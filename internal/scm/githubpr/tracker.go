@@ -126,8 +126,12 @@ func splitProject(project string) (owner, repo string, ok bool) {
 // FetchCandidateIssues returns open pull requests carrying a configured
 // active-state label. Comments are nil on all returned issues. When
 // query_filter is set, candidates are additionally matched against it:
-// an "assignee:<login>" clause keeps only PRs assigned to that login,
-// with "@me" resolved to the API token owner via /user.
+// an "assignee:<login>" clause keeps only PRs assigned to that login
+// (with "@me" resolved to the API token owner via /user), and a
+// "-label:<name>" clause drops any PR carrying that label. Negative
+// label clauses matter here because this path lists via /pulls, which
+// cannot run search syntax — without client-side matching they would be
+// silently ignored and escalated PRs would be re-dispatched.
 func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
@@ -155,6 +159,15 @@ func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Is
 	return issues, err
 }
 
+// queryFilter carries the parsed "assignee:<login>" clause (if any)
+// plus every "-label:<name>" exclusion. Positive label clauses need no
+// parsing on this path: labels are already reflected in PR labels and
+// checked via activeStates.
+type queryFilter struct {
+	assignee queryAssignee
+	excluded []string
+}
+
 // queryAssignee carries one parsed "assignee:<login>" clause, or none.
 type queryAssignee struct {
 	login string
@@ -162,39 +175,73 @@ type queryAssignee struct {
 }
 
 // resolvedQueryFilter parses the adapter's query_filter into matchable
-// clauses. An empty filter matches everything. Only assignee clauses
-// apply to the pulls-list path; label clauses are already reflected in
-// PR labels (checked via activeStates) because this path cannot run
-// search syntax. "@me" resolves to the token owner's login via /user.
-func (a *GitHubPRAdapter) resolvedQueryFilter(ctx context.Context) (queryAssignee, error) {
+// clauses. An empty filter matches everything. Only assignee and
+// negative-label clauses apply to the pulls-list path; positive label
+// clauses are already reflected in PR labels (checked via activeStates)
+// because this path cannot run search syntax. "@me" resolves to the
+// token owner's login via /user.
+func (a *GitHubPRAdapter) resolvedQueryFilter(ctx context.Context) (queryFilter, error) {
+	filter := queryFilter{excluded: parseExcludedLabels(a.queryFilter)}
 	assignee, found := parseAssigneeClause(a.queryFilter)
 	if !found {
-		return queryAssignee{}, nil
+		return filter, nil
 	}
 	if !strings.EqualFold(assignee, "@me") {
-		return queryAssignee{login: assignee, found: true}, nil
+		filter.assignee = queryAssignee{login: assignee, found: true}
+		return filter, nil
 	}
 	login, err := a.currentLogin(ctx)
 	if err != nil {
-		return queryAssignee{}, err
+		return queryFilter{}, err
 	}
-	return queryAssignee{login: login, found: true}, nil
+	filter.assignee = queryAssignee{login: login, found: true}
+	return filter, nil
 }
 
 // match reports whether issue satisfies the parsed filter. A filter
-// without an assignee clause matches every issue. Matching is
-// case-insensitive; unassigned PRs never match an assignee clause.
+// without an assignee clause matches every issue on assignee;
+// exclusion labels reject regardless. Matching is case-insensitive;
+// unassigned PRs never match an assignee clause.
 // ponytail: domain.Issue carries the first assignee only; a PR where
 // the user is a second assignee won't match — extend the domain type
 // with all assignees when multi-assignee routing is needed.
-func (f queryAssignee) match(issue domain.Issue) bool {
-	if !f.found {
-		return true
+func (f queryFilter) match(issue domain.Issue) bool {
+	if f.assignee.found {
+		if issue.Assignee == "" {
+			return false
+		}
+		if !strings.EqualFold(issue.Assignee, f.assignee.login) {
+			return false
+		}
 	}
-	if issue.Assignee == "" {
-		return false
+	if len(f.excluded) > 0 {
+		present := toSetLower(issue.Labels)
+		for _, label := range f.excluded {
+			if _, ok := present[label]; ok {
+				return false
+			}
+		}
 	}
-	return strings.EqualFold(issue.Assignee, f.login)
+	return true
+}
+
+// parseExcludedLabels extracts every "-label:<name>" clause from a
+// search-style filter string, lowercased for comparison against the
+// adapter-normalized issue labels.
+func parseExcludedLabels(filter string) []string {
+	var excluded []string
+	for _, field := range strings.Fields(filter) {
+		name, value, cut := splitCut(field, ":")
+		if !cut || !strings.EqualFold(name, "-label") {
+			continue
+		}
+		value = strings.ToLower(strings.Trim(value, `"`))
+		if value == "" {
+			continue
+		}
+		excluded = append(excluded, value)
+	}
+	return excluded
 }
 
 // parseAssigneeClause extracts the login from the first
@@ -307,6 +354,11 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 		}
 	}
 
+	filter, fetchErr := a.resolvedQueryFilter(ctx)
+	if fetchErr != nil {
+		return []domain.Issue{}, fetchErr
+	}
+
 	var matched []domain.Issue
 	err := trackermetrics.Track(a.metrics, "fetch_by_states", func() error {
 		matchedIssues := make([]domain.Issue, 0)
@@ -319,6 +371,9 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 			}
 			for _, issue := range prs {
 				if _, ok := stateSet[issue.State]; !ok {
+					continue
+				}
+				if !filter.match(issue) {
 					continue
 				}
 				if _, dup := seen[issue.Identifier]; dup {

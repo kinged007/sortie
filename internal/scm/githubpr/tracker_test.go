@@ -175,3 +175,44 @@ func TestFetchCandidates_RespectsAssigneeFilter(t *testing.T) {
 		t.Fatalf("issues = %+v, want only PR 2", issues)
 	}
 }
+
+func TestFetchCandidates_SkipsExcludedLabels(t *testing.T) {
+	t.Parallel()
+
+	pr := func(number int, labels string) string {
+		return fmt.Sprintf(`{"number":%d,"title":"PR %d","body":null,"state":"open","html_url":"https://github.com/owner/repo/pull/%d","labels":[%s],"assignees":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+			number, number, number, labels)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[`+pr(1, `{"name":"agent:needs-review"}`)+`,`+pr(2, `{"name":"agent:needs-review"},{"name":"needs-human"}`)+`]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"unexpected path"}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validConfig(srv.URL)
+	cfg["active_states"] = []string{"agent:needs-review"}
+	cfg["query_filter"] = "-label:needs-human"
+	a := mustAdapter(t, cfg)
+	issues, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1", issues)
+	}
+
+	issues, err = a.FetchIssuesByStates(context.Background(), []string{"agent:needs-review"})
+	if err != nil {
+		t.Fatalf("FetchIssuesByStates: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1", issues)
+	}
+}
