@@ -1,0 +1,3 @@
+{"type": "session", "id": "ses_resume1", "cwd": "/tmp"}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "resumed"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "resumed"}], "usage": {"input": 60, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 65}, "model": "coding-manual"}}

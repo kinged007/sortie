@@ -16,8 +16,10 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/kiro"
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
+	_ "github.com/sortie-ai/sortie/internal/agent/pi"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitea"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
+	_ "github.com/sortie-ai/sortie/internal/scm/githubpr"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitlab"
 	_ "github.com/sortie-ai/sortie/internal/tracker/file"
 	_ "github.com/sortie-ai/sortie/internal/tracker/jira"
@@ -48,6 +50,14 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 			{
 				name:         "github requires api_key and project and declares both state lists",
 				kind:         "github",
+				wantAPIKey:   true,
+				wantProject:  true,
+				wantActive:   []string{"backlog", "in-progress", "review"},
+				wantTerminal: []string{"done", "wontfix"},
+			},
+			{
+				name:         "github-pr requires api_key and project and declares both state lists",
+				kind:         "github-pr",
 				wantAPIKey:   true,
 				wantProject:  true,
 				wantActive:   []string{"backlog", "in-progress", "review"},
@@ -166,6 +176,14 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantMCPInjection:     registry.MCPInjectionUnsupported,
 				wantUsageArrival:     registry.UsageArrivalNone,
 				wantUsageAttribution: registry.UsageAttributionNone,
+			},
+			{
+				name:                 "pi requires command, declares MCP injection translated, declares turn_end/per_model usage, and declares no resume blocker",
+				kind:                 "pi",
+				wantCommand:          true,
+				wantMCPInjection:     registry.MCPInjectionTranslated,
+				wantUsageArrival:     registry.UsageArrivalTurnEnd,
+				wantUsageAttribution: registry.UsageAttributionPerModel,
 			},
 			{
 				name:                 "opencode requires command, declares MCP injection translated, declares turn_end/per_model usage, and declares no resume blocker",

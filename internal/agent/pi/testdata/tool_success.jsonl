@@ -1,0 +1,5 @@
+{"type": "session", "id": "ses_tool1", "cwd": "/tmp"}
+{"type": "message_update", "assistantMessageEvent": {"type": "toolcall_start", "contentIndex": 0, "toolName": "write"}}
+{"type": "message_update", "assistantMessageEvent": {"type": "toolcall_end", "contentIndex": 0, "toolCall": {"type": "toolCall", "id": "call_1", "name": "write", "arguments": {"path": "hello.txt"}}}}
+{"type": "tool_execution_end", "toolCallId": "call_1", "toolName": "write", "result": {"content": [{"type": "text", "text": "ok"}], "isError": false}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 50, "output": 10, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 60}, "model": "coding-manual"}}

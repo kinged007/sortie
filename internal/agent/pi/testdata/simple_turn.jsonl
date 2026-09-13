@@ -1,0 +1,4 @@
+{"type": "session", "id": "ses_abc123", "cwd": "/tmp"}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "Hello, "}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "world!"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "Hello, world!"}], "usage": {"input": 100, "output": 20, "cacheRead": 10, "cacheWrite": 0, "totalTokens": 130}, "model": "coding-manual"}}

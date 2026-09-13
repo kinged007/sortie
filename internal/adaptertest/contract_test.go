@@ -794,7 +794,7 @@ func checkContractImports(fset *token.FileSet, file *ast.File, pkg contractPacka
 // name absent here is still caught once some package registers it as
 // a kind.
 var contractAgentIdentityFloorTable = []string{
-	"claude", "codex", "copilot", "kiro", "opencode", "mock",
+	"claude", "codex", "copilot", "kiro", "opencode", "pi", "mock",
 	"gemini", "amp", "goose", "zed", "cursor", "aider", "qwen", "crush",
 }
 
