@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
@@ -123,10 +124,17 @@ func splitProject(project string) (owner, repo string, ok bool) {
 }
 
 // FetchCandidateIssues returns open pull requests carrying a configured
-// active-state label. Comments are nil on all returned issues.
+// active-state label. Comments are nil on all returned issues. When
+// query_filter is set, candidates are additionally matched against it:
+// an "assignee:<login>" clause keeps only PRs assigned to that login,
+// with "@me" resolved to the API token owner via /user.
 func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
+		filter, fetchErr := a.resolvedQueryFilter(ctx)
+		if fetchErr != nil {
+			return fetchErr
+		}
 		fetched, fetchErr := a.fetchOpenPRs(ctx)
 		if fetchErr != nil {
 			return fetchErr
@@ -136,12 +144,90 @@ func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Is
 			if _, ok := activeSet[issue.State]; !ok {
 				continue
 			}
+			if !filter.match(issue) {
+				continue
+			}
 			issue.Comments = nil
 			issues = append(issues, issue)
 		}
 		return nil
 	})
 	return issues, err
+}
+
+// queryAssignee carries one parsed "assignee:<login>" clause, or none.
+type queryAssignee struct {
+	login string
+	found bool
+}
+
+// resolvedQueryFilter parses the adapter's query_filter into matchable
+// clauses. An empty filter matches everything. Only assignee clauses
+// apply to the pulls-list path; label clauses are already reflected in
+// PR labels (checked via activeStates) because this path cannot run
+// search syntax. "@me" resolves to the token owner's login via /user.
+func (a *GitHubPRAdapter) resolvedQueryFilter(ctx context.Context) (queryAssignee, error) {
+	assignee, found := parseAssigneeClause(a.queryFilter)
+	if !found {
+		return queryAssignee{}, nil
+	}
+	if !strings.EqualFold(assignee, "@me") {
+		return queryAssignee{login: assignee, found: true}, nil
+	}
+	login, err := a.currentLogin(ctx)
+	if err != nil {
+		return queryAssignee{}, err
+	}
+	return queryAssignee{login: login, found: true}, nil
+}
+
+// match reports whether issue satisfies the parsed filter. A filter
+// without an assignee clause matches every issue. Matching is
+// case-insensitive; unassigned PRs never match an assignee clause.
+// ponytail: domain.Issue carries the first assignee only; a PR where
+// the user is a second assignee won't match — extend the domain type
+// with all assignees when multi-assignee routing is needed.
+func (f queryAssignee) match(issue domain.Issue) bool {
+	if !f.found {
+		return true
+	}
+	if issue.Assignee == "" {
+		return false
+	}
+	return strings.EqualFold(issue.Assignee, f.login)
+}
+
+// parseAssigneeClause extracts the login from the first
+// "assignee:<login>" clause in a search-style filter string.
+func parseAssigneeClause(filter string) (string, bool) {
+	for _, field := range strings.Fields(filter) {
+		name, value, cut := splitCut(field, ":")
+		if !cut || !strings.EqualFold(name, "assignee") {
+			continue
+		}
+		value = strings.Trim(value, `"`)
+		if value == "" {
+			continue
+		}
+		return value, true
+	}
+	return "", false
+}
+
+// currentLogin returns the login of the API token owner via GET /user.
+func (a *GitHubPRAdapter) currentLogin(ctx context.Context) (string, error) {
+	body, _, err := a.client.Get(ctx, "/user", nil)
+	if err != nil {
+		return "", err
+	}
+	var user pullUser
+	if err := json.Unmarshal(body, &user); err != nil {
+		return "", &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse user response", Err: err}
+	}
+	if user.Login == "" {
+		return "", &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "empty login in user response"}
+	}
+	return user.Login, nil
 }
 
 func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context) ([]domain.Issue, error) {

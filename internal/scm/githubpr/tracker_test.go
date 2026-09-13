@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -122,5 +123,55 @@ func TestTransitionIssue_SwapsLabel(t *testing.T) {
 	}
 	if len(deleted) != 1 || len(posted) != 1 {
 		t.Errorf("deleted=%v posted=%v, want one of each", deleted, posted)
+	}
+}
+
+func TestFetchCandidates_RespectsAssigneeFilter(t *testing.T) {
+	t.Parallel()
+
+	pr := func(number int, login string) string {
+		assignees := `[]`
+		if login != "" {
+			assignees = `[{"login":` + strconv.Quote(login) + `}]`
+		}
+		return fmt.Sprintf(`{"number":%d,"title":"PR %d","body":null,"state":"open","html_url":"https://github.com/owner/repo/pull/%d","labels":[{"name":"agent:needs-review"}],"assignees":%s,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+			number, number, number, assignees)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[`+pr(1, "alice")+`,`+pr(2, "bob")+`,`+pr(3, "")+`]`)
+		case "/user":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"login":"alice"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"unexpected path"}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validConfig(srv.URL)
+	cfg["active_states"] = []string{"agent:needs-review"}
+	cfg["query_filter"] = "assignee:@me"
+	a := mustAdapter(t, cfg)
+	issues, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1", issues)
+	}
+
+	cfg["query_filter"] = "assignee:bob"
+	a = mustAdapter(t, cfg)
+	issues, err = a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "2" {
+		t.Fatalf("issues = %+v, want only PR 2", issues)
 	}
 }
