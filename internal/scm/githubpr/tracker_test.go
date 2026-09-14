@@ -216,3 +216,59 @@ func TestFetchCandidates_SkipsExcludedLabels(t *testing.T) {
 		t.Fatalf("issues = %+v, want only PR 1", issues)
 	}
 }
+
+func TestFetchCandidates_EnforcesRequiredLabels(t *testing.T) {
+	t.Parallel()
+
+	pr := func(number int, labels string) string {
+		return fmt.Sprintf(`{"number":%d,"title":"PR %d","body":null,"state":"open","html_url":"https://github.com/owner/repo/pull/%d","labels":[%s],"assignees":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+			number, number, number, labels)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `[`+
+				pr(1, `{"name":"agent:build"}`)+`,`+
+				pr(2, `{"name":"agent:reviewed"}`)+`,`+
+				pr(3, ``)+`]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"unexpected path"}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validConfig(srv.URL)
+	cfg["active_states"] = []string{"in-progress", "agent:build"}
+	cfg["query_filter"] = "label:agent:build -label:needs-human"
+	a := mustAdapter(t, cfg)
+	issues, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	// PR 2 carries agent:reviewed (in neither active state); PR 3 is
+	// unlabeled and falls back to in-progress, but lacks agent:build.
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1", issues)
+	}
+
+	issues, err = a.FetchIssuesByStates(context.Background(), []string{"in-progress", "agent:build"})
+	if err != nil {
+		t.Fatalf("FetchIssuesByStates: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1", issues)
+	}
+
+	cfg["query_filter"] = "label:agent:quick,agent:build"
+	a = mustAdapter(t, cfg)
+	issues, err = a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "1" {
+		t.Fatalf("issues = %+v, want only PR 1 via OR", issues)
+	}
+}
