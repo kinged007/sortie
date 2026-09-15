@@ -1,3 +1,5 @@
+//go:build unix
+
 package probe
 
 import "github.com/sortie-ai/sortie/internal/qualification"
