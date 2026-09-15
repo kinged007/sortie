@@ -293,6 +293,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - If a human-readable status surface is implemented, it is driven from orchestrator state and does not affect correctness
 - If humanized event summaries are implemented, they cover key agent event classes without changing orchestrator behavior
 - An unmeasured run is distinguishable from a zero-consumption run in the persisted row, in both `sortie stats` output forms, on the dashboard, and in the `cost_budget` result; an unmeasured run creates no Prometheus series
+- A running row's `turn_count` equals the number of agent turns its worker has started, self-review turns included, whether the agent kind emits `session_started` on every turn, only on its first turn, or never
 
 ### 17.7 CLI and Host Lifecycle
 

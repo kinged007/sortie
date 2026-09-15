@@ -91,6 +91,13 @@ type agentEventMsg struct {
 	Event   domain.AgentEvent
 }
 
+// turnStartedMsg pairs an issue ID with the worker's started-turn count,
+// the turn about to run included, for delivery through turnStartedCh.
+type turnStartedMsg struct {
+	IssueID      string
+	TurnsStarted int
+}
+
 // OrchestratorParams holds the construction-time dependencies for
 // [NewOrchestrator]. All fields are required unless documented otherwise.
 type OrchestratorParams struct {
@@ -250,12 +257,13 @@ type Orchestrator struct {
 	blockerResolver    BlockerResolver
 	abandonCh          <-chan struct{}
 
-	workerExitCh chan WorkerResult
-	retryTimerCh chan string
-	agentEventCh chan agentEventMsg
-	selfReviewCh chan selfReviewProgressMsg
-	snapshotCh   chan snapshotRequest
-	refreshCh    chan struct{}
+	workerExitCh  chan WorkerResult
+	retryTimerCh  chan string
+	agentEventCh  chan agentEventMsg
+	selfReviewCh  chan selfReviewProgressMsg
+	turnStartedCh chan turnStartedMsg
+	snapshotCh    chan snapshotRequest
+	refreshCh     chan struct{}
 
 	preflightParams PreflightParams
 	observers       []Observer
@@ -392,6 +400,7 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 		retryTimerCh:                      make(chan string, retryBuf),
 		agentEventCh:                      make(chan agentEventMsg, eventBuf),
 		selfReviewCh:                      make(chan selfReviewProgressMsg, eventBuf),
+		turnStartedCh:                     make(chan turnStartedMsg, eventBuf),
 		snapshotCh:                        make(chan snapshotRequest, 4),
 		refreshCh:                         make(chan struct{}, 1),
 		preflightParams:                   params.PreflightParams,
@@ -470,6 +479,14 @@ func (o *Orchestrator) applySelfReviewProgress(msg selfReviewProgressMsg) {
 	}
 }
 
+func (o *Orchestrator) applyTurnStarted(msg turnStartedMsg) {
+	entry, ok := o.state.Running[msg.IssueID]
+	if !ok {
+		return
+	}
+	entry.TurnCount = msg.TurnsStarted
+}
+
 // applyQueuedAheadOfExit applies the messages queued ahead of the
 // WorkerResults of exitingIssueIDs, evaluating the in-flight token
 // ceiling for every applied event except those of an exiting issue:
@@ -481,6 +498,7 @@ func (o *Orchestrator) applyQueuedAheadOfExit(ctx context.Context, exitingIssueI
 		o.applyAgentEvent(ctx, msg, !exiting)
 	})
 	applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
+	applyQueued(o.turnStartedCh, o.applyTurnStarted)
 }
 
 // handleWorkerExit takes workerExit together with every WorkerResult
@@ -598,6 +616,9 @@ func (o *Orchestrator) Run(ctx context.Context) {
 
 		case msg := <-o.selfReviewCh:
 			o.applySelfReviewProgress(msg)
+
+		case msg := <-o.turnStartedCh:
+			o.applyTurnStarted(msg)
 
 		case req := <-o.snapshotCh:
 			snap := RuntimeSnapshot(o.state, time.Now())
@@ -982,6 +1003,12 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 			},
 			OnExit: func(issueID string, result WorkerResult) {
 				o.workerExitCh <- result
+			},
+			OnTurnStarted: func(issueID string, turnsStarted int) {
+				select {
+				case o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: turnsStarted}:
+				case <-ctx.Done():
+				}
 			},
 			OnProgress: func(msg selfReviewProgressMsg) {
 				select {
@@ -1508,6 +1535,7 @@ func (o *Orchestrator) drainRunningWorkers() {
 				o.applyAgentEvent(drainCtx, msg, false)
 			})
 			applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
+			applyQueued(o.turnStartedCh, o.applyTurnStarted)
 			cfg := o.workflowManager.Config()
 			HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
 				Store:                             o.store,
@@ -1543,6 +1571,9 @@ func (o *Orchestrator) drainRunningWorkers() {
 
 		case msg := <-o.selfReviewCh:
 			o.applySelfReviewProgress(msg)
+
+		case msg := <-o.turnStartedCh:
+			o.applyTurnStarted(msg)
 
 		case req := <-o.snapshotCh:
 			snap := RuntimeSnapshot(o.state, time.Now())

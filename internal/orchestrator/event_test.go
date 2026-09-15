@@ -78,8 +78,7 @@ func TestHandleAgentEvent_BasicFields(t *testing.T) {
 }
 
 // TestHandleAgentEvent_SessionStarted verifies that EventSessionStarted
-// populates SessionID and AgentPID on the entry and increments TurnCount
-// by 1, reflecting that turn_count counts turns started.
+// populates SessionID and AgentPID on the entry.
 func TestHandleAgentEvent_SessionStarted(t *testing.T) {
 	t.Parallel()
 
@@ -98,9 +97,6 @@ func TestHandleAgentEvent_SessionStarted(t *testing.T) {
 	}
 	if entry.AgentPID != "9999" {
 		t.Errorf("AgentPID = %q, want %q", entry.AgentPID, "9999")
-	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1 (session_started increments turn count)", entry.TurnCount)
 	}
 }
 
@@ -124,54 +120,54 @@ func TestHandleAgentEvent_SessionStarted_EmptySessionID(t *testing.T) {
 	}
 }
 
-// TestHandleAgentEvent_TurnCount verifies the turn-count semantics:
-// TurnCount counts turns started, so session_started events increment it.
-// Finalization and other event types must not change TurnCount.
+// TestHandleAgentEvent_TurnCount verifies that no agent event changes TurnCount.
 func TestHandleAgentEvent_TurnCount(t *testing.T) {
 	t.Parallel()
 
-	t.Run("increments on session_started", func(t *testing.T) {
-		t.Parallel()
-		state, entry := newStateWithEntry("MT-4")
-
-		HandleAgentEvent(state, "MT-4", domain.AgentEvent{
-			Type:      domain.EventSessionStarted,
-			Timestamp: time.Now().UTC(),
-			SessionID: "s1",
-		}, slog.Default(), nil)
-
-		if entry.TurnCount != 1 {
-			t.Errorf("TurnCount = %d, want 1 for session_started", entry.TurnCount)
-		}
-	})
-
-	noIncrementTypes := []struct {
-		name      string
-		eventType domain.AgentEventType
-	}{
-		{"turn_completed", domain.EventTurnCompleted},
-		{"turn_failed", domain.EventTurnFailed},
-		{"turn_cancelled", domain.EventTurnCancelled},
-		{"turn_ended_with_error", domain.EventTurnEndedWithError},
-		{"turn_input_required", domain.EventTurnInputRequired},
-		{"startup_failed", domain.EventStartupFailed},
-		{"notification", domain.EventNotification},
-		{"token_usage", domain.EventTokenUsage},
-		{"other_message", domain.EventOtherMessage},
+	eventTypes := []domain.AgentEventType{
+		domain.EventSessionStarted,
+		domain.EventStartupFailed,
+		domain.EventTurnCompleted,
+		domain.EventTurnFailed,
+		domain.EventTurnCancelled,
+		domain.EventTurnEndedWithError,
+		domain.EventTurnInputRequired,
+		domain.EventTokenUsage,
+		domain.EventNotification,
+		domain.EventOtherMessage,
+		domain.EventMalformed,
+		domain.EventToolResult,
 	}
 
-	for _, nft := range noIncrementTypes {
-		t.Run("no increment on "+nft.name, func(t *testing.T) {
+	for _, eventType := range eventTypes {
+		t.Run(string(eventType)+" from a zero TurnCount", func(t *testing.T) {
 			t.Parallel()
-			state, entry := newStateWithEntry("MT-5")
+			state, entry := newStateWithEntry("TC-ZERO")
 
-			HandleAgentEvent(state, "MT-5", domain.AgentEvent{
-				Type:      nft.eventType,
+			HandleAgentEvent(state, "TC-ZERO", domain.AgentEvent{
+				Type:      eventType,
 				Timestamp: time.Now().UTC(),
+				SessionID: "s1",
 			}, slog.Default(), nil)
 
 			if entry.TurnCount != 0 {
-				t.Errorf("TurnCount = %d, want 0 for %q", entry.TurnCount, nft.eventType)
+				t.Errorf("TurnCount = %d, want 0 (unchanged) for %q", entry.TurnCount, eventType)
+			}
+		})
+
+		t.Run(string(eventType)+" from a nonzero TurnCount", func(t *testing.T) {
+			t.Parallel()
+			state, entry := newStateWithEntry("TC-NONZERO")
+			entry.TurnCount = 3
+
+			HandleAgentEvent(state, "TC-NONZERO", domain.AgentEvent{
+				Type:      eventType,
+				Timestamp: time.Now().UTC(),
+				SessionID: "s1",
+			}, slog.Default(), nil)
+
+			if entry.TurnCount != 3 {
+				t.Errorf("TurnCount = %d, want 3 (unchanged) for %q", entry.TurnCount, eventType)
 			}
 		})
 	}
@@ -308,8 +304,8 @@ func TestHandleAgentEvent_FullSequence(t *testing.T) {
 	if entry.LastAgentEvent != "turn_completed" {
 		t.Errorf("LastAgentEvent = %q, want %q", entry.LastAgentEvent, "turn_completed")
 	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1", entry.TurnCount)
+	if entry.TurnCount != 0 {
+		t.Errorf("TurnCount = %d, want 0 (HandleAgentEvent never sets it)", entry.TurnCount)
 	}
 	if entry.AgentInputTokens != 200 {
 		t.Errorf("AgentInputTokens = %d, want 200", entry.AgentInputTokens)
@@ -645,13 +641,7 @@ func TestHandleAgentEvent_DebugLogging(t *testing.T) {
 
 		state, entry := newStateWithEntry(issueID)
 		entry.Identifier = identifier
-
-		// Send session_started first so TurnCount = 1 when turn_completed fires.
-		HandleAgentEvent(state, issueID, domain.AgentEvent{
-			Type:      domain.EventSessionStarted,
-			Timestamp: time.Now().UTC(),
-			SessionID: "sess-log",
-		}, logger, nil)
+		entry.TurnCount = 1
 
 		HandleAgentEvent(state, issueID, domain.AgentEvent{
 			Type:      domain.EventTurnCompleted,
@@ -1430,7 +1420,6 @@ func TestHandleAgentEvent_CombinedTimingAccumulation(t *testing.T) {
 	state, entry := newStateWithEntry("COMBO-1")
 	ts := time.Now().UTC()
 
-	// Session started, increments TurnCount to 1.
 	HandleAgentEvent(state, "COMBO-1", domain.AgentEvent{
 		Type:      domain.EventSessionStarted,
 		Timestamp: ts,
@@ -1465,8 +1454,8 @@ func TestHandleAgentEvent_CombinedTimingAccumulation(t *testing.T) {
 	if entry.ToolTimeMs != 200 {
 		t.Errorf("ToolTimeMs = %d, want 200", entry.ToolTimeMs)
 	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1", entry.TurnCount)
+	if entry.TurnCount != 0 {
+		t.Errorf("TurnCount = %d, want 0 (HandleAgentEvent never sets it)", entry.TurnCount)
 	}
 }
 
