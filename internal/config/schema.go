@@ -1,8 +1,8 @@
 package config
 
 import (
+	"errors"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -177,7 +177,7 @@ type FrontMatterWarning struct {
 // ValidateFrontMatter performs advisory static analysis on the raw
 // front matter map. It requires the parsed [ServiceConfig] to extract
 // dynamic extension keys (tracker.kind, agent.kind). Returns warnings
-// only — these do not affect config validity or runtime behavior.
+// only, and these do not affect config validity or runtime behavior.
 //
 // The raw map must be the post-env-override map (same map that
 // [NewServiceConfig] processed), so that env-override-created sections
@@ -496,7 +496,7 @@ func formatUnresolvedExtensionVarMessage(unsetNames []string) string {
 	case 1:
 		return fmt.Sprintf("unresolved $VAR reference: variable %q is unset or empty", unsetNames[0])
 	case 2:
-		return fmt.Sprintf("unresolved $VAR reference: variables %q and %q are unset or empty", unsetNames[0], unsetNames[1]) //nolint:gosec // G602: case 2 guarantees len(unsetNames) == 2
+		return fmt.Sprintf("unresolved $VAR reference: variables %q and %q are unset or empty", unsetNames[0], unsetNames[1]) //nolint:gosec // G602: the two-name branch guarantees len(unsetNames) == 2
 	}
 	var b strings.Builder
 	b.WriteString("unresolved $VAR reference: variables ")
@@ -617,7 +617,7 @@ func checkHooksTimeoutSemantic(warnings []FrontMatterWarning, raw map[string]any
 	}
 	n, err := coerceInt(v)
 	if err != nil {
-		return warnings // type mismatch already reported
+		return warnings
 	}
 	if n <= 0 {
 		warnings = append(warnings, FrontMatterWarning{
@@ -651,6 +651,9 @@ func checkByStateSemantic(warnings []FrontMatterWarning, raw map[string]any) []F
 		fieldPath := "agent.max_concurrent_agents_by_state." + stateKey
 		n, err := coerceInt(stateVal)
 		if err != nil {
+			if errors.Is(err, ErrIntegerOutOfRange) {
+				continue
+			}
 			warnings = append(warnings, FrontMatterWarning{
 				Check:   "type_mismatch",
 				Field:   fieldPath,
@@ -687,17 +690,8 @@ func typeMatches(v any, ft FieldType) bool {
 		_, ok := v.([]any)
 		return ok
 	case FieldInt:
-		switch val := v.(type) {
-		case int, int64, int32:
-			return true
-		case float64:
-			return val == math.Trunc(val)
-		case string:
-			_, err := strconv.Atoi(strings.TrimSpace(val))
-			return err == nil
-		default:
-			return false
-		}
+		_, err := coerceInt(v)
+		return err == nil || errors.Is(err, ErrIntegerOutOfRange)
 	default:
 		return false
 	}

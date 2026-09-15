@@ -1832,9 +1832,17 @@ func toInt(v any) (int, error) {
 		if n != math.Trunc(n) {
 			return 0, fmt.Errorf("expected integer value, got fractional %v", n)
 		}
-		return int(n), nil
-	case int64:
-		return int(n), nil
+		parsed, ok := config.IntFromNumber(n)
+		if !ok {
+			return 0, config.ErrIntegerOutOfRange
+		}
+		return parsed, nil
+	case int64, uint64:
+		parsed, ok := config.IntFromNumber(n)
+		if !ok {
+			return 0, config.ErrIntegerOutOfRange
+		}
+		return parsed, nil
 	default:
 		return 0, fmt.Errorf("expected numeric value, got %T", v)
 	}
