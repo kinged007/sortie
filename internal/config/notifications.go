@@ -101,7 +101,7 @@ func parseNotificationBackend(index int, elem any) (NotificationBackend, error) 
 		if err != nil {
 			return NotificationBackend{}, &ConfigError{
 				Field:   field + ".max_per_session",
-				Message: fmt.Sprintf("invalid integer value: %v", rawMax),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", rawMax)),
 			}
 		}
 		if n < 0 {

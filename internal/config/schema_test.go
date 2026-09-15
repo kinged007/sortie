@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -525,6 +526,19 @@ func TestValidateFrontMatter(t *testing.T) {
 			raw:       map[string]any{"hooks": map[string]any{"timeout_ms": 1}},
 			wantCount: 0,
 		},
+		{
+			// An out-of-range value fails config construction outright,
+			// so the advisory layer emits nothing rather than a
+			// type_mismatch warning naming a fault the value does not have.
+			name:      "hooks.timeout_ms out-of-range positive value produces no warning",
+			raw:       map[string]any{"hooks": map[string]any{"timeout_ms": float64(1e20)}},
+			wantCount: 0,
+		},
+		{
+			name:      "hooks.timeout_ms out-of-range negative value produces no warning",
+			raw:       map[string]any{"hooks": map[string]any{"timeout_ms": float64(-1e20)}},
+			wantCount: 0,
+		},
 
 		{
 			name: "agent.max_concurrent_agents_by_state non-numeric value",
@@ -565,6 +579,31 @@ func TestValidateFrontMatter(t *testing.T) {
 			},
 			wantCount: 0,
 		},
+		{
+			// An out-of-range entry of either sign fails config
+			// construction outright, so checkByStateSemantic must not add
+			// its own "will be ignored" warning on top of that.
+			name: "agent.max_concurrent_agents_by_state out-of-range positive value produces no warning",
+			raw: map[string]any{
+				"agent": map[string]any{
+					"max_concurrent_agents_by_state": map[string]any{
+						"In Progress": float64(1e20),
+					},
+				},
+			},
+			wantCount: 0,
+		},
+		{
+			name: "agent.max_concurrent_agents_by_state out-of-range negative value produces no warning",
+			raw: map[string]any{
+				"agent": map[string]any{
+					"max_concurrent_agents_by_state": map[string]any{
+						"In Progress": float64(-1e20),
+					},
+				},
+			},
+			wantCount: 0,
+		},
 
 		{
 			name:      "agent.max_consecutive_absences known key produces no warning",
@@ -594,6 +633,47 @@ func TestValidateFrontMatter(t *testing.T) {
 			wantCount:  1,
 			wantChecks: []string{"type_mismatch"},
 			wantFields: []string{"agent.stop_grace_ms"},
+		},
+
+		{
+			// self_review.enabled: false means the config layer never
+			// reads max_iterations, but the per-field type check in
+			// ValidateFrontMatter runs unconditionally on every known
+			// field present in the section. An out-of-range value there
+			// must not warn; a non-numeric one still must.
+			name: "disabled self_review block accepts out-of-range integer without warning",
+			raw: map[string]any{
+				"self_review": map[string]any{"enabled": false, "max_iterations": float64(1e20)},
+			},
+			wantCount: 0,
+		},
+		{
+			name: "disabled self_review block still warns on non-numeric value",
+			raw: map[string]any{
+				"self_review": map[string]any{"enabled": false, "max_iterations": "abc"},
+			},
+			wantCount:  1,
+			wantChecks: []string{"type_mismatch"},
+			wantFields: []string{"self_review.max_iterations"},
+		},
+		{
+			// ci_feedback without a "kind" is never read by the config
+			// layer (buildCIFeedbackConfig returns early), but the same
+			// unconditional type check applies.
+			name: "kind-less ci_feedback block accepts out-of-range integer without warning",
+			raw: map[string]any{
+				"ci_feedback": map[string]any{"max_retries": float64(1e20)},
+			},
+			wantCount: 0,
+		},
+		{
+			name: "kind-less ci_feedback block still warns on non-numeric value",
+			raw: map[string]any{
+				"ci_feedback": map[string]any{"max_retries": "abc"},
+			},
+			wantCount:  1,
+			wantChecks: []string{"type_mismatch"},
+			wantFields: []string{"ci_feedback.max_retries"},
 		},
 
 		{
@@ -985,6 +1065,48 @@ func TestValidateFrontMatterReactions(t *testing.T) {
 				if got[i].Field != wantField {
 					t.Errorf("warnings[%d].Field = %q, want %q", i, got[i].Field, wantField)
 				}
+			}
+		})
+	}
+}
+
+// TestTypeMatches_FieldInt covers typeMatches's FieldInt case, which
+// delegates to coerceInt and accepts a value in range or one that fails
+// coercion with ErrIntegerOutOfRange.
+func TestTypeMatches_FieldInt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		v    any
+		want bool
+	}{
+		{"int", int(5), true},
+		{"int64", int64(5), true},
+		{"uint64 in range", uint64(5), true},
+		{"uint64 out of range", uint64(9223372036854775808), true},
+		{"float64 whole", float64(5), true},
+		{"float64 fractional", float64(5.5), false},
+		{"float64 NaN", math.NaN(), false},
+		// +Inf passes coerceInt's Trunc(v) == v check, then fails
+		// IntFromNumber's range test, so it reports ErrIntegerOutOfRange
+		// rather than the "fractional value" error NaN reports.
+		{"float64 +Inf", math.Inf(1), true},
+		{"float64 out of range", float64(1e20), true},
+		{"string numeric", "5", true},
+		{"string out of range", "99999999999999999999", true},
+		{"string non-numeric", "abc", false},
+		{"bool", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := typeMatches(tt.v, FieldInt)
+
+			if got != tt.want {
+				t.Errorf("typeMatches(%v, FieldInt) = %v, want %v", tt.v, got, tt.want)
 			}
 		})
 	}

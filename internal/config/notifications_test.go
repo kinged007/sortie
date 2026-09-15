@@ -159,6 +159,42 @@ func TestNotificationsConfig_NegativeMaxPerSession(t *testing.T) {
 	assertConfigErrorField(t, err, "notifications[0].max_per_session")
 }
 
+func TestNotificationsConfig_MaxPerSessionOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		val  any
+	}{
+		{"uint64", uint64(9223372036854775808)},
+		{"float64", float64(1e20)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw := map[string]any{
+				"notifications": []any{
+					map[string]any{
+						"kind":            "webhook",
+						"url":             "https://example.com/hook",
+						"max_per_session": tt.val,
+					},
+				},
+			}
+
+			_, err := NewServiceConfig(raw)
+			assertConfigErrorField(t, err, "notifications[0].max_per_session")
+			var ce *ConfigError
+			if !errors.As(err, &ce) {
+				t.Fatalf("error type = %T, want *ConfigError", err)
+			}
+			assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+		})
+	}
+}
+
 func TestNotificationsConfig_ZeroMaxPerSession_Valid(t *testing.T) {
 	t.Parallel()
 

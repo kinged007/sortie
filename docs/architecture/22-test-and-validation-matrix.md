@@ -29,9 +29,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - A non-positive `agent.turn_timeout_ms` is rejected at config parse time; an absent key takes the default
 - An absent `agent.max_consecutive_absences` key takes the default of `3`; `0` and negative values are rejected at config parse time; `SORTIE_AGENT_MAX_CONSECUTIVE_ABSENCES` overrides a file-supplied value and is rejected under the same rule
 - An absent `reactions.ci_failure.watch_window_ms` key takes the default; a negative value and a value above `9223372036854` are rejected at config parse time, naming the field and the value; `9223372036854` itself is accepted
-- Per-state concurrency override map normalizes state names and ignores invalid values
+- Per-state concurrency override map normalizes state names, rejects an entry outside the integer range, and ignores other invalid values
 - A string-typed adapter configuration key whose value carries another YAML type is rejected with a diagnostic naming the key and the type found, distinct from the absent-key diagnostic, by the earliest surface that reads it: config load for a key the config layer owns, adapter construction and `sortie validate` for a key the adapter owns
 - A static check fails when a tracker, source-control, agent, notifier, or config-layer package gains a new discarded string type assertion outside its allowlisted sites
+- An integer setting outside the integer range is rejected with a diagnostic naming the setting and the range, for a numeral beyond the signed 64-bit range, a numeral beyond the unsigned 64-bit range, and a negative numeral beyond the range in a setting whose non-positive values are otherwise ignored or defaulted; the range test holds at the exact 64-bit boundaries of either sign and, through the conversion parameterized by integer width, at the 32-bit boundaries; an in-range, non-numeric, or fractional value keeps its existing diagnostic
 - Prompt template renders `issue`, `attempt`, and `run`
 - Prompt rendering fails on unknown variables (strict mode)
 

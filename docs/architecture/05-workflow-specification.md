@@ -148,7 +148,7 @@ Fields:
 - `timeout_ms` (integer, optional)
   - Default: `60000`
   - Applies to all workspace hooks.
-  - Non-positive values should be treated as invalid and fall back to the default.
+  - A value outside the range an integer setting accepts, positive or negative, is rejected when the configuration is parsed; other non-positive values should be treated as invalid and fall back to the default.
   - Changes should be re-applied at runtime for future hook executions.
 
 Hook environment variables (minimum set available to all hooks):
@@ -192,7 +192,7 @@ Fields:
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
-  - Invalid entries (non-positive or non-numeric) are ignored.
+  - An entry outside the range an integer setting accepts, positive or negative, is rejected when the configuration is parsed; other invalid entries (non-positive or non-numeric) are ignored.
 - `max_sessions` (integer)
   - Default: `0` (unlimited; no effort budget enforced).
   - Maximum number of completed worker sessions for a single issue before the orchestrator stops re-dispatching it. Counted from `run_history` entries.

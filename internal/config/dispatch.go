@@ -460,7 +460,7 @@ func parsePriorityPredicate(raw any, field string) (*PriorityPredicate, error) {
 			if err != nil {
 				return nil, &ConfigError{
 					Field:   fmt.Sprintf("%s.in[%d]", field, i),
-					Message: fmt.Sprintf("expected integer, got %T", elem),
+					Message: integerFaultMessage(err, fmt.Sprintf("expected integer, got %T", elem)),
 				}
 			}
 			pred.Values = append(pred.Values, n)
@@ -471,7 +471,7 @@ func parsePriorityPredicate(raw any, field string) (*PriorityPredicate, error) {
 	if err != nil {
 		return nil, &ConfigError{
 			Field:   field + "." + opFound,
-			Message: fmt.Sprintf("expected integer, got %T", rawVal),
+			Message: integerFaultMessage(err, fmt.Sprintf("expected integer, got %T", rawVal)),
 		}
 	}
 	pred.Value = n

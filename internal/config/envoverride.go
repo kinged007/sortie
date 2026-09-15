@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -179,7 +180,7 @@ func ensureSubMap(m map[string]any, key string) map[string]any {
 		if v, isMap := existing.(map[string]any); isMap {
 			return v
 		}
-		// Present but wrong type — warn about silent data loss.
+		// Present but wrong type, so warn about silent data loss.
 		if existing != nil {
 			slog.Warn("env override replaced non-map YAML section",
 				slog.String("section", key),
@@ -199,6 +200,9 @@ func coerceEnvInt(s string) (any, error) {
 	trimmed := strings.TrimSpace(s)
 	n, err := strconv.Atoi(trimmed)
 	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return nil, ErrIntegerOutOfRange
+		}
 		return nil, fmt.Errorf("invalid integer value: %s", s)
 	}
 	return n, nil
