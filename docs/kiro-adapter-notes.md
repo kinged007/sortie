@@ -39,17 +39,17 @@ Whether the check fails for every API key or only for keys on some plans is unes
 Token accounting has no source here. The runtime reports an abstract credits figure rather than token counts, so every run is reported unmeasured, token-based budget enforcement is inert, and only the turn timeout and cancellation bound a turn. The protocol route reports credits per turn as a vendor extension on its metadata notifications; that is a cost reading, not a token count, and nothing converts one into the other. The registered `kiro` kind declares `none` arrival and `none` attribution, matching this absence directly.
 
 - protocol turn_disposition: Not observed: not_observed
-- protocol retry_classification: Observed: usable
-- protocol token_ceiling: Observed: usable
+- protocol retry_classification: Not observed: not_observed
+- protocol token_ceiling: Not observed: not_observed
 - protocol tool_server_delivery: Observed: usable
 - protocol session_continuation: Observed: usable
 - protocol permission_handling: Observed: usable
-- native_stream_json turn_disposition: Observed: usable
-- native_stream_json retry_classification: Observed: usable
-- native_stream_json token_ceiling: Observed: usable
-- native_stream_json session_continuation: Observed: usable
+- native_stream_json turn_disposition: Not observed: not_observed
+- native_stream_json retry_classification: Not observed: not_observed
+- native_stream_json token_ceiling: Not observed: not_observed
+- native_stream_json session_continuation: Not observed: not_observed
 
-Three of those rows were graded from this run's own observation: tool-server delivery, permission handling, and session continuation on the protocol surface. Every other row is scaffolded from the profile's declared and catalog-level state rather than induced, and a reader has no other way to tell a measured row from a scaffolded one.
+Three of those rows were graded from this run's own observation: tool-server delivery, permission handling, and session continuation on the protocol surface. Every row no inducer graded reads Not observed: not_observed, so a reader can tell a measured row from an unmeasured one directly off the grade.
 
 Permission handling was measured under the posture that asks, which for this runtime means the same launch with its single trust-and-posture switch taken back out. The runtime raises the request, Sortie's unattended posture refuses it, the refusal is accepted, and nothing is left pending when the turn ends. The consequence for a real run is the one the transport notes already state: under a posture that asks, a declared tool is delivered and still never called.
 
@@ -95,7 +95,24 @@ Windows live qualification is unobserved.
 
 The run behind this file left these semantic cases unobserved:
 
+- native_stream_json retry_classification human_input: not_observed
+- native_stream_json retry_classification non_retryable_refusal: not_observed
+- native_stream_json retry_classification retryable_runtime_or_transport_failure: not_observed
+- native_stream_json retry_classification unknown_outcome: not_observed
+- native_stream_json turn_disposition cancellation: not_observed
+- native_stream_json turn_disposition limit_reached: not_observed
+- native_stream_json turn_disposition runtime_failure: not_observed
+- native_stream_json turn_disposition runtime_refusal: not_observed
+- native_stream_json turn_disposition success: not_observed
+- protocol retry_classification human_input: not_observed
+- protocol retry_classification non_retryable_refusal: not_observed
+- protocol retry_classification retryable_runtime_or_transport_failure: not_observed
+- protocol retry_classification unknown_outcome: not_observed
+- protocol turn_disposition cancellation: not_observed
+- protocol turn_disposition limit_reached: not_observed
+- protocol turn_disposition runtime_failure: not_observed
 - protocol turn_disposition runtime_refusal: not_observed
+- protocol turn_disposition success: not_observed
 
 ## Verifying a change
 

@@ -16,7 +16,8 @@
   "capability_gap_labels": ["token counts"],
   "entry_points": {
     "protocol": {
-      "args": ["--model", "{model}", "--approval-mode", "default", "--policy", "{policy}", "--skip-trust", "--acp"]
+      "args": ["--model", "{model}", "--approval-mode", "yolo", "--skip-trust", "--acp"],
+      "asking_args": ["--model", "{model}", "--approval-mode", "default", "--skip-trust", "--acp"]
     },
     "native_json": {
       "args": ["--model", "{model}", "--approval-mode", "default", "--policy", "{policy}", "--skip-trust", "--output-format", "json", "--prompt", "{prompt}"]

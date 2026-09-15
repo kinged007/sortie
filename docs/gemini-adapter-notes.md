@@ -18,22 +18,22 @@ Token accounting misses spend in two shapes. This runtime never sends the protoc
 
 - protocol turn_disposition: Not observed: not_observed
 - protocol retry_classification: Not observed: not_observed
-- protocol token_ceiling: Observed: gap
+- protocol token_ceiling: Not observed: not_observed
 - protocol tool_server_delivery: Observed: usable
 - protocol session_continuation: Observed: usable
 - protocol permission_handling: Observed: usable
 - native_json turn_disposition: Not observed: not_observed
 - native_json retry_classification: Not observed: not_observed
-- native_json token_ceiling: Observed: gap
-- native_json session_continuation: Observed: usable
+- native_json token_ceiling: Not observed: not_observed
+- native_json session_continuation: Not observed: not_observed
 - native_stream_json turn_disposition: Not observed: not_observed
 - native_stream_json retry_classification: Not observed: not_observed
-- native_stream_json token_ceiling: Observed: gap
-- native_stream_json session_continuation: Observed: usable
+- native_stream_json token_ceiling: Not observed: not_observed
+- native_stream_json session_continuation: Not observed: not_observed
 
 ## Protocol-specific observations
 
-A stop reason of end_turn does not mean the turn ended cleanly. Of the five stop reasons the protocol defines, this runtime's own code produces four: `end_turn`, `max_turn_requests`, `max_tokens`, and `cancelled`. Loop detection reports as `max_turn_requests`. `max_tokens` is reachable only through the runtime's own pre-emptive context-overflow predictor, which fires before the model's stream is actually exhausted; the stream's own genuine token-limit signal never reaches the protocol layer as `max_tokens`, because the handler that catches an invalid stream folds that signal into `end_turn` alongside the model's safety and recitation blocks. `refusal` is never assigned: no code path in this runtime produces it. So a model declining to answer on safety grounds, and a turn that genuinely ran out of context, both surface as an ordinary, successful-looking `end_turn`, and nothing in the response distinguishes either one from a turn that actually completed as asked. The qualification profile's `limit_reached` inducer measures the pre-emptive predictor specifically, driving `max_tokens` with an oversize input; it does not measure the model's own mid-stream token exhaustion, which stays folded into `end_turn` and is unreachable by any inducer here.
+A stop reason of end_turn does not mean the turn ended cleanly. Of the five stop reasons the protocol defines, this runtime's own code produces four: `end_turn`, `max_turn_requests`, `max_tokens`, and `cancelled`. Loop detection reports as `max_turn_requests`. `max_tokens` is reachable only through the runtime's own pre-emptive context-overflow predictor, which fires before the model's stream is actually exhausted; the stream's own genuine token-limit signal never reaches the protocol layer as `max_tokens`, because the handler that catches an invalid stream folds that signal into `end_turn` alongside the model's safety and recitation blocks. `refusal` is never assigned: no code path in this runtime produces it. So a model declining to answer on safety grounds, and a turn that genuinely ran out of context, both surface as an ordinary, successful-looking `end_turn`, and nothing in the response distinguishes either one from a turn that actually completed as asked.
 
 Session continuation replays history, with two traps. Continuing a session is implemented and does work: `session/load` rebuilds the prior conversation and streams it back as genuine `session/update` notifications, one per historical turn. Two things about that replay need care.
 
@@ -55,7 +55,8 @@ Our own teardown outruns a graceful exit. For a local launch, Sortie's own teard
 
 ## Excluded capability cases
 
-none
+- retry_classification non_retryable_refusal: declared outcome_never_produced
+- turn_disposition runtime_refusal: declared outcome_never_produced
 
 ## Unobserved surfaces
 
@@ -63,14 +64,24 @@ Windows live qualification is unobserved.
 
 The run behind this file left these semantic cases unobserved:
 
-- protocol turn_disposition runtime_failure: not_observed
-- protocol retry_classification human_input: not_observed
-- native_json turn_disposition runtime_failure: not_observed
-- native_json turn_disposition cancellation: not_observed
-- native_json retry_classification retryable_runtime_or_transport_failure: not_observed
 - native_json retry_classification human_input: not_observed
-- native_stream_json turn_disposition runtime_failure: not_observed
-- native_stream_json turn_disposition cancellation: not_observed
-- native_stream_json turn_disposition limit_reached: runtime_failed
-- native_stream_json retry_classification retryable_runtime_or_transport_failure: not_observed
+- native_json retry_classification retryable_runtime_or_transport_failure: not_observed
+- native_json retry_classification unknown_outcome: not_observed
+- native_json turn_disposition cancellation: not_observed
+- native_json turn_disposition limit_reached: not_observed
+- native_json turn_disposition runtime_failure: not_observed
+- native_json turn_disposition success: not_observed
 - native_stream_json retry_classification human_input: not_observed
+- native_stream_json retry_classification retryable_runtime_or_transport_failure: not_observed
+- native_stream_json retry_classification unknown_outcome: not_observed
+- native_stream_json turn_disposition cancellation: not_observed
+- native_stream_json turn_disposition limit_reached: not_observed
+- native_stream_json turn_disposition runtime_failure: not_observed
+- native_stream_json turn_disposition success: not_observed
+- protocol retry_classification human_input: not_observed
+- protocol retry_classification retryable_runtime_or_transport_failure: not_observed
+- protocol retry_classification unknown_outcome: not_observed
+- protocol turn_disposition cancellation: not_observed
+- protocol turn_disposition limit_reached: not_observed
+- protocol turn_disposition runtime_failure: not_observed
+- protocol turn_disposition success: not_observed

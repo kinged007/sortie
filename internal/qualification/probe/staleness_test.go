@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,11 +25,9 @@ const stalenessExamplesDir = "../../../examples"
 
 // stalenessGradeSatisfies is the per-surface satisfying grade set: a
 // grade this transport can assign without an observation MUST NOT be a
-// member. gap is excluded because this transport sets token_ceiling to
-// gap at record construction for every runtime; not_inducible and
-// declared_gap are excluded because they are catalog- or
-// operator-asserted, never observed.
-var stalenessGradeSatisfies = []qualification.Grade{qualification.GradeUsable, qualification.GradeCorroborationOnly}
+// member. not_inducible and declared_gap are excluded because they are
+// catalog- or operator-asserted, never observed.
+var stalenessGradeSatisfies = []qualification.Grade{qualification.GradeUsable, qualification.GradeGap, qualification.GradeCorroborationOnly}
 
 // stalenessProfilePaths enumerates the tracked profiles directory
 // through a filesystem read, failing t when it yields none.
@@ -51,27 +50,128 @@ func stalenessProfilePaths(t *testing.T) []string {
 	return paths
 }
 
-// checkProfileMeasured fails t unless every surface in
-// profile.MeasuredSurfaces() carries at least one grade row satisfying
-// stalenessGradeSatisfies in measurement's expectation grades.
-func checkProfileMeasured(t *testing.T, profilePath string, profile qualification.RuntimeProfile, measurement qualification.Measurement) {
-	t.Helper()
+// measuredSurfaceProblems reports every problem the offline gate finds
+// in measurement against profile: the protocol surface must carry at
+// least one grade row satisfying stalenessGradeSatisfies, since that
+// is the only surface this transport's own inducers grade, and every
+// other measured surface must carry at least one grade row at all. It
+// is pure, so a negative control can drive it without failing the
+// package run.
+func measuredSurfaceProblems(profile qualification.RuntimeProfile, measurement qualification.Measurement) []string {
+	var problems []string
 	for _, surface := range profile.MeasuredSurfaces() {
-		satisfied := false
 		var seen []qualification.Grade
 		for _, grade := range measurement.Expectation.Grades {
-			if grade.Surface != surface {
-				continue
+			if grade.Surface == surface {
+				seen = append(seen, grade.Grade)
 			}
-			seen = append(seen, grade.Grade)
-			if slices.Contains(stalenessGradeSatisfies, grade.Grade) {
+		}
+		if surface != qualification.SurfaceProtocol {
+			if len(seen) == 0 {
+				problems = append(problems, fmt.Sprintf("surface %s carries no grade row", surface))
+			}
+			continue
+		}
+		satisfied := false
+		for _, grade := range seen {
+			if slices.Contains(stalenessGradeSatisfies, grade) {
 				satisfied = true
+				break
 			}
 		}
 		if !satisfied {
-			t.Errorf("%s: surface %s carries no grade row satisfying %v, only %v", profilePath, surface, stalenessGradeSatisfies, seen)
+			problems = append(problems, fmt.Sprintf("surface %s carries no grade row satisfying %v, only %v", surface, stalenessGradeSatisfies, seen))
 		}
 	}
+	return problems
+}
+
+// measuredSurfaceProblemsProfile builds a RuntimeProfile whose
+// MeasuredSurfaces is exactly protocol, native_json, and
+// native_stream_json, so measuredSurfaceProblems' own surface walk
+// runs over a known, closed set.
+func measuredSurfaceProblemsProfile() qualification.RuntimeProfile {
+	return qualification.RuntimeProfile{
+		EntryPoints: map[qualification.Surface]qualification.EntryPoint{
+			qualification.SurfaceProtocol:         {},
+			qualification.SurfaceNativeJSON:       {},
+			qualification.SurfaceNativeStreamJSON: {},
+		},
+	}
+}
+
+// TestMeasuredSurfaceProblems confirms measuredSurfaceProblems' three
+// outcomes: a protocol row satisfying stalenessGradeSatisfies alongside
+// native rows that merely exist reports no problem, a protocol surface
+// with no satisfying row reports a problem naming it, and a measured
+// native surface carrying no grade row at all reports a problem naming
+// it.
+func TestMeasuredSurfaceProblems(t *testing.T) {
+	t.Parallel()
+
+	profile := measuredSurfaceProblemsProfile()
+
+	t.Run("a gap protocol row and not_observed native rows report no problem", func(t *testing.T) {
+		t.Parallel()
+
+		measurement := qualification.Measurement{
+			Expectation: qualification.NotesExpectation{
+				Grades: []qualification.NotesGrade{
+					{Surface: qualification.SurfaceProtocol, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeGap},
+					{Surface: qualification.SurfaceNativeJSON, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+					{Surface: qualification.SurfaceNativeStreamJSON, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+				},
+			},
+		}
+
+		if problems := measuredSurfaceProblems(profile, measurement); len(problems) != 0 {
+			t.Errorf("measuredSurfaceProblems(...) = %v, want none", problems)
+		}
+	})
+
+	t.Run("every protocol row not_observed reports a problem naming protocol", func(t *testing.T) {
+		t.Parallel()
+
+		measurement := qualification.Measurement{
+			Expectation: qualification.NotesExpectation{
+				Grades: []qualification.NotesGrade{
+					{Surface: qualification.SurfaceProtocol, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+					{Surface: qualification.SurfaceProtocol, Capability: qualification.CapabilityRetryClassification, Grade: qualification.GradeNotObserved},
+					{Surface: qualification.SurfaceNativeJSON, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+					{Surface: qualification.SurfaceNativeStreamJSON, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+				},
+			},
+		}
+
+		problems := measuredSurfaceProblems(profile, measurement)
+		if len(problems) != 1 {
+			t.Fatalf("measuredSurfaceProblems(...) = %v, want exactly one problem", problems)
+		}
+		if !strings.Contains(problems[0], string(qualification.SurfaceProtocol)) {
+			t.Errorf("measuredSurfaceProblems(...) = %q, want it to name %q", problems[0], qualification.SurfaceProtocol)
+		}
+	})
+
+	t.Run("a measured native surface with no grade row reports a problem naming it", func(t *testing.T) {
+		t.Parallel()
+
+		measurement := qualification.Measurement{
+			Expectation: qualification.NotesExpectation{
+				Grades: []qualification.NotesGrade{
+					{Surface: qualification.SurfaceProtocol, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeUsable},
+					{Surface: qualification.SurfaceNativeStreamJSON, Capability: qualification.CapabilityTurnDisposition, Grade: qualification.GradeNotObserved},
+				},
+			},
+		}
+
+		problems := measuredSurfaceProblems(profile, measurement)
+		if len(problems) != 1 {
+			t.Fatalf("measuredSurfaceProblems(...) = %v, want exactly one problem", problems)
+		}
+		if !strings.Contains(problems[0], string(qualification.SurfaceNativeJSON)) {
+			t.Errorf("measuredSurfaceProblems(...) = %q, want it to name %q", problems[0], qualification.SurfaceNativeJSON)
+		}
+	})
 }
 
 // checkPublishedSampleOwnership fails t unless exactly one profile
@@ -125,10 +225,10 @@ func isAgentClientProtocolSample(t *testing.T, path string) bool {
 // TestStaleness implements the offline staleness gate: every tracked
 // runtime profile decodes cleanly, its notes and measurement artifact
 // are readable and agree with it, its verdict is not not_qualified,
-// every surface it measures carries at least one observed grade row,
-// and every published agent-client-protocol WORKFLOW.*.md sample is
-// named by exactly one profile's published_sample. It runs in every
-// ordinary go test pass and costs nothing: editing a tracked profile,
+// every surface it measures satisfies measuredSurfaceProblems, and
+// every published agent-client-protocol WORKFLOW.*.md sample is named
+// by exactly one profile's published_sample. It runs in every ordinary
+// go test pass and costs nothing: editing a tracked profile,
 // measurement, notes document, or published route sample without a
 // fresh, digest-bound measurement keeps this test red.
 func TestStaleness(t *testing.T) {
@@ -167,7 +267,9 @@ func TestStaleness(t *testing.T) {
 			t.Errorf("%s: measurement verdict is not_qualified", profilePath)
 		}
 
-		checkProfileMeasured(t, profilePath, profile, measurement)
+		for _, problem := range measuredSurfaceProblems(profile, measurement) {
+			t.Errorf("%s: %s", profilePath, problem)
+		}
 	}
 
 	sampleEntries, err := os.ReadDir(stalenessExamplesDir)

@@ -365,29 +365,15 @@ func Run(t *testing.T, coords Coordinates) Result {
 		corroborateAbsentSurface(t, coords, absent.Surface)
 	}
 
-	// The full per-case semantic induction catalog (cancellation,
-	// refusal, oversize-input limit_reached) is not reproduced here;
-	// this collection scaffolds a schema-valid evidence set from the
-	// declared and catalog-level state the profile itself carries for
-	// those cases, and grades each measured surface's own launch
-	// classification. The three load-bearing rows below are graded
-	// from this run's own observation instead: tool-server delivery,
-	// permission handling, and session continuation.
-	fixture := qualification.NewFixture(qualification.FixtureUnmeasured, profile.AbsentSurfaces...)
-	for _, declaration := range profile.Declarations {
-		fixture.SetSemanticDeclaredGap(declaration.Capability, declaration.Case, declaration.Reason)
-	}
-
 	toolGrade, toolDetail := induceToolServerCall(t, coords)
-	fixture.SetToolServerDelivery(toolGrade, toolDetail)
-
 	permissionGrade, permissionDetail := inducePermissionRequest(t, coords)
-	fixture.SetPermissionHandling(permissionGrade, permissionDetail)
-
 	continuationGrade, continuationDetail := induceSessionContinuation(t, coords)
-	fixture.SetSessionContinuation(qualification.SurfaceProtocol, continuationGrade, continuationDetail)
 
-	fixture.Finalize()
+	fixture := gradedEvidence(profile,
+		inducedRow{grade: toolGrade, detail: toolDetail},
+		inducedRow{grade: permissionGrade, detail: permissionDetail},
+		inducedRow{grade: continuationGrade, detail: continuationDetail},
+	)
 
 	verdict, err := qualification.ValidateObservationsWithDeclarations(qualification.WriteEvidenceFile(t, fixture.Records), profile)
 	if err != nil {

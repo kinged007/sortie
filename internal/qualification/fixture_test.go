@@ -288,6 +288,36 @@ func TestFixtureSetSessionContinuation(t *testing.T) {
 	}
 }
 
+// TestFixtureSetSessionContinuationUsableReadsRecallsOwnPriorSessionID
+// confirms the usable arm's SessionID comes from the recall record's
+// own current prior_session_id rather than a freshly recomputed
+// FixtureSession(surface, "seed") constant: after a caller rewrites
+// PriorSessionID away from that constant, a usable call must carry the
+// rewritten value forward.
+func TestFixtureSetSessionContinuationUsableReadsRecallsOwnPriorSessionID(t *testing.T) {
+	t.Parallel()
+
+	rewrittenPriorSession := "sess-protocol-resumed-from-elsewhere"
+
+	fixture := NewFixture(FixtureQualified)
+	recall := fixture.FindFirst(MatchContinuation(SurfaceProtocol, InputContinuationRecall))
+	if recall == nil {
+		t.Fatal("no continuation recall record for protocol")
+	}
+	recall.PriorSessionID = new(rewrittenPriorSession)
+
+	fixture.SetSessionContinuation(SurfaceProtocol, GradeUsable, "replay observed against the live second session")
+
+	got := fixture.FindFirst(MatchContinuation(SurfaceProtocol, InputContinuationRecall))
+	if got == nil {
+		t.Fatal("no continuation recall record for protocol after SetSessionContinuation")
+	}
+	if !NullableEqual(got.SessionID, &rewrittenPriorSession) {
+		t.Errorf("SetSessionContinuation(protocol, usable, ...) recall.SessionID = %s, want the recall's own prior_session_id %q",
+			continuationRecordDetail(got.SessionID), rewrittenPriorSession)
+	}
+}
+
 // matchPolicyPrecondition matches the single addPolicyPrecondition
 // record, mirroring matchPermission's and matchToolServer's shape for
 // a seeded record with no exported constructor of its own.
@@ -295,5 +325,236 @@ func matchPolicyPrecondition() func(*Record) bool {
 	return func(rec *Record) bool {
 		return rec.Scenario == ScenarioPolicyPrecondition && rec.Surface == SurfaceAggregate &&
 			rec.Capability == CapabilityPermissionHandling
+	}
+}
+
+// declaredGapAbsentSets is the four absent-surface combinations this
+// file's controls range over: none, each native surface alone, and
+// both.
+func declaredGapAbsentSets() []struct {
+	name   string
+	absent []AbsentSurface
+} {
+	return []struct {
+		name   string
+		absent []AbsentSurface
+	}{
+		{name: "no absent surface"},
+		{name: "native_json absent", absent: []AbsentSurface{{Surface: SurfaceNativeJSON, Reason: SurfaceNotOffered}}},
+		{name: "native_stream_json absent", absent: []AbsentSurface{{Surface: SurfaceNativeStreamJSON, Reason: SurfaceNotOffered}}},
+		{name: "both native surfaces absent", absent: []AbsentSurface{
+			{Surface: SurfaceNativeJSON, Reason: SurfaceNotOffered},
+			{Surface: SurfaceNativeStreamJSON, Reason: SurfaceNotOffered},
+		}},
+	}
+}
+
+// semanticTuple names one capability-case pair a declaration rewrites.
+type semanticTuple struct {
+	Capability Capability
+	Case       Case
+}
+
+// declaredGapRewrittenTuples returns the capability-case pair
+// SetSemanticDeclaredGap(capability, caseID, ...) rewrites directly,
+// plus its DeclaredGapPeers closure pair when one exists.
+func declaredGapRewrittenTuples(capability Capability, caseID Case) []semanticTuple {
+	tuples := []semanticTuple{{Capability: capability, Case: caseID}}
+	if peer, ok := DeclaredGapPeers[caseID]; ok {
+		tuples = append(tuples, semanticTuple{Capability: capabilityOwning(peer), Case: peer})
+	}
+	return tuples
+}
+
+// TestFixtureSetSemanticDeclaredGapMatchesQualifiedFixture confirms
+// that for every capability and case, and every absent-surface set, a
+// FixtureNotObserved fixture and a FixtureQualified fixture built with
+// the same absent set rewrite equal records under RecordsEqual for the
+// same SetSemanticDeclaredGap call, and that the not-observed
+// fixture, finalized, still validates against its own declarations:
+// the declared_gap record it writes carries the same session_id and
+// evidence_path a qualified fixture's own record already carries,
+// whatever the record held before the rewrite.
+func TestFixtureSetSemanticDeclaredGapMatchesQualifiedFixture(t *testing.T) {
+	t.Parallel()
+
+	capabilities := []Capability{CapabilityTurnDisposition, CapabilityRetryClassification}
+
+	for _, absentSet := range declaredGapAbsentSets() {
+		t.Run(absentSet.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, capability := range capabilities {
+				for _, caseID := range CapabilityCases[capability] {
+					t.Run(string(capability)+"/"+string(caseID), func(t *testing.T) {
+						t.Parallel()
+
+						const reason = DeclaredGapNeverProduced
+
+						notObserved := NewFixture(FixtureNotObserved, absentSet.absent...)
+						qualified := NewFixture(FixtureQualified, absentSet.absent...)
+						notObserved.SetSemanticDeclaredGap(capability, caseID, reason)
+						qualified.SetSemanticDeclaredGap(capability, caseID, reason)
+
+						declarable := intersectSurfaces(DeclarableSurfaces, notObserved.measured())
+						for _, surface := range declarable {
+							for _, tuple := range declaredGapRewrittenTuples(capability, caseID) {
+								gotNotObserved := notObserved.FindFirst(MatchSemantic(surface, tuple.Capability, tuple.Case))
+								gotQualified := qualified.FindFirst(MatchSemantic(surface, tuple.Capability, tuple.Case))
+								if gotNotObserved == nil || gotQualified == nil {
+									t.Fatalf("MatchSemantic(%s, %s, %s) found not_observed=%v qualified=%v, want both present", surface, tuple.Capability, tuple.Case, gotNotObserved, gotQualified)
+								}
+								if !RecordsEqual(*gotNotObserved, *gotQualified) {
+									t.Errorf("SetSemanticDeclaredGap(%s, %s, ...) on %s: not_observed record = %+v, want equal to the FixtureQualified record %+v", tuple.Capability, tuple.Case, surface, *gotNotObserved, *gotQualified)
+								}
+							}
+						}
+
+						notObserved.Finalize()
+						path := WriteEvidenceFile(t, notObserved.Records)
+						if _, err := ValidateObservationsWithDeclarations(path, notObserved.Declarations()); err != nil {
+							t.Errorf("ValidateObservationsWithDeclarations(...) error = %v, want nil", err)
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
+// continuationRecordDetail formats a pointer field for a failure
+// message, rendering a nil pointer as the literal text "nil" rather
+// than its address.
+func continuationRecordDetail(p *string) string {
+	if p == nil {
+		return "nil"
+	}
+	return *p
+}
+
+// assertContinuationRow fails t unless fixture's continuation baseline,
+// recall, and seed records for surface match SetSessionContinuation's
+// own closed per-grade table for grade and detail.
+func assertContinuationRow(t *testing.T, fixture *Fixture, surface Surface, grade Grade, detail string) {
+	t.Helper()
+
+	wantOutcome := BaselineVerdictFor(grade)
+
+	baseline := fixture.FindFirst(MatchBaseline(surface, CapabilitySessionContinuation))
+	if baseline == nil {
+		t.Fatalf("no session_continuation baseline record for %s", surface)
+	}
+	if baseline.Grade != grade || baseline.Outcome != wantOutcome || baseline.Detail != boundDetail(detail) {
+		t.Errorf("baseline for %s = %+v, want grade=%s outcome=%s detail=%q", surface, *baseline, grade, wantOutcome, boundDetail(detail))
+	}
+
+	recall := fixture.FindFirst(MatchContinuation(surface, InputContinuationRecall))
+	if recall == nil {
+		t.Fatalf("no continuation recall record for %s", surface)
+	}
+	seedSession := FixtureSession(surface, "seed")
+	fallbackSession := FixtureSession(surface, "recall-fallback")
+	var wantRecallDetail string
+	var wantRecallSessionID *string
+	switch grade {
+	case GradeUsable:
+		wantRecallDetail = RecallConfirmedSameSession
+		wantRecallSessionID = &seedSession
+	case GradeGap:
+		wantRecallDetail = RecallFreshFallback
+		wantRecallSessionID = &fallbackSession
+	case GradeNotObserved:
+		wantRecallDetail = RecallUnobservedActual
+	}
+	if recall.Grade != grade || recall.Outcome != wantOutcome || recall.Detail != wantRecallDetail {
+		t.Errorf("recall for %s = %+v, want grade=%s outcome=%s detail=%q", surface, *recall, grade, wantOutcome, wantRecallDetail)
+	}
+	if !NullableEqual(recall.SessionID, wantRecallSessionID) {
+		t.Errorf("recall for %s SessionID = %s, want %s", surface, continuationRecordDetail(recall.SessionID), continuationRecordDetail(wantRecallSessionID))
+	}
+
+	seed := fixture.FindFirst(MatchContinuation(surface, InputContinuationSeed))
+	if seed == nil {
+		t.Fatalf("no continuation seed record for %s", surface)
+	}
+	wantSeedGrade, wantSeedOutcome, wantSeedDetail := GradeUsable, OutcomePass, "seed session completed a turn that left history"
+	if grade == GradeNotObserved {
+		wantSeedGrade, wantSeedOutcome, wantSeedDetail = GradeNotObserved, OutcomeNotObserved, notObservedDetail(RowContinuationSeed)
+	}
+	if seed.Grade != wantSeedGrade || seed.Outcome != wantSeedOutcome || seed.Detail != wantSeedDetail {
+		t.Errorf("seed for %s = %+v, want grade=%s outcome=%s detail=%q", surface, *seed, wantSeedGrade, wantSeedOutcome, wantSeedDetail)
+	}
+}
+
+// TestFixtureSetSessionContinuationIsOrderIndependent confirms that
+// for every variant, every measured surface, and every ordered pair of
+// grades drawn from usable, gap, and not_observed, calling
+// SetSessionContinuation twice in a row, once with the first grade and
+// once with the second, leaves the baseline, recall, and seed records
+// equal under RecordsEqual to a single call with the second grade on a
+// fresh fixture of the same variant: what one call writes depends only
+// on the surface, the grade, and the detail it was given, never on
+// what an earlier call to the same setter wrote.
+func TestFixtureSetSessionContinuationIsOrderIndependent(t *testing.T) {
+	t.Parallel()
+
+	variants := []string{FixtureQualified, FixtureNotQualified, FixtureUnmeasured, FixtureDeclaredGap, FixtureNotObserved}
+	grades := []Grade{GradeUsable, GradeGap, GradeNotObserved}
+
+	for _, variant := range variants {
+		t.Run(variant, func(t *testing.T) {
+			t.Parallel()
+
+			for _, surface := range measuredSurfaces(RuntimeProfile{}) {
+				t.Run(string(surface), func(t *testing.T) {
+					t.Parallel()
+
+					for _, g1 := range grades {
+						for _, g2 := range grades {
+							t.Run(string(g1)+"_then_"+string(g2), func(t *testing.T) {
+								t.Parallel()
+
+								const firstDetail = "first replay observation"
+								const secondDetail = "second replay observation"
+
+								twoCalls := NewFixture(variant)
+								twoCalls.SetSessionContinuation(surface, g1, firstDetail)
+								twoCalls.SetSessionContinuation(surface, g2, secondDetail)
+
+								oneCall := NewFixture(variant)
+								oneCall.SetSessionContinuation(surface, g2, secondDetail)
+
+								rows := []struct {
+									name  string
+									match func(*Record) bool
+								}{
+									{"baseline", MatchBaseline(surface, CapabilitySessionContinuation)},
+									{"recall", MatchContinuation(surface, InputContinuationRecall)},
+									{"seed", MatchContinuation(surface, InputContinuationSeed)},
+								}
+								for _, row := range rows {
+									gotTwoCalls := twoCalls.FindFirst(row.match)
+									gotOneCall := oneCall.FindFirst(row.match)
+									if gotTwoCalls == nil || gotOneCall == nil {
+										t.Fatalf("%s record missing (two calls=%v, one call=%v)", row.name, gotTwoCalls, gotOneCall)
+									}
+									if !RecordsEqual(*gotTwoCalls, *gotOneCall) {
+										t.Errorf("SetSessionContinuation(%s, %s, ...) preceded by a %s call: %s record = %+v, want equal to a fresh fixture's single call %+v", surface, g2, g1, row.name, *gotTwoCalls, *gotOneCall)
+									}
+								}
+
+								assertContinuationRow(t, oneCall, surface, g2, secondDetail)
+
+								oneCall.Finalize()
+								path := WriteEvidenceFile(t, oneCall.Records)
+								if _, err := ValidateObservationsWithDeclarations(path, oneCall.Declarations()); err != nil {
+									t.Errorf("ValidateObservationsWithDeclarations(...) error = %v, want nil", err)
+								}
+							})
+						}
+					}
+				})
+			}
+		})
 	}
 }

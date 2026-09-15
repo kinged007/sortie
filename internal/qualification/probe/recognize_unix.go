@@ -20,10 +20,7 @@ var errNativeBoundExceeded = errors.New("the native probe exceeded its bounded w
 
 // lineBoundedWriter accumulates newline-delimited lines up to limit
 // bytes each, dropping any single line that exceeds it instead of
-// retaining it, and counting the lines it dropped. A stream-json
-// treatment run echoes its filler payload as one line that can reach
-// several megabytes; without this bound that echo would be retained
-// for the whole classification.
+// retaining it, and counting the lines it dropped.
 type lineBoundedWriter struct {
 	limit      int
 	pending    []byte

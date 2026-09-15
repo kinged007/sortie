@@ -21,6 +21,7 @@ const (
 	FixtureNotQualified = "not_qualified"
 	FixtureUnmeasured   = "unmeasured"
 	FixtureDeclaredGap  = "declared_gap"
+	FixtureNotObserved  = "not_observed"
 )
 
 // FixtureSession builds the synthetic session identifier for one
@@ -36,7 +37,10 @@ func FixtureSession(Surface Surface, name string) string {
 // so it is measured and below rather than unmeasured; the unmeasured
 // variant leaves the protocol runtime-refusal disposition Case
 // unobserved; the declared_gap variant excludes that same Case and its
-// peer on every declarable Surface under an operator declaration.
+// peer on every declarable Surface under an operator declaration; the
+// not_observed variant carries every record at grade and outcome
+// not_observed, so a collector can compose it with only the rows its
+// own inducers actually graded.
 type Fixture struct {
 	Records []Record
 
@@ -49,6 +53,12 @@ type Fixture struct {
 	// absent is the set of surfaces this fixture was built to declare
 	// absent, so its records never cover them.
 	absent []AbsentSurface
+
+	// variant is the constructor variant this fixture was built from,
+	// so Finalize and AppendIdentity can choose the not-observed
+	// runtime-identity record NewFixture(FixtureNotObserved, ...)
+	// requires over the qualified one every other variant adds.
+	variant string
 }
 
 // NewFixture builds the non-final records of one variant in canonical
@@ -58,7 +68,20 @@ type Fixture struct {
 // the protocol surface alone. The runtime-identity records are added
 // by Finalize.
 func NewFixture(variant string, absent ...AbsentSurface) *Fixture {
-	f := &Fixture{absent: slices.Clone(absent)}
+	f := &Fixture{absent: slices.Clone(absent), variant: variant}
+	if variant == FixtureNotObserved {
+		f.addWorkspaceSecurityNotObserved()
+		f.addPolicyPreconditionNotObserved()
+		f.addSemanticProbesNotObserved()
+		f.addBaselinesNotObserved()
+		f.addTokenInventoriesNotObserved()
+		f.addPermissionNotObserved()
+		f.addToolServerNotObserved()
+		f.addContinuationNotObserved()
+		f.addEndToEndNotObserved()
+		f.addProcessCleanupNotObserved()
+		return f
+	}
 	f.addWorkspaceSecurity()
 	f.addPolicyPrecondition()
 	f.addSemanticProbes()
@@ -126,10 +149,21 @@ func (f *Fixture) Finalize() {
 	}
 	slices.Sort(ids)
 	for _, id := range ids {
-		f.Add(IdentityFixtureRecord(id))
+		f.Add(f.identityRecord(id))
 	}
 	slices.SortStableFunc(f.Records, OrderCompare)
 	f.Renumber()
+}
+
+// identityRecord builds one runtime-identity record for SessionID,
+// choosing the not-observed shape on a fixture built from
+// FixtureNotObserved and IdentityFixtureRecord's qualified shape on
+// every other variant.
+func (f *Fixture) identityRecord(SessionID string) Record {
+	if f.variant == FixtureNotObserved {
+		return identityFixtureRecordNotObserved(SessionID)
+	}
+	return IdentityFixtureRecord(SessionID)
 }
 
 // Renumber assigns one-based contiguous Sequence numbers in slice order.
@@ -226,9 +260,12 @@ func (f *Fixture) setSemanticDeclaredGapOne(capability Capability, caseID Case, 
 		if rec == nil {
 			continue
 		}
+		sessionID, evidencePath := semanticIdentity(surface, caseID)
 		rec.Outcome = OutcomeNotProducible
 		rec.Grade = GradeDeclaredGap
 		rec.Detail = reason
+		rec.SessionID = new(sessionID)
+		rec.EvidencePath = new(evidencePath)
 	}
 	f.recordDeclaration(capability, caseID, reason)
 	for _, surface := range declarable {
@@ -327,34 +364,45 @@ func (f *Fixture) semanticRecord(Surface Surface, Capability Capability, caseID 
 	switch Surface {
 	case SurfaceProtocol:
 		rec.Source = SourceProtocolStable
-		rec.EvidencePath = new("/turn/stop_reason")
 		rec.AgentName = new(FixtureAgentName)
 		rec.AgentVersion = new(FixtureAgentVer)
 		rec.ProtocolVersion = new(1)
 	default:
 		rec.Source = SourceNativeStructured
-		if Surface == SurfaceNativeJSON {
-			rec.EvidencePath = new("/response/terminal")
-		} else {
-			rec.EvidencePath = new("/stream/terminal")
-		}
 		rec.AgentVersion = new(FixtureAgentVer)
 	}
-
-	switch {
-	case caseID == CaseRuntimeRefusal:
-		rec.SessionID = new(FixtureSession(Surface, "runtime-refusal"))
-	case caseID == CaseNonRetryableRefusal:
-		rec.SessionID = new(FixtureSession(Surface, "runtime-refusal"))
-	case caseID == CaseHumanInput && Surface == SurfaceProtocol:
-		rec.SessionID = new(FixtureSession(Surface, "permission"))
-	case caseID == CaseHumanInput:
-		rec.SessionID = new(FixtureSession(Surface, "human-input"))
-	default:
-		rec.SessionID = new(FixtureSession(Surface, string(caseID)))
-	}
+	sessionID, evidencePath := semanticIdentity(Surface, caseID)
+	rec.SessionID = new(sessionID)
+	rec.EvidencePath = new(evidencePath)
 	rec.Detail = fmt.Sprintf("%s %s Case completed with a distinct Outcome on %s", Capability, caseID, Surface)
 	return rec
+}
+
+// semanticIdentity returns the session_id and evidence_path
+// semanticRecord assigns for one Surface-case tuple, factored into one
+// definition so SetSemanticDeclaredGap can restore exactly what
+// semanticRecord would have assigned, whatever a rewritten record
+// carried before.
+func semanticIdentity(Surface Surface, caseID Case) (sessionID, evidencePath string) {
+	switch {
+	case caseID == CaseRuntimeRefusal, caseID == CaseNonRetryableRefusal:
+		sessionID = FixtureSession(Surface, "runtime-refusal")
+	case caseID == CaseHumanInput && Surface == SurfaceProtocol:
+		sessionID = FixtureSession(Surface, "permission")
+	case caseID == CaseHumanInput:
+		sessionID = FixtureSession(Surface, "human-input")
+	default:
+		sessionID = FixtureSession(Surface, string(caseID))
+	}
+	switch Surface {
+	case SurfaceProtocol:
+		evidencePath = "/turn/stop_reason"
+	case SurfaceNativeJSON:
+		evidencePath = "/response/terminal"
+	default:
+		evidencePath = "/stream/terminal"
+	}
+	return sessionID, evidencePath
 }
 
 // BaselineVerdictFor returns the Outcome a derived baseline Record
@@ -571,6 +619,233 @@ func (f *Fixture) addProcessCleanup() {
 	f.Add(rec)
 }
 
+// notObservedDetail renders the label rule NewFixture(FixtureNotObserved,
+// ...) assigns every row outside the ones with their own closed detail
+// vocabulary (semantic probes and continuation recalls).
+func notObservedDetail(class RowClass) string {
+	return rowLabel(class) + " was not observed"
+}
+
+// addWorkspaceSecurityNotObserved adds the not-observed workspace
+// security Record.
+func (f *Fixture) addWorkspaceSecurityNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioWorkspaceSecurity
+	rec.Surface = SurfaceAggregate
+	rec.Capability = CapabilityWorkspaceSecurity
+	rec.Source = SourceProcessObservation
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputSecurity
+	rec.EvidencePath = new("/workspace/settings")
+	rec.Detail = notObservedDetail(RowWorkspaceSecurity)
+	f.Add(rec)
+}
+
+// addPolicyPreconditionNotObserved adds the not-observed policy
+// precondition Record, referencing the protocol control session.
+func (f *Fixture) addPolicyPreconditionNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioPolicyPrecondition
+	rec.Surface = SurfaceAggregate
+	rec.Capability = CapabilityPermissionHandling
+	rec.Source = SourceProcessObservation
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputPolicyControl
+	rec.EvidencePath = new("policy.deny_marker")
+	rec.SessionID = new(FixtureSession(SurfaceProtocol, "policy"))
+	rec.AgentVersion = new(FixtureAgentVer)
+	rec.Detail = notObservedDetail(RowPolicyPrecondition)
+	f.Add(rec)
+}
+
+// addSemanticProbesNotObserved adds all not-observed semantic records
+// in canonical order, built from semanticRecord so every field this
+// row class leaves unchanged (source, input_id, agent fields, protocol
+// version) tracks the qualified variant's own value.
+func (f *Fixture) addSemanticProbesNotObserved() {
+	for _, Surface := range f.measured() {
+		for _, Capability := range []Capability{CapabilityTurnDisposition, CapabilityRetryClassification} {
+			for _, caseID := range CapabilityCases[Capability] {
+				rec := f.semanticRecord(Surface, Capability, caseID)
+				rec.Grade = GradeNotObserved
+				rec.Outcome = OutcomeNotObserved
+				rec.SessionID = nil
+				rec.EvidencePath = nil
+				rec.Detail = fmt.Sprintf("%s %s Case was not observed on %s", Capability, caseID, Surface)
+				f.Add(rec)
+			}
+		}
+	}
+}
+
+// addBaselinesNotObserved adds the not-observed per-Surface Capability
+// summaries. The detail keeps the qualified variant's own wording: it
+// already describes the derivation, not an outcome.
+func (f *Fixture) addBaselinesNotObserved() {
+	for _, Surface := range f.measured() {
+		for _, Capability := range comparisonCapabilities {
+			rec := f.base()
+			rec.Scenario = ScenarioSurfaceBaseline
+			rec.Surface = Surface
+			rec.Capability = Capability
+			rec.Source = SourceComparison
+			rec.InputID = InputBaseline
+			rec.EvidencePath = new(fmt.Sprintf("/comparison/%s/%s", Surface, Capability))
+			rec.Detail = fmt.Sprintf("derived %s Grade for %s", Capability, Surface)
+			rec.Grade = GradeNotObserved
+			rec.Outcome = OutcomeNotObserved
+			f.Add(rec)
+		}
+	}
+}
+
+// addTokenInventoriesNotObserved adds one not-observed token sentinel
+// per measured Surface: a not-observed fixture never fabricates a
+// token-bearing path.
+func (f *Fixture) addTokenInventoriesNotObserved() {
+	for _, Surface := range f.measured() {
+		rec := f.base()
+		rec.Scenario = ScenarioTokenSource
+		rec.Surface = Surface
+		rec.Capability = CapabilityTokenCeiling
+		rec.Source = SourceNone
+		rec.Grade = GradeNotObserved
+		rec.Outcome = OutcomeNotObserved
+		rec.InputID = InputTokenInventory
+		rec.Detail = notObservedDetail(RowToken)
+		f.Add(rec)
+	}
+}
+
+// addPermissionNotObserved adds the not-observed protocol permission
+// Record.
+func (f *Fixture) addPermissionNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioPermissionRequest
+	rec.Surface = SurfaceProtocol
+	rec.Capability = CapabilityPermissionHandling
+	rec.Source = SourceProtocolStable
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputPermissionProbe
+	rec.EvidencePath = new("session/request_permission")
+	rec.SessionID = new(FixtureSession(SurfaceProtocol, "permission"))
+	rec.AgentName = new(FixtureAgentName)
+	rec.AgentVersion = new(FixtureAgentVer)
+	rec.ProtocolVersion = new(1)
+	rec.Detail = notObservedDetail(RowPermission)
+	f.Add(rec)
+}
+
+// addToolServerNotObserved adds the not-observed protocol MCP delivery
+// Record.
+func (f *Fixture) addToolServerNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioToolServer
+	rec.Surface = SurfaceProtocol
+	rec.Capability = CapabilityToolServerDelivery
+	rec.Source = SourceProcessObservation
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputMCPProbe
+	rec.EvidencePath = new("mcp_server.receipt")
+	rec.SessionID = new(FixtureSession(SurfaceProtocol, "mcp"))
+	rec.AgentName = new(FixtureAgentName)
+	rec.AgentVersion = new(FixtureAgentVer)
+	rec.ProtocolVersion = new(1)
+	rec.Detail = notObservedDetail(RowMCPDelivery)
+	f.Add(rec)
+}
+
+// addContinuationNotObserved adds one not-observed seed and one
+// not-observed recall per measured Surface, the recall's
+// prior_session_id resolving to that Surface's own seed session so
+// checkContinuationRelations is satisfied from construction.
+func (f *Fixture) addContinuationNotObserved() {
+	for _, Surface := range f.measured() {
+		seedSession := FixtureSession(Surface, "seed")
+
+		seed := f.base()
+		seed.Scenario = ScenarioContinuation
+		seed.Surface = Surface
+		seed.Capability = CapabilitySessionContinuation
+		seed.InputID = InputContinuationSeed
+		seed.Grade = GradeNotObserved
+		seed.Outcome = OutcomeNotObserved
+		seed.Source = SourceNativeStructured
+		if Surface == SurfaceProtocol {
+			seed.Source = SourceProtocolStable
+			seed.AgentName = new(FixtureAgentName)
+			seed.AgentVersion = new(FixtureAgentVer)
+			seed.ProtocolVersion = new(1)
+		} else {
+			seed.AgentVersion = new(FixtureAgentVer)
+		}
+		seed.EvidencePath = new("/continuation/seed")
+		seed.SessionID = new(seedSession)
+		seed.Detail = notObservedDetail(RowContinuationSeed)
+		f.Add(seed)
+
+		recall := f.base()
+		recall.Scenario = ScenarioContinuation
+		recall.Surface = Surface
+		recall.Capability = CapabilitySessionContinuation
+		recall.InputID = InputContinuationRecall
+		recall.Grade = GradeNotObserved
+		recall.Outcome = OutcomeNotObserved
+		recall.Source = seed.Source
+		recall.EvidencePath = new("/continuation/recall")
+		recall.PriorSessionID = new(seedSession)
+		recall.Detail = RecallUnobservedActual
+		if Surface == SurfaceProtocol {
+			recall.AgentName = new(FixtureAgentName)
+			recall.AgentVersion = new(FixtureAgentVer)
+			recall.ProtocolVersion = new(1)
+		} else {
+			recall.AgentVersion = new(FixtureAgentVer)
+		}
+		f.Add(recall)
+	}
+}
+
+// addEndToEndNotObserved adds the not-observed isolated end-to-end
+// Record.
+func (f *Fixture) addEndToEndNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioEndToEnd
+	rec.Surface = SurfaceProtocol
+	rec.Capability = CapabilityTurnDisposition
+	rec.Source = SourceProcessObservation
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputE2E
+	rec.EvidencePath = new("/run_history/status")
+	rec.SessionID = new(FixtureSession(SurfaceProtocol, "e2e"))
+	rec.AgentName = new(FixtureAgentName)
+	rec.AgentVersion = new(FixtureAgentVer)
+	rec.ProtocolVersion = new(1)
+	rec.Detail = notObservedDetail(RowEndToEnd)
+	f.Add(rec)
+}
+
+// addProcessCleanupNotObserved adds the not-observed aggregate cleanup
+// Record.
+func (f *Fixture) addProcessCleanupNotObserved() {
+	rec := f.base()
+	rec.Scenario = ScenarioProcessCleanup
+	rec.Surface = SurfaceAggregate
+	rec.Capability = CapabilityProcessCleanup
+	rec.Source = SourceProcessObservation
+	rec.Grade = GradeNotObserved
+	rec.Outcome = OutcomeNotObserved
+	rec.InputID = InputCleanup
+	rec.EvidencePath = new("process_group.liveness")
+	rec.Detail = notObservedDetail(RowProcessCleanup)
+	f.Add(rec)
+}
+
 // MatchSemantic matches one semantic tuple.
 func MatchSemantic(Surface Surface, Capability Capability, caseID Case) func(*Record) bool {
 	return func(rec *Record) bool {
@@ -665,6 +940,31 @@ func IdentityFixtureRecord(SessionID string) Record {
 		AgentVersion:    new(FixtureAgentVer),
 		ProtocolVersion: new(1),
 		Detail:          "handshake reported agent name and version",
+	}
+}
+
+// identityFixtureRecordNotObserved builds one not-observed
+// runtime-identity record for one actual protocol session: the id is
+// inferred from another record's own reference, but the handshake
+// that would confirm the agent's name and version was not observed.
+func identityFixtureRecordNotObserved(SessionID string) Record {
+	return Record{
+		SchemaVersion:   1,
+		Sequence:        0,
+		ObservedAt:      FixtureTime,
+		Scenario:        ScenarioRuntimeIdentity,
+		Surface:         SurfaceProtocol,
+		Capability:      CapabilityRuntimeIdentity,
+		Source:          SourceProtocolStable,
+		Grade:           GradeNotObserved,
+		Outcome:         OutcomeNotObserved,
+		InputID:         InputIdentity,
+		EvidencePath:    new("/handshake/agent_info"),
+		SessionID:       new(SessionID),
+		AgentName:       new(FixtureAgentName),
+		AgentVersion:    new(FixtureAgentVer),
+		ProtocolVersion: new(1),
+		Detail:          notObservedDetail(RowRuntimeIdentity),
 	}
 }
 
@@ -802,34 +1102,55 @@ func (f *Fixture) SetPermissionHandling(grade Grade, detail string) {
 }
 
 // SetSessionContinuation rewrites surface's session-continuation
-// baseline and recall Records to grade, following a live replay
+// baseline, recall, and seed Records to grade, following a live replay
 // observation. The baseline carries detail, bounded by DetailBound; the
 // recall Record instead carries the closed detail token
 // checkRecallRecord requires for grade, since a recall Record's detail
-// is not free text. Once grade is not GradeUsable, the recall no longer
-// reads RecallConfirmedSameSession.
+// is not free text. The seed reads usable whenever a turn was observed
+// to complete (grade usable or gap) and not_observed only when nothing
+// was observed at all: the setter receives the surface grade alone, so
+// that is the finest distinction it can draw. Any grade outside usable,
+// gap, and not_observed leaves every record unchanged. What one call
+// writes depends only on surface, grade, and detail, never on what an
+// earlier call to this setter wrote.
 func (f *Fixture) SetSessionContinuation(surface Surface, grade Grade, detail string) {
+	if grade != GradeUsable && grade != GradeGap && grade != GradeNotObserved {
+		return
+	}
+	outcome := BaselineVerdictFor(grade)
+
 	if baseline := f.FindFirst(MatchBaseline(surface, CapabilitySessionContinuation)); baseline != nil {
 		baseline.Grade = grade
 		baseline.Detail = boundDetail(detail)
-		baseline.Outcome = BaselineVerdictFor(grade)
+		baseline.Outcome = outcome
 	}
 
-	recall := f.FindFirst(MatchContinuation(surface, InputContinuationRecall))
-	if recall == nil {
-		return
+	if recall := f.FindFirst(MatchContinuation(surface, InputContinuationRecall)); recall != nil {
+		recall.Grade = grade
+		recall.Outcome = outcome
+		switch grade {
+		case GradeUsable:
+			recall.Detail = RecallConfirmedSameSession
+			recall.SessionID = new(*recall.PriorSessionID)
+		case GradeGap:
+			recall.Detail = RecallFreshFallback
+			recall.SessionID = new(FixtureSession(surface, "recall-fallback"))
+		case GradeNotObserved:
+			recall.Detail = RecallUnobservedActual
+			recall.SessionID = nil
+		}
 	}
-	recall.Grade = grade
-	recall.Outcome = BaselineVerdictFor(grade)
-	switch grade {
-	case GradeUsable:
-		recall.Detail = RecallConfirmedSameSession
-	case GradeGap:
-		recall.Detail = RecallFreshFallback
-		recall.SessionID = new(FixtureSession(surface, "recall-fallback"))
-	case GradeNotObserved:
-		recall.Detail = RecallUnobservedActual
-		recall.SessionID = nil
+
+	if seed := f.FindFirst(MatchContinuation(surface, InputContinuationSeed)); seed != nil {
+		if grade == GradeNotObserved {
+			seed.Grade = GradeNotObserved
+			seed.Outcome = OutcomeNotObserved
+			seed.Detail = notObservedDetail(RowContinuationSeed)
+		} else {
+			seed.Grade = GradeUsable
+			seed.Outcome = OutcomePass
+			seed.Detail = "seed session completed a turn that left history"
+		}
 	}
 }
 
@@ -864,7 +1185,7 @@ func (f *Fixture) DuplicateAfter(target *Record) {
 // canonical position. Controls that introduce a new actual protocol
 // session id after Finalize call this to keep the identity set complete.
 func (f *Fixture) AppendIdentity(SessionID string) {
-	f.Add(IdentityFixtureRecord(SessionID))
+	f.Add(f.identityRecord(SessionID))
 	slices.SortStableFunc(f.Records, OrderCompare)
 	f.Renumber()
 }
