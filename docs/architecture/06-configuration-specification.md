@@ -55,6 +55,7 @@ Validation checks:
 
 - Workflow file can be loaded and parsed.
 - A `tracker`, `agent`, `ci_feedback` or `notifications` key the config layer reads as a string, together with `db_path`, is rejected when its value carries another YAML type, distinct from the diagnostic for an absent key. This verdict is identical at startup, at `sortie validate`, and on the reload fail-safe path, because all three read the same config-construction result. The `workspace.root`, hook-script and reaction-escalation keys are not covered: a wrong-typed value there still reads as the empty string.
+- An integer setting whose value lies outside the range an integer holds on the running build (-9223372036854775808 to 9223372036854775807 on every 64-bit target), whether written as a numeral, as a quoted numeral, or through a `SORTIE_*` override, is rejected with a diagnostic naming the setting and that range, and never reaches the setting's own value checks as a different number. A setting the config layer reads reports this at startup, at `sortie validate`, and on the reload fail-safe path; a reaction setting reports it at startup and at `sortie validate`; `server.port` reports it at startup. A block the config layer does not read reports nothing.
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution, when required by the selected tracker adapter.
 - `tracker.project` is present when required by the selected tracker adapter.
