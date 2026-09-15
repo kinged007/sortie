@@ -75,9 +75,10 @@ type ForkPerTurnHooks struct {
 	GetSessionID func() string
 
 	// OnFinalize determines the final TurnResult and error from the
-	// subprocess exit state. The skeleton calls OnFinalize only after the
-	// subprocess has exited following the scan loop; every abnormal
-	// ending is handled entirely by the skeleton.
+	// subprocess exit state. The skeleton calls OnFinalize after the
+	// subprocess has exited following the scan loop, for every ending it
+	// has not already classified as a stdout scan error, a cancellation,
+	// exit code 127, or a signal, so a non-zero exit code reaches it.
 	//
 	// emit is the per-turn event callback passed to RunTurn. OnFinalize
 	// MUST use this to emit the terminal event (EventTurnCompleted or
@@ -485,8 +486,7 @@ loop:
 		}
 	}
 
-	// The remaining success paths are delegated to OnFinalize. The
-	// explicit nil check prevents a typed-nil *domain.AgentError from
+	// The explicit nil check prevents a typed-nil *domain.AgentError from
 	// becoming a non-nil error interface on the success path. The
 	// skeleton calls EmitWarnLines when agentErr is non-nil, so
 	// OnFinalize must not call it.
