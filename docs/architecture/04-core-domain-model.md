@@ -115,6 +115,7 @@ Fields:
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
+  - The worker counts each turn as it starts, self-review turns included, whichever agent events the session emits.
 
 #### 4.1.7 Retry Entry
 
