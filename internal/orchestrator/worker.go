@@ -133,8 +133,9 @@ type WorkerResult struct {
 
 	// TurnsStarted is the number of turns the worker began, counted as
 	// each one starts rather than when it returns, so a turn that
-	// errored or was cancelled still counts. A reader deciding whether
-	// the session ever ran needs this rather than TurnsCompleted.
+	// errored or was cancelled still counts. Self-review turns count
+	// too. A reader deciding whether the session ever ran needs this
+	// rather than TurnsCompleted.
 	TurnsStarted int
 
 	// SessionID is the adapter-assigned session identifier. Empty if
@@ -352,6 +353,11 @@ type WorkerDeps struct {
 	// Called exactly once, as the last action before the goroutine
 	// returns. Must be safe for concurrent use.
 	OnExit func(issueID string, result WorkerResult)
+
+	// OnTurnStarted reports turnsStarted, the new turn included, before
+	// each coding or self-review turn runs. Called from the worker
+	// goroutine; must be safe for concurrent use. Nil disables it.
+	OnTurnStarted func(issueID string, turnsStarted int)
 
 	// ResumeSessionID is the session ID from a previous worker attempt
 	// for the same issue. Non-empty on continuation retries so the
@@ -1146,6 +1152,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 
 		logger.Info("turn started", slog.Int("turn_number", turnNumber), slog.Int("max_turns", maxTurns))
 		turnsStarted++
+		if deps.OnTurnStarted != nil {
+			deps.OnTurnStarted(issue.ID, turnsStarted)
+		}
 
 		if turnNumber == 1 {
 			localMeasured = false
@@ -1386,7 +1395,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				foldRelayedEvent(event)
 				deps.OnEvent(issueID, event)
 			},
-			OnProgress:     deps.OnProgress,
+			OnProgress: deps.OnProgress,
+			OnTurnStarted: func() {
+				turnsStarted++
+				if deps.OnTurnStarted != nil {
+					deps.OnTurnStarted(issue.ID, turnsStarted)
+				}
+			},
 			Logger:         logger,
 			Metrics:        deps.Metrics,
 			TurnsCompleted: &turnsCompleted,
@@ -1497,6 +1512,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		Identifier:                   issue.Identifier,
 		ExitKind:                     WorkerExitNormal,
 		TurnsCompleted:               turnsCompleted,
+		TurnsStarted:                 turnsStarted,
 		SessionID:                    session.ID,
 		WorkspacePath:                wsResult.Path,
 		HandoffEvidencePolicy:        handoffEvidencePolicy,

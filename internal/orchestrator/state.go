@@ -185,7 +185,7 @@ type RunningEntry struct {
 	StartedAt time.Time
 
 	// TurnCount is the number of coding-agent turns started within the
-	// current worker lifetime.
+	// current worker lifetime, self-review turns included.
 	TurnCount int
 
 	// CancelFunc cancels the per-worker context created by [DispatchIssue].
@@ -508,7 +508,7 @@ func ReactionKey(issueID, kind string) string {
 // PendingReaction records that an issue needs external signal
 // reconciliation. Created by worker exit handlers or external event
 // receivers. Consumed by per-kind reconcile functions during the
-// reconcile tick. Runtime-only (not persisted to SQLite — cross-restart
+// reconcile tick. Runtime-only (not persisted to SQLite; cross-restart
 // deduplication uses reaction_fingerprints).
 type PendingReaction struct {
 	// IssueID is the domain issue ID.
@@ -963,7 +963,7 @@ type State struct {
 	RetryAttempts map[string]*RetryEntry
 
 	// Completed is a set of issue IDs that have completed at least once.
-	// Bookkeeping only — not used for dispatch gating.
+	// Bookkeeping only, not used for dispatch gating.
 	Completed map[string]struct{}
 
 	// BudgetExhausted maps issue ID to the runtime view of one issue
@@ -1285,10 +1285,7 @@ func ActiveElapsedSeconds(state *State, now time.Time) float64 {
 // Only an arrival that reports during the turn can produce one, and
 // then only once a figure has arrived or while no turn has begun: a
 // session past its first turn with nothing counted measured nothing,
-// whatever its declaration promised. turnCount is compared against
-// zero and nothing else, because a kind emitting the session-started
-// event once per session rather than once per turn undercounts it;
-// every kind emits it at least once, at its first turn.
+// whatever its declaration promised.
 func apiRequestsMeasured(arrival registry.UsageArrival, turnCount, apiRequestCount int) bool {
 	if !arrival.ReportsDuringTurn() {
 		return false
@@ -1306,7 +1303,7 @@ func apiRequestsMeasured(arrival registry.UsageArrival, turnCount, apiRequestCou
 // test callers pass a fixed time for deterministic assertions.
 //
 // The returned result contains copied-out data for Running, Retrying,
-// and AgentTotals — callers may serialize or retain those fields without
+// and AgentTotals; callers may serialize or retain those fields without
 // synchronization concerns.
 //
 // RateLimits is shallow-copied from State.AgentRateLimits.Data and may

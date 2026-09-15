@@ -483,13 +483,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	if sessionID == "" {
 		sessionID = entry.SessionID
 	}
-	// The worker's own turn tally is taken alongside the entry's,
-	// because the entry's is fed by the agent event channel, which a
-	// full agentEventCh can drop a session_started event from: that
-	// would otherwise leave the count at zero and let a session that
-	// really ran be stored as a measured zero. The started tally is
-	// the one to take, because a turn that errored or was cancelled
-	// still means the session ran.
+	// The entry lags the worker's tally when the worker context ends
+	// before a turn-started message is delivered, and a turn that
+	// errored or was cancelled still means the session ran.
 	turnsSeen := max(entry.TurnCount, workerResult.TurnsStarted)
 
 	// An unmeasured count is stored as zero so a reader of the database

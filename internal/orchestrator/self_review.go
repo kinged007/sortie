@@ -31,13 +31,17 @@ type selfReviewProgressMsg struct {
 
 // RunSelfReviewParams captures all inputs for runSelfReviewLoop.
 type RunSelfReviewParams struct {
-	Session        domain.Session
-	Issue          domain.Issue
-	WorkspacePath  string
-	Config         config.SelfReviewConfig
-	AgentAdapter   domain.AgentAdapter
-	OnEvent        func(issueID string, event domain.AgentEvent)
-	OnProgress     func(selfReviewProgressMsg)
+	Session       domain.Session
+	Issue         domain.Issue
+	WorkspacePath string
+	Config        config.SelfReviewConfig
+	AgentAdapter  domain.AgentAdapter
+	OnEvent       func(issueID string, event domain.AgentEvent)
+	OnProgress    func(selfReviewProgressMsg)
+	// OnTurnStarted, when non-nil, is called on the worker goroutine
+	// before each review and fix turn.
+	OnTurnStarted func()
+
 	Logger         *slog.Logger
 	Metrics        domain.Metrics
 	TurnsCompleted *int
@@ -538,6 +542,9 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 			)
 		}
 
+		if params.OnTurnStarted != nil {
+			params.OnTurnStarted()
+		}
 		_, turnErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
 			Prompt: reviewPrompt,
 			Issue:  params.Issue,
@@ -645,6 +652,9 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 		fixPrompt := buildFixPrompt(verdict, parseErr, i, maxIter)
 
+		if params.OnTurnStarted != nil {
+			params.OnTurnStarted()
+		}
 		_, fixErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
 			Prompt: fixPrompt,
 			Issue:  params.Issue,

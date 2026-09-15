@@ -75,14 +75,7 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		entry.AgentPID = event.AgentPID
 	}
 
-	// Increment TurnCount on session_started — the signal that a new
-	// turn has begun. claude-code and copilot-cli emit session_started
-	// once per turn (a fresh subprocess or fork per turn); codex and
-	// opencode emit it once per session, on the first turn only, so
-	// TurnCount undercounts the true turn count for those two kinds.
 	if event.Type == domain.EventSessionStarted {
-		entry.TurnCount++
-
 		// Overwrite the session ID when the event carries a non-empty
 		// session ID. Claude Code spawns a fresh subprocess per turn,
 		// so the active session ID changes.
@@ -104,7 +97,7 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 	}
 
 	// Increment the tool call completion counter for tool_result events
-	// with a known tool name. Empty ToolName is a defensive guard —
+	// with a known tool name. Empty ToolName is a defensive guard;
 	// well-behaved adapters always populate it.
 	if event.Type == domain.EventToolResult && event.ToolName != "" {
 		outcome := outcomeSuccess
@@ -163,10 +156,7 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 
 			// A turn_end kind settles at most one figure per turn; more
 			// than one within the current turn contradicts that
-			// declaration. The comparison is scoped to the turn via the
-			// per-turn baseline, not via TurnCount, which undercounts for
-			// a kind emitting session_started once per session rather
-			// than once per turn.
+			// declaration.
 			if entry.UsageArrival == registry.UsageArrivalTurnEnd &&
 				entry.APIRequestCount-entry.APIRequestCountAtLastTurnEnd > 1 {
 				log.Debug("turn_end arrival reported more than one usage figure within a turn",
