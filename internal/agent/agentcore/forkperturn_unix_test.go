@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -103,11 +105,27 @@ func selfSignalScenario(_ []string, _ json.RawMessage) int {
 	return 0
 }
 
+// overflowOnTerminateScenario writes one line, catches the graceful
+// termination signal, and only then writes an unterminated line one byte
+// longer than the stdout scanner accepts, so the scan fails after the turn's
+// context is already done. The scanner reads exactly its limit before it
+// fails, so the last byte fits in the pipe, the write completes, and the
+// runtime exits on its own well inside the stop grace.
+func overflowOnTerminateScenario(_ []string, _ json.RawMessage) int {
+	terminate := make(chan os.Signal, 1)
+	signal.Notify(terminate, syscall.SIGTERM)
+	fmt.Println(`{"type":"notification"}`)
+	<-terminate
+	fmt.Print(strings.Repeat("x", procutil.DefaultScannerMaxSize+1))
+	return 0
+}
+
 func init() {
 	scenarios["pgidLeader"] = agenttest.Typed(pgidLeaderScenario)
 	scenarios["escapedPgidLeader"] = agenttest.Typed(escapedPgidLeaderScenario)
 	scenarios["stderrOnlyLeader"] = agenttest.Typed(stderrOnlyLeaderScenario)
 	scenarios["selfSignal"] = selfSignalScenario
+	scenarios["overflowOnTerminate"] = overflowOnTerminateScenario
 }
 
 // writePgidScript builds a leader fake runtime that spawns a long-running
@@ -215,21 +233,72 @@ func assertPgidProcessDead(t *testing.T, pid int, timeout time.Duration) {
 
 // TestForkPerTurnSession_Arm5_ExternalSIGTERM verifies that a subprocess
 // killed by an external signal it never asked for is classified through
-// procutil.WasSignaled as a cancelled turn, not a plain non-zero exit.
+// procutil.WasSignaled as a cancelled turn, not a plain non-zero exit, and
+// that the turn carries the session's usage snapshot and measurement
+// verdict through that classification.
 func TestForkPerTurnSession_Arm5_ExternalSIGTERM(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	script := agenttest.FakeRuntime(t, tmpDir, "agent", "selfSignal", nil)
-	target := newTestTarget(tmpDir, script)
-	sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	emit, events := sinkEvents()
-	_, err := sess.RunTurn(context.Background(), "p", emit)
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", "selfSignal", nil)
+			target := newTestTarget(tmpDir, script)
 
-	requireAgentError(t, err, domain.ErrTurnCancelled)
-	if !hasEventType(*events, domain.EventTurnCancelled) {
-		t.Errorf("EventTurnCancelled not emitted; got %v", *events)
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			emit, events := sinkEvents()
+			result, err := sess.RunTurn(context.Background(), "p", emit)
+
+			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnCancelled, domain.ErrTurnCancelled, measured, *calls)
+		})
+	}
+}
+
+// TestForkPerTurnSession_UsageVerdict_ScanErrorAfterCancel verifies that a
+// stdout scan that fails after the turn's context is cancelled reports a
+// cancelled turn carrying the session's usage snapshot and measurement
+// verdict.
+func TestForkPerTurnSession_UsageVerdict_ScanErrorAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", "overflowOnTerminate", nil)
+			target := newTestTarget(tmpDir, script)
+
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			hooks.ParseLine = parseLineEmitSessionStartedOnce()
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			result, events, err := runWithSessionStartCancel(t, sess)
+
+			assertUsageVerdictCarried(t, result, err, events, domain.EventTurnCancelled, domain.ErrTurnCancelled, measured, *calls)
+		})
 	}
 }
 

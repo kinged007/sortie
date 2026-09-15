@@ -1564,6 +1564,85 @@ func TestRunTurn_SessionStateRecovery_JournalGoneNextTurn(t *testing.T) {
 	}
 }
 
+// TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn drives two turns on
+// one local session whose COPILOT_HOME holds a captured session.shutdown
+// record: the first turn recovers a usage figure from the journal and
+// measures the run, and the second turn is cancelled via context before it
+// completes. It asserts the second turn's UsageMeasured stays true, its
+// Usage equals the first turn's, and no token_usage event fires on the
+// cancelled turn.
+func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
+	// No t.Parallel(): t.Setenv is incompatible with it.
+	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+	copilotHome := t.TempDir()
+	t.Setenv("COPILOT_HOME", copilotHome)
+
+	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
+	fixture := loadTestFixture(t, "session_shutdown.jsonl")
+	lines := strings.Split(strings.TrimRight(fixture, "\n"), "\n")
+	if len(lines) < 1 {
+		t.Fatalf("session_shutdown.jsonl has %d lines, want at least 1", len(lines))
+	}
+	writeJournal(t, journalPath(copilotHome, sessionID), lines[0]+"\n")
+
+	adapter, session := newTestSession(t, t.TempDir())
+	state := session.Internal.(*sessionState)
+	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), 0)
+
+	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "read main.go",
+		OnEvent: func(domain.AgentEvent) {},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn(first) error = %v", err)
+	}
+	if !result1.UsageMeasured {
+		t.Fatal("RunTurn(first).UsageMeasured = false, want true")
+	}
+	if result1.Usage == (domain.TokenUsage{}) {
+		t.Fatal("RunTurn(first).Usage is zero, want non-zero")
+	}
+
+	state.target.Command = agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{Hang: true})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var events2 []domain.AgentEvent
+	var result2 domain.TurnResult
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		result2, runErr = adapter.RunTurn(ctx, session, domain.RunTurnParams{
+			Prompt: "read main.go",
+			OnEvent: func(e domain.AgentEvent) {
+				events2 = append(events2, e)
+				if e.Type == domain.EventSessionStarted {
+					cancel()
+				}
+			},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunTurn(second) did not return within 10s")
+	}
+
+	requireAgentError(t, runErr, domain.ErrTurnCancelled)
+	if !result2.UsageMeasured {
+		t.Error("RunTurn(second).UsageMeasured = false, want true (measured on the first turn)")
+	}
+	if result2.Usage != result1.Usage {
+		t.Errorf("RunTurn(second).Usage = %+v, want %+v (equal to the first turn's)", result2.Usage, result1.Usage)
+	}
+	for _, e := range events2 {
+		if e.Type == domain.EventTokenUsage {
+			t.Errorf("RunTurn(second) emitted a token_usage event %+v, want none", e)
+		}
+	}
+}
+
 // TestRunTurn_SessionStateRecovery_Degradation drives
 // sessionState.recoverUsage directly (bypassing the subprocess) to
 // exercise the three read-skipping conditions: an absent events file,
