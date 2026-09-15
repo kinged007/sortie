@@ -1379,6 +1379,250 @@ func TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues(t *testing.T) {
 	})
 }
 
+// TestApplyTurnStarted verifies that applyTurnStarted sets TurnCount only for a running issue.
+func TestApplyTurnStarted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sets TurnCount for a present entry", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 4, 0, nil, AgentTotals{})
+		state.Running["A"] = &RunningEntry{Identifier: "A-ident", TurnCount: 2}
+		o := &Orchestrator{state: state}
+
+		o.applyTurnStarted(turnStartedMsg{IssueID: "A", TurnsStarted: 7})
+
+		if got := state.Running["A"].TurnCount; got != 7 {
+			t.Errorf("TurnCount = %d, want 7", got)
+		}
+	})
+
+	t.Run("is a no-op for an absent entry", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 4, 0, nil, AgentTotals{})
+		o := &Orchestrator{state: state}
+
+		o.applyTurnStarted(turnStartedMsg{IssueID: "missing", TurnsStarted: 3})
+
+		if len(state.Running) != 0 {
+			t.Errorf("state.Running = %v, want empty", state.Running)
+		}
+	})
+}
+
+// TestOrchestrator_TurnStartedAppliesAheadOfExit verifies that a
+// turn-started message queued before a worker's exit reaches that run's
+// entry, and never a later run of the same issue.
+func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("applyQueuedAheadOfExit (Orchestrator.Run's workerExitCh path)", func(t *testing.T) {
+		t.Parallel()
+
+		issueID := "ISSUE-TURN-ORDER-RUN"
+		state := NewState(60000, 4, 0, nil, AgentTotals{})
+		state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+		entry := state.Running[issueID]
+
+		store := &stubStore{}
+		tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+		o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+		o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 5}
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:      issueID,
+			Identifier:   entry.Identifier,
+			ExitKind:     WorkerExitNormal,
+			TurnsStarted: 5,
+		})
+
+		if _, stillRunning := state.Running[issueID]; stillRunning {
+			t.Fatal("state.Running still holds the exited issue, want it removed")
+		}
+		if entry.TurnCount != 5 {
+			t.Errorf("entry.TurnCount = %d, want 5 (applied before HandleWorkerExit removed the entry)", entry.TurnCount)
+		}
+
+		state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+		o.applyQueuedAheadOfExit(context.Background(), map[string]struct{}{})
+		if got := state.Running[issueID].TurnCount; got != 0 {
+			t.Errorf("a later entry's TurnCount = %d, want 0 (no stray message left queued)", got)
+		}
+	})
+
+	t.Run("workerExitCh case of drainRunningWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		// The drain's own turnStartedCh case wins the random select about
+		// half the time, so a single trial cannot catch a missing drain.
+		const trials = 64
+
+		for trial := range trials {
+			issueID := fmt.Sprintf("ISSUE-TURN-ORDER-DRAIN-%d", trial)
+			state := NewState(60000, 4, 0, nil, AgentTotals{})
+			state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+			entry := state.Running[issueID]
+
+			store := &stubStore{}
+			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+			o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 9}
+			o.workerExitCh <- WorkerResult{
+				IssueID:      issueID,
+				Identifier:   entry.Identifier,
+				ExitKind:     WorkerExitNormal,
+				TurnsStarted: 9,
+			}
+
+			done := make(chan struct{})
+			go func() {
+				o.drainRunningWorkers()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("trial %d: drainRunningWorkers did not return within 10 seconds", trial)
+			}
+
+			if entry.TurnCount != 9 {
+				t.Fatalf("trial %d: entry.TurnCount = %d, want 9 (applied before the drain's HandleWorkerExit removed the entry)", trial, entry.TurnCount)
+			}
+		}
+	})
+}
+
+// waitForTurnCount polls snapshots until issueID reports want, failing on
+// a larger value or at the deadline. Run applies turn-started messages
+// asynchronously to snapshot requests, so a single read can race ahead.
+func waitForTurnCount(t *testing.T, snapshot func() (RuntimeSnapshotResult, error), issueID string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snap, err := snapshot()
+		if err != nil {
+			t.Fatalf("snapshot(): %v", err)
+		}
+		idx := slices.IndexFunc(snap.Running, func(e SnapshotRunningEntry) bool { return e.IssueID == issueID })
+		if idx < 0 {
+			t.Fatalf("snapshot has no running entry for %q", issueID)
+		}
+		got := snap.Running[idx].TurnCount
+		if got == want {
+			return
+		}
+		if got > want {
+			t.Fatalf("TurnCount = %d, want %d (observed ahead of releasing this turn)", got, want)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TurnCount did not reach %d within the deadline, last observed %d", want, got)
+		}
+	}
+}
+
+// TestOrchestrator_TurnCountTracksWorkerTally verifies that a live
+// snapshot reports TurnCount k while turn k runs, whatever the adapter's
+// session_started pattern.
+func TestOrchestrator_TurnCountTracksWorkerTally(t *testing.T) {
+	t.Parallel()
+
+	const wantTurns = 3
+
+	patterns := []struct {
+		name  string
+		emits func(int) bool
+	}{
+		{"session_started every turn", emitsSessionStartedEveryTurn},
+		{"session_started first turn only", emitsSessionStartedFirstTurnOnly},
+		{"session_started never", emitsSessionStartedNever},
+	}
+
+	for _, pattern := range patterns {
+		t.Run(pattern.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			cfg := defaultWorkerConfig(tmpDir)
+			cfg.Agent.MaxTurns = wantTurns
+			// Keeps a second tick from reconciling mid-test.
+			cfg.Polling.IntervalMS = 3_600_000
+			wm := &stubWorkflowManager{config: cfg, template: mustParseTemplate(t, "{{ .issue.title }}")}
+
+			issue := workerTestIssue()
+			state := NewState(cfg.Polling.IntervalMS, 4, 0, nil, AgentTotals{})
+			state.Running[issue.ID] = &RunningEntry{
+				Identifier: issue.Identifier,
+				Issue:      issue,
+				DispatchID: issue.ID + "-dispatch",
+				StartedAt:  time.Now().UTC(),
+				CancelFunc: func() {},
+			}
+
+			adapter := &turnEmissionAdapter{
+				emits:   pattern.emits,
+				entered: make(chan int),
+				release: make(chan struct{}),
+			}
+
+			regs := passingPreflightRegistries()
+			regs.ReloadWorkflow = func() error { return nil }
+			regs.ConfigFunc = wm.Config
+
+			o := NewOrchestrator(OrchestratorParams{
+				State:           state,
+				Logger:          discardLogger(),
+				TrackerAdapter:  &mockTrackerAdapter{},
+				AgentAdapter:    adapter,
+				WorkflowManager: wm,
+				Store:           &stubStore{},
+				PreflightParams: regs,
+			})
+
+			// Built before Run, whose first tick writes
+			// o.sshStrictHostKeyChecking concurrently.
+			wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			runDone := make(chan struct{})
+			go func() {
+				o.Run(ctx)
+				close(runDone)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				<-runDone
+			})
+
+			workerDone := make(chan struct{})
+			go func() {
+				wfn(ctx, issue, nil)
+				close(workerDone)
+			}()
+
+			snapshot := o.SnapshotFunc()
+			for k := 1; k <= wantTurns; k++ {
+				turn := <-adapter.entered
+				if turn != k {
+					t.Fatalf("adapter entered turn %d, want %d", turn, k)
+				}
+				waitForTurnCount(t, snapshot, issue.ID, k)
+				adapter.release <- struct{}{}
+			}
+
+			select {
+			case <-workerDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("worker did not exit within 10 seconds")
+			}
+		})
+	}
+}
+
 func TestMakeWorkerFn(t *testing.T) {
 	t.Parallel()
 

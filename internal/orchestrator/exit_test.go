@@ -9900,11 +9900,9 @@ func TestHandleWorkerExit_DeclaredRunSeedsReactionsReleasedOnTerminalReconcile(t
 	}
 }
 
-// TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally covers the
-// entry whose session_started event a full agentEventCh dropped. The
-// entry's turn count reads zero, which alone would store a session
-// that really ran as a measured zero; the worker's own tally is what
-// prevents it.
+// TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally verifies that a
+// session whose entry never received a turn count is judged by the
+// worker's tally rather than stored as a measured zero.
 func TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally(t *testing.T) {
 	t.Parallel()
 
@@ -9912,7 +9910,6 @@ func TestHandleWorkerExit_RequestVerdictUsesWorkerTurnTally(t *testing.T) {
 	state := exitState(t, "ISSUE-REQV3", nil)
 	entry := state.Running["ISSUE-REQV3"]
 	entry.UsageArrival = registry.UsageArrivalIncremental
-	// Nothing from the event channel reached this entry.
 	entry.TurnCount = 0
 	entry.APIRequestCount = 0
 

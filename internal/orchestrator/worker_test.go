@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -125,6 +126,63 @@ func (m *mockAgentAdapter) StopSession(ctx context.Context, session domain.Sessi
 	}
 	return nil
 }
+
+// turnEmissionAdapter completes every turn, emitting session_started on
+// the turns emits selects. When set, beforeRunTurn and entered receive
+// the turn number as RunTurn begins, and release holds the turn open.
+type turnEmissionAdapter struct {
+	emits         func(turn int) bool
+	beforeRunTurn func(turn int)
+	entered       chan int
+	release       chan struct{}
+	turn          int
+}
+
+var _ domain.AgentAdapter = (*turnEmissionAdapter)(nil)
+
+func (a *turnEmissionAdapter) StartSession(_ context.Context, _ domain.StartSessionParams) (domain.Session, error) {
+	return domain.Session{ID: "sess-1"}, nil
+}
+
+func (a *turnEmissionAdapter) StopSession(_ context.Context, _ domain.Session) error {
+	return nil
+}
+
+func (a *turnEmissionAdapter) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+	a.turn++
+	turn := a.turn
+	if a.beforeRunTurn != nil {
+		a.beforeRunTurn(turn)
+	}
+	if a.entered != nil {
+		a.entered <- turn
+	}
+	if a.release != nil {
+		select {
+		case <-a.release:
+		case <-ctx.Done():
+			// Lets cleanup free a turn that a failed test never released.
+			return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCancelled}, ctx.Err()
+		}
+	}
+	if a.emits(turn) && params.OnEvent != nil {
+		params.OnEvent(domain.AgentEvent{
+			Type:      domain.EventSessionStarted,
+			SessionID: session.ID,
+			Timestamp: time.Now().UTC(),
+		})
+	}
+	return domain.TurnResult{
+		SessionID:  session.ID,
+		ExitReason: domain.EventTurnCompleted,
+	}, nil
+}
+
+func emitsSessionStartedEveryTurn(int) bool { return true }
+
+func emitsSessionStartedFirstTurnOnly(turn int) bool { return turn == 1 }
+
+func emitsSessionStartedNever(int) bool { return false }
 
 // transitionIssueCall records a single invocation of TransitionIssue.
 type transitionIssueCall struct {
@@ -8538,4 +8596,300 @@ func TestRunWorkerAttempt_StateFileCarriesResultOnlyMeasurement(t *testing.T) {
 	if *got.TotalTokens != 100 {
 		t.Errorf("TotalTokens = %d, want 100", *got.TotalTokens)
 	}
+}
+
+// TestRunWorkerAttempt_OnTurnStartedDeliversPerTurnTally verifies that
+// OnTurnStarted receives 1 through N, each before its turn runs, and
+// that TurnsStarted is N.
+func TestRunWorkerAttempt_OnTurnStartedDeliversPerTurnTally(t *testing.T) {
+	t.Parallel()
+
+	const wantTurns = 4
+
+	patterns := []struct {
+		name  string
+		emits func(int) bool
+	}{
+		{"session_started every turn", emitsSessionStartedEveryTurn},
+		{"session_started first turn only", emitsSessionStartedFirstTurnOnly},
+		{"session_started never", emitsSessionStartedNever},
+	}
+
+	for _, pattern := range patterns {
+		t.Run(pattern.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			cfg := defaultWorkerConfig(tmpDir)
+			cfg.Agent.MaxTurns = wantTurns
+
+			// Both callbacks run on the worker goroutine, so append order is call order.
+			var order []string
+			var onTurnStartedCalls []int
+
+			adapter := &turnEmissionAdapter{
+				emits: pattern.emits,
+				beforeRunTurn: func(turn int) {
+					order = append(order, fmt.Sprintf("run:%d", turn))
+				},
+			}
+
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter:         &mockTrackerAdapter{},
+				AgentAdapter:           adapter,
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				OnTurnStarted: func(_ string, turnsStarted int) {
+					onTurnStartedCalls = append(onTurnStartedCalls, turnsStarted)
+					order = append(order, fmt.Sprintf("started:%d", turnsStarted))
+				},
+				Logger: discardLogger(),
+			}
+
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+			result := ec.waitResult(t)
+
+			if result.ExitKind != WorkerExitNormal {
+				t.Fatalf("ExitKind = %q, want %q (error: %v)", result.ExitKind, WorkerExitNormal, result.Error)
+			}
+
+			wantCalls := []int{1, 2, 3, 4}
+			if !slices.Equal(onTurnStartedCalls, wantCalls) {
+				t.Errorf("OnTurnStarted calls = %v, want %v", onTurnStartedCalls, wantCalls)
+			}
+			if result.TurnsStarted != wantTurns {
+				t.Errorf("WorkerResult.TurnsStarted = %d, want %d", result.TurnsStarted, wantTurns)
+			}
+
+			wantOrder := []string{
+				"started:1", "run:1",
+				"started:2", "run:2",
+				"started:3", "run:3",
+				"started:4", "run:4",
+			}
+			if !slices.Equal(order, wantOrder) {
+				t.Errorf("interleaved OnTurnStarted/RunTurn order = %v, want %v", order, wantOrder)
+			}
+		})
+	}
+}
+
+// TestRunWorkerAttempt_SelfReviewTurnsCountTowardTurnsStarted verifies
+// that self-review turns count toward OnTurnStarted and TurnsStarted.
+func TestRunWorkerAttempt_SelfReviewTurnsCountTowardTurnsStarted(t *testing.T) {
+	t.Parallel()
+
+	const codingTurns = 2
+
+	tmpDir := t.TempDir()
+	cfg := defaultWorkerConfig(tmpDir)
+	cfg.Agent.MaxTurns = codingTurns
+	cfg.SelfReview = config.SelfReviewConfig{
+		Enabled:               true,
+		MaxIterations:         2,
+		VerificationCommands:  []string{"echo ok"},
+		VerificationTimeoutMS: 5000,
+	}
+
+	startFn, wsPath := captureWorkspacePath()
+	var onTurnStartedCalls []int
+	ec := newExitCapture()
+
+	deps := WorkerDeps{
+		TrackerAdapter: &mockTrackerAdapter{},
+		AgentAdapter: &mockAgentAdapter{
+			startSessionFn: startFn,
+			runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+				if isSelfReviewTurnPrompt(params.Prompt) {
+					writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "iterate", Summary: "needs fix"})
+				}
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			},
+		},
+		ConfigFunc:             func() config.ServiceConfig { return cfg },
+		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+		OnEvent:                func(_ string, _ domain.AgentEvent) {},
+		OnExit:                 ec.onExit,
+		OnTurnStarted: func(_ string, turnsStarted int) {
+			onTurnStartedCalls = append(onTurnStartedCalls, turnsStarted)
+		},
+		Logger: discardLogger(),
+	}
+
+	RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+	result := ec.waitResult(t)
+
+	if result.ExitKind != WorkerExitNormal {
+		t.Fatalf("ExitKind = %q, want %q (error: %v)", result.ExitKind, WorkerExitNormal, result.Error)
+	}
+
+	// The cap (MaxIterations=2) ends the phase after iteration 2's
+	// review turn, with no further fix turn.
+	wantCalls := []int{1, 2, 3, 4, 5}
+	if !slices.Equal(onTurnStartedCalls, wantCalls) {
+		t.Errorf("OnTurnStarted calls = %v, want %v", onTurnStartedCalls, wantCalls)
+	}
+	if result.TurnsStarted != len(wantCalls) {
+		t.Errorf("WorkerResult.TurnsStarted = %d, want %d", result.TurnsStarted, len(wantCalls))
+	}
+	if result.TurnsCompleted != len(wantCalls) {
+		t.Errorf("WorkerResult.TurnsCompleted = %d, want %d", result.TurnsCompleted, len(wantCalls))
+	}
+	if result.ReviewMetadata == nil {
+		t.Fatal("ReviewMetadata = nil, want non-nil")
+	}
+	if !result.ReviewMetadata.CapReached {
+		t.Error("ReviewMetadata.CapReached = false, want true")
+	}
+}
+
+// turnStartedFixture builds an Orchestrator with a turnStartedCh of the
+// given capacity and a running entry for the dispatched issue. MaxTurns
+// is 1 so the test budgets for exactly one OnTurnStarted call.
+func turnStartedFixture(t *testing.T, turnStartedChCap int) (*Orchestrator, domain.Issue) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	cfg := defaultWorkerConfig(tmpDir)
+	cfg.Agent.MaxTurns = 1
+	wm := &stubWorkflowManager{config: cfg, template: mustParseTemplate(t, "{{ .issue.title }}")}
+
+	o := &Orchestrator{
+		state:           NewState(1000, 5, 0, nil, AgentTotals{}),
+		logger:          discardLogger(),
+		trackerAdapter:  &mockTrackerAdapter{},
+		agentAdapter:    &mockAgentAdapter{},
+		workflowManager: wm,
+		workerExitCh:    make(chan WorkerResult, 4),
+		agentEventCh:    make(chan agentEventMsg, 4),
+		selfReviewCh:    make(chan selfReviewProgressMsg, 4),
+		turnStartedCh:   make(chan turnStartedMsg, turnStartedChCap),
+		hostPool:        NewHostPool(nil, 0),
+		preflightParams: passingPreflightRegistries(),
+	}
+
+	issue := workerTestIssue()
+	o.state.Running[issue.ID] = &RunningEntry{Identifier: issue.Identifier, Issue: issue}
+
+	return o, issue
+}
+
+// TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone verifies
+// that OnTurnStarted blocks on a full turnStartedCh and gives up when the
+// worker context ends.
+func TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("blocks while full, delivers once a slot frees", func(t *testing.T) {
+		t.Parallel()
+
+		o, issue := turnStartedFixture(t, 1)
+		o.turnStartedCh <- turnStartedMsg{IssueID: "filler", TurnsStarted: -1}
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		o.agentAdapter = &mockAgentAdapter{
+			runTurnFn: func(_ context.Context, session domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
+				close(entered)
+				<-release
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			},
+		}
+
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		ctx := t.Context()
+
+		workerDone := make(chan struct{})
+		go func() {
+			wfn(ctx, issue, nil)
+			close(workerDone)
+		}()
+
+		select {
+		case <-entered:
+			t.Fatal("RunTurn was entered while turnStartedCh was still full, want OnTurnStarted to block first")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		<-o.turnStartedCh
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("RunTurn was never entered after a slot freed")
+		}
+		close(release)
+
+		select {
+		case <-workerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not exit")
+		}
+		<-o.workerExitCh
+
+		select {
+		case msg := <-o.turnStartedCh:
+			if msg.IssueID != issue.ID || msg.TurnsStarted != 1 {
+				t.Errorf("delivered message = %+v, want {IssueID: %q, TurnsStarted: 1}", msg, issue.ID)
+			}
+		default:
+			t.Fatal("turnStartedCh is empty, want the delivered message")
+		}
+	})
+
+	t.Run("escapes without delivering when the worker context ends", func(t *testing.T) {
+		t.Parallel()
+
+		o, issue := turnStartedFixture(t, 1)
+		o.turnStartedCh <- turnStartedMsg{IssueID: "filler", TurnsStarted: -1}
+
+		entered := make(chan struct{})
+		o.agentAdapter = &mockAgentAdapter{
+			runTurnFn: func(_ context.Context, session domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
+				close(entered)
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCancelled}, context.Canceled
+			},
+		}
+
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		ctx, cancel := context.WithCancel(context.Background())
+
+		workerDone := make(chan struct{})
+		go func() {
+			wfn(ctx, issue, nil)
+			close(workerDone)
+		}()
+
+		select {
+		case <-entered:
+			t.Fatal("RunTurn was entered while turnStartedCh was still full, want OnTurnStarted to block first")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		cancel()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("RunTurn was never entered after cancelling the worker context")
+		}
+
+		select {
+		case <-workerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not exit")
+		}
+		<-o.workerExitCh
+
+		if got := len(o.turnStartedCh); got != 1 {
+			t.Fatalf("len(turnStartedCh) = %d, want 1 (the filler message, undisturbed)", got)
+		}
+		msg := <-o.turnStartedCh
+		if msg.IssueID != "filler" {
+			t.Errorf("turnStartedCh holds %+v, want the untouched filler message", msg)
+		}
+	})
 }
