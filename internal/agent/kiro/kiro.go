@@ -167,7 +167,7 @@ func (a *KiroAdapter) StartSession(ctx context.Context, params domain.StartSessi
 			}
 			return nil, nil
 		},
-		GetUsage:     func() domain.TokenUsage { return domain.TokenUsage{} },
+		GetUsage:     func() (domain.TokenUsage, bool) { return domain.TokenUsage{}, false },
 		GetSessionID: func() string { return state.sessionID },
 		OnFinalize: func(emit func(domain.AgentEvent), _ any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
 			creditsSeen, authFailed := classifyStderr(stderrLines)

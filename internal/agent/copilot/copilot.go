@@ -454,7 +454,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 
 			return nil, nil
 		},
-		GetUsage:     func() domain.TokenUsage { return state.usage.Snapshot() },
+		GetUsage:     func() (domain.TokenUsage, bool) { return state.usage.Snapshot(), state.usage.Measured() },
 		GetSessionID: func() string { return state.copilotSessionID },
 		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
 			lastResult, _ := lastParsed.(*rawEvent)

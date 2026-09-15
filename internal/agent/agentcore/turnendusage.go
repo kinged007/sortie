@@ -44,6 +44,13 @@ func (u *TurnEndUsage) Snapshot() domain.TokenUsage {
 	return u.acc.Snapshot()
 }
 
+// Measured reports whether a Finalize call has received a non-nil
+// recovered figure yet. It is false for a value from NewTurnEndUsage
+// until then, and true from that call on.
+func (u *TurnEndUsage) Measured() bool {
+	return u.measured
+}
+
 // Finalize ends one turn. recovered is nil when the turn produced no
 // figure. When recovered is non-nil, Finalize settles it into the
 // session's run-cumulative snapshot, latches the measured verdict, and

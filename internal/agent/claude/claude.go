@@ -295,7 +295,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 
 			return nil, nil
 		},
-		GetUsage:     func() domain.TokenUsage { return state.acc.Snapshot() },
+		GetUsage:     func() (domain.TokenUsage, bool) { return state.acc.Snapshot(), state.usageMeasured },
 		GetSessionID: func() string { return state.claudeSessionID },
 		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
 			usage := state.acc.Snapshot()
@@ -408,7 +408,7 @@ func (a *ClaudeCodeAdapter) StopSession(ctx context.Context, session domain.Sess
 // limit is formatted as first-line-plus-tail: the first line of the error
 // output is preserved (typically an exit-code header), followed by the
 // omission marker "\n...\n", followed by the last bytes of the remaining
-// output — ensuring that CLI failure lines at the tail are always visible.
+// output, ensuring that CLI failure lines at the tail are always visible.
 const maxToolErrorLen = 2048
 
 // toolResultText extracts a human-readable string from a tool_result
@@ -478,7 +478,7 @@ func tailBytes(s string, n int) string {
 // truncateToolError returns s within maxLen bytes, preserving the most useful
 // content for operator log inspection. When s fits in maxLen it is returned
 // unchanged. For longer strings the algorithm is first-line-plus-tail: the
-// first line of s (up to the first '\n') is kept as a header — for CLI tools
+// first line of s (up to the first '\n') is kept as a header, for CLI tools
 // this is typically an exit-code line such as "Exit code 2". The omission
 // marker "\n...\n" separates the header from the tail, and the remaining byte
 // budget is filled by the last bytes of s after the first line, so that
