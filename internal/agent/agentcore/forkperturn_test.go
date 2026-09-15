@@ -88,7 +88,7 @@ func noopHooks() ForkPerTurnHooks {
 	return ForkPerTurnHooks{
 		BuildArgs:    func(turn int, prompt string) []string { return nil },
 		ParseLine:    func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) { return nil, nil },
-		GetUsage:     func() domain.TokenUsage { return domain.TokenUsage{} },
+		GetUsage:     func() (domain.TokenUsage, bool) { return domain.TokenUsage{}, false },
 		GetSessionID: func() string { return "" },
 		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnCompleted(emit, "ok", 0, domain.TokenUsage{})
@@ -141,6 +141,108 @@ func requireAgentError(t *testing.T, err error, want domain.AgentErrorKind) {
 	}
 }
 
+// wantUsageVerdictSnapshot is the non-zero snapshot every usageVerdictDouble
+// in this file reports, paired with the measured value each subtest
+// controls.
+var wantUsageVerdictSnapshot = domain.TokenUsage{InputTokens: 700, OutputTokens: 300, TotalTokens: 1000}
+
+// usageVerdictDouble returns a GetUsage double that reports usage and
+// measured on every call, together with a pointer to the number of times it
+// was called.
+func usageVerdictDouble(usage domain.TokenUsage, measured bool) (func() (domain.TokenUsage, bool), *int) {
+	calls := new(int)
+	return func() (domain.TokenUsage, bool) {
+		*calls++
+		return usage, measured
+	}, calls
+}
+
+// assertUsageVerdictCarried checks that result and the terminal event of
+// type terminalType both carry wantUsageVerdictSnapshot and wantMeasured,
+// that err is a *domain.AgentError of the given kind, and that the
+// GetUsage double behind calls was invoked exactly once.
+func assertUsageVerdictCarried(
+	t *testing.T,
+	result domain.TurnResult,
+	err error,
+	events []domain.AgentEvent,
+	terminalType domain.AgentEventType,
+	wantKind domain.AgentErrorKind,
+	wantMeasured bool,
+	calls int,
+) {
+	t.Helper()
+
+	if calls != 1 {
+		t.Errorf("GetUsage call count = %d, want 1", calls)
+	}
+	if result.UsageMeasured != wantMeasured {
+		t.Errorf("TurnResult.UsageMeasured = %v, want %v", result.UsageMeasured, wantMeasured)
+	}
+	if result.Usage != wantUsageVerdictSnapshot {
+		t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantUsageVerdictSnapshot)
+	}
+
+	terminal, ok := findEventOfType(events, terminalType)
+	if !ok {
+		t.Fatalf("%s not emitted; got %v", terminalType, events)
+	}
+	if terminal.Usage != wantUsageVerdictSnapshot {
+		t.Errorf("%s.Usage = %+v, want %+v", terminalType, terminal.Usage, wantUsageVerdictSnapshot)
+	}
+
+	requireAgentError(t, err, wantKind)
+}
+
+// runWithSessionStartCancel calls sess.RunTurn, cancelling its context the
+// moment the first EventSessionStarted event arrives from a ParseLine hook
+// that emits it on the first line it sees. It waits up to 5s for RunTurn to
+// return and fails the test if it does not.
+func runWithSessionStartCancel(t *testing.T, sess *ForkPerTurnSession) (domain.TurnResult, []domain.AgentEvent, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var events []domain.AgentEvent
+	emit := func(e domain.AgentEvent) {
+		events = append(events, e)
+		if e.Type == domain.EventSessionStarted {
+			cancel()
+		}
+	}
+
+	type outcome struct {
+		result domain.TurnResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := sess.RunTurn(ctx, "p", emit)
+		done <- outcome{result, err}
+	}()
+
+	select {
+	case got := <-done:
+		return got.result, events, got.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunTurn did not return within 5s")
+		return domain.TurnResult{}, nil, nil
+	}
+}
+
+// parseLineEmitSessionStartedOnce returns a ParseLine hook that emits
+// EventSessionStarted the first time it is called and does nothing on
+// every later call.
+func parseLineEmitSessionStartedOnce() func([]byte, func(domain.AgentEvent), string) (any, error) {
+	var started bool
+	return func(_ []byte, emit func(domain.AgentEvent), pid string) (any, error) {
+		if !started {
+			started = true
+			EmitSessionStarted(emit, pid, "")
+		}
+		return nil, nil
+	}
+}
+
 func TestForkPerTurnSession(t *testing.T) {
 	t.Parallel()
 
@@ -173,7 +275,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 		stubUsage := domain.TokenUsage{InputTokens: 500, OutputTokens: 100, TotalTokens: 600}
 		hooks := noopHooks()
-		hooks.GetUsage = func() domain.TokenUsage { return stubUsage }
+		hooks.GetUsage = func() (domain.TokenUsage, bool) { return stubUsage, true }
 		sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -252,7 +354,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 		stubUsage := domain.TokenUsage{InputTokens: 500, OutputTokens: 100, TotalTokens: 600}
 		hooks := noopHooks()
-		hooks.GetUsage = func() domain.TokenUsage { return stubUsage }
+		hooks.GetUsage = func() (domain.TokenUsage, bool) { return stubUsage, true }
 		sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
 
 		emit, events := sinkEvents()
@@ -306,6 +408,163 @@ func TestForkPerTurnSession(t *testing.T) {
 		}
 		agenttest.RequireWarnLines(t, spy, "Arm4")
 	})
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run("Arm1_UsageVerdict_PostScanCancel_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: "{}\n", Hang: true})
+			target := newTestTarget(tmpDir, script)
+
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			hooks.ParseLine = parseLineEmitSessionStartedOnce()
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			result, events, err := runWithSessionStartCancel(t, sess)
+
+			assertUsageVerdictCarried(t, result, err, events, domain.EventTurnCancelled, domain.ErrTurnCancelled, measured, *calls)
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run("Arm2_UsageVerdict_ScannerOverflow_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", "overflow", overflowParams{Size: 11000001})
+			target := newTestTarget(tmpDir, script)
+
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			emit, events := sinkEvents()
+			result, err := sess.RunTurn(context.Background(), "p", emit)
+
+			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnFailed, domain.ErrPortExit, measured, *calls)
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run("Arm4_UsageVerdict_Exit127_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{ExitCode: 127})
+			target := newTestTarget(tmpDir, script)
+
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			emit, events := sinkEvents()
+			result, err := sess.RunTurn(context.Background(), "p", emit)
+
+			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnFailed, domain.ErrAgentNotFound, measured, *calls)
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run("StartFailure_ContextCancelled_UsageVerdict_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			target := &LaunchTarget{
+				Command:       "/nonexistent-binary-does-not-exist",
+				WorkspacePath: tmpDir,
+			}
+
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			emit, events := sinkEvents()
+
+			result, err := sess.RunTurn(ctx, "p", emit)
+
+			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnCancelled, domain.ErrTurnCancelled, measured, *calls)
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		measured bool
+	}{
+		{"MeasuredTrue", true},
+		{"MeasuredFalse", false},
+	} {
+		measured := tc.measured
+		t.Run("StartFailure_NotCancelled_UsageVerdict_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			target := &LaunchTarget{
+				Command:       "/nonexistent-binary-does-not-exist",
+				WorkspacePath: tmpDir,
+			}
+
+			const wantSessionID = "start-failure-session"
+			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
+			hooks := noopHooks()
+			hooks.GetUsage = getUsage
+			hooks.GetSessionID = func() string { return wantSessionID }
+			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+			emit, events := sinkEvents()
+			result, err := sess.RunTurn(context.Background(), "p", emit)
+
+			if *calls != 1 {
+				t.Errorf("GetUsage call count = %d, want 1", *calls)
+			}
+			if result.Usage != wantUsageVerdictSnapshot {
+				t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantUsageVerdictSnapshot)
+			}
+			if result.UsageMeasured != measured {
+				t.Errorf("TurnResult.UsageMeasured = %v, want %v", result.UsageMeasured, measured)
+			}
+			if result.SessionID != wantSessionID {
+				t.Errorf("TurnResult.SessionID = %q, want %q", result.SessionID, wantSessionID)
+			}
+			if result.ExitReason != "" {
+				t.Errorf("TurnResult.ExitReason = %q, want empty", result.ExitReason)
+			}
+			if len(*events) != 0 {
+				t.Errorf("emit received %d events, want 0: %v", len(*events), *events)
+			}
+			requireAgentError(t, err, domain.ErrPortExit)
+		})
+	}
 
 	t.Run("Arm6_ParseLineResult_OnFinalizeSuccess", func(t *testing.T) {
 		t.Parallel()

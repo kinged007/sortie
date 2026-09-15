@@ -150,15 +150,27 @@ type stubStore struct {
 	deleteAllBudgetHoldErr    error
 	listBudgetHoldNotices     []persistence.BudgetHoldNotice
 	listBudgetHoldNoticesErr  error
+
+	// onAppendRunHistory and onUpsertSessionMetadata, when set, run
+	// synchronously on the caller's goroutine after the write is
+	// recorded, so a test observing the orchestrator's single-writer
+	// event loop can capture state at the moment a record is persisted
+	// instead of polling for it from the test goroutine.
+	onAppendRunHistory      func(persistence.RunHistory)
+	onUpsertSessionMetadata func(persistence.SessionMetadata)
 }
 
 var _ OrchestratorStore = (*stubStore)(nil)
 
 func (s *stubStore) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	run.ID = int64(len(s.runHistories) + 1)
 	s.runHistories = append(s.runHistories, run)
+	hook := s.onAppendRunHistory
+	s.mu.Unlock()
+	if hook != nil {
+		hook(run)
+	}
 	return run, nil
 }
 
@@ -171,9 +183,14 @@ func (s *stubStore) UpsertAggregateMetrics(_ context.Context, m persistence.Aggr
 
 func (s *stubStore) UpsertSessionMetadata(_ context.Context, m persistence.SessionMetadata) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.sessions = append(s.sessions, m)
-	return s.upsertSessionMetadataErr
+	hook := s.onUpsertSessionMetadata
+	err := s.upsertSessionMetadataErr
+	s.mu.Unlock()
+	if hook != nil {
+		hook(m)
+	}
+	return err
 }
 
 // sessionWrites returns a copy of the captured session metadata writes.
@@ -789,6 +806,823 @@ func TestOrchestratorShutdown(t *testing.T) {
 	}
 }
 
+// TestApplyQueued pins applyQueued's bound: it drains every message a
+// channel holds, in receive order, stops the instant a receive finds
+// the channel empty, and never runs more than cap(ch) iterations even
+// when apply keeps refilling the channel it drains.
+func TestApplyQueued(t *testing.T) {
+	t.Parallel()
+
+	t.Run("drains three messages from a channel of capacity four, in order", func(t *testing.T) {
+		t.Parallel()
+
+		ch := make(chan int, 4)
+		ch <- 1
+		ch <- 2
+		ch <- 3
+
+		var got []int
+		applyQueued(ch, func(v int) { got = append(got, v) })
+
+		want := []int{1, 2, 3}
+		if len(got) != len(want) {
+			t.Fatalf("applyQueued() called apply %d times, want %d: %v", len(got), len(want), got)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("got[%d] = %d, want %d", i, got[i], w)
+			}
+		}
+	})
+
+	t.Run("an empty channel returns without calling apply", func(t *testing.T) {
+		t.Parallel()
+
+		ch := make(chan int, 4)
+		called := false
+		applyQueued(ch, func(int) { called = true })
+
+		if called {
+			t.Error("apply was called on an empty channel, want no calls")
+		}
+	})
+
+	t.Run("a channel that refills itself during the drain stops after cap(ch) calls", func(t *testing.T) {
+		t.Parallel()
+
+		ch := make(chan int, 4)
+		ch <- 1
+		ch <- 2
+		ch <- 3
+		ch <- 4
+
+		var got []int
+		applyQueued(ch, func(v int) {
+			got = append(got, v)
+			ch <- v + 100
+		})
+
+		want := []int{1, 2, 3, 4}
+		if len(got) != len(want) {
+			t.Fatalf("applyQueued() called apply %d times, want exactly %d: %v", len(got), len(want), got)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("got[%d] = %d, want %d", i, got[i], w)
+			}
+		}
+		if got := len(ch); got != 4 {
+			t.Errorf("len(ch) after the drain = %d, want 4 (the four newly sent messages left queued)", got)
+		}
+	})
+}
+
+// queuedOrderingIssueEntry builds a minimal RunningEntry for the
+// queued-before-exit ordering tests: active per budgetTickConfig's
+// state list, so the tick reconcile pass this fixture's Run leg admits
+// leaves the entry running rather than cancelling it as non-active.
+func queuedOrderingIssueEntry(issueID string) *RunningEntry {
+	return &RunningEntry{
+		Identifier: issueID + "-ident",
+		Issue:      domain.Issue{ID: issueID, Identifier: issueID + "-ident", State: "To Do"},
+		DispatchID: issueID + "-dispatch",
+		StartedAt:  time.Now().UTC(),
+		CancelFunc: func() {},
+	}
+}
+
+// queuedOrderingCrossingEvent returns a token_usage message reporting
+// model and a cumulative total of 30, the fixture the queued-before-exit
+// ordering tests share.
+func queuedOrderingCrossingEvent(issueID, model string) agentEventMsg {
+	return agentEventMsg{
+		IssueID: issueID,
+		Event: domain.AgentEvent{
+			Type:      domain.EventTokenUsage,
+			Timestamp: time.Now().UTC(),
+			Model:     model,
+			Usage:     domain.TokenUsage{TotalTokens: 30},
+		},
+	}
+}
+
+// TestOrchestrator_QueuedMessagesApplyAheadOfExit pins the ordering
+// property: a message a worker delivered before its WorkerResult is
+// applied to its own run's entry before that WorkerResult is handled,
+// in both Orchestrator.Run and Orchestrator.drainRunningWorkers. Each
+// leg runs 64 independent trials so a loop that instead picked at
+// random between the queued WorkerResult and the queued messages would
+// fail with overwhelming probability rather than by chance.
+func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
+	t.Parallel()
+
+	const trials = 64
+
+	t.Run("Run applies a queued agent event and a queued self-review message before the exit", func(t *testing.T) {
+		t.Parallel()
+
+		for trial := range trials {
+			issueID := fmt.Sprintf("ISSUE-P9-RUN-%d", trial)
+			state := NewState(60000, 4, 0, nil, AgentTotals{})
+			state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+
+			store := &stubStore{}
+			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+			// HandleWorkerExit's own session_metadata write always carries
+			// an empty DispatchID (exit.go clears it ahead of the
+			// run_history append), while the queued event's earlier
+			// throttled incremental write carries the entry's non-empty
+			// DispatchID. So the first UpsertSessionMetadata call carrying
+			// an empty DispatchID is HandleWorkerExit's own, distinguishable
+			// from the queued write regardless of call order.
+			type observedRow struct {
+				meta               persistence.SessionMetadata
+				selfReviewQueueLen int
+			}
+			captured := make(chan observedRow, 1)
+			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
+				if meta.DispatchID != "" {
+					return
+				}
+				captured <- observedRow{meta: meta, selfReviewQueueLen: len(o.selfReviewCh)}
+			}
+
+			o.agentEventCh <- queuedOrderingCrossingEvent(issueID, "m")
+			o.selfReviewCh <- selfReviewProgressMsg{IssueID: issueID, Message: "self_review_iteration", Iteration: 1, MaxIterations: 2}
+			o.workerExitCh <- WorkerResult{IssueID: issueID, Identifier: issueID + "-ident", ExitKind: WorkerExitNormal}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				o.Run(ctx)
+				close(done)
+			}()
+
+			var row observedRow
+			select {
+			case row = <-captured:
+			case <-time.After(10 * time.Second):
+				cancel()
+				<-done
+				t.Fatalf("trial %d: timed out waiting for HandleWorkerExit's session_metadata row", trial)
+			}
+
+			cancel()
+			<-done
+
+			if row.meta.ModelName != "m" {
+				t.Fatalf("trial %d: SessionMetadata.ModelName = %q, want %q", trial, row.meta.ModelName, "m")
+			}
+			if row.meta.TotalTokens != 30 {
+				t.Fatalf("trial %d: SessionMetadata.TotalTokens = %d, want 30", trial, row.meta.TotalTokens)
+			}
+			if row.selfReviewQueueLen != 0 {
+				t.Fatalf("trial %d: len(selfReviewCh) = %d at the time the row was upserted, want 0 (applied ahead of the exit)", trial, row.selfReviewQueueLen)
+			}
+		}
+	})
+
+	t.Run("drainRunningWorkers applies a queued agent event and a queued self-review message before the exit", func(t *testing.T) {
+		t.Parallel()
+
+		for trial := range trials {
+			issueID := fmt.Sprintf("ISSUE-P9-DRAIN-%d", trial)
+			state := NewState(60000, 4, 0, nil, AgentTotals{})
+			state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+
+			store := &stubStore{}
+			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+			// The hooks run on the drain goroutine, which has returned before
+			// the test reads selfReviewQueueLen. HandleWorkerExit's own
+			// session_metadata write always carries an empty DispatchID
+			// (exit.go clears it ahead of the run_history append), which
+			// distinguishes it from the queued event's earlier throttled
+			// incremental write, carrying the entry's non-empty DispatchID.
+			selfReviewQueueLen := -1
+			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
+				if meta.DispatchID != "" {
+					return
+				}
+				selfReviewQueueLen = len(o.selfReviewCh)
+			}
+
+			o.agentEventCh <- queuedOrderingCrossingEvent(issueID, "m")
+			o.selfReviewCh <- selfReviewProgressMsg{IssueID: issueID, Message: "self_review_iteration", Iteration: 1, MaxIterations: 2}
+			o.workerExitCh <- WorkerResult{IssueID: issueID, Identifier: issueID + "-ident", ExitKind: WorkerExitNormal}
+
+			done := make(chan struct{})
+			go func() {
+				o.drainRunningWorkers()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("trial %d: drainRunningWorkers did not return within 10 seconds", trial)
+			}
+
+			// The queued agent event's own throttled incremental write may
+			// land before HandleWorkerExit's unconditional exit-time write,
+			// so the property under test is pinned on the last row: the one
+			// HandleWorkerExit itself upserted.
+			writes := store.sessionWrites()
+			if len(writes) == 0 {
+				t.Fatalf("trial %d: UpsertSessionMetadata was never called, want at least 1", trial)
+			}
+			exitWrite := writes[len(writes)-1]
+			if exitWrite.ModelName != "m" {
+				t.Fatalf("trial %d: SessionMetadata.ModelName = %q, want %q", trial, exitWrite.ModelName, "m")
+			}
+			if exitWrite.TotalTokens != 30 {
+				t.Fatalf("trial %d: SessionMetadata.TotalTokens = %d, want 30", trial, exitWrite.TotalTokens)
+			}
+			if selfReviewQueueLen != 0 {
+				t.Fatalf("trial %d: len(selfReviewCh) = %d at the time the row was upserted, want 0 (applied ahead of the exit)", trial, selfReviewQueueLen)
+			}
+		}
+	})
+}
+
+// budgetCeilingExemptionFixture builds an *Orchestrator, a *stubStore,
+// a *spyMetrics, and a log buffer for the ceiling-exemption tests: a
+// per-issue token ceiling of 100 with every issue's completed-session
+// sum reported as 90, and a workflow config with no handoff state and
+// an active-state list that never matches an entry's own (empty)
+// Issue.State, so a normal exit's disposition falls through to the
+// non-active default arm rather than scheduling a real retry timer.
+func budgetCeilingExemptionFixture(t *testing.T) (o *Orchestrator, store *stubStore, spy *spyMetrics, logBuf *bytes.Buffer) {
+	t.Helper()
+
+	cfg := config.ServiceConfig{Tracker: config.TrackerConfig{ActiveStates: []string{"Done"}}}
+	store = &stubStore{tokenSum: 90}
+	spy = &spyMetrics{}
+	logBuf = &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	state := NewState(60000, 4, 100, nil, AgentTotals{})
+
+	o = &Orchestrator{
+		state:           state,
+		logger:          logger,
+		metrics:         spy,
+		store:           store,
+		workflowManager: &stubWorkflowManager{config: cfg},
+		agentEventCh:    make(chan agentEventMsg, 8),
+		workerExitCh:    make(chan WorkerResult, 8),
+		selfReviewCh:    make(chan selfReviewProgressMsg, 8),
+		retryTimerCh:    make(chan string, 8),
+		hostPool:        NewHostPool(nil, 0),
+	}
+	return o, store, spy, logBuf
+}
+
+// budgetCeilingCrossingEvent returns a token_usage message reporting a
+// cumulative total of 30, which, added to the 90 the fixture's store
+// reports as already completed, crosses the fixture's ceiling of 100.
+func budgetCeilingCrossingEvent(issueID string) agentEventMsg {
+	return agentEventMsg{
+		IssueID: issueID,
+		Event: domain.AgentEvent{
+			Type:      domain.EventTokenUsage,
+			Timestamp: time.Now().UTC(),
+			Usage:     domain.TokenUsage{TotalTokens: 30},
+		},
+	}
+}
+
+// TestHandleWorkerExit_NoBudgetStopForExitingRun pins the ceiling
+// exemption: a crossing usage figure applied ahead of the WorkerResult
+// of the run it belongs to is never evaluated against the in-flight
+// token ceiling, so that run's own exit is recorded on its own terms,
+// whether it ended normally or was cancelled by something else
+// entirely.
+func TestHandleWorkerExit_NoBudgetStopForExitingRun(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a normal exit records succeeded with no budget stop", func(t *testing.T) {
+		t.Parallel()
+
+		o, store, spy, logBuf := budgetCeilingExemptionFixture(t)
+		var cancelCalls atomic.Int32
+		o.state.Running["X"] = &RunningEntry{
+			Identifier:           "X-ident",
+			Issue:                domain.Issue{ID: "X", Identifier: "X-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { cancelCalls.Add(1) },
+		}
+		o.state.Claimed["X"] = struct{}{}
+		o.agentEventCh <- budgetCeilingCrossingEvent("X")
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:       "X",
+			Identifier:    "X-ident",
+			ExitKind:      WorkerExitNormal,
+			Usage:         domain.TokenUsage{TotalTokens: 30},
+			UsageMeasured: true,
+		})
+
+		if len(spy.runsStoppedByBudget) != 0 {
+			t.Errorf("IncRunsStoppedByBudget calls = %v, want none", spy.runsStoppedByBudget)
+		}
+		if strings.Contains(logBuf.String(), "run stopped by token ceiling") {
+			t.Error(`log contains "run stopped by token ceiling", want no such record`)
+		}
+		if cancelCalls.Load() != 0 {
+			t.Errorf("CancelFunc called %d times, want 0", cancelCalls.Load())
+		}
+		if len(store.runHistories) != 1 {
+			t.Fatalf("AppendRunHistory called %d times, want 1", len(store.runHistories))
+		}
+		run := store.runHistories[0]
+		if run.Status != "succeeded" {
+			t.Errorf("RunHistory.Status = %q, want %q", run.Status, "succeeded")
+		}
+		if run.TotalTokens != 30 {
+			t.Errorf("RunHistory.TotalTokens = %d, want 30", run.TotalTokens)
+		}
+	})
+
+	t.Run("a cancelled exit records cancelled with no budget stop", func(t *testing.T) {
+		t.Parallel()
+
+		o, store, spy, logBuf := budgetCeilingExemptionFixture(t)
+		var cancelCalls atomic.Int32
+		o.state.Running["X"] = &RunningEntry{
+			Identifier:           "X-ident",
+			Issue:                domain.Issue{ID: "X", Identifier: "X-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { cancelCalls.Add(1) },
+		}
+		o.state.Claimed["X"] = struct{}{}
+		o.agentEventCh <- budgetCeilingCrossingEvent("X")
+		stallErr := errors.New("stall timeout")
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:    "X",
+			Identifier: "X-ident",
+			ExitKind:   WorkerExitCancelled,
+			Error:      stallErr,
+		})
+
+		if len(spy.runsStoppedByBudget) != 0 {
+			t.Errorf("IncRunsStoppedByBudget calls = %v, want none", spy.runsStoppedByBudget)
+		}
+		if strings.Contains(logBuf.String(), "run stopped by token ceiling") {
+			t.Error(`log contains "run stopped by token ceiling", want no such record`)
+		}
+		if cancelCalls.Load() != 0 {
+			t.Errorf("CancelFunc called %d times, want 0", cancelCalls.Load())
+		}
+		if len(store.runHistories) != 1 {
+			t.Fatalf("AppendRunHistory called %d times, want 1", len(store.runHistories))
+		}
+		run := store.runHistories[0]
+		if run.Status != "cancelled" {
+			t.Errorf("RunHistory.Status = %q, want %q (not budget_stopped)", run.Status, "cancelled")
+		}
+		if run.Error == nil || !strings.Contains(*run.Error, stallErr.Error()) {
+			t.Errorf("RunHistory.Error = %v, want it to contain %q", run.Error, stallErr.Error())
+		}
+	})
+
+	t.Run("a queued figure for an issue whose exit is already waiting records no budget stop", func(t *testing.T) {
+		t.Parallel()
+
+		o, store, spy, logBuf := budgetCeilingExemptionFixture(t)
+		var yCancels atomic.Int32
+		o.state.Running["X"] = &RunningEntry{
+			Identifier: "X-ident",
+			Issue:      domain.Issue{ID: "X", Identifier: "X-ident"},
+			StartedAt:  time.Now().UTC(),
+		}
+		o.state.Running["Y"] = &RunningEntry{
+			Identifier:           "Y-ident",
+			Issue:                domain.Issue{ID: "Y", Identifier: "Y-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { yCancels.Add(1) },
+		}
+		o.state.Claimed["X"] = struct{}{}
+		o.state.Claimed["Y"] = struct{}{}
+		o.agentEventCh <- budgetCeilingCrossingEvent("Y")
+		o.workerExitCh <- WorkerResult{
+			IssueID:       "Y",
+			Identifier:    "Y-ident",
+			ExitKind:      WorkerExitNormal,
+			Usage:         domain.TokenUsage{TotalTokens: 30},
+			UsageMeasured: true,
+		}
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:    "X",
+			Identifier: "X-ident",
+			ExitKind:   WorkerExitNormal,
+		})
+
+		if len(spy.runsStoppedByBudget) != 0 {
+			t.Errorf("IncRunsStoppedByBudget calls = %v, want none", spy.runsStoppedByBudget)
+		}
+		if strings.Contains(logBuf.String(), "run stopped by token ceiling") {
+			t.Error(`log contains "run stopped by token ceiling", want no such record`)
+		}
+		if yCancels.Load() != 0 {
+			t.Errorf("Y's CancelFunc called %d times, want 0", yCancels.Load())
+		}
+		if len(store.runHistories) != 2 {
+			t.Fatalf("AppendRunHistory called %d times, want 2", len(store.runHistories))
+		}
+		if run := store.runHistories[1]; run.IssueID != "Y" || run.Status != "succeeded" {
+			t.Errorf("second RunHistory = {IssueID: %q, Status: %q}, want {IssueID: %q, Status: %q}", run.IssueID, run.Status, "Y", "succeeded")
+		}
+	})
+}
+
+// TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues pins the
+// other half of the exemption: a queued message for any issue other
+// than the one whose exit is being handled still gets the ceiling
+// evaluated against it, so that issue can still be stopped in flight.
+func TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a direct call stops Y and leaves X exempt", func(t *testing.T) {
+		t.Parallel()
+
+		o, _, spy, logBuf := budgetCeilingExemptionFixture(t)
+		var xCancels, yCancels atomic.Int32
+		o.state.Running["X"] = &RunningEntry{
+			Identifier:           "X-ident",
+			Issue:                domain.Issue{ID: "X", Identifier: "X-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { xCancels.Add(1) },
+		}
+		o.state.Running["Y"] = &RunningEntry{
+			Identifier:           "Y-ident",
+			Issue:                domain.Issue{ID: "Y", Identifier: "Y-ident"},
+			StartedAt:            time.Now().UTC(),
+			IssueTokensCompleted: 90,
+			CancelFunc:           func() { yCancels.Add(1) },
+		}
+		o.agentEventCh <- budgetCeilingCrossingEvent("Y")
+		o.agentEventCh <- budgetCeilingCrossingEvent("X")
+
+		o.applyQueuedAheadOfExit(context.Background(), map[string]struct{}{"X": {}})
+
+		if got := len(spy.runsStoppedByBudget); got != 1 {
+			t.Fatalf("IncRunsStoppedByBudget called %d times, want 1: %v", got, spy.runsStoppedByBudget)
+		}
+		if got := strings.Count(logBuf.String(), "run stopped by token ceiling"); got != 1 {
+			t.Fatalf(`log contains %d "run stopped by token ceiling" records, want exactly 1: %s`, got, logBuf.String())
+		}
+		if !strings.Contains(logBuf.String(), "issue_id=Y") {
+			t.Errorf(`log does not name issue_id=Y: %s`, logBuf.String())
+		}
+		if yCancels.Load() != 1 {
+			t.Errorf("Y's CancelFunc called %d times, want 1", yCancels.Load())
+		}
+		if xCancels.Load() != 0 {
+			t.Errorf("X's CancelFunc called %d times, want 0", xCancels.Load())
+		}
+		if !o.state.Running["Y"].TokenCeilingStopped {
+			t.Error("Y's TokenCeilingStopped = false, want true")
+		}
+		if o.state.Running["X"].TokenCeilingStopped {
+			t.Error("X's TokenCeilingStopped = true, want false")
+		}
+	})
+
+	t.Run("Run enforces the ceiling for another issue's queued message across 64 trials", func(t *testing.T) {
+		t.Parallel()
+
+		const trials = 64
+		for trial := range trials {
+			issueX := fmt.Sprintf("ISSUE-P13-X-%d", trial)
+			issueY := fmt.Sprintf("ISSUE-P13-Y-%d", trial)
+
+			wm := budgetTickConfig(0)
+			wm.config.Agent.MaxTokens = 100
+
+			store := &stubStore{tokenSum: 90}
+			spy := &spyMetrics{}
+			var yCancels atomic.Int32
+			state := NewState(60000, 4, 100, nil, AgentTotals{})
+			state.Running[issueX] = queuedOrderingIssueEntry(issueX)
+			state.Running[issueX].IssueTokensCompleted = 90
+			state.Running[issueY] = queuedOrderingIssueEntry(issueY)
+			state.Running[issueY].IssueTokensCompleted = 90
+			state.Running[issueY].CancelFunc = func() { yCancels.Add(1) }
+
+			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+			o := budgetOrchestratorWithMetrics(state, wm, store, tracker, discardLogger(), spy)
+
+			// X's row is the trial's first run_history row, appended after
+			// applyQueuedAheadOfExit has already applied (and, for Y,
+			// ceiling-enforced) every message queued ahead of X's exit. The
+			// hook observes Y's CancelFunc and the budget-stop counter at
+			// that moment, from the loop goroutine, before Y's own exit or
+			// the shutdown drain can call Y's CancelFunc again. The send
+			// never blocks, so Y's later row cannot stall the loop.
+			type observedRow struct {
+				yCancels        int32
+				stoppedByBudget int
+			}
+			captured := make(chan observedRow, 1)
+			store.onAppendRunHistory = func(persistence.RunHistory) {
+				select {
+				case captured <- observedRow{
+					yCancels:        yCancels.Load(),
+					stoppedByBudget: len(spy.runsStoppedByBudget),
+				}:
+				default:
+				}
+			}
+
+			o.agentEventCh <- budgetCeilingCrossingEvent(issueY)
+			o.workerExitCh <- WorkerResult{IssueID: issueX, Identifier: issueX + "-ident", ExitKind: WorkerExitNormal}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				o.Run(ctx)
+				close(done)
+			}()
+
+			var row observedRow
+			select {
+			case row = <-captured:
+			case <-time.After(10 * time.Second):
+				cancel()
+				<-done
+				t.Fatalf("trial %d: timed out waiting for X's run_history row", trial)
+			}
+
+			// Y exits too, so the shutdown drain finds no running entry to
+			// wait for.
+			o.workerExitCh <- WorkerResult{IssueID: issueY, Identifier: issueY + "-ident", ExitKind: WorkerExitNormal}
+			cancel()
+			<-done
+
+			if row.yCancels != 1 {
+				t.Fatalf("trial %d: Y's CancelFunc called %d times by the time X's row was upserted, want 1", trial, row.yCancels)
+			}
+			if row.stoppedByBudget != 1 {
+				t.Fatalf("trial %d: IncRunsStoppedByBudget called %d times by the time X's row was upserted, want 1", trial, row.stoppedByBudget)
+			}
+		}
+	})
+}
+
+// TestApplyTurnStarted verifies that applyTurnStarted sets TurnCount only for a running issue.
+func TestApplyTurnStarted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sets TurnCount for a present entry", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 4, 0, nil, AgentTotals{})
+		state.Running["A"] = &RunningEntry{Identifier: "A-ident", TurnCount: 2}
+		o := &Orchestrator{state: state}
+
+		o.applyTurnStarted(turnStartedMsg{IssueID: "A", TurnsStarted: 7})
+
+		if got := state.Running["A"].TurnCount; got != 7 {
+			t.Errorf("TurnCount = %d, want 7", got)
+		}
+	})
+
+	t.Run("is a no-op for an absent entry", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 4, 0, nil, AgentTotals{})
+		o := &Orchestrator{state: state}
+
+		o.applyTurnStarted(turnStartedMsg{IssueID: "missing", TurnsStarted: 3})
+
+		if len(state.Running) != 0 {
+			t.Errorf("state.Running = %v, want empty", state.Running)
+		}
+	})
+}
+
+// TestOrchestrator_TurnStartedAppliesAheadOfExit verifies that a
+// turn-started message queued before a worker's exit reaches that run's
+// entry, and never a later run of the same issue.
+func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("applyQueuedAheadOfExit (Orchestrator.Run's workerExitCh path)", func(t *testing.T) {
+		t.Parallel()
+
+		issueID := "ISSUE-TURN-ORDER-RUN"
+		state := NewState(60000, 4, 0, nil, AgentTotals{})
+		state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+		entry := state.Running[issueID]
+
+		store := &stubStore{}
+		tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+		o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+		o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 5}
+
+		o.handleWorkerExit(context.Background(), WorkerResult{
+			IssueID:      issueID,
+			Identifier:   entry.Identifier,
+			ExitKind:     WorkerExitNormal,
+			TurnsStarted: 5,
+		})
+
+		if _, stillRunning := state.Running[issueID]; stillRunning {
+			t.Fatal("state.Running still holds the exited issue, want it removed")
+		}
+		if entry.TurnCount != 5 {
+			t.Errorf("entry.TurnCount = %d, want 5 (applied before HandleWorkerExit removed the entry)", entry.TurnCount)
+		}
+
+		state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+		o.applyQueuedAheadOfExit(context.Background(), map[string]struct{}{})
+		if got := state.Running[issueID].TurnCount; got != 0 {
+			t.Errorf("a later entry's TurnCount = %d, want 0 (no stray message left queued)", got)
+		}
+	})
+
+	t.Run("workerExitCh case of drainRunningWorkers", func(t *testing.T) {
+		t.Parallel()
+
+		// The drain's own turnStartedCh case wins the random select about
+		// half the time, so a single trial cannot catch a missing drain.
+		const trials = 64
+
+		for trial := range trials {
+			issueID := fmt.Sprintf("ISSUE-TURN-ORDER-DRAIN-%d", trial)
+			state := NewState(60000, 4, 0, nil, AgentTotals{})
+			state.Running[issueID] = queuedOrderingIssueEntry(issueID)
+			entry := state.Running[issueID]
+
+			store := &stubStore{}
+			tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+
+			o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 9}
+			o.workerExitCh <- WorkerResult{
+				IssueID:      issueID,
+				Identifier:   entry.Identifier,
+				ExitKind:     WorkerExitNormal,
+				TurnsStarted: 9,
+			}
+
+			done := make(chan struct{})
+			go func() {
+				o.drainRunningWorkers()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("trial %d: drainRunningWorkers did not return within 10 seconds", trial)
+			}
+
+			if entry.TurnCount != 9 {
+				t.Fatalf("trial %d: entry.TurnCount = %d, want 9 (applied before the drain's HandleWorkerExit removed the entry)", trial, entry.TurnCount)
+			}
+		}
+	})
+}
+
+// waitForTurnCount polls snapshots until issueID reports want, failing on
+// a larger value or at the deadline. Run applies turn-started messages
+// asynchronously to snapshot requests, so a single read can race ahead.
+func waitForTurnCount(t *testing.T, snapshot func() (RuntimeSnapshotResult, error), issueID string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snap, err := snapshot()
+		if err != nil {
+			t.Fatalf("snapshot(): %v", err)
+		}
+		idx := slices.IndexFunc(snap.Running, func(e SnapshotRunningEntry) bool { return e.IssueID == issueID })
+		if idx < 0 {
+			t.Fatalf("snapshot has no running entry for %q", issueID)
+		}
+		got := snap.Running[idx].TurnCount
+		if got == want {
+			return
+		}
+		if got > want {
+			t.Fatalf("TurnCount = %d, want %d (observed ahead of releasing this turn)", got, want)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TurnCount did not reach %d within the deadline, last observed %d", want, got)
+		}
+	}
+}
+
+// TestOrchestrator_TurnCountTracksWorkerTally verifies that a live
+// snapshot reports TurnCount k while turn k runs, whatever the adapter's
+// session_started pattern.
+func TestOrchestrator_TurnCountTracksWorkerTally(t *testing.T) {
+	t.Parallel()
+
+	const wantTurns = 3
+
+	patterns := []struct {
+		name  string
+		emits func(int) bool
+	}{
+		{"session_started every turn", emitsSessionStartedEveryTurn},
+		{"session_started first turn only", emitsSessionStartedFirstTurnOnly},
+		{"session_started never", emitsSessionStartedNever},
+	}
+
+	for _, pattern := range patterns {
+		t.Run(pattern.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			cfg := defaultWorkerConfig(tmpDir)
+			cfg.Agent.MaxTurns = wantTurns
+			// Keeps a second tick from reconciling mid-test.
+			cfg.Polling.IntervalMS = 3_600_000
+			wm := &stubWorkflowManager{config: cfg, template: mustParseTemplate(t, "{{ .issue.title }}")}
+
+			issue := workerTestIssue()
+			state := NewState(cfg.Polling.IntervalMS, 4, 0, nil, AgentTotals{})
+			state.Running[issue.ID] = &RunningEntry{
+				Identifier: issue.Identifier,
+				Issue:      issue,
+				DispatchID: issue.ID + "-dispatch",
+				StartedAt:  time.Now().UTC(),
+				CancelFunc: func() {},
+			}
+
+			adapter := &turnEmissionAdapter{
+				emits:   pattern.emits,
+				entered: make(chan int),
+				release: make(chan struct{}),
+			}
+
+			regs := passingPreflightRegistries()
+			regs.ReloadWorkflow = func() error { return nil }
+			regs.ConfigFunc = wm.Config
+
+			o := NewOrchestrator(OrchestratorParams{
+				State:           state,
+				Logger:          discardLogger(),
+				TrackerAdapter:  &mockTrackerAdapter{},
+				AgentAdapter:    adapter,
+				WorkflowManager: wm,
+				Store:           &stubStore{},
+				PreflightParams: regs,
+			})
+
+			// Built before Run, whose first tick writes
+			// o.sshStrictHostKeyChecking concurrently.
+			wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			runDone := make(chan struct{})
+			go func() {
+				o.Run(ctx)
+				close(runDone)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				<-runDone
+			})
+
+			workerDone := make(chan struct{})
+			go func() {
+				wfn(ctx, issue, nil)
+				close(workerDone)
+			}()
+
+			snapshot := o.SnapshotFunc()
+			for k := 1; k <= wantTurns; k++ {
+				turn := <-adapter.entered
+				if turn != k {
+					t.Fatalf("adapter entered turn %d, want %d", turn, k)
+				}
+				waitForTurnCount(t, snapshot, issue.ID, k)
+				adapter.release <- struct{}{}
+			}
+
+			select {
+			case <-workerDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("worker did not exit within 10 seconds")
+			}
+		})
+	}
+}
+
 func TestMakeWorkerFn(t *testing.T) {
 	t.Parallel()
 
@@ -833,7 +1667,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -894,7 +1728,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -948,7 +1782,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			SessionID:  "resume-sess-42",
 		}
 
-		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1002,7 +1836,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1018,6 +1852,70 @@ func TestMakeWorkerFn(t *testing.T) {
 
 		if capturedStrictHostKeyChecking != "yes" {
 			t.Errorf("StartSessionParams.SSHStrictHostKeyChecking = %q, want %q", capturedStrictHostKeyChecking, "yes")
+		}
+	})
+
+	t.Run("DispatchID from context reaches the tool server env", func(t *testing.T) {
+		t.Parallel()
+
+		state := NewState(1000, 5, 0, nil, AgentTotals{})
+		tmpDir := t.TempDir()
+		cfg := defaultWorkerConfig(tmpDir)
+		tmpl := mustParseTemplate(t, "do {{ .issue.identifier }}")
+
+		var capturedMCPConfigPath atomic.Value
+		agent := &mockAgentAdapter{
+			startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
+				capturedMCPConfigPath.Store(params.MCPConfigPath)
+				return domain.Session{ID: "sess-1"}, nil
+			},
+		}
+
+		wm := &stubWorkflowManager{config: cfg, template: tmpl, absPath: "/fake/WORKFLOW.md"}
+
+		o := NewOrchestrator(OrchestratorParams{
+			State:           state,
+			Logger:          discardLogger(),
+			TrackerAdapter:  &mockTrackerAdapter{},
+			AgentAdapter:    agent,
+			WorkflowManager: wm,
+			Store:           &stubStore{},
+		})
+
+		issue := workerTestIssue()
+		state.Running[issue.ID] = &RunningEntry{
+			Identifier: issue.Identifier,
+			Issue:      issue,
+		}
+
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+
+		exitDone := make(chan struct{})
+		go func() {
+			wfn(withDispatchID(context.Background(), "dispatch-mkw-123"), issue, nil)
+			close(exitDone)
+		}()
+
+		select {
+		case <-exitDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("worker did not exit within 10 seconds")
+		}
+
+		mcpConfigPath, _ := capturedMCPConfigPath.Load().(string)
+		if mcpConfigPath == "" {
+			t.Fatal("StartSessionParams.MCPConfigPath is empty, want non-empty")
+		}
+
+		workspacePath := filepath.Dir(filepath.Dir(mcpConfigPath))
+		entry := sortieEntry(t, readMCPConfig(t, workspacePath))
+		env, ok := entry["env"].(map[string]any)
+		if !ok {
+			t.Fatal("env is not an object")
+		}
+		got, _ := env["SORTIE_DISPATCH_ID"].(string)
+		if got != "dispatch-mkw-123" {
+			t.Errorf("env[%q] = %q, want %q (WorkerDeps.DispatchID from dispatchIDFromContext)", "SORTIE_DISPATCH_ID", got, "dispatch-mkw-123")
 		}
 	})
 }
@@ -1069,7 +1967,7 @@ func TestMakeWorkerFn_DerivesPostureFromReactionKind(t *testing.T) {
 			})
 
 			issue := workerTestIssue()
-			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil)
+			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil, registry.UsageArrivalUndeclared)
 
 			exitDone := make(chan struct{})
 			go func() {
@@ -5543,6 +6441,56 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("none arrival writes no row", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.UsageArrival = registry.UsageArrivalNone
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+
+		if writes := store.sessionWrites(); len(writes) != 0 {
+			t.Errorf("UpsertSessionMetadata calls = %d, want 0 (none arrival)", len(writes))
+		}
+	})
+
+	t.Run("incremental arrival writes once for the same event", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.UsageArrival = registry.UsageArrivalIncremental
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+
+		if writes := store.sessionWrites(); len(writes) != 1 {
+			t.Errorf("UpsertSessionMetadata calls = %d, want 1 (incremental arrival)", len(writes))
+		}
+	})
+
+	t.Run("DispatchID from the running entry is carried on every write", func(t *testing.T) {
+		t.Parallel()
+
+		store := &stubStore{}
+		o, entry := incrementalWriteOrchestrator(t, store)
+		entry.DispatchID = "dispatch-incr-1"
+
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(10, 20, 30, 5))
+		entry.LastMetadataWrite = time.Now().UTC().Add(-sessionMetadataWriteInterval - time.Second)
+		o.maybeWriteIncrementalMetadata(ctx, "id-1", tokenUsageEvent(11, 21, 33, 6))
+
+		writes := store.sessionWrites()
+		if len(writes) != 2 {
+			t.Fatalf("UpsertSessionMetadata calls = %d, want 2", len(writes))
+		}
+		for i, w := range writes {
+			if w.DispatchID != "dispatch-incr-1" {
+				t.Errorf("writes[%d].DispatchID = %q, want %q", i, w.DispatchID, "dispatch-incr-1")
+			}
+		}
+	})
+
 	t.Run("store error does not advance the throttle timestamp", func(t *testing.T) {
 		t.Parallel()
 
@@ -5560,6 +6508,53 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 			t.Errorf("UpsertSessionMetadata calls = %d, want 2 (failed write not throttled)", len(writes))
 		}
 	})
+}
+
+// TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry delivers a
+// self-review progress message on the drain-loop selfReviewCh site while
+// the worker is still running and asserts the runtime snapshot reports
+// that progress before the worker exits.
+func TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry(t *testing.T) {
+	t.Parallel()
+
+	state := NewState(60000, 1, 0, nil, AgentTotals{})
+	state.Running["id-1"] = queuedOrderingIssueEntry("id-1")
+	store := &stubStore{}
+	tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
+	o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
+	// The drain must still serve snapshot requests when the poll below
+	// gives up, so its own deadline sits well beyond the poll's.
+	o.drainTimeout = time.Minute
+
+	done := make(chan struct{})
+	go func() {
+		o.drainRunningWorkers()
+		close(done)
+	}()
+
+	o.selfReviewCh <- selfReviewProgressMsg{IssueID: "id-1", Message: "self_review_iteration", Iteration: 2, MaxIterations: 3}
+
+	deadline := time.After(10 * time.Second)
+	for {
+		reply := make(chan RuntimeSnapshotResult, 1)
+		o.snapshotCh <- snapshotRequest{ReplyCh: reply}
+		snap := <-reply
+		if len(snap.Running) == 1 && snap.Running[0].SelfReviewActive && snap.Running[0].SelfReviewIteration == 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("RuntimeSnapshot().Running = %+v after 10s of drain, want one entry with SelfReviewActive true and SelfReviewIteration 2", snap.Running)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	o.workerExitCh <- WorkerResult{IssueID: "id-1", Identifier: "id-1-ident"}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drainRunningWorkers did not return within 10 seconds")
+	}
 }
 
 // TestDrainRunningWorkers_TokenUsageEventTriggersIncrementalWrite delivers a
@@ -7238,10 +8233,16 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 	// at the end of the test.
 	var runTurnStarted sync.WaitGroup
 	runTurnStarted.Add(2)
+	reportedUsage := domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CacheReadTokens: 5}
 	trackedAdapter := &mockAgentAdapter{
 		runTurnFn: func(_ context.Context, sess domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
 			runTurnStarted.Done()
-			return domain.TurnResult{SessionID: sess.ID, ExitReason: domain.EventTurnCompleted}, nil
+			return domain.TurnResult{
+				SessionID:     sess.ID,
+				ExitReason:    domain.EventTurnCompleted,
+				Usage:         reportedUsage,
+				UsageMeasured: true,
+			}, nil
 		},
 	}
 
@@ -7313,6 +8314,23 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 	if narrowedEntry.UsageArrival != registry.UsageArrivalNone || narrowedEntry.UsageAttribution != registry.UsageAttributionNone {
 		t.Errorf("rule-routed entry (UsageArrival, UsageAttribution) = (%q, %q), want (%q, %q)",
 			narrowedEntry.UsageArrival, narrowedEntry.UsageAttribution, registry.UsageArrivalNone, registry.UsageAttributionNone)
+	}
+
+	exitResults := make(map[string]WorkerResult, 2)
+	for i := range 2 {
+		select {
+		case r := <-o.workerExitCh:
+			exitResults[r.IssueID] = r
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for worker exit %d/2", i+1)
+		}
+	}
+
+	if got := exitResults[defaultIssue.ID].Usage; got != reportedUsage {
+		t.Errorf("default-kind WorkerResult.Usage = %+v, want %+v (the reported figure)", got, reportedUsage)
+	}
+	if got := exitResults[narrowedIssue.ID].Usage; got != (domain.TokenUsage{}) {
+		t.Errorf("rule-routed (none) WorkerResult.Usage = %+v, want zero", got)
 	}
 }
 

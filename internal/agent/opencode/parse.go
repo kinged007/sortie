@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 )
 
@@ -112,6 +114,14 @@ type exportUsage struct {
 	CacheReadTokens int64
 	Model           string
 	Cost            float64
+
+	// Recovered reports whether the export produced a figure at all,
+	// which is not the same question as whether that figure is non-zero.
+	// The runtime's assistant message carries `tokens` as a required
+	// object rather than one present only when something was spent, so a
+	// turn that genuinely cost zero exports the same shape as any other
+	// and must not read back as "nothing was recovered".
+	Recovered bool
 }
 
 func parseRunEvent(line []byte) (rawRunEvent, error) {
@@ -202,14 +212,22 @@ func queryExportUsage(ctx context.Context, state *sessionState, sinceUnixMS int6
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	stdout, err := cmd.Output()
-	if err != nil {
+	var stdout bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{
+		Stdout: &stdout,
+		Logger: state.logger(),
+	})
+	if startErr != nil || result.WaitErr != nil {
+		err := startErr
+		if err == nil {
+			err = result.WaitErr
+		}
 		state.logger().Warn("failed to export opencode usage", slog.Any("error", err))
 		return exportUsage{}
 	}
 
-	usage := parseExportOutput(stdout, sessionID, sinceUnixMS)
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+	usage := parseExportOutput(stdout.Bytes(), sessionID, sinceUnixMS)
+	if !usage.Recovered {
 		state.logger().Warn("no assistant token usage found in opencode export")
 	}
 	return usage
@@ -263,15 +281,23 @@ func queryModelNotFound(ctx context.Context, state *sessionState) (message strin
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	stdout, err := cmd.Output()
-	if err != nil {
+	var stdout bytes.Buffer
+	result, startErr := procutil.RunCapture(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{
+		Stdout: &stdout,
+		Logger: state.logger(),
+	})
+	if startErr != nil || result.WaitErr != nil {
+		err := startErr
+		if err == nil {
+			err = result.WaitErr
+		}
 		state.logger().Warn("failed to list opencode models", slog.Any("error", err))
 		return "", false
 	}
 
 	// Model identifiers are provider/model slugs without whitespace, so the
 	// catalog collapses to one entry per field regardless of line endings.
-	entries := strings.Fields(string(stdout))
+	entries := strings.Fields(stdout.String())
 	if len(entries) == 0 || slices.Contains(entries, model) {
 		return "", false
 	}
@@ -320,6 +346,13 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 				continue
 			}
 		}
+		// The runtime saves an assistant message with all-zero tokens before
+		// it calls the model, and fills them in together with `finish` when
+		// the step finishes. A message without `finish` is that placeholder,
+		// which a turn killed mid-step leaves behind, not a measurement.
+		if stringFromAny(info["finish"]) == "" {
+			continue
+		}
 		tokens := mapFromAny(info["tokens"])
 		if tokens == nil {
 			continue
@@ -365,6 +398,7 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 	}
 
 	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
+	sum.Recovered = true
 	return sum
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,6 +273,80 @@ func TestNewServiceConfig(t *testing.T) {
 		assertConfigErrorField(t, err, "polling.interval_ms")
 	})
 
+	t.Run("Coercion/Int64InRange", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": int64(5000)},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Polling.IntervalMS", 5000, cfg.Polling.IntervalMS)
+	})
+
+	t.Run("Coercion/Uint64InRange", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": uint64(5000)},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Polling.IntervalMS", 5000, cfg.Polling.IntervalMS)
+	})
+
+	t.Run("Coercion/Uint64OutOfRange", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": uint64(9223372036854775808)},
+		})
+		assertConfigErrorField(t, err, "polling.interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("Coercion/Float64OutOfRange", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": float64(1e20)},
+		})
+		assertConfigErrorField(t, err, "polling.interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("Coercion/StringOutOfRange", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": "99999999999999999999"},
+		})
+		assertConfigErrorField(t, err, "polling.interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("Coercion/NaNKeepsInvalidIntegerMessage", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": math.NaN()},
+		})
+		assertConfigErrorField(t, err, "polling.interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", "invalid integer value: NaN", ce.Message)
+	})
+
+	t.Run("Coercion/BoolRejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"polling": map[string]any{"interval_ms": true},
+		})
+		assertConfigErrorField(t, err, "polling.interval_ms")
+	})
+
 	t.Run("ByStateMap/Normalization", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
@@ -327,6 +402,64 @@ func TestNewServiceConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("ByStateMap/OutOfRangeUint64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{
+				"max_concurrent_agents_by_state": map[string]any{
+					"in progress": uint64(9223372036854775808),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "agent.max_concurrent_agents_by_state.in progress")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("ByStateMap/OutOfRangePositiveFloat64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{
+				"max_concurrent_agents_by_state": map[string]any{
+					"in progress": float64(1e20),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "agent.max_concurrent_agents_by_state.in progress")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("ByStateMap/OutOfRangeNegativeFloat64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{
+				"max_concurrent_agents_by_state": map[string]any{
+					"in progress": float64(-1e20),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "agent.max_concurrent_agents_by_state.in progress")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("ByStateMap/DeterministicFirstSortedKeyNamed", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{
+				"max_concurrent_agents_by_state": map[string]any{
+					"zzz_last":  uint64(9223372036854775808),
+					"aaa_first": float64(1e20),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "agent.max_concurrent_agents_by_state.aaa_first")
+	})
+
 	t.Run("HooksTimeout/Zero", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
@@ -342,6 +475,50 @@ func TestNewServiceConfig(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
 			"hooks": map[string]any{"timeout_ms": -100},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Hooks.TimeoutMS", 60000, cfg.Hooks.TimeoutMS)
+	})
+
+	t.Run("HooksTimeout/OutOfRangeUint64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"hooks": map[string]any{"timeout_ms": uint64(9223372036854775808)},
+		})
+		assertConfigErrorField(t, err, "hooks.timeout_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("HooksTimeout/OutOfRangePositiveFloat64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"hooks": map[string]any{"timeout_ms": float64(1e20)},
+		})
+		assertConfigErrorField(t, err, "hooks.timeout_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("HooksTimeout/OutOfRangeNegativeFloat64Rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"hooks": map[string]any{"timeout_ms": float64(-1e20)},
+		})
+		assertConfigErrorField(t, err, "hooks.timeout_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("HooksTimeout/NegativeInRangeStillDefaults", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"hooks": map[string]any{"timeout_ms": -5},
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1264,6 +1441,36 @@ func TestNewServiceConfig(t *testing.T) {
 		assertConfigErrorField(t, err, "reactions.ci.max_retries")
 	})
 
+	t.Run("Reactions/MaxRetriesOutOfRangeUint64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"reactions": map[string]any{
+				"ci": map[string]any{
+					"max_retries": uint64(9223372036854775808),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "reactions.ci.max_retries")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("Reactions/MaxRetriesOutOfRangeFloat64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"reactions": map[string]any{
+				"ci": map[string]any{
+					"max_retries": float64(1e20),
+				},
+			},
+		})
+		assertConfigErrorField(t, err, "reactions.ci.max_retries")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
 	t.Run("Reactions/InvalidEscalationValue", func(t *testing.T) {
 		t.Parallel()
 		_, err := NewServiceConfig(map[string]any{
@@ -1474,6 +1681,39 @@ func TestReactionsTriage(t *testing.T) {
 					t.Fatalf("NewServiceConfig() unexpected error: %v", err)
 				}
 				assertIntEqual(t, "Reactions[merge_conflicts].Triage.TimeoutMS", tt.timeoutMS, cfg.Reactions["merge_conflicts"].Triage.TimeoutMS)
+			})
+		}
+	})
+
+	t.Run("TimeoutMSOutOfRange", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name      string
+			timeoutMS any
+		}{
+			{"uint64_out_of_range", uint64(9223372036854775808)},
+			{"float64_out_of_range", float64(1e20)},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := NewServiceConfig(map[string]any{
+					"reactions": map[string]any{
+						"merge_conflicts": map[string]any{
+							"triage": map[string]any{
+								"script":     "./triage.sh",
+								"timeout_ms": tt.timeoutMS,
+							},
+						},
+					},
+				})
+				assertConfigErrorField(t, err, "reactions.merge_conflicts.triage.timeout_ms")
+				var ce *ConfigError
+				errors.As(err, &ce)
+				assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
 			})
 		}
 	})
@@ -1729,6 +1969,30 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 			"poll_interval_ms": "not-a-number",
 		})
 		assertConfigErrorField(t, err, "reactions.label_commands.poll_interval_ms")
+	})
+
+	t.Run("out-of-range uint64 value is a range ConfigError", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildLabelCommandsConfig(map[string]any{
+			"provider":         "github",
+			"poll_interval_ms": uint64(9223372036854775808),
+		})
+		assertConfigErrorField(t, err, "reactions.label_commands.poll_interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("out-of-range float64 value is a range ConfigError", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildLabelCommandsConfig(map[string]any{
+			"provider":         "github",
+			"poll_interval_ms": float64(1e20),
+		})
+		assertConfigErrorField(t, err, "reactions.label_commands.poll_interval_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
 	})
 }
 
@@ -2532,6 +2796,34 @@ func TestNewServiceConfig_SelfReview(t *testing.T) {
 		}
 	})
 
+	t.Run("MaxIterations_OutOfRangeUint64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"self_review": map[string]any{
+				"enabled": true, "verification_commands": []any{"echo ok"},
+				"max_iterations": uint64(9223372036854775808),
+			},
+		})
+		assertConfigErrorField(t, err, "self_review.max_iterations")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("MaxIterations_OutOfRangeFloat64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"self_review": map[string]any{
+				"enabled": true, "verification_commands": []any{"echo ok"},
+				"max_iterations": float64(1e20),
+			},
+		})
+		assertConfigErrorField(t, err, "self_review.max_iterations")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
 	t.Run("Reviewer_Invalid", func(t *testing.T) {
 		t.Parallel()
 		_, err := NewServiceConfig(map[string]any{
@@ -2656,6 +2948,24 @@ func TestNewServiceConfig_AgentTurnTimeoutMS(t *testing.T) {
 			t.Fatalf("NewServiceConfig: %v", err)
 		}
 		assertIntEqual(t, "Agent.TurnTimeoutMS", 3600000, cfg.Agent.TurnTimeoutMS)
+	})
+
+	t.Run("OutOfRangeUint64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{"agent": map[string]any{"turn_timeout_ms": uint64(9223372036854775808)}})
+		assertConfigErrorField(t, err, "agent.turn_timeout_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
+	})
+
+	t.Run("OutOfRangeFloat64", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{"agent": map[string]any{"turn_timeout_ms": float64(1e20)}})
+		assertConfigErrorField(t, err, "agent.turn_timeout_ms")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", ErrIntegerOutOfRange.Error(), ce.Message)
 	})
 }
 
@@ -2807,6 +3117,26 @@ func TestPopulateCIFeedbackFromReactions(t *testing.T) {
 			},
 			wantErr:   true,
 			wantField: "reactions.ci_failure.max_log_lines",
+		},
+		{
+			name: "MaxLogLinesOutOfRangeUint64",
+			rc: ReactionConfig{
+				Provider: "github-actions",
+				Extra:    map[string]any{"max_log_lines": uint64(9223372036854775808)},
+			},
+			wantErr:       true,
+			wantField:     "reactions.ci_failure.max_log_lines",
+			wantMsgSubstr: ErrIntegerOutOfRange.Error(),
+		},
+		{
+			name: "MaxLogLinesOutOfRangeFloat64",
+			rc: ReactionConfig{
+				Provider: "github-actions",
+				Extra:    map[string]any{"max_log_lines": float64(1e20)},
+			},
+			wantErr:       true,
+			wantField:     "reactions.ci_failure.max_log_lines",
+			wantMsgSubstr: ErrIntegerOutOfRange.Error(),
 		},
 		{
 			name: "EmptyProviderReturnsZero",

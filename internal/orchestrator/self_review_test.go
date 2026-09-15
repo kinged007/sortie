@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1638,4 +1639,104 @@ func TestSelfReviewLoop_FixTurnTimeoutAnnotatesIteration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// recordingReviewAdapter logs "run_turn" as each RunTurn call begins.
+type recordingReviewAdapter struct {
+	domain.AgentAdapter
+	log *[]string
+}
+
+func (r *recordingReviewAdapter) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+	*r.log = append(*r.log, "run_turn")
+	return r.AgentAdapter.RunTurn(ctx, session, params)
+}
+
+// TestSelfReviewLoop_OnTurnStartedCalledBeforeEachTurn verifies that
+// OnTurnStarted fires once before each review turn and each fix turn.
+func TestSelfReviewLoop_OnTurnStartedCalledBeforeEachTurn(t *testing.T) {
+	t.Parallel()
+
+	t.Run("called immediately before the review turn and the fix turn, in order", func(t *testing.T) {
+		t.Parallel()
+
+		wsPath := t.TempDir()
+		m := &reviewMetricsCount{}
+		turns := 0
+		var log []string
+
+		// The empty verdict belongs to the fix turn.
+		adapter := &recordingReviewAdapter{
+			AgentAdapter: &verdictWriter{
+				wsPath: wsPath,
+				verdicts: []domain.ReviewVerdict{
+					{Verdict: "iterate", Summary: "need fix"},
+					{},
+					{Verdict: "pass", Summary: "done"},
+				},
+			},
+			log: &log,
+		}
+
+		meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+			Session:        domain.Session{ID: "sess"},
+			Issue:          selfReviewIssue(),
+			WorkspacePath:  wsPath,
+			Config:         selfReviewCfg(),
+			AgentAdapter:   adapter,
+			OnEvent:        func(_ string, _ domain.AgentEvent) {},
+			OnTurnStarted:  func() { log = append(log, "turn_started") },
+			Logger:         discardLogger(),
+			Metrics:        m,
+			TurnsCompleted: &turns,
+		})
+
+		if meta == nil {
+			t.Fatal("meta = nil, want non-nil")
+		}
+		if meta.FinalVerdict != "pass" {
+			t.Errorf("FinalVerdict = %q, want %q", meta.FinalVerdict, "pass")
+		}
+
+		want := []string{
+			"turn_started", "run_turn",
+			"turn_started", "run_turn",
+			"turn_started", "run_turn",
+		}
+		if !slices.Equal(log, want) {
+			t.Errorf("interleaved OnTurnStarted/RunTurn order = %v, want %v", log, want)
+		}
+	})
+
+	t.Run("not called for a fix turn the loop never starts", func(t *testing.T) {
+		t.Parallel()
+
+		wsPath := t.TempDir()
+		m := &reviewMetricsCount{}
+		turns := 0
+		var log []string
+
+		adapter := &recordingReviewAdapter{
+			AgentAdapter: &failOnFirstAdapter{wsPath: wsPath},
+			log:          &log,
+		}
+
+		_, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+			Session:        domain.Session{ID: "sess"},
+			Issue:          selfReviewIssue(),
+			WorkspacePath:  wsPath,
+			Config:         selfReviewCfg(),
+			AgentAdapter:   adapter,
+			OnEvent:        func(_ string, _ domain.AgentEvent) {},
+			OnTurnStarted:  func() { log = append(log, "turn_started") },
+			Logger:         discardLogger(),
+			Metrics:        m,
+			TurnsCompleted: &turns,
+		})
+
+		want := []string{"turn_started", "run_turn"}
+		if !slices.Equal(log, want) {
+			t.Errorf("interleaved OnTurnStarted/RunTurn order = %v, want %v (the failed review turn only, no fix turn)", log, want)
+		}
+	})
 }

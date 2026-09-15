@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math"
@@ -1122,6 +1123,30 @@ func TestWatchWindowMS(t *testing.T) {
 			extra:   map[string]any{"watch_window_ms": 1.5},
 			wantErr: true,
 		},
+		{
+			name:    "NaN is rejected",
+			extra:   map[string]any{"watch_window_ms": math.NaN()},
+			wantErr: true,
+		},
+		{
+			name:  "uint64 in range is accepted",
+			extra: map[string]any{"watch_window_ms": uint64(3600000)},
+			want:  3600000,
+		},
+		{
+			name:    "uint64 out of range is rejected with the range diagnostic",
+			extra:   map[string]any{"watch_window_ms": uint64(9223372036854775808)},
+			wantErr: true,
+			wantErrText: "invalid watch_window_ms: " +
+				"value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807",
+		},
+		{
+			name:    "float64 out of range is rejected with the range diagnostic",
+			extra:   map[string]any{"watch_window_ms": float64(1e20)},
+			wantErr: true,
+			wantErrText: "invalid watch_window_ms: " +
+				"value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1153,10 +1178,11 @@ func TestBuildAutoMergeReactionConfig_DefaultsAndOverrides(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		rc      config.ReactionConfig
-		want    AutoMergeReactionConfig
-		wantErr bool
+		name      string
+		rc        config.ReactionConfig
+		want      AutoMergeReactionConfig
+		wantErr   bool
+		wantErrIs error // when set, err must satisfy errors.Is(err, wantErrIs)
 	}{
 		{
 			name: "all defaults",
@@ -1319,6 +1345,18 @@ func TestBuildAutoMergeReactionConfig_DefaultsAndOverrides(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:      "poll_interval_ms out of range as uint64",
+			rc:        config.ReactionConfig{Extra: map[string]any{"poll_interval_ms": uint64(9223372036854775808)}},
+			wantErr:   true,
+			wantErrIs: config.ErrIntegerOutOfRange,
+		},
+		{
+			name:      "poll_interval_ms out of range as float64",
+			rc:        config.ReactionConfig{Extra: map[string]any{"poll_interval_ms": float64(1e20)}},
+			wantErr:   true,
+			wantErrIs: config.ErrIntegerOutOfRange,
+		},
+		{
 			name:    "invalid escalation value",
 			rc:      config.ReactionConfig{Escalation: "webhook"},
 			wantErr: true,
@@ -1333,6 +1371,9 @@ func TestBuildAutoMergeReactionConfig_DefaultsAndOverrides(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("BuildAutoMergeReactionConfig() = nil error, want error")
+				}
+				if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+					t.Errorf("BuildAutoMergeReactionConfig() error = %v, want it to satisfy errors.Is(err, %v)", err, tt.wantErrIs)
 				}
 				return
 			}
@@ -2295,6 +2336,60 @@ func TestRuntimeSnapshot_UsageDispositionFields(t *testing.T) {
 				t.Errorf("TokensPending = %v, want %v", got.TokensPending, tt.wantTokenPending)
 			}
 		})
+	}
+}
+
+// TestRuntimeSnapshot_AgentTotalsExclusionCounts verifies RunningUnreported
+// and RunningNonReporting partition the running set by mutually exclusive
+// reasons, leaving a measured session in neither.
+func TestRuntimeSnapshot_AgentTotalsExclusionCounts(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	state := NewState(5000, 4, 0, nil, AgentTotals{UnmeasuredSessions: 5})
+	state.Running["unreported-inc"] = &RunningEntry{
+		Identifier:   "PROJ-1",
+		Issue:        domain.Issue{ID: "unreported-inc", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalIncremental,
+	}
+	state.Running["unreported-turnend"] = &RunningEntry{
+		Identifier:   "PROJ-2",
+		Issue:        domain.Issue{ID: "unreported-turnend", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalTurnEnd,
+	}
+	state.Running["no-arrival-1"] = &RunningEntry{
+		Identifier:   "PROJ-3",
+		Issue:        domain.Issue{ID: "no-arrival-1", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalNone,
+	}
+	state.Running["no-arrival-2"] = &RunningEntry{
+		Identifier:   "PROJ-4",
+		Issue:        domain.Issue{ID: "no-arrival-2", State: "In Progress"},
+		StartedAt:    fixedNow.Add(-time.Minute),
+		UsageArrival: registry.UsageArrivalNone,
+	}
+	state.Running["measured"] = &RunningEntry{
+		Identifier:    "PROJ-5",
+		Issue:         domain.Issue{ID: "measured", State: "In Progress"},
+		StartedAt:     fixedNow.Add(-time.Minute),
+		UsageArrival:  registry.UsageArrivalIncremental,
+		UsageMeasured: true,
+	}
+
+	result := RuntimeSnapshot(state, fixedNow)
+
+	if result.AgentTotals.RunningUnreported != 2 {
+		t.Errorf("AgentTotals.RunningUnreported = %d, want 2", result.AgentTotals.RunningUnreported)
+	}
+	if result.AgentTotals.RunningNonReporting != 2 {
+		t.Errorf("AgentTotals.RunningNonReporting = %d, want 2", result.AgentTotals.RunningNonReporting)
+	}
+	if result.AgentTotals.UnmeasuredSessions != 5 {
+		t.Errorf("AgentTotals.UnmeasuredSessions = %d, want 5 (passthrough of the persisted counter)", result.AgentTotals.UnmeasuredSessions)
 	}
 }
 

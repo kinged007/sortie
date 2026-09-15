@@ -6,7 +6,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// TestTurnEndUsage_FinalizeOrdering pins P1 and P2: a non-nil recovered
+// TestTurnEndUsage_FinalizeOrdering verifies that a non-nil recovered
 // figure emits exactly one token_usage event, positioned after every
 // event the caller emitted before calling Finalize and immediately
 // before the terminal event, with nothing following the terminal
@@ -67,7 +67,7 @@ func TestTurnEndUsage_FinalizeOrdering(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport pins P3: a turn
+// TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport verifies that a turn
 // finalized with a nil recovered figure emits no token_usage event, and
 // its terminal event and TurnResult carry Snapshot() (the zero value,
 // since no turn has settled a figure yet).
@@ -104,7 +104,7 @@ func TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_UsageMeasuredLatches pins P4: TurnResult.UsageMeasured
+// TestTurnEndUsage_UsageMeasuredLatches verifies that TurnResult.UsageMeasured
 // is false on every turn before the first non-nil recovered figure, and
 // true on that turn and every later turn of the session, including a
 // later turn finalized with nil.
@@ -115,23 +115,36 @@ func TestTurnEndUsage_UsageMeasuredLatches(t *testing.T) {
 	u := NewTurnEndUsage()
 	ev := TurnEvidence{Terminal: TerminalSuccess}
 
+	if u.Measured() {
+		t.Error("Measured() on a value from NewTurnEndUsage = true, want false")
+	}
+
 	unmeasured, _ := u.Finalize(emit, nil, ev, "s", 0, nil)
 	if unmeasured.UsageMeasured {
 		t.Error("turn finalized before any recovered figure: UsageMeasured = true, want false")
+	}
+	if u.Measured() != unmeasured.UsageMeasured {
+		t.Errorf("Measured() = %v, want %v (equal to Finalize's UsageMeasured)", u.Measured(), unmeasured.UsageMeasured)
 	}
 
 	measured, _ := u.Finalize(emit, nil, ev, "s", 0, &RecoveredUsage{Run: domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}})
 	if !measured.UsageMeasured {
 		t.Error("turn finalized with the first non-nil recovered figure: UsageMeasured = false, want true")
 	}
+	if u.Measured() != measured.UsageMeasured {
+		t.Errorf("Measured() = %v, want %v (equal to Finalize's UsageMeasured)", u.Measured(), measured.UsageMeasured)
+	}
 
 	laterNil, _ := u.Finalize(emit, nil, ev, "s", 0, nil)
 	if !laterNil.UsageMeasured {
 		t.Error("later turn finalized with nil after a measured turn: UsageMeasured = false, want true")
 	}
+	if u.Measured() != laterNil.UsageMeasured {
+		t.Errorf("Measured() = %v, want %v (equal to Finalize's UsageMeasured)", u.Measured(), laterNil.UsageMeasured)
+	}
 }
 
-// TestTurnEndUsage_SnapshotNonDecreasing pins P5: over a rising-then-
+// TestTurnEndUsage_SnapshotNonDecreasing verifies that, over a rising-then-
 // falling sequence of recovered.Run values, Snapshot() and every
 // emitted Usage are componentwise non-decreasing, and TotalTokens
 // always equals InputTokens plus OutputTokens.

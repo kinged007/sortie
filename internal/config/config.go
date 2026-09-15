@@ -5,6 +5,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/maputil"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
@@ -532,7 +534,10 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		return ServiceConfig{}, err
 	}
 
-	hooks := buildHooksConfig(extractSubMap(raw, "hooks"))
+	hooks, err := buildHooksConfig(extractSubMap(raw, "hooks"))
+	if err != nil {
+		return ServiceConfig{}, err
+	}
 
 	agent, err := buildAgentConfig(extractSubMap(raw, "agent"))
 	if err != nil {
@@ -788,8 +793,14 @@ func buildWorkspaceConfig(m map[string]any, envKeys map[string]bool) (WorkspaceC
 	return WorkspaceConfig{Root: root, RetentionDays: retentionDays}, nil
 }
 
-func buildHooksConfig(m map[string]any) HooksConfig {
+func buildHooksConfig(m map[string]any) (HooksConfig, error) {
 	timeoutMS, err := coerceIntFieldSafe(m, "timeout_ms")
+	if err != nil && errors.Is(err, ErrIntegerOutOfRange) {
+		return HooksConfig{}, &ConfigError{
+			Field:   "hooks.timeout_ms",
+			Message: ErrIntegerOutOfRange.Error(),
+		}
+	}
 	if err != nil || timeoutMS <= 0 {
 		timeoutMS = 60000
 	}
@@ -799,7 +810,7 @@ func buildHooksConfig(m map[string]any) HooksConfig {
 		AfterRun:     extractString(m, "after_run"),
 		BeforeRemove: extractString(m, "before_remove"),
 		TimeoutMS:    timeoutMS,
-	}
+	}, nil
 }
 
 func buildDBPath(raw map[string]any, envKeys map[string]bool) (string, error) {
@@ -815,7 +826,7 @@ func buildDBPath(raw map[string]any, envKeys map[string]bool) (string, error) {
 		}
 	}
 	// Explicit empty string (db_path: "") is equivalent to omitting
-	// the field — the caller applies its default path.
+	// the field, and the caller applies its default path.
 	if s == "" {
 		return "", nil
 	}
@@ -855,7 +866,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		if err != nil {
 			return AgentConfig{}, &ConfigError{
 				Field:   "agent.turn_timeout_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		turnTimeoutMS = parsed
@@ -883,7 +894,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		if err != nil {
 			return AgentConfig{}, &ConfigError{
 				Field:   "agent.stall_timeout_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		stallTimeoutMS = parsed
@@ -895,7 +906,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		if err != nil {
 			return AgentConfig{}, &ConfigError{
 				Field:   "agent.stop_grace_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		stopGraceMS = parsed
@@ -937,7 +948,10 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		maxRetryBackoff = 300000
 	}
 
-	byState := normalizeByStateMap(mapVal(m, "max_concurrent_agents_by_state"))
+	byState, err := normalizeByStateMap(mapVal(m, "max_concurrent_agents_by_state"))
+	if err != nil {
+		return AgentConfig{}, err
+	}
 
 	maxSessions, err := coerceIntField(m, "max_sessions", "agent.max_sessions")
 	if err != nil {
@@ -971,7 +985,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		if err != nil {
 			return AgentConfig{}, &ConfigError{
 				Field:   "agent.max_consecutive_absences",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		maxConsecutiveAbsences = parsed
@@ -1087,7 +1101,7 @@ func populateCIFeedbackFromReactions(rc ReactionConfig) (CIFeedbackConfig, error
 		if err != nil {
 			return CIFeedbackConfig{}, &ConfigError{
 				Field:   "reactions.ci_failure.max_log_lines",
-				Message: fmt.Sprintf("invalid integer value: %v", raw),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", raw)),
 			}
 		}
 		maxLogLines = parsed
@@ -1105,7 +1119,7 @@ func populateCIFeedbackFromReactions(rc ReactionConfig) (CIFeedbackConfig, error
 		if err != nil {
 			return CIFeedbackConfig{}, &ConfigError{
 				Field:   "reactions.ci_failure.watch_window_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", raw),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", raw)),
 			}
 		}
 		watchWindowMS = parsed
@@ -1158,7 +1172,7 @@ func buildSelfReviewConfig(m map[string]any) (SelfReviewConfig, error) {
 		if err != nil {
 			return SelfReviewConfig{}, &ConfigError{
 				Field:   "self_review.max_iterations",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		maxIter = parsed
@@ -1185,7 +1199,7 @@ func buildSelfReviewConfig(m map[string]any) (SelfReviewConfig, error) {
 		if err != nil {
 			return SelfReviewConfig{}, &ConfigError{
 				Field:   "self_review.verification_timeout_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		timeoutMS = parsed
@@ -1203,7 +1217,7 @@ func buildSelfReviewConfig(m map[string]any) (SelfReviewConfig, error) {
 		if err != nil {
 			return SelfReviewConfig{}, &ConfigError{
 				Field:   "self_review.max_diff_bytes",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		maxDiffBytes = parsed
@@ -1452,17 +1466,38 @@ func coerceInt(x any) (int, error) {
 	switch v := x.(type) {
 	case int:
 		return v, nil
-	case int64:
-		return int(v), nil
 	case int32:
 		return int(v), nil
+	case int64:
+		n, ok := IntFromNumber(v)
+		if !ok {
+			return 0, ErrIntegerOutOfRange
+		}
+		return n, nil
+	case uint64:
+		n, ok := IntFromNumber(v)
+		if !ok {
+			return 0, ErrIntegerOutOfRange
+		}
+		return n, nil
 	case float64:
 		if v != math.Trunc(v) {
 			return 0, fmt.Errorf("fractional value %v", v)
 		}
-		return int(v), nil
+		n, ok := IntFromNumber(v)
+		if !ok {
+			return 0, ErrIntegerOutOfRange
+		}
+		return n, nil
 	case string:
-		return strconv.Atoi(strings.TrimSpace(v))
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			if errors.Is(err, strconv.ErrRange) {
+				return 0, ErrIntegerOutOfRange
+			}
+			return 0, err
+		}
+		return n, nil
 	default:
 		return 0, fmt.Errorf("unsupported type %T", x)
 	}
@@ -1479,14 +1514,15 @@ func coerceIntField(m map[string]any, key, field string) (int, error) {
 	if err != nil {
 		return 0, &ConfigError{
 			Field:   field,
-			Message: fmt.Sprintf("invalid integer value: %v", v),
+			Message: integerFaultMessage(err, fmt.Sprintf("invalid integer value: %v", v)),
 		}
 	}
 	return n, nil
 }
 
 // coerceIntFieldSafe is like coerceIntField but never returns a
-// ConfigError — the caller handles failure by falling back to a default.
+// [*ConfigError] itself; it reports a coercion error as a plain error,
+// leaving the disposition to the caller.
 func coerceIntFieldSafe(m map[string]any, key string) (int, error) {
 	v, exists := m[key]
 	if !exists || v == nil {
@@ -1766,7 +1802,7 @@ func buildReactionsConfig(m map[string]any) (map[string]ReactionConfig, error) {
 			if parseErr != nil {
 				return nil, &ConfigError{
 					Field:   "reactions." + k + ".max_retries",
-					Message: fmt.Sprintf("invalid integer value: %v", raw),
+					Message: integerFaultMessage(parseErr, fmt.Sprintf("invalid integer value: %v", raw)),
 				}
 			}
 			maxRetries = parsed
@@ -1874,7 +1910,7 @@ func buildReactionTriageConfig(raw any, fieldPrefix string) (ReactionTriageConfi
 		if coerceErr != nil {
 			return ReactionTriageConfig{}, &ConfigError{
 				Field:   fieldPrefix + ".triage.timeout_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", v),
+				Message: integerFaultMessage(coerceErr, fmt.Sprintf("invalid integer value: %v", v)),
 			}
 		}
 		timeoutMS = n
@@ -1964,7 +2000,7 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 		if pErr != nil {
 			return LabelCommandsConfig{}, &ConfigError{
 				Field:   "reactions.label_commands.poll_interval_ms",
-				Message: fmt.Sprintf("invalid integer value: %v", raw),
+				Message: integerFaultMessage(pErr, fmt.Sprintf("invalid integer value: %v", raw)),
 			}
 		}
 		if n < 30000 {
@@ -1993,21 +2029,30 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 	}, nil
 }
 
-func normalizeByStateMap(raw any) map[string]int {
+func normalizeByStateMap(raw any) (map[string]int, error) {
 	byState := make(map[string]int)
 	if raw == nil {
-		return byState
+		return byState, nil
 	}
 	rawMap, ok := raw.(map[string]any)
 	if !ok {
-		return byState
+		return byState, nil
 	}
-	for key, v := range rawMap {
-		n, err := coerceInt(v)
-		if err != nil || n <= 0 {
+	for _, key := range maputil.SortedKeys(rawMap) {
+		n, err := coerceInt(rawMap[key])
+		if err != nil {
+			if errors.Is(err, ErrIntegerOutOfRange) {
+				return nil, &ConfigError{
+					Field:   "agent.max_concurrent_agents_by_state." + key,
+					Message: ErrIntegerOutOfRange.Error(),
+				}
+			}
+			continue
+		}
+		if n <= 0 {
 			continue
 		}
 		byState[strings.ToLower(key)] = n
 	}
-	return byState
+	return byState, nil
 }

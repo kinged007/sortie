@@ -1416,6 +1416,84 @@ func TestRunTurn_ContextCancelledBeforeStart(t *testing.T) {
 	}
 }
 
+// TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn drives two turns on
+// one session: the first turn's result carries a usage object and measures
+// the run, and the second turn is cancelled via context before it
+// completes. It asserts the second turn's UsageMeasured stays true and its
+// Usage equals the first turn's, since the measured verdict lives in the
+// session's state rather than being derived fresh per turn.
+func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := fakeSequentialClaude(t, tmpDir,
+		agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"measured-persists","cwd":"/tmp"}
+{"type":"result","subtype":"success","result":"done","is_error":false,"usage":{"input_tokens":100,"output_tokens":50},"session_id":"measured-persists"}
+`},
+		agenttest.Output{
+			Stdout: `{"type":"system","subtype":"init","session_id":"measured-persists","cwd":"/tmp"}
+`,
+			Hang: true,
+		},
+	)
+
+	adapter, _ := NewClaudeCodeAdapter(map[string]any{})
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		AgentConfig:   domain.AgentConfig{Command: script},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "first",
+		OnEvent: func(domain.AgentEvent) {},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn(first) error = %v", err)
+	}
+	if !result1.UsageMeasured {
+		t.Fatal("RunTurn(first).UsageMeasured = false, want true")
+	}
+	if result1.Usage == (domain.TokenUsage{}) {
+		t.Fatal("RunTurn(first).Usage is zero, want non-zero")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var result2 domain.TurnResult
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		result2, runErr = adapter.RunTurn(ctx, session, domain.RunTurnParams{
+			Prompt: "second",
+			OnEvent: func(e domain.AgentEvent) {
+				if e.Type == domain.EventSessionStarted {
+					cancel()
+				}
+			},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunTurn(second) did not return within 10s")
+	}
+
+	var agentErr *domain.AgentError
+	if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
+		t.Fatalf("RunTurn(second) error = %v, want AgentError{Kind: %q}", runErr, domain.ErrTurnCancelled)
+	}
+	if !result2.UsageMeasured {
+		t.Error("RunTurn(second).UsageMeasured = false, want true (measured on the first turn)")
+	}
+	if result2.Usage != result1.Usage {
+		t.Errorf("RunTurn(second).Usage = %+v, want %+v (equal to the first turn's)", result2.Usage, result1.Usage)
+	}
+}
+
 func TestRunTurn_PanicsOnNilOnEvent(t *testing.T) {
 	t.Parallel()
 

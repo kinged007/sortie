@@ -78,8 +78,7 @@ func TestHandleAgentEvent_BasicFields(t *testing.T) {
 }
 
 // TestHandleAgentEvent_SessionStarted verifies that EventSessionStarted
-// populates SessionID and AgentPID on the entry and increments TurnCount
-// by 1, reflecting that turn_count counts turns started.
+// populates SessionID and AgentPID on the entry.
 func TestHandleAgentEvent_SessionStarted(t *testing.T) {
 	t.Parallel()
 
@@ -98,9 +97,6 @@ func TestHandleAgentEvent_SessionStarted(t *testing.T) {
 	}
 	if entry.AgentPID != "9999" {
 		t.Errorf("AgentPID = %q, want %q", entry.AgentPID, "9999")
-	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1 (session_started increments turn count)", entry.TurnCount)
 	}
 }
 
@@ -124,54 +120,54 @@ func TestHandleAgentEvent_SessionStarted_EmptySessionID(t *testing.T) {
 	}
 }
 
-// TestHandleAgentEvent_TurnCount verifies the turn-count semantics:
-// TurnCount counts turns started, so session_started events increment it.
-// Finalization and other event types must not change TurnCount.
+// TestHandleAgentEvent_TurnCount verifies that no agent event changes TurnCount.
 func TestHandleAgentEvent_TurnCount(t *testing.T) {
 	t.Parallel()
 
-	t.Run("increments on session_started", func(t *testing.T) {
-		t.Parallel()
-		state, entry := newStateWithEntry("MT-4")
-
-		HandleAgentEvent(state, "MT-4", domain.AgentEvent{
-			Type:      domain.EventSessionStarted,
-			Timestamp: time.Now().UTC(),
-			SessionID: "s1",
-		}, slog.Default(), nil)
-
-		if entry.TurnCount != 1 {
-			t.Errorf("TurnCount = %d, want 1 for session_started", entry.TurnCount)
-		}
-	})
-
-	noIncrementTypes := []struct {
-		name      string
-		eventType domain.AgentEventType
-	}{
-		{"turn_completed", domain.EventTurnCompleted},
-		{"turn_failed", domain.EventTurnFailed},
-		{"turn_cancelled", domain.EventTurnCancelled},
-		{"turn_ended_with_error", domain.EventTurnEndedWithError},
-		{"turn_input_required", domain.EventTurnInputRequired},
-		{"startup_failed", domain.EventStartupFailed},
-		{"notification", domain.EventNotification},
-		{"token_usage", domain.EventTokenUsage},
-		{"other_message", domain.EventOtherMessage},
+	eventTypes := []domain.AgentEventType{
+		domain.EventSessionStarted,
+		domain.EventStartupFailed,
+		domain.EventTurnCompleted,
+		domain.EventTurnFailed,
+		domain.EventTurnCancelled,
+		domain.EventTurnEndedWithError,
+		domain.EventTurnInputRequired,
+		domain.EventTokenUsage,
+		domain.EventNotification,
+		domain.EventOtherMessage,
+		domain.EventMalformed,
+		domain.EventToolResult,
 	}
 
-	for _, nft := range noIncrementTypes {
-		t.Run("no increment on "+nft.name, func(t *testing.T) {
+	for _, eventType := range eventTypes {
+		t.Run(string(eventType)+" from a zero TurnCount", func(t *testing.T) {
 			t.Parallel()
-			state, entry := newStateWithEntry("MT-5")
+			state, entry := newStateWithEntry("TC-ZERO")
 
-			HandleAgentEvent(state, "MT-5", domain.AgentEvent{
-				Type:      nft.eventType,
+			HandleAgentEvent(state, "TC-ZERO", domain.AgentEvent{
+				Type:      eventType,
 				Timestamp: time.Now().UTC(),
+				SessionID: "s1",
 			}, slog.Default(), nil)
 
 			if entry.TurnCount != 0 {
-				t.Errorf("TurnCount = %d, want 0 for %q", entry.TurnCount, nft.eventType)
+				t.Errorf("TurnCount = %d, want 0 (unchanged) for %q", entry.TurnCount, eventType)
+			}
+		})
+
+		t.Run(string(eventType)+" from a nonzero TurnCount", func(t *testing.T) {
+			t.Parallel()
+			state, entry := newStateWithEntry("TC-NONZERO")
+			entry.TurnCount = 3
+
+			HandleAgentEvent(state, "TC-NONZERO", domain.AgentEvent{
+				Type:      eventType,
+				Timestamp: time.Now().UTC(),
+				SessionID: "s1",
+			}, slog.Default(), nil)
+
+			if entry.TurnCount != 3 {
+				t.Errorf("TurnCount = %d, want 3 (unchanged) for %q", entry.TurnCount, eventType)
 			}
 		})
 	}
@@ -308,8 +304,8 @@ func TestHandleAgentEvent_FullSequence(t *testing.T) {
 	if entry.LastAgentEvent != "turn_completed" {
 		t.Errorf("LastAgentEvent = %q, want %q", entry.LastAgentEvent, "turn_completed")
 	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1", entry.TurnCount)
+	if entry.TurnCount != 0 {
+		t.Errorf("TurnCount = %d, want 0 (HandleAgentEvent never sets it)", entry.TurnCount)
 	}
 	if entry.AgentInputTokens != 200 {
 		t.Errorf("AgentInputTokens = %d, want 200", entry.AgentInputTokens)
@@ -645,13 +641,7 @@ func TestHandleAgentEvent_DebugLogging(t *testing.T) {
 
 		state, entry := newStateWithEntry(issueID)
 		entry.Identifier = identifier
-
-		// Send session_started first so TurnCount = 1 when turn_completed fires.
-		HandleAgentEvent(state, issueID, domain.AgentEvent{
-			Type:      domain.EventSessionStarted,
-			Timestamp: time.Now().UTC(),
-			SessionID: "sess-log",
-		}, logger, nil)
+		entry.TurnCount = 1
 
 		HandleAgentEvent(state, issueID, domain.AgentEvent{
 			Type:      domain.EventTurnCompleted,
@@ -1212,6 +1202,50 @@ func TestHandleAgentEvent_ModelTracking_NoModel(t *testing.T) {
 	}
 }
 
+// TestTokenUsageModel verifies that tokenUsageModel returns a
+// token_usage event's Model verbatim, whitespace-only value included,
+// and "" for any other event type even when Model is set.
+func TestTokenUsageModel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		event domain.AgentEvent
+		want  string
+	}{
+		{
+			name:  "token_usage event returns its model verbatim",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: "claude-sonnet-4-20250514"},
+			want:  "claude-sonnet-4-20250514",
+		},
+		{
+			name:  "token_usage event with a whitespace-only model returns it verbatim",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: "   "},
+			want:  "   ",
+		},
+		{
+			name:  "token_usage event with an empty model returns empty",
+			event: domain.AgentEvent{Type: domain.EventTokenUsage, Model: ""},
+			want:  "",
+		},
+		{
+			name:  "a non-token_usage event returns empty even when Model is set",
+			event: domain.AgentEvent{Type: domain.EventTurnCompleted, Model: "claude-sonnet-4-20250514"},
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tokenUsageModel(tt.event); got != tt.want {
+				t.Errorf("tokenUsageModel(%+v) = %q, want %q", tt.event, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestHandleAgentEvent_CacheReadTokens_DebugLog verifies that the
 // delta_cache_read field appears in the debug log for token_usage events.
 func TestHandleAgentEvent_CacheReadTokens_DebugLog(t *testing.T) {
@@ -1386,7 +1420,6 @@ func TestHandleAgentEvent_CombinedTimingAccumulation(t *testing.T) {
 	state, entry := newStateWithEntry("COMBO-1")
 	ts := time.Now().UTC()
 
-	// Session started, increments TurnCount to 1.
 	HandleAgentEvent(state, "COMBO-1", domain.AgentEvent{
 		Type:      domain.EventSessionStarted,
 		Timestamp: ts,
@@ -1421,8 +1454,8 @@ func TestHandleAgentEvent_CombinedTimingAccumulation(t *testing.T) {
 	if entry.ToolTimeMs != 200 {
 		t.Errorf("ToolTimeMs = %d, want 200", entry.ToolTimeMs)
 	}
-	if entry.TurnCount != 1 {
-		t.Errorf("TurnCount = %d, want 1", entry.TurnCount)
+	if entry.TurnCount != 0 {
+		t.Errorf("TurnCount = %d, want 0 (HandleAgentEvent never sets it)", entry.TurnCount)
 	}
 }
 
@@ -1637,39 +1670,14 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 	})
 }
 
-// TestHandleAgentEvent_UsageDeclarationDriftLog proves the corrected
-// declaration-drift log: a none-arrival entry logs on any token_usage
-// event; a turn_end-arrival entry logs only when a turn reports more
-// than one figure, scoped to the current turn via the per-turn
-// baseline rather than via TurnCount, which produces a false positive
-// for a kind emitting session_started once per session (opencode-shaped)
-// rather than once per turn; an incremental-arrival entry never logs
-// regardless of figure count.
+// TestHandleAgentEvent_UsageDeclarationDriftLog verifies a turn_end entry
+// logs only when a turn reports more than one figure, and an incremental
+// entry never logs.
 func TestHandleAgentEvent_UsageDeclarationDriftLog(t *testing.T) {
 	t.Parallel()
 
 	const issueID = "DRIFT-1"
-	const driftNoneMessage = "token_usage event contradicts the declared usage arrival"
 	const driftTurnEndMessage = "turn_end arrival reported more than one usage figure within a turn"
-
-	t.Run("none-arrival entry receiving a token_usage event logs", func(t *testing.T) {
-		t.Parallel()
-		var buf bytes.Buffer
-		logger := debugLogger(t, &buf)
-
-		state, entry := newStateWithEntry(issueID)
-		entry.UsageArrival = registry.UsageArrivalNone
-
-		HandleAgentEvent(state, issueID, domain.AgentEvent{
-			Type:      domain.EventTokenUsage,
-			Timestamp: time.Now().UTC(),
-			Usage:     domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
-		}, logger, nil)
-
-		if !strings.Contains(buf.String(), driftNoneMessage) {
-			t.Errorf("log output missing %q\ngot: %s", driftNoneMessage, buf.String())
-		}
-	})
 
 	t.Run("turn_end-arrival entry, one figure per turn across two opencode-shaped turns, never logs", func(t *testing.T) {
 		t.Parallel()
@@ -1757,8 +1765,112 @@ func TestHandleAgentEvent_UsageDeclarationDriftLog(t *testing.T) {
 			}, logger, nil)
 		}
 
-		if strings.Contains(buf.String(), driftNoneMessage) || strings.Contains(buf.String(), driftTurnEndMessage) {
+		if strings.Contains(buf.String(), driftTurnEndMessage) {
 			t.Errorf("log output unexpectedly contains a drift message for an incremental-arrival entry\ngot: %s", buf.String())
 		}
 	})
+}
+
+// TestAdmitsUsageFigures verifies that only arrival none rejects a figure.
+func TestAdmitsUsageFigures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		arrival registry.UsageArrival
+		want    bool
+	}{
+		{"none arrival rejects", registry.UsageArrivalNone, false},
+		{"incremental arrival admits", registry.UsageArrivalIncremental, true},
+		{"turn_end arrival admits", registry.UsageArrivalTurnEnd, true},
+		{"undeclared arrival admits", registry.UsageArrivalUndeclared, true},
+		{"an arrival outside the declared set admits", registry.UsageArrival("bogus"), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := admitsUsageFigures(tt.arrival); got != tt.want {
+				t.Errorf("admitsUsageFigures(%q) = %v, want %v", tt.arrival, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandleAgentEvent_NoneArrivalDiscardsFigures verifies a none entry
+// discards usage figures while its non-usage fields advance like an
+// incremental entry's.
+func TestHandleAgentEvent_NoneArrivalDiscardsFigures(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Now().UTC()
+	sequence := func() []domain.AgentEvent {
+		return []domain.AgentEvent{
+			{Type: domain.EventSessionStarted, Timestamp: ts, SessionID: "sess-none"},
+			{
+				Type: domain.EventTokenUsage, Timestamp: ts, Model: "some-model",
+				Usage: domain.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15, CacheReadTokens: 2},
+			},
+			{Type: domain.EventTokenUsage, Timestamp: ts},
+			{
+				Type: domain.EventTurnCompleted, Timestamp: ts,
+				Usage: domain.TokenUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
+			},
+		}
+	}
+
+	noneState, noneEntry := newStateWithEntry("NONE-1")
+	noneEntry.UsageArrival = registry.UsageArrivalNone
+	noneSpy := &spyMetrics{}
+	for _, event := range sequence() {
+		HandleAgentEvent(noneState, "NONE-1", event, slog.Default(), noneSpy)
+	}
+
+	incState, incEntry := newStateWithEntry("INC-1")
+	incEntry.UsageArrival = registry.UsageArrivalIncremental
+	incSpy := &spyMetrics{}
+	for _, event := range sequence() {
+		HandleAgentEvent(incState, "INC-1", event, slog.Default(), incSpy)
+	}
+
+	if incEntry.AgentTotalTokens == 0 {
+		t.Fatal("setup invariant failed: the incremental entry recorded no tokens from the same sequence")
+	}
+
+	if got := zeroTokenCounters(noneEntry); got != ([4]int64{}) {
+		t.Errorf("none-arrival token counters = %+v, want all zero", got)
+	}
+	if noneEntry.UsageMeasured {
+		t.Error("none-arrival UsageMeasured = true, want false")
+	}
+	if noneEntry.APIRequestCount != 0 {
+		t.Errorf("none-arrival APIRequestCount = %d, want 0", noneEntry.APIRequestCount)
+	}
+	if noneEntry.ModelName != "" {
+		t.Errorf("none-arrival ModelName = %q, want empty", noneEntry.ModelName)
+	}
+	if noneEntry.RequestsByModel != nil {
+		t.Errorf("none-arrival RequestsByModel = %v, want nil", noneEntry.RequestsByModel)
+	}
+	if noneState.AgentTotals != (AgentTotals{}) {
+		t.Errorf("none-arrival State.AgentTotals = %+v, want zero", noneState.AgentTotals)
+	}
+
+	noneSpy.mu.Lock()
+	noneTokenCalls := len(noneSpy.tokens)
+	noneSpy.mu.Unlock()
+	if noneTokenCalls != 0 {
+		t.Errorf("metrics.AddTokens called %d times for a none-arrival entry, want 0", noneTokenCalls)
+	}
+
+	if noneEntry.TurnCount != incEntry.TurnCount {
+		t.Errorf("none-arrival TurnCount = %d, want %d (equal to the incremental entry)", noneEntry.TurnCount, incEntry.TurnCount)
+	}
+	if noneEntry.LastAgentEvent != incEntry.LastAgentEvent {
+		t.Errorf("none-arrival LastAgentEvent = %q, want %q", noneEntry.LastAgentEvent, incEntry.LastAgentEvent)
+	}
+	if !noneEntry.LastAgentTimestamp.Equal(incEntry.LastAgentTimestamp) {
+		t.Errorf("none-arrival LastAgentTimestamp = %v, want %v", noneEntry.LastAgentTimestamp, incEntry.LastAgentTimestamp)
+	}
 }

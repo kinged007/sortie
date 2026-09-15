@@ -73,6 +73,12 @@ type AgentTotals struct {
 	TotalTokens     int64
 	CacheReadTokens int64
 	SecondsRunning  float64
+
+	// UnmeasuredSessions counts ended sessions whose usage was never
+	// recorded, cumulatively across process restarts. The token
+	// counters above exclude these sessions; this is how many there
+	// were.
+	UnmeasuredSessions int64
 }
 
 // RateLimitSnapshot holds the latest rate-limit information received from
@@ -99,6 +105,10 @@ type RunningEntry struct {
 	// SessionID is the adapter-assigned session identifier. Initially
 	// empty; populated when the worker reports session_started.
 	SessionID string
+
+	// DispatchID is the dispatch ID minted by [DispatchIssue] for this
+	// running entry. Never reassigned for the lifetime of the entry.
+	DispatchID string
 
 	// ThreadID is the adapter-assigned thread identifier. Populated by
 	// adapters that expose thread/turn granularity; empty otherwise.
@@ -175,7 +185,7 @@ type RunningEntry struct {
 	StartedAt time.Time
 
 	// TurnCount is the number of coding-agent turns started within the
-	// current worker lifetime.
+	// current worker lifetime, self-review turns included.
 	TurnCount int
 
 	// CancelFunc cancels the per-worker context created by [DispatchIssue].
@@ -270,7 +280,8 @@ type RunningEntry struct {
 
 	// UsageMeasured is true once at least one usage measurement has been
 	// reported so far in this running session. Monotone: set true by
-	// [HandleAgentEvent] and never cleared.
+	// [HandleAgentEvent] and never cleared. Never set when UsageArrival
+	// is none.
 	UsageMeasured bool
 
 	// UsageArrival and UsageAttribution are the usage-reporting
@@ -497,7 +508,7 @@ func ReactionKey(issueID, kind string) string {
 // PendingReaction records that an issue needs external signal
 // reconciliation. Created by worker exit handlers or external event
 // receivers. Consumed by per-kind reconcile functions during the
-// reconcile tick. Runtime-only (not persisted to SQLite — cross-restart
+// reconcile tick. Runtime-only (not persisted to SQLite; cross-restart
 // deduplication uses reaction_fingerprints).
 type PendingReaction struct {
 	// IssueID is the domain issue ID.
@@ -952,7 +963,7 @@ type State struct {
 	RetryAttempts map[string]*RetryEntry
 
 	// Completed is a set of issue IDs that have completed at least once.
-	// Bookkeeping only — not used for dispatch gating.
+	// Bookkeeping only, not used for dispatch gating.
 	Completed map[string]struct{}
 
 	// BudgetExhausted maps issue ID to the runtime view of one issue
@@ -1217,12 +1228,21 @@ type SnapshotBudgetEntry struct {
 // SnapshotAgentTotals holds aggregate token counts and runtime seconds
 // at a point in time. Unlike [AgentTotals], SecondsRunning includes
 // elapsed time from currently active sessions.
+//
+// UnmeasuredSessions, RunningUnreported, and RunningNonReporting
+// count, by reason, the sessions the four token counters leave out:
+// ended sessions with no recorded usage, running sessions whose kind
+// reports usage but none has arrived yet, and running sessions whose
+// kind reports none at all.
 type SnapshotAgentTotals struct {
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	TotalTokens     int64   `json:"total_tokens"`
-	CacheReadTokens int64   `json:"cache_read_tokens"`
-	SecondsRunning  float64 `json:"seconds_running"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	SecondsRunning      float64 `json:"seconds_running"`
+	UnmeasuredSessions  int64   `json:"unmeasured_sessions"`
+	RunningUnreported   int     `json:"running_unreported"`
+	RunningNonReporting int     `json:"running_non_reporting"`
 }
 
 // RuntimeSnapshotResult is a point-in-time capture of the orchestrator's
@@ -1265,10 +1285,7 @@ func ActiveElapsedSeconds(state *State, now time.Time) float64 {
 // Only an arrival that reports during the turn can produce one, and
 // then only once a figure has arrived or while no turn has begun: a
 // session past its first turn with nothing counted measured nothing,
-// whatever its declaration promised. turnCount is compared against
-// zero and nothing else, because a kind emitting the session-started
-// event once per session rather than once per turn undercounts it;
-// every kind emits it at least once, at its first turn.
+// whatever its declaration promised.
 func apiRequestsMeasured(arrival registry.UsageArrival, turnCount, apiRequestCount int) bool {
 	if !arrival.ReportsDuringTurn() {
 		return false
@@ -1286,7 +1303,7 @@ func apiRequestsMeasured(arrival registry.UsageArrival, turnCount, apiRequestCou
 // test callers pass a fixed time for deterministic assertions.
 //
 // The returned result contains copied-out data for Running, Retrying,
-// and AgentTotals — callers may serialize or retain those fields without
+// and AgentTotals; callers may serialize or retain those fields without
 // synchronization concerns.
 //
 // RateLimits is shallow-copied from State.AgentRateLimits.Data and may
@@ -1304,8 +1321,16 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	var activeElapsedTotal float64
+	var runningUnreported, runningNonReporting int
 	for _, entry := range state.Running {
 		requestsMeasured := apiRequestsMeasured(entry.UsageArrival, entry.TurnCount, entry.APIRequestCount)
+
+		switch {
+		case entry.UsageArrival == registry.UsageArrivalNone:
+			runningNonReporting++
+		case entry.UsageArrival.ReportsAnyFigure() && !entry.UsageMeasured:
+			runningUnreported++
+		}
 
 		// A map has no null on the wire, so absence is the only way to
 		// say the breakdown means nothing. Gating it here rather than
@@ -1371,11 +1396,14 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	snap.AgentTotals = SnapshotAgentTotals{
-		InputTokens:     state.AgentTotals.InputTokens,
-		OutputTokens:    state.AgentTotals.OutputTokens,
-		TotalTokens:     state.AgentTotals.TotalTokens,
-		CacheReadTokens: state.AgentTotals.CacheReadTokens,
-		SecondsRunning:  state.AgentTotals.SecondsRunning + activeElapsedTotal,
+		InputTokens:         state.AgentTotals.InputTokens,
+		OutputTokens:        state.AgentTotals.OutputTokens,
+		TotalTokens:         state.AgentTotals.TotalTokens,
+		CacheReadTokens:     state.AgentTotals.CacheReadTokens,
+		SecondsRunning:      state.AgentTotals.SecondsRunning + activeElapsedTotal,
+		UnmeasuredSessions:  state.AgentTotals.UnmeasuredSessions,
+		RunningUnreported:   runningUnreported,
+		RunningNonReporting: runningNonReporting,
 	}
 
 	snap.BudgetExhaustedCount = len(state.BudgetExhausted)
@@ -1804,9 +1832,17 @@ func toInt(v any) (int, error) {
 		if n != math.Trunc(n) {
 			return 0, fmt.Errorf("expected integer value, got fractional %v", n)
 		}
-		return int(n), nil
-	case int64:
-		return int(n), nil
+		parsed, ok := config.IntFromNumber(n)
+		if !ok {
+			return 0, config.ErrIntegerOutOfRange
+		}
+		return parsed, nil
+	case int64, uint64:
+		parsed, ok := config.IntFromNumber(n)
+		if !ok {
+			return 0, config.ErrIntegerOutOfRange
+		}
+		return parsed, nil
 	default:
 		return 0, fmt.Errorf("expected numeric value, got %T", v)
 	}

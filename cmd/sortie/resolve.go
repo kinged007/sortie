@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"path/filepath"
 
@@ -105,10 +106,20 @@ func resolveServerPort(portFlag int, portFlagSet bool, serverSection map[string]
 	case int:
 		port = v
 	case float64:
-		if v != float64(int(v)) {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) {
 			return 0, false, fmt.Errorf("invalid server.port value %v: must be an integer", v)
 		}
-		port = int(v)
+		parsed, ok := config.IntFromNumber(v)
+		if !ok {
+			return 0, false, fmt.Errorf("invalid server.port value: must be between 0 and 65535")
+		}
+		port = parsed
+	case int64, uint64:
+		parsed, ok := config.IntFromNumber(v)
+		if !ok {
+			return 0, false, fmt.Errorf("invalid server.port value: must be between 0 and 65535")
+		}
+		port = parsed
 	default:
 		return 0, false, fmt.Errorf("invalid server.port value: unsupported type %T, must be an integer", portVal)
 	}

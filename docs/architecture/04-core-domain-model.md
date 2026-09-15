@@ -115,6 +115,7 @@ Fields:
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
+  - The worker counts each turn as it starts, self-review turns included, whichever agent events the session emits.
 
 #### 4.1.7 Retry Entry
 
@@ -163,4 +164,6 @@ Fields:
   - Compare states after `lowercase`.
 - `Session ID`
   - Opaque string assigned by the agent adapter. Composition is adapter-specific.
+- `Dispatch ID`
+  - Opaque string the orchestrator mints each time it dispatches an issue, never reused. Identifies that dispatch's running session to the tool server and in `session_metadata`. Differs from `Session ID` because a resumed session keeps its session ID across dispatches, while each dispatch mints its own dispatch ID.
 

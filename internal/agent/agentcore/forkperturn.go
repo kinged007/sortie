@@ -55,33 +55,34 @@ type ForkPerTurnHooks struct {
 	// be concurrency-safe.
 	ParseLine func(line []byte, emit func(domain.AgentEvent), pid string) (result any, err error)
 
-	// GetUsage returns the session's run-cumulative token usage snapshot,
-	// not a per-turn figure. The skeleton calls this when constructing the
-	// TurnResult and the terminal event for Arms 1–5 of the decision tree
-	// (cancellation, scan-error, exit-127, and signal paths). The adapter
-	// implements this as a one-line closure over its *[RunUsage]:
-	// func() domain.TokenUsage { return acc.Snapshot() }.
+	// GetUsage returns the session's run-cumulative token usage snapshot
+	// together with the session's measurement verdict. usage is the
+	// run-cumulative snapshot, not a per-turn figure. measured reports
+	// whether the session has observed at least one usage measurement by
+	// the time of the call. Within one session, once a call returns
+	// measured true, every later call returns true. A session whose
+	// resolved usage arrival is none returns measured false on every
+	// call.
 	//
-	// GetUsage is called after the scan loop completes and is always
-	// called on RunTurn's goroutine.
-	GetUsage func() domain.TokenUsage
+	// GetUsage is always called on RunTurn's goroutine.
+	GetUsage func() (usage domain.TokenUsage, measured bool)
 
 	// GetSessionID returns the adapter's current session identifier.
-	// The skeleton calls this when constructing the TurnResult for Arms
-	// 1–5 of the decision tree (cancellation, scan-error, exit-127, and
-	// signal paths) to populate TurnResult.SessionID. The returned value
-	// may be empty on the first turn before the agent has assigned a
-	// session identifier.
+	// The skeleton calls this to populate TurnResult.SessionID on every
+	// return it builds itself, including a start-failure return. The
+	// returned value may be empty on the first turn before the agent has
+	// assigned a session identifier.
 	GetSessionID func() string
 
 	// OnFinalize determines the final TurnResult and error from the
-	// subprocess exit state. The skeleton calls OnFinalize only on the
-	// success paths of the post-Wait decision tree (arms 6–10). Arms 1–5
-	// are handled entirely by the skeleton.
+	// subprocess exit state. The skeleton calls OnFinalize after the
+	// subprocess has exited following the scan loop, for every ending it
+	// has not already classified as a stdout scan error, a cancellation,
+	// exit code 127, or a signal, so a non-zero exit code reaches it.
 	//
 	// emit is the per-turn event callback passed to RunTurn. OnFinalize
 	// MUST use this to emit the terminal event (EventTurnCompleted or
-	// EventTurnFailed) for arms 6–10.
+	// EventTurnFailed).
 	//
 	// lastParsed is the last non-nil value returned by ParseLine during
 	// the scan loop, or nil if no terminal event was observed.
@@ -252,13 +253,20 @@ func (s *ForkPerTurnSession) RunTurn(
 	// arriving in a reopened window cannot read s.proc == nil and miss
 	// signaling a process that was about to be recorded.
 	s.mu.Lock()
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, s.logger)
 	if err != nil {
 		s.mu.Unlock()
 
+		usage, measured := s.hooks.GetUsage()
+		startFailed := domain.TurnResult{
+			SessionID:     s.hooks.GetSessionID(),
+			Usage:         usage,
+			UsageMeasured: measured,
+		}
+
 		var startErr *procutil.StartError
 		if !errors.As(err, &startErr) {
-			return domain.TurnResult{}, &domain.AgentError{
+			return startFailed, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
 				Message: "failed to start subprocess",
 				Err:     err,
@@ -267,33 +275,28 @@ func (s *ForkPerTurnSession) RunTurn(
 
 		switch startErr.Stage {
 		case procutil.StageStdoutPipe:
-			return domain.TurnResult{}, &domain.AgentError{
+			return startFailed, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
 				Message: "failed to create stdout pipe",
 				Err:     startErr.Err,
 			}
 		case procutil.StageStderrPipe:
-			return domain.TurnResult{}, &domain.AgentError{
+			return startFailed, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
 				Message: "failed to create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			if ctx.Err() != nil {
-				usage := s.hooks.GetUsage()
 				EmitTurnCancelled(emit, "context cancelled", usage)
-				result := domain.TurnResult{
-					SessionID:  s.hooks.GetSessionID(),
-					ExitReason: domain.EventTurnCancelled,
-					Usage:      usage,
-				}
-				return result, &domain.AgentError{
+				startFailed.ExitReason = domain.EventTurnCancelled
+				return startFailed, &domain.AgentError{
 					Kind:    domain.ErrTurnCancelled,
 					Message: "turn cancelled",
 					Err:     ctx.Err(),
 				}
 			}
-			return domain.TurnResult{}, &domain.AgentError{
+			return startFailed, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
 				Message: "failed to start subprocess",
 				Err:     startErr.Err,
@@ -307,9 +310,6 @@ func (s *ForkPerTurnSession) RunTurn(
 	// close here cannot cut that bound short.
 	defer pipes.Close() //nolint:errcheck,gosec // best-effort cleanup
 
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		s.logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
 	s.turns = prospectiveTurn
 	s.proc = cmd.Process
 	s.waitCh = make(chan struct{})
@@ -323,7 +323,7 @@ func (s *ForkPerTurnSession) RunTurn(
 
 	stderrCollector := procutil.NewStderrCollector(pipes.Stderr, s.logger)
 	reader := procutil.NewStdoutReader(pipes.Stdout, s.logger)
-	reaper := procutil.StartReaper(cmd)
+	reaper := procutil.StartReaper(cmd, s.logger)
 
 	var lastParsed any
 	parseLine := func(line []byte) {
@@ -406,12 +406,13 @@ loop:
 		// Context cancellation propagates through exec.CommandContext
 		// and can surface as a pipe read error. Treat as cancellation.
 		if ctx.Err() != nil {
-			usage := s.hooks.GetUsage()
+			usage, measured := s.hooks.GetUsage()
 			EmitTurnCancelled(emit, "context cancelled", usage)
 			result := domain.TurnResult{
-				SessionID:  s.hooks.GetSessionID(),
-				ExitReason: domain.EventTurnCancelled,
-				Usage:      usage,
+				SessionID:     s.hooks.GetSessionID(),
+				ExitReason:    domain.EventTurnCancelled,
+				Usage:         usage,
+				UsageMeasured: measured,
 			}
 			return result, &domain.AgentError{
 				Kind:    domain.ErrTurnCancelled,
@@ -421,12 +422,13 @@ loop:
 		}
 
 		procutil.EmitWarnLines(stderrLines, s.logger)
-		usage := s.hooks.GetUsage()
+		usage, measured := s.hooks.GetUsage()
 		EmitTurnFailed(emit, "stdout read error: "+scanErr.Error(), 0, usage)
 		result := domain.TurnResult{
-			SessionID:  s.hooks.GetSessionID(),
-			ExitReason: domain.EventTurnFailed,
-			Usage:      usage,
+			SessionID:     s.hooks.GetSessionID(),
+			ExitReason:    domain.EventTurnFailed,
+			Usage:         usage,
+			UsageMeasured: measured,
 		}
 		return result, &domain.AgentError{
 			Kind:    domain.ErrPortExit,
@@ -436,12 +438,13 @@ loop:
 	}
 
 	if ctx.Err() != nil {
-		usage := s.hooks.GetUsage()
+		usage, measured := s.hooks.GetUsage()
 		EmitTurnCancelled(emit, "context cancelled", usage)
 		result := domain.TurnResult{
-			SessionID:  s.hooks.GetSessionID(),
-			ExitReason: domain.EventTurnCancelled,
-			Usage:      usage,
+			SessionID:     s.hooks.GetSessionID(),
+			ExitReason:    domain.EventTurnCancelled,
+			Usage:         usage,
+			UsageMeasured: measured,
 		}
 		return result, &domain.AgentError{
 			Kind:    domain.ErrTurnCancelled,
@@ -454,12 +457,13 @@ loop:
 
 	if exitCode == 127 {
 		procutil.EmitWarnLines(stderrLines, s.logger)
-		usage := s.hooks.GetUsage()
+		usage, measured := s.hooks.GetUsage()
 		EmitTurnFailed(emit, "agent binary not found", 0, usage)
 		result := domain.TurnResult{
-			SessionID:  s.hooks.GetSessionID(),
-			ExitReason: domain.EventTurnFailed,
-			Usage:      usage,
+			SessionID:     s.hooks.GetSessionID(),
+			ExitReason:    domain.EventTurnFailed,
+			Usage:         usage,
+			UsageMeasured: measured,
 		}
 		return result, &domain.AgentError{
 			Kind:    domain.ErrAgentNotFound,
@@ -468,12 +472,13 @@ loop:
 	}
 
 	if procutil.WasSignaled(waitErr) {
-		usage := s.hooks.GetUsage()
+		usage, measured := s.hooks.GetUsage()
 		EmitTurnCancelled(emit, "killed by signal", usage)
 		result := domain.TurnResult{
-			SessionID:  s.hooks.GetSessionID(),
-			ExitReason: domain.EventTurnCancelled,
-			Usage:      usage,
+			SessionID:     s.hooks.GetSessionID(),
+			ExitReason:    domain.EventTurnCancelled,
+			Usage:         usage,
+			UsageMeasured: measured,
 		}
 		return result, &domain.AgentError{
 			Kind:    domain.ErrTurnCancelled,
@@ -481,10 +486,9 @@ loop:
 		}
 	}
 
-	// Arms 6–10: delegated to OnFinalize.
 	// The explicit nil check prevents a typed-nil *domain.AgentError from
-	// becoming a non-nil error interface on the success path.
-	// The skeleton calls EmitWarnLines when agentErr is non-nil, so
+	// becoming a non-nil error interface on the success path. The
+	// skeleton calls EmitWarnLines when agentErr is non-nil, so
 	// OnFinalize must not call it.
 	result, agentErr := s.hooks.OnFinalize(emit, lastParsed, exitCode, stderrLines)
 	if agentErr != nil {

@@ -234,7 +234,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
@@ -259,7 +259,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				Message: "create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.TurnResult{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: "start opencode subprocess",
@@ -283,13 +283,9 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	state.active = runtime
 	state.mu.Unlock()
 
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
-
 	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
-	startWait(runtime, cmd)
+	startWait(runtime, cmd, logger)
 
 	emit := func(event domain.AgentEvent) {
 		if state.target.RemoteCommand == "" {
@@ -471,6 +467,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
 					killTurnProcess(runtime)
 					_ = waitForProcess(runtime)
+					recovered := recoverUsage(ctx, state, runWindow(state))
 					clearActive(state, runtime)
 
 					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
@@ -483,7 +480,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 							Cause:             readErr,
 						}
 					}
-					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 					if agentErr != nil {
 						return result, agentErr
 					}
@@ -527,9 +524,10 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			killTurnProcess(runtime)
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
+			recovered := recoverUsage(ctx, state, runWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -552,13 +550,14 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			_ = waitForProcess(runtime)
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
+			recovered := recoverUsage(ctx, state, runWindow(state))
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{
 				Terminal:          agentcore.TerminalFailure,
 				TerminalErrorKind: domain.ErrResponseTimeout,
 				TerminalMessage:   "timed out waiting for first opencode json event",
 			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered)
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -594,23 +593,7 @@ func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Sessio
 // not reset the read timer the way a stdout line does, neither of which is
 // a regression because the warning has never actually reached stdout.
 func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
-	window := int64(0)
-	if !state.createdSession {
-		window = state.runStartedAtMS
-	}
-	usage := queryExportUsage(ctx, state, window)
-
-	var recovered *agentcore.RecoveredUsage
-	if hasUsage(usage) {
-		recovered = &agentcore.RecoveredUsage{
-			Run: domain.TokenUsage{
-				InputTokens:     usage.InputTokens,
-				OutputTokens:    usage.OutputTokens,
-				CacheReadTokens: usage.CacheReadTokens,
-			},
-			Model: usage.Model,
-		}
-	}
+	recovered := recoverUsage(ctx, state, runWindow(state))
 
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
@@ -716,9 +699,9 @@ func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
 // startWait reaps the turn's subprocess independently of its stdout
 // reader and, once the reap and group kill have run, bounds the wait
 // for the turn's stderr drain before reading it.
-func startWait(runtime *turnRuntime, cmd *exec.Cmd) {
+func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 	go func() {
-		reaper := procutil.StartReaper(cmd)
+		reaper := procutil.StartReaper(cmd, logger)
 		<-reaper.Done()
 
 		// The turn's exit is published below, behind a stderr bound that
@@ -891,8 +874,58 @@ func isMaskedServerError(message string) bool {
 	return strings.TrimSpace(message) == maskedServerErrorMessage
 }
 
+// recoverUsage runs the session export and returns what it recovered, or
+// nil when it recovered nothing.
+//
+// A turn that ends by exit, cancellation, read timeout or stdout read error
+// runs this: by the time it gets here the process has been waited for, and
+// its session export is just as readable in each case. Leaving it out of one
+// meant the same completed work reported a figure or reported nothing
+// depending only on which case of the select won. A session mismatch does
+// not run it, because the work ran in a session other than the one the
+// export would read.
+func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *agentcore.RecoveredUsage {
+	// WithoutCancel: this runs after the turn is over, and on the cancel path
+	// `ctx` is the thing that just fired -- deriving the export's own timeout
+	// from it cancels the query before it starts, and the work whose cost is
+	// being recovered has already happened. The other terminal paths reach
+	// here with a context that CAN be cancelled too (the caller may cancel
+	// while the read timeout or the process exit is being handled), so the
+	// detach belongs here rather than at each call site, where the next
+	// terminal path added would have to remember it. Still bounded:
+	// `queryExportUsage` applies its own `exportTimeout`.
+	usage := queryExportUsage(context.WithoutCancel(ctx), state, sinceUnixMS)
+	if !hasUsage(usage) {
+		return nil
+	}
+	return &agentcore.RecoveredUsage{
+		Run: domain.TokenUsage{
+			InputTokens:     usage.InputTokens,
+			OutputTokens:    usage.OutputTokens,
+			CacheReadTokens: usage.CacheReadTokens,
+		},
+		Model: usage.Model,
+	}
+}
+
+// runWindow is the timestamp the export filters messages by: the run's start
+// for a session this adapter did not create, so the history a resumed
+// session brought with it stays out while every turn of this run stays in,
+// and none at all for one it did, where every message belongs to this run.
+func runWindow(state *sessionState) int64 {
+	if state.createdSession {
+		return 0
+	}
+	return state.runStartedAtMS
+}
+
+// hasUsage reports whether the export recovered a figure, not whether that
+// figure is non-zero. The value-based test it replaces threw away a
+// successful recovery whose messages all reported zero tokens, and with it
+// the model the export named -- so a KNOWN zero spend was reported as an
+// UNKNOWN one, which is the distinction the measured verdict exists to make.
 func hasUsage(usage exportUsage) bool {
-	return usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0 || usage.CacheReadTokens > 0
+	return usage.Recovered
 }
 
 // drainLinesBounded takes whatever the reader has already produced and

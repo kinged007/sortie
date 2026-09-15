@@ -148,7 +148,7 @@ Fields:
 - `timeout_ms` (integer, optional)
   - Default: `60000`
   - Applies to all workspace hooks.
-  - Non-positive values should be treated as invalid and fall back to the default.
+  - A value outside the range an integer setting accepts, positive or negative, is rejected when the configuration is parsed; other non-positive values should be treated as invalid and fall back to the default.
   - Changes should be re-applied at runtime for future hook executions.
 
 Hook environment variables (minimum set available to all hooks):
@@ -192,7 +192,7 @@ Fields:
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
-  - Invalid entries (non-positive or non-numeric) are ignored.
+  - An entry outside the range an integer setting accepts, positive or negative, is rejected when the configuration is parsed; other invalid entries (non-positive or non-numeric) are ignored.
 - `max_sessions` (integer)
   - Default: `0` (unlimited; no effort budget enforced).
   - Maximum number of completed worker sessions for a single issue before the orchestrator stops re-dispatching it. Counted from `run_history` entries.
@@ -287,7 +287,7 @@ Fields:
   - Each iteration consists of a review turn and (if the verdict is `iterate`) a fix turn. `max_iterations: N` means up to `2N − 1` additional agent turns.
 - `verification_commands` (list of strings)
   - Shell commands executed during each review iteration. Required when `enabled` is true.
-  - Each command runs in its own subprocess with the workspace as `cwd`, process group isolation, and per-command timeout.
+  - Each command runs in its own subprocess with the workspace as `cwd` and a per-command timeout. Its process group, its Job Object on Windows, is terminated when it exits, times out, or is cancelled, resending that termination until the group or job reports no member left or a 2-second bound elapses, and its exit status decides whether it passed. A Windows command running without a Job Object, because one could not be created or assigned, has only its direct process reached by that termination. A termination that still cannot confirm the group or job empty once the bound elapses is reported as a warning.
 - `verification_timeout_ms` (integer)
   - Per-command timeout in milliseconds. Default: `120000` (2 minutes).
 - `max_diff_bytes` (integer)

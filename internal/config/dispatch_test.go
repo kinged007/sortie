@@ -301,6 +301,105 @@ func TestBuildDispatchConfig_PriorityInPredicate(t *testing.T) {
 	}
 }
 
+// TestBuildDispatchConfig_PriorityPredicateRange covers the range
+// classification at parsePriorityPredicate's scalar-operator arm and
+// its "in" sequence arm: a uint64 or float64 outside the platform int
+// range is rejected with the same diagnostic text an out-of-range
+// coerceIntField caller reports, while an in-range value of either
+// type is accepted.
+func TestBuildDispatchConfig_PriorityPredicateRange(t *testing.T) {
+	t.Parallel()
+
+	dir := mkDispatchDir(t)
+
+	t.Run("scalar operator out of range", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			val  any
+		}{
+			{"uint64", uint64(9223372036854775808)},
+			{"float64", float64(1e20)},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				raw := map[string]any{
+					"dispatch": map[string]any{
+						"rules": []any{
+							map[string]any{
+								"name":  "prio-rule",
+								"match": map[string]any{"priority": map[string]any{"gt": tt.val}},
+								"agent": "mock",
+							},
+						},
+					},
+				}
+
+				_, err := BuildDispatchConfig(raw, dir, alwaysRegistered)
+				ce := requireConfigError(t, err)
+				if ce.Field != "dispatch.rules[0].match.priority.gt" {
+					t.Errorf("ConfigError.Field = %q, want %q", ce.Field, "dispatch.rules[0].match.priority.gt")
+				}
+				if ce.Message != ErrIntegerOutOfRange.Error() {
+					t.Errorf("ConfigError.Message = %q, want %q", ce.Message, ErrIntegerOutOfRange.Error())
+				}
+			})
+		}
+	})
+
+	t.Run("in sequence element out of range", func(t *testing.T) {
+		t.Parallel()
+
+		raw := map[string]any{
+			"dispatch": map[string]any{
+				"rules": []any{
+					map[string]any{
+						"name":  "in-rule",
+						"match": map[string]any{"priority": map[string]any{"in": []any{1, uint64(9223372036854775808)}}},
+						"agent": "mock",
+					},
+				},
+			},
+		}
+
+		_, err := BuildDispatchConfig(raw, dir, alwaysRegistered)
+		ce := requireConfigError(t, err)
+		if ce.Field != "dispatch.rules[0].match.priority.in[1]" {
+			t.Errorf("ConfigError.Field = %q, want %q", ce.Field, "dispatch.rules[0].match.priority.in[1]")
+		}
+		if ce.Message != ErrIntegerOutOfRange.Error() {
+			t.Errorf("ConfigError.Message = %q, want %q", ce.Message, ErrIntegerOutOfRange.Error())
+		}
+	})
+
+	t.Run("in-range uint64 and float64 accepted", func(t *testing.T) {
+		t.Parallel()
+
+		raw := map[string]any{
+			"dispatch": map[string]any{
+				"rules": []any{
+					map[string]any{
+						"name":  "prio-rule",
+						"match": map[string]any{"priority": map[string]any{"gt": uint64(5)}},
+						"agent": "mock",
+					},
+				},
+			},
+		}
+
+		got, err := BuildDispatchConfig(raw, dir, alwaysRegistered)
+		if err != nil {
+			t.Fatalf("BuildDispatchConfig() error = %v, want nil", err)
+		}
+		if got.Rules[0].Match.Priority.Value != 5 {
+			t.Errorf("Priority.Value = %d, want 5", got.Rules[0].Match.Priority.Value)
+		}
+	})
+}
+
 func TestBuildDispatchConfig_ErrorCases(t *testing.T) {
 	t.Parallel()
 

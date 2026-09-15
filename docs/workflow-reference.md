@@ -492,7 +492,7 @@ hooks:
 | `before_run`    | multiline shell script or null | No       | _(none)_ | Future hook executions | Runs before each agent attempt, after workspace preparation.                         |
 | `after_run`     | multiline shell script or null | No       | _(none)_ | Future hook executions | Runs after each agent attempt (success, failure, timeout, or cancellation).          |
 | `before_remove` | multiline shell script or null | No       | _(none)_ | Future hook executions | Runs before workspace deletion, if the directory exists.                             |
-| `timeout_ms`    | integer                        | No       | `60000`  | Future hook executions | Timeout in milliseconds for all hooks. Non-positive values fall back to the default. |
+| `timeout_ms`    | integer                        | No       | `60000`  | Future hook executions | Timeout in milliseconds for all hooks. A value outside the integer range, positive or negative, fails config load; other non-positive values fall back to the default. |
 
 See [Section 6: Hook Lifecycle Reference](#6-hook-lifecycle-reference) for execution contract, environment variables, and failure semantics.
 
@@ -528,7 +528,7 @@ agent:
 | `max_concurrent_agents`          | integer or string integer         | No                                  | `10`            | **Yes** — affects subsequent dispatch      | Global concurrency limit across all issues.                                                                                                                                      |
 | `max_turns`                      | integer                           | No                                  | `20`            | Future dispatches                          | Maximum coding-agent turns per worker session. The worker re-checks tracker state after each turn and starts another turn if the issue is still active, up to this limit.        |
 | `max_retry_backoff_ms`           | integer or string integer         | No                                  | `300000` (5m)   | **Yes** — affects future retry scheduling  | Maximum delay cap for exponential backoff on retries.                                                                                                                            |
-| `max_concurrent_agents_by_state` | map of `state → positive integer` | No                                  | `{}` (empty)    | **Yes** — affects subsequent dispatch      | Per-state concurrency limits. State keys are normalized to lowercase for lookup. Non-positive or non-numeric entries are silently ignored.                                       |
+| `max_concurrent_agents_by_state` | map of `state → positive integer` | No                                  | `{}` (empty)    | **Yes** — affects subsequent dispatch      | Per-state concurrency limits. State keys are normalized to lowercase for lookup. An entry outside the integer range, positive or negative, fails config load; other non-positive or non-numeric entries are silently ignored.                                       |
 | `max_sessions`                   | integer                           | No                                  | `0` (unlimited) | **Yes** — affects future retry evaluations | Maximum completed worker sessions per issue before the orchestrator stops re-dispatching. Counted from run history. `0` disables the budget (unlimited). Must be non-negative. The separate `max_consecutive_absences` governs the consecutive-absence ceiling. Reaching the ceiling also posts one comment on the issue naming the session budget and `agent.max_sessions` as the setting that raises it. |
 | `max_tokens`                     | integer                           | No                                  | `0` (unlimited) | **Yes** — stops a run already in flight and affects future retry evaluations | Cumulative per-issue token ceiling. The orchestrator sums `total_tokens` across the issue's run history, adds the running session's own reported spend, and stops re-dispatching once the sum reaches the limit; reaching the ceiling also stops a run already in flight, on the event loop, as soon as a usage figure carries the sum there. A run whose coding agent reported no token usage contributes nothing to the sum, and such a run makes the ceiling report that it could not be fully evaluated (a warning is logged and the dispatch proceeds). `0` disables the budget (unlimited). Must be non-negative. Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight. |
 | `max_consecutive_absences`       | integer                           | No                                  | `3`             | **Yes** — affects future worker exits, retry evaluations, and poll-tick park sweeps | Bounds how many runs in a row may be observed to have produced no evidence of work before the issue is parked. Any run that produces evidence of work resets the count to zero. `0` and negative values are rejected as a configuration error. The separate `max_sessions` governs the total per-issue session budget. |
@@ -631,6 +631,8 @@ The self-review section configures an optional post-coding verification and iter
 
 **Turn Accounting:** `max_iterations: N` means up to `2N − 1` additional agent turns (N review turns + N−1 fix turns). For the default `max_iterations: 3`, this is up to 5 additional turns beyond the coding turn loop. Plan token budgets accordingly.
 
+**Process lifetime:** Each verification command's process group (its Job Object on Windows) is terminated when it exits, times out, or is cancelled, resending that termination until the group or job reports no member left or a 2-second bound elapses, and its exit status alone decides whether it passed. On Windows, a command whose Job Object could not be created or assigned still runs, with the failure logged, and that teardown then reaches only the command itself. When a command exits on its own and its termination reached a process it left running, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `command`; a termination that still cannot confirm the group or job empty once the bound elapses is logged as a warning instead.
+
 **Validation rules:**
 
 - When `enabled` is `true`, `verification_commands` must be a non-empty list. An empty list is rejected with a configuration error.
@@ -699,7 +701,7 @@ reactions:
       timeout_ms: 120000
 ```
 
-**Execution environment.** The command runs with the per-issue workspace directory as its working directory, through the same machinery as `hooks.before_run`: the same restricted environment, the same process-group kill on timeout, and the same 8 KiB captured output tail. It receives the four variables every hook receives (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`), `SORTIE_SSH_HOST` when a host preference is set, and three of its own:
+**Execution environment.** The command runs with the per-issue workspace directory as its working directory, through the same machinery as `hooks.before_run`: the same restricted environment, the termination of its whole process group when it exits, times out, or is cancelled, and the same 8 KiB captured output tail. It receives the four variables every hook receives (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`), `SORTIE_SSH_HOST` when a host preference is set, and three of its own:
 
 | Variable                | Value                                                                                                    |
 | ----------------------- | -------------------------------------------------------------------------------------------------------- |
@@ -746,7 +748,7 @@ Exit code 0 together with a well-formed result file naming one of the three valu
 
 **Three obligations on the script.** Each is load-bearing. A script written without them works in the common case and produces an incident in the uncommon one.
 
-1. **It MUST tolerate being killed at any instruction.** The orchestrator kills the script and its process group when `timeout_ms` elapses, when shutdown drains in-flight runs, and whenever a pass computes a different fingerprint for the subject. A script that force-pushes, rewrites history, or leaves a repository mid-rebase when killed turns a routine cancellation into an operator incident.
+1. **It MUST tolerate being killed at any instruction.** The orchestrator kills the script and its process group when `timeout_ms` elapses, when shutdown drains in-flight runs, and whenever a pass computes a different fingerprint for the subject. A script that force-pushes, rewrites history, or leaves a repository mid-rebase when killed turns a routine cancellation into an operator incident. The orchestrator also ends every process the script leaves in its process group when the script exits on its own, resending that termination until the group reports no member left or a 2-second bound elapses, and logging one INFO record, `leftover processes terminated after the command exited`, carrying `reaction_kind`; a termination that still cannot confirm the group empty once the bound elapses is logged as a warning instead.
 2. **It MUST be idempotent for a given subject.** A cancelled run, a run whose outcome is discarded because the fingerprint moved, and every run in flight or finished at restart are each followed by a fresh run for the same subject. A restart is the ordinary case: triage state is runtime-only, so a subject whose durable deduplication row never landed is triaged again from scratch.
 3. **`handled` is a terminal claim about that subject, not a hint.** Nothing re-checks it. A script that answers `handled` without resolving the subject suppresses both the agent continuation and the escalation for that fingerprint until the fingerprint moves or the kind's watch window elapses, which is 24 hours by default for `ci_failure` and 30 minutes for the other three. The watch window bounds the claim only while the fingerprint stands, and on `ci_failure` the two clauses are not independent: that kind's window is measured from the last recorded head, and every head change records a new one, so a script that pushes restarts the window its own answer would otherwise age out against. A `ci_failure` script that answers `handled` on each of a succession of heads it pushed itself is bounded by nothing: it spends no agent turn, fires no escalation, and the entry never ages out.
 
@@ -1557,7 +1559,10 @@ Returns the system-wide runtime state including running sessions, retry queue, a
     "output_tokens": 2400,
     "total_tokens": 7400,
     "cache_read_tokens": 1500,
-    "seconds_running": 1834.2
+    "seconds_running": 1834.2,
+    "unmeasured_sessions": 2,
+    "running_unreported": 1,
+    "running_non_reporting": 0
   },
   "rate_limits": {}
 }
@@ -1569,12 +1574,12 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tokens`                  | object            | Token counts for this session. Each of the four members, `input_tokens`, `output_tokens`, `total_tokens`, and `cache_read_tokens`, is an integer or `null`. The four are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
 | `tokens.cache_read_tokens` | integer or `null` | Cumulative cache-read token count. Reflects tokens served from the LLM provider's prompt cache rather than reprocessed. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache data. |
-| `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model.         |
+| `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model, and when `usage_arrival` is `none`.         |
 | `api_request_count` | integer or `null` | Number of `token_usage` events received during this session, and a count of actual API requests only when `api_requests_measured` is `true`. `null` exactly when that field is `false`. |
 | `requests_by_model` | object or absent  | Map of model name to request count (e.g. `{"claude-sonnet-4-20250514": 3}`). Omitted when `api_requests_measured` is `false`, and when `usage_attribution` does not name a model. Enables tracking model usage when the agent switches models mid-session. |
 | `tool_time_percent` | number or `null`  | Cumulative tool call execution time as a percentage of session wall-clock time. Computed at response time. `null` when no tool timing data has been received. |
 | `api_time_percent`  | number or `null`  | Cumulative LLM API response wait time as a percentage of session wall-clock time. Computed at response time. `null` when no API timing data has been received. |
-| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`.   |
+| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
 | `usage_arrival`      | string            | The session's kind's declared usage-reporting arrival, frozen at dispatch: `incremental`, `turn_end`, `none`, or `""` when undeclared.    |
 | `usage_attribution`  | string            | The session's kind's declared usage-reporting attribution, frozen at dispatch: `per_model`, `session_total`, `none`, or `""` when undeclared. |
 | `tokens_pending`     | boolean           | True only when `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for is still in flight.      |
@@ -1589,6 +1594,13 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | `total_tokens`      | integer | Total tokens consumed.                                                                                  |
 | `cache_read_tokens` | integer | Total cache-read tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
 | `seconds_running`   | number  | Aggregate wall-clock runtime — completed-session time plus elapsed time from currently running sessions. |
+| `unmeasured_sessions` | integer | Ended sessions whose token usage was never recorded, which the token totals above leave out. Survives a restart. |
+| `running_unreported` | integer | Running sessions whose `usage_arrival` reports usage but that have not reported a figure yet. |
+| `running_non_reporting` | integer | Running sessions whose `usage_arrival` is `none`. |
+
+A session whose `usage_arrival` is `none` contributes nothing to the token totals, even when its runtime reports a figure.
+
+`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` configures a rate for any agent kind, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 
@@ -2487,6 +2499,20 @@ Hooks execute as shell scripts in a local shell context:
 - **Working directory:** The per-issue workspace directory.
 - **Timeout:** Controlled by `hooks.timeout_ms` (default: 60,000 ms).
 - **Logging:** Hook start, completion, failures, and timeouts are logged by the orchestrator.
+- **Process lifetime:** When a hook's shell exits, whatever its exit status, Sortie terminates every process still in its process group (its Job Object on Windows), resending that termination until the group or job reports no member left or a 2-second bound elapses. On Windows, a hook whose Job Object could not be created or assigned still runs, with the failure logged, and that teardown then reaches only the shell itself. A background command inside the script ends with the hook: on Linux and macOS `&`, `nohup … &`, `( … & )`, and on Linux `systemd-run --scope`; on Windows `start /b`, `pg_ctl start`, and `pm2 start`. A process meant to outlive the hook needs a supervisor outside that tree:
+
+  | Platform | Route | Prerequisite |
+  | --- | --- | --- |
+  | Linux, container engine | `docker compose up -d` or `docker run -d` | The hook's user reaches the Docker daemon: group membership or `sudo` for a rootful daemon, or `DOCKER_HOST` / a chosen context for rootless Docker. |
+  | Linux, systemd user unit | `systemctl --user start`, `systemd-run --user` (without `--scope`), or `brew services start` as a non-root user | A running user manager (an active login session, or lingering enabled), and `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS` in the hook's environment. |
+  | Linux, systemd system unit | `systemctl start` | Sortie runs as `root`, or a polkit rule grants its user `org.freedesktop.systemd1.manage-units`. |
+  | macOS, launchd | `brew services start` | The user Sortie runs as is logged in at the graphical console. |
+  | macOS, Docker Desktop | `docker compose up -d` or `docker run -d` | Docker Desktop has started for the user Sortie runs as. |
+  | Windows, Service Control Manager | `Start-Service` or `sc start` | The service is installed, and the account Sortie runs as holds the `SERVICE_START` right on it. |
+  | Windows, Docker Desktop | `docker compose up -d` or `docker run -d` | Docker Desktop is running for the user Sortie runs as. |
+  | Windows, Task Scheduler | `schtasks /run /tn <task>` or `Start-ScheduledTask` on a task the user registered | The task exists and runs in the user's own security context. |
+
+  Prefer a supervisor that owns the service across runs, such as `docker compose up -d` on Linux and macOS, which recreates a service's containers only when its configuration or image changed, or a service manager. A hook whose next step uses the service should wait until the service accepts connections, since these start commands can return before it does. When a hook that exits on its own leaves a process running that it did not start through one of these routes, Sortie logs one INFO record, `leftover processes terminated after the command exited`, carrying `hook` and `workspace`; a termination that still cannot confirm the group or job empty once the bound elapses is logged as a warning instead.
 
 > **Login shell environments:** If a hook requires a login shell (e.g., for `nvm`, `rbenv`, or other profile-dependent tooling), nest the invocation explicitly inside the script:
 >
@@ -2539,7 +2565,7 @@ These allow hooks to make decisions without parsing orchestrator internals.
 
 Hook subprocesses **do not** inherit the full environment of the Sortie process. They receive a restricted environment consisting of:
 
-- A small allowlist of standard POSIX and infrastructure variables: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LC_ALL`, `SSH_AUTH_SOCK`.
+- A small allowlist of standard POSIX and infrastructure variables: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LC_ALL`, `SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`. The last two locate the user's service manager and carry no secret.
 - All parent environment variables whose names start with `SORTIE_`.
 - The `SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, and `SORTIE_ATTEMPT` variables injected by the orchestrator (listed above).
 
@@ -2739,6 +2765,7 @@ These errors are raised during typed config construction from the parsed front m
 | `config: polling.interval_ms: invalid integer value: <val>`                     | Non-integer value for a field expecting an integer.                      | Use a plain integer (e.g., `30000`) or a quoted string integer (e.g., `"30000"`). Remove units, decimals, or non-numeric characters. |
 | `config: agent.max_concurrent_agents: invalid integer value: <val>`             | Same as above, for any integer field.                                    | Same fix as above.                                                                                                                   |
 | `config: agent.stall_timeout_ms: invalid integer value: <val>`                  | Same as above.                                                           | Same fix.                                                                                                                            |
+| `config: <field>: value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807` | An integer too large or too small for Sortie to hold, in any integer field. | Use a value within the range. The field's own limits still apply.                                                                   |
 | `config: agent.max_sessions: must be non-negative`                              | Negative value for `max_sessions`.                                       | Use `0` (unlimited) or a positive integer.                                                                                           |
 | `config: agent.max_tokens: must be non-negative`                                | Negative value for `max_tokens`.                                         | Use `0` (unlimited) or a positive integer.                                                                                           |
 | `config: agent.max_consecutive_absences: must be greater than 0`                | `0` or a negative value for `max_consecutive_absences`.                  | Use a positive integer, or remove the key to take the default of `3`.                                                                |
@@ -2793,6 +2820,7 @@ These errors are raised when `SORTIE_*` environment variables or `.env` file val
 | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `config: polling.interval_ms: invalid integer value: <val> (from SORTIE_POLLING_INTERVAL_MS)`                  | Non-integer value in an integer env var.                  | Set the env var to a plain integer (e.g., `30000`). Remove units or decimals.    |
 | `config: agent.<field>: invalid integer value: <val> (from SORTIE_AGENT_<FIELD>)`                              | Same, for any agent integer field.                        | Same fix as above.                                                               |
+| `config: <section>.<field>: value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807 (from SORTIE_<SECTION>_<FIELD>)` | An integer too large or too small for Sortie to hold, in an integer env var. | Set the env var to a value within the range.                                     |
 | `config: tracker.comments.<field>: invalid boolean value: <val> (expected true/false/1/0) (from SORTIE_TRACKER_COMMENTS_<FIELD>)` | Invalid boolean in a comments env var.                    | Use `true`, `false`, `1`, or `0` (case-insensitive).                             |
 | `config: dotenv <path>:<line>: missing '=' in line`                                                            | `.env` file line has no `=` separator.                    | Ensure each non-comment line in the `.env` file is `KEY=VALUE`.                  |
 | `config: dotenv <path>:<line>: invalid key "<key>"`                                                            | `.env` file key contains invalid characters.              | Keys MUST match `[A-Za-z_][A-Za-z0-9_]*`.                                       |

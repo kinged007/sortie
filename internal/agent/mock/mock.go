@@ -229,9 +229,6 @@ func (m *MockAdapter) RunTurn(ctx context.Context, session domain.Session, param
 		}
 	}
 
-	// Emit session_started on every turn, matching real adapter behavior.
-	// Claude Code spawns a fresh subprocess per turn and emits
-	// session_started at startup.
 	params.OnEvent(domain.AgentEvent{
 		Type:      domain.EventSessionStarted,
 		Timestamp: time.Now().UTC(),

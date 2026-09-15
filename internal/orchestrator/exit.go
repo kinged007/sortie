@@ -231,11 +231,22 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	// Reconcile the entry's token totals from the worker's own figure
 	// before run_history, session_metadata, and aggregate_metrics are
 	// built below, so a trailing usage event dropped by a full
-	// agentEventCh or processed after this entry was removed cannot
-	// leave the recorded total lower than what the worker actually
-	// spent. applyUsageDelta's monotone-delta rule applies a zero delta
-	// when workerResult.Usage is already fully accounted for.
+	// agentEventCh cannot leave the recorded total lower than what the
+	// worker actually spent. applyUsageDelta's monotone-delta rule
+	// applies a zero delta when workerResult.Usage is already fully
+	// accounted for.
 	applyUsageDelta(state, entry, workerResult.Usage, metrics)
+
+	// Reconcile the entry's model name and request count from the
+	// worker's own figure the same way the token totals above are
+	// reconciled: the worker's mirror folded every event the entry
+	// applied, in the same order, plus any event a full agentEventCh
+	// dropped, so its non-empty model name and its request count are
+	// never behind the entry's own.
+	if workerResult.ModelName != "" {
+		entry.ModelName = workerResult.ModelName
+	}
+	entry.APIRequestCount = max(entry.APIRequestCount, workerResult.APIRequestCount)
 
 	// measured is the OR of the entry's own measurement flag and the
 	// worker's mirror, computed after the usage reconciliation above so
@@ -252,7 +263,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 
 	// Enrich with session context now that both sources are available.
 	// Prefer workerResult.SessionID (authoritative from the adapter) over
-	// entry.SessionID (depends on EventSessionStarted processing order).
+	// entry.SessionID, whose EventSessionStarted event a full
+	// agentEventCh may have dropped.
 	if sid := workerResult.SessionID; sid != "" {
 		log = logging.WithSession(log, sid)
 	} else if entry.SessionID != "" {
@@ -268,7 +280,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 
 	// Deferred workspace cleanup: reconciliation marks terminal issues with
 	// PendingCleanup so cleanup runs only after the worker has fully exited.
-	// Guarded on WorkspacePath being non-empty — if the worker exited before
+	// Guarded on WorkspacePath being non-empty; if the worker exited before
 	// workspace preparation, there is no directory to clean.
 	if entry.PendingCleanup && entry.WorkspacePath != "" {
 		if err := workspace.CleanupByPath(ctx, workspace.CleanupByPathParams{
@@ -296,6 +308,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		elapsed = 0
 	}
 	state.AgentTotals.SecondsRunning += elapsed
+	if !measured {
+		state.AgentTotals.UnmeasuredSessions++
+	}
 
 	exitType := mapExitKindToExitType(workerResult.ExitKind)
 	if workerResult.SoftStop {
@@ -459,6 +474,55 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 			runHistory.ReviewMetadata = new(string(data))
 		}
 	}
+
+	// Persist session metadata so per-session token data survives restarts.
+	// Prefer workerResult.SessionID: the worker carries the authoritative value
+	// directly from the adapter, while entry.SessionID depends on
+	// EventSessionStarted having been processed before exit.
+	sessionID := workerResult.SessionID
+	if sessionID == "" {
+		sessionID = entry.SessionID
+	}
+	// The entry lags the worker's tally when the worker context ends
+	// before a turn-started message is delivered, and a turn that
+	// errored or was cancelled still means the session ran.
+	turnsSeen := max(entry.TurnCount, workerResult.TurnsStarted)
+
+	// An unmeasured count is stored as zero so a reader of the database
+	// cannot find a figure contradicting the qualifier beside it.
+	requestsMeasured := apiRequestsMeasured(entry.UsageArrival, turnsSeen, entry.APIRequestCount)
+	requestCount := 0
+	if requestsMeasured {
+		requestCount = entry.APIRequestCount
+	}
+	sessionMeta := persistence.SessionMetadata{
+		IssueID:   workerResult.IssueID,
+		SessionID: sessionID,
+		// The dispatch's row is cleared here, ahead of the run_history
+		// write below: once that row exists, a session_metadata row still
+		// keyed to this dispatch would add the run's spend a second time.
+		// These are separate writes; a clear that fails while the append
+		// below still succeeds leaves that double count as an accepted
+		// risk rather than one this path corrects.
+		DispatchID:          "",
+		InputTokens:         entry.AgentInputTokens,
+		OutputTokens:        entry.AgentOutputTokens,
+		TotalTokens:         entry.AgentTotalTokens,
+		CacheReadTokens:     entry.CacheReadTokens,
+		ModelName:           entry.ModelName,
+		APIRequestCount:     requestCount,
+		APIRequestsMeasured: requestsMeasured,
+		UpdatedAt:           now.Format(time.RFC3339),
+	}
+	if entry.AgentPID != "" {
+		sessionMeta.AgentPID = &entry.AgentPID
+	}
+	if err := params.Store.UpsertSessionMetadata(ctx, sessionMeta); err != nil {
+		log.Error("failed to persist session metadata",
+			slog.Any("error", err),
+		)
+	}
+
 	runHistoryPersisted := true
 	if _, err := params.Store.AppendRunHistory(ctx, runHistory); err != nil {
 		runHistoryPersisted = false
@@ -528,61 +592,17 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	}
 
 	aggMetrics := persistence.AggregateMetrics{
-		Key:             "agent_totals",
-		InputTokens:     state.AgentTotals.InputTokens,
-		OutputTokens:    state.AgentTotals.OutputTokens,
-		TotalTokens:     state.AgentTotals.TotalTokens,
-		CacheReadTokens: state.AgentTotals.CacheReadTokens,
-		SecondsRunning:  state.AgentTotals.SecondsRunning,
-		UpdatedAt:       now.Format(time.RFC3339),
+		Key:                "agent_totals",
+		InputTokens:        state.AgentTotals.InputTokens,
+		OutputTokens:       state.AgentTotals.OutputTokens,
+		TotalTokens:        state.AgentTotals.TotalTokens,
+		CacheReadTokens:    state.AgentTotals.CacheReadTokens,
+		SecondsRunning:     state.AgentTotals.SecondsRunning,
+		UnmeasuredSessions: state.AgentTotals.UnmeasuredSessions,
+		UpdatedAt:          now.Format(time.RFC3339),
 	}
 	if err := params.Store.UpsertAggregateMetrics(ctx, aggMetrics); err != nil {
 		log.Error("failed to persist aggregate metrics",
-			slog.Any("error", err),
-		)
-	}
-
-	// Persist session metadata so per-session token data survives restarts.
-	// Prefer workerResult.SessionID: the worker carries the authoritative value
-	// directly from the adapter, while entry.SessionID depends on
-	// EventSessionStarted having been processed before exit.
-	sessionID := workerResult.SessionID
-	if sessionID == "" {
-		sessionID = entry.SessionID
-	}
-	// The worker's own turn tally is taken alongside the entry's,
-	// because the entry's is fed by the agent event channel while this
-	// exit arrives on its own: a session_started still queued there
-	// would otherwise leave the count at zero and let a session that
-	// really ran be stored as a measured zero. The started tally is
-	// the one to take, because a turn that errored or was cancelled
-	// still means the session ran.
-	turnsSeen := max(entry.TurnCount, workerResult.TurnsStarted)
-
-	// An unmeasured count is stored as zero so a reader of the database
-	// cannot find a figure contradicting the qualifier beside it.
-	requestsMeasured := apiRequestsMeasured(entry.UsageArrival, turnsSeen, entry.APIRequestCount)
-	requestCount := 0
-	if requestsMeasured {
-		requestCount = entry.APIRequestCount
-	}
-	sessionMeta := persistence.SessionMetadata{
-		IssueID:             workerResult.IssueID,
-		SessionID:           sessionID,
-		InputTokens:         entry.AgentInputTokens,
-		OutputTokens:        entry.AgentOutputTokens,
-		TotalTokens:         entry.AgentTotalTokens,
-		CacheReadTokens:     entry.CacheReadTokens,
-		ModelName:           entry.ModelName,
-		APIRequestCount:     requestCount,
-		APIRequestsMeasured: requestsMeasured,
-		UpdatedAt:           now.Format(time.RFC3339),
-	}
-	if entry.AgentPID != "" {
-		sessionMeta.AgentPID = &entry.AgentPID
-	}
-	if err := params.Store.UpsertSessionMetadata(ctx, sessionMeta); err != nil {
-		log.Error("failed to persist session metadata",
 			slog.Any("error", err),
 		)
 	}
