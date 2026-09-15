@@ -10,20 +10,23 @@ func TestCoerceEnvInt(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		input   string
-		want    int
-		wantErr bool
+		name      string
+		input     string
+		want      int
+		wantErr   bool
+		wantRange bool // when true, the error must satisfy errors.Is(err, ErrIntegerOutOfRange)
 	}{
-		{"positive integer", "123", 123, false},
-		{"zero", "0", 0, false},
-		{"negative integer", "-5", -5, false},
-		{"whitespace trimmed", " 456 ", 456, false},
-		{"whitespace tabs", "\t100\t", 100, false},
-		{"non-numeric", "abc", 0, true},
-		{"float string", "1.5", 0, true},
-		{"empty string", "", 0, true},
-		{"mixed alpha and digit", "12abc", 0, true},
+		{"positive integer", "123", 123, false, false},
+		{"zero", "0", 0, false, false},
+		{"negative integer", "-5", -5, false, false},
+		{"whitespace trimmed", " 456 ", 456, false, false},
+		{"whitespace tabs", "\t100\t", 100, false, false},
+		{"non-numeric", "abc", 0, true, false},
+		{"float string", "1.5", 0, true, false},
+		{"empty string", "", 0, true, false},
+		{"mixed alpha and digit", "12abc", 0, true, false},
+		{"positive out of range", "99999999999999999999", 0, true, true},
+		{"negative out of range", "-99999999999999999999", 0, true, true},
 	}
 
 	for _, tt := range tests {
@@ -35,6 +38,12 @@ func TestCoerceEnvInt(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("coerceEnvInt(%q) = %v, want error", tt.input, got)
+				}
+				if tt.wantRange && !errors.Is(err, ErrIntegerOutOfRange) {
+					t.Errorf("coerceEnvInt(%q) error = %v, want it to satisfy errors.Is(err, ErrIntegerOutOfRange)", tt.input, err)
+				}
+				if !tt.wantRange && errors.Is(err, ErrIntegerOutOfRange) {
+					t.Errorf("coerceEnvInt(%q) error = %v, want a non-range error", tt.input, err)
 				}
 				return
 			}
@@ -477,6 +486,15 @@ func TestApplyEnvOverrides(t *testing.T) {
 		_, err := applyEnvOverrides(raw)
 		assertEnvOverrideError(t, err, "polling.interval_ms", "SORTIE_POLLING_INTERVAL_MS")
 		assertEnvOverrideError(t, err, "polling.interval_ms", "invalid integer value")
+	})
+
+	t.Run("int override out of range names the setting, the range, and the env var", func(t *testing.T) {
+		t.Setenv("SORTIE_AGENT_MAX_TURNS", "99999999999999999999")
+
+		raw := map[string]any{}
+		_, err := applyEnvOverrides(raw)
+		wantMsg := ErrIntegerOutOfRange.Error() + " (from SORTIE_AGENT_MAX_TURNS)"
+		assertEnvOverrideError(t, err, "agent.max_turns", wantMsg)
 	})
 
 	t.Run("workspace retention days override reaches RetentionDays with no YAML key", func(t *testing.T) {

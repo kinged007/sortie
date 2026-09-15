@@ -381,8 +381,8 @@ func TestValidateUnresolvedEnvVar(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
 	}
-	// os.ExpandEnv produces "" for the unset var, then preflight check 3
-	// catches the empty api_key for the jira adapter.
+	// os.ExpandEnv produces "" for the unset var, and the empty
+	// tracker.api_key preflight then catches it for the jira adapter.
 	if !strings.Contains(stderr.String(), "tracker.api_key") {
 		t.Errorf("stderr = %q, want to contain %q", stderr.String(), "tracker.api_key")
 	}
@@ -2571,6 +2571,75 @@ func TestValidateNonPositiveTurnTimeoutMSJSON(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("validateOutput.Errors = %v, want a diagnostic with check %q", out.Errors, "config.agent.turn_timeout_ms")
+	}
+}
+
+// outOfRangeTurnTimeoutWorkflow returns workflow content with
+// agent.turn_timeout_ms set to numeral, an unquoted YAML integer
+// literal too large for the platform int type to hold, and otherwise
+// valid tracker/agent fields, offline (the file tracker makes no
+// network call).
+func outOfRangeTurnTimeoutWorkflow(numeral string) []byte {
+	return []byte(`---
+polling:
+  interval_ms: 30000
+tracker:
+  kind: file
+  active_states:
+    - To Do
+  terminal_states:
+    - Done
+agent:
+  kind: mock
+  turn_timeout_ms: ` + numeral + `
+file:
+  path: issues.json
+---
+Do {{ .issue.title }}.
+`)
+}
+
+// TestValidateAgentTurnTimeoutMSOutOfRange covers an agent.turn_timeout_ms
+// numeral beyond the unsigned 64-bit range (gopkg.in/yaml.v3 decodes it as
+// float64) and one exactly at 2^63 (decoded as uint64); both exit 1 with a
+// single stderr line naming the field and the range an integer setting
+// accepts.
+func TestValidateAgentTurnTimeoutMSOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	wantLine := "error: config.agent.turn_timeout_ms: " +
+		"value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807\n"
+
+	tests := []struct {
+		name    string
+		numeral string
+	}{
+		{"beyond uint64 range decodes as float64", "99999999999999999999"},
+		{"exactly 2^63 decodes as uint64", "9223372036854775808"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			wfPath := writeCustomWorkflowFile(t, dir, outOfRangeTurnTimeoutWorkflow(tt.numeral))
+
+			var stdout, stderr bytes.Buffer
+			ctx := context.Background()
+
+			code := run(ctx, []string{"validate", wfPath}, &stdout, &stderr)
+
+			if code != 1 {
+				t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
+			}
+			if stderr.String() != wantLine {
+				t.Errorf("stderr = %q, want %q", stderr.String(), wantLine)
+			}
+			if stdout.String() != "" {
+				t.Errorf("stdout = %q, want empty", stdout.String())
+			}
+		})
 	}
 }
 

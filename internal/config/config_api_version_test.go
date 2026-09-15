@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestBuildTrackerConfig_APIVersion verifies the tracker config builder
 // carries api_version through and resolves $VAR indirection, mirroring
@@ -105,5 +108,22 @@ func TestNewServiceConfig_APIVersion(t *testing.T) {
 			t.Fatalf("NewServiceConfig with bare integer api_version: %v", err)
 		}
 		assertStringEqual(t, "Tracker.APIVersion", "2", cfg.Tracker.APIVersion)
+	})
+
+	// api_version is a string setting; the integer-range fix does not
+	// extend a courtesy to a float64 no int could hold, so this keeps
+	// reporting the pre-existing type fault rather than a range
+	// diagnostic.
+	t.Run("out-of-range bare float value keeps the type-fault message", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"tracker": map[string]any{"kind": "jira", "api_version": float64(99999999999999999999)},
+		})
+		assertConfigErrorField(t, err, "tracker.api_version")
+		var ce *ConfigError
+		if !errors.As(err, &ce) {
+			t.Fatalf("error type = %T, want *ConfigError", err)
+		}
+		assertStringEqual(t, "ConfigError.Message", "expected string, got float", ce.Message)
 	})
 }

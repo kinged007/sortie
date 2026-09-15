@@ -749,6 +749,40 @@ func TestResolveServerPort(t *testing.T) {
 			wantEnabled: false,
 			wantErr:     true,
 		},
+		{
+			name:        "extensions uint64 port out of range rejected",
+			portFlag:    7678,
+			portFlagSet: false,
+			extensions:  map[string]any{"server": map[string]any{"port": uint64(9223372036854775808)}},
+			wantPort:    0,
+			wantEnabled: false,
+			wantErr:     true,
+		},
+		{
+			name:        "extensions float64 port far out of range rejected",
+			portFlag:    7678,
+			portFlagSet: false,
+			extensions:  map[string]any{"server": map[string]any{"port": float64(1e20)}},
+			wantPort:    0,
+			wantEnabled: false,
+			wantErr:     true,
+		},
+		{
+			name:        "extensions uint64 port in range accepted",
+			portFlag:    7678,
+			portFlagSet: false,
+			extensions:  map[string]any{"server": map[string]any{"port": uint64(8080)}},
+			wantPort:    8080,
+			wantEnabled: true,
+		},
+		{
+			name:        "extensions int64 port in range accepted",
+			portFlag:    7678,
+			portFlagSet: false,
+			extensions:  map[string]any{"server": map[string]any{"port": int64(8080)}},
+			wantPort:    8080,
+			wantEnabled: true,
+		},
 	}
 
 	for _, tt := range tests {
