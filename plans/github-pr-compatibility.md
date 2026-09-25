@@ -4,8 +4,8 @@ Make `internal/scm/githubpr` a peer of `internal/scm/github` across transport,
 filtering, blocker declaration, error mapping, pagination, and operator-facing
 documentation.
 
-Status: in progress. Phases A and B are implemented in this change set.
-Phases C and D are recorded follow-ups.
+Status: Phases A, B, and D are implemented. Phase C is deferred at the user's
+direction and stays recorded below.
 
 ## Contract baseline
 
@@ -104,6 +104,9 @@ an `incomplete_results: true` response logs a warning.
 
 ## Phase C — feature and validation (deferred)
 
+Deferred by decision. Nothing here is a correctness defect: each item is a
+capability the `github` adapter has and `github-pr` does not.
+
 - **ETag cache on state refresh.** `fetchStatesByNumbers` issues one
   unconditional GET per PR per tick. Move `github`'s cache into `githubapi` and
   use conditional requests from both adapters. Requires an exported cache API.
@@ -122,18 +125,19 @@ an `incomplete_results: true` response logs a warning.
 - **Live integration suite.** `github` has an env-gated
   `SORTIE_GITHUB_TEST` suite. `github-pr` has none.
 
-## Phase D — documentation (deferred)
+## Phase D — documentation (implemented)
 
-`github-pr` appears in no Markdown file in the repository. Add:
+`github-pr` appeared in no Markdown file in the repository. Added:
 
 - `README.md` issue-tracker list.
 - `docs/workflow-reference.md` supported kinds, API-key list, and a
   `query_filter` note stating the raw search-qualifier grammar.
-- A `#### 11.6.5 GitHub PR adapter` section in the tracker integration contract,
-  covering the differences from §11.6.4: no dependency relation, no
-  `state_reason`, no parent.
+- `docs/architecture/11-issue-tracker-integration-contract.md` section 11.6.5,
+  covering the differences from section 11.6.4: no dependency relation, no
+  `state_reason`, no parent, no branch name, no native issue type, no ETag
+  cache, and tracker-only registration.
 - `examples/WORKFLOW.github-pr.md`.
-- A `CHANGELOG.md` Unreleased entry.
+- `CHANGELOG.md` Unreleased entries.
 
 ## Test plan
 

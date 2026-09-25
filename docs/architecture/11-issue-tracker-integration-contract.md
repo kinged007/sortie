@@ -103,6 +103,7 @@ The following tracker adapters ship today:
 - Jira, over the Atlassian REST API.
 - Linear, over its GraphQL API.
 - GitHub, Gitea, and GitLab, each over its own REST API. On a forge the tracker role and the source-control role share one integration, so the same credential and host serve both. See ADR-0016.
+- GitHub Pull Requests, over the GitHub REST API and search endpoint, as a tracker-only variant of the GitHub adapter. See Section 11.6.5.
 
 Each normalizes its native responses to the `Issue` model (Section 4.1.1), maps native errors to the categories in Section 11.4, and registers itself under its `kind` at initialization. The orchestrator core never depends on an adapter directly; it resolves one by `kind` through the adapter registry, which is what keeps the core free of vendor vocabulary.
 
@@ -237,3 +238,40 @@ The GitHub adapter targets the REST API (plus the search endpoint) at `tracker.e
 - `add_label` attaches a label by name additively through GitHub's labels-add route, so existing labels are preserved.
 
 **Operator query filter.** `tracker.query_filter` (Section 5.3.1) is a raw GitHub search-qualifier fragment appended after the adapter's own `repo:`, `type:issue`, and `state:open` qualifiers. It merges into the search-endpoint candidate fetch when non-empty (an empty filter keeps candidate fetches on the plain issues-list route) and never into the closed-issue search `fetch_issues_by_states` performs for terminal-state matching, so an operator filter never hides a terminal issue from that lookup.
+
+#### 11.6.5 GitHub PR adapter
+
+The `github-pr` adapter tracks pull requests in a GitHub repository, where the Section 11.6.4 adapter tracks issues. It targets the same REST API and search endpoint at `tracker.endpoint`, which defaults to `https://api.github.com` and accepts a GitHub Enterprise Server API root. The two adapters share one transport package for the HTTP client and the Section 11.4 status mapping, so the network timeout and the error categories are defined once. What differs is the candidate set and the normalization, and the adapter is deliberately narrower than its counterpart: it registers a tracker and nothing else.
+
+**Authentication.** The resolved `tracker.api_key` is sent as a `Bearer` token in the `Authorization` header alongside a pinned API-version header, exactly as the Section 11.6.4 adapter sends it, and the constructor runs no credential or project preflight, so a misconfigured token or an inaccessible repository surfaces on the first read rather than at startup.
+
+**Repository scoping.** `tracker.project` is the repository in `owner/repo` form, exactly one slash with non-empty halves, the same grammar the Section 11.6.4 adapter enforces. Every read and write route is scoped to that repository. The adapter uses no global issue id: it addresses pull requests by their repository-scoped `number` and qualifies each `display_id` as `owner/repo#N`.
+
+**State model.** GitHub has no native Sortie-recognized workflow state, so the adapter models Sortie state with labels, following the shared label-state derivation rule above. Its native open and closed status values are `open` and `closed`, the same spelling the Section 11.6.4 adapter reads, and the internal fallback active and terminal label lists are the same.
+
+**Normalization specifics.** Beyond the shared rules in Section 11.3:
+
+- `id` and `identifier` are both the repository-scoped pull-request number as a string; GitHub's global database id is never read.
+- `priority` is always null, because GitHub carries no priority field.
+- `parent` is always null, because the adapter reads no parent route for a pull request.
+- `branch_name` is always empty, because the adapter reads no branch field; the head branch is not read on any route it issues.
+- `issue_type` is always empty. A pull request is the only candidate type, so there is no native type field to pass through, unlike the Section 11.6.4 adapter, which passes the issue type through when GitHub reports one.
+- `blocked_by` is always a non-nil empty slice and `blockers_unresolved` is always false. GitHub's blocked-by relation is defined on issues and a pull request is not a member of it, so there is no relation to invert as Section 11.3 describes and no dependency route is read. The adapter declares this capability limit at registration as `blockers_unsupported` rather than leaving it to be inferred from the normalization code, which is what stops the shared resolver from spending its per-pass read budget on every candidate.
+- `assignee` is the first entry of the pull request's assignee list.
+- Comments come from the pull-request comments route, and the adapter requests them in ascending creation order.
+- Every candidate route is pull-request-native, so no route co-mingles issues with pull requests and the adapter drops no entry. This is the one place where the shape of the wire model is simpler than the Section 11.6.4 adapter's, which must filter the pull-request marker off the issues routes.
+
+**Transport and pagination.** GitHub paginates with `Link` response headers, so the adapter follows the header to exhaustion with a page size of 50, a bounded ceiling of 200 pages, and a 30,000 ms network timeout. A walk that reaches the ceiling logs a WARN naming the endpoint rather than returning a partial candidate set silently. The search response's `incomplete_results` flag is decoded, and a true value logs a WARN, because a search truncated at GitHub's own result ceiling is otherwise indistinguishable from a complete one. The adapter issues no conditional requests: the batched state read for running sessions fetches each pull request unconditionally, where the Section 11.6.4 adapter reads those through a per-path ETag cache.
+
+**Error classification.** The adapter applies the same Section 11.4 mapping as the Section 11.6.4 adapter, read from the shared classifier, so 401 maps to `tracker_auth_error`, a 403 carrying an exhausted rate-limit header maps to `tracker_api_error` while other 403s map to `tracker_auth_error`, 404 to a not-found result, 400 and 422 to `tracker_payload_error`, 410, 405, 409, and 429 to `tracker_api_error`, and 5xx and transport failures to `tracker_transport_error`.
+
+**Write operations.** The adapter implements the three writes the `TrackerAdapter` interface requires beyond the read set, composing each from GitHub's label and pull-request routes because GitHub has no transition endpoint:
+
+- `transition_issue` rejects a target that is not a configured active, terminal, or handoff label before any write. Otherwise it removes the current state label, adds the target label, and reconciles native status: a terminal target closes an open pull request and an active target reopens a closed one. Every step is idempotent, so a partial failure converges on retry. A terminal target does not set GitHub's `state_reason`, because the pull-request route does not accept that field, so a closed pull request is not marked completed or not-planned. This is a wire difference from the Section 11.6.4 adapter, which closes through the issue route and does set the reason, and it is not a defect to be corrected.
+- `comment_issue` posts the text verbatim as a Markdown issue comment on the pull request, which GitHub accepts natively.
+- `add_label` attaches a label by name additively through the issue-labels route, so existing labels are preserved.
+
+**Operator query filter.** `tracker.query_filter` (Section 5.3.1) is a raw GitHub search-qualifier fragment appended after the adapter's own `repo:`, `type:pr`, and `state:open` qualifiers and sent to the search endpoint. The adapter performs no local parsing of the filter, so every qualifier GitHub's search route documents reaches the server unchanged and a qualifier it does not document cannot be silently dropped. `assignee:@me` needs no local resolution, because GitHub resolves `@me` against the authenticated user on any username qualifier. The filter merges into the candidate fetch when non-empty, and an empty filter keeps that fetch on the plain pull-request list route, which avoids the search rate limit GitHub applies more tightly than the core API. The filter never merges into the closed-pull-request search `fetch_issues_by_states` performs for terminal-state matching, nor into the batched state lookups that reconcile running sessions, so an operator filter never hides a pull request from reconciliation and a dispatched pull request whose labels drift away from the filter still has its workspace cleaned up.
+
+**Relationship to the Section 11.6.4 adapter.** The two adapters are independent packages that share a transport package; neither imports the other. The differences above are the whole of it, plus the registration scope: the Section 11.6.4 adapter registers a tracker, a CI provider, and a source-control provider, while this adapter registers a tracker alone. A deployment wanting pull-request dispatch and the GitHub source-control tools configures both kinds, and supplies a credential to each, because credentials are merged on exact kind equality.
+
