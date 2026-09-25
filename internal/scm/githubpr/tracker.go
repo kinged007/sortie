@@ -18,6 +18,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/githubapi"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -29,12 +30,11 @@ func init() {
 		ValidateTrackerConfig: validateConfig,
 		DefaultActiveStates:   defaultActiveStates,
 		DefaultTerminalStates: defaultTerminalStates,
-		BlockerSource:         registry.BlockersPerIssue,
+		BlockerSource:         registry.BlockersUnsupported,
 	})
 }
 
 var _ domain.TrackerAdapter = (*GitHubPRAdapter)(nil)
-var _ domain.BlockerReader = (*GitHubPRAdapter)(nil)
 
 const maxPages = 200
 
@@ -104,7 +104,7 @@ func NewGitHubPRAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return &GitHubPRAdapter{
-		client:         newClient(endpoint, apiKey, userAgent),
+		client:         githubapi.NewClient(endpoint, apiKey, userAgent),
 		owner:          owner,
 		repo:           repo,
 		activeStates:   lowerStates(typeutil.ExtractStringSlice(config["active_states"]), defaultActiveStates),
@@ -116,7 +116,7 @@ func NewGitHubPRAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 }
 
 func splitProject(project string) (owner, repo string, ok bool) {
-	o, r, cut := splitCut(project, "/")
+	o, r, cut := strings.Cut(project, "/")
 	if !cut || o == "" || r == "" || containsSlash(r) {
 		return "", "", false
 	}
@@ -125,33 +125,26 @@ func splitProject(project string) (owner, repo string, ok bool) {
 
 // FetchCandidateIssues returns open pull requests carrying a configured
 // active-state label. Comments are nil on all returned issues. When
-// query_filter is set, candidates are additionally matched against it:
-// a "label:<name>" clause keeps only PRs carrying that label (comma
-// separates OR alternatives), an "assignee:<login>" clause keeps only
-// PRs assigned to that login (with "@me" resolved to the API token
-// owner via /user), and a "-label:<name>" clause drops any PR carrying
-// that label. All three matter here because this path lists via /pulls,
-// which cannot run search syntax — without client-side matching they
-// would be silently ignored: escalated PRs would be re-dispatched, and
-// (via DeriveLabelState's fallback to activeStates[0]) any unlabeled
-// open PR would derive the first active state and be dispatched.
+// query_filter is empty, candidates are listed from the pulls endpoint and
+// filtered by label in process. When it is set, the filter is a raw GitHub
+// search-qualifier fragment handed to the search endpoint, which applies it
+// server-side; an empty filter keeps the plain pulls-list route.
 func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
-		filter, fetchErr := a.resolvedQueryFilter(ctx)
-		if fetchErr != nil {
-			return fetchErr
+		var fetched []domain.Issue
+		var fetchErr error
+		if a.queryFilter != "" {
+			fetched, fetchErr = a.fetchCandidatesViaSearch(ctx)
+		} else {
+			fetched, fetchErr = a.fetchOpenPRs(ctx)
 		}
-		fetched, fetchErr := a.fetchOpenPRs(ctx)
 		if fetchErr != nil {
 			return fetchErr
 		}
 		activeSet := toSet(a.activeStates)
 		for _, issue := range fetched {
 			if _, ok := activeSet[issue.State]; !ok {
-				continue
-			}
-			if !filter.match(issue) {
 				continue
 			}
 			issue.Comments = nil
@@ -162,164 +155,42 @@ func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Is
 	return issues, err
 }
 
-// queryFilter carries the parsed "label:<name>" requirements (each
-// clause an OR-set; every clause needs one hit), the parsed
-// "assignee:<login>" clause (if any), plus every "-label:<name>"
-// exclusion.
-type queryFilter struct {
-	assignee queryAssignee
-	required [][]string
-	excluded []string
-}
+// fetchCandidatesViaSearch fetches open pull requests through the search
+// endpoint so the operator's query_filter is evaluated by GitHub. The filter
+// is passed through verbatim: GitHub documents @me as a suffix for every
+// username qualifier, so no client-side clause parsing is required.
+func (a *GitHubPRAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domain.Issue, error) {
+	q := fmt.Sprintf("repo:%s/%s type:pr state:open %s", a.owner, a.repo, a.queryFilter)
+	params := url.Values{
+		"q":        {q},
+		"sort":     {"created"},
+		"order":    {"asc"},
+		"per_page": {"50"},
+	}
 
-// queryAssignee carries one parsed "assignee:<login>" clause, or none.
-type queryAssignee struct {
-	login string
-	found bool
-}
+	paginator := httpkit.NewLinkPaginator(a.client, "/search/issues", params, func(body []byte) ([]domain.Issue, error) {
+		var page searchResponse
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse search response", Err: err}
+		}
+		if page.IncompleteResults {
+			slog.Warn("github search returned incomplete results", slog.Int("total_count", page.TotalCount))
+		}
+		issues := make([]domain.Issue, 0, len(page.Items))
+		for _, item := range page.Items {
+			issues = append(issues, a.normalize(item.asPullRequest()))
+		}
+		return issues, nil
+	}, httpkit.PaginatorOptions{
+		MaxPages: maxPages,
+		OnLimitReached: func(limit int) {
+			slog.Warn("pagination limit reached",
+				slog.Int("max_pages", limit),
+				slog.String("endpoint", "/search/issues"))
+		},
+	})
 
-// resolvedQueryFilter parses the adapter's query_filter into matchable
-// clauses. An empty filter matches everything. Label, assignee, and
-// negative-label clauses all apply to the pulls-list path because it
-// cannot run search syntax. "@me" resolves to the token owner's login
-// via /user.
-func (a *GitHubPRAdapter) resolvedQueryFilter(ctx context.Context) (queryFilter, error) {
-	filter := queryFilter{
-		required: parseRequiredLabels(a.queryFilter),
-		excluded: parseExcludedLabels(a.queryFilter),
-	}
-	assignee, found := parseAssigneeClause(a.queryFilter)
-	if !found {
-		return filter, nil
-	}
-	if !strings.EqualFold(assignee, "@me") {
-		filter.assignee = queryAssignee{login: assignee, found: true}
-		return filter, nil
-	}
-	login, err := a.currentLogin(ctx)
-	if err != nil {
-		return queryFilter{}, err
-	}
-	filter.assignee = queryAssignee{login: login, found: true}
-	return filter, nil
-}
-
-// match reports whether issue satisfies the parsed filter. A filter
-// without an assignee clause matches every issue on assignee;
-// exclusion labels reject regardless; every label: clause needs one
-// of its alternatives present. Matching is case-insensitive;
-// unassigned PRs never match an assignee clause.
-// ponytail: domain.Issue carries the first assignee only; a PR where
-// the user is a second assignee won't match — extend the domain type
-// with all assignees when multi-assignee routing is needed.
-func (f queryFilter) match(issue domain.Issue) bool {
-	if f.assignee.found {
-		if issue.Assignee == "" {
-			return false
-		}
-		if !strings.EqualFold(issue.Assignee, f.assignee.login) {
-			return false
-		}
-	}
-	if len(f.excluded) > 0 || len(f.required) > 0 {
-		present := toSetLower(issue.Labels)
-		for _, label := range f.excluded {
-			if _, ok := present[label]; ok {
-				return false
-			}
-		}
-		for _, alternatives := range f.required {
-			hit := false
-			for _, label := range alternatives {
-				if _, ok := present[label]; ok {
-					hit = true
-					break
-				}
-			}
-			if !hit {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// parseRequiredLabels extracts every "label:<name>" clause from a
-// search-style filter string as an OR-set per clause (comma separates
-// alternatives, as in GitHub search). Values are lowercased for
-// comparison against the adapter-normalized issue labels.
-func parseRequiredLabels(filter string) [][]string {
-	var required [][]string
-	for _, field := range strings.Fields(filter) {
-		name, value, cut := splitCut(field, ":")
-		if !cut || !strings.EqualFold(name, "label") {
-			continue
-		}
-		var alternatives []string
-		for _, alt := range strings.Split(strings.Trim(value, `"`), ",") {
-			alt = strings.ToLower(strings.TrimSpace(alt))
-			if alt == "" {
-				continue
-			}
-			alternatives = append(alternatives, alt)
-		}
-		if len(alternatives) > 0 {
-			required = append(required, alternatives)
-		}
-	}
-	return required
-}
-
-// parseExcludedLabels extracts every "-label:<name>" clause from a
-// search-style filter string, lowercased for comparison against the
-// adapter-normalized issue labels.
-func parseExcludedLabels(filter string) []string {
-	var excluded []string
-	for _, field := range strings.Fields(filter) {
-		name, value, cut := splitCut(field, ":")
-		if !cut || !strings.EqualFold(name, "-label") {
-			continue
-		}
-		value = strings.ToLower(strings.Trim(value, `"`))
-		if value == "" {
-			continue
-		}
-		excluded = append(excluded, value)
-	}
-	return excluded
-}
-
-// parseAssigneeClause extracts the login from the first
-// "assignee:<login>" clause in a search-style filter string.
-func parseAssigneeClause(filter string) (string, bool) {
-	for _, field := range strings.Fields(filter) {
-		name, value, cut := splitCut(field, ":")
-		if !cut || !strings.EqualFold(name, "assignee") {
-			continue
-		}
-		value = strings.Trim(value, `"`)
-		if value == "" {
-			continue
-		}
-		return value, true
-	}
-	return "", false
-}
-
-// currentLogin returns the login of the API token owner via GET /user.
-func (a *GitHubPRAdapter) currentLogin(ctx context.Context) (string, error) {
-	body, _, err := a.client.Get(ctx, "/user", nil)
-	if err != nil {
-		return "", err
-	}
-	var user pullUser
-	if err := json.Unmarshal(body, &user); err != nil {
-		return "", &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse user response", Err: err}
-	}
-	if user.Login == "" {
-		return "", &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "empty login in user response"}
-	}
-	return user.Login, nil
+	return paginator.All(ctx)
 }
 
 func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context) ([]domain.Issue, error) {
@@ -342,7 +213,14 @@ func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context) ([]domain.Issue, err
 			issues = append(issues, issue)
 		}
 		return issues, nil
-	}, httpkit.PaginatorOptions{MaxPages: maxPages})
+	}, httpkit.PaginatorOptions{
+		MaxPages: maxPages,
+		OnLimitReached: func(limit int) {
+			slog.Warn("pagination limit reached",
+				slog.Int("max_pages", limit),
+				slog.String("endpoint", path))
+		},
+	})
 
 	return paginator.All(ctx)
 }
@@ -371,8 +249,6 @@ func (a *GitHubPRAdapter) FetchIssueByID(ctx context.Context, issueID string) (d
 		}
 
 		issue = a.normalize(pr)
-		issue.BlockedBy = []domain.BlockerRef{}
-		issue.BlockersUnresolved = false
 
 		issue.Comments, err = a.FetchIssueComments(ctx, issueID)
 		return err
@@ -382,7 +258,10 @@ func (a *GitHubPRAdapter) FetchIssueByID(ctx context.Context, issueID string) (d
 
 // FetchIssuesByStates returns pull requests in the specified states:
 // open PRs via the pulls list endpoint for non-terminal states,
-// closed PRs via search for terminal states.
+// closed PRs via search for terminal states. The operator's query_filter
+// is not applied here: this operation drives running-state reconciliation
+// and startup terminal cleanup, and a filter that no longer matches a
+// dispatched PR would strand its workspace.
 func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []string) ([]domain.Issue, error) {
 	if len(states) == 0 {
 		return []domain.Issue{}, nil
@@ -399,11 +278,6 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 		}
 	}
 
-	filter, fetchErr := a.resolvedQueryFilter(ctx)
-	if fetchErr != nil {
-		return []domain.Issue{}, fetchErr
-	}
-
 	var matched []domain.Issue
 	err := trackermetrics.Track(a.metrics, "fetch_by_states", func() error {
 		matchedIssues := make([]domain.Issue, 0)
@@ -416,9 +290,6 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 			}
 			for _, issue := range prs {
 				if _, ok := stateSet[issue.State]; !ok {
-					continue
-				}
-				if !filter.match(issue) {
 					continue
 				}
 				if _, dup := seen[issue.Identifier]; dup {
@@ -455,14 +326,14 @@ func (a *GitHubPRAdapter) fetchClosedPRsByLabel(ctx context.Context, label strin
 		"order":    {"asc"},
 		"per_page": {"50"},
 	}
-	if a.queryFilter != "" {
-		params.Set("q", q+" "+a.queryFilter)
-	}
 
 	paginator := httpkit.NewLinkPaginator(a.client, "/search/issues", params, func(body []byte) ([]domain.Issue, error) {
 		var page searchResponse
 		if err := json.Unmarshal(body, &page); err != nil {
 			return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse search response", Err: err}
+		}
+		if page.IncompleteResults {
+			slog.Warn("github search returned incomplete results", slog.String("label", label))
 		}
 		issues := make([]domain.Issue, 0, len(page.Items))
 		for _, item := range page.Items {
@@ -476,7 +347,15 @@ func (a *GitHubPRAdapter) fetchClosedPRsByLabel(ctx context.Context, label strin
 			seen[issue.Identifier] = struct{}{}
 		}
 		return issues, nil
-	}, httpkit.PaginatorOptions{MaxPages: maxPages})
+	}, httpkit.PaginatorOptions{
+		MaxPages: maxPages,
+		OnLimitReached: func(limit int) {
+			slog.Warn("pagination limit reached",
+				slog.Int("max_pages", limit),
+				slog.String("endpoint", "/search/issues"),
+				slog.String("label", label))
+		},
+	})
 
 	return paginator.All(ctx)
 }
@@ -556,7 +435,14 @@ func (a *GitHubPRAdapter) FetchIssueComments(ctx context.Context, issueID string
 				return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse comments response", Err: err}
 			}
 			return raw, nil
-		}, httpkit.PaginatorOptions{MaxPages: maxPages})
+		}, httpkit.PaginatorOptions{
+			MaxPages: maxPages,
+			OnLimitReached: func(limit int) {
+				slog.Warn("pagination limit reached",
+					slog.Int("max_pages", limit),
+					slog.String("endpoint", path))
+			},
+		})
 
 		raw, err := paginator.All(ctx)
 		if err != nil {
@@ -569,17 +455,6 @@ func (a *GitHubPRAdapter) FetchIssueComments(ctx context.Context, issueID string
 		return nil
 	})
 	return comments, err
-}
-
-// FetchIssueBlockers returns an empty list: PRs carry no blocker graph
-// in this adapter. The non-nil slice satisfies the per-issue contract
-// without a dependencies route.
-func (a *GitHubPRAdapter) FetchIssueBlockers(ctx context.Context, issueID string) ([]domain.BlockerRef, error) {
-	blockers := make([]domain.BlockerRef, 0)
-	err := trackermetrics.Track(a.metrics, "fetch_blockers", func() error {
-		return nil
-	})
-	return blockers, err
 }
 
 // TransitionIssue moves a PR to the target state by swapping the state
@@ -708,7 +583,7 @@ func (a *GitHubPRAdapter) normalize(pr pullRequest) domain.Issue {
 		Labels:             issuekit.NormalizeLabels(labelNames(pr.Labels)),
 		Assignee:           assignee,
 		BlockedBy:          []domain.BlockerRef{},
-		BlockersUnresolved: true,
+		BlockersUnresolved: false,
 		CreatedAt:          pr.CreatedAt,
 		UpdatedAt:          pr.UpdatedAt,
 	}

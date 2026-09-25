@@ -1,4 +1,8 @@
-package github
+// Package githubapi holds the HTTP transport shared by the GitHub tracker,
+// CI, and SCM adapters and by the GitHub pull-request tracker. It registers no
+// kind and holds no adapter; it exists so one timeout, one set of request
+// headers, and one HTTP-status-to-error mapping serve every GitHub surface.
+package githubapi
 
 import (
 	"fmt"
@@ -11,13 +15,21 @@ import (
 	"github.com/sortie-ai/sortie/internal/httpkit"
 )
 
-func newGitHubClient(baseURL, token, userAgent string) *httpkit.Client {
+// requestTimeout bounds every GitHub request. The orchestrator runs its poll
+// tick inline on the event loop with no per-tick deadline, so an unbounded
+// client can wedge polling, worker-exit handling, and retry timers together.
+// It is a var so the timeout can be lowered in tests.
+var requestTimeout = 30 * time.Second
+
+// NewClient returns a client for the GitHub REST API at baseURL,
+// authenticated with token as a bearer credential.
+func NewClient(baseURL, token, userAgent string) *httpkit.Client {
 	trimmedBaseURL := strings.TrimRight(baseURL, "/")
 	authorization := "Bearer " + token
 
 	return httpkit.NewClient(httpkit.ClientOptions{
 		BaseURL: trimmedBaseURL,
-		Timeout: 30 * time.Second,
+		Timeout: requestTimeout,
 		Authorize: func(req *http.Request) {
 			req.Header.Set("Authorization", authorization)
 			req.Header.Set("Accept", "application/vnd.github+json")
@@ -31,6 +43,10 @@ func newGitHubClient(baseURL, token, userAgent string) *httpkit.Client {
 
 const maxErrorBody = 512
 
+// classifyHTTPError maps a non-success GitHub response to a domain tracker
+// error. A 403 carries either an exhausted rate limit or a permission
+// failure, so the remaining-requests header is read before the body: the two
+// map to different kinds and the orchestrator retries them differently.
 func classifyHTTPError(resp *http.Response, method, path string) error {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 	_, _ = io.Copy(io.Discard, resp.Body)

@@ -1,4 +1,4 @@
-package github
+package githubapi
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
@@ -16,7 +17,7 @@ import (
 
 func newTestClient(t *testing.T, baseURL string) *httpkit.Client {
 	t.Helper()
-	return newGitHubClient(baseURL, "test-token", "sortie/test")
+	return NewClient(baseURL, "test-token", "sortie/test")
 }
 
 func assertClientError(t *testing.T, err error, want domain.TrackerErrorKind) {
@@ -437,5 +438,38 @@ func TestClientGetRaw_Success(t *testing.T) {
 	}
 	if string(body) != "hello" {
 		t.Errorf("body = %q, want %q", body, "hello")
+	}
+}
+
+// TestNewClient_BoundsSlowRequests is not parallel because it lowers the
+// package timeout that the other tests' clients read.
+func TestNewClient_BoundsSlowRequests(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	original := requestTimeout
+	requestTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = original })
+
+	client := NewClient(srv.URL, "test-token", "sortie/test")
+	start := time.Now()
+	_, _, err := client.Get(context.Background(), "/slow", nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Get returned no error for a request the client should have timed out")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Get took %s, want the client timeout to end it near %s", elapsed, 50*time.Millisecond)
+	}
+	var trackerErr *domain.TrackerError
+	if !errors.As(err, &trackerErr) || trackerErr.Kind != domain.ErrTrackerTransport {
+		t.Errorf("error = %v, want a tracker_transport_error", err)
 	}
 }
