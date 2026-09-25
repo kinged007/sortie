@@ -265,6 +265,52 @@ func TestCandidateBlockersAreAuthoritative(t *testing.T) {
 	}
 }
 
+func TestFetchCandidates_IncompleteResultsStillDecode(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// GitHub sets this when its own result ceiling truncated the set.
+		// The adapter must warn and keep the pages it did receive.
+		_, _ = io.WriteString(w, `{"total_count":2,"incomplete_results":true,"items":[`+
+			prJSON(1, "backlog", "open")+`,`+prJSON(2, "backlog", "open")+`]}`)
+	}))
+	defer srv.Close()
+
+	cfg := validConfig(srv.URL)
+	cfg["query_filter"] = "label:agent-ready"
+	a := mustAdapter(t, cfg)
+	issues, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues = %+v, want both items despite incomplete_results", issues)
+	}
+}
+
+func TestFetchCandidates_PaginationCeilingStops(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		// An endless chain: every page advertises a next one.
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?page=%d>; rel="next"`, r.Host, r.URL.Path, requests+1))
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	defer srv.Close()
+
+	a := mustAdapter(t, validConfig(srv.URL))
+	if _, err := a.FetchCandidateIssues(context.Background()); err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if requests != maxPages {
+		t.Errorf("requests = %d, want the walk to stop at the %d-page ceiling", requests, maxPages)
+	}
+}
+
 func TestAdapterDoesNotImplementBlockerReader(t *testing.T) {
 	t.Parallel()
 
