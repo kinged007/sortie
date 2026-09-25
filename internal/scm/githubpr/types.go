@@ -1,11 +1,7 @@
 package githubpr
 
 import (
-	"net/http"
-	"strings"
-
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 )
 
@@ -40,8 +36,9 @@ type pullComment struct {
 
 // searchResponse is GET /search/issues restricted to type:pr items.
 type searchResponse struct {
-	TotalCount int          `json:"total_count"`
-	Items      []searchItem `json:"items"`
+	TotalCount        int          `json:"total_count"`
+	IncompleteResults bool         `json:"incomplete_results"`
+	Items             []searchItem `json:"items"`
 }
 
 // searchItem carries the pulls-listed shape nested under pull_request
@@ -74,20 +71,4 @@ func normalizeComments(raw []pullComment) []domain.Comment {
 		}
 	}
 	return issuekit.NormalizeComments(source)
-}
-
-func newClient(baseURL, token, userAgent string) *httpkit.Client {
-	trimmed := strings.TrimRight(baseURL, "/")
-	authorization := "Bearer " + token
-	return httpkit.NewClient(httpkit.ClientOptions{
-		BaseURL: trimmed,
-		Authorize: func(req *http.Request) {
-			req.Header.Set("Authorization", authorization)
-			req.Header.Set("Accept", "application/vnd.github+json")
-			req.Header.Set("X-GitHub-Api-Version", "2026-03-10")
-			req.Header.Set("User-Agent", userAgent)
-		},
-		ClassifyError:     classifyError,
-		ClassifyTransport: httpkit.ClassifyTransport,
-	})
 }

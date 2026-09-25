@@ -12,6 +12,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/githubapi"
 	"github.com/sortie-ai/sortie/internal/scm/scmcore"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -118,7 +119,7 @@ func NewGitHubCIProvider(maxLogLines int, adapterConfig map[string]any) (domain.
 	}
 
 	return &GitHubCIProvider{
-		client:      newGitHubClient(endpoint, apiKey, userAgent),
+		client:      githubapi.NewClient(endpoint, apiKey, userAgent),
 		owner:       owner,
 		repo:        repo,
 		maxLogLines: maxLogLines,

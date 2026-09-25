@@ -30,6 +30,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/githubapi"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -179,7 +180,7 @@ func NewGitHubAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return &GitHubAdapter{
-		client:         newGitHubClient(endpoint, apiKey, userAgent),
+		client:         githubapi.NewClient(endpoint, apiKey, userAgent),
 		owner:          owner,
 		repo:           repo,
 		activeStates:   activeStates,

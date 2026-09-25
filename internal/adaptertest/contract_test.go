@@ -165,6 +165,7 @@ type contractSharedPackage struct {
 // orchestrator's production code.
 var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/scmcore":                     {reason: "shared forge decision core; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/scm/githubapi":                   {reason: "shared GitHub transport and error classification; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig":                 {reason: "shared MCP configuration parsing; registers no kind and holds no adapter", coreImportable: true},
