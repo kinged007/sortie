@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The comment posted when a session starts (`tracker.comments.on_dispatch`) now reads only "Sortie session started.", without the session and workspace lines that always read `pending`, the agent kind, or the attempt count. The comments posted when a session ends (`tracker.comments.on_completion`, `tracker.comments.on_failure`) no longer show the agent's session identifier, and the failure comment no longer quotes the error; it gives the duration and whether the issue will be retried, and the cause stays available in the log, the run history, and the dashboard.
   ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
 
+### Deprecated
+
+- The `kiro` agent kind is deprecated. Kiro CLI now runs through the `agent-client-protocol` kind with `kiro-cli acp -a`, which delivers Sortie's tools under a stored login. Workflows naming `kiro` keep working; each run and `sortie validate` warn once, naming `agent-client-protocol`. A later release removes the kind.
+  ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
+
 ### Fixed
 
 - A run that ends having reported no token usage, while `agent.max_tokens` is set, now says so in the log, naming the agent kind and the ceiling the run could not be held to. Before this, only an agent kind that declares up front that it never reports token usage drew a warning, so a kind that declares figures do arrive while the runtime it starts reports none left the ceiling doing nothing and said nothing about it. The dashboard no longer describes such a session as not having reported its tokens yet: once the point its agent reports at has passed with nothing counted, the session's Tokens row reads "not reported", and the footer counts the session among those running an agent that reports no token usage rather than among those still to report.

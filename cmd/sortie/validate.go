@@ -101,7 +101,8 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 
 	mgr, err := workflow.NewManager(path, logger,
 		workflow.WithValidateFunc(orchestrator.ValidateConfigForPromotion),
-		workflow.WithAgentKindProbe(registry.Agents.Has))
+		workflow.WithAgentKindProbe(registry.Agents.Has),
+		workflow.WithAdvisoryFunc(agentKindDeprecationAdvisories))
 	if err != nil {
 		emitDiags(stdout, stderr, *format, mapManagerError(err), warningDiags)
 		return 1

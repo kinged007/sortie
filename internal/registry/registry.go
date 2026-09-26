@@ -167,10 +167,23 @@ const (
 	BlockersUnsupported BlockerSource = "unsupported"
 )
 
+// AgentDeprecation declares that a registered agent kind is
+// deprecated in favor of Replacement.
+type AgentDeprecation struct {
+	Replacement string
+}
+
 // AgentMeta holds optional agent-adapter-declared properties queried
 // by the orchestrator at preflight time. Zero value means no special
 // requirements.
 type AgentMeta struct {
+	// Deprecation is nil when the kind is not deprecated, which holds
+	// for every registered kind but one. Non-nil declares the kind
+	// deprecated in favor of Deprecation.Replacement: the kind stays
+	// registered, and it constructs and runs unchanged. Read-only after
+	// registration.
+	Deprecation *AgentDeprecation
+
 	// RequiresCommand indicates the agent adapter requires a
 	// non-empty agent.command config value.
 	RequiresCommand bool

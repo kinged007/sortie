@@ -64,6 +64,10 @@ server:
 
 {{/* Sortie sample workflow, GitHub Issues + Kiro CLI.
 
+     The "kiro" agent kind is deprecated in favor of "agent-client-protocol";
+     see examples/WORKFLOW.agent-client-protocol.kiro.md for the migrated
+     example.
+
      The Kiro adapter launches one "kiro-cli chat --no-interactive"
      subprocess per turn. Headless Kiro emits no structured output, so
      budget enforcement is time-based: turn_timeout_ms above is the
