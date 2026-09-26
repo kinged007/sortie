@@ -4596,3 +4596,147 @@ func TestValidateTriageConfigErrors(t *testing.T) {
 		})
 	}
 }
+
+// advisoryWorkflow returns a minimal file-tracker workflow with
+// agentFrontMatter spliced in as its agent selection and any adapter
+// blocks it needs.
+func advisoryWorkflow(agentFrontMatter string) []byte {
+	return []byte(`---
+tracker:
+  kind: file
+  active_states:
+    - To Do
+  terminal_states:
+    - Done
+` + agentFrontMatter + `file:
+  path: issues.json
+---
+Do {{ .issue.title }}.
+`)
+}
+
+// ciFeedbackDeprecatedAdvisoryWorkflow carries both the deprecated
+// ci_feedback section and its reactions.ci_failure replacement, so
+// NewServiceConfig records the ci_feedback.deprecated advisory.
+func ciFeedbackDeprecatedAdvisoryWorkflow() []byte {
+	return advisoryWorkflow(`agent:
+  kind: mock
+ci_feedback:
+  kind: github
+reactions:
+  ci_failure:
+    provider: github
+`)
+}
+
+// kiroAgentKindWorkflow selects the deprecated kiro kind, with
+// trust_all_tools set so it passes kiro's own offline trust-posture
+// check and the only warning is the deprecation advisory.
+func kiroAgentKindWorkflow() []byte {
+	return advisoryWorkflow(`agent:
+  kind: kiro
+  command: /usr/bin/true
+kiro:
+  trust_all_tools: true
+`)
+}
+
+// agentClientProtocolWithLeftoverKiroBlockWorkflow selects the
+// agent-client-protocol kind while a kiro: block sits unused in the
+// front matter, named by no selector.
+func agentClientProtocolWithLeftoverKiroBlockWorkflow() []byte {
+	return advisoryWorkflow(`agent:
+  kind: agent-client-protocol
+  command: /usr/bin/true
+kiro:
+  trust_all_tools: true
+`)
+}
+
+// TestRunValidate_ConfigurationAdvisories asserts that sortie validate
+// renders exactly one warning per configuration advisory, with valid
+// and the exit code unaffected, and that the agent-client-protocol
+// route draws no agent.kind.deprecated warning even with a leftover
+// kiro: block no selector names. Text-format rendering of a warning is
+// generic, pre-existing behavior exercised elsewhere in this file; this
+// covers only the two distinct wiring points that feed validate's
+// advisory loop: a config-sourced advisory (ci_feedback, built inside
+// NewServiceConfig) and a manager-sourced one (the kiro deprecation,
+// added through [workflow.WithAdvisoryFunc]). Every other advisory
+// producer shares one of these two wiring points and is proven at the
+// unit level where it is built.
+func TestRunValidate_ConfigurationAdvisories(t *testing.T) {
+	tests := []struct {
+		name        string
+		workflow    []byte
+		wantCheck   string
+		wantTextSub string
+		wantAbsent  bool
+	}{
+		{
+			name:        "ci_feedback deprecated in favor of reactions.ci_failure",
+			workflow:    ciFeedbackDeprecatedAdvisoryWorkflow(),
+			wantCheck:   "ci_feedback.deprecated",
+			wantTextSub: "ci_feedback is deprecated and ignored because reactions.ci_failure is set",
+		},
+		{
+			name:        "kiro agent kind deprecated in favor of agent-client-protocol",
+			workflow:    kiroAgentKindWorkflow(),
+			wantCheck:   "agent.kind.deprecated",
+			wantTextSub: `agent kind "kiro" is deprecated and will be removed in a later release; use agent kind "agent-client-protocol" instead`,
+		},
+		{
+			name:       "agent-client-protocol route with a leftover kiro block draws no deprecation warning",
+			workflow:   agentClientProtocolWithLeftoverKiroBlockWorkflow(),
+			wantCheck:  "agent.kind.deprecated",
+			wantAbsent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			writeIssuesFixture(t, dir)
+			wfPath := writeCustomWorkflowFile(t, dir, tt.workflow)
+
+			var stdout, stderr bytes.Buffer
+			code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run(validate --format json) = %d, want 0; stderr: %s", code, stderr.String())
+			}
+
+			var out validateOutput
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
+			}
+			if !out.Valid {
+				t.Errorf("validateOutput.Valid = false, want true")
+			}
+
+			var matches []validateDiag
+			for _, w := range out.Warnings {
+				if w.Check == tt.wantCheck {
+					matches = append(matches, w)
+				}
+			}
+
+			if tt.wantAbsent {
+				if len(matches) != 0 {
+					t.Errorf("validateOutput.Warnings with check %q = %v, want none", tt.wantCheck, matches)
+				}
+				return
+			}
+			if len(matches) != 1 {
+				t.Fatalf("validateOutput.Warnings with check %q = %v, want exactly 1", tt.wantCheck, matches)
+			}
+			if matches[0].Severity != "warning" {
+				t.Errorf("warning Severity = %q, want %q", matches[0].Severity, "warning")
+			}
+			if !strings.Contains(matches[0].Message, tt.wantTextSub) {
+				t.Errorf("warning Message = %q, want to contain %q", matches[0].Message, tt.wantTextSub)
+			}
+		})
+	}
+}

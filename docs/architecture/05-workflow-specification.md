@@ -170,6 +170,7 @@ Fields:
   - Other kinds (for example, HTTP-based adapters) are available only if you register them separately.
   - Parallels `tracker.kind`.
   - This is the default agent kind used when no `dispatch.rules` entry overrides it; see §5.3.10 for the override mechanism.
+  - `kiro` is deprecated, with `agent-client-protocol` as its replacement. The kind stays registered and a configuration naming it keeps working.
 - `command` (string)
   - The command the agent adapter uses to launch the agent process. A local subprocess adapter splits it on whitespace into an argument vector; an SSH worker passes it to the remote shell unsplit. Adapter-defined default.
   - When `agent.kind` requires a local command, this field must be present and non-empty.

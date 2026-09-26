@@ -36,6 +36,7 @@ Dynamic reload is required:
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) may require restart unless live rebind is explicitly supported.
 - Sortie also re-validates/reloads defensively during runtime operations (for example before dispatch) in case filesystem watch events are missed.
 - Invalid reloads do not crash the service; Sortie keeps operating with the last known good effective configuration and emits an operator-visible error.
+- A configuration's advisories are recorded once, when the configuration is built or loaded, never on each defensive re-read, and reported once per appearance: the running orchestrator reports one at the tick that first draws it, and again only after a tick whose effective configuration did not draw it; `sortie validate` reports the same advisories as warnings.
 
 ### 6.3 Dispatch Preflight Validation
 

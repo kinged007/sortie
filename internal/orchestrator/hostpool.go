@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/config"
 )
 
 // HostPool manages SSH host allocation for dispatch. Not safe for
@@ -196,15 +197,6 @@ func deduplicateHosts(hosts []string) []string {
 	return deduped
 }
 
-// WorkerWarning is a structured validation diagnostic produced by
-// [ParseWorkerConfig]. It carries a stable log message and typed
-// slog attributes so the caller can emit it through its scoped
-// logger without interpolating variable data into the message string.
-type WorkerWarning struct {
-	Message string
-	Attrs   []slog.Attr
-}
-
 // WorkerConfig holds parsed worker extension configuration.
 type WorkerConfig struct {
 	// SSHHosts is the list of SSH host strings for remote dispatch.
@@ -230,10 +222,11 @@ type WorkerConfig struct {
 	SSHDisallowPassEnv []string
 
 	// Warnings contains structured validation diagnostics produced
-	// during parsing. Empty when all values are valid or absent.
-	// The caller logs these through its scoped logger after
-	// change-detection.
-	Warnings []WorkerWarning
+	// during parsing, as worker advisories: Check and Text are always
+	// empty, since sortie validate never reports them. Empty when all
+	// values are valid or absent. The caller reports these through
+	// [LogAdvisories].
+	Warnings []config.Advisory
 }
 
 // ParseWorkerConfig parses the worker extension section. Returns a
@@ -280,7 +273,7 @@ func ParseWorkerConfig(workerSection map[string]any, envRefPaths map[string]bool
 
 	strictHostKeyChecking, warn := parseSSHStrictHostKeyChecking(workerSection)
 
-	var warnings []WorkerWarning
+	var warnings []config.Advisory
 	if warn != nil {
 		warnings = append(warnings, *warn)
 	}
@@ -303,14 +296,14 @@ func ParseWorkerConfig(workerSection map[string]any, envRefPaths map[string]bool
 	if len(hosts) > 0 {
 		for _, name := range listed {
 			if slices.Contains(disallowed, name) {
-				warnings = append(warnings, WorkerWarning{
+				warnings = append(warnings, config.Advisory{
 					Message: "ssh_pass_env variable is disallowed by ssh_disallow_pass_env, not carrying it",
 					Attrs:   []slog.Attr{slog.String("variable", name)},
 				})
 				continue
 			}
 			if value, present := os.LookupEnv(name); !present || strings.TrimSpace(value) == "" {
-				warnings = append(warnings, WorkerWarning{
+				warnings = append(warnings, config.Advisory{
 					Message: "ssh_pass_env variable is not set or empty in the orchestrator environment",
 					Attrs:   []slog.Attr{slog.String("variable", name)},
 				})
@@ -338,7 +331,7 @@ func ParseWorkerConfig(workerSection map[string]any, envRefPaths map[string]bool
 // fails [sshutil.IsEnvName] produces entryMessage carrying only its
 // index, never its text, and is skipped. A valid name already seen is
 // dropped, keeping the first occurrence.
-func nameList(workerSection map[string]any, envRefPaths map[string]bool, key, nonListMessage, entryMessage, envRefMessage string) ([]string, []WorkerWarning) {
+func nameList(workerSection map[string]any, envRefPaths map[string]bool, key, nonListMessage, entryMessage, envRefMessage string) ([]string, []config.Advisory) {
 	raw, present := workerSection[key]
 	if !present || raw == nil {
 		return nil, nil
@@ -346,14 +339,14 @@ func nameList(workerSection map[string]any, envRefPaths map[string]bool, key, no
 
 	rawList, ok := raw.([]any)
 	if !ok {
-		return nil, []WorkerWarning{{Message: nonListMessage}}
+		return nil, []config.Advisory{{Message: nonListMessage}}
 	}
 
 	var names []string
-	var warnings []WorkerWarning
+	var warnings []config.Advisory
 	for i, element := range rawList {
 		if envRefPaths[key+"["+strconv.Itoa(i)+"]"] {
-			warnings = append(warnings, WorkerWarning{
+			warnings = append(warnings, config.Advisory{
 				Message: envRefMessage,
 				Attrs:   []slog.Attr{slog.Int("index", i)},
 			})
@@ -361,7 +354,7 @@ func nameList(workerSection map[string]any, envRefPaths map[string]bool, key, no
 		}
 		s, ok := element.(string)
 		if !ok || !sshutil.IsEnvName(s) {
-			warnings = append(warnings, WorkerWarning{
+			warnings = append(warnings, config.Advisory{
 				Message: entryMessage,
 				Attrs:   []slog.Attr{slog.Int("index", i)},
 			})
@@ -379,12 +372,12 @@ func nameList(workerSection map[string]any, envRefPaths map[string]bool, key, no
 // dropped name. A reserved name satisfies [sshutil.IsEnvName], so it
 // reaches here rather than nameList's entry check, and carrying it
 // would collide with the carrier's own launch-completeness marker.
-func dropReservedNames(names []string) ([]string, []WorkerWarning) {
+func dropReservedNames(names []string) ([]string, []config.Advisory) {
 	var kept []string
-	var warnings []WorkerWarning
+	var warnings []config.Advisory
 	for _, name := range names {
 		if sshutil.IsReservedEnvName(name) {
-			warnings = append(warnings, WorkerWarning{
+			warnings = append(warnings, config.Advisory{
 				Message: "ssh_pass_env variable is reserved by Sortie, not carrying it",
 				Attrs:   []slog.Attr{slog.String("variable", name)},
 			})
@@ -420,7 +413,7 @@ func carriedEnvNames(declared, listed, disallowed []string) []string {
 // Returns the normalized value (one of "accept-new", "yes", "no", or
 // empty for default) and a structured diagnostic. The diagnostic is
 // non-nil when the raw value has the wrong type or is unrecognized.
-func parseSSHStrictHostKeyChecking(workerMap map[string]any) (string, *WorkerWarning) {
+func parseSSHStrictHostKeyChecking(workerMap map[string]any) (string, *config.Advisory) {
 	raw, ok := workerMap["ssh_strict_host_key_checking"]
 	if !ok {
 		return "", nil
@@ -428,7 +421,7 @@ func parseSSHStrictHostKeyChecking(workerMap map[string]any) (string, *WorkerWar
 
 	s, ok := raw.(string)
 	if !ok {
-		return "", &WorkerWarning{
+		return "", &config.Advisory{
 			Message: "received non-string ssh_strict_host_key_checking, using default",
 			Attrs:   []slog.Attr{slog.String("default", "accept-new")},
 		}
@@ -439,35 +432,9 @@ func parseSSHStrictHostKeyChecking(workerMap map[string]any) (string, *WorkerWar
 	case "accept-new", "yes", "no":
 		return normalized, nil
 	default:
-		return "", &WorkerWarning{
+		return "", &config.Advisory{
 			Message: "rejected unrecognized ssh_strict_host_key_checking value",
 			Attrs:   []slog.Attr{slog.String("value", s), slog.String("default", "accept-new")},
 		}
 	}
-}
-
-func workerWarningsEqual(a, b []WorkerWarning) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
-	}
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Message != b[i].Message {
-			return false
-		}
-		if len(a[i].Attrs) != len(b[i].Attrs) {
-			return false
-		}
-		for j := range a[i].Attrs {
-			if a[i].Attrs[j].Key != b[i].Attrs[j].Key {
-				return false
-			}
-			if !a[i].Attrs[j].Value.Equal(b[i].Attrs[j].Value) {
-				return false
-			}
-		}
-	}
-	return true
 }

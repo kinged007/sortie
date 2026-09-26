@@ -51,6 +51,7 @@ func init() {
 		UsageArrival:        registry.UsageArrivalNone,
 		UsageAttribution:    registry.UsageAttributionNone,
 		CredentialEnv:       registry.DeclareCredentialEnv("KIRO_API_KEY"),
+		Deprecation:         &registry.AgentDeprecation{Replacement: "agent-client-protocol"},
 	})
 }
 

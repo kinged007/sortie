@@ -274,7 +274,10 @@ type Orchestrator struct {
 	sshPassEnv         []string
 	sshDisallowPassEnv []string
 
-	prevWorkerWarnings []WorkerWarning
+	// reportedAdvisories is the set of advisories reported as of the
+	// most recent tick, empty at construction. Read and written only by
+	// handleTick.
+	reportedAdvisories []config.Advisory
 }
 
 // NewOrchestrator creates an [Orchestrator] with all dependencies wired.
@@ -627,9 +630,10 @@ func (o *Orchestrator) updateGauges(now time.Time) {
 
 // applyWorkerConfig parses the worker extension section and applies it to
 // the host pool and the SSH launch fields makeWorkerFn reads, returning the
-// parsing diagnostics. Run applies it once before activating recovered
-// retries; handleTick applies it every tick so a reload takes effect.
-func (o *Orchestrator) applyWorkerConfig(cfg config.ServiceConfig) []WorkerWarning {
+// parsing diagnostics as worker advisories. Run applies it once before
+// activating recovered retries; handleTick applies it every tick so a
+// reload takes effect.
+func (o *Orchestrator) applyWorkerConfig(cfg config.ServiceConfig) []config.Advisory {
 	wc := ParseWorkerConfig(cfg.ExtensionSection("worker"), cfg.ExtensionEnvRefPaths("worker"))
 	o.hostPool.Update(wc.SSHHosts, wc.MaxPerHost)
 	o.sshStrictHostKeyChecking = wc.SSHStrictHostKeyChecking
@@ -669,14 +673,9 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 	o.state.TokenWarningThreshold = cfg.Agent.TokenWarningThreshold()
 	o.state.MaxConcurrentByState = cfg.Agent.MaxConcurrentByState
 
-	warnings := o.applyWorkerConfig(cfg)
-
-	if !workerWarningsEqual(o.prevWorkerWarnings, warnings) {
-		for _, w := range warnings {
-			o.logger.LogAttrs(ctx, slog.LevelWarn, w.Message, w.Attrs...) //nolint:sloglint // WorkerWarning.Message comes from one of a fixed set of string constants ParseWorkerConfig produces
-		}
-		o.prevWorkerWarnings = warnings
-	}
+	current := append(cfg.Advisories(), o.applyWorkerConfig(cfg)...)
+	LogAdvisories(ctx, o.logger, newAdvisories(current, o.reportedAdvisories))
+	o.reportedAdvisories = current
 
 	// Reconcile unconditionally so in-flight workers are monitored even when
 	// dispatch is skipped.

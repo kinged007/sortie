@@ -24,7 +24,7 @@ A runtime moves onto the protocol when its protocol surface carries every load-b
 
 4. **Deprecation is a promise; direction is not.** A deprecation notice commits the project to a removal. Issuing one before the removal is achievable teaches operators that notices need not be acted on, which is expensive to unlearn.
 
-5. **A migration costs the operator one line.** The project's transition is not the operator's to pay for: the same workflow, the same behavior, one changed value. A route that withdraws a capability an operator holds fails that test whatever it gains elsewhere.
+5. **A migration costs the operator a mechanical edit, nothing more.** The project's transition is not the operator's to pay for: the same workflow, the same behavior, a configuration edit made mechanically. A route that withdraws a capability an operator holds fails that test whatever it gains elsewhere.
 
 6. **The question recurs unchanged.** One move creates one pair, and the roster carries runtimes still to move. Answering per runtime would re-argue identical reasoning and let the outcomes diverge for no reason an operator could see.
 
@@ -47,7 +47,7 @@ A workflow file naming either kind keeps working across the release that publish
 
 ### What an operator is told
 
-The protocol is the transport this project builds on. New runtimes arrive on it, and a runtime that qualifies moves onto it. That is a direction rather than a deprecation: no deprecation is in force, and none is issued before its condition is met.
+The protocol is the transport this project builds on. New runtimes arrive on it, and a runtime that qualifies moves onto it. That is a direction rather than a deprecation: a hand-written kind is deprecated only once its condition is met, never before.
 
 Where two routes reach one runtime, what each costs is documented for that runtime, where `agent.kind` is chosen rather than in an adapter's working notes. It is per runtime because the difference is per runtime, and one sentence covering every pair would be wrong somewhere.
 
