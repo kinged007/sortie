@@ -47,7 +47,7 @@ A workflow file naming either kind keeps working across the release that publish
 
 ### What an operator is told
 
-The protocol is the transport this project builds on. New runtimes arrive on it, and a runtime that qualifies moves onto it. That is a direction rather than a deprecation: no deprecation is in force, and none is issued before its condition is met.
+The protocol is the transport this project builds on. New runtimes arrive on it, and a runtime that qualifies moves onto it. That is a direction rather than a deprecation: a hand-written kind is deprecated only once its condition is met, never before.
 
 Where two routes reach one runtime, what each costs is documented for that runtime, where `agent.kind` is chosen rather than in an adapter's working notes. It is per runtime because the difference is per runtime, and one sentence covering every pair would be wrong somewhere.
 
