@@ -1916,7 +1916,7 @@ func TestBuildLabelCommandsConfig_Defaults(t *testing.T) {
 
 	t.Run("absent block is a zero-value config, no error", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(nil)
+		got, _, err := buildLabelCommandsConfig(nil)
 		if err != nil {
 			t.Fatalf("buildLabelCommandsConfig(nil): unexpected error: %v", err)
 		}
@@ -1927,7 +1927,7 @@ func TestBuildLabelCommandsConfig_Defaults(t *testing.T) {
 
 	t.Run("provider only fills in every default", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider": "github",
 		})
 		if err != nil {
@@ -1951,7 +1951,7 @@ func TestBuildLabelCommandsConfig_EmptyProviderIgnoresFields(t *testing.T) {
 	// With no active provider the block is inert, so a below-floor poll
 	// interval and a type-invalid label field are neither clamped nor
 	// rejected: the whole block is ignored and yields a zero-value config.
-	got, err := buildLabelCommandsConfig(map[string]any{
+	got, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":         "",
 		"poll_interval_ms": 5,
 		"review_label":     123,
@@ -1967,7 +1967,7 @@ func TestBuildLabelCommandsConfig_EmptyProviderIgnoresFields(t *testing.T) {
 func TestBuildLabelCommandsConfig_ReviewLabelDisabled(t *testing.T) {
 	t.Parallel()
 
-	got, err := buildLabelCommandsConfig(map[string]any{
+	got, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":     "github",
 		"review_label": "",
 		"fix_label":    "sortie:fix",
@@ -2006,7 +2006,7 @@ func TestBuildLabelCommandsConfig_FixLabelParsedNotWired(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := buildLabelCommandsConfig(tt.m)
+			got, _, err := buildLabelCommandsConfig(tt.m)
 			if err != nil {
 				t.Fatalf("buildLabelCommandsConfig(%+v): unexpected error: %v", tt.m, err)
 			}
@@ -2022,7 +2022,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("below floor clamps to 30000", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, advisory, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 5000,
 		})
@@ -2032,11 +2032,21 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 		if got.PollIntervalMS != 30000 {
 			t.Errorf("PollIntervalMS = %d, want 30000 (clamped)", got.PollIntervalMS)
 		}
+		if advisory == nil {
+			t.Fatal("buildLabelCommandsConfig advisory = nil, want non-nil when poll_interval_ms is clamped")
+		}
+		assertStringEqual(t, "advisory.Check", "reactions.label_commands.poll_interval_ms.clamped", advisory.Check)
+		assertStringEqual(t, "advisory.Text", "reactions.label_commands.poll_interval_ms is 5000, below the minimum of 30000; 30000 is used", advisory.Text)
+		assertStringEqual(t, "advisory.Message", "clamped label_commands poll_interval_ms to floor", advisory.Message)
+		if len(advisory.Attrs) != 2 || advisory.Attrs[0].Key != "configured_ms" || advisory.Attrs[0].Value.Int64() != 5000 ||
+			advisory.Attrs[1].Key != "floor_ms" || advisory.Attrs[1].Value.Int64() != 30000 {
+			t.Errorf("advisory.Attrs = %v, want [configured_ms=5000 floor_ms=30000]", advisory.Attrs)
+		}
 	})
 
 	t.Run("at floor is unchanged", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, advisory, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 30000,
 		})
@@ -2046,11 +2056,14 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 		if got.PollIntervalMS != 30000 {
 			t.Errorf("PollIntervalMS = %d, want 30000", got.PollIntervalMS)
 		}
+		if advisory != nil {
+			t.Errorf("buildLabelCommandsConfig advisory = %+v, want nil when poll_interval_ms is not clamped", advisory)
+		}
 	})
 
 	t.Run("above floor is unchanged", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 90000,
 		})
@@ -2064,7 +2077,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("non-integer value is a ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": "not-a-number",
 		})
@@ -2073,7 +2086,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("out-of-range uint64 value is a range ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": uint64(9223372036854775808),
 		})
@@ -2085,7 +2098,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("out-of-range float64 value is a range ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": float64(1e20),
 		})
@@ -2099,7 +2112,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 func TestBuildLabelCommandsConfig_BothLabelsEmptyErrors(t *testing.T) {
 	t.Parallel()
 
-	_, err := buildLabelCommandsConfig(map[string]any{
+	_, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":     "github",
 		"review_label": "",
 		"fix_label":    "",
@@ -2307,6 +2320,17 @@ func assertStringEqual(t *testing.T, name, want, got string) {
 	if got != want {
 		t.Errorf("%s = %q, want %q", name, got, want)
 	}
+}
+
+// hasAdvisory reports whether advisories carries one whose Check and
+// Message equal the given values.
+func hasAdvisory(advisories []Advisory, check, message string) bool {
+	for _, a := range advisories {
+		if a.Check == check && a.Message == message {
+			return true
+		}
+	}
+	return false
 }
 
 func assertIntEqual(t *testing.T, name string, want, got int) {
@@ -2834,6 +2858,35 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 			t.Error("ci_feedback leaked into cfg.extensions; want absent")
 		}
 	})
+}
+
+func TestNewServiceConfig_CIFeedbackAndLabelCommandsAdvisoriesAccumulate(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := NewServiceConfig(map[string]any{
+		"ci_feedback": map[string]any{"kind": "github"},
+		"reactions": map[string]any{
+			"ci_failure": map[string]any{"provider": "github-actions"},
+			"label_commands": map[string]any{
+				"provider":         "github",
+				"poll_interval_ms": 5000,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServiceConfig: unexpected error: %v", err)
+	}
+
+	got := cfg.Advisories()
+	if len(got) != 2 {
+		t.Fatalf("Advisories() = %+v, want 2 entries", got)
+	}
+	if !hasAdvisory(got, "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
+		t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", got)
+	}
+	if !hasAdvisory(got, "reactions.label_commands.poll_interval_ms.clamped", "clamped label_commands poll_interval_ms to floor") {
+		t.Errorf("Advisories() = %+v, want the poll_interval_ms.clamped advisory", got)
+	}
 }
 
 func TestNewServiceConfig_SelfReview(t *testing.T) {
@@ -3550,6 +3603,10 @@ func TestCIFailureMigration(t *testing.T) {
 		assertIntEqual(t, "CIFeedback.MaxLogLines", 75, cfg.CIFeedback.MaxLogLines)
 		assertStringEqual(t, "CIFeedback.Escalation", "comment", cfg.CIFeedback.Escalation)
 		assertStringEqual(t, "CIFeedback.EscalationLabel", "ci-blocked", cfg.CIFeedback.EscalationLabel)
+
+		if !hasAdvisory(cfg.Advisories(), "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
+			t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", cfg.Advisories())
+		}
 	})
 
 	t.Run("Precedence/CIFeedbackOnly", func(t *testing.T) {

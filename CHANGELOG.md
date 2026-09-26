@@ -72,6 +72,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - An agent that prints only text Sortie cannot read on standard output, such as its usage text, before it exits is now reported like one that exits before it responds, with its exit status and the end of what it printed to standard error. This covers `claude-code`, `copilot-cli`, and `opencode`.
   ([#960](https://github.com/sortie-ai/sortie/issues/960))
 
+- Configuration warnings (a deprecated `ci_feedback` section, a `label_commands` prompt template missing its branch or a poll interval below its minimum, a missing env file, an environment override replacing a section that is not a mapping) now appear once when they first apply instead of on every poll. `sortie validate` reports them as warnings instead of printing log lines. `sortie stats` and `sortie mcp-server` no longer print them.
+  ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
+
 ### Migrations
 
 - Add `unaccounted_turns INTEGER NOT NULL DEFAULT 0` to `run_history`, counting the run's turns that spent tokens no figure was proven to account for, whether no figure arrived at all or the one that did fell short of the turn. A pre-migration row reads back zero and so presents as fully accounted, but nothing measured it: before the upgrade a turn that spent tokens without reporting a figure was indistinguishable from one that cost nothing, and because `run_history` is an append-only record no later run can correct, that zero stays. A historical run's spend therefore reads as complete because nothing can now establish otherwise, not because it was verified.

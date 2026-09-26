@@ -93,26 +93,33 @@ var envOverrides = []envOverride{
 // applyEnvOverrides merges SORTIE_* environment variables and .env file
 // values into the raw config map. Returns a set of field paths that were
 // set from environment sources (used by section builders to skip $VAR
-// expansion). Returns an error on .env parse failures or type coercion
-// failures.
-func applyEnvOverrides(raw map[string]any) (map[string]bool, error) {
+// expansion) and the advisories recording a missing .env file or a
+// non-map section an override replaced. Returns an error on .env parse
+// failures or type coercion failures.
+func applyEnvOverrides(raw map[string]any) (map[string]bool, []Advisory, error) {
 	// Resolve dotenv path: CLI flag -> env var -> empty (no loading).
 	dotenvPath := getDotEnvPath()
 	if dotenvPath == "" {
 		dotenvPath = os.Getenv("SORTIE_ENV_FILE")
 	}
 
+	var advisories []Advisory
+
 	var dotenv map[string]string
 	if dotenvPath != "" {
 		var err error
 		dotenv, err = parseDotEnv(dotenvPath)
 		if err != nil {
-			return nil, fmt.Errorf("config: %w", err)
+			return nil, nil, fmt.Errorf("config: %w", err)
 		}
 		if dotenv == nil {
 			// Path was set but file does not exist.
-			slog.Warn("env file not found, skipping", //nolint:gosec // G706: path is operator-provided via CLI flag or env var
-				slog.String("path", dotenvPath))
+			advisories = append(advisories, Advisory{
+				Check:   "env_file.missing",
+				Text:    fmt.Sprintf("env file %s does not exist; no values are read from it", strconv.Quote(dotenvPath)),
+				Message: "env file not found, skipping",
+				Attrs:   []slog.Attr{slog.String("path", dotenvPath)},
+			})
 		}
 	}
 
@@ -133,7 +140,7 @@ func applyEnvOverrides(raw map[string]any) (map[string]bool, error) {
 			if ov.Section != "" {
 				fieldPath = ov.Section + "." + ov.Field
 			}
-			return nil, &ConfigError{
+			return nil, nil, &ConfigError{
 				Field:   fieldPath,
 				Message: fmt.Sprintf("%s (from %s)", err.Error(), ov.EnvVar),
 			}
@@ -155,20 +162,29 @@ func applyEnvOverrides(raw map[string]any) (map[string]bool, error) {
 		if strings.Contains(ov.Field, ".") {
 			// Nested field (e.g. "comments.on_dispatch" under "tracker").
 			parent, child, _ := strings.Cut(ov.Field, ".")
-			secMap := ensureSubMap(raw, ov.Section)
-			subMap := ensureSubMap(secMap, parent)
+			secMap, secAdvisory := ensureSubMap(raw, ov.Section)
+			if secAdvisory != nil {
+				advisories = append(advisories, *secAdvisory)
+			}
+			subMap, subAdvisory := ensureSubMap(secMap, parent)
+			if subAdvisory != nil {
+				advisories = append(advisories, *subAdvisory)
+			}
 			subMap[child] = coerced
 			envKeys[ov.Section+"."+ov.Field] = true
 			continue
 		}
 
 		// Section-level field.
-		secMap := ensureSubMap(raw, ov.Section)
+		secMap, secAdvisory := ensureSubMap(raw, ov.Section)
+		if secAdvisory != nil {
+			advisories = append(advisories, *secAdvisory)
+		}
 		secMap[ov.Field] = coerced
 		envKeys[ov.Section+"."+ov.Field] = true
 	}
 
-	return envKeys, nil
+	return envKeys, advisories, nil
 }
 
 // DotEnvEntries returns the "NAME=value" entries of the .env file at
@@ -200,23 +216,27 @@ func DotEnvEntries() []string {
 // ensureSubMap ensures m[key] is a map[string]any and returns it. If
 // the existing value is nil or absent, a fresh empty map is created and
 // assigned. If the existing value is a non-map type, it is replaced and
-// a warning is logged for the operator (silent data loss).
-func ensureSubMap(m map[string]any, key string) map[string]any {
+// an advisory records the silent data loss for the operator.
+func ensureSubMap(m map[string]any, key string) (map[string]any, *Advisory) {
 	existing, ok := m[key]
+	var advisory *Advisory
 	if ok {
 		if v, isMap := existing.(map[string]any); isMap {
-			return v
+			return v, nil
 		}
-		// Present but wrong type, so warn about silent data loss.
+		// Present but wrong type, so record the silent data loss.
 		if existing != nil {
-			slog.Warn("env override replaced non-map YAML section",
-				slog.String("section", key),
-				slog.String("yaml_type", fmt.Sprintf("%T", existing)))
+			advisory = &Advisory{
+				Check:   "env_override.section_replaced",
+				Text:    fmt.Sprintf("the %s section is not a mapping; an environment override replaced it with one that holds only the overridden settings", strconv.Quote(key)),
+				Message: "env override replaced non-map YAML section",
+				Attrs:   []slog.Attr{slog.String("section", key), slog.String("yaml_type", fmt.Sprintf("%T", existing))},
+			}
 		}
 	}
 	v := make(map[string]any)
 	m[key] = v
-	return v
+	return v, advisory
 }
 
 func coerceString(s string) (any, error) {

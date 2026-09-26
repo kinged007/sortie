@@ -124,6 +124,10 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 		})
 	}
 
+	for _, a := range mgr.Config().Advisories() {
+		warningDiags = append(warningDiags, validateDiag{Severity: "warning", Check: a.Check, Message: a.Text})
+	}
+
 	// Fold the offline forge diagnostics into the same exit decision as
 	// the preflight errors. A reaction- or activation-only fault must
 	// block dispatch even when the dispatch preflight passes, so both the

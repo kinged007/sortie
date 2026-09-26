@@ -38,6 +38,18 @@ func WithValidateFunc(fn ValidateFunc) ManagerOption {
 	return func(m *Manager) { m.validateFunc = fn }
 }
 
+// AdvisoryFunc computes advisories from a loaded configuration beyond
+// those [config.NewServiceConfig] and the manager's own load-time
+// checks record. See [WithAdvisoryFunc].
+type AdvisoryFunc func(config.ServiceConfig) []config.Advisory
+
+// WithAdvisoryFunc sets the function the manager calls once per load,
+// on the configuration after its dispatch configuration is set, to
+// record further advisories. A nil fn, the default, adds nothing.
+func WithAdvisoryFunc(fn AdvisoryFunc) ManagerOption {
+	return func(m *Manager) { m.advisoryFunc = fn }
+}
+
 // WithAgentKindProbe sets the agent-kind registry probe used by
 // dispatch-rule validation at workflow load time. The probe receives
 // an agent kind string and returns true when the kind is currently
@@ -60,6 +72,7 @@ type Manager struct {
 	logger         *slog.Logger
 	validateFunc   ValidateFunc
 	agentKindProbe func(kind string) bool
+	advisoryFunc   AdvisoryFunc
 
 	mu                   sync.RWMutex
 	currentConfig        config.ServiceConfig
@@ -356,10 +369,15 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 	// without a {{ if .label_review }} branch it posts no review. This scan
 	// is best-effort and never fails the load.
 	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.ReviewLabel != "" && !strings.Contains(wf.PromptTemplate, "label_review") {
-		m.currentLogger().Warn("label_commands active but prompt template has no label_review branch",
-			slog.String("workflow", m.path),
-			slog.String("hint", "add a {{ if .label_review }} branch so label-review dispatches post a review"),
-		)
+		cfg.AddAdvisories(config.Advisory{
+			Check:   "reactions.label_commands.review_branch_missing",
+			Text:    "reactions.label_commands is active with a review label, but the prompt template has no {{ if .label_review }} branch; a label-review dispatch posts no review",
+			Message: "label_commands active but prompt template has no label_review branch",
+			Attrs: []slog.Attr{
+				slog.String("workflow", m.path),
+				slog.String("hint", "add a {{ if .label_review }} branch so label-review dispatches post a review"),
+			},
+		})
 	}
 
 	// Advisory: a label-fix dispatch clones the workspace and carries
@@ -367,10 +385,15 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 	// the normal work prompt against a real checkout with push capability.
 	// This scan is best-effort and never fails the load.
 	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.FixLabel != "" && !strings.Contains(wf.PromptTemplate, "label_fix") {
-		m.currentLogger().Warn("label_commands active but prompt template has no label_fix branch",
-			slog.String("workflow", m.path),
-			slog.String("hint", "add a {{ if .label_fix }} branch so label-fix dispatches check out the branch, push fixes, and post a summary"),
-		)
+		cfg.AddAdvisories(config.Advisory{
+			Check:   "reactions.label_commands.fix_branch_missing",
+			Text:    "reactions.label_commands is active with a fix label, but the prompt template has no {{ if .label_fix }} branch; a label-fix dispatch runs the normal work prompt against a checkout that can push",
+			Message: "label_commands active but prompt template has no label_fix branch",
+			Attrs: []slog.Attr{
+				slog.String("workflow", m.path),
+				slog.String("hint", "add a {{ if .label_fix }} branch so label-fix dispatches check out the branch, push fixes, and post a summary"),
+			},
+		})
 	}
 
 	probe := m.agentKindProbe
@@ -386,6 +409,10 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 		return config.ServiceConfig{}, nil, nil, err
 	}
 	cfg.SetDispatch(dispatchCfg)
+
+	if m.advisoryFunc != nil {
+		cfg.AddAdvisories(m.advisoryFunc(cfg)...)
+	}
 
 	tmpl, err := prompt.Parse(wf.PromptTemplate, m.path, wf.FrontMatterLines)
 	if err != nil {

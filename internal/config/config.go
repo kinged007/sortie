@@ -90,6 +90,11 @@ type ServiceConfig struct {
 	// only through that constructor, can read it. Zero value (nil
 	// Backends) means no notifier backend is configured.
 	Notifications NotificationsConfig
+
+	// advisories holds the advisories recorded while this configuration
+	// was built or loaded. Read and written only through
+	// [ServiceConfig.Advisories] and [ServiceConfig.AddAdvisories].
+	advisories []Advisory
 }
 
 // SetDispatch attaches a parsed [DispatchConfig] to the service
@@ -498,10 +503,12 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		raw = map[string]any{}
 	}
 
-	envKeys, err := applyEnvOverrides(raw)
+	envKeys, envAdvisories, err := applyEnvOverrides(raw)
 	if err != nil {
 		return ServiceConfig{}, err
 	}
+	var advisories []Advisory
+	advisories = append(advisories, envAdvisories...)
 
 	rawTracker := extractSubMap(raw, "tracker")
 	tracker, err := buildTrackerConfig(rawTracker, envKeys)
@@ -618,15 +625,22 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 			return ServiceConfig{}, err
 		}
 		if hasCIFeedbackSection {
-			slog.Warn("ci_feedback section is deprecated; using reactions.ci_failure instead",
-				slog.String("hint", "remove the ci_feedback section from your WORKFLOW.md"))
+			advisories = append(advisories, Advisory{
+				Check:   "ci_feedback.deprecated",
+				Text:    "ci_feedback is deprecated and ignored because reactions.ci_failure is set; remove the ci_feedback section",
+				Message: "ci_feedback section is deprecated; using reactions.ci_failure instead",
+				Attrs:   []slog.Attr{slog.String("hint", "remove the ci_feedback section from your WORKFLOW.md")},
+			})
 		}
 		delete(reactions, "ci_failure")
 	}
 
-	labelCommands, err := buildLabelCommandsConfig(extractSubMap(extractSubMap(raw, "reactions"), "label_commands"))
+	labelCommands, labelCommandsAdvisory, err := buildLabelCommandsConfig(extractSubMap(extractSubMap(raw, "reactions"), "label_commands"))
 	if err != nil {
 		return ServiceConfig{}, err
+	}
+	if labelCommandsAdvisory != nil {
+		advisories = append(advisories, *labelCommandsAdvisory)
 	}
 
 	notifications, err := buildNotificationsConfig(raw)
@@ -645,7 +659,7 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 
 	registerConfigSecrets(tracker, reactions, notifications, extensions)
 
-	return ServiceConfig{
+	cfg := ServiceConfig{
 		Tracker:                 tracker,
 		Polling:                 polling,
 		Workspace:               workspace,
@@ -659,7 +673,9 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		extensions:              extensions,
 		extensionsPreResolution: preResolution,
 		Notifications:           notifications,
-	}, nil
+	}
+	cfg.AddAdvisories(advisories...)
+	return cfg, nil
 }
 
 // registerConfigSecrets registers every resolved credential a
@@ -2070,17 +2086,18 @@ type LabelCommandsConfig struct {
 // Returns a zero-value config with Provider == "" when the block is absent
 // or empty. Returns a [*ConfigError] when a field has the wrong type, when
 // poll_interval_ms is not an integer, or when provider is set while both
-// command labels resolve to empty.
-func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
+// command labels resolve to empty. The second return value is non-nil
+// exactly when poll_interval_ms was clamped to its floor.
+func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, *Advisory, error) {
 	if len(m) == 0 {
-		return LabelCommandsConfig{}, nil
+		return LabelCommandsConfig{}, nil, nil
 	}
 
 	// The block is rejected wholesale rather than ignored, because
 	// label commands have no escalation to invoke and so could not
 	// honor one of the three dispositions.
 	if _, exists := m["triage"]; exists {
-		return LabelCommandsConfig{}, &ConfigError{
+		return LabelCommandsConfig{}, nil, &ConfigError{
 			Field:   "reactions.label_commands.triage",
 			Message: triageUnsupportedKindMessage,
 		}
@@ -2088,45 +2105,49 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 
 	provider, _, err := requireStringField(m, "provider", "reactions.label_commands.provider")
 	if err != nil {
-		return LabelCommandsConfig{}, err
+		return LabelCommandsConfig{}, nil, err
 	}
 
 	// An absent or empty provider makes the whole block inert. Its other
 	// fields are ignored, so they are neither validated, clamped, nor
 	// defaulted here.
 	if provider == "" {
-		return LabelCommandsConfig{}, nil
+		return LabelCommandsConfig{}, nil, nil
 	}
 
 	// An absent label key defaults to the conventional label; an explicit
 	// empty string is a deliberate disable and must be preserved.
 	reviewLabel := "sortie:review"
 	if s, found, rErr := requireStringField(m, "review_label", "reactions.label_commands.review_label"); rErr != nil {
-		return LabelCommandsConfig{}, rErr
+		return LabelCommandsConfig{}, nil, rErr
 	} else if found {
 		reviewLabel = s
 	}
 
 	fixLabel := "sortie:fix"
 	if s, found, fErr := requireStringField(m, "fix_label", "reactions.label_commands.fix_label"); fErr != nil {
-		return LabelCommandsConfig{}, fErr
+		return LabelCommandsConfig{}, nil, fErr
 	} else if found {
 		fixLabel = s
 	}
 
 	pollIntervalMS := 60000
+	var advisory *Advisory
 	if raw, exists := m["poll_interval_ms"]; exists && raw != nil {
 		n, pErr := coerceInt(raw)
 		if pErr != nil {
-			return LabelCommandsConfig{}, &ConfigError{
+			return LabelCommandsConfig{}, nil, &ConfigError{
 				Field:   "reactions.label_commands.poll_interval_ms",
 				Message: integerFaultMessage(pErr, fmt.Sprintf("invalid integer value: %v", raw)),
 			}
 		}
 		if n < 30000 {
-			slog.Warn("clamped label_commands poll_interval_ms to floor",
-				slog.Int("configured_ms", n),
-				slog.Int("floor_ms", 30000))
+			advisory = &Advisory{
+				Check:   "reactions.label_commands.poll_interval_ms.clamped",
+				Text:    fmt.Sprintf("reactions.label_commands.poll_interval_ms is %d, below the minimum of 30000; 30000 is used", n),
+				Message: "clamped label_commands poll_interval_ms to floor",
+				Attrs:   []slog.Attr{slog.Int("configured_ms", n), slog.Int("floor_ms", 30000)},
+			}
 			n = 30000
 		}
 		pollIntervalMS = n
@@ -2135,7 +2156,7 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 	// An active provider with both command labels disabled is a loud
 	// misconfiguration: the block does nothing but is not silently inert.
 	if provider != "" && reviewLabel == "" && fixLabel == "" {
-		return LabelCommandsConfig{}, &ConfigError{
+		return LabelCommandsConfig{}, nil, &ConfigError{
 			Field:   "reactions.label_commands",
 			Message: "an active provider requires at least one non-empty command label (review_label or fix_label)",
 		}
@@ -2146,7 +2167,7 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 		ReviewLabel:    reviewLabel,
 		FixLabel:       fixLabel,
 		PollIntervalMS: pollIntervalMS,
-	}, nil
+	}, advisory, nil
 }
 
 func normalizeByStateMap(raw any) (map[string]int, error) {

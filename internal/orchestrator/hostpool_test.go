@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/sortie-ai/sortie/internal/config"
 )
 
 // unsetEnvForTest removes name for the duration of the test and
@@ -274,7 +276,7 @@ func TestParseWorkerConfig(t *testing.T) {
 		wantHosts                 []string
 		wantMaxPerHost            int
 		wantSSHStrictHostKeyCheck string
-		wantWarnings              []WorkerWarning
+		wantWarnings              []config.Advisory
 	}{
 		{
 			name:          "nil worker section",
@@ -359,7 +361,7 @@ func TestParseWorkerConfig(t *testing.T) {
 				"ssh_strict_host_key_checking": "ask",
 			},
 			wantSSHStrictHostKeyCheck: "",
-			wantWarnings: []WorkerWarning{
+			wantWarnings: []config.Advisory{
 				{
 					Message: "rejected unrecognized ssh_strict_host_key_checking value",
 					Attrs:   []slog.Attr{slog.String("value", "ask"), slog.String("default", "accept-new")},
@@ -372,7 +374,7 @@ func TestParseWorkerConfig(t *testing.T) {
 				"ssh_strict_host_key_checking": 42,
 			},
 			wantSSHStrictHostKeyCheck: "",
-			wantWarnings: []WorkerWarning{
+			wantWarnings: []config.Advisory{
 				{
 					Message: "received non-string ssh_strict_host_key_checking, using default",
 					Attrs:   []slog.Attr{slog.String("default", "accept-new")},
@@ -710,87 +712,6 @@ func TestCarriedEnvNames(t *testing.T) {
 			got := carriedEnvNames(tt.declared, tt.listed, tt.disallowed)
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("carriedEnvNames(%v, %v, %v) = %v, want %v", tt.declared, tt.listed, tt.disallowed, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestWorkerWarningsEqual(t *testing.T) {
-	t.Parallel()
-
-	attrValue := func(key, val string) slog.Attr { return slog.String(key, val) }
-
-	tests := []struct {
-		name string
-		a    []WorkerWarning
-		b    []WorkerWarning
-		want bool
-	}{
-		{
-			name: "both nil",
-			a:    nil,
-			b:    nil,
-			want: true,
-		},
-		{
-			name: "both empty",
-			a:    []WorkerWarning{},
-			b:    []WorkerWarning{},
-			want: true,
-		},
-		{
-			name: "nil vs empty",
-			a:    nil,
-			b:    []WorkerWarning{},
-			want: true,
-		},
-		{
-			name: "single warning identical",
-			a: []WorkerWarning{
-				{Message: "some warning", Attrs: []slog.Attr{attrValue("key", "val")}},
-			},
-			b: []WorkerWarning{
-				{Message: "some warning", Attrs: []slog.Attr{attrValue("key", "val")}},
-			},
-			want: true,
-		},
-		{
-			name: "same message different attr value",
-			a: []WorkerWarning{
-				{Message: "some warning", Attrs: []slog.Attr{attrValue("key", "val-a")}},
-			},
-			b: []WorkerWarning{
-				{Message: "some warning", Attrs: []slog.Attr{attrValue("key", "val-b")}},
-			},
-			want: false,
-		},
-		{
-			name: "different message",
-			a: []WorkerWarning{
-				{Message: "warning-a", Attrs: []slog.Attr{attrValue("k", "v")}},
-			},
-			b: []WorkerWarning{
-				{Message: "warning-b", Attrs: []slog.Attr{attrValue("k", "v")}},
-			},
-			want: false,
-		},
-		{
-			name: "different lengths",
-			a: []WorkerWarning{
-				{Message: "w", Attrs: []slog.Attr{attrValue("k", "v")}},
-			},
-			b:    []WorkerWarning{},
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := workerWarningsEqual(tt.a, tt.b)
-			if got != tt.want {
-				t.Errorf("workerWarningsEqual(%v, %v) = %t, want %t", tt.a, tt.b, got, tt.want)
 			}
 		})
 	}

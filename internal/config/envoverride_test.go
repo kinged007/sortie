@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -178,7 +179,7 @@ func TestEnsureSubMap(t *testing.T) {
 	t.Run("absent key creates empty map", func(t *testing.T) {
 		t.Parallel()
 		m := map[string]any{}
-		sub := ensureSubMap(m, "tracker")
+		sub, _ := ensureSubMap(m, "tracker")
 		if sub == nil {
 			t.Fatal("ensureSubMap returned nil, want empty map")
 		}
@@ -199,7 +200,7 @@ func TestEnsureSubMap(t *testing.T) {
 	t.Run("nil value creates empty map", func(t *testing.T) {
 		t.Parallel()
 		m := map[string]any{"tracker": nil}
-		sub := ensureSubMap(m, "tracker")
+		sub, _ := ensureSubMap(m, "tracker")
 		if sub == nil {
 			t.Fatal("ensureSubMap returned nil, want empty map")
 		}
@@ -212,7 +213,7 @@ func TestEnsureSubMap(t *testing.T) {
 		t.Parallel()
 		inner := map[string]any{"kind": "jira"}
 		m := map[string]any{"tracker": inner}
-		sub := ensureSubMap(m, "tracker")
+		sub, _ := ensureSubMap(m, "tracker")
 		if sub == nil {
 			t.Fatal("ensureSubMap returned nil")
 		}
@@ -229,7 +230,7 @@ func TestEnsureSubMap(t *testing.T) {
 	t.Run("non-map type replaced with empty map", func(t *testing.T) {
 		t.Parallel()
 		m := map[string]any{"tracker": "a-string"}
-		sub := ensureSubMap(m, "tracker")
+		sub, advisory := ensureSubMap(m, "tracker")
 		if sub == nil {
 			t.Fatal("ensureSubMap returned nil, want empty map")
 		}
@@ -240,12 +241,23 @@ func TestEnsureSubMap(t *testing.T) {
 		if _, isStr := m["tracker"].(string); isStr {
 			t.Error("m[\"tracker\"] is still a string; expected it to be replaced with map")
 		}
+
+		if advisory == nil {
+			t.Fatal("ensureSubMap advisory = nil, want non-nil when the existing value is not a map")
+		}
+		assertStringEqual(t, "advisory.Check", "env_override.section_replaced", advisory.Check)
+		assertStringEqual(t, "advisory.Text", `the "tracker" section is not a mapping; an environment override replaced it with one that holds only the overridden settings`, advisory.Text)
+		assertStringEqual(t, "advisory.Message", "env override replaced non-map YAML section", advisory.Message)
+		if len(advisory.Attrs) != 2 || advisory.Attrs[0].Key != "section" || advisory.Attrs[0].Value.String() != "tracker" ||
+			advisory.Attrs[1].Key != "yaml_type" || advisory.Attrs[1].Value.String() != "string" {
+			t.Errorf("advisory.Attrs = %v, want [section=tracker yaml_type=string]", advisory.Attrs)
+		}
 	})
 
 	t.Run("integer type replaced with empty map", func(t *testing.T) {
 		t.Parallel()
 		m := map[string]any{"polling": 42}
-		sub := ensureSubMap(m, "polling")
+		sub, _ := ensureSubMap(m, "polling")
 		if sub == nil {
 			t.Fatal("ensureSubMap returned nil")
 		}
@@ -289,7 +301,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_ENV_FILE", "")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -308,7 +320,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_KIND", "file")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -331,7 +343,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		raw := map[string]any{
 			"tracker": map[string]any{"no_change_state": "Done"},
 		}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -352,7 +364,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_ACTIVE_STATES", "Open,Working")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -383,7 +395,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_ACTIVE_STATES", "  Open , Working  ")
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -410,7 +422,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_ENV_FILE", "") // no dotenv fallback
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -423,7 +435,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_COMMENTS_ON_DISPATCH", "true")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -442,7 +454,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_COMMENTS_ON_COMPLETION", "1")
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -458,7 +470,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_COMMENTS_ON_DISPATCH", "maybe")
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		assertEnvOverrideError(t, err, "tracker.comments.on_dispatch", "SORTIE_TRACKER_COMMENTS_ON_DISPATCH")
 	})
 
@@ -466,7 +478,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_POLLING_INTERVAL_MS", "5000")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -484,7 +496,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_POLLING_INTERVAL_MS", "abc")
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		assertEnvOverrideError(t, err, "polling.interval_ms", "SORTIE_POLLING_INTERVAL_MS")
 		assertEnvOverrideError(t, err, "polling.interval_ms", "invalid integer value")
 	})
@@ -493,7 +505,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_AGENT_MAX_TURNS", "99999999999999999999")
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		wantMsg := ErrIntegerOutOfRange.Error() + " (from SORTIE_AGENT_MAX_TURNS)"
 		assertEnvOverrideError(t, err, "agent.max_turns", wantMsg)
 	})
@@ -629,7 +641,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_DB_PATH", "/data/sortie.db")
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -642,12 +654,12 @@ func TestApplyEnvOverrides(t *testing.T) {
 		}
 	})
 
-	t.Run("non-map YAML section does not panic", func(t *testing.T) {
+	t.Run("non-map YAML section replaced records an advisory", func(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_KIND", "file")
 
 		// raw["tracker"] is a string; ensureSubMap must replace it.
 		raw := map[string]any{"tracker": "a-string"}
-		_, err := applyEnvOverrides(raw)
+		_, advisories, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -658,6 +670,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 		if got, _ := trackerMap["kind"].(string); got != "file" {
 			t.Errorf("raw[\"tracker\"][\"kind\"] = %q, want %q", got, "file")
 		}
+		if !hasAdvisory(advisories, "env_override.section_replaced", "env override replaced non-map YAML section") {
+			t.Errorf("applyEnvOverrides advisories = %+v, want the env_override.section_replaced advisory", advisories)
+		}
 	})
 
 	t.Run("dotenv fallback via SORTIE_ENV_FILE", func(t *testing.T) {
@@ -666,7 +681,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_PROJECT", "") // ensure real env is empty
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -686,7 +701,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_TRACKER_KIND", "jira") // real env overrides .env
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -697,16 +712,27 @@ func TestApplyEnvOverrides(t *testing.T) {
 		}
 	})
 
-	t.Run("missing dotenv file logs warning and returns no error", func(t *testing.T) {
+	t.Run("missing dotenv file records an advisory and returns no error", func(t *testing.T) {
 		nonexistent := t.TempDir() + "/does_not_exist.env"
 		t.Setenv("SORTIE_ENV_FILE", nonexistent)
 
 		raw := map[string]any{}
-		envKeys, err := applyEnvOverrides(raw)
+		envKeys, advisories, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error for missing file: %v", err)
 		}
 		_ = envKeys // no overrides expected
+
+		if len(advisories) != 1 {
+			t.Fatalf("applyEnvOverrides advisories = %+v, want exactly 1", advisories)
+		}
+		got := advisories[0]
+		assertStringEqual(t, "advisory.Check", "env_file.missing", got.Check)
+		assertStringEqual(t, "advisory.Text", `env file `+strconv.Quote(nonexistent)+` does not exist; no values are read from it`, got.Text)
+		assertStringEqual(t, "advisory.Message", "env file not found, skipping", got.Message)
+		if len(got.Attrs) != 1 || got.Attrs[0].Key != "path" || got.Attrs[0].Value.String() != nonexistent {
+			t.Errorf("advisory.Attrs = %v, want [path=%s]", got.Attrs, nonexistent)
+		}
 	})
 
 	t.Run("SetDotEnvPath takes priority over SORTIE_ENV_FILE", func(t *testing.T) {
@@ -721,7 +747,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		SetDotEnvPath(file1) // CLI flag value -> should give "jira"
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		if err != nil {
 			t.Fatalf("applyEnvOverrides: unexpected error: %v", err)
 		}
@@ -737,7 +763,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_ENV_FILE", malformed)
 
 		raw := map[string]any{}
-		_, err := applyEnvOverrides(raw)
+		_, _, err := applyEnvOverrides(raw)
 		if err == nil {
 			t.Fatal("applyEnvOverrides: expected error for malformed .env file, got nil")
 		}

@@ -8055,6 +8055,27 @@ func TestHandleTick_WorkerWarningChangeDetection(t *testing.T) {
 	if got := strings.Count(buf.String(), warnMsg); got != 2 {
 		t.Errorf("warning count after changing SSHHosts only = %d, want 2\nlog:\n%s", got, buf.String())
 	}
+
+	const clampMsg = "clamped label_commands poll_interval_ms to floor"
+	cfg.AddAdvisories(config.Advisory{
+		Check:   "reactions.label_commands.poll_interval_ms.clamped",
+		Text:    "reactions.label_commands.poll_interval_ms is 5000, below the minimum of 30000; 30000 is used",
+		Message: clampMsg,
+		Attrs:   []slog.Attr{slog.Int("configured_ms", 5000), slog.Int("floor_ms", 30000)},
+	})
+	wm.setConfig(cfg)
+	o.handleTick(ctx)
+	if got := strings.Count(buf.String(), clampMsg); got != 1 {
+		t.Errorf("configuration advisory count after adding it alongside the worker warning = %d, want 1\nlog:\n%s", got, buf.String())
+	}
+	if got := strings.Count(buf.String(), warnMsg); got != 2 {
+		t.Errorf("worker warning count after adding an unrelated configuration advisory = %d, want 2 (unchanged)\nlog:\n%s", got, buf.String())
+	}
+
+	o.handleTick(ctx)
+	if got := strings.Count(buf.String(), clampMsg); got != 1 {
+		t.Errorf("configuration advisory count after a repeat tick with the same configuration = %d, want 1 (must not repeat)\nlog:\n%s", got, buf.String())
+	}
 }
 
 func TestTickLogging_DispatchBreakdown(t *testing.T) {
