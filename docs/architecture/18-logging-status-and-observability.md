@@ -18,6 +18,8 @@ Message formatting requirements:
 - Include concise failure reason when present.
 - Avoid logging large raw payloads unless necessary.
 
+A configuration advisory is recorded once, at construction or at workflow load, and logged from nowhere else: not at the point it is recorded, and not from configuration construction run for any other purpose. The running orchestrator reports a recorded advisory through one `Warn` record per entry, at the tick that first draws it and again only after a tick whose effective configuration stopped drawing it; a dry run logs the same records once, before it fetches candidate issues. A reachable deprecated agent kind draws one such record, message `"agent kind is deprecated and will be removed in a later release"`, carrying `agent_kind` and `replacement_kind`.
+
 Handoff-evidence records are part of the required operator surface:
 
 - A withheld verdict whose verification read (§11.5, §14.2) does not find the issue terminal emits a `Warn` record naming the verdict and carrying `turns_completed` plus the resulting `consecutive_absences` count. The standard issue context fields identify the affected issue.

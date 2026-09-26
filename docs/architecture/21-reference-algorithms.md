@@ -46,6 +46,7 @@ on_tick(state):
   # that reads config, not only before dispatch.
   validation = validate_dispatch_config()
   state = apply_config_to_state(state, current_config())
+  report_new_advisories(current_config().advisories() + worker_config().advisories())
 
   state = reconcile_running_issues(state)
 

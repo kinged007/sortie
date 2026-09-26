@@ -24,7 +24,7 @@ A runtime moves onto the protocol when its protocol surface carries every load-b
 
 4. **Deprecation is a promise; direction is not.** A deprecation notice commits the project to a removal. Issuing one before the removal is achievable teaches operators that notices need not be acted on, which is expensive to unlearn.
 
-5. **A migration costs the operator one line.** The project's transition is not the operator's to pay for: the same workflow, the same behavior, one changed value. A route that withdraws a capability an operator holds fails that test whatever it gains elsewhere.
+5. **A migration costs the operator a mechanical edit, nothing more.** The project's transition is not the operator's to pay for: the same workflow, the same behavior, a configuration edit made mechanically. A route that withdraws a capability an operator holds fails that test whatever it gains elsewhere.
 
 6. **The question recurs unchanged.** One move creates one pair, and the roster carries runtimes still to move. Answering per runtime would re-argue identical reasoning and let the outcomes diverge for no reason an operator could see.
 

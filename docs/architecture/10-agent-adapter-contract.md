@@ -16,6 +16,8 @@ An agent adapter must implement the following operations:
 - `StopSession(session)`
   - Terminate the agent process/service cleanly.
 
+A registered kind declares `Deprecation`, `nil` for every kind but one and non-nil naming the replacement kind for the one that is. A deprecated kind stays registered and constructs and runs unchanged; the declaration is read-only after registration. A configuration reaching a deprecated kind draws one advisory, reported once as a `sortie validate` warning and once per appearance in the run log, naming the kind and its replacement. `kiro` declares `Deprecation`, naming `agent-client-protocol` as its replacement.
+
 Built-in agent adapter kinds:
 
 - `claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `mock`, and `agent-client-protocol` are built-in agent adapter kinds.
