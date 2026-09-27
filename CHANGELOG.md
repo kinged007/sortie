@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-09-27
+
 ### Added
 
 - A run on the `agent-client-protocol` kind now reports token usage when its runtime is a Gemini CLI started on the machine running Sortie, so `agent.max_tokens` applies to it, its spend joins the token and cost totals, and it is no longer counted among the sessions whose usage was never recorded. Sortie reads the counts from the usage records Gemini CLI writes to disk rather than from the protocol, and falls back to the runtime's session journal when those records are unavailable; the figures cover input tokens, output tokens including reasoning, and cache reads. A turn whose spend was never fully reported, a cancelled turn above all, is now recorded as spend of an unknown amount: whatever figure did arrive still counts toward the totals, what that figure leaves out does not, and `used_tokens_complete` in the `cost_budget` tool reads `false`, so the issue's spend reads as a lower bound instead of passing for the whole of it as it did before. A session on a Gemini CLI build other than `0.59.0`, and a runtime started on a remote host through `worker.ssh_hosts`, stay unmeasured with `agent.max_tokens` inactive, because a figure is reported only for a build it was measured against.
