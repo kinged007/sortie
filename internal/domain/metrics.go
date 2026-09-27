@@ -27,7 +27,7 @@ type Metrics interface {
 	SetActiveSessionsElapsed(seconds float64)
 
 	// AddTokens increments the cumulative token counter by count.
-	// tokenType is "input", "output", or "cache_read"
+	// tokenType is "input", "output", "cache_read", or "cache_write"
 	// (sortie_tokens_total{type} counter).
 	AddTokens(tokenType string, count int64)
 

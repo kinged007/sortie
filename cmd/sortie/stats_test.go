@@ -161,6 +161,61 @@ func createLegacyStatsDB(t *testing.T, dbPath string) {
 	}
 }
 
+// createFullSchemaWithoutCacheWriteTokensDB builds dbPath with every
+// optional run_history column the full schema tier requires, except
+// cache_write_tokens, matching a database migration 020 has not yet
+// reached, and inserts one measured row with the given rate-relevant
+// token counts.
+func createFullSchemaWithoutCacheWriteTokensDB(t *testing.T, dbPath string, inputTokens, outputTokens, cacheReadTokens int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open(%q): %v", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE run_history (
+		id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+		issue_id            TEXT    NOT NULL,
+		identifier          TEXT    NOT NULL,
+		attempt             INTEGER NOT NULL,
+		agent_adapter       TEXT    NOT NULL,
+		workspace           TEXT    NOT NULL,
+		started_at          TEXT    NOT NULL,
+		completed_at        TEXT    NOT NULL,
+		status              TEXT    NOT NULL,
+		error               TEXT,
+		workflow_file       TEXT,
+		turns_completed     INTEGER NOT NULL DEFAULT 0,
+		display_identifier  TEXT,
+		review_metadata     TEXT,
+		rule_name           TEXT    NOT NULL DEFAULT '',
+		template_id         TEXT    NOT NULL DEFAULT '',
+		input_tokens        INTEGER NOT NULL DEFAULT 0,
+		output_tokens       INTEGER NOT NULL DEFAULT 0,
+		total_tokens        INTEGER NOT NULL DEFAULT 0,
+		cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+		tokens_measured     INTEGER NOT NULL DEFAULT 1,
+		unaccounted_turns   INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatalf("create pre-migration-020 run_history table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at,
+			status, turns_completed, input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured)
+		 VALUES ('ISS-CW', 'PROJ-CW', 1, 'claude-code', '/tmp/ws', '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z',
+			'succeeded', 1, ?, ?, ?, ?, 1)`,
+		inputTokens, outputTokens, inputTokens+outputTokens, cacheReadTokens,
+	); err != nil {
+		t.Fatalf("insert pre-migration-020 row: %v", err)
+	}
+}
+
 // newStatsWorkspace creates a temp directory holding a minimal
 // WORKFLOW.md and a database built by build, and returns the workflow
 // path.
@@ -230,7 +285,7 @@ func TestStatsSummaryFormulas(t *testing.T) {
 	t.Run("duration and turns normalize on succeeded rows; cost per succeeded run divides all spend", func(t *testing.T) {
 		t.Parallel()
 
-		rates := server.TokenRates{"mock": server.TokenRateConfig{InputPerMtok: new(float64(10))}}
+		rates := server.TokenRates{"mock": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))}}
 		agg := newStatsAggregator(fullCaps, rates)
 
 		addRows(t, agg,
@@ -270,7 +325,7 @@ func TestStatsSummaryFormulas(t *testing.T) {
 func TestStatsGroupDisclosure(t *testing.T) {
 	t.Parallel()
 
-	rates := server.TokenRates{"mock": server.TokenRateConfig{InputPerMtok: new(float64(10))}}
+	rates := server.TokenRates{"mock": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))}}
 	agg := newStatsAggregator(fullCaps, rates)
 
 	addRows(t, agg, persistence.RunStatsRow{
@@ -328,8 +383,8 @@ func TestStatsCostDerivation(t *testing.T) {
 		t.Parallel()
 
 		rates := server.TokenRates{
-			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10))},
-			"codex":       server.TokenRateConfig{InputPerMtok: new(float64(20))},
+			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
+			"codex":       server.TokenRateConfig{InputPerMtok: new(float64(20)), OutputPerMtok: new(float64(0))},
 		}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, makeRow("claude-code", 1_000_000), makeRow("codex", 1_000_000))
@@ -351,7 +406,7 @@ func TestStatsCostDerivation(t *testing.T) {
 		t.Parallel()
 
 		rates := server.TokenRates{
-			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10))},
+			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
 		}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, makeRow("claude-code", 1_000_000), makeRow("codex", 1_000_000))
@@ -370,6 +425,43 @@ func TestStatsCostDerivation(t *testing.T) {
 		})
 		if !found {
 			t.Errorf("statsFootnotes = %v, want an unpriced-run footnote", footnotes)
+		}
+	})
+
+	t.Run("the only entry is incomplete: dash and cost-unpriced footnote, not the token_rates remedy", func(t *testing.T) {
+		t.Parallel()
+
+		rates := server.TokenRates{
+			"claude-code": server.TokenRateConfig{OutputPerMtok: new(float64(15))},
+		}
+		agg := newStatsAggregator(fullCaps, rates)
+		addRows(t, agg, makeRow("claude-code", 1_000_000))
+
+		report := agg.report(fixedNow, "/wf", "/db", nil, nil, nil)
+
+		if report.Summary.CostUnpricedRuns != 1 {
+			t.Errorf("Summary.CostUnpricedRuns = %d, want 1", report.Summary.CostUnpricedRuns)
+		}
+		if report.Summary.CostUSD != nil {
+			t.Errorf("Summary.CostUSD = %v, want nil (the only entry prices nothing)", *report.Summary.CostUSD)
+		}
+
+		footnotes := statsFootnotes(report.Summary)
+		found := slices.ContainsFunc(footnotes, func(f string) bool {
+			return strings.Contains(f, "the cost figures skip 1 of these runs")
+		})
+		if !found {
+			t.Errorf("statsFootnotes = %v, want an unpriced-run footnote", footnotes)
+		}
+
+		var stdout, stderr bytes.Buffer
+		renderStatsText(&stdout, &stderr, report)
+		out := stdout.String()
+		if !strings.Contains(out, "cost (measured runs)    -   per succeeded run -") {
+			t.Errorf("renderStatsText stdout = %q, want the dash arm", out)
+		}
+		if strings.Contains(out, "not estimated; set token_rates") {
+			t.Errorf("renderStatsText stdout = %q, want no token_rates remedy naming a cause that is not the actual one", out)
 		}
 	})
 
@@ -408,7 +500,7 @@ func TestStatsCostDerivation(t *testing.T) {
 	t.Run("all runs unmeasured with token_rates configured renders a dash for both figures", func(t *testing.T) {
 		t.Parallel()
 
-		rates := server.TokenRates{"kiro": server.TokenRateConfig{InputPerMtok: new(float64(10))}}
+		rates := server.TokenRates{"kiro": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))}}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, persistence.RunStatsRow{
 			Status: "succeeded", AgentAdapter: "kiro",
@@ -458,7 +550,7 @@ func TestStatsCostDerivation(t *testing.T) {
 	t.Run("a range with a measured priced run renders numbers", func(t *testing.T) {
 		t.Parallel()
 
-		rates := server.TokenRates{"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10))}}
+		rates := server.TokenRates{"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))}}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, makeRow("claude-code", 1_000_000))
 
@@ -525,8 +617,8 @@ func TestStatsTokenReporting(t *testing.T) {
 		t.Parallel()
 
 		rates := server.TokenRates{
-			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10))},
-			"kiro":        server.TokenRateConfig{InputPerMtok: new(float64(10))},
+			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
+			"kiro":        server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
 		}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, measuredUnmeasuredRows()...)
@@ -562,8 +654,8 @@ func TestStatsTokenReporting(t *testing.T) {
 		t.Parallel()
 
 		rates := server.TokenRates{
-			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10))},
-			"kiro":        server.TokenRateConfig{InputPerMtok: new(float64(10))},
+			"claude-code": server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
+			"kiro":        server.TokenRateConfig{InputPerMtok: new(float64(10)), OutputPerMtok: new(float64(0))},
 		}
 		agg := newStatsAggregator(fullCaps, rates)
 		addRows(t, agg, measuredUnmeasuredRows()...)
@@ -1231,6 +1323,73 @@ func TestRunStatsConfigErrors(t *testing.T) {
 			t.Errorf("stderr = %q, want the %q diagnostic prefix", stderr.String(), "sortie stats:")
 		}
 	})
+}
+
+// TestRunStats_MissingCacheWriteTokensColumnMatchesMigratedCopy drives
+// two databases carrying the identical row: one built with every
+// optional run_history column except cache_write_tokens, one built
+// through the real migration path (whose row therefore carries
+// cache_write_tokens 0, since the runtime that recorded it predates the
+// column). Both must report the full schema tier, a zero cache_write
+// figure, and the identical cost, so an operator reading a database
+// migration 020 has not reached yet sees no different a report than one
+// that has already reached it.
+func TestRunStats_MissingCacheWriteTokensColumnMatchesMigratedCopy(t *testing.T) {
+	t.Parallel()
+
+	const inputTokens, outputTokens, cacheReadTokens = 1_000_000, 200_000, 100_000
+	extra := "token_rates:\n  claude-code:\n    input_per_mtok: 5\n    output_per_mtok: 25\n    cache_read_per_mtok: 0.5\n"
+
+	runReport := func(t *testing.T, wfPath string) statsReport {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := run(context.Background(), []string{"stats", "--format", "json", wfPath}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("run(stats) = %d, want 0; stderr: %s", code, stderr.String())
+		}
+		var report statsReport
+		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+			t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
+		}
+		return report
+	}
+
+	missingColumnDir := t.TempDir()
+	missingColumnWfPath := writeCustomWorkflowFile(t, missingColumnDir, statsWorkflow(extra))
+	createFullSchemaWithoutCacheWriteTokensDB(t, filepath.Join(missingColumnDir, ".sortie.db"), inputTokens, outputTokens, cacheReadTokens)
+	missingColumn := runReport(t, missingColumnWfPath)
+
+	migratedDir := t.TempDir()
+	migratedWfPath := writeCustomWorkflowFile(t, migratedDir, statsWorkflow(extra))
+	createStatsDB(t, filepath.Join(migratedDir, ".sortie.db"), persistence.RunHistory{
+		IssueID: "ISS-CW", Identifier: "PROJ-CW", Attempt: 1, AgentAdapter: "claude-code", Workspace: "/tmp/ws",
+		StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
+		TurnsCompleted: 1, InputTokens: inputTokens, OutputTokens: outputTokens,
+		TotalTokens: inputTokens + outputTokens, CacheReadTokens: cacheReadTokens, TokensMeasured: true,
+	})
+	migratedCopy := runReport(t, migratedWfPath)
+
+	for _, tt := range []struct {
+		label  string
+		report statsReport
+	}{
+		{"missing cache_write_tokens column", missingColumn},
+		{"migrated copy", migratedCopy},
+	} {
+		if tt.report.SchemaTier != "full" {
+			t.Errorf("%s: SchemaTier = %q, want %q", tt.label, tt.report.SchemaTier, "full")
+		}
+		if tt.report.Summary.Tokens == nil || tt.report.Summary.Tokens.CacheWrite != 0 {
+			t.Errorf("%s: Summary.Tokens.CacheWrite = %v, want 0", tt.label, tt.report.Summary.Tokens)
+		}
+		if tt.report.Summary.CostUSD == nil {
+			t.Fatalf("%s: Summary.CostUSD = nil, want a priced total", tt.label)
+		}
+	}
+	if *missingColumn.Summary.CostUSD != *migratedCopy.Summary.CostUSD {
+		t.Errorf("CostUSD = %v for the database missing cache_write_tokens, want %v (the migrated copy's cost)",
+			*missingColumn.Summary.CostUSD, *migratedCopy.Summary.CostUSD)
+	}
 }
 
 func TestRunStatsDBPathResolution(t *testing.T) {

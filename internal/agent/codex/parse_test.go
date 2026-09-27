@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -123,6 +124,27 @@ func TestParsePassthroughConfig(t *testing.T) {
 	})
 }
 
+// TestNormalizeBreakdown_CacheWriteTokensStaysZero pins that codex's
+// wire breakdown carries no cache-write count: a heavily cached
+// breakdown still normalizes to CacheWriteTokens 0, and a two-event
+// sequence built from it satisfies the shared usage contract with no
+// cache-write component anywhere in the chain.
+func TestNormalizeBreakdown_CacheWriteTokensStaysZero(t *testing.T) {
+	t.Parallel()
+
+	first := normalizeBreakdown(tokenUsageBreakdown{InputTokens: 20000, CachedInputTokens: 18000, OutputTokens: 500})
+	second := normalizeBreakdown(tokenUsageBreakdown{InputTokens: 40000, CachedInputTokens: 36000, OutputTokens: 900})
+
+	if first.CacheWriteTokens != 0 || second.CacheWriteTokens != 0 {
+		t.Errorf("normalizeBreakdown CacheWriteTokens = (%d, %d), want (0, 0)", first.CacheWriteTokens, second.CacheWriteTokens)
+	}
+
+	agenttest.AssertUsageContract(t, []domain.AgentEvent{
+		{Type: domain.EventTokenUsage, Usage: first},
+		{Type: domain.EventTurnCompleted, Usage: second},
+	})
+}
+
 func TestNormalizeBreakdown(t *testing.T) {
 	t.Parallel()
 
@@ -198,78 +220,6 @@ func TestParseModelRerouted_MalformedPayload(t *testing.T) {
 	_, err := parseModelRerouted(json.RawMessage(`not json`))
 	if err == nil {
 		t.Fatal("parseModelRerouted(malformed) error = nil, want non-nil")
-	}
-}
-
-func TestSubtractUsage(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		a, b domain.TokenUsage
-		want domain.TokenUsage
-	}{
-		{
-			name: "positive difference",
-			a:    domain.TokenUsage{InputTokens: 27549, OutputTokens: 82, CacheReadTokens: 27392},
-			b:    domain.TokenUsage{InputTokens: 13731, OutputTokens: 54, CacheReadTokens: 13700},
-			want: domain.TokenUsage{InputTokens: 13818, OutputTokens: 28, CacheReadTokens: 13692, TotalTokens: 13846},
-		},
-		{
-			name: "floored at zero when b exceeds a",
-			a:    domain.TokenUsage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 2},
-			b:    domain.TokenUsage{InputTokens: 100, OutputTokens: 100, CacheReadTokens: 100},
-			want: domain.TokenUsage{},
-		},
-		{
-			name: "equal values yield zero delta",
-			a:    domain.TokenUsage{InputTokens: 50, OutputTokens: 20, CacheReadTokens: 5},
-			b:    domain.TokenUsage{InputTokens: 50, OutputTokens: 20, CacheReadTokens: 5},
-			want: domain.TokenUsage{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := subtractUsage(tt.a, tt.b)
-			if got != tt.want {
-				t.Errorf("subtractUsage(%+v, %+v) = %+v, want %+v", tt.a, tt.b, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestMaxUsage(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		a, b domain.TokenUsage
-		want domain.TokenUsage
-	}{
-		{
-			name: "componentwise maximum, mixed",
-			a:    domain.TokenUsage{InputTokens: 100, OutputTokens: 5, CacheReadTokens: 50},
-			b:    domain.TokenUsage{InputTokens: 20, OutputTokens: 40, CacheReadTokens: 10},
-			want: domain.TokenUsage{InputTokens: 100, OutputTokens: 40, CacheReadTokens: 50, TotalTokens: 140},
-		},
-		{
-			name: "b entirely zero returns a",
-			a:    domain.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
-			b:    domain.TokenUsage{},
-			want: domain.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := maxUsage(tt.a, tt.b)
-			if got != tt.want {
-				t.Errorf("maxUsage(%+v, %+v) = %+v, want %+v", tt.a, tt.b, got, tt.want)
-			}
-		})
 	}
 }
 

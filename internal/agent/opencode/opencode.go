@@ -988,9 +988,10 @@ func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *
 	}
 	return &agentcore.RecoveredUsage{
 		Run: domain.TokenUsage{
-			InputTokens:     usage.InputTokens,
-			OutputTokens:    usage.OutputTokens,
-			CacheReadTokens: usage.CacheReadTokens,
+			InputTokens:      usage.InputTokens,
+			OutputTokens:     usage.OutputTokens,
+			CacheReadTokens:  usage.CacheReadTokens,
+			CacheWriteTokens: usage.CacheWriteTokens,
 		},
 		Model: usage.Model,
 	}

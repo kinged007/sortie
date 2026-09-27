@@ -80,16 +80,17 @@ func assertUsageContract(t contractReporter, events []domain.AgentEvent) {
 			continue
 		}
 
-		if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CacheReadTokens < 0 || usage.TotalTokens < 0 {
+		if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CacheReadTokens < 0 ||
+			usage.CacheWriteTokens < 0 || usage.TotalTokens < 0 {
 			t.Errorf("event %d: Usage has a negative component: %+v", i, usage)
 		}
 		if usage.TotalTokens != usage.InputTokens+usage.OutputTokens {
 			t.Errorf("event %d: TotalTokens = %d, want InputTokens+OutputTokens = %d",
 				i, usage.TotalTokens, usage.InputTokens+usage.OutputTokens)
 		}
-		if usage.CacheReadTokens > usage.InputTokens {
-			t.Errorf("event %d: CacheReadTokens = %d, want <= InputTokens (%d)",
-				i, usage.CacheReadTokens, usage.InputTokens)
+		if usage.CacheReadTokens+usage.CacheWriteTokens > usage.InputTokens {
+			t.Errorf("event %d: CacheReadTokens+CacheWriteTokens = %d, want <= InputTokens (%d)",
+				i, usage.CacheReadTokens+usage.CacheWriteTokens, usage.InputTokens)
 		}
 		if usage.InputTokens < prev.InputTokens {
 			t.Errorf("event %d: InputTokens decreased from %d to %d", i, prev.InputTokens, usage.InputTokens)
@@ -102,6 +103,9 @@ func assertUsageContract(t contractReporter, events []domain.AgentEvent) {
 		}
 		if usage.CacheReadTokens < prev.CacheReadTokens {
 			t.Errorf("event %d: CacheReadTokens decreased from %d to %d", i, prev.CacheReadTokens, usage.CacheReadTokens)
+		}
+		if usage.CacheWriteTokens < prev.CacheWriteTokens {
+			t.Errorf("event %d: CacheWriteTokens decreased from %d to %d", i, prev.CacheWriteTokens, usage.CacheWriteTokens)
 		}
 		prev = usage
 	}
@@ -268,7 +272,8 @@ func dominates(result, figure domain.TokenUsage) bool {
 	return result.InputTokens >= figure.InputTokens &&
 		result.OutputTokens >= figure.OutputTokens &&
 		result.TotalTokens >= figure.TotalTokens &&
-		result.CacheReadTokens >= figure.CacheReadTokens
+		result.CacheReadTokens >= figure.CacheReadTokens &&
+		result.CacheWriteTokens >= figure.CacheWriteTokens
 }
 
 // turnTerminalEventTypes lists the event types that end a turn, the set

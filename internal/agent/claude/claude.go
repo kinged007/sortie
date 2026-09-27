@@ -235,7 +235,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 						if meta.Usage != nil && meta.ID != "" {
 							candidate := usageFromAssistant(meta.Usage)
 							prior, seen := state.turnMessages[meta.ID]
-							state.turnMessages[meta.ID] = componentwiseMaxUsage(prior, candidate)
+							state.turnMessages[meta.ID] = agentcore.MaxUsage(prior, candidate)
 							provisional := sumTurnMessages(state.turnMessages)
 							snapshot := state.acc.SetTurnProvisional(provisional)
 

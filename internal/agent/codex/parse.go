@@ -155,30 +155,6 @@ func parseModelRerouted(params json.RawMessage) (modelReroutedParams, error) {
 	return p, nil
 }
 
-// subtractUsage returns a minus b componentwise, floored at zero, with
-// TotalTokens recomputed as InputTokens plus OutputTokens.
-func subtractUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens-b.InputTokens, 0),
-		OutputTokens:    max(a.OutputTokens-b.OutputTokens, 0),
-		CacheReadTokens: max(a.CacheReadTokens-b.CacheReadTokens, 0),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
-}
-
-// maxUsage returns the componentwise maximum of a and b, with
-// TotalTokens recomputed as InputTokens plus OutputTokens.
-func maxUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens, b.InputTokens),
-		OutputTokens:    max(a.OutputTokens, b.OutputTokens),
-		CacheReadTokens: max(a.CacheReadTokens, b.CacheReadTokens),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
-}
-
 // mapCodexErrorInfo maps a codexErrorInfo string to a domain error
 // kind. Retryable vs non-retryable classification is encoded in the
 // AgentErrorKind value.

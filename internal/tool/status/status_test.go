@@ -206,14 +206,15 @@ func TestStatusTool_TokenCounts(t *testing.T) {
 	t.Parallel()
 
 	tool := New(stateFileReader(t, stateFile{
-		TurnNumber:      5,
-		MaxTurns:        20,
-		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		InputTokens:     new(int64(15000)),
-		OutputTokens:    new(int64(3000)),
-		TotalTokens:     new(int64(18000)),
-		CacheReadTokens: new(int64(2000)),
-		TokensMeasured:  true,
+		TurnNumber:       5,
+		MaxTurns:         20,
+		StartedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		InputTokens:      new(int64(15000)),
+		OutputTokens:     new(int64(3000)),
+		TotalTokens:      new(int64(18000)),
+		CacheReadTokens:  new(int64(2000)),
+		CacheWriteTokens: new(int64(500)),
+		TokensMeasured:   true,
 	}))
 	m := executeOK(t, tool)
 	assertSuccessEnvelope(t, m)
@@ -225,10 +226,11 @@ func TestStatusTool_TokenCounts(t *testing.T) {
 	}
 
 	checks := map[string]float64{
-		"input_tokens":      15000,
-		"output_tokens":     3000,
-		"total_tokens":      18000,
-		"cache_read_tokens": 2000,
+		"input_tokens":       15000,
+		"output_tokens":      3000,
+		"total_tokens":       18000,
+		"cache_read_tokens":  2000,
+		"cache_write_tokens": 500,
 	}
 	for field, want := range checks {
 		got, ok := tokens[field].(float64)
@@ -250,14 +252,15 @@ func TestStatusTool_TokenCounts_GenuineZero(t *testing.T) {
 	t.Parallel()
 
 	tool := New(stateFileReader(t, stateFile{
-		TurnNumber:      1,
-		MaxTurns:        20,
-		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		InputTokens:     new(int64(0)),
-		OutputTokens:    new(int64(0)),
-		TotalTokens:     new(int64(0)),
-		CacheReadTokens: new(int64(0)),
-		TokensMeasured:  true,
+		TurnNumber:       1,
+		MaxTurns:         20,
+		StartedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		InputTokens:      new(int64(0)),
+		OutputTokens:     new(int64(0)),
+		TotalTokens:      new(int64(0)),
+		CacheReadTokens:  new(int64(0)),
+		CacheWriteTokens: new(int64(0)),
+		TokensMeasured:   true,
 	}))
 	m := executeOK(t, tool)
 	assertSuccessEnvelope(t, m)
@@ -270,7 +273,7 @@ func TestStatusTool_TokenCounts_GenuineZero(t *testing.T) {
 	if !ok {
 		t.Fatalf("data.tokens is not an object: %v", d["tokens"])
 	}
-	for _, field := range []string{"input_tokens", "output_tokens", "total_tokens", "cache_read_tokens"} {
+	for _, field := range []string{"input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens"} {
 		got, present := tokens[field]
 		if !present {
 			t.Errorf("data.tokens.%s key missing from response", field)

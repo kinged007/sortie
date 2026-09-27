@@ -6332,6 +6332,7 @@ func incrementalWriteOrchestrator(t *testing.T, store *stubStore) (*Orchestrator
 		AgentOutputTokens: 20,
 		AgentTotalTokens:  30,
 		CacheReadTokens:   5,
+		CacheWriteTokens:  3,
 		ModelName:         "test-model",
 		APIRequestCount:   2,
 	}
@@ -6364,9 +6365,10 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 		if meta.SessionID != "sess-1" {
 			t.Errorf("SessionMetadata.SessionID = %q, want %q", meta.SessionID, "sess-1")
 		}
-		if meta.InputTokens != 10 || meta.OutputTokens != 20 || meta.TotalTokens != 30 || meta.CacheReadTokens != 5 {
-			t.Errorf("SessionMetadata tokens = (%d, %d, %d, %d), want (10, 20, 30, 5)",
-				meta.InputTokens, meta.OutputTokens, meta.TotalTokens, meta.CacheReadTokens)
+		if meta.InputTokens != 10 || meta.OutputTokens != 20 || meta.TotalTokens != 30 ||
+			meta.CacheReadTokens != 5 || meta.CacheWriteTokens != 3 {
+			t.Errorf("SessionMetadata tokens = (%d, %d, %d, %d, %d), want (10, 20, 30, 5, 3)",
+				meta.InputTokens, meta.OutputTokens, meta.TotalTokens, meta.CacheReadTokens, meta.CacheWriteTokens)
 		}
 		if meta.ModelName != "test-model" {
 			t.Errorf("SessionMetadata.ModelName = %q, want %q", meta.ModelName, "test-model")

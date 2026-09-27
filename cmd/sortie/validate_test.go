@@ -521,6 +521,26 @@ Do {{ .issue.title }}.
 // errorAndWarningWorkflow returns a workflow with the "trackers" typo
 // (warning) and no tracker.kind (error). ValidateConfigForPromotion
 // passes because active_states is set; preflight fails on tracker.kind.
+// incompleteTokenRateWorkflow returns a workflow whose only fault is a
+// token_rates entry missing input_per_mtok.
+func incompleteTokenRateWorkflow() []byte {
+	return []byte(`---
+tracker:
+  kind: file
+  active_states:
+    - To Do
+  terminal_states:
+    - Done
+agent:
+  kind: mock
+token_rates:
+  claude-code:
+    output_per_mtok: 15
+---
+Do {{ .issue.title }}.
+`)
+}
+
 func errorAndWarningWorkflow() []byte {
 	return []byte(`---
 trackers:
@@ -693,6 +713,49 @@ func TestValidateWarningNonPositiveHooksTimeout(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "non-positive") {
 		t.Errorf("stderr = %q, want to contain %q", stderr.String(), "non-positive")
+	}
+}
+
+// TestValidateTokenRateAdvisoryWarning drives a workflow whose only
+// fault is an incomplete token_rates entry: it must exit 0 with
+// valid: true, and the warning must be listed under check
+// "token_rates", matching TokenRateAdvisories' own text for the same
+// input.
+func TestValidateTokenRateAdvisoryWarning(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	wfPath := writeCustomWorkflowFile(t, dir, incompleteTokenRateWorkflow())
+
+	var stdout, stderr bytes.Buffer
+	ctx := context.Background()
+
+	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
+	}
+	if !out.Valid {
+		t.Errorf("validateOutput.Valid = false, want true")
+	}
+
+	const wantMessage = "token_rates.claude-code: entry needs both input_per_mtok and output_per_mtok and prices nothing"
+	found := false
+	for _, w := range out.Warnings {
+		if w.Check != "token_rates" {
+			continue
+		}
+		found = true
+		if w.Message != wantMessage {
+			t.Errorf("token_rates warning Message = %q, want %q", w.Message, wantMessage)
+		}
+	}
+	if !found {
+		t.Errorf("validateOutput.Warnings = %v, want a warning under check %q", out.Warnings, "token_rates")
 	}
 }
 

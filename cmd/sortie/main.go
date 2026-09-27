@@ -346,6 +346,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			OutputTokens:       metrics.OutputTokens,
 			TotalTokens:        metrics.TotalTokens,
 			CacheReadTokens:    metrics.CacheReadTokens,
+			CacheWriteTokens:   metrics.CacheWriteTokens,
 			SecondsRunning:     metrics.SecondsRunning,
 			UnmeasuredSessions: metrics.UnmeasuredSessions,
 		}
@@ -849,10 +850,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	var srv *server.Server
 	if serverEnabled {
 		rawTokenRates, tokenRatesPresent := br.cfg.ExtensionValue("token_rates")
-		tokenRates, trWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
-		for _, w := range trWarnings {
-			br.logger.Warn("skipped invalid token rate entry", slog.String("detail", w))
-		}
+		tokenRates, _ := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
 		addr := net.JoinHostPort(br.serverHost, strconv.Itoa(br.serverPort))
 		srv = server.New(server.Params{

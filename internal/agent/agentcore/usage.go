@@ -62,32 +62,57 @@ func (u *RunUsage) Snapshot() domain.TokenUsage {
 // raise sets u.high to the componentwise maximum of u.high and snapshot
 // and returns the result.
 func (u *RunUsage) raise(snapshot domain.TokenUsage) domain.TokenUsage {
-	u.high = domain.TokenUsage{
-		InputTokens:     max(u.high.InputTokens, snapshot.InputTokens),
-		OutputTokens:    max(u.high.OutputTokens, snapshot.OutputTokens),
-		CacheReadTokens: max(u.high.CacheReadTokens, snapshot.CacheReadTokens),
-	}
-	u.high.TotalTokens = u.high.InputTokens + u.high.OutputTokens
+	u.high = MaxUsage(u.high, snapshot)
 	return u.high
 }
 
 // clamp floors every negative component of usage at zero and recomputes
 // TotalTokens as InputTokens plus OutputTokens.
 func clamp(usage domain.TokenUsage) domain.TokenUsage {
-	usage.InputTokens = max(usage.InputTokens, 0)
-	usage.OutputTokens = max(usage.OutputTokens, 0)
-	usage.CacheReadTokens = max(usage.CacheReadTokens, 0)
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-	return usage
+	return SubtractUsage(usage, domain.TokenUsage{})
 }
 
 // add returns the componentwise sum of a and b, with TotalTokens
 // recomputed as InputTokens plus OutputTokens.
 func add(a, b domain.TokenUsage) domain.TokenUsage {
+	return AddUsage(a, b)
+}
+
+// SubtractUsage returns the componentwise difference a minus b, floored
+// at zero in every component, with TotalTokens recomputed as
+// InputTokens plus OutputTokens.
+func SubtractUsage(a, b domain.TokenUsage) domain.TokenUsage {
+	diff := domain.TokenUsage{
+		InputTokens:      max(a.InputTokens-b.InputTokens, 0),
+		OutputTokens:     max(a.OutputTokens-b.OutputTokens, 0),
+		CacheReadTokens:  max(a.CacheReadTokens-b.CacheReadTokens, 0),
+		CacheWriteTokens: max(a.CacheWriteTokens-b.CacheWriteTokens, 0),
+	}
+	diff.TotalTokens = diff.InputTokens + diff.OutputTokens
+	return diff
+}
+
+// MaxUsage returns the componentwise maximum of a and b, with
+// TotalTokens recomputed as InputTokens plus OutputTokens.
+func MaxUsage(a, b domain.TokenUsage) domain.TokenUsage {
+	result := domain.TokenUsage{
+		InputTokens:      max(a.InputTokens, b.InputTokens),
+		OutputTokens:     max(a.OutputTokens, b.OutputTokens),
+		CacheReadTokens:  max(a.CacheReadTokens, b.CacheReadTokens),
+		CacheWriteTokens: max(a.CacheWriteTokens, b.CacheWriteTokens),
+	}
+	result.TotalTokens = result.InputTokens + result.OutputTokens
+	return result
+}
+
+// AddUsage returns the componentwise sum of a and b, with TotalTokens
+// recomputed as InputTokens plus OutputTokens.
+func AddUsage(a, b domain.TokenUsage) domain.TokenUsage {
 	sum := domain.TokenUsage{
-		InputTokens:     a.InputTokens + b.InputTokens,
-		OutputTokens:    a.OutputTokens + b.OutputTokens,
-		CacheReadTokens: a.CacheReadTokens + b.CacheReadTokens,
+		InputTokens:      a.InputTokens + b.InputTokens,
+		OutputTokens:     a.OutputTokens + b.OutputTokens,
+		CacheReadTokens:  a.CacheReadTokens + b.CacheReadTokens,
+		CacheWriteTokens: a.CacheWriteTokens + b.CacheWriteTokens,
 	}
 	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
 	return sum

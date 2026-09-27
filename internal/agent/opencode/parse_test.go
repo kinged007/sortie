@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/domain"
 )
 
 // loadFixture reads testdata/<name> and returns its bytes.
@@ -442,6 +444,46 @@ func TestQueryExportUsage(t *testing.T) {
 	})
 }
 
+// TestCacheWriteTokensMapping drives a non-zero cache-write count
+// through both export parse paths: the 1.x nested-info shape
+// (parseExportOutput, against the recorded fixture) and the 2.x flat
+// message shape (parseSessionExport). The two results form a rising
+// two-event sequence run through agenttest.AssertUsageContract, so the
+// shared cache-sum and monotonicity invariants are checked against
+// real mapping output rather than a hand-built domain.TokenUsage.
+func TestCacheWriteTokensMapping(t *testing.T) {
+	t.Parallel()
+
+	exportOutput := parseExportOutput(loadFixture(t, "export_usage.json"), "ses_abc123", 0)
+	if exportOutput.CacheWriteTokens != 50 {
+		t.Errorf("parseExportOutput().CacheWriteTokens = %d, want 50", exportOutput.CacheWriteTokens)
+	}
+
+	const sessionID = "ses_cache_write_v2"
+	data := []byte(`{"info":{"id":"` + sessionID + `"},"messages":[{"type":"assistant","finish":"stop",` +
+		`"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
+		`"tokens":{"input":3000,"output":500,"reasoning":0,"cache":{"read":400,"write":900}}}]}`)
+	sessionExport := parseSessionExport(data, sessionID, 0)
+	if sessionExport.CacheWriteTokens != 900 {
+		t.Errorf("parseSessionExport().CacheWriteTokens = %d, want 900", sessionExport.CacheWriteTokens)
+	}
+
+	agenttest.AssertUsageContract(t, []domain.AgentEvent{
+		{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{
+			InputTokens: exportOutput.InputTokens, OutputTokens: exportOutput.OutputTokens,
+			TotalTokens: exportOutput.TotalTokens, CacheReadTokens: exportOutput.CacheReadTokens,
+			CacheWriteTokens: exportOutput.CacheWriteTokens,
+		}},
+		{Type: domain.EventTurnCompleted, Usage: domain.TokenUsage{
+			InputTokens:      exportOutput.InputTokens + sessionExport.InputTokens,
+			OutputTokens:     exportOutput.OutputTokens + sessionExport.OutputTokens,
+			TotalTokens:      exportOutput.TotalTokens + sessionExport.TotalTokens,
+			CacheReadTokens:  exportOutput.CacheReadTokens + sessionExport.CacheReadTokens,
+			CacheWriteTokens: exportOutput.CacheWriteTokens + sessionExport.CacheWriteTokens,
+		}},
+	})
+}
+
 // TestParseSessionExport drives the 2.x export document fixture,
 // mirroring parseExportOutput's 1.x semantics: input sums tokens.input
 // plus both cache figures, output sums tokens.output plus reasoning,
@@ -471,9 +513,6 @@ func TestParseSessionExport(t *testing.T) {
 		}
 		if usage.Model != "opencode/big-pickle" {
 			t.Errorf("Model = %q, want %q", usage.Model, "opencode/big-pickle")
-		}
-		if usage.Cost != 0 {
-			t.Errorf("Cost = %v, want 0", usage.Cost)
 		}
 		if !usage.Recovered {
 			t.Error("Recovered = false, want true")

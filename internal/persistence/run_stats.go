@@ -17,6 +17,7 @@ type RunHistoryCapabilities struct {
 	HasRuleRouting      bool // migration 010: rule_name, template_id
 	HasTokens           bool // migration 011: the four token columns
 	HasTokenMeasurement bool // migration 012: tokens_measured
+	HasCacheWriteTokens bool // migration 020
 }
 
 // Full reports whether the database carries every optional run_history
@@ -32,25 +33,34 @@ func (c RunHistoryCapabilities) Full() bool {
 // RunStatsRow is the narrow run_history projection the aggregate read
 // returns. A field the schema does not carry holds its zero value.
 type RunStatsRow struct {
-	Status          string
-	AgentAdapter    string
-	RuleName        string
-	TemplateID      string
-	StartedAt       string // ISO-8601 as stored
-	CompletedAt     string // ISO-8601 as stored
-	TurnsCompleted  int
-	ReviewMetadata  *string // nil when the column is NULL or absent
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	CacheReadTokens int64
-	TokensMeasured  bool
+	Status           string
+	AgentAdapter     string
+	RuleName         string
+	TemplateID       string
+	StartedAt        string // ISO-8601 as stored
+	CompletedAt      string // ISO-8601 as stored
+	TurnsCompleted   int
+	ReviewMetadata   *string // nil when the column is NULL or absent
+	InputTokens      int64
+	OutputTokens     int64
+	TotalTokens      int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64 // 0 when the database lacks the column
+	TokensMeasured   bool
 }
 
-// runStatsSelectFull projects every RunStatsRow field. It is used when
-// RunHistoryCapabilities.Full reports true.
+// runStatsSelectFull projects every RunStatsRow field except
+// CacheWriteTokens. It is used when RunHistoryCapabilities.Full reports
+// true and HasCacheWriteTokens reports false.
 const runStatsSelectFull = `SELECT status, agent_adapter, rule_name, template_id, started_at, completed_at,
 	turns_completed, review_metadata, input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured
+FROM run_history`
+
+// runStatsSelectFullWithCacheWrite projects every RunStatsRow field. It is
+// used when RunHistoryCapabilities.Full and HasCacheWriteTokens both
+// report true.
+const runStatsSelectFullWithCacheWrite = `SELECT status, agent_adapter, rule_name, template_id, started_at, completed_at,
+	turns_completed, review_metadata, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured
 FROM run_history`
 
 // runStatsSelectBase projects only the base columns every schema version
@@ -99,6 +109,7 @@ func (s *Store) RunHistoryCapabilities(ctx context.Context) (RunHistoryCapabilit
 		HasTokens: columns["input_tokens"] && columns["output_tokens"] &&
 			columns["total_tokens"] && columns["cache_read_tokens"],
 		HasTokenMeasurement: columns["tokens_measured"],
+		HasCacheWriteTokens: columns["cache_write_tokens"],
 	}, nil
 }
 
@@ -124,7 +135,10 @@ func (s *Store) ScanRunHistoryRange(
 ) error {
 	full := caps.Full()
 	query := runStatsSelectBase
-	if full {
+	switch {
+	case full && caps.HasCacheWriteTokens:
+		query = runStatsSelectFullWithCacheWrite
+	case full:
 		query = runStatsSelectFull
 	}
 
@@ -153,7 +167,20 @@ func (s *Store) ScanRunHistoryRange(
 	for rows.Next() {
 		var row RunStatsRow
 		var reviewMeta sql.NullString
-		if full {
+		switch {
+		case full && caps.HasCacheWriteTokens:
+			if err := rows.Scan(
+				&row.Status, &row.AgentAdapter, &row.RuleName, &row.TemplateID,
+				&row.StartedAt, &row.CompletedAt, &row.TurnsCompleted, &reviewMeta,
+				&row.InputTokens, &row.OutputTokens, &row.TotalTokens, &row.CacheReadTokens, &row.CacheWriteTokens,
+				&row.TokensMeasured,
+			); err != nil {
+				return fmt.Errorf("scan run history range: %w", err)
+			}
+			if reviewMeta.Valid {
+				row.ReviewMetadata = new(reviewMeta.String)
+			}
+		case full:
 			if err := rows.Scan(
 				&row.Status, &row.AgentAdapter, &row.RuleName, &row.TemplateID,
 				&row.StartedAt, &row.CompletedAt, &row.TurnsCompleted, &reviewMeta,
@@ -164,7 +191,7 @@ func (s *Store) ScanRunHistoryRange(
 			if reviewMeta.Valid {
 				row.ReviewMetadata = new(reviewMeta.String)
 			}
-		} else {
+		default:
 			if err := rows.Scan(&row.Status, &row.AgentAdapter, &row.StartedAt, &row.CompletedAt); err != nil {
 				return fmt.Errorf("scan run history range: %w", err)
 			}

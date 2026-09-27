@@ -1309,21 +1309,35 @@ func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		name            string
-		cacheReadTokens int64
-		wantTooltip     bool
-		wantFormatted   string
+		name             string
+		cacheReadTokens  int64
+		cacheWriteTokens int64
+		wantAnnotation   string
+		wantFormatted    []string
 	}{
 		{
 			name:            "non-zero cache read tokens renders tooltip",
 			cacheReadTokens: 763850,
-			wantTooltip:     true,
-			wantFormatted:   "763,850",
+			wantAnnotation:  "(763,850 cache read)",
+			wantFormatted:   []string{"763,850"},
 		},
 		{
-			name:            "zero cache read tokens omits annotation",
+			name:             "non-zero cache write tokens renders tooltip",
+			cacheWriteTokens: 38948,
+			wantAnnotation:   "(38,948 cache write)",
+			wantFormatted:    []string{"38,948"},
+		},
+		{
+			name:             "cache read and cache write both non-zero render the combined form",
+			cacheReadTokens:  154053,
+			cacheWriteTokens: 38948,
+			wantAnnotation:   "(154,053 cache read, 38,948 cache write)",
+			wantFormatted:    []string{"154,053", "38,948"},
+		},
+		{
+			name:            "zero cache read and cache write tokens omits annotation",
 			cacheReadTokens: 0,
-			wantTooltip:     false,
+			wantAnnotation:  "",
 		},
 	}
 
@@ -1341,6 +1355,7 @@ func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 						StartedAt:        now.Add(-5 * time.Minute),
 						AgentTotalTokens: 1000,
 						CacheReadTokens:  tt.cacheReadTokens,
+						CacheWriteTokens: tt.cacheWriteTokens,
 						UsageMeasured:    true,
 						UsageArrival:     registry.UsageArrivalIncremental,
 						UsageAttribution: registry.UsageAttributionPerModel,
@@ -1355,14 +1370,20 @@ func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 				t.Fatalf("GET / status = %d, want %d", dr.StatusCode, http.StatusOK)
 			}
 
-			wantAnnotation := "(" + FormatInt(tt.cacheReadTokens) + " cached)"
-			gotTooltip := strings.Contains(dr.Body, wantAnnotation)
-			if gotTooltip != tt.wantTooltip {
-				t.Errorf("body contains cached-count annotation %q = %v, want %v", wantAnnotation, gotTooltip, tt.wantTooltip)
+			if tt.wantAnnotation == "" {
+				for _, forbidden := range []string{" cache read)", " cache write)"} {
+					if strings.Contains(dr.Body, forbidden) {
+						t.Errorf("body unexpectedly contains a cache annotation %q for a zero-cache row", forbidden)
+					}
+				}
+			} else if !strings.Contains(dr.Body, tt.wantAnnotation) {
+				t.Errorf("body missing cache annotation %q", tt.wantAnnotation)
 			}
 
-			if tt.wantFormatted != "" && !strings.Contains(dr.Body, tt.wantFormatted) {
-				t.Errorf("body missing formatted cache read count %q", tt.wantFormatted)
+			for _, formatted := range tt.wantFormatted {
+				if !strings.Contains(dr.Body, formatted) {
+					t.Errorf("body missing formatted cache token count %q", formatted)
+				}
 			}
 		})
 	}
@@ -1982,6 +2003,60 @@ func TestHandleDashboard_WithTokenRates(t *testing.T) {
 	}
 }
 
+// TestHandleDashboard_IncompleteTokenRateEntryDashesActiveEstCost
+// drives a running, measured claude-code session under a token_rates
+// entry missing input_per_mtok: the dashboard must show Active Est.
+// Cost as a dash rather than a number, and name the excluded session
+// in the same note complete rates render for an unnamed kind.
+func TestHandleDashboard_IncompleteTokenRateEntryDashesActiveEstCost(t *testing.T) {
+	t.Parallel()
+
+	fptr := func(v float64) *float64 { return &v }
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	snap := orchestrator.RuntimeSnapshotResult{
+		GeneratedAt: now,
+		Running: []orchestrator.SnapshotRunningEntry{
+			{
+				IssueID:           "id-incomplete",
+				Identifier:        "MT-INCOMPLETE",
+				State:             "In Progress",
+				StartedAt:         now.Add(-5 * time.Minute),
+				AgentKind:         "claude-code",
+				AgentInputTokens:  1_000_000,
+				AgentOutputTokens: 500_000,
+				UsageMeasured:     true,
+				UsageArrival:      registry.UsageArrivalIncremental,
+			},
+		},
+	}
+
+	srv := New(Params{
+		SnapshotFn: fixedSnapshot(snap),
+		RefreshFn:  acceptingRefresh(),
+		Logger:     slog.New(slog.DiscardHandler),
+		StartedAt:  now.Add(-1 * time.Hour),
+		TokenRates: TokenRates{
+			"claude-code": TokenRateConfig{OutputPerMtok: fptr(15.0)},
+		},
+	})
+	ts := httptest.NewServer(srv.Mux())
+	t.Cleanup(ts.Close)
+
+	dr := getDashboard(t, ts, "/")
+	if dr.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", dr.StatusCode, http.StatusOK)
+	}
+
+	if !strings.Contains(dr.Body, "&mdash;") {
+		t.Error("body missing the dash render for an unpriced Active Est. Cost")
+	}
+	wantNote := "1 running session is excluded from Est. Cost because token_rates has no price for its agent."
+	if !strings.Contains(dr.Body, wantNote) {
+		t.Errorf("body missing the cost-unpriced note %q", wantNote)
+	}
+}
+
 func TestHandleDashboard_WithoutTokenRates(t *testing.T) {
 	t.Parallel()
 
@@ -2094,7 +2169,7 @@ func TestBuildDashboardData_ExclusionNotes(t *testing.T) {
 
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 	fptr := func(v float64) *float64 { return &v }
-	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0)}}
+	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)}}
 
 	t.Run("singular forms", func(t *testing.T) {
 		t.Parallel()

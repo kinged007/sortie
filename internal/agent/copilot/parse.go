@@ -129,9 +129,10 @@ type shutdownModel struct {
 // shutdownModelUsage holds one model's token counts from a
 // session.shutdown record's modelMetrics entry.
 type shutdownModelUsage struct {
-	InputTokens     int64 `json:"inputTokens"`
-	OutputTokens    int64 `json:"outputTokens"`
-	CacheReadTokens int64 `json:"cacheReadTokens"`
+	InputTokens      int64 `json:"inputTokens"`
+	OutputTokens     int64 `json:"outputTokens"`
+	CacheReadTokens  int64 `json:"cacheReadTokens"`
+	CacheWriteTokens int64 `json:"cacheWriteTokens"`
 }
 
 // parseEvent parses a single JSONL line from Copilot CLI stdout into

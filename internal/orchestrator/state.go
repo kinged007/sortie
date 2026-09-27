@@ -63,11 +63,12 @@ var knownBudgetReasons = []string{budgetReasonSession, budgetReasonToken}
 // SecondsRunning tracks only ended-session time; the snapshot adds active
 // sessions' elapsed time.
 type AgentTotals struct {
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	CacheReadTokens int64
-	SecondsRunning  float64
+	InputTokens      int64
+	OutputTokens     int64
+	TotalTokens      int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	SecondsRunning   float64
 
 	// UnmeasuredSessions counts ended sessions whose usage was never
 	// recorded, cumulative across restarts. The counters above exclude
@@ -129,6 +130,10 @@ type RunningEntry struct {
 	CacheReadTokens int64
 
 	LastReportedCacheReadTokens int64
+
+	CacheWriteTokens int64
+
+	LastReportedCacheWriteTokens int64
 
 	ModelName string
 
@@ -951,6 +956,7 @@ type SnapshotRunningEntry struct {
 	AgentOutputTokens   int64                     `json:"output_tokens"`
 	AgentTotalTokens    int64                     `json:"total_tokens"`
 	CacheReadTokens     int64                     `json:"cache_read_tokens"`
+	CacheWriteTokens    int64                     `json:"cache_write_tokens"`
 	ModelName           string                    `json:"model_name,omitempty"`
 	APIRequestCount     int                       `json:"api_request_count"`
 	RequestsByModel     map[string]int            `json:"requests_by_model,omitempty"`
@@ -1010,6 +1016,7 @@ type SnapshotAgentTotals struct {
 	OutputTokens        int64   `json:"output_tokens"`
 	TotalTokens         int64   `json:"total_tokens"`
 	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheWriteTokens    int64   `json:"cache_write_tokens"`
 	SecondsRunning      float64 `json:"seconds_running"`
 	UnmeasuredSessions  int64   `json:"unmeasured_sessions"`
 	RunningUnreported   int     `json:"running_unreported"`
@@ -1145,6 +1152,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			AgentOutputTokens:   entry.AgentOutputTokens,
 			AgentTotalTokens:    entry.AgentTotalTokens,
 			CacheReadTokens:     entry.CacheReadTokens,
+			CacheWriteTokens:    entry.CacheWriteTokens,
 			ModelName:           entry.ModelName,
 			APIRequestCount:     entry.APIRequestCount,
 			RequestsByModel:     modelRequests,
@@ -1191,6 +1199,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 		OutputTokens:        state.AgentTotals.OutputTokens,
 		TotalTokens:         state.AgentTotals.TotalTokens,
 		CacheReadTokens:     state.AgentTotals.CacheReadTokens,
+		CacheWriteTokens:    state.AgentTotals.CacheWriteTokens,
 		SecondsRunning:      state.AgentTotals.SecondsRunning + activeElapsedTotal,
 		UnmeasuredSessions:  state.AgentTotals.UnmeasuredSessions,
 		RunningUnreported:   runningUnreported,

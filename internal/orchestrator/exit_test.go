@@ -423,6 +423,8 @@ func TestHandleWorkerExit_RunHistoryTokenColumns(t *testing.T) {
 	entry.AgentOutputTokens = 200
 	entry.AgentTotalTokens = 300
 	entry.CacheReadTokens = 40
+	entry.CacheWriteTokens = 25
+	state.AgentTotals.CacheWriteTokens = 25
 	// The event that advanced these totals also marked the entry
 	// measured, so a fixture carrying totals must carry the flag.
 	entry.UsageMeasured = true
@@ -451,6 +453,9 @@ func TestHandleWorkerExit_RunHistoryTokenColumns(t *testing.T) {
 	if run.CacheReadTokens != 40 {
 		t.Errorf("RunHistory.CacheReadTokens = %d, want 40", run.CacheReadTokens)
 	}
+	if run.CacheWriteTokens != 25 {
+		t.Errorf("RunHistory.CacheWriteTokens = %d, want 25", run.CacheWriteTokens)
+	}
 
 	if len(store.sessionMetadata) != 1 {
 		t.Fatalf("UpsertSessionMetadata called %d times, want 1", len(store.sessionMetadata))
@@ -458,6 +463,16 @@ func TestHandleWorkerExit_RunHistoryTokenColumns(t *testing.T) {
 	meta := store.sessionMetadata[0]
 	if meta.TotalTokens != run.TotalTokens {
 		t.Errorf("SessionMetadata.TotalTokens = %d, want %d (parity with run_history)", meta.TotalTokens, run.TotalTokens)
+	}
+	if meta.CacheWriteTokens != run.CacheWriteTokens {
+		t.Errorf("SessionMetadata.CacheWriteTokens = %d, want %d (parity with run_history)", meta.CacheWriteTokens, run.CacheWriteTokens)
+	}
+
+	if len(store.metrics) != 1 {
+		t.Fatalf("UpsertAggregateMetrics called %d times, want 1", len(store.metrics))
+	}
+	if got := store.metrics[0].CacheWriteTokens; got != 25 {
+		t.Errorf("AggregateMetrics.CacheWriteTokens = %d, want 25 (restored into orchestrator.AgentTotals after a restart)", got)
 	}
 }
 

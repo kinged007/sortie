@@ -1116,6 +1116,7 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 		OutputTokens:        entry.AgentOutputTokens,
 		TotalTokens:         entry.AgentTotalTokens,
 		CacheReadTokens:     entry.CacheReadTokens,
+		CacheWriteTokens:    entry.CacheWriteTokens,
 		ModelName:           entry.ModelName,
 		APIRequestCount:     requestCount,
 		APIRequestsMeasured: requestsMeasured,

@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The `opencode` agent kind now works with OpenCode 2.x as well as 1.x: Sortie reads the installed version at the start of each session and drives whichever one is configured, stopping the run with an error naming the version when it is neither. On OpenCode 2.x, `opencode.pure` and an `opencode.variant` set without an `opencode.model` are refused the same way.
   ([#960](https://github.com/sortie-ai/sortie/issues/960))
 
+- Tokens that `claude-code`, `copilot-cli`, and `opencode` write to the prompt cache now show separately on the dashboard, in the JSON API, in `sortie stats`, and in metrics, and can be priced with the new `token_rates` rate `cache_write_per_mtok`. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
 ### Changed
 
 - Workflows that use the `copilot-cli` agent kind now need GitHub Copilot CLI 1.0.51 or later.
@@ -27,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The comment posted when a session starts (`tracker.comments.on_dispatch`) now reads only "Sortie session started.", without the session and workspace lines that always read `pending`, the agent kind, or the attempt count. The comments posted when a session ends (`tracker.comments.on_completion`, `tracker.comments.on_failure`) no longer show the agent's session identifier, and the failure comment no longer quotes the error; it gives the duration and whether the issue will be retried, and the cause stays available in the log, the run history, and the dashboard.
   ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
+
+- A `token_rates` entry now needs both `input_per_mtok` and `output_per_mtok`: an agent whose entry lacks either one gets no cost estimate, and `sortie validate` warns about such an entry and about any rate name it does not recognize. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
 
 ### Deprecated
 
@@ -80,10 +84,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Configuration warnings (a deprecated `ci_feedback` section, a `label_commands` prompt template missing its branch or a poll interval below its minimum, a missing env file, an environment override replacing a section that is not a mapping) now appear once when they first apply instead of on every poll. `sortie validate` reports them as warnings instead of printing log lines. `sortie stats` and `sortie mcp-server` no longer print them.
   ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
 
+- Estimated costs on the dashboard, in the JSON API, and in `sortie stats` no longer charge tokens read from the prompt cache twice, which made them several times too high for sessions that use the cache heavily. `sortie stats` shows the corrected cost for past runs as well. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
 ### Migrations
 
 - Add `unaccounted_turns INTEGER NOT NULL DEFAULT 0` to `run_history`, counting the run's turns that spent tokens no figure was proven to account for, whether no figure arrived at all or the one that did fell short of the turn. A pre-migration row reads back zero and so presents as fully accounted, but nothing measured it: before the upgrade a turn that spent tokens without reporting a figure was indistinguishable from one that cost nothing, and because `run_history` is an append-only record no later run can correct, that zero stays. A historical run's spend therefore reads as complete because nothing can now establish otherwise, not because it was verified.
   ([#1057](https://github.com/sortie-ai/sortie/issues/1057))
+
+- Add `cache_write_tokens INTEGER NOT NULL DEFAULT 0` to `run_history`, `session_metadata`, and `aggregate_metrics`. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
 
 ## [1.24.1] - 2026-09-17
 
