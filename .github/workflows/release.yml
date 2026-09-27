@@ -349,7 +349,7 @@ jobs:
           node-version: "24"
 
       - name: Install Claude
-        run: npm install -g @anthropic-ai/claude-code
+        run: npm install -g --ignore-scripts=false @anthropic-ai/claude-code
 
       - name: Run integration tests
         run: go test -race -count=1 -v -timeout 600s -run 'Integration' ./internal/agent/claude/...
@@ -445,9 +445,9 @@ jobs:
       matrix:
         include:
           - major: "1"
-            install: npm install -g opencode-ai@1
+            install: npm install -g --ignore-scripts=false opencode-ai@1
           - major: "2"
-            install: npm install -g @opencode/cli@2
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
     env:
       SORTIE_OPENCODE_TEST: "1"
       SORTIE_OPENCODE_MAJOR: ${{ matrix.major }}

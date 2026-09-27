@@ -49,7 +49,7 @@ jobs:
             test_path: ./internal/agent/claude/...
             timeout: 600s
             node: true
-            install: npm install -g @anthropic-ai/claude-code
+            install: npm install -g --ignore-scripts=false @anthropic-ai/claude-code
             version_cmd: claude --version
             source: "npm: @anthropic-ai/claude-code (unpinned, installs latest)"
 
@@ -87,7 +87,7 @@ jobs:
             test_path: ./internal/agent/opencode/...
             timeout: 300s
             node: true
-            install: npm install -g opencode-ai@1
+            install: npm install -g --ignore-scripts=false opencode-ai@1
             version_cmd: opencode --version
             source: "npm: opencode-ai@1 (latest 1.x)"
             opencode_major: "1"
@@ -100,7 +100,7 @@ jobs:
             test_path: ./internal/agent/opencode/...
             timeout: 300s
             node: true
-            install: npm install -g @opencode/cli@2
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
             version_cmd: opencode --version
             source: "npm: @opencode/cli@2 (latest 2.x)"
             opencode_major: "2"
