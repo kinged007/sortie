@@ -14,6 +14,9 @@ concurrency:
   group: nightly
   cancel-in-progress: false
 
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+
 jobs:
   integration:
     name: "Integration: ${{ matrix.name }}"

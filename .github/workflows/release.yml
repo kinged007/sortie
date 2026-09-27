@@ -34,6 +34,9 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+
 jobs:
   validate:
     name: Validate inputs
