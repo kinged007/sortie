@@ -2803,6 +2803,7 @@ These offline checks never contact Linear and never log the API key value. State
 | `reactions.label_commands.review_branch_missing`            | `reactions.label_commands` names a provider, the review label is non-empty, and the prompt template has no `label_review` branch. |
 | `reactions.label_commands.fix_branch_missing`               | `reactions.label_commands` names a provider, the fix label is non-empty, and the prompt template has no `label_fix` branch. |
 | `agent.kind.deprecated`                                     | A kind the configuration reaches (`agent.kind`, `dispatch.default.agent`, or a `dispatch.rules[*].agent`) is registered as deprecated. |
+| `token_rates`                                               | `token_rates` or one of its entries is not a map, an entry has an empty agent kind, a rate is not a finite, non-negative number, an entry names a key Sortie does not recognize, or an entry lacks `input_per_mtok` or `output_per_mtok`. |
 
 ---
 
