@@ -1,18 +1,12 @@
-// Package pi implements [domain.AgentAdapter] for the Pi CLI.
-// It launches one `pi run --format json` subprocess per turn,
-// normalizes stdout envelopes into domain events, and recovers final token
-// usage with `pi export --sanitize`. When a turn fails and the run
-// stream carried nothing but pi's masked generic server error, the
-// adapter consults `pi models` to reconstruct the unknown-model
-// diagnostic.
+// Package pi implements [domain.AgentAdapter] for the Pi CLI
+// (pi 0.85.1). It launches one `pi -p --mode json` subprocess per
+// Sortie turn, normalizes the JSON event stream into domain events, and
+// settles the session's cumulative token usage from the one usage
+// figure each pi turn_end carries.
 //
-// The CLI accepts no MCP configuration path as an argument, so on a local
-// launch the adapter translates the file named by
-// [domain.StartSessionParams] MCPConfigPath into Pi's own
-// configuration form and delivers it in the turn's environment. A remote
-// launch receives none: the only delivery route there is the command line,
-// where the document's credentials would be readable by any user of the
-// host.
+// pi has no MCP transport, so the adapter declares
+// [registry.MCPInjectionUnsupported] and delivers nothing: Sortie's
+// tools are neither advertised to nor callable by a pi session.
 package pi
 
 import (
@@ -22,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,7 +36,7 @@ func init() {
 	registry.Agents.RegisterWithMeta("pi", NewPiAdapter, registry.AgentMeta{
 		RequiresCommand:     true,
 		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionTranslated,
+		MCPInjection:        registry.MCPInjectionUnsupported,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 	})
@@ -54,38 +49,27 @@ type PiAdapter struct {
 }
 
 type sessionState struct {
-	target         agentcore.LaunchTarget
-	agentConfig    domain.AgentConfig
-	passthrough    passthroughConfig
-	sessionID      string
-	turnCount      int
-	sessionOpened  bool
-	closed         bool
-	baseLogger     *slog.Logger
-	createdSession bool
-	runStartedAtMS int64
-	usage          *agentcore.TurnEndUsage
-	mu             sync.Mutex
-	active         *turnRuntime
+	target        agentcore.LaunchTarget
+	agentConfig   domain.AgentConfig
+	sessionID     string
+	sessionOpened bool
+	closed        bool
+	baseLogger    *slog.Logger
+	usage         *agentcore.TurnEndUsage
+	mu            sync.Mutex
+	active        *turnRuntime
+
+	// total is the session's run-cumulative token usage: the sum of
+	// every model response every turn of this session produced. It is
+	// only read and written on the goroutine executing the session's
+	// single active turn, which the orchestrator never overlaps.
+	total domain.TokenUsage
 
 	// drainGrace bounds every post-exit wait a turn performs on its
 	// stdout reader once the subprocess has been reaped. Written once by
 	// StartSession, or by a test before a session's first turn; RunTurn
 	// reads it when it builds each turn's own turnRuntime.
 	drainGrace time.Duration
-
-	// mcpConfigContent is the translated MCP configuration document
-	// delivered through the runtime's inline configuration environment
-	// variable on every turn's subprocess. Empty when the session
-	// carries no generated configuration, when that configuration
-	// declares no server, or when the launch target is remote. Set
-	// once in StartSession and never mutated after.
-	mcpConfigContent string
-}
-
-type lastUsageFigure struct {
-	run   domain.TokenUsage
-	model string
 }
 
 type turnRuntime struct {
@@ -96,7 +80,6 @@ type turnRuntime struct {
 	reader          *procutil.StdoutReader
 	stderrCollector *procutil.StderrCollector
 	firstJSONSeen   bool
-	lastUsage       *lastUsageFigure
 	waitMu          sync.Mutex
 	waitRes         waitResult
 
@@ -108,6 +91,22 @@ type turnRuntime struct {
 	// work is the per-turn work-evidence observer for the shared
 	// turn-disposition decision.
 	work *agentcore.WorkObserver
+
+	// usage is this turn's own model responses, summed. usageModel
+	// names the model the last counted response came from, which is
+	// what a turn carrying several models reports.
+	usage      domain.TokenUsage
+	usageModel string
+
+	// assistantFailure holds the first assistant response that stopped
+	// with reason "error" or "aborted". pi --mode json exits 0 for both,
+	// so this is the only evidence such a turn failed.
+	assistantFailure string
+
+	// sawAssistantMessageEnd records whether the current pi turn already
+	// delivered its authoritative message_end, so turn_end does not
+	// report the same assistant response's text a second time.
+	sawAssistantMessageEnd bool
 }
 
 type waitResult struct {
@@ -118,44 +117,32 @@ type waitResult struct {
 // NewPiAdapter creates an [PiAdapter] from the raw "pi"
 // adapter configuration in WORKFLOW.md.
 func NewPiAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, fault := parsePassthroughConfig(config)
-	if fault != nil {
-		return nil, fault
-	}
-	if err := checkCrossField(pt); err != nil {
-		return nil, err
+	pt, faults := parsePassthroughConfig(config)
+	if len(faults) > 0 {
+		messages := make([]string, len(faults))
+		for i, f := range faults {
+			messages[i] = f.Message
+		}
+		return nil, errors.New(strings.Join(messages, "; "))
 	}
 	return &PiAdapter{passthrough: pt}, nil
 }
 
 // StartSession resolves the launch target and initializes adapter-owned
-// session state without starting an Pi subprocess.
+// session state without starting a Pi subprocess.
 func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	target, agentErr := agentcore.ResolveLaunchTarget(params, "pi")
 	if agentErr != nil {
 		return domain.Session{}, agentErr
 	}
 
-	mcpConfigContent, mcpErr := buildMCPConfigContent(params.MCPConfigPath, target.RemoteCommand != "")
-	if mcpErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("translate MCP config: %v", mcpErr),
-			Err:     mcpErr,
-		}
-	}
-
 	state := &sessionState{
-		target:           target,
-		agentConfig:      params.AgentConfig,
-		passthrough:      a.passthrough,
-		sessionID:        params.ResumeSessionID,
-		baseLogger:       slog.Default().With(slog.String("component", "pi-adapter")),
-		createdSession:   params.ResumeSessionID == "",
-		runStartedAtMS:   time.Now().UnixMilli(),
-		usage:            agentcore.NewTurnEndUsage(),
-		drainGrace:       procutil.DefaultDrainGrace,
-		mcpConfigContent: mcpConfigContent,
+		target:      target,
+		agentConfig: params.AgentConfig,
+		sessionID:   params.ResumeSessionID,
+		baseLogger:  slog.Default().With(slog.String("component", "pi-adapter")),
+		usage:       agentcore.NewTurnEndUsage(),
+		drainGrace:  procutil.DefaultDrainGrace,
 	}
 
 	return domain.Session{
@@ -181,25 +168,6 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		}
 	}
 
-	env, err := buildRunEnv(os.Environ(), a.passthrough)
-	if err != nil {
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "build pi environment",
-			Err:     err,
-		}
-	}
-	env = appendMCPConfigEnv(env, state.mcpConfigContent)
-
-	managedEnv, err := buildManagedEnv(a.passthrough)
-	if err != nil {
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "build pi managed environment",
-			Err:     err,
-		}
-	}
-
 	state.mu.Lock()
 	if state.closed {
 		state.mu.Unlock()
@@ -215,17 +183,17 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			Message: "session already has an active turn",
 		}
 	}
-	state.turnCount++
+
+	env := os.Environ()
 	cmdArgs := buildRunArgs(state, params.Prompt, a.passthrough)
 	logger := state.loggerLocked()
 
 	var cmd *exec.Cmd
 	if state.target.RemoteCommand != "" {
-		remoteCommand := buildSSHRemoteCommand(state.target.RemoteCommand, managedEnv)
 		sshArgs := sshutil.BuildSSHArgs(
 			state.target.SSHHost,
 			state.target.WorkspacePath,
-			remoteCommand,
+			state.target.RemoteCommand,
 			cmdArgs,
 			sshutil.SSHOptions{StrictHostKeyChecking: state.target.SSHStrictHostKeyChecking},
 		)
@@ -238,7 +206,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd)
+	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
@@ -263,7 +231,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				Message: "create stderr pipe",
 				Err:     startErr.Err,
 			}
-		default: // procutil.StageProcessStart
+		default: // procutil.StageProcessStart, procutil.StageProcessResume
 			return domain.TurnResult{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: "start pi subprocess",
@@ -286,13 +254,9 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	state.active = runtime
 	state.mu.Unlock()
 
-	if assignErr := procutil.AssignProcess(cmd.Process.Pid, cmd.Process); assignErr != nil {
-		logger.Warn("process group assignment failed", slog.Any("error", assignErr))
-	}
-
 	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
 	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
-	startWait(runtime, cmd)
+	startWait(runtime, cmd, logger)
 
 	emit := func(event domain.AgentEvent) {
 		if state.target.RemoteCommand == "" {
@@ -353,10 +317,22 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			readTimeoutC = nil
 		}
 
-		if sid := rawEvent.SessionRef(); sid != "" {
-			started, mismatch := state.applySessionEvent(sid)
-			if mismatch {
-				message := fmt.Sprintf("session id mismatch: expected %q, got %q", state.currentSessionID(), sid)
+		now := time.Now().UTC()
+		malformed := func(reason error) {
+			emit(domain.AgentEvent{
+				Type:      domain.EventMalformed,
+				Timestamp: now,
+				Message:   reason.Error(),
+			})
+		}
+
+		if rawEvent.Type == "session" {
+			id, cwd, err := rawEvent.sessionHeader()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
+			}
+			if problem := state.checkSessionHeader(id, cwd); problem != "" {
 				killTurnProcess(runtime)
 				_ = waitForProcess(runtime)
 				drainReaderBounded(runtime.reader, runtime.drainGrace)
@@ -365,65 +341,112 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				ev := agentcore.TurnEvidence{
 					Terminal:          agentcore.TerminalFailure,
 					TerminalErrorKind: domain.ErrResponseError,
-					TerminalMessage:   message,
+					TerminalMessage:   problem,
 				}
-				result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+				result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
 				return result, agentErr, true
 			}
-			if started {
+			if state.applySessionEvent(id) {
 				emit(domain.AgentEvent{
 					Type:      domain.EventSessionStarted,
-					Timestamp: time.Now().UTC(),
+					Timestamp: now,
 					SessionID: state.currentSessionID(),
 					Message:   "session started",
 				})
 			}
-		}
-		if run, model, ok := rawEvent.UsageRun(); ok {
-			runtime.lastUsage = &lastUsageFigure{run: run, model: model}
+			return domain.TurnResult{}, nil, false
 		}
 
-		now := time.Now().UTC()
 		switch rawEvent.Type {
+		case "turn_start":
+			runtime.sawAssistantMessageEnd = false
+
 		case "message_update":
-			text, tool, toolDone, isErr := rawEvent.TextDelta()
-			if tool != "" {
-				runtime.work.ObserveToolActivity()
-				if toolDone {
-					emit(domain.AgentEvent{
-						Type:      domain.EventToolResult,
-						Timestamp: now,
-						ToolName:  tool,
-						ToolError: isErr,
-					})
-				}
-				break
+			delta, err := rawEvent.assistantDelta()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
 			}
-			if text != "" {
+			switch delta.Type {
+			case "text_start", "text_delta", "thinking_start", "thinking_delta":
+				runtime.work.ObserveAssistantOutput()
+			case "toolcall_start", "toolcall_end":
+				runtime.work.ObserveToolActivity()
+			}
+
+		case "message_end":
+			msg, err := rawEvent.completedMessage()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
+			}
+			if msg.Role != "assistant" {
+				return domain.TurnResult{}, nil, false
+			}
+			runtime.sawAssistantMessageEnd = true
+			if runtime.assistantFailure == "" {
+				runtime.assistantFailure = msg.failure()
+			}
+			if text := msg.text(); text != "" {
 				runtime.work.ObserveAssistantOutput()
 				agentcore.EmitNotification(emit, typeutil.TruncateRunes(text, 500))
 			}
 
+		case "turn_end":
+			msg, err := rawEvent.completedMessage()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
+			}
+			// turn_end names the same assistant response the matching
+			// message_end already reported, so it is the fallback for
+			// the text and the only source of the response's usage.
+			if msg.Role == "assistant" && !runtime.sawAssistantMessageEnd {
+				if runtime.assistantFailure == "" {
+					runtime.assistantFailure = msg.failure()
+				}
+				if text := msg.text(); text != "" {
+					runtime.work.ObserveAssistantOutput()
+					agentcore.EmitNotification(emit, typeutil.TruncateRunes(text, 500))
+				}
+			}
+			if msg.Role == "assistant" && msg.Usage != nil {
+				runtime.usage = addUsage(runtime.usage, msg.Usage.tokenUsage())
+				if msg.Model != "" {
+					runtime.usageModel = msg.Model
+				}
+			}
+
 		case "tool_execution_end":
-			name, isErr := rawEvent.ToolResult()
+			if rawEvent.ToolName == "" {
+				malformed(fmt.Errorf("tool_execution_end carries no toolName"))
+				return domain.TurnResult{}, nil, false
+			}
 			runtime.work.ObserveToolActivity()
 			emit(domain.AgentEvent{
 				Type:      domain.EventToolResult,
 				Timestamp: now,
-				ToolName:  name,
-				ToolError: isErr,
+				ToolName:  rawEvent.ToolName,
+				ToolError: rawEvent.IsError,
 			})
 
-		case "turn_end", "message_end":
-			if text := rawEvent.CompletedText(); text != "" {
-				runtime.work.ObserveAssistantOutput()
-				agentcore.EmitNotification(emit, typeutil.TruncateRunes(text, 500))
+		case "compaction_end":
+			usage, ok, err := rawEvent.compactionUsage()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
+			}
+			if ok {
+				runtime.usage = addUsage(runtime.usage, usage)
+			}
+			if rawEvent.ErrorMessage != "" && !rawEvent.Aborted {
+				agentcore.EmitNotification(emit, "pi compaction failed: "+rawEvent.ErrorMessage)
 			}
 
 		default:
-			// session/agent_start/turn_start/message_start and other
-			// framing events carry no content: ignore them.
-			_ = now
+			if !rawEvent.known() {
+				malformed(fmt.Errorf("unknown pi event type %q", rawEvent.Type))
+			}
 		}
 
 		return domain.TurnResult{}, nil, false
@@ -460,7 +483,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 							Cause:             readErr,
 						}
 					}
-					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
 					if agentErr != nil {
 						return result, agentErr
 					}
@@ -506,7 +529,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -535,7 +558,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				TerminalErrorKind: domain.ErrResponseTimeout,
 				TerminalMessage:   "timed out waiting for first pi json event",
 			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil)
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -564,29 +587,10 @@ func (a *PiAdapter) StopSession(ctx context.Context, session domain.Session) err
 }
 
 // finalizeExitedTurn builds and emits the turn's terminal disposition once
-// the subprocess has exited. It also scans the turn's stderr lines for a
-// denied-permission warning, which the runtime writes to stderr rather than
-// stdout; recognizing it here rather than mid-turn means the corresponding
-// notification arrives at turn end rather than as it happens, and it does
-// not reset the read timer the way a stdout line does, neither of which is
-// a regression because the warning has never actually reached stdout.
+// the subprocess has exited.
 func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
-	// pi has no export subcommand; usage arrives on the stream's
-	// turn_end/message_end events and was latched per line above.
-	var recovered *agentcore.RecoveredUsage
-	if runtime.lastUsage != nil {
-		recovered = &agentcore.RecoveredUsage{Run: runtime.lastUsage.run, Model: runtime.lastUsage.model}
-	}
-
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
-	for _, line := range stderrLines {
-		if !isPermissionWarning(line) {
-			continue
-		}
-		posture := agentcore.DecideHumanRequest(agentcore.ClassPermission, false, agentcore.AnswerRuntimeRefused)
-		agentcore.EmitNotification(emit, posture.Notice)
-	}
 	sessionID := state.currentSessionID()
 
 	ev := agentcore.TurnEvidence{
@@ -602,6 +606,18 @@ func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState,
 		ev.TerminalMessage = "turn cancelled"
 		ev.Cause = nil
 
+	case runtime.assistantFailure != "":
+		// pi --mode json applies no exit-code check to a failed
+		// response, so this branch is what keeps a 0-exit provider
+		// failure from being recorded as a successful turn.
+		procutil.EmitWarnLines(stderrLines, state.logger())
+		ev.Terminal = agentcore.TerminalFailure
+		ev.TerminalErrorKind = domain.ErrResponseError
+		ev.TerminalMessage = runtime.assistantFailure
+		if excerpt := stderrExcerpt(stderrLines); excerpt != "" {
+			ev.TerminalMessage += ": " + excerpt
+		}
+
 	case !runtime.firstJSONSeen:
 		procutil.EmitWarnLines(stderrLines, state.logger())
 
@@ -609,11 +625,37 @@ func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState,
 		procutil.EmitWarnLines(stderrLines, state.logger())
 	}
 
-	result, agentErr := state.usage.Finalize(emit, state.logger(), ev, sessionID, 0, recovered)
+	result, agentErr := state.usage.Finalize(emit, state.logger(), ev, sessionID, 0, state.settleUsage(runtime))
 	if agentErr != nil {
 		return result, agentErr
 	}
 	return result, nil
+}
+
+// settleUsage folds this turn's own model responses into the session's
+// run-cumulative total and returns the figure the turn reports, or nil
+// when the turn produced no usage at all.
+func (s *sessionState) settleUsage(runtime *turnRuntime) *agentcore.RecoveredUsage {
+	if runtime.usage == (domain.TokenUsage{}) {
+		return nil
+	}
+	s.total = addUsage(s.total, runtime.usage)
+	return &agentcore.RecoveredUsage{Run: s.total, Model: runtime.usageModel}
+}
+
+// checkSessionHeader validates a session header against the session's
+// own identity and workspace, and returns the problem it found or "".
+func (s *sessionState) checkSessionHeader(id, cwd string) string {
+	if want := filepath.Clean(s.target.WorkspacePath); filepath.Clean(cwd) != want {
+		return fmt.Sprintf("session %q runs in %q, want the turn's workspace %q", id, cwd, s.target.WorkspacePath)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionID != "" && s.sessionID != id {
+		return fmt.Sprintf("session id mismatch: expected %q, got %q", s.sessionID, id)
+	}
+	return ""
 }
 
 func (s *sessionState) logger() *slog.Logger {
@@ -645,33 +687,29 @@ func (s *sessionState) isClosed() bool {
 	return s.closed
 }
 
-func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
-	if eventSessionID == "" {
-		return false, false
-	}
-
+// applySessionEvent adopts the header's session id, and reports whether
+// this is the first header of the Sortie session, so session_started is
+// emitted exactly once even across a resume.
+func (s *sessionState) applySessionEvent(eventSessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.sessionID == "" {
 		s.sessionID = eventSessionID
-	} else if s.sessionID != eventSessionID {
-		return false, true
 	}
-
 	if s.sessionOpened {
-		return false, false
+		return false
 	}
 	s.sessionOpened = true
-	return true, false
+	return true
 }
 
 // startWait reaps the turn's subprocess independently of its stdout
 // reader and, once the reap and group kill have run, bounds the wait
 // for the turn's stderr drain before reading it.
-func startWait(runtime *turnRuntime, cmd *exec.Cmd) {
+func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 	go func() {
-		reaper := procutil.StartReaper(cmd)
+		reaper := procutil.StartReaper(cmd, logger)
 		<-reaper.Done()
 
 		// The turn's exit is published below, behind a stderr bound that
@@ -799,16 +837,27 @@ func readTimeout(state *sessionState) time.Duration {
 	return 30 * time.Second
 }
 
-func exportTimeout(state *sessionState) time.Duration {
-	timeout := 2 * readTimeout(state)
-	if timeout <= 0 || timeout > 30*time.Second {
-		return 30 * time.Second
-	}
-	return timeout
-}
+// stderrExcerptLines and stderrExcerptRunes bound how much of a failed
+// turn's stderr reaches its terminal report.
+const (
+	stderrExcerptLines = 3
+	stderrExcerptRunes = 300
+)
 
-func isPermissionWarning(line string) bool {
-	return strings.HasPrefix(strings.TrimSpace(line), "! permission requested:")
+// stderrExcerpt returns a bounded excerpt of the turn's stderr lines
+// for its terminal failure message, or "" when the turn wrote none.
+func stderrExcerpt(lines []string) string {
+	var kept []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			kept = append(kept, trimmed)
+		}
+		if len(kept) == stderrExcerptLines {
+			break
+		}
+	}
+	return typeutil.TruncateRunes(strings.Join(kept, "; "), stderrExcerptRunes)
 }
 
 // drainLinesBounded takes whatever the reader has already produced and

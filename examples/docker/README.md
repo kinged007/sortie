@@ -15,6 +15,7 @@ docker build -f examples/docker/codex.Dockerfile -t sortie-codex .
 docker build -f examples/docker/copilot.Dockerfile -t sortie-copilot .
 docker build -f examples/docker/kiro.Dockerfile -t sortie-kiro .
 docker build -f examples/docker/opencode.Dockerfile -t sortie-opencode .
+docker build -f examples/docker/pi.Dockerfile -t sortie-pi .
 ```
 
 Run it:
@@ -37,6 +38,7 @@ docker run --rm --init \
 | `copilot.Dockerfile` | GitHub Copilot | `node:24-slim` |
 | `kiro.Dockerfile` | Kiro CLI | `debian:bookworm-slim` |
 | `opencode.Dockerfile` | OpenCode | `node:24-slim` |
+| `pi.Dockerfile` | Pi CLI | `node:24-slim` |
 
 Each Dockerfile follows the same pattern: copy the Sortie binary from the
 distroless image (`ghcr.io/sortie-ai/sortie`), install the agent, create a

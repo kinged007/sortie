@@ -33,6 +33,7 @@ jobs:
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
       KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      SORTIE_PI_MODEL: ${{ vars.SORTIE_PI_MODEL }}
 
     strategy:
       fail-fast: false
@@ -85,6 +86,18 @@ jobs:
             install: npm install -g opencode-ai
             version_cmd: opencode --version
             source: "npm: opencode-ai (unpinned, installs latest)"
+
+          - name: Pi
+            adapter: pi
+            kind: agent
+            guard: SORTIE_PI_TEST
+            run_filter: Integration
+            test_path: ./internal/agent/pi/...
+            timeout: 300s
+            node: true
+            install: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
+            version_cmd: pi --version
+            source: "npm: @earendil-works/pi-coding-agent@0.85.1 (pinned)"
 
           - name: Kiro
             adapter: kiro

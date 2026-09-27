@@ -1791,7 +1791,10 @@ func contractIdentityWordsFromIdent(name string) []string {
 		// An uppercase run ending in a lowercase rune starts a new word at
 		// that run's last uppercase rune, so useCLAUDEFlag yields "use",
 		// "claude" and "flag" rather than gluing the token to "flag".
-		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 {
+		// A short initialism followed by a plural s stays one word: PIDs
+		// is not the identity token pi followed by ds.
+		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 &&
+			(len(current) > 3 || r != 's') {
 			last := current[len(current)-1]
 			current = current[:len(current)-1]
 			flush()

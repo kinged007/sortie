@@ -1,56 +1,26 @@
 package pi
 
 import (
-	"encoding/json"
+	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
-	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
-
-// envLookup returns the value for key in an env []string slice.
-func envLookup(env []string, key string) (string, bool) {
-	prefix := key + "="
-	for _, e := range env {
-		if after, ok := strings.CutPrefix(e, prefix); ok {
-			return after, true
-		}
-	}
-	return "", false
-}
-
-// assertEnvPresent fails unless key is present in env with the given value.
-func assertEnvPresent(t *testing.T, env []string, key, wantVal string) {
-	t.Helper()
-	got, ok := envLookup(env, key)
-	if !ok {
-		t.Errorf("env %q absent, want %q=%q", key, key, wantVal)
-		return
-	}
-	if got != wantVal {
-		t.Errorf("env %q = %q, want %q", key, got, wantVal)
-	}
-}
-
-// assertEnvAbsent fails if key is present in env.
-func assertEnvAbsent(t *testing.T, env []string, key string) {
-	t.Helper()
-	if _, ok := envLookup(env, key); ok {
-		t.Errorf("env %q is present, want absent", key)
-	}
-}
 
 // assertHasArgPair fails if flag and value do not appear as consecutive
 // elements in args.
 func assertHasArgPair(t *testing.T, args []string, flag, value string) {
 	t.Helper()
-	for i := 0; i < len(args)-1; i++ {
+	for i := range len(args) - 1 {
 		if args[i] == flag && args[i+1] == value {
 			return
 		}
@@ -72,7 +42,6 @@ func assertNoFlag(t *testing.T, args []string, flag string) {
 	t.Helper()
 	if slices.Contains(args, flag) {
 		t.Errorf("buildRunArgs() unexpected flag %q in [%s]", flag, strings.Join(args, " "))
-		return
 	}
 }
 
@@ -100,8 +69,9 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			config: map[string]any{},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				if pt.Model != "" || pt.AllowedTools != nil || pt.DeniedTools != nil {
-					t.Errorf("passthroughConfig = %+v, want zero value", pt)
+				want := passthroughConfig{ProjectTrust: trustIgnore}
+				if !reflect.DeepEqual(pt, want) {
+					t.Errorf("passthroughConfig = %+v, want %+v (an unattended turn defaults to --no-approve)", pt, want)
 				}
 			},
 		},
@@ -112,14 +82,8 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				if len(pt.AllowedTools) != 2 {
-					t.Fatalf("AllowedTools len = %d, want 2", len(pt.AllowedTools))
-				}
-				if pt.AllowedTools[0] != "read" {
-					t.Errorf("AllowedTools[0] = %q, want %q", pt.AllowedTools[0], "read")
-				}
-				if pt.AllowedTools[1] != "edit" {
-					t.Errorf("AllowedTools[1] = %q, want %q", pt.AllowedTools[1], "edit")
+				if !slices.Equal(pt.AllowedTools, []string{"read", "edit"}) {
+					t.Errorf("AllowedTools = %v, want [read edit]", pt.AllowedTools)
 				}
 			},
 		},
@@ -130,22 +94,19 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				if len(pt.DeniedTools) != 1 {
-					t.Fatalf("DeniedTools len = %d, want 1", len(pt.DeniedTools))
-				}
-				if pt.DeniedTools[0] != "bash" {
-					t.Errorf("DeniedTools[0] = %q, want %q", pt.DeniedTools[0], "bash")
+				if !slices.Equal(pt.DeniedTools, []string{"bash"}) {
+					t.Errorf("DeniedTools = %v, want [bash]", pt.DeniedTools)
 				}
 			},
 		},
 		{
-			name: "unknown_key_preserved",
+			name: "unknown_extension_tool_names_preserved",
 			config: map[string]any{
 				"allowed_tools": []any{"customtool"},
 			},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				if len(pt.AllowedTools) != 1 || pt.AllowedTools[0] != "customtool" {
+				if !slices.Equal(pt.AllowedTools, []string{"customtool"}) {
 					t.Errorf("AllowedTools = %v, want [customtool]", pt.AllowedTools)
 				}
 			},
@@ -161,12 +122,19 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 		{
 			name: "model_and_flags",
 			config: map[string]any{
-				"model": "anthropic/claude-3-5-sonnet",
+				"model":         "anthropic/claude-3-5-sonnet",
+				"thinking":      "xhigh",
+				"project_trust": "approve",
 			},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				if pt.Model != "anthropic/claude-3-5-sonnet" {
-					t.Errorf("Model = %q, want %q", pt.Model, "anthropic/claude-3-5-sonnet")
+				want := passthroughConfig{
+					Model:        "anthropic/claude-3-5-sonnet",
+					Thinking:     "xhigh",
+					ProjectTrust: trustApprove,
+				}
+				if !reflect.DeepEqual(pt, want) {
+					t.Errorf("passthroughConfig = %+v, want %+v", pt, want)
 				}
 			},
 		},
@@ -203,220 +171,107 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 	}
 }
 
-// TestParsePassthroughConfig_TypeFault covers the funnel's fault path for
-// a wrong-typed string field: it returns the zero passthroughConfig and a
-// fault whose rendering names the key and the type found. Every string
-// key the funnel reads gets its own case, so a key whose fault arm was
-// never wired shows up as a gap here rather than at runtime.
-func TestParsePassthroughConfig_TypeFault(t *testing.T) {
+// TestParsePassthroughConfig_Faults covers every refusal the funnel
+// makes, so a new key whose fault arm was never wired shows up here
+// rather than at runtime.
+func TestParsePassthroughConfig_Faults(t *testing.T) {
 	t.Parallel()
 
-	keys := []string{"model"}
+	tests := []struct {
+		name      string
+		config    map[string]any
+		wantCheck string
+		wantInMsg string
+	}{
+		{"model wrong type", map[string]any{"model": 123}, "pi.model.wrong_type", "model: expected string, got integer"},
+		{"thinking wrong type", map[string]any{"thinking": true}, "pi.thinking.wrong_type", "thinking: expected string, got boolean"},
+		{"trust wrong type", map[string]any{"project_trust": 7}, "pi.project_trust.wrong_type", "project_trust: expected string, got integer"},
+		{"thinking invalid value", map[string]any{"thinking": "turbo"}, "pi.thinking.invalid_value", `"turbo" is not a pi thinking level`},
+		{"trust invalid value", map[string]any{"project_trust": "maybe"}, "pi.project_trust.invalid_value", `"maybe" is not a pi trust setting`},
+		{"allowed_tools wrong type", map[string]any{"allowed_tools": "read"}, "pi.allowed_tools.wrong_type", "allowed_tools: expected list, got string"},
+		{"denied_tools wrong type", map[string]any{"denied_tools": 5}, "pi.denied_tools.wrong_type", "denied_tools: expected list, got integer"},
+		{"allowed_tools non-string element", map[string]any{"allowed_tools": []any{"read", 4}}, "pi.allowed_tools.malformed_list", "allowed_tools[1]: expected a tool name, got integer"},
+		{"denied_tools empty name", map[string]any{"denied_tools": []any{" "}}, "pi.denied_tools.malformed_list", "denied_tools[0]: tool name is empty"},
+		{"unknown key", map[string]any{"auto_compact": false}, "pi.auto_compact.unknown_key", `unknown pi config key "auto_compact"`},
+		{"overlap", map[string]any{"allowed_tools": []any{"read", "bash"}, "denied_tools": []any{"bash"}}, "pi.allowed_tools.overlap", "overlap: bash"},
+	}
 
-	for _, key := range keys {
-		t.Run(key, func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			pt, fault := parsePassthroughConfig(map[string]any{key: 123})
+			_, err := NewPiAdapter(tt.config)
+			if err == nil {
+				t.Fatal("NewPiAdapter() error = nil, want a refusal")
+			}
+			if !strings.Contains(err.Error(), tt.wantInMsg) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.wantInMsg)
+			}
 
-			if fault == nil {
-				t.Fatalf("parsePassthroughConfig(%s=123) fault = nil, want non-nil", key)
+			diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: tt.config})
+			var found *registry.ValidationDiag
+			for i := range diags {
+				if diags[i].Check == tt.wantCheck {
+					found = &diags[i]
+					break
+				}
 			}
-			if fault.Key != key {
-				t.Errorf("parsePassthroughConfig(%s=123) fault.Key = %q, want %q", key, fault.Key, key)
+			if found == nil {
+				t.Fatalf("validateConfig() diags = %+v, want one with check %q", diags, tt.wantCheck)
 			}
-			wantErr := key + ": expected string, got integer"
-			if fault.Error() != wantErr {
-				t.Errorf("parsePassthroughConfig(%s=123) fault.Error() = %q, want %q", key, fault.Error(), wantErr)
-			}
-			if pt.Model != "" || pt.AllowedTools != nil || pt.DeniedTools != nil {
-				t.Errorf("parsePassthroughConfig(%s=123) passthroughConfig = %+v, want zero value", key, pt)
+			if found.Message != err.Error() {
+				t.Errorf("validateConfig() message = %q, want it byte-identical to the constructor's %q", found.Message, err.Error())
 			}
 		})
 	}
 }
 
-// TestMCPInjectionConformance proves pi's real launch surface
-// matches its declared disposition, on both a local and a remote
-// launch. Both channels the adapter builds are captured, not the
-// argument slice alone: pi is the adapter that carries most of
-// its configuration through the environment, so an environment-only
-// leak would otherwise go unseen.
-func TestMCPInjectionConformance(t *testing.T) {
+// TestParsePassthroughConfig_GenericAgentKeysAreNotPiKeys pins the
+// boundary between the two sources of the config map. The agent block
+// contributes kind, command, and the four timeout keys to every
+// adapter's map, so a pi validator that read them as pi block keys
+// would refuse every valid workflow rather than a misspelled option.
+func TestParsePassthroughConfig_GenericAgentKeysAreNotPiKeys(t *testing.T) {
 	t.Parallel()
 
-	declared, ok := registry.Agents.Meta("pi")
-	if !ok {
-		t.Fatal(`registry.Agents.Meta("pi") reported not registered`)
+	config := map[string]any{
+		"kind":             "pi",
+		"command":          "pi",
+		"turn_timeout_ms":  3_600_000,
+		"read_timeout_ms":  5_000,
+		"stall_timeout_ms": 300_000,
+		"stop_grace_ms":    5_000,
+		"project_trust":    "ignore",
 	}
 
-	dir := t.TempDir()
-	mcpConfigPath := filepath.Join(dir, ".sortie", "mcp.json")
-	if err := os.MkdirAll(filepath.Dir(mcpConfigPath), 0o750); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
+	if _, err := NewPiAdapter(config); err != nil {
+		t.Errorf("NewPiAdapter() error = %v, want nil: the agent block's own keys are not pi block keys", err)
 	}
-	const generatedConfig = `{"mcpServers":{"sortie-tools":{"type":"stdio","command":"/usr/local/bin/sortie","args":["mcp-server","--workflow","/repo/WORKFLOW.md"],"env":{"SORTIE_ISSUE_ID":"abc-123"}}}}`
-	if err := os.WriteFile(mcpConfigPath, []byte(generatedConfig), 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	t.Run("local launch delivers the translated document", func(t *testing.T) {
-		t.Parallel()
-
-		document, err := buildMCPConfigContent(mcpConfigPath, false)
-		if err != nil {
-			t.Fatalf("buildMCPConfigContent() error = %v", err)
-		}
-
-		state := newTestSessionState("/workspace", "")
-		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{})
-		if err != nil {
-			t.Fatalf("buildRunEnv() error = %v", err)
-		}
-		env = appendMCPConfigEnv(env, document)
-
-		agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
-	})
-
-	t.Run("remote launch delivers nothing", func(t *testing.T) {
-		t.Parallel()
-
-		state := newTestSessionState("/workspace", "")
-		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{})
-		if err != nil {
-			t.Fatalf("buildRunEnv() error = %v", err)
-		}
-
-		// StartSession's remote guard skips rendering entirely, so a
-		// remote session's turn environment carries nothing to append
-		// here.
-		agenttest.AssertMCPInjection(t, registry.MCPInjectionUnsupported, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
-	})
-}
-
-// TestRenderMCPConfigDocument_DeclaresEveryServer asserts that the
-// translated document declares every server from the generated file,
-// in the runtime's own "local"/"remote" entry shapes.
-func TestRenderMCPConfigDocument_DeclaresEveryServer(t *testing.T) {
-	t.Parallel()
-
-	servers := []mcpconfig.Server{
-		{
-			Name:      "sortie-tools",
-			Transport: mcpconfig.TransportStdio,
-			Command:   "/usr/local/bin/sortie",
-			Args:      []string{"mcp-server"},
-			Env:       map[string]string{"SORTIE_ISSUE_ID": "abc-123"},
-		},
-		{
-			Name:      "remote-tools",
-			Transport: mcpconfig.TransportHTTP,
-			URL:       "https://example.invalid/mcp",
-			Headers:   map[string]string{"Authorization": "Bearer token"},
-		},
-	}
-
-	document, err := renderMCPConfigDocument(servers)
-	if err != nil {
-		t.Fatalf("renderMCPConfigDocument() error = %v", err)
-	}
-
-	var doc mcpConfigDocument
-	if err := json.Unmarshal([]byte(document), &doc); err != nil {
-		t.Fatalf("renderMCPConfigDocument() produced invalid JSON: %v; document = %q", err, document)
-	}
-
-	local, ok := doc.MCP["sortie-tools"]
-	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"sortie-tools\" entry")
-	}
-	if local.Type != "local" {
-		t.Errorf("sortie-tools entry Type = %q, want %q", local.Type, "local")
-	}
-	wantCommand := []string{"/usr/local/bin/sortie", "mcp-server"}
-	if !slices.Equal(local.Command, wantCommand) {
-		t.Errorf("sortie-tools entry Command = %v, want %v", local.Command, wantCommand)
-	}
-	if local.Environment["SORTIE_ISSUE_ID"] != "abc-123" {
-		t.Errorf("sortie-tools entry Environment[%q] = %q, want %q", "SORTIE_ISSUE_ID", local.Environment["SORTIE_ISSUE_ID"], "abc-123")
-	}
-	if !local.Enabled {
-		t.Error("sortie-tools entry Enabled = false, want true (nil Server.Enabled defaults true)")
-	}
-
-	remote, ok := doc.MCP["remote-tools"]
-	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"remote-tools\" entry")
-	}
-	if remote.Type != "remote" {
-		t.Errorf("remote-tools entry Type = %q, want %q", remote.Type, "remote")
-	}
-	if remote.URL != "https://example.invalid/mcp" {
-		t.Errorf("remote-tools entry URL = %q, want %q", remote.URL, "https://example.invalid/mcp")
-	}
-	if remote.Headers["Authorization"] != "Bearer token" {
-		t.Errorf("remote-tools entry Headers[%q] = %q, want %q", "Authorization", remote.Headers["Authorization"], "Bearer token")
+	if diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config}); len(diags) != 0 {
+		t.Errorf("validateConfig() diags = %+v, want none", diags)
 	}
 }
 
-// TestRenderMCPConfigDocument_EnabledFalseRoundTrips asserts that an
-// entry carrying enabled: false round-trips into the rendered document
-// as a disabled server.
-func TestRenderMCPConfigDocument_EnabledFalseRoundTrips(t *testing.T) {
+func TestParsePassthroughConfig_ReportsEveryFault(t *testing.T) {
 	t.Parallel()
 
-	disabled := false
-	servers := []mcpconfig.Server{
-		{
-			Name:      "sortie-tools",
-			Transport: mcpconfig.TransportStdio,
-			Command:   "/usr/local/bin/sortie",
-			Enabled:   &disabled,
-		},
+	config := map[string]any{
+		"model":         123,
+		"thinking":      "turbo",
+		"project_trust": "maybe",
+		"denied_tools":  "bash",
+		"auto_compact":  false,
 	}
 
-	document, err := renderMCPConfigDocument(servers)
-	if err != nil {
-		t.Fatalf("renderMCPConfigDocument() error = %v", err)
+	diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config})
+	if len(diags) != 5 {
+		t.Fatalf("validateConfig() reported %d diagnostics, want 5: %+v", len(diags), diags)
 	}
-
-	var doc mcpConfigDocument
-	if err := json.Unmarshal([]byte(document), &doc); err != nil {
-		t.Fatalf("renderMCPConfigDocument() produced invalid JSON: %v", err)
+	for _, d := range diags {
+		if d.Severity != "error" {
+			t.Errorf("severity = %q, want %q", d.Severity, "error")
+		}
 	}
-
-	entry, ok := doc.MCP["sortie-tools"]
-	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"sortie-tools\" entry")
-	}
-	if entry.Enabled {
-		t.Error("sortie-tools entry Enabled = true, want false (Server.Enabled = false must round-trip)")
-	}
-}
-
-// TestRunTurn_InheritedOpencodeConfigContentScrubbed asserts that an
-// inherited OPENCODE_CONFIG_CONTENT value from the parent process is
-// scrubbed from the turn environment, so only the adapter's own
-// rendered document, appended after buildRunEnv, can ever set it.
-func TestRunTurn_InheritedOpencodeConfigContentScrubbed(t *testing.T) {
-	t.Parallel()
-
-	base := []string{"OPENCODE_CONFIG_CONTENT=inherited-from-parent-process", "PATH=/usr/bin"}
-
-	env, err := buildRunEnv(base, passthroughConfig{})
-	if err != nil {
-		t.Fatalf("buildRunEnv() error = %v", err)
-	}
-
-	assertEnvAbsent(t, env, "OPENCODE_CONFIG_CONTENT")
-
-	// The adapter's own document is appended only after buildRunEnv
-	// returns, so the final turn environment carries exactly the
-	// adapter's own value, never the inherited one.
-	env = append(env, "OPENCODE_CONFIG_CONTENT=own-document")
-	assertEnvPresent(t, env, "OPENCODE_CONFIG_CONTENT", "own-document")
 }
 
 func TestBuildRunArgs(t *testing.T) {
@@ -461,6 +316,27 @@ func TestBuildRunArgs(t *testing.T) {
 			wantPairs: [][2]string{{"--model", "anthropic/claude-3-5-sonnet"}},
 		},
 		{
+			name:      "thinking_flag",
+			sessionID: "",
+			pt:        passthroughConfig{Thinking: "medium"},
+			prompt:    "work",
+			wantPairs: [][2]string{{"--thinking", "medium"}},
+		},
+		{
+			name:      "tool_lists_join_with_commas",
+			sessionID: "",
+			pt:        passthroughConfig{AllowedTools: []string{"read", "grep"}, DeniedTools: []string{"bash", "write"}},
+			prompt:    "work",
+			wantPairs: [][2]string{{"--tools", "read,grep"}, {"--exclude-tools", "bash,write"}},
+		},
+		{
+			name:      "trust_approve",
+			sessionID: "",
+			pt:        passthroughConfig{ProjectTrust: trustApprove},
+			prompt:    "work",
+			wantPairs: [][2]string{{"--approve", ""}},
+		},
+		{
 			name:      "prompt_after_dashdash",
 			sessionID: "",
 			pt:        passthroughConfig{},
@@ -479,10 +355,25 @@ func TestBuildRunArgs(t *testing.T) {
 				assertHasFlag(t, args, flag)
 			}
 			for _, pair := range tt.wantPairs {
+				if pair[1] == "" {
+					assertHasFlag(t, args, pair[0])
+					continue
+				}
 				assertHasArgPair(t, args, pair[0], pair[1])
 			}
 			for _, flag := range tt.wantAbsent {
 				assertNoFlag(t, args, flag)
+			}
+
+			// An unattended turn is launched with the trust decision
+			// stated explicitly, never left to a prompt no one answers.
+			if tt.pt.ProjectTrust != trustApprove {
+				if !slices.Contains(args, "--no-approve") {
+					t.Errorf("args = %v, want --no-approve unless project_trust is approve", args)
+				}
+				assertNoFlag(t, args, "--approve")
+			} else {
+				assertNoFlag(t, args, "--no-approve")
 			}
 
 			// Prompt must be the last argument, after "--".
@@ -500,194 +391,155 @@ func TestBuildRunArgs(t *testing.T) {
 	}
 }
 
-// TestBuildRunArgs_NonInteractivePosture asserts that the full
-// configuration path, from an empty WORKFLOW.md pi sub-object through
-// buildRunArgs, launches non-interactive JSON mode.
-func TestBuildRunArgs_NonInteractivePosture(t *testing.T) {
+// TestBuildRunArgs_NoOpencodeFlagsRemains asserts that no environment
+// key from a different CLI is still being delivered: pi takes every
+// restriction it honors as a flag, so an OPENCODE_* variable would be
+// an operator-visible setting that does nothing.
+func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 	t.Parallel()
-
-	pt, err := parsePassthroughConfig(map[string]any{})
-	if err != nil {
-		t.Fatalf("parsePassthroughConfig(map[string]any{}) error = %v", err)
-	}
 
 	state := newTestSessionState("/tmp/workspace", "")
-	args := buildRunArgs(state, "work", pt)
+	args := buildRunArgs(state, "work", passthroughConfig{
+		AllowedTools: []string{"read"},
+		DeniedTools:  []string{"bash"},
+		Thinking:     "high",
+		ProjectTrust: trustApprove,
+	})
 
-	assertHasFlag(t, args, "-p")
-	assertHasArgPair(t, args, "--mode", "json")
-}
-
-func TestBuildRunEnv(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		base      []string
-		pt        passthroughConfig
-		checkFunc func(t *testing.T, env []string)
-	}{
-		{
-			name: "baseline_always_set",
-			base: []string{},
-			pt:   passthroughConfig{},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvPresent(t, env, "OPENCODE_AUTO_SHARE", "false")
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOUPDATE", "true")
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
-			},
-		},
-		{
-			name: "autocompact_always_off",
-			base: []string{},
-			pt:   passthroughConfig{},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOCOMPACT", "true")
-			},
-		},
-		{
-			name: "inherited_permission_removed",
-			base: []string{"OPENCODE_PERMISSION=old_value", "OTHER_VAR=keep"},
-			pt:   passthroughConfig{},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvAbsent(t, env, "OPENCODE_PERMISSION")
-				assertEnvPresent(t, env, "OTHER_VAR", "keep")
-			},
-		},
-		{
-			name: "allowed_tools_policy",
-			base: []string{},
-			pt:   passthroughConfig{AllowedTools: []string{"read"}},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				raw, ok := envLookup(env, "OPENCODE_PERMISSION")
-				if !ok {
-					t.Fatal("OPENCODE_PERMISSION absent")
-				}
-				var policy map[string]string
-				if err := json.Unmarshal([]byte(raw), &policy); err != nil {
-					t.Fatalf("OPENCODE_PERMISSION unmarshal: %v", err)
-				}
-				if policy["read"] != "allow" {
-					t.Errorf("OPENCODE_PERMISSION[read] = %q, want %q", policy["read"], "allow")
-				}
-				if policy["bash"] != "deny" {
-					t.Errorf("OPENCODE_PERMISSION[bash] = %q, want %q", policy["bash"], "deny")
-				}
-			},
-		},
-		{
-			name: "denied_tools_policy",
-			base: []string{},
-			pt:   passthroughConfig{DeniedTools: []string{"bash"}},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				raw, ok := envLookup(env, "OPENCODE_PERMISSION")
-				if !ok {
-					t.Fatal("OPENCODE_PERMISSION absent")
-				}
-				var policy map[string]string
-				if err := json.Unmarshal([]byte(raw), &policy); err != nil {
-					t.Fatalf("OPENCODE_PERMISSION unmarshal: %v", err)
-				}
-				if policy["bash"] != "deny" {
-					t.Errorf("OPENCODE_PERMISSION[bash] = %q, want %q", policy["bash"], "deny")
-				}
-			},
-		},
-		{
-			name: "no_policy_no_permission_key",
-			base: []string{},
-			pt:   passthroughConfig{},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvAbsent(t, env, "OPENCODE_PERMISSION")
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			env, err := buildRunEnv(tt.base, tt.pt)
-			if err != nil {
-				t.Fatalf("buildRunEnv() error = %v", err)
-			}
-			if tt.checkFunc != nil {
-				tt.checkFunc(t, env)
-			}
-		})
+	want := []string{"-p", "--mode", "json", "--thinking", "high", "--tools", "read", "--exclude-tools", "bash", "--approve", "--", "work"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Errorf("args = %v, want %v", args, want)
 	}
 }
 
-func TestSSHRemoteCommand(t *testing.T) {
+// TestMCPInjectionConformance drives a real turn for a session that
+// carries the worker-generated MCP config path, captures the argv and
+// environment the pi process actually received, and asserts neither the
+// path nor the Sortie server command reaches it. Capturing the launch
+// rather than composing one is what makes this negative assertion able
+// to fail: an adapter that delivered the document through any channel
+// would have it in one of these two files.
+func TestMCPInjectionConformance(t *testing.T) {
 	t.Parallel()
 
-	t.Run("env_prefixed", func(t *testing.T) {
-		t.Parallel()
+	declared, ok := registry.Agents.Meta("pi")
+	if !ok {
+		t.Fatal(`registry.Agents.Meta("pi") reported not registered`)
+	}
+	if declared.MCPInjection != registry.MCPInjectionUnsupported {
+		t.Fatalf("registered MCPInjection = %q, want %q", declared.MCPInjection, registry.MCPInjectionUnsupported)
+	}
+	// The same disposition is what the generic preflight reads to warn
+	// that a pi session can reach no tool at all. A local and a remote
+	// launch must both deliver none, or that warning is a false alarm
+	// in one of the two modes.
+	for _, remote := range []bool{false, true} {
+		if declared.MCPInjection.DeliversTools(remote) {
+			t.Errorf("MCPInjection.DeliversTools(remote=%t) = true, want false: a pi session can reach no Sortie tool in either launch mode", remote)
+		}
+	}
 
-		extra := map[string]string{
-			"KEY_A": "value_a",
-			"KEY_B": "value_b",
-		}
-		got := buildSSHRemoteCommand("pi", extra)
+	dir := t.TempDir()
+	mcpConfigPath := filepath.Join(dir, ".sortie", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(mcpConfigPath), 0o750); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	const generatedConfig = `{"mcpServers":{"sortie-tools":{"type":"stdio","command":"/usr/local/bin/sortie","args":["mcp-server","--workflow","/repo/WORKFLOW.md"],"env":{"SORTIE_ISSUE_ID":"abc-123"}}}}`
+	if err := os.WriteFile(mcpConfigPath, []byte(generatedConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
 
-		if !strings.Contains(got, "KEY_A=") {
-			t.Errorf("result %q missing KEY_A", got)
-		}
-		if !strings.Contains(got, "KEY_B=") {
-			t.Errorf("result %q missing KEY_B", got)
-		}
-		if !strings.HasSuffix(got, " pi") {
-			t.Errorf("result %q does not end with remote command", got)
-		}
+	argvFile := filepath.Join(dir, "argv.txt")
+	envFile := filepath.Join(dir, "env.txt")
+	script := writePiScript(t, dir, `printf '%s\n' "$*" > `+argvFile+`
+env > `+envFile+`
+exit 0`)
+
+	a, err := NewPiAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath:   dir,
+		AgentConfig:     domain.AgentConfig{Command: script},
+		MCPConfigPath:   mcpConfigPath,
+		ResumeSessionID: "",
 	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	// The fake process writes its launch surface and then exits without a
+	// JSON response, so the shared no-work rule returns an error here. The
+	// launch capture is still the subject of this test.
+	_, _, _ = collectEvents(t, a, session, "work")
 
-	t.Run("values_shell_quoted", func(t *testing.T) {
-		t.Parallel()
+	argv, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("ReadFile(argv) error = %v", err)
+	}
+	env, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("ReadFile(env) error = %v", err)
+	}
 
-		extra := map[string]string{
-			"KEY": "value with spaces",
+	surface := agenttest.MCPLaunchSurface{
+		Args: strings.Split(strings.TrimRight(string(argv), "\n"), "\n"),
+		Env:  strings.Split(strings.TrimRight(string(env), "\n"), "\n"),
+	}
+	agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, surface)
+	// The generated document names the server and its command, so their
+	// absence is a second, independent reading of the same capture.
+	for _, forbidden := range []string{"sortie-tools", "/usr/local/bin/sortie", "mcp-server"} {
+		if strings.Contains(string(argv)+string(env), forbidden) {
+			t.Errorf("launch surface carries %q, want the pi process to receive no Sortie MCP detail", forbidden)
 		}
-		got := buildSSHRemoteCommand("pi", extra)
+	}
+}
 
-		// ShellQuote wraps in single quotes.
-		if !strings.Contains(got, "'value with spaces'") {
-			t.Errorf("result %q: value with spaces not single-quoted", got)
+// TestRemoteLaunch_ForwardsSessionAndWorkspace asserts the SSH launch
+// keeps --session on the remote command line and runs the turn in the
+// workspace.
+func TestRemoteLaunch_ForwardsSessionAndWorkspace(t *testing.T) {
+	t.Parallel()
+
+	state := newTestSessionState("/remote/ws", "ses_remote")
+	args := buildRunArgs(state, "work", passthroughConfig{ProjectTrust: trustApprove})
+
+	sshArgs := buildSSHArgsForTest(state, args)
+	joined := strings.Join(sshArgs, " ")
+
+	for _, want := range []string{"/remote/ws", "--session", "ses_remote", "--approve", "--", "work"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ssh args = %q, want them to carry %q", joined, want)
 		}
+	}
+}
+
+// buildSSHArgsForTest builds the ssh argv the adapter builds for a
+// remote launch of the given run arguments.
+func buildSSHArgsForTest(state *sessionState, cmdArgs []string) []string {
+	target := state.target
+	target.RemoteCommand = "pi"
+	target.SSHHost = "host"
+	return sshutil.BuildSSHArgs(target.SSHHost, target.WorkspacePath, target.RemoteCommand, cmdArgs, sshutil.SSHOptions{})
+}
+
+// TestValidateConfig_NoFaultsForSupportedConfiguration asserts a pi
+// block written with every accepted key passes the offline validator.
+func TestValidateConfig_NoFaultsForSupportedConfiguration(t *testing.T) {
+	t.Parallel()
+
+	diags := validateConfig(registry.AgentConfigFields{
+		Kind: "pi",
+		Passthrough: map[string]any{
+			"model":         "anthropic/claude-3-5-sonnet",
+			"thinking":      "off",
+			"project_trust": "ignore",
+			"allowed_tools": []any{"read", "grep"},
+			"denied_tools":  []any{"bash"},
+		},
 	})
-
-	t.Run("no_extra_env_returns_command", func(t *testing.T) {
-		t.Parallel()
-
-		got := buildSSHRemoteCommand("pi run --format json", nil)
-		if got != "pi run --format json" {
-			t.Errorf("result = %q, want %q", got, "pi run --format json")
-		}
-	})
-
-	t.Run("no_arbitrary_env", func(t *testing.T) {
-		t.Parallel()
-
-		extra := map[string]string{
-			"MY_KEY": "my_val",
-		}
-		got := buildSSHRemoteCommand("pi", extra)
-
-		// Only MY_KEY should appear as an env prefix; no other KEY= patterns.
-		parts := strings.Fields(got)
-		envCount := 0
-		for _, p := range parts {
-			if strings.Contains(p, "=") && p != "pi" {
-				envCount++
-			}
-		}
-		if envCount != 1 {
-			t.Errorf("env prefix count = %d, want 1; result = %q", envCount, got)
-		}
-	})
+	if len(diags) != 0 {
+		t.Errorf("validateConfig() = %+v, want no diagnostics", diags)
+	}
 }

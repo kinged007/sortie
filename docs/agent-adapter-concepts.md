@@ -2,7 +2,7 @@
 
 This document explains the mental model behind Sortie's agent adapters: how a coding-agent runtime becomes a `kind` string the orchestrator can dispatch to, the boundaries an adapter package must respect, the test gate that keeps a runtime's integration suite honest, what the per-adapter notes file is for, and how a runtime's support for the Agent Client Protocol is qualified rather than assumed. Read [Add or refresh an agent adapter](agent-adapter-howto.md) for the ordered procedure that applies these ideas.
 
-Seven packages under `internal/agent` implement `domain.AgentAdapter` today: `claude`, `clientprotocol`, `codex`, `copilot`, `kiro`, `mock`, and `opencode`, registering the kinds `claude-code`, `agent-client-protocol`, `codex`, `copilot-cli`, `kiro`, `mock`, and `opencode` respectively. That count comes from the `var _ domain.AgentAdapter = (*X)(nil)` compile-time assertion each package carries; grep for it rather than trusting a number written down elsewhere, including this sentence once another adapter lands.
+Eight packages under `internal/agent` implement `domain.AgentAdapter` today: `claude`, `clientprotocol`, `codex`, `copilot`, `kiro`, `mock`, `opencode`, and `pi`, registering the kinds `claude-code`, `agent-client-protocol`, `codex`, `copilot-cli`, `kiro`, `mock`, `opencode`, and `pi` respectively. That count comes from the `var _ domain.AgentAdapter = (*X)(nil)` compile-time assertion each package carries; grep for it rather than trusting a number written down elsewhere, including this sentence once another adapter lands.
 
 ## The kind registry and the composition root
 
@@ -36,6 +36,8 @@ An adapter package owns exactly one kind's protocol translation and nothing else
 ## Declaring an adapter's properties to the orchestrator
 
 Beyond the constructor, `registry.AgentMeta` lets an adapter declare properties the preflight pipeline and dispatch path need without inspecting the adapter itself: `RequiresCommand` (whether `agent.command` must be non-empty), `ValidateAgentConfig` (an adapter-specific config validator returning `[]registry.ValidationDiag`), `MCPInjection` (what the adapter does with the worker-generated MCP configuration path: `Supported`, `Translated`, or `Unsupported`), `SessionResumeBlockedBy` (a pure function reporting which of the adapter's own config keys, under a given passthrough map, would prevent session resume across separate process launches), and `UsageArrival` / `UsageAttribution` / `UsageSessionRules` (when a `token_usage` event becomes available, what it attributes to, and the per-session rule set that narrows the pair when a passthrough setting or the launch mode changes what the runtime reports). A kind registered with the bare `Register` call carries the zero value of `AgentMeta`, which is read as "no special requirements" rather than an error.
+
+The declared `MCPInjection` is the adapter's own statement about the tool channel, and a runtime with none says so rather than staying silent. `pi` is the built-in example: it has no MCP transport, declares `Unsupported`, and therefore never reads the generated configuration, so Sortie's tools are neither advertised to nor callable by one of its sessions. An operator sees that at preflight time as the `agent.kind.no_tool_channel` warning, which names the kind rather than leaving the absence to be discovered when a tool call fails.
 
 ## The per-adapter integration-test gate
 

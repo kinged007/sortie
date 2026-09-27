@@ -456,7 +456,6 @@ Five prompt-template variables are always empty for this tracker, so a template 
 
 **`github-pr` is a tracker only.** The `github` kind additionally registers a CI provider and a source-control provider, which is what supplies the self-review SCM tools, the merge-conflict and review-reaction handling, and CI status checks. A workflow on `github-pr` gets none of those, because the adapter registers no such provider. An operator who wants both pull-request dispatch and the GitHub source-control tools configures the two kinds side by side; the credentials do not carry across, so the `github:` block needs its own `api_key`. See the architecture contract for the full list of differences from the GitHub adapter.
 
-
 ---
 
 ### 2.3 `polling` — Poll Loop Timing
@@ -575,12 +574,12 @@ agent:
 
 | Field                            | Type                              | Required                            | Default         | Dynamic Reload                             | Description                                                                                                                                                                      |
 | -------------------------------- | --------------------------------- | ----------------------------------- | --------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`                           | string                            | No                                  | `claude-code`   | Future dispatches                          | Agent adapter identifier. This is the default kind used when no `dispatch.rules` entry (and no `dispatch.default.agent`) overrides it. Built-in adapters: `claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `mock`, and `agent-client-protocol`. Other kinds (for example, HTTP-based adapters) are available only if you register them separately. |
-| `command`                        | string (argument vector)          | When adapter requires local process | Adapter-defined | Future dispatches                          | Command to launch the agent for adapters that run as a local subprocess (`claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, and `agent-client-protocol`). When the agent runs locally, the value is split on whitespace into an argument vector and run without a shell, so shell syntax is not interpreted and `~` and `$VAR` are not expanded; when `worker.ssh_hosts` sends the agent to a remote host, the value is passed to the remote shell unsplit. Adapters that do not start a local process ignore this field. |
+| `kind`                           | string                            | No                                  | `claude-code`   | Future dispatches                          | Agent adapter identifier. This is the default kind used when no `dispatch.rules` entry (and no `dispatch.default.agent`) overrides it. Built-in adapters: `claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, `mock`, and `agent-client-protocol`. Other kinds (for example, HTTP-based adapters) are available only if you register them separately. |
+| `command`                        | string (argument vector)          | When adapter requires local process | Adapter-defined | Future dispatches                          | Command to launch the agent for adapters that run as a local subprocess (`claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, and `agent-client-protocol`). When the agent runs locally, the value is split on whitespace into an argument vector and run without a shell, so shell syntax is not interpreted and `~` and `$VAR` are not expanded; when `worker.ssh_hosts` sends the agent to a remote host, the value is passed to the remote shell unsplit. Adapters that do not start a local process ignore this field. |
 | `turn_timeout_ms`                | integer                           | No                                  | `3600000` (1h)  | Future worker attempts                     | Wall-clock bound on a single agent turn, enforced by the orchestrator. Must be positive.                                                                                         |
 | `read_timeout_ms`                | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | Request/response timeout during startup and synchronous operations.                                                                                                              |
 | `stall_timeout_ms`               | integer                           | No                                  | `300000` (5m)   | Future worker attempts                     | Inactivity timeout based on event stream gaps. Set to `0` or negative to **disable** stall detection.                                                                            |
-| `stop_grace_ms`                  | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | The period an adapter waits, after sending a catchable termination signal, for the agent to exit on its own before it force-terminates the process group. Must be positive; overridable through `SORTIE_AGENT_STOP_GRACE_MS`. In `claude-code`, `copilot-cli`, `kiro`, and `opencode`, the same value also bounds a cancelled turn's escalation to a force kill; `mock` launches no process, so it has no such period. The per-session stop deadline derives from this field alone, no longer from `agent.read_timeout_ms`, which shortens that deadline for a deployment that had set `read_timeout_ms` above `20000`. Raising this field also lengthens graceful shutdown by the same amount: a session still stopping when Sortie is asked to shut down is waited for rather than abandoned, and at the default the worker drain alone is 50s. A second Ctrl-C during shutdown ends every remaining shutdown wait at once, so a raised grace never strands the operator without an escape. |
+| `stop_grace_ms`                  | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | The period an adapter waits, after sending a catchable termination signal, for the agent to exit on its own before it force-terminates the process group. Must be positive; overridable through `SORTIE_AGENT_STOP_GRACE_MS`. In `claude-code`, `copilot-cli`, `kiro`, `opencode`, and `pi`, the same value also bounds a cancelled turn's escalation to a force kill; `mock` launches no process, so it has no such period. The per-session stop deadline derives from this field alone, no longer from `agent.read_timeout_ms`, which shortens that deadline for a deployment that had set `read_timeout_ms` above `20000`. Raising this field also lengthens graceful shutdown by the same amount: a session still stopping when Sortie is asked to shut down is waited for rather than abandoned, and at the default the worker drain alone is 50s. A second Ctrl-C during shutdown ends every remaining shutdown wait at once, so a raised grace never strands the operator without an escape. |
 | `max_concurrent_agents`          | integer or string integer         | No                                  | `10`            | **Yes** — affects subsequent dispatch      | Global concurrency limit across all issues.                                                                                                                                      |
 | `max_turns`                      | integer                           | No                                  | `20`            | Future dispatches                          | Maximum coding-agent turns per worker session. The worker re-checks tracker state after each turn and starts another turn if the issue is still active, up to this limit.        |
 | `max_retry_backoff_ms`           | integer or string integer         | No                                  | `300000` (5m)   | **Yes** — affects future retry scheduling  | Maximum delay cap for exponential backoff on retries.                                                                                                                            |
@@ -1911,7 +1910,7 @@ token_rates:
     cache_read_per_mtok: 0.25
 ```
 
-When `token_rates` is configured, the dashboard displays estimated USD cost for currently running sessions, and the `sortie stats` subcommand prices the runs it aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`, `"copilot-cli"`, `"codex"`, `"opencode"`). All rates are in USD per 1 million tokens.
+When `token_rates` is configured, the dashboard displays estimated USD cost for currently running sessions, and the `sortie stats` subcommand prices the runs it aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`, `"copilot-cli"`, `"codex"`, `"opencode"`, `"pi"`). All rates are in USD per 1 million tokens.
 
 When `token_rates` is absent or empty, the dashboard shows raw token counts without cost estimates and `sortie stats` reports no cost figures.
 
@@ -2142,6 +2141,40 @@ The `kiro` block is forwarded to the Kiro adapter, which runs `kiro-cli chat --n
 
 **MCP:** Under `KIRO_API_KEY` authentication the backend `GetProfile` gate disables MCP. A workspace `mcp.json` is not loaded and `--require-mcp-startup` is unreachable, so MCP-dependent workflows cannot run on the API-key path.
 
+**Pi adapter:**
+
+```yaml
+pi:
+  model: claude-sonnet-4-6
+  thinking: high
+  project_trust: ignore
+  allowed_tools:
+    - read
+    - glob
+    - grep
+    - edit
+    - bash
+  denied_tools:
+    - web_search
+```
+
+The `pi` block is forwarded to the Pi adapter, which runs `pi -p --mode json -- <prompt>` once per turn, with the issue workspace as the process working directory, and adds `--session <session_id>` on every turn once a session ID is known. The block accepts exactly the five keys in the table below: a key outside that set is refused rather than ignored, because pi has no passthrough channel, so an unrecognized key would otherwise look configured while doing nothing. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `pi.<key>.wrong_type`. Every fault the constructor refuses is also reported offline under the `pi.` check namespace, because both read the same configuration parser.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pi.model` | string | _(absent)_ | Forwarded to `--model`. The accepted identifiers depend on the installed CLI and the account's provider configuration. |
+| `pi.thinking` | string | _(absent)_ | Forwarded to `--thinking`. Values: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Any other value fails construction and is reported offline under `pi.thinking.invalid_value`. |
+| `pi.project_trust` | string | `ignore` | Decides between `--no-approve` and `--approve`, which control whether pi loads the workspace's own project-local files and packages. `ignore` sends `--no-approve`; `approve` sends `--approve`. The default is the restrictive one because an unattended turn has no operator to answer a trust prompt and must not silently adopt whatever the workspace declares. |
+| `pi.allowed_tools` | list of strings | _(absent)_ | Forwarded to `--tools` as a comma-joined list, narrowing the tools the agent may use. Must be a list of non-empty names; anything else is a type fault. |
+| `pi.denied_tools` | list of strings | _(absent)_ | Forwarded to `--exclude-tools` as a comma-joined list. Same list rules as `pi.allowed_tools`. |
+
+**Validation rules:**
+
+- `pi.allowed_tools` and `pi.denied_tools` MUST NOT name the same tool. An overlap fails construction and is reported offline under `pi.allowed_tools.overlap`.
+- A tool list is a list of non-empty tool names. An entry that is not a string, and an entry that is empty or whitespace only, fail construction and are reported offline under `pi.<list_key>.malformed_list`.
+
+**MCP:** pi has no MCP transport, so this block accepts no `mcp_config` key and the generated `.sortie/mcp.json` is never delivered to the agent. Sortie's tools are neither advertised to a pi session nor callable by it, on a local launch and over SSH alike; the tools the agent works with are the ones pi itself provides, narrowed by `pi.allowed_tools` and `pi.denied_tools`. A workflow that depends on Sortie's own tools cannot run on this kind.
+
 **Agent Client Protocol adapter:**
 
 ```yaml
@@ -2168,12 +2201,13 @@ Which adapters hand that generated file's servers to the agent process differs b
 | `codex` | Yes, local launch only | the generated servers are re-expressed as configuration overrides on the app-server command line, which the runtime parses into its own configuration |
 | `opencode` | Yes, local launch only | the generated servers are re-expressed as the runtime's own configuration document, delivered through an inline configuration environment variable |
 | `kiro` | No | the backend profile gate disables MCP under API-key authentication |
+| `pi` | No | pi has no MCP transport, so the generated servers are never delivered and Sortie's tools are neither advertised nor callable |
 | `mock` | No | the adapter launches no process |
 | `agent-client-protocol` | Yes, local launch only | the generated servers are re-expressed inside the session-creation request |
 
 An SSH session on `codex` or `opencode` receives neither form of delivery: both translating kinds carry the generated servers only on a local launch.
 
-Setting `mcp_config` in a block belonging to `kiro` or `mock` therefore has no effect on the agent. `sortie validate` reports that combination as a warning naming the kind, under the check `agent.mcp_config`. A separate warning, `agent.kind.no_tool_channel`, fires for any agent kind whose disposition delivers no channel on a local launch, stating that Sortie's tools will be neither advertised nor callable for it. Both are warnings and not errors: such a configuration stays valid, the run proceeds, and the exit code is unchanged.
+Setting `mcp_config` in a block belonging to `kiro` or `mock` therefore has no effect on the agent. In the `pi` block the same key is a different case: pi accepts no such key, so it fails construction and is reported by `sortie validate` under `pi.mcp_config.unknown_key` rather than warned about. `sortie validate` reports that combination as a warning naming the kind, under the check `agent.mcp_config`. A separate warning, `agent.kind.no_tool_channel`, fires for any agent kind whose disposition delivers no channel on a local launch, stating that Sortie's tools will be neither advertised nor callable for it. Both are warnings and not errors: such a configuration stays valid, the run proceeds, and the exit code is unchanged.
 
 A kind named by `dispatch.default.agent` or by `dispatch.rules[*].agent` that differs from the top-level `agent.kind` must carry its own top-level settings block; `agent.kind` itself never requires one. An empty mapping (`codex: {}`) or a bare key with nothing following (`codex:`) satisfies the requirement; a scalar or a list value does not. `sortie validate` reports a missing or malformed block as an error under the check `dispatch.agent.missing_block`, naming the selector that introduced the kind and the block it expects. `agent.command` is workflow-wide, and a routed kind's own settings block cannot override it ([architecture §5.3.5](architecture/05-workflow-specification.md#535-agent-object)); adding the block satisfies this check without making the route launch the routed kind's own binary.
 

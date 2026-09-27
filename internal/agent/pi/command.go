@@ -1,73 +1,213 @@
 package pi
 
 import (
-	"encoding/json"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
 
-	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
-	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 type passthroughConfig struct {
 	Model        string
+	Thinking     string
+	ProjectTrust projectTrust
 	AllowedTools []string
 	DeniedTools  []string
 }
 
-type permissionAction string
+// projectTrust is the operator's decision about whether pi loads the
+// workspace's own project-local files and packages.
+type projectTrust string
 
 const (
-	permissionAllow permissionAction = "allow"
-	permissionDeny  permissionAction = "deny"
+	// trustIgnore keeps project-local files and packages out of the run.
+	// It is the default, because an unattended turn has no operator to
+	// answer a trust prompt and must not silently adopt whatever the
+	// workspace declares.
+	trustIgnore projectTrust = "ignore"
+
+	// trustApprove loads them.
+	trustApprove projectTrust = "approve"
 )
 
-type permissionPolicy map[string]permissionAction
+// validThinkingLevels are the --thinking levels pi 0.85.1 accepts, and
+// the only values a pi block's thinking key may take.
+var validThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
-var knownPermissionKeys = map[string]struct{}{
-	"bash":      {},
-	"edit":      {},
-	"question":  {},
-	"read":      {},
-	"task":      {},
-	"todowrite": {},
-	"webfetch":  {},
-	"websearch": {},
-	"write":     {},
+// knownConfigKeys is every key the pi block of WORKFLOW.md accepts. A
+// key outside it is refused rather than ignored: pi has no passthrough
+// channel, so an unrecognized key would otherwise look configured while
+// doing nothing.
+var knownConfigKeys = map[string]struct{}{
+	"model":         {},
+	"thinking":      {},
+	"project_trust": {},
+	"allowed_tools": {},
+	"denied_tools":  {},
 }
 
-// parsePassthroughConfig extracts Pi-specific settings from the
-// raw config map. A missing key uses its zero-value default. A key
-// present with a non-string value for a string field reports a fault
-// rather than defaulting; [checkCrossField] holds the allowed_tools and
-// denied_tools overlap check.
-func parsePassthroughConfig(config map[string]any) (passthroughConfig, *typeutil.TypeFault) {
-	model, fault := typeutil.StringField(config, "model")
-	if fault != nil {
-		return passthroughConfig{}, fault
+// genericConfigKeys are the keys the agent block contributes to every
+// adapter's config map, whichever kind it names. They are not pi block
+// keys, so the unknown-key check exempts them: refusing them would
+// reject every valid workflow rather than one misspelled option.
+var genericConfigKeys = map[string]struct{}{
+	"kind":             {},
+	"command":          {},
+	"turn_timeout_ms":  {},
+	"read_timeout_ms":  {},
+	"stall_timeout_ms": {},
+	"stop_grace_ms":    {},
+}
+
+// configFault is one reason a pi passthrough is refused. Check is the
+// diagnostic key, Message the text both the constructor and the
+// registered validator report, so the two can never disagree.
+type configFault struct {
+	Check   string
+	Message string
+}
+
+// fault builds one configFault under the adapter's diagnostic namespace.
+func fault(check, format string, args ...any) *configFault {
+	return &configFault{Check: "pi." + check, Message: fmt.Sprintf(format, args...)}
+}
+
+// parsePassthroughConfig extracts pi-specific settings from the raw
+// config map, reporting every fault it finds rather than only the first,
+// so one pass tells an operator everything that needs fixing.
+func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*configFault) {
+	var faults []*configFault
+
+	for _, key := range unknownConfigKeys(config) {
+		faults = append(faults, fault(key+".unknown_key",
+			"unknown pi config key %q; the pi block accepts %s",
+			key, strings.Join(sortedConfigKeys(), ", ")))
 	}
 
-	return passthroughConfig{
-		Model:        model,
-		AllowedTools: slices.Clone(typeutil.ExtractStringSlice(config["allowed_tools"])),
-		DeniedTools:  slices.Clone(typeutil.ExtractStringSlice(config["denied_tools"])),
-	}, nil
-}
+	pt := passthroughConfig{}
 
-// checkCrossField rejects a passthrough whose allowed_tools and
-// denied_tools overlap.
-func checkCrossField(pt passthroughConfig) error {
+	model, modelFault := typeutil.StringField(config, "model")
+	if modelFault != nil {
+		faults = append(faults, fault(modelFault.Key+".wrong_type", "%s", modelFault.Error()))
+	}
+	pt.Model = model
+
+	thinking, thinkingFault := typeutil.StringField(config, "thinking")
+	switch {
+	case thinkingFault != nil:
+		faults = append(faults, fault(thinkingFault.Key+".wrong_type", "%s", thinkingFault.Error()))
+	case thinking != "" && !slices.Contains(validThinkingLevels, thinking):
+		faults = append(faults, fault("thinking.invalid_value",
+			"thinking: %q is not a pi thinking level; valid values are %s",
+			thinking, strings.Join(validThinkingLevels, ", ")))
+	default:
+		pt.Thinking = thinking
+	}
+
+	pt.ProjectTrust = trustIgnore
+	trust, trustFault := typeutil.StringField(config, "project_trust")
+	switch {
+	case trustFault != nil:
+		faults = append(faults, fault(trustFault.Key+".wrong_type", "%s", trustFault.Error()))
+	case trust == "":
+	case projectTrust(trust) == trustIgnore, projectTrust(trust) == trustApprove:
+		pt.ProjectTrust = projectTrust(trust)
+	default:
+		faults = append(faults, fault("project_trust.invalid_value",
+			"project_trust: %q is not a pi trust setting; valid values are %s, %s",
+			trust, trustIgnore, trustApprove))
+	}
+
+	allowed, allowedFaults := toolList(config, "allowed_tools")
+	faults = append(faults, allowedFaults...)
+	pt.AllowedTools = allowed
+
+	denied, deniedFaults := toolList(config, "denied_tools")
+	faults = append(faults, deniedFaults...)
+	pt.DeniedTools = denied
+
 	if message := overlapMessage(pt.AllowedTools, pt.DeniedTools); message != "" {
-		return fmt.Errorf("%s", message)
+		faults = append(faults, fault("allowed_tools.overlap", "%s", message))
 	}
-	return nil
+
+	if len(faults) > 0 {
+		return passthroughConfig{}, faults
+	}
+	return pt, nil
+}
+
+// toolList reads one tool-list key. A value that is not a list of
+// non-empty tool names is refused: typeutil.ExtractStringSlice drops
+// what it cannot read, so accepting its output would hand pi a shorter
+// list than the operator wrote.
+func toolList(config map[string]any, key string) ([]string, []*configFault) {
+	raw, present := config[key]
+	if !present || raw == nil {
+		return nil, nil
+	}
+
+	var items []any
+	switch typed := raw.(type) {
+	case []any:
+		items = typed
+	case []string:
+		items = make([]any, len(typed))
+		for i, name := range typed {
+			items[i] = name
+		}
+	default:
+		return nil, []*configFault{fault(key+".wrong_type",
+			"%s: expected list, got %s", key, typeutil.DescribeYAMLType(raw))}
+	}
+
+	var names []string
+	var faults []*configFault
+	for i, item := range items {
+		name, ok := item.(string)
+		if !ok {
+			faults = append(faults, fault(key+".malformed_list",
+				"%s[%d]: expected a tool name, got %s", key, i, typeutil.DescribeYAMLType(item)))
+			continue
+		}
+		if strings.TrimSpace(name) == "" {
+			faults = append(faults, fault(key+".malformed_list", "%s[%d]: tool name is empty", key, i))
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, faults
+}
+
+// unknownConfigKeys returns the config keys pi does not accept, sorted.
+func unknownConfigKeys(config map[string]any) []string {
+	var unknown []string
+	for key := range config {
+		if _, ok := knownConfigKeys[key]; ok {
+			continue
+		}
+		if _, ok := genericConfigKeys[key]; ok {
+			continue
+		}
+		unknown = append(unknown, key)
+	}
+	slices.Sort(unknown)
+	return unknown
+}
+
+// sortedConfigKeys returns knownConfigKeys' keys in a stable order, so
+// the unknown-key diagnostic renders identically on every run.
+func sortedConfigKeys() []string {
+	keys := make([]string, 0, len(knownConfigKeys))
+	for key := range knownConfigKeys {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // pi runs non-interactive with -p --mode json; the prompt is a positional
-// arg and --session resumes. cmd.Dir is already the workspace, so no --dir.
+// arg after --, and cmd.Dir is already the workspace, so no --dir.
 func buildRunArgs(state *sessionState, prompt string, pt passthroughConfig) []string {
 	args := []string{"-p", "--mode", "json"}
 
@@ -77,222 +217,21 @@ func buildRunArgs(state *sessionState, prompt string, pt passthroughConfig) []st
 	if pt.Model != "" {
 		args = append(args, "--model", pt.Model)
 	}
+	if pt.Thinking != "" {
+		args = append(args, "--thinking", pt.Thinking)
+	}
+	if len(pt.AllowedTools) > 0 {
+		args = append(args, "--tools", strings.Join(pt.AllowedTools, ","))
+	}
+	if len(pt.DeniedTools) > 0 {
+		args = append(args, "--exclude-tools", strings.Join(pt.DeniedTools, ","))
+	}
+	if pt.ProjectTrust == trustApprove {
+		args = append(args, "--approve")
+	} else {
+		args = append(args, "--no-approve")
+	}
 
 	args = append(args, "--", prompt)
 	return args
-}
-
-func buildRunEnv(base []string, pt passthroughConfig) ([]string, error) {
-	managedEnv, err := buildManagedEnv(pt)
-	if err != nil {
-		return nil, err
-	}
-
-	env := make([]string, 0, len(base)+len(managedEnv))
-	for _, entry := range base {
-		if shouldDropManagedEnv(entry) {
-			continue
-		}
-		env = append(env, entry)
-	}
-
-	keys := make([]string, 0, len(managedEnv))
-	for key := range managedEnv {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	for _, key := range keys {
-		env = append(env, key+"="+managedEnv[key])
-	}
-
-	return env, nil
-}
-
-func buildSSHRemoteCommand(remoteCommand string, extraEnv map[string]string) string {
-	if len(extraEnv) == 0 {
-		return remoteCommand
-	}
-
-	keys := make([]string, 0, len(extraEnv))
-	for key := range extraEnv {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-
-	parts := make([]string, 0, len(keys)+1)
-	for _, key := range keys {
-		parts = append(parts, key+"="+sshutil.ShellQuote(extraEnv[key]))
-	}
-	parts = append(parts, remoteCommand)
-
-	return strings.Join(parts, " ")
-}
-
-// ponytail: keys stay OPENCODE_* — pi honors them today; rename here if pi diverges.
-func buildManagedEnv(pt passthroughConfig) (map[string]string, error) {
-	managed := map[string]string{
-		"OPEN" + "CODE_AUTO_SHARE":           "false",
-		"OPEN" + "CODE_DISABLE_AUTOCOMPACT":  "true",
-		"OPEN" + "CODE_DISABLE_AUTOUPDATE":   "true",
-		"OPEN" + "CODE_DISABLE_LSP_DOWNLOAD": "true",
-	}
-
-	policy, ok := buildPermissionPolicy(pt)
-	if !ok {
-		return managed, nil
-	}
-
-	encoded, err := json.Marshal(policy)
-	if err != nil {
-		return nil, fmt.Errorf("marshal pi permission policy: %w", err)
-	}
-	managed["OPEN"+"CODE_PERMISSION"] = string(encoded)
-
-	return managed, nil
-}
-
-func buildPermissionPolicy(pt passthroughConfig) (permissionPolicy, bool) {
-	if len(pt.AllowedTools) == 0 && len(pt.DeniedTools) == 0 {
-		return nil, false
-	}
-
-	policy := make(permissionPolicy, len(pt.AllowedTools)+len(pt.DeniedTools)+len(knownPermissionKeys))
-	allowed := make(map[string]struct{}, len(pt.AllowedTools))
-	for _, key := range pt.AllowedTools {
-		allowed[key] = struct{}{}
-		policy[key] = permissionAllow
-		logUnknownPermissionKey(key)
-	}
-
-	if len(pt.AllowedTools) > 0 {
-		for key := range knownPermissionKeys {
-			if _, ok := allowed[key]; ok {
-				continue
-			}
-			policy[key] = permissionDeny
-		}
-	}
-
-	for _, key := range pt.DeniedTools {
-		policy[key] = permissionDeny
-		logUnknownPermissionKey(key)
-	}
-
-	return policy, true
-}
-
-func shouldDropManagedEnv(entry string) bool {
-	key, _, found := strings.Cut(entry, "=")
-	if !found {
-		return false
-	}
-
-	switch key {
-	case "OPEN" + "CODE_AUTO_SHARE",
-		"OPEN" + "CODE_DISABLE_AUTOCOMPACT",
-		"OPEN" + "CODE_DISABLE_AUTOUPDATE",
-		"OPEN" + "CODE_DISABLE_LSP_DOWNLOAD",
-		"OPEN" + "CODE_PERMISSION",
-		"OPEN" + "CODE_CONFIG_CONTENT":
-		return true
-	default:
-		return false
-	}
-}
-
-// mcpConfigDocument is the runtime's own inline MCP configuration
-// document shape, delivered through its inline-configuration
-// environment variable.
-type mcpConfigDocument struct {
-	MCP map[string]mcpConfigDocumentEntry `json:"mcp"`
-}
-
-// mcpConfigDocumentEntry is one server entry of [mcpConfigDocument].
-type mcpConfigDocumentEntry struct {
-	Type        string            `json:"type"`
-	Command     []string          `json:"command,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	URL         string            `json:"url,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Enabled     bool              `json:"enabled"`
-}
-
-// renderMCPConfigDocument translates servers into the runtime's own
-// MCP configuration document as compact JSON. A nil Server.Enabled
-// renders true, matching the runtime's own default.
-// buildMCPConfigContent returns the translated configuration document
-// a session started with these parameters delivers, or an empty string
-// when it delivers none: a remote launch, no generated configuration,
-// or a configuration declaring no server. It is the adapter's own
-// composition, so a conformance test measures what a session does
-// rather than repeating the steps and measuring itself.
-func buildMCPConfigContent(mcpConfigPath string, remote bool) (string, error) {
-	if mcpConfigPath == "" || remote {
-		return "", nil
-	}
-
-	servers, err := mcpconfig.Parse(mcpConfigPath)
-	if err != nil {
-		return "", err
-	}
-	if len(servers) == 0 {
-		return "", nil
-	}
-	return renderMCPConfigDocument(servers)
-}
-
-// appendMCPConfigEnv appends the delivery variable to env when content
-// is non-empty, and returns env unchanged otherwise.
-func appendMCPConfigEnv(env []string, content string) []string {
-	if content == "" {
-		return env
-	}
-	return append(env, "OPEN"+"CODE_CONFIG_CONTENT="+content)
-}
-
-func renderMCPConfigDocument(servers []mcpconfig.Server) (string, error) {
-	doc := mcpConfigDocument{MCP: make(map[string]mcpConfigDocumentEntry, len(servers))}
-
-	for _, server := range servers {
-		enabled := true
-		if server.Enabled != nil {
-			enabled = *server.Enabled
-		}
-
-		switch server.Transport {
-		case mcpconfig.TransportStdio:
-			doc.MCP[server.Name] = mcpConfigDocumentEntry{
-				Type:        "local",
-				Command:     append([]string{server.Command}, server.Args...),
-				Environment: server.Env,
-				Enabled:     enabled,
-			}
-		case mcpconfig.TransportHTTP:
-			doc.MCP[server.Name] = mcpConfigDocumentEntry{
-				Type:    "remote",
-				URL:     server.URL,
-				Headers: server.Headers,
-				Enabled: enabled,
-			}
-		default:
-			return "", fmt.Errorf("mcp server %q: entry carries neither command nor url", server.Name)
-		}
-	}
-
-	encoded, err := json.Marshal(doc)
-	if err != nil {
-		return "", fmt.Errorf("marshal pi mcp document: %w", err)
-	}
-	return string(encoded), nil
-}
-
-func logUnknownPermissionKey(key string) {
-	if _, ok := knownPermissionKeys[key]; ok {
-		return
-	}
-
-	slog.Default().With(slog.String("component", "pi-adapter")).Debug(
-		"forwarding unknown pi permission key",
-		slog.String("permission_key", key),
-	)
 }

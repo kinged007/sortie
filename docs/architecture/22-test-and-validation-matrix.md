@@ -284,6 +284,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - An adapter whose runtime publishes a task-completion report carries a test driving both a turn the agent declared complete and a turn the runtime ended without that report through the adapter, asserting the two dispositions differ
 - A turn whose subprocess standard-error handle is held open by a surviving descendant still publishes its outcome and cleans up its process group within a bounded time
 - A turn whose subprocess standard-output handle is held open by a surviving descendant still ends within the adapter's own bound, naming the runtime's exit, rather than reaching the orchestrator's stall timeout
+- The Pi adapter's JSON parser is exercised against fixtures derived from the installed Pi 0.85.1 event schema, including top-level tool error flags, assistant stop reasons, malformed nested payloads, compaction usage, and unknown event types
+- Pi's native `--thinking`, `--tools`, `--exclude-tools`, and project-trust arguments are covered by exact argument-vector tests, and every accepted or refused `pi` configuration key is covered by the shared validation path
+- Pi live integration tests are gated by `SORTIE_PI_TEST=1`, use the pinned Pi CLI, and cover a fresh turn, same-workspace resume, tool/usage behavior, invalid-model failure, and cancellation
 
 ### 17.6 Observability
 

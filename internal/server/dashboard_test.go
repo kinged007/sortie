@@ -2634,6 +2634,7 @@ var usageReportingKindStrings = []string{
 	"kiro",
 	"mock",
 	"opencode",
+	"pi",
 }
 
 // TestHandleDashboard_UsageReportingPanel_NoAdapterOrLaunchModeStrings
@@ -2677,7 +2678,8 @@ func TestHandleDashboard_UsageReportingPanel_NoAdapterOrLaunchModeStrings(t *tes
 
 	lower := strings.ToLower(dr.Body)
 	for _, kind := range usageReportingKindStrings {
-		if strings.Contains(lower, strings.ToLower(kind)) {
+		pattern := regexp.MustCompile(`(^|[^a-z0-9])` + regexp.QuoteMeta(strings.ToLower(kind)) + `([^a-z0-9]|$)`)
+		if pattern.MatchString(lower) {
 			t.Errorf("body contains agent kind string %q, want none", kind)
 		}
 	}
