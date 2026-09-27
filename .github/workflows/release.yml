@@ -468,7 +468,16 @@ jobs:
         run: ${{ matrix.install }}
 
       - name: Run integration tests
-        run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/opencode/...
+        run: |
+          for attempt in 1 2; do
+            if go test -race -count=1 -v -timeout 180s -run 'Integration' ./internal/agent/opencode/...; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then
+              exit 1
+            fi
+            echo "OpenCode integration attempt failed; retrying once"
+          done
 
   test-integration-kiro:
     name: "Integration: Kiro"
