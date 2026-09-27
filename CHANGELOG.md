@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The `opencode` agent kind now works with OpenCode 2.x as well as 1.x: Sortie reads the installed version at the start of each session and drives whichever one is configured, stopping the run with an error naming the version when it is neither. On OpenCode 2.x, `opencode.pure` and an `opencode.variant` set without an `opencode.model` are refused the same way.
   ([#960](https://github.com/sortie-ai/sortie/issues/960))
 
+- `token_rates` entries may set `cache_write_per_mtok` to price prompt-cache-write tokens separately from input; `claude-code`, `copilot-cli`, and `opencode` report the count and price it at the input rate until the operator sets the new rate. The count now also appears on its own: the dashboard's Cache Write figure, `cache_write_tokens` on the JSON API and `sortie_status`, `cache_write` in `sortie stats`, and `sortie_tokens_total{type="cache_write"}`.
+  ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
 ### Changed
 
 - Workflows that use the `copilot-cli` agent kind now need GitHub Copilot CLI 1.0.51 or later.
@@ -27,6 +30,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The comment posted when a session starts (`tracker.comments.on_dispatch`) now reads only "Sortie session started.", without the session and workspace lines that always read `pending`, the agent kind, or the attempt count. The comments posted when a session ends (`tracker.comments.on_completion`, `tracker.comments.on_failure`) no longer show the agent's session identifier, and the failure comment no longer quotes the error; it gives the duration and whether the issue will be retried, and the cause stays available in the log, the run history, and the dashboard.
   ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
+
+- A `token_rates` entry now needs both `input_per_mtok` and `output_per_mtok` to price its kind at all: an entry missing either one prices nothing and its kind counts as unpriced, the same as a kind `token_rates` never names, even when it is the only entry configured. `0` stays a valid rate, and an unrecognized rate key now warns. These warnings, like other configuration warnings, now reach the run log, `sortie validate`, and the dry run, and `sortie stats` lists its own in its report.
+  ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
 
 ### Deprecated
 
@@ -80,10 +86,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Configuration warnings (a deprecated `ci_feedback` section, a `label_commands` prompt template missing its branch or a poll interval below its minimum, a missing env file, an environment override replacing a section that is not a mapping) now appear once when they first apply instead of on every poll. `sortie validate` reports them as warnings instead of printing log lines. `sortie stats` and `sortie mcp-server` no longer print them.
   ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
 
+- Cost estimates on the dashboard, the JSON API, and `sortie stats` no longer count a cache-read token at both the input rate and the cache-read rate; each token now prices once, at the rate of its own class. `sortie stats` re-prices every run recorded since 1.19.0 by the corrected rule.
+  ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
 ### Migrations
 
 - Add `unaccounted_turns INTEGER NOT NULL DEFAULT 0` to `run_history`, counting the run's turns that spent tokens no figure was proven to account for, whether no figure arrived at all or the one that did fell short of the turn. A pre-migration row reads back zero and so presents as fully accounted, but nothing measured it: before the upgrade a turn that spent tokens without reporting a figure was indistinguishable from one that cost nothing, and because `run_history` is an append-only record no later run can correct, that zero stays. A historical run's spend therefore reads as complete because nothing can now establish otherwise, not because it was verified.
   ([#1057](https://github.com/sortie-ai/sortie/issues/1057))
+
+- Add `cache_write_tokens INTEGER NOT NULL DEFAULT 0` to `run_history`, `session_metadata`, and `aggregate_metrics`, counting input tokens written to the prompt cache. A pre-migration row reads back zero, so its cache writes price at the input rate rather than their own.
+  ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
 
 ## [1.24.1] - 2026-09-17
 

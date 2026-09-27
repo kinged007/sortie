@@ -74,9 +74,9 @@ The orchestrator expects the following event types from any agent adapter. Adapt
 - `turn_cancelled`: turn was cancelled
 - `turn_ended_with_error`: turn ended due to an error condition
 - `turn_input_required`: agent asked for a decision only a person could give, ending the attempt under the shared refusal posture
-- `token_usage`: normalized token usage event: `{input_tokens, output_tokens, total_tokens, cache_read_tokens}`. Optional `model` field (string) identifies the LLM model when available. Optional `api_duration_ms` field (int64, milliseconds) carries per-request or per-turn API response wait time when the adapter can measure it.
+- `token_usage`: normalized token usage event: `{input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens}`. Optional `model` field (string) identifies the LLM model when available. Optional `api_duration_ms` field (int64, milliseconds) carries per-request or per-turn API response wait time when the adapter can measure it.
 
-Counter definitions: `input_tokens` counts every token sent to the model, including prompt-cache reads and prompt-cache writes. `output_tokens` counts every token the model generated, including reasoning tokens. `cache_read_tokens` is the subset of `input_tokens` served from the prompt cache and MUST NOT be added to any other counter. `total_tokens` is `input_tokens + output_tokens`, computed by the adapter: an adapter MUST NOT pass a vendor total through, and MUST report `0` for a counter its runtime does not expose. This definition supersedes the clause in ADR-0013 (`docs/decisions/0013-agent-cost-budget.md`) that leaves `cache_read_tokens` undefined as either included in or disjoint from `total_tokens`.
+Counter definitions: `input_tokens` counts every token sent to the model, including prompt-cache reads and prompt-cache writes. `output_tokens` counts every token the model generated, including reasoning tokens. `cache_read_tokens` is the subset of `input_tokens` served from the prompt cache and MUST NOT be added to any other counter. `cache_write_tokens` counts input tokens written to the prompt cache; it is disjoint from `cache_read_tokens`, is zero when the runtime reports no cache-write count, and MUST NOT be added to any other counter. `total_tokens` is `input_tokens + output_tokens`, computed by the adapter: an adapter MUST NOT pass a vendor total through, and MUST report `0` for a counter its runtime does not expose. This definition supersedes the clause in ADR-0013 (`docs/decisions/0013-agent-cost-budget.md`) that leaves `cache_read_tokens` undefined as either included in or disjoint from `total_tokens`.
 
 Scope: every reported value is cumulative over the run, meaning the agent session the orchestrator opened with `StartSession`, across every turn of that session, and excludes usage a resumed session accumulated before `StartSession`. The sequence of values an adapter reports within one run is monotonically non-decreasing per component.
 
@@ -109,11 +109,11 @@ Each event should include:
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
 - `agent_pid` (if available)
-- optional `usage` map: `{input_tokens, output_tokens, total_tokens, cache_read_tokens}`
+- optional `usage` map: `{input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens}`
 - optional `model` string: LLM model identifier when available
 - payload fields as needed
 
-Token accounting is normalized at the adapter boundary. The orchestrator receives `{input_tokens, output_tokens, total_tokens, cache_read_tokens}` directly and does not parse adapter-specific payload shapes.
+Token accounting is normalized at the adapter boundary. The orchestrator receives `{input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens}` directly and does not parse adapter-specific payload shapes.
 
 ### 10.4 Approval, Tools, and User Input Policy
 
@@ -229,8 +229,8 @@ Response fields:
 | `turns_remaining` | integer | `max_turns - turn_number`, clamped at 0 |
 | `attempt` | integer or null | Retry or continuation attempt number; null on the first run |
 | `session_duration_seconds` | number | Wall-clock seconds since the session started |
-| `tokens` | object | `input_tokens`, `output_tokens`, `total_tokens`, and `cache_read_tokens`. Each member is an integer or null; the four are null together, exactly when the sibling `tokens_measured` is false, and each carries its figure otherwise |
-| `tokens_measured` | boolean | True when the four figures in `tokens` are a measurement the session's runtime reported; false when nothing measured them, and also false for a session whose resolved usage arrival is `none`, whatever its runtime reports |
+| `tokens` | object | `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, and `cache_write_tokens`. Each member is an integer or null; the five are null together, exactly when the sibling `tokens_measured` is false, and each carries its figure otherwise |
+| `tokens_measured` | boolean | True when the five figures in `tokens` are a measurement the session's runtime reported; false when nothing measured them, and also false for a session whose resolved usage arrival is `none`, whatever its runtime reports |
 
 On success the tool returns the response object above under `data`, in the envelope `{"success": true, "data": {...}}` of Section 10.4.2. On failure it returns the failure envelope `{"success": false, "error": {"kind": "<kind>", "message": "<message>"}}`. An absent, symlinked, oversized, or unreadable state file yields `error.kind` `state_unavailable`; a present but unparseable state file, including an invalid `started_at`, yields `state_malformed`.
 

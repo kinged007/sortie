@@ -1540,7 +1540,8 @@ Returns the system-wide runtime state including running sessions, retry queue, a
         "input_tokens": 1200,
         "output_tokens": 800,
         "total_tokens": 2000,
-        "cache_read_tokens": 400
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 100
       },
       "model_name": "claude-sonnet-4-20250514",
       "api_request_count": 3,
@@ -1581,6 +1582,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
     "output_tokens": 2400,
     "total_tokens": 7400,
     "cache_read_tokens": 1500,
+    "cache_write_tokens": 300,
     "seconds_running": 1834.2,
     "unmeasured_sessions": 2,
     "running_unreported": 1,
@@ -1594,14 +1596,15 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 
 | Field               | Type              | Description                                                                                                                                |
 | ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `tokens`                  | object            | Token counts for this session. Each of the four members, `input_tokens`, `output_tokens`, `total_tokens`, and `cache_read_tokens`, is an integer or `null`. The four are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
+| `tokens`                  | object            | Token counts for this session. Each of the five members, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, and `cache_write_tokens`, is an integer or `null`. The five are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
 | `tokens.cache_read_tokens` | integer or `null` | Cumulative cache-read token count. Reflects tokens served from the LLM provider's prompt cache rather than reprocessed. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache data. |
+| `tokens.cache_write_tokens` | integer or `null` | Cumulative cache-write token count. Reflects input tokens written to the LLM provider's prompt cache. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache-write count. |
 | `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model, and when `usage_arrival` is `none`.         |
 | `api_request_count` | integer or `null` | Number of `token_usage` events received during this session, and a count of actual API requests only when `api_requests_measured` is `true`. `null` exactly when that field is `false`. |
 | `requests_by_model` | object or absent  | Map of model name to request count (e.g. `{"claude-sonnet-4-20250514": 3}`). Omitted when `api_requests_measured` is `false`, and when `usage_attribution` does not name a model. Enables tracking model usage when the agent switches models mid-session. |
 | `tool_time_percent` | number or `null`  | Cumulative tool call execution time as a percentage of session wall-clock time. Computed at response time. `null` when no tool timing data has been received. |
 | `api_time_percent`  | number or `null`  | Cumulative LLM API response wait time as a percentage of session wall-clock time. Computed at response time. `null` when no API timing data has been received. |
-| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
+| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The five members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
 | `usage_arrival`      | string            | The session's kind's declared usage-reporting arrival, frozen at dispatch: `incremental`, `turn_end`, `none`, or `""` when undeclared.    |
 | `usage_attribution`  | string            | The session's kind's declared usage-reporting attribution, frozen at dispatch: `per_model`, `session_total`, `none`, or `""` when undeclared. |
 | `tokens_pending`     | boolean           | True only when `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for is still in flight.      |
@@ -1615,6 +1618,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | `output_tokens`     | integer | Total output tokens consumed.                                                                           |
 | `total_tokens`      | integer | Total tokens consumed.                                                                                  |
 | `cache_read_tokens` | integer | Total cache-read tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
+| `cache_write_tokens` | integer | Total cache-write tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
 | `seconds_running`   | number  | Aggregate wall-clock runtime — completed-session time plus elapsed time from currently running sessions. |
 | `unmeasured_sessions` | integer | Ended sessions whose token usage was never recorded, which the token totals above leave out. Survives a restart. |
 | `running_unreported` | integer | Running sessions whose `usage_arrival` reports usage but that have not reported a figure yet. |
@@ -1622,7 +1626,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 
 A session whose `usage_arrival` is `none` contributes nothing to the token totals, even when its runtime reports a figure.
 
-`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` configures a rate for any agent kind, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
+`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` holds an entry for any agent kind, complete or not, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate, or an incomplete one. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 
@@ -1653,7 +1657,8 @@ Returns issue-specific runtime and debug details for a single issue. Returns `40
       "input_tokens": 1200,
       "output_tokens": 800,
       "total_tokens": 2000,
-      "cache_read_tokens": 400
+      "cache_read_tokens": 400,
+      "cache_write_tokens": 100
     },
     "model_name": "claude-sonnet-4-20250514",
     "api_request_count": 3,
@@ -1735,7 +1740,7 @@ The endpoint uses a dedicated `prometheus.Registry` (not the Go default global) 
 | `sortie_sessions_retrying`                      | Gauge     | —                           | Number of issues in the retry queue.                           |
 | `sortie_slots_available`                        | Gauge     | —                           | Remaining dispatch capacity under current concurrency limits.  |
 | `sortie_active_sessions_elapsed_seconds`        | Gauge     | —                           | Cumulative wall-clock elapsed time across running sessions.    |
-| `sortie_tokens_total`                           | Counter   | `type`                      | Tokens consumed, by type (`input`, `output`, `cache_read`).    |
+| `sortie_tokens_total`                           | Counter   | `type`                      | Tokens consumed, by type (`input`, `output`, `cache_read`, `cache_write`). `cache_read` and `cache_write` are subsets of `input`, so summing across every `type` double-counts them. |
 | `sortie_agent_runtime_seconds_total`            | Counter   | —                           | Cumulative agent-session wall-clock time for completed sessions. |
 | `sortie_dispatches_total`                       | Counter   | `outcome`                   | Dispatch attempts (`success`, `error`).                        |
 | `sortie_worker_exits_total`                     | Counter   | `exit_type`                 | Worker exits (`normal`, `error`, `cancelled`, `soft_stop`).    |
@@ -1878,10 +1883,12 @@ token_rates:
     input_per_mtok: 3.00
     output_per_mtok: 15.00
     cache_read_per_mtok: 0.30
+    cache_write_per_mtok: 3.75
   copilot-cli:
     input_per_mtok: 2.00
     output_per_mtok: 8.00
     cache_read_per_mtok: 0.20
+    cache_write_per_mtok: 2.50
   codex:
     input_per_mtok: 2.50
     output_per_mtok: 10.00
@@ -1890,6 +1897,8 @@ token_rates:
 
 When `token_rates` is configured, the dashboard displays estimated USD cost for currently running sessions, and the `sortie stats` subcommand prices the runs it aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`, `"copilot-cli"`, `"codex"`, `"opencode"`). All rates are in USD per 1 million tokens.
 
+Every figure Sortie prices is a fresh-input token, a cache-read token, a cache-write token, or an output token, priced once each at its own rate. An unset `cache_read_per_mtok` or `cache_write_per_mtok` prices that class at `input_per_mtok`, so a configuration that sets neither keeps pricing every input token, cached or not, at the input rate. `claude-code`, `copilot-cli`, and `opencode` report a cache-write count; an operator of one of those kinds sets `cache_write_per_mtok` to that provider's cache-write rate to price it separately.
+
 When `token_rates` is absent or empty, the dashboard shows raw token counts without cost estimates and `sortie stats` reports no cost figures.
 
 An entry keyed to a kind whose usage-reporting declaration resolves to no token usage for the sessions a configuration produces has no effect: no cost can be estimated for it. `sortie validate` reports this under the check `agent.kind.no_cost_estimate`, naming the kind, so an operator who prices a non-reporting kind learns why the dashboard's Est. Cost column stays blank rather than discovering it by reading source.
@@ -1897,18 +1906,21 @@ An entry keyed to a kind whose usage-reporting declaration resolves to no token 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `token_rates` | map | _(absent)_ | Top-level extension key. Keys are agent adapter kind strings. |
-| `token_rates.<kind>.input_per_mtok` | number | _(not set)_ | USD per million input tokens. |
-| `token_rates.<kind>.output_per_mtok` | number | _(not set)_ | USD per million output tokens. |
-| `token_rates.<kind>.cache_read_per_mtok` | number | _(not set)_ | USD per million cache-read tokens. |
+| `token_rates.<kind>.input_per_mtok` | number | _(not set)_ | USD per million input tokens. Required, with `output_per_mtok`, for the kind to price at all. |
+| `token_rates.<kind>.output_per_mtok` | number | _(not set)_ | USD per million output tokens. Required, with `input_per_mtok`, for the kind to price at all. |
+| `token_rates.<kind>.cache_read_per_mtok` | number | _(not set)_ | USD per million cache-read tokens; unset prices cache reads at `input_per_mtok`. |
+| `token_rates.<kind>.cache_write_per_mtok` | number | _(not set)_ | USD per million cache-write tokens; unset prices cache writes at `input_per_mtok`. |
 
 **Validation rules:**
 
 - `token_rates` MUST be a map when present. Non-map values produce a warning (not a fatal error).
 - Each `<kind>` value MUST be a map. Non-map values produce a warning for that kind.
-- Rate values MUST be non-negative numbers. Negative values produce a warning and are treated as not configured.
-- Missing rate fields within a kind are valid. Partial rates (e.g., only `output_per_mtok`) compute cost from the configured fields only.
+- Rate values MUST be non-negative, finite numbers. A negative, non-finite, or non-numeric value produces a warning and is treated as not configured.
+- An unrecognized key inside a kind's entry produces a warning and is ignored.
+- An entry needs both `input_per_mtok` and `output_per_mtok` to price anything. An entry missing either one, or holding neither, prices nothing: its kind counts as unpriced on the dashboard, the JSON API, and `sortie stats`, the same as a kind `token_rates` never names. This holds even when the incomplete entry is the only one `token_rates` configures.
 - Zero-valued rates are valid and produce `$0.00` for that token type.
 - An entry keyed to the empty string is dropped and produces a warning; it prices no kind.
+- Every warning above is a configuration advisory under check `token_rates` (Section 8): it reaches the run log once per configuration change, `sortie validate`'s diagnostics without affecting `valid` or the exit status, and the dry run. `sortie stats` also lists its own `token_rates` warnings in its report, because they decide which runs it prices.
 
 **Reload behavior:** Token rates do not reload dynamically. Changes require a process restart, consistent with `server.port` and `server.host`.
 
@@ -2780,7 +2792,7 @@ A `handoff_state` or `in_progress_state` that collides with `active_states` or `
 
 These offline checks never contact Linear and never log the API key value. State-name existence against the team and credential validity are checked by the online preflight at adapter construction, not by `sortie validate`.
 
-**Configuration advisories.** A configuration advisory is recorded once, when the configuration that draws it is built or loaded, and never printed at that point. Every advisory reaches an operator through the same three surfaces: `sortie validate` reports it once as a `warning` diagnostic and never fails the run for it; the running orchestrator logs it once at the tick that first draws it, and again only after a tick whose configuration did not draw it; a dry run logs it once, before it fetches candidate issues. `sortie stats` and `sortie mcp-server` never print an advisory.
+**Configuration advisories.** A configuration advisory is recorded once, when the configuration that draws it is built or loaded, and never printed at that point. Every advisory reaches an operator through the same three surfaces: `sortie validate` reports it once as a `warning` diagnostic and never fails the run for it; the running orchestrator logs it once at the tick that first draws it, and again only after a tick whose configuration did not draw it; a dry run logs it once, before it fetches candidate issues. `sortie mcp-server` never prints an advisory. `sortie stats` is the one exception: it lists its own `token_rates` warnings in its report, because they decide which runs it prices.
 
 | Check                                                     | Condition                                                                                          |
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |

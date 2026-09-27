@@ -18,7 +18,7 @@ Message formatting requirements:
 - Include concise failure reason when present.
 - Avoid logging large raw payloads unless necessary.
 
-A configuration advisory is recorded once, at construction or at workflow load, and logged from nowhere else: not at the point it is recorded, and not from configuration construction run for any other purpose. The running orchestrator reports a recorded advisory through one `Warn` record per entry, at the tick that first draws it and again only after a tick whose effective configuration stopped drawing it; a dry run logs the same records once, before it fetches candidate issues. A reachable deprecated agent kind draws one such record, message `"agent kind is deprecated and will be removed in a later release"`, carrying `agent_kind` and `replacement_kind`.
+A configuration advisory is recorded once, at construction or at workflow load, and logged from nowhere else: not at the point it is recorded, and not from configuration construction run for any other purpose. The running orchestrator reports a recorded advisory through one `Warn` record per entry, at the tick that first draws it and again only after a tick whose effective configuration stopped drawing it; a dry run logs the same records once, before it fetches candidate issues. A reachable deprecated agent kind draws one such record, message `"agent kind is deprecated and will be removed in a later release"`, carrying `agent_kind` and `replacement_kind`. An invalid or incomplete `token_rates` entry draws one such record per warning, message `"skipped invalid token rate entry"`, carrying `detail` (the warning text).
 
 Handoff-evidence records are part of the required operator surface:
 
@@ -90,6 +90,7 @@ If the implementation exposes a synchronous runtime snapshot (for dashboards or 
   - `output_tokens`
   - `total_tokens`
   - `cache_read_tokens`
+  - `cache_write_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
   - `unmeasured_sessions` (cumulative count of ended sessions whose usage was never recorded; persisted alongside the counters above and restored on startup, so it names the sessions they excluded across every restart, not just the current process)
   - `running_unreported` (count of the current running set whose kind reports usage, whose figure has not arrived, and whose `tokens_awaited` is true, so it may still arrive)
@@ -120,14 +121,15 @@ A figure can be missing for two distinct reasons: the database predates the sche
 
 A run is measured when the runtime reported at least one usage figure for the session and the adapter carried it into the recorded counters, or when the worker never entered an agent turn, because a run that launched no agent spent exactly zero. A run is unmeasured when an agent turn began and no usage figure ever arrived; its recorded token figures are zero and that zero carries no information. A measurement of zero is a measured run whose reported figures are zero, which is a legitimate statement recorded as measured. A figure reported for a session whose resolved usage arrival is `none` is not a measurement: it enters no token counter, persisted row, or reporting surface, and the run stays unmeasured unless it never entered an agent turn.
 
-The run record carries this distinction alongside the four token counters. An unmeasured run contributes nothing to any token counter and is excluded from cost pricing. It advances no Prometheus token counter and creates no series, the same as a run that never emitted a usage event.
+The run record carries this distinction alongside the five token counters. An unmeasured run contributes nothing to any token counter and is excluded from cost pricing. It advances no Prometheus token counter and creates no series, the same as a run that never emitted a usage event.
 
 The run's usage includes the credential-verification step (§10.9): the step's own request is a model request like any other, and the working session's figures continue its series rather than starting over from zero. The worker captures the step's componentwise watermark once the step ends and adds it to every later working-session figure, event and turn result alike, before that figure is folded into the run's totals and before it is relayed; an all-zero working figure, or a step that reported nothing, changes nothing. A verification `SpendUnaccounted` result raises the run's unaccounted count exactly as a working turn's does. The relayed verification events carry the message `verifying the agent credential` and are `token_usage` or `notification` only, with no `session_id`, `agent_pid`, tool field, or rate-limit payload.
 
 Token accounting rules:
 
-- Agent adapters normalize token counts before emitting events. The orchestrator receives `{input_tokens, output_tokens, total_tokens, cache_read_tokens}` directly.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting. The `cache_read_tokens` field follows the same cumulative-delta accounting as `input_tokens` / `output_tokens`. Deltas are accumulated from any event carrying a non-zero usage payload, not only `token_usage` events, so an adapter can attach the authoritative run-cumulative snapshot to a turn-finalization event without losing it.
+- Agent adapters normalize token counts before emitting events. The orchestrator receives `{input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens}` directly.
+- For absolute totals, track deltas relative to last reported totals to avoid double-counting. The `cache_read_tokens` and `cache_write_tokens` fields follow the same cumulative-delta accounting as `input_tokens` / `output_tokens`. Deltas are accumulated from any event carrying a non-zero usage payload, not only `token_usage` events, so an adapter can attach the authoritative run-cumulative snapshot to a turn-finalization event without losing it.
+- Every cost figure Sortie shows prices `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, and `output_tokens` each once, at the rate configured for its own token class: fresh input (`input_tokens` minus the two cache counters, floored at zero) at the input rate, cache reads at the cache-read rate, cache writes at the cache-write rate, and output at the output rate. An unset cache-read or cache-write rate prices that class at the input rate. An agent kind's rate entry prices nothing, and that kind's sessions and runs count as unpriced, unless the entry carries both an input and an output rate.
 - `api_request_count` is incremented monotonically, and only, per `token_usage` event; a usage-bearing terminal event does not count as an additional request. The count is a measurement of API requests only when the session's resolved `usage_arrival` is `incremental` and either a figure has arrived or no turn has begun. A kind resolving `turn_end` settles the count at most once per turn and never measures requests, and a session whose runtime stopped delivering per-request figures reports the count as unmeasured rather than as zero, so a consumer never reads a fabricated zero where the declaration alone promised a request count.
 - `tokens_pending` distinguishes a settled figure from one still in flight: it is true only when the resolved `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for has not yet reached a terminal event. A consumer presenting the current token total alongside this flag can tell an operator the figure excludes the turn in progress, rather than presenting a stale total as final.
 - Accumulate aggregate totals in orchestrator state (`agent_totals`).
@@ -215,7 +217,8 @@ Minimum endpoints:
             "input_tokens": 1200,
             "output_tokens": 800,
             "total_tokens": 2000,
-            "cache_read_tokens": 400
+            "cache_read_tokens": 400,
+            "cache_write_tokens": 100
           },
           "model_name": "claude-sonnet-4-20250514",
           "api_request_count": 3,
@@ -256,6 +259,7 @@ Minimum endpoints:
         "output_tokens": 2400,
         "total_tokens": 7400,
         "cache_read_tokens": 1500,
+        "cache_write_tokens": 300,
         "seconds_running": 1834.2,
         "unmeasured_sessions": 3,
         "running_unreported": 1,
@@ -293,7 +297,8 @@ Minimum endpoints:
           "input_tokens": 1200,
           "output_tokens": 800,
           "total_tokens": 2000,
-          "cache_read_tokens": 400
+          "cache_read_tokens": 400,
+          "cache_write_tokens": 100
         },
         "api_request_count": 3,
         "tokens_measured": true,
@@ -348,7 +353,7 @@ API design notes:
 - Implementations may add fields, but should avoid breaking existing fields within a version.
 - On a running row, `api_request_count` is `null` exactly when `api_requests_measured` is false, the four members of `tokens` are `null` exactly when `tokens_measured` is false, and `requests_by_model` is absent on the first condition and when the attribution names no model.
 - Sortie deviates from the field-stability note above for those five figures, narrowing each from an integer to a nullable one, because a consumer reading a number cannot tell a measured zero from an unmeasured one. A typed consumer is forced to handle the null; an untyped one, in a language where `null` coerces to `0` in arithmetic, is no worse off than it was.
-- `active_estimated_cost_usd`, an implementation extension beyond the baseline shape above, sums the estimated cost of running, measured sessions whose agent kind has a configured token rate; it is omitted when no running, measured session prices. `cost_unpriced_running` sits beside it and counts the running, measured sessions the sum leaves out for want of a rate. It is present, zero included, whenever a token rate is configured for any agent kind, and omitted otherwise, so its presence alone tells a consumer whether cost pricing is configured at all.
+- `active_estimated_cost_usd`, an implementation extension beyond the baseline shape above, sums the estimated cost of running, measured sessions whose agent kind has a configured token rate; it is omitted when no running, measured session prices. `cost_unpriced_running` sits beside it and counts the running, measured sessions the sum leaves out for want of a rate. It is present, zero included, whenever `token_rates` holds an entry for any agent kind, complete or not, and omitted otherwise, so its presence alone tells a consumer whether cost pricing is configured at all.
 - Endpoints should be read-only except for operational triggers like `/refresh`.
 - Unsupported methods on defined routes should return `405 Method Not Allowed`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
@@ -373,7 +378,7 @@ Defined metrics (label sets and buckets are specified here; see ADR-0008 for his
 | `sortie_slots_available` | Gauge | Remaining dispatch capacity under current concurrency limits. |
 | `sortie_active_sessions_elapsed_seconds` | Gauge | Cumulative wall-clock elapsed time across all currently running sessions. |
 | `sortie_ssh_host_usage{host}` | Gauge | Current session count per remote SSH host, partitioned by host. Recomputed from the host-usage map after each tick, worker exit, and retry-timer event; hosts removed by config reload decrement to zero rather than freezing at their last value. |
-| `sortie_tokens_total{type}` | Counter | Tokens consumed, partitioned by type (`input`, `output`). |
+| `sortie_tokens_total{type}` | Counter | Tokens consumed, partitioned by type (`input`, `output`, `cache_read`, `cache_write`). `cache_read` and `cache_write` are subsets of `input`, so summing across every `type` double-counts them. |
 | `sortie_agent_runtime_seconds_total` | Counter | Cumulative agent-session wall-clock time for completed sessions. |
 | `sortie_dispatches_total{outcome}` | Counter | Dispatch attempts, partitioned by outcome (`success`, `error`). |
 | `sortie_worker_exits_total{exit_type}` | Counter | Worker exits, partitioned by exit type (`normal`, `error`, `cancelled`, `soft_stop`). A soft-stop exit reports `soft_stop` rather than the exit kind it would otherwise map to. |
