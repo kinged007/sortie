@@ -397,10 +397,11 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		OutputTokens:     entry.AgentOutputTokens,
 		TotalTokens:      entry.AgentTotalTokens,
 		CacheReadTokens:  entry.CacheReadTokens,
+		CacheWriteTokens: entry.CacheWriteTokens,
 		TokensMeasured:   measured,
 		UnaccountedTurns: workerResult.UnaccountedTurns,
 	}
-	// A row recording no measurement must carry zero in all four token
+	// A row recording no measurement must carry zero in all five token
 	// columns. The reconciliation above can populate them from a worker
 	// figure that never asserted a measurement, so zero explicitly.
 	if !measured {
@@ -408,6 +409,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		runHistory.OutputTokens = 0
 		runHistory.TotalTokens = 0
 		runHistory.CacheReadTokens = 0
+		runHistory.CacheWriteTokens = 0
 	}
 	if workerResult.ReviewMetadata != nil {
 		masked := maskedReviewMetadata(*workerResult.ReviewMetadata)
@@ -450,6 +452,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		OutputTokens:        entry.AgentOutputTokens,
 		TotalTokens:         entry.AgentTotalTokens,
 		CacheReadTokens:     entry.CacheReadTokens,
+		CacheWriteTokens:    entry.CacheWriteTokens,
 		ModelName:           entry.ModelName,
 		APIRequestCount:     requestCount,
 		APIRequestsMeasured: requestsMeasured,
@@ -538,6 +541,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		OutputTokens:       state.AgentTotals.OutputTokens,
 		TotalTokens:        state.AgentTotals.TotalTokens,
 		CacheReadTokens:    state.AgentTotals.CacheReadTokens,
+		CacheWriteTokens:   state.AgentTotals.CacheWriteTokens,
 		SecondsRunning:     state.AgentTotals.SecondsRunning,
 		UnmeasuredSessions: state.AgentTotals.UnmeasuredSessions,
 		UpdatedAt:          now.Format(time.RFC3339),

@@ -43,25 +43,26 @@ const (
 )
 
 // workerState is the .sortie/state.json shape the running agent reads back
-// through its status tool. The four token members are nil together,
+// through its status tool. The five token members are nil together,
 // exactly when TokensMeasured is false, and a nil member serializes as JSON
 // null rather than being omitted, so the agent cannot mistake an unmeasured
 // session for one that spent nothing. The session-start write states a
 // measured zero: no turn has begun, so nothing has been spent.
 type workerState struct {
-	TurnNumber      int    `json:"turn_number"`
-	MaxTurns        int    `json:"max_turns"`
-	Attempt         *int   `json:"attempt"`
-	StartedAt       string `json:"started_at"`
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
-	TokensMeasured  bool   `json:"tokens_measured"`
+	TurnNumber       int    `json:"turn_number"`
+	MaxTurns         int    `json:"max_turns"`
+	Attempt          *int   `json:"attempt"`
+	StartedAt        string `json:"started_at"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	TokensMeasured   bool   `json:"tokens_measured"`
 }
 
 // withTokens returns s carrying the measurement mirror and, when measured,
-// the four figures folded so far. Every state-file write passes through it.
+// the five figures folded so far. Every state-file write passes through it.
 func (s workerState) withTokens(usage domain.TokenUsage, measured bool) workerState {
 	s.TokensMeasured = measured
 	if !measured {
@@ -71,6 +72,7 @@ func (s workerState) withTokens(usage domain.TokenUsage, measured bool) workerSt
 	s.OutputTokens = &usage.OutputTokens
 	s.TotalTokens = &usage.TotalTokens
 	s.CacheReadTokens = &usage.CacheReadTokens
+	s.CacheWriteTokens = &usage.CacheWriteTokens
 	return s
 }
 
@@ -519,22 +521,13 @@ func runBoundedTurn(
 // added to cumulative, and lastUsage is raised to the componentwise max.
 // Confined to the worker goroutine; never touches orchestrator state.
 func foldLocalUsage(usage, cumulative, lastUsage domain.TokenUsage) (newCumulative, newLastUsage domain.TokenUsage) {
-	deltaInput := max(usage.InputTokens-lastUsage.InputTokens, 0)
-	deltaOutput := max(usage.OutputTokens-lastUsage.OutputTokens, 0)
-	deltaTotal := max(usage.TotalTokens-lastUsage.TotalTokens, 0)
-	deltaCacheRead := max(usage.CacheReadTokens-lastUsage.CacheReadTokens, 0)
-
+	delta, newLastUsage := usageDeltaAndWatermark(usage, lastUsage)
 	newCumulative = domain.TokenUsage{
-		InputTokens:     cumulative.InputTokens + deltaInput,
-		OutputTokens:    cumulative.OutputTokens + deltaOutput,
-		TotalTokens:     cumulative.TotalTokens + deltaTotal,
-		CacheReadTokens: cumulative.CacheReadTokens + deltaCacheRead,
-	}
-	newLastUsage = domain.TokenUsage{
-		InputTokens:     max(lastUsage.InputTokens, usage.InputTokens),
-		OutputTokens:    max(lastUsage.OutputTokens, usage.OutputTokens),
-		TotalTokens:     max(lastUsage.TotalTokens, usage.TotalTokens),
-		CacheReadTokens: max(lastUsage.CacheReadTokens, usage.CacheReadTokens),
+		InputTokens:      cumulative.InputTokens + delta.InputTokens,
+		OutputTokens:     cumulative.OutputTokens + delta.OutputTokens,
+		TotalTokens:      cumulative.TotalTokens + delta.TotalTokens,
+		CacheReadTokens:  cumulative.CacheReadTokens + delta.CacheReadTokens,
+		CacheWriteTokens: cumulative.CacheWriteTokens + delta.CacheWriteTokens,
 	}
 	return newCumulative, newLastUsage
 }
@@ -547,10 +540,11 @@ func applyUsageOffset(usage, offset domain.TokenUsage) domain.TokenUsage {
 		return usage
 	}
 	return domain.TokenUsage{
-		InputTokens:     usage.InputTokens + offset.InputTokens,
-		OutputTokens:    usage.OutputTokens + offset.OutputTokens,
-		TotalTokens:     usage.TotalTokens + offset.TotalTokens,
-		CacheReadTokens: usage.CacheReadTokens + offset.CacheReadTokens,
+		InputTokens:      usage.InputTokens + offset.InputTokens,
+		OutputTokens:     usage.OutputTokens + offset.OutputTokens,
+		TotalTokens:      usage.TotalTokens + offset.TotalTokens,
+		CacheReadTokens:  usage.CacheReadTokens + offset.CacheReadTokens,
+		CacheWriteTokens: usage.CacheWriteTokens + offset.CacheWriteTokens,
 	}
 }
 

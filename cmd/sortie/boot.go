@@ -17,6 +17,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/server"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
@@ -25,12 +26,13 @@ const (
 	defaultServerHost = "127.0.0.1"
 )
 
-// agentKindDeprecationAdvisories is the shared advisory hook every
-// [workflow.Manager] the program constructs wires through
-// [workflow.WithAdvisoryFunc], so a workflow reaching a deprecated
-// agent kind draws the same advisory on every load path.
-var agentKindDeprecationAdvisories workflow.AdvisoryFunc = func(cfg config.ServiceConfig) []config.Advisory {
-	return orchestrator.AgentKindDeprecations(cfg, registry.Agents.Meta)
+// workflowAdvisories is the shared advisory hook every [workflow.Manager]
+// the program constructs wires through [workflow.WithAdvisoryFunc], so a
+// workflow reaching a deprecated agent kind or an invalid token_rates
+// entry draws the same advisory on every load path.
+var workflowAdvisories workflow.AdvisoryFunc = func(cfg config.ServiceConfig) []config.Advisory {
+	advisories := orchestrator.AgentKindDeprecations(cfg, registry.Agents.Meta)
+	return append(advisories, server.TokenRateAdvisories(cfg)...)
 }
 
 type bootParams struct {
@@ -160,7 +162,7 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 	mgr, err := workflow.NewManager(path, logger,
 		workflow.WithValidateFunc(orchestrator.ValidateConfigForPromotion),
 		workflow.WithAgentKindProbe(registry.Agents.Has),
-		workflow.WithAdvisoryFunc(agentKindDeprecationAdvisories))
+		workflow.WithAdvisoryFunc(workflowAdvisories))
 	if err != nil {
 		fmt.Fprintf(p.stderr, "sortie: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return bootResult{}, 1

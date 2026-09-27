@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -44,10 +45,11 @@ type dashboardData struct {
 	BudgetExhaustedCount int
 	BudgetExhausted      []dashboardBudgetEntry
 
-	RuntimeDisplay  string
-	InputTokens     int64
-	OutputTokens    int64
-	CacheReadTokens int64
+	RuntimeDisplay   string
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
 
 	HasTokenRates      bool
 	EstimatedCostUSD   *string
@@ -70,6 +72,7 @@ type dashboardRunningEntry struct {
 	LastEvent        string
 	TotalTokens      int64
 	CacheReadTokens  int64
+	CacheWriteTokens int64
 	ModelName        string
 	DetailURL        string
 	Host             string
@@ -369,17 +372,18 @@ func buildDashboardData(
 	}
 
 	data := dashboardData{
-		Version:         version,
-		Uptime:          FormatDuration(uptimeDur),
-		GeneratedAt:     snap.GeneratedAt,
-		RunningCount:    runningCount,
-		RetryingCount:   len(snap.Retrying),
-		AvailableSlots:  available,
-		TotalTokens:     snap.AgentTotals.TotalTokens,
-		RuntimeDisplay:  FormatDuration(time.Duration(snap.AgentTotals.SecondsRunning * float64(time.Second))),
-		InputTokens:     snap.AgentTotals.InputTokens,
-		OutputTokens:    snap.AgentTotals.OutputTokens,
-		CacheReadTokens: snap.AgentTotals.CacheReadTokens,
+		Version:          version,
+		Uptime:           FormatDuration(uptimeDur),
+		GeneratedAt:      snap.GeneratedAt,
+		RunningCount:     runningCount,
+		RetryingCount:    len(snap.Retrying),
+		AvailableSlots:   available,
+		TotalTokens:      snap.AgentTotals.TotalTokens,
+		RuntimeDisplay:   FormatDuration(time.Duration(snap.AgentTotals.SecondsRunning * float64(time.Second))),
+		InputTokens:      snap.AgentTotals.InputTokens,
+		OutputTokens:     snap.AgentTotals.OutputTokens,
+		CacheReadTokens:  snap.AgentTotals.CacheReadTokens,
+		CacheWriteTokens: snap.AgentTotals.CacheWriteTokens,
 	}
 
 	sortedRunning := make([]orchestrator.SnapshotRunningEntry, len(snap.Running))
@@ -416,15 +420,28 @@ func buildDashboardData(
 		var entryCostStr string
 		if hasRates && e.UsageMeasured {
 			if rc, ok := tokenRates[e.AgentKind]; ok {
-				if c := EstimateCost(e.AgentInputTokens, e.AgentOutputTokens, e.CacheReadTokens, &rc); c != nil {
+				usage := domain.TokenUsage{
+					InputTokens:      e.AgentInputTokens,
+					OutputTokens:     e.AgentOutputTokens,
+					CacheReadTokens:  e.CacheReadTokens,
+					CacheWriteTokens: e.CacheWriteTokens,
+				}
+				if c := EstimateCost(usage, &rc); c != nil {
 					entryCostStr = FormatCost(*c)
 				}
 			}
 		}
 
 		tokensStr := FormatInt(e.AgentTotalTokens)
+		var cacheParts []string
 		if e.CacheReadTokens != 0 {
-			tokensStr += " (" + FormatInt(e.CacheReadTokens) + " cached)"
+			cacheParts = append(cacheParts, FormatInt(e.CacheReadTokens)+" cache read")
+		}
+		if e.CacheWriteTokens != 0 {
+			cacheParts = append(cacheParts, FormatInt(e.CacheWriteTokens)+" cache write")
+		}
+		if len(cacheParts) > 0 {
+			tokensStr += " (" + strings.Join(cacheParts, ", ") + ")"
 		}
 
 		running[i] = dashboardRunningEntry{
@@ -435,6 +452,7 @@ func buildDashboardData(
 			LastEvent:         string(e.LastAgentEvent),
 			TotalTokens:       e.AgentTotalTokens,
 			CacheReadTokens:   e.CacheReadTokens,
+			CacheWriteTokens:  e.CacheWriteTokens,
 			ModelName:         e.ModelName,
 			DetailURL:         "/api/v1/" + url.PathEscape(e.Identifier),
 			Host:              e.SSHHost,

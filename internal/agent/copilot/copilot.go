@@ -241,7 +241,7 @@ func (s *sessionState) recoverUsage(logger *slog.Logger) *agentcore.RecoveredUsa
 		return nil
 	}
 
-	return &agentcore.RecoveredUsage{Run: subtractUsage(current, s.baseline), Model: model}
+	return &agentcore.RecoveredUsage{Run: agentcore.SubtractUsage(current, s.baseline), Model: model}
 }
 
 // NewCopilotAdapter creates a [CopilotAdapter] from adapter

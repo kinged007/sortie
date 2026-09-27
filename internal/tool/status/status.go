@@ -39,15 +39,16 @@ var inputSchema = json.RawMessage(`{
 // false and those figures are ignored rather than published under a
 // qualifier that contradicts them.
 type stateFile struct {
-	TurnNumber      int    `json:"turn_number"`
-	MaxTurns        int    `json:"max_turns"`
-	Attempt         *int   `json:"attempt"`
-	StartedAt       string `json:"started_at"`
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
-	TokensMeasured  bool   `json:"tokens_measured"`
+	TurnNumber       int    `json:"turn_number"`
+	MaxTurns         int    `json:"max_turns"`
+	Attempt          *int   `json:"attempt"`
+	StartedAt        string `json:"started_at"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	TokensMeasured   bool   `json:"tokens_measured"`
 }
 
 type statusResponse struct {
@@ -60,14 +61,15 @@ type statusResponse struct {
 	TokensMeasured         bool    `json:"tokens_measured"`
 }
 
-// tokens carries the session's four token figures. The members are
+// tokens carries the session's five token figures. The members are
 // nil together, exactly when the response's TokensMeasured is false,
 // and each serializes as JSON null rather than being omitted.
 type tokens struct {
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
 }
 
 // StatusTool implements [domain.AgentTool] for the sortie_status tool.
@@ -144,10 +146,11 @@ func (t *StatusTool) Execute(_ context.Context, _ json.RawMessage) (json.RawMess
 	}
 	if sf.TokensMeasured {
 		resp.Tokens = tokens{
-			InputTokens:     sf.InputTokens,
-			OutputTokens:    sf.OutputTokens,
-			TotalTokens:     sf.TotalTokens,
-			CacheReadTokens: sf.CacheReadTokens,
+			InputTokens:      sf.InputTokens,
+			OutputTokens:     sf.OutputTokens,
+			TotalTokens:      sf.TotalTokens,
+			CacheReadTokens:  sf.CacheReadTokens,
+			CacheWriteTokens: sf.CacheWriteTokens,
 		}
 	}
 

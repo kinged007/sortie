@@ -151,6 +151,7 @@ func shutdownTotals(evt shutdownEvent) domain.TokenUsage {
 			usage.InputTokens += model.Usage.InputTokens
 			usage.OutputTokens += model.Usage.OutputTokens
 			usage.CacheReadTokens += model.Usage.CacheReadTokens
+			usage.CacheWriteTokens += model.Usage.CacheWriteTokens
 		}
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 		return usage
@@ -160,21 +161,10 @@ func shutdownTotals(evt shutdownEvent) domain.TokenUsage {
 	input := details["input"].TokenCount + details["cache_read"].TokenCount + details["cache_write"].TokenCount
 	output := details["output"].TokenCount
 	return domain.TokenUsage{
-		InputTokens:     input,
-		OutputTokens:    output,
-		TotalTokens:     input + output,
-		CacheReadTokens: details["cache_read"].TokenCount,
+		InputTokens:      input,
+		OutputTokens:     output,
+		TotalTokens:      input + output,
+		CacheReadTokens:  details["cache_read"].TokenCount,
+		CacheWriteTokens: details["cache_write"].TokenCount,
 	}
-}
-
-// subtractUsage returns a minus b componentwise, floored at zero, with
-// TotalTokens recomputed as InputTokens plus OutputTokens.
-func subtractUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens-b.InputTokens, 0),
-		OutputTokens:    max(a.OutputTokens-b.OutputTokens, 0),
-		CacheReadTokens: max(a.CacheReadTokens-b.CacheReadTokens, 0),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
 }

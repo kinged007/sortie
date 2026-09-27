@@ -68,15 +68,16 @@ type runningEntryResponse struct {
 	APIRequestsMeasured bool   `json:"api_requests_measured"`
 }
 
-// tokenInfo carries a running row's four token figures. The members
+// tokenInfo carries a running row's five token figures. The members
 // are nil together, exactly when the row's TokensMeasured is false,
 // and a nil member serializes as JSON null rather than being omitted,
 // so a consumer can tell a measured zero from an unmeasured figure.
 type tokenInfo struct {
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
 }
 
 type retryEntryResponse struct {
@@ -169,10 +170,11 @@ func toRunningEntryResponse(e orchestrator.SnapshotRunningEntry, nowArgs ...time
 	// occupies, beside the flag that explains it.
 	if e.UsageMeasured {
 		resp.Tokens = tokenInfo{
-			InputTokens:     &e.AgentInputTokens,
-			OutputTokens:    &e.AgentOutputTokens,
-			TotalTokens:     &e.AgentTotalTokens,
-			CacheReadTokens: &e.CacheReadTokens,
+			InputTokens:      &e.AgentInputTokens,
+			OutputTokens:     &e.AgentOutputTokens,
+			TotalTokens:      &e.AgentTotalTokens,
+			CacheReadTokens:  &e.CacheReadTokens,
+			CacheWriteTokens: &e.CacheWriteTokens,
 		}
 	}
 	if e.APIRequestsMeasured {

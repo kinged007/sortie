@@ -889,14 +889,14 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 					turnID = p.TurnID
 				}
 				if p.TurnID != turnID {
-					state.baseline = maxUsage(state.baseline, normalizeBreakdown(p.TokenUsage.Total))
+					state.baseline = agentcore.MaxUsage(state.baseline, normalizeBreakdown(p.TokenUsage.Total))
 					continue
 				}
 				if !state.baselineSet {
-					state.baseline = subtractUsage(normalizeBreakdown(p.TokenUsage.Total), normalizeBreakdown(p.TokenUsage.Last))
+					state.baseline = agentcore.SubtractUsage(normalizeBreakdown(p.TokenUsage.Total), normalizeBreakdown(p.TokenUsage.Last))
 					state.baselineSet = true
 				}
-				snapshot := state.acc.SetRunCumulative(subtractUsage(normalizeBreakdown(p.TokenUsage.Total), state.baseline))
+				snapshot := state.acc.SetRunCumulative(agentcore.SubtractUsage(normalizeBreakdown(p.TokenUsage.Total), state.baseline))
 				params.OnEvent(domain.AgentEvent{
 					Type:      domain.EventTokenUsage,
 					Timestamp: now,

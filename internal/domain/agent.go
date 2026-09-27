@@ -53,6 +53,11 @@ type TokenUsage struct {
 	// added to any other counter. Zero when the adapter reports no cache
 	// data.
 	CacheReadTokens int64
+
+	// CacheWriteTokens counts input tokens written to the prompt cache.
+	// It is disjoint from CacheReadTokens, never added to any other
+	// counter, and zero when the runtime reports no cache-write count.
+	CacheWriteTokens int64
 }
 
 // AgentEvent is a normalized event emitted by an agent adapter over the

@@ -37,10 +37,11 @@ type RunHistory struct {
 	RuleName       string  // Frozen at initial dispatch; empty for legacy rows and fallback dispatches.
 	TemplateID     string  // Frozen at initial dispatch; empty for legacy rows and the workflow body template.
 
-	InputTokens     int64 // 0 for pre-migration rows.
-	OutputTokens    int64 // 0 for pre-migration rows.
-	TotalTokens     int64 // 0 for pre-migration rows.
-	CacheReadTokens int64 // 0 for pre-migration rows.
+	InputTokens      int64 // 0 for pre-migration rows.
+	OutputTokens     int64 // 0 for pre-migration rows.
+	TotalTokens      int64 // 0 for pre-migration rows.
+	CacheReadTokens  int64 // 0 for pre-migration rows.
+	CacheWriteTokens int64 // 0 for pre-migration rows.
 
 	// TokensMeasured is true when the token columns carry a runtime-reported
 	// figure and false when spend is unknown rather than zero. Every writer
@@ -80,12 +81,12 @@ func (s *Store) AppendRunHistory(ctx context.Context, run RunHistory) (RunHistor
 
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO run_history
-			(issue_id, identifier, display_identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured, unaccounted_turns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(issue_id, identifier, display_identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.IssueID, run.Identifier, dispIDVal, run.Attempt, run.AgentAdapter,
 		run.Workspace, run.StartedAt, run.CompletedAt, run.Status, errVal, wfVal,
 		run.TurnsCompleted, reviewMetaVal, run.RuleName, run.TemplateID,
-		run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens, run.TokensMeasured,
+		run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens, run.CacheWriteTokens, run.TokensMeasured,
 		run.UnaccountedTurns,
 	)
 	if err != nil {
@@ -106,7 +107,7 @@ func (s *Store) QueryRunHistoryByIssue(ctx context.Context, issueID string) ([]R
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 			started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-			input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured, unaccounted_turns
+			input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 		FROM run_history
 		WHERE issue_id = ?
 		ORDER BY id DESC`, issueID)
@@ -123,7 +124,7 @@ func (s *Store) QueryRunHistoryByIssue(ctx context.Context, issueID string) ([]R
 			&r.ID, &r.IssueID, &r.Identifier, &dispIDVal, &r.Attempt, &r.AgentAdapter,
 			&r.Workspace, &r.StartedAt, &r.CompletedAt, &r.Status, &errVal, &wfVal,
 			&r.TurnsCompleted, &reviewMetaVal, &r.RuleName, &r.TemplateID,
-			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.TokensMeasured,
+			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.TokensMeasured,
 			&r.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("scan run history: %w", err)
@@ -178,7 +179,7 @@ func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context,
 		SELECT r.id, r.issue_id, r.identifier, r.display_identifier, r.attempt, r.agent_adapter,
 			r.workspace, r.started_at, r.completed_at, r.status, r.error, r.workflow_file,
 			r.turns_completed, r.review_metadata, r.rule_name, r.template_id,
-			r.input_tokens, r.output_tokens, r.total_tokens, r.cache_read_tokens, r.tokens_measured,
+			r.input_tokens, r.output_tokens, r.total_tokens, r.cache_read_tokens, r.cache_write_tokens, r.tokens_measured,
 			r.unaccounted_turns
 		FROM run_history AS r
 		JOIN bounded ON bounded.latest_id = r.id
@@ -196,7 +197,7 @@ func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context,
 			&run.ID, &run.IssueID, &run.Identifier, &dispIDVal, &run.Attempt, &run.AgentAdapter,
 			&run.Workspace, &run.StartedAt, &run.CompletedAt, &run.Status, &errVal, &wfVal,
 			&run.TurnsCompleted, &reviewMetaVal, &run.RuleName, &run.TemplateID,
-			&run.InputTokens, &run.OutputTokens, &run.TotalTokens, &run.CacheReadTokens, &run.TokensMeasured,
+			&run.InputTokens, &run.OutputTokens, &run.TotalTokens, &run.CacheReadTokens, &run.CacheWriteTokens, &run.TokensMeasured,
 			&run.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("load recovery runs: %w", err)
@@ -236,7 +237,7 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 				started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-				input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured, unaccounted_turns
+				input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 			FROM run_history
 			WHERE id < ?
 			ORDER BY id DESC
@@ -245,7 +246,7 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 				started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-				input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured, unaccounted_turns
+				input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 			FROM run_history
 			ORDER BY id DESC
 			LIMIT ?`, limit)
@@ -263,7 +264,7 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 			&r.ID, &r.IssueID, &r.Identifier, &dispIDVal, &r.Attempt, &r.AgentAdapter,
 			&r.Workspace, &r.StartedAt, &r.CompletedAt, &r.Status, &errVal, &wfVal,
 			&r.TurnsCompleted, &reviewMetaVal, &r.RuleName, &r.TemplateID,
-			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.TokensMeasured,
+			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.TokensMeasured,
 			&r.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("scan run history: %w", err)

@@ -638,6 +638,10 @@
           title="Prompt cache read tokens — served from cache, not reprocessed"
           >Cache Read: {{fmtInt .CacheReadTokens}}</span
         >
+        &middot;
+        <span title="Prompt cache write tokens, stored for reuse by later requests"
+          >Cache Write: {{fmtInt .CacheWriteTokens}}</span
+        >
         &middot; Output: {{fmtInt .OutputTokens}}{{if .HasTokenRates}}
         &middot; Est. Cost: {{if .EstimatedCostUSD}}{{.EstimatedCostUSD}}{{else}}&mdash;{{end}}{{end}}
       </div>

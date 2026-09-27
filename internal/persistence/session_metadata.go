@@ -12,16 +12,17 @@ import (
 // session ID, process ID, and accumulated token counters at the time of
 // the last update.
 type SessionMetadata struct {
-	IssueID         string  // Tracker-internal issue ID (primary key).
-	SessionID       string  // Last session ID assigned by the agent adapter.
-	AgentPID        *string // Last known agent PID; nil when unknown.
-	InputTokens     int64   // Accumulated input tokens for the session.
-	OutputTokens    int64   // Accumulated output tokens for the session.
-	TotalTokens     int64   // Accumulated total tokens for the session.
-	CacheReadTokens int64   // Accumulated cache-read tokens for the session.
-	ModelName       string  // Last reported LLM model identifier.
-	APIRequestCount int     // Measured model API requests; zero when APIRequestsMeasured is false.
-	UpdatedAt       string  // ISO-8601 timestamp of last update.
+	IssueID          string  // Tracker-internal issue ID (primary key).
+	SessionID        string  // Last session ID assigned by the agent adapter.
+	AgentPID         *string // Last known agent PID; nil when unknown.
+	InputTokens      int64   // Accumulated input tokens for the session.
+	OutputTokens     int64   // Accumulated output tokens for the session.
+	TotalTokens      int64   // Accumulated total tokens for the session.
+	CacheReadTokens  int64   // Accumulated cache-read tokens for the session.
+	CacheWriteTokens int64   // Accumulated cache-write tokens for the session.
+	ModelName        string  // Last reported LLM model identifier.
+	APIRequestCount  int     // Measured model API requests; zero when APIRequestsMeasured is false.
+	UpdatedAt        string  // ISO-8601 timestamp of last update.
 
 	// APIRequestsMeasured is true when APIRequestCount is a
 	// measurement of model API requests. False when nothing counted
@@ -49,9 +50,9 @@ func (s *Store) UpsertSessionMetadata(ctx context.Context, meta SessionMetadata)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO session_metadata
 			(issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
-			 cache_read_tokens, model_name, api_request_count, api_requests_measured,
+			 cache_read_tokens, cache_write_tokens, model_name, api_request_count, api_requests_measured,
 			 dispatch_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (issue_id) DO UPDATE SET
 			session_id        = excluded.session_id,
 			agent_pid         = excluded.agent_pid,
@@ -59,6 +60,7 @@ func (s *Store) UpsertSessionMetadata(ctx context.Context, meta SessionMetadata)
 			output_tokens     = excluded.output_tokens,
 			total_tokens      = excluded.total_tokens,
 			cache_read_tokens = excluded.cache_read_tokens,
+			cache_write_tokens = excluded.cache_write_tokens,
 			model_name        = excluded.model_name,
 			api_request_count = excluded.api_request_count,
 			api_requests_measured = excluded.api_requests_measured,
@@ -66,7 +68,7 @@ func (s *Store) UpsertSessionMetadata(ctx context.Context, meta SessionMetadata)
 			updated_at        = excluded.updated_at`,
 		meta.IssueID, meta.SessionID, nullPID,
 		meta.InputTokens, meta.OutputTokens, meta.TotalTokens,
-		meta.CacheReadTokens, meta.ModelName, meta.APIRequestCount,
+		meta.CacheReadTokens, meta.CacheWriteTokens, meta.ModelName, meta.APIRequestCount,
 		meta.APIRequestsMeasured, meta.DispatchID, meta.UpdatedAt,
 	)
 	if err != nil {
@@ -84,13 +86,13 @@ func (s *Store) LoadSessionMetadata(ctx context.Context, issueID string) (Sessio
 
 	err := s.db.QueryRowContext(ctx,
 		`SELECT issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
-		        cache_read_tokens, model_name, api_request_count, api_requests_measured,
+		        cache_read_tokens, cache_write_tokens, model_name, api_request_count, api_requests_measured,
 		        dispatch_id, updated_at
 		FROM session_metadata
 		WHERE issue_id = ?`, issueID,
 	).Scan(&m.IssueID, &m.SessionID, &nullPID,
 		&m.InputTokens, &m.OutputTokens, &m.TotalTokens,
-		&m.CacheReadTokens, &m.ModelName, &m.APIRequestCount,
+		&m.CacheReadTokens, &m.CacheWriteTokens, &m.ModelName, &m.APIRequestCount,
 		&m.APIRequestsMeasured, &m.DispatchID, &m.UpdatedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
@@ -111,7 +113,7 @@ func (s *Store) LoadSessionMetadata(ctx context.Context, issueID string) (Sessio
 func (s *Store) LoadAllSessionMetadata(ctx context.Context) ([]SessionMetadata, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT issue_id, session_id, agent_pid, input_tokens, output_tokens, total_tokens,
-		        cache_read_tokens, model_name, api_request_count, api_requests_measured,
+		        cache_read_tokens, cache_write_tokens, model_name, api_request_count, api_requests_measured,
 		        dispatch_id, updated_at
 		FROM session_metadata
 		ORDER BY updated_at DESC, issue_id ASC`)
@@ -126,7 +128,7 @@ func (s *Store) LoadAllSessionMetadata(ctx context.Context) ([]SessionMetadata, 
 		var nullPID sql.NullString
 		if err := rows.Scan(&m.IssueID, &m.SessionID, &nullPID,
 			&m.InputTokens, &m.OutputTokens, &m.TotalTokens,
-			&m.CacheReadTokens, &m.ModelName, &m.APIRequestCount,
+			&m.CacheReadTokens, &m.CacheWriteTokens, &m.ModelName, &m.APIRequestCount,
 			&m.APIRequestsMeasured, &m.DispatchID, &m.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan session metadata: %w", err)
 		}

@@ -74,12 +74,13 @@ type statsDuration struct {
 	Samples int      `json:"samples"`
 }
 
-// statsTokens reports the four token sums as stored, never recomputed.
+// statsTokens reports the five token sums as stored, never recomputed.
 type statsTokens struct {
-	Input     int64 `json:"input"`
-	Output    int64 `json:"output"`
-	Total     int64 `json:"total"`
-	CacheRead int64 `json:"cache_read"`
+	Input      int64 `json:"input"`
+	Output     int64 `json:"output"`
+	Total      int64 `json:"total"`
+	CacheRead  int64 `json:"cache_read"`
+	CacheWrite int64 `json:"cache_write"`
 }
 
 // statsGroup is one row of a by_status, by_adapter, by_rule, or
@@ -171,7 +172,13 @@ func priceOf(row persistence.RunStatsRow, rates server.TokenRates) *float64 {
 	if !ok {
 		return nil
 	}
-	return server.EstimateCost(row.InputTokens, row.OutputTokens, row.CacheReadTokens, &rc)
+	usage := domain.TokenUsage{
+		InputTokens:      row.InputTokens,
+		OutputTokens:     row.OutputTokens,
+		CacheReadTokens:  row.CacheReadTokens,
+		CacheWriteTokens: row.CacheWriteTokens,
+	}
+	return server.EstimateCost(usage, &rc)
 }
 
 // statsSelfReviewAccum accumulates the self-review folding state across
@@ -357,6 +364,7 @@ func (a *statsAggregator) add(row persistence.RunStatsRow) error {
 				g.tokens.Output += row.OutputTokens
 				g.tokens.Total += row.TotalTokens
 				g.tokens.CacheRead += row.CacheReadTokens
+				g.tokens.CacheWrite += row.CacheWriteTokens
 				g.measuredRuns++
 				if isSucceeded {
 					g.succeededMeasured++
@@ -366,6 +374,7 @@ func (a *statsAggregator) add(row persistence.RunStatsRow) error {
 			a.total.tokens.Output += row.OutputTokens
 			a.total.tokens.Total += row.TotalTokens
 			a.total.tokens.CacheRead += row.CacheReadTokens
+			a.total.tokens.CacheWrite += row.CacheWriteTokens
 			a.total.measuredRuns++
 			if isSucceeded {
 				a.total.succeededMeasured++
@@ -659,14 +668,15 @@ func formatStatsDuration(d statsDuration) string {
 		formatSecondsDash(d.P50), formatSecondsDash(d.P95), formatSecondsDash(d.Mean), d.Samples)
 }
 
-// formatStatsTokens renders a statsTokens's four sums on one line, or
+// formatStatsTokens renders a statsTokens's five sums on one line, or
 // "-" when t is nil.
 func formatStatsTokens(t *statsTokens) string {
 	if t == nil {
 		return "-"
 	}
-	return fmt.Sprintf("input %s   output %s   total %s   cache read %s",
-		server.FormatInt(t.Input), server.FormatInt(t.Output), server.FormatInt(t.Total), server.FormatInt(t.CacheRead))
+	return fmt.Sprintf("input %s   output %s   total %s   cache read %s   cache write %s",
+		server.FormatInt(t.Input), server.FormatInt(t.Output), server.FormatInt(t.Total),
+		server.FormatInt(t.CacheRead), server.FormatInt(t.CacheWrite))
 }
 
 // formatTokensTotalDash renders only t's Total field, or "-" when t is

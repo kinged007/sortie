@@ -131,7 +131,6 @@ type rawStepFinishPart struct {
 	Type      string         `json:"type"`
 	Reason    string         `json:"reason"`
 	Tokens    *rawStepTokens `json:"tokens,omitempty"`
-	Cost      float64        `json:"cost,omitempty"`
 }
 
 type rawStepTokens struct {
@@ -148,12 +147,12 @@ type rawCacheUsage struct {
 }
 
 type exportUsage struct {
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	CacheReadTokens int64
-	Model           string
-	Cost            float64
+	InputTokens      int64
+	OutputTokens     int64
+	TotalTokens      int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	Model            string
 
 	// Recovered reports whether the export produced a figure at all,
 	// which is not the same question as whether that figure is non-zero.
@@ -324,6 +323,7 @@ func parseSessionExport(data []byte, sessionID string, sinceUnixMS int64) export
 		sum.InputTokens += inputTokens + cacheReadTokens + cacheWriteTokens
 		sum.OutputTokens += outputTokens + reasoningTokens
 		sum.CacheReadTokens += cacheReadTokens
+		sum.CacheWriteTokens += cacheWriteTokens
 		kept = true
 
 		model := mapFromAny(message["model"])
@@ -331,9 +331,6 @@ func parseSessionExport(data []byte, sessionID string, sinceUnixMS int64) export
 		modelID := stringFromAny(model["id"])
 		if providerID != "" && modelID != "" {
 			sum.Model = providerID + "/" + modelID
-		}
-		if cost, ok := float64FromAny(message["cost"]); ok {
-			sum.Cost = cost
 		}
 	}
 	if !kept {
@@ -456,8 +453,8 @@ func hasProviderModel(entries []string, provider string) bool {
 // info.time.created is present, parseable, and greater than or equal to
 // sinceUnixMS are counted; sinceUnixMS of 0 counts every matching
 // message. A message without a tokens object is skipped. The reported
-// model and cost come from the last kept message. Returns the zero
-// exportUsage on any parse failure or when no message is kept.
+// model comes from the last kept message. Returns the zero exportUsage
+// on any parse failure or when no message is kept.
 func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportUsage {
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -527,15 +524,13 @@ func parseExportOutput(data []byte, sessionID string, sinceUnixMS int64) exportU
 		sum.InputTokens += inputTokens + cacheReadTokens + cacheWriteTokens
 		sum.OutputTokens += outputTokens + reasoningTokens
 		sum.CacheReadTokens += cacheReadTokens
+		sum.CacheWriteTokens += cacheWriteTokens
 		kept = true
 
 		providerID := stringFromAny(info["providerID"])
 		modelID := stringFromAny(info["modelID"])
 		if providerID != "" && modelID != "" {
 			sum.Model = providerID + "/" + modelID
-		}
-		if cost, ok := float64FromAny(info["cost"]); ok {
-			sum.Cost = cost
 		}
 	}
 	if !kept {
@@ -592,27 +587,6 @@ func int64FromAny(value any) (int64, bool) {
 		return int64(typed), true
 	case json.Number:
 		value, err := typed.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return value, true
-	default:
-		return 0, false
-	}
-}
-
-func float64FromAny(value any) (float64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return float64(typed), true
-	case int32:
-		return float64(typed), true
-	case int64:
-		return float64(typed), true
-	case float64:
-		return typed, true
-	case json.Number:
-		value, err := typed.Float64()
 		if err != nil {
 			return 0, false
 		}
