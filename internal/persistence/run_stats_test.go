@@ -407,4 +407,43 @@ func TestScanRunHistoryRange(t *testing.T) {
 			t.Errorf("RunStatsRow token fields = %+v, want all zero (base projection)", got)
 		}
 	})
+
+	t.Run("full projection with HasCacheWriteTokens reads a non-zero cache-write figure", func(t *testing.T) {
+		t.Parallel()
+
+		s := openTestStore(t)
+		migrateOrFatal(t, s)
+		ctx := context.Background()
+
+		row := runAt("cache-write-row", "2026-01-01T00:00:00Z")
+		row.CacheReadTokens = 154053
+		row.CacheWriteTokens = 38948
+		row.TokensMeasured = true
+		appendOrFatal(t, s, row)
+
+		caps, err := s.RunHistoryCapabilities(ctx)
+		if err != nil {
+			t.Fatalf("RunHistoryCapabilities: %v", err)
+		}
+		if !caps.HasCacheWriteTokens {
+			t.Fatalf("HasCacheWriteTokens = false, want true for a freshly migrated store")
+		}
+		if !caps.Full() {
+			t.Fatalf("caps.Full() = false, want true (HasCacheWriteTokens is not part of the schema-tier decision)")
+		}
+
+		var got []RunStatsRow
+		if err := s.ScanRunHistoryRange(ctx, caps, nil, nil, func(row RunStatsRow) error {
+			got = append(got, row)
+			return nil
+		}); err != nil {
+			t.Fatalf("ScanRunHistoryRange: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("ScanRunHistoryRange visited %d rows, want 1", len(got))
+		}
+		if got[0].CacheWriteTokens != 38948 {
+			t.Errorf("RunStatsRow.CacheWriteTokens = %d, want 38948", got[0].CacheWriteTokens)
+		}
+	})
 }

@@ -210,6 +210,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"cache_read_tokens", "INTEGER", true, 0},
 				{"tokens_measured", "INTEGER", true, 0},
 				{"unaccounted_turns", "INTEGER", true, 0},
+				{"cache_write_tokens", "INTEGER", true, 0},
 			},
 		},
 		{
@@ -227,6 +228,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"api_request_count", "INTEGER", true, 0},
 				{"api_requests_measured", "INTEGER", true, 0},
 				{"dispatch_id", "TEXT", true, 0},
+				{"cache_write_tokens", "INTEGER", true, 0},
 			},
 		},
 		{
@@ -240,6 +242,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"updated_at", "TEXT", true, 0},
 				{"cache_read_tokens", "INTEGER", true, 0},
 				{"unmeasured_sessions", "INTEGER", true, 0},
+				{"cache_write_tokens", "INTEGER", true, 0},
 			},
 		},
 	}
@@ -354,6 +357,55 @@ func TestMigrate_Migration018_UnmeasuredSessionsDefault(t *testing.T) {
 	}
 	if unmeasured != 0 {
 		t.Errorf("aggregate_metrics.unmeasured_sessions default = %d, want 0", unmeasured)
+	}
+}
+
+// TestMigrate_Migration020_CacheWriteTokensDefault verifies migration
+// 020 applies cleanly against a database already seeded through
+// migration 019, and that a row written before it reads
+// cache_write_tokens zero on all three tables it touches.
+func TestMigrate_Migration020_CacheWriteTokensDefault(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 19)
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status)
+		 VALUES ('rh-pre020', 'MT-020', 1, 'mock', '/tmp', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'succeeded')`,
+	); err != nil {
+		t.Fatalf("insert pre-migration-020 run_history row: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO session_metadata (issue_id, session_id, updated_at) VALUES ('sm-pre020', 'sess-pre020', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatalf("insert pre-migration-020 session_metadata row: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO aggregate_metrics (key, updated_at) VALUES ('agent_totals', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatalf("insert pre-migration-020 aggregate_metrics row: %v", err)
+	}
+
+	migrateOrFatal(t, s)
+
+	tests := []struct {
+		table string
+		query string
+	}{
+		{"run_history", `SELECT cache_write_tokens FROM run_history WHERE issue_id = 'rh-pre020'`},
+		{"session_metadata", `SELECT cache_write_tokens FROM session_metadata WHERE issue_id = 'sm-pre020'`},
+		{"aggregate_metrics", `SELECT cache_write_tokens FROM aggregate_metrics WHERE key = 'agent_totals'`},
+	}
+	for _, tt := range tests {
+		var got int64
+		if err := s.db.QueryRowContext(ctx, tt.query).Scan(&got); err != nil {
+			t.Fatalf("query %s.cache_write_tokens: %v", tt.table, err)
+		}
+		if got != 0 {
+			t.Errorf("%s.cache_write_tokens for a pre-migration-020 row = %d, want 0", tt.table, got)
+		}
 	}
 }
 

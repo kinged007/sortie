@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -1234,6 +1236,130 @@ func TestApplyUsageDelta_RepeatedCumulative_AppliesZeroDelta(t *testing.T) {
 	if state.AgentTotals.TotalTokens != usage.TotalTokens {
 		t.Errorf("AgentTotals.TotalTokens after repeated cumulative = %d, want %d (no double count)", state.AgentTotals.TotalTokens, usage.TotalTokens)
 	}
+}
+
+// tokenUsageComponentFields returns the domain.TokenUsage int64 field
+// names every shared fold combines componentwise, excluding
+// TotalTokens, which each fold recomputes from InputTokens plus
+// OutputTokens rather than carrying independently. A future counter
+// added to the struct is picked up here with no change needed, so a
+// fold that forgets to carry it fails immediately.
+func tokenUsageComponentFields(t *testing.T) []string {
+	t.Helper()
+
+	var names []string
+	for f := range reflect.TypeFor[domain.TokenUsage]().Fields() {
+		if f.Type.Kind() != reflect.Int64 || f.Name == "TotalTokens" {
+			continue
+		}
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+// markerTokenUsage builds a domain.TokenUsage whose every component in
+// fields carries a distinct, non-zero value derived from its position,
+// so a fold that silently drops one component produces a detectably
+// wrong result rather than a coincidental match against a shared
+// constant.
+func markerTokenUsage(fields []string) domain.TokenUsage {
+	var usage domain.TokenUsage
+	v := reflect.ValueOf(&usage).Elem()
+	for i, name := range fields {
+		v.FieldByName(name).SetInt(int64(1000 + i*137))
+	}
+	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	return usage
+}
+
+// assertComponentsSurvive fails t unless got carries, for every field
+// named in fields, the same value want does, and unless got.TotalTokens
+// equals got.InputTokens plus got.OutputTokens.
+func assertComponentsSurvive(t *testing.T, subject string, fields []string, want, got domain.TokenUsage) {
+	t.Helper()
+
+	wv := reflect.ValueOf(want)
+	gv := reflect.ValueOf(got)
+	for _, name := range fields {
+		wantVal := wv.FieldByName(name).Int()
+		gotVal := gv.FieldByName(name).Int()
+		if gotVal != wantVal {
+			t.Errorf("%s: field %s = %d, want %d (component dropped)", subject, name, gotVal, wantVal)
+		}
+	}
+	if got.TotalTokens != got.InputTokens+got.OutputTokens {
+		t.Errorf("%s: TotalTokens = %d, want InputTokens+OutputTokens = %d", subject, got.TotalTokens, got.InputTokens+got.OutputTokens)
+	}
+}
+
+// TestTokenUsageComponentsSurviveEveryFold enumerates domain.TokenUsage's
+// int64 components by reflection and drives a marker value, distinct
+// per component, through every shared arithmetic helper and
+// orchestrator fold that combines two domain.TokenUsage values. Each
+// call folds the marker against the zero value, so a fold that carries
+// a component correctly reproduces the marker's own value for it; one
+// that drops a component reports zero instead, and this test catches
+// that without needing an update when the counter set changes, because
+// it discovers the fields itself rather than naming them.
+func TestTokenUsageComponentsSurviveEveryFold(t *testing.T) {
+	t.Parallel()
+
+	fields := tokenUsageComponentFields(t)
+	if len(fields) == 0 {
+		t.Fatal("reflection found no domain.TokenUsage int64 component fields")
+	}
+	marker := markerTokenUsage(fields)
+
+	t.Run("agentcore.SubtractUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.SubtractUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "SubtractUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.MaxUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.MaxUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "MaxUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.AddUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.AddUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "AddUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.RunUsage clamp", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.NewRunUsage().SetRunCumulative(marker)
+		assertComponentsSurvive(t, "RunUsage.SetRunCumulative", fields, marker, got)
+	})
+
+	t.Run("applyUsageDelta", func(t *testing.T) {
+		t.Parallel()
+		state, entry := newStateWithEntry("MT-REFLECT-DELTA")
+		got := applyUsageDelta(state, entry, marker, &domain.NoopMetrics{})
+		assertComponentsSurvive(t, "applyUsageDelta return value", fields, marker, got)
+
+		entryUsage := domain.TokenUsage{
+			InputTokens: entry.AgentInputTokens, OutputTokens: entry.AgentOutputTokens,
+			TotalTokens: entry.AgentTotalTokens, CacheReadTokens: entry.CacheReadTokens,
+			CacheWriteTokens: entry.CacheWriteTokens,
+		}
+		assertComponentsSurvive(t, "applyUsageDelta entry accumulation", fields, marker, entryUsage)
+	})
+
+	t.Run("foldLocalUsage", func(t *testing.T) {
+		t.Parallel()
+		gotCumulative, gotLastUsage := foldLocalUsage(marker, domain.TokenUsage{}, domain.TokenUsage{})
+		assertComponentsSurvive(t, "foldLocalUsage cumulative", fields, marker, gotCumulative)
+		assertComponentsSurvive(t, "foldLocalUsage watermark", fields, marker, gotLastUsage)
+	})
+
+	t.Run("applyUsageOffset", func(t *testing.T) {
+		t.Parallel()
+		got := applyUsageOffset(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "applyUsageOffset", fields, marker, got)
+	})
 }
 
 // TestHandleAgentEvent_ModelTracking_NoModel verifies that when no model

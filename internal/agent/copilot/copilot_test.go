@@ -1329,7 +1329,7 @@ func TestRunTurn_SessionStateRecovery_FirstRecord(t *testing.T) {
 		t.Fatalf("result.SessionID = %q, want %q", result.SessionID, sessionID)
 	}
 
-	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053}
+	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
 	if result.Usage != wantUsage {
 		t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantUsage)
 	}
@@ -1367,7 +1367,7 @@ func TestRunTurn_SessionStateRecovery_BaselineDifference(t *testing.T) {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
 
-	wantUsage := domain.TokenUsage{InputTokens: 78913, OutputTokens: 100, TotalTokens: 79013, CacheReadTokens: 78279}
+	wantUsage := domain.TokenUsage{InputTokens: 78913, OutputTokens: 100, TotalTokens: 79013, CacheReadTokens: 78279, CacheWriteTokens: 630}
 	if result.Usage != wantUsage {
 		t.Errorf("TurnResult.Usage = %+v, want %+v (difference between the two records)", result.Usage, wantUsage)
 	}
@@ -1463,7 +1463,7 @@ func TestRunTurn_SessionStateRecovery_JournalGoneNextTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunTurn(first) error = %v", err)
 	}
-	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053}
+	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
 	if result1.Usage != wantUsage {
 		t.Fatalf("RunTurn(first).Usage = %+v, want %+v", result1.Usage, wantUsage)
 	}

@@ -78,6 +78,9 @@ var contractBanTable = map[string]string{
 	"buildSSHRemoteCommand":  "agentcore.LaunchTarget.SSHOptions",
 	"truncateRunes":          "redact.Truncate",
 	"TruncateRunes":          "redact.Truncate",
+	"subtractUsage":          "agentcore.SubtractUsage",
+	"maxUsage":               "agentcore.MaxUsage",
+	"componentwiseMaxUsage":  "agentcore.MaxUsage",
 }
 
 // contractTrackerAdapterMethods are the tracker operation methods rule

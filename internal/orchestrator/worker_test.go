@@ -2278,8 +2278,8 @@ func TestRunWorkerAttempt_TurnEndPairZeroAddedDelta(t *testing.T) {
 	cfg.Agent.MaxTurns = 2
 
 	const model = "claude-sonnet-5"
-	s1 := domain.TokenUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120, CacheReadTokens: 5}
-	s2 := domain.TokenUsage{InputTokens: 250, OutputTokens: 55, TotalTokens: 305, CacheReadTokens: 12}
+	s1 := domain.TokenUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120, CacheReadTokens: 5, CacheWriteTokens: 2}
+	s2 := domain.TokenUsage{InputTokens: 250, OutputTokens: 55, TotalTokens: 305, CacheReadTokens: 12, CacheWriteTokens: 6}
 
 	var turnNumber atomic.Int64
 	ec := newExitCapture()
@@ -4277,7 +4277,7 @@ func readWorkerStateFile(t *testing.T, wsPath string) workerState {
 	return s
 }
 
-// assertMeasuredZero requires TokensMeasured true beside four non-nil
+// assertMeasuredZero requires TokensMeasured true beside five non-nil
 // pointers to zero, the shape for a session that has spent nothing.
 func assertMeasuredZero(t *testing.T, s workerState) {
 	t.Helper()
@@ -4287,6 +4287,7 @@ func assertMeasuredZero(t *testing.T, s workerState) {
 	for name, p := range map[string]*int64{
 		"InputTokens": s.InputTokens, "OutputTokens": s.OutputTokens,
 		"TotalTokens": s.TotalTokens, "CacheReadTokens": s.CacheReadTokens,
+		"CacheWriteTokens": s.CacheWriteTokens,
 	} {
 		if p == nil {
 			t.Errorf("%s = nil, want a non-nil pointer to 0", name)
@@ -4298,16 +4299,17 @@ func assertMeasuredZero(t *testing.T, s workerState) {
 	}
 }
 
-// assertUnmeasuredNull requires TokensMeasured false beside four nil
+// assertUnmeasuredNull requires TokensMeasured false beside five nil
 // pointers, the shape for a session with no measurement yet.
 func assertUnmeasuredNull(t *testing.T, s workerState) {
 	t.Helper()
 	if s.TokensMeasured {
 		t.Fatal("TokensMeasured = true, want false")
 	}
-	if s.InputTokens != nil || s.OutputTokens != nil || s.TotalTokens != nil || s.CacheReadTokens != nil {
-		t.Errorf("token pointers = (%v, %v, %v, %v), want all nil",
-			s.InputTokens, s.OutputTokens, s.TotalTokens, s.CacheReadTokens)
+	if s.InputTokens != nil || s.OutputTokens != nil || s.TotalTokens != nil ||
+		s.CacheReadTokens != nil || s.CacheWriteTokens != nil {
+		t.Errorf("token pointers = (%v, %v, %v, %v, %v), want all nil",
+			s.InputTokens, s.OutputTokens, s.TotalTokens, s.CacheReadTokens, s.CacheWriteTokens)
 	}
 }
 
@@ -4322,6 +4324,7 @@ func assertTokenUsageMatches(t *testing.T, got workerState, want domain.TokenUsa
 	}{
 		"InputTokens": {got.InputTokens, want.InputTokens}, "OutputTokens": {got.OutputTokens, want.OutputTokens},
 		"TotalTokens": {got.TotalTokens, want.TotalTokens}, "CacheReadTokens": {got.CacheReadTokens, want.CacheReadTokens},
+		"CacheWriteTokens": {got.CacheWriteTokens, want.CacheWriteTokens},
 	}
 	for name, c := range checks {
 		if c.got == nil {
@@ -4500,7 +4503,7 @@ func TestRunWorkerAttempt_StateFileTokenGate(t *testing.T) {
 					params.OnEvent(domain.AgentEvent{
 						Type:      domain.EventTokenUsage,
 						Timestamp: time.Now().UTC(),
-						Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+						Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10, CacheWriteTokens: 4},
 					})
 					captured = readWorkerStateFile(t, wsPath())
 					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
@@ -4529,6 +4532,7 @@ func TestRunWorkerAttempt_StateFileTokenGate(t *testing.T) {
 		}{
 			"InputTokens": {captured.InputTokens, 120}, "OutputTokens": {captured.OutputTokens, 30},
 			"TotalTokens": {captured.TotalTokens, 150}, "CacheReadTokens": {captured.CacheReadTokens, 10},
+			"CacheWriteTokens": {captured.CacheWriteTokens, 4},
 		}
 		for name, c := range checks {
 			if c.got == nil {
@@ -5120,7 +5124,7 @@ func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
 				Type:      domain.EventTokenUsage,
 				Timestamp: time.Now().UTC(),
 				Model:     model,
-				Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+				Usage:     domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10, CacheWriteTokens: 4},
 			})
 			if *turnNum == 1 {
 				*postEvent = readWorkerStateFile(t, wsPath())
@@ -5128,7 +5132,7 @@ func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
 			return domain.TurnResult{
 				SessionID:     session.ID,
 				ExitReason:    domain.EventTurnCompleted,
-				Usage:         domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10},
+				Usage:         domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10, CacheWriteTokens: 4},
 				UsageMeasured: true,
 			}, nil
 		}
@@ -5238,7 +5242,7 @@ func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
 			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
 		}
 
-		wantUsage := domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10}
+		wantUsage := domain.TokenUsage{InputTokens: 120, OutputTokens: 30, TotalTokens: 150, CacheReadTokens: 10, CacheWriteTokens: 4}
 		if result.Usage != wantUsage {
 			t.Errorf("WorkerResult.Usage = %+v, want %+v", result.Usage, wantUsage)
 		}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -274,7 +275,7 @@ func TestReadSessionUsage(t *testing.T) {
 		if !found {
 			t.Fatal("found = false, want true")
 		}
-		want := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053}
+		want := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
 		if current != want {
 			t.Errorf("current = %+v, want %+v (tokenDetails: input+cache_read+cache_write)", current, want)
 		}
@@ -299,13 +300,49 @@ func TestReadSessionUsage(t *testing.T) {
 		if !found {
 			t.Fatal("found = false, want true")
 		}
-		want := domain.TokenUsage{InputTokens: 8, OutputTokens: 3, TotalTokens: 11, CacheReadTokens: 2}
+		want := domain.TokenUsage{InputTokens: 8, OutputTokens: 3, TotalTokens: 11, CacheReadTokens: 2, CacheWriteTokens: 1}
 		if current != want {
 			t.Errorf("current = %+v, want %+v (empty modelMetrics falls back to tokenDetails)", current, want)
 		}
 		if model != "" {
 			t.Errorf("model = %q, want empty (empty modelMetrics names no model)", model)
 		}
+	})
+}
+
+// TestShutdownTotals_CacheWriteTokensMapping drives shutdownTotals over
+// both the modelMetrics path and the tokenDetails fallback with a
+// non-zero cache-write count on each, then runs the two results as a
+// rising two-event sequence through agenttest.AssertUsageContract so
+// the shared cache-sum and monotonicity invariants are checked against
+// real mapping output.
+func TestShutdownTotals_CacheWriteTokensMapping(t *testing.T) {
+	t.Parallel()
+
+	modelMetrics := shutdownTotals(shutdownEvent{Data: shutdownData{
+		ModelMetrics: map[string]shutdownModel{
+			"claude-sonnet-5": {Usage: shutdownModelUsage{
+				InputTokens: 193011, OutputTokens: 596, CacheReadTokens: 154053, CacheWriteTokens: 38948,
+			}},
+		},
+	}})
+	if modelMetrics.CacheWriteTokens != 38948 {
+		t.Errorf("shutdownTotals() modelMetrics path CacheWriteTokens = %d, want 38948", modelMetrics.CacheWriteTokens)
+	}
+
+	tokenDetails := shutdownTotals(shutdownEvent{Data: shutdownData{
+		TokenDetails: map[string]shutdownTokenCount{
+			"input": {TokenCount: 14}, "cache_read": {TokenCount: 232332},
+			"cache_write": {TokenCount: 39578}, "output": {TokenCount: 696},
+		},
+	}})
+	if tokenDetails.CacheWriteTokens != 39578 {
+		t.Errorf("shutdownTotals() tokenDetails path CacheWriteTokens = %d, want 39578", tokenDetails.CacheWriteTokens)
+	}
+
+	agenttest.AssertUsageContract(t, []domain.AgentEvent{
+		{Type: domain.EventTokenUsage, Usage: modelMetrics},
+		{Type: domain.EventTurnCompleted, Usage: tokenDetails},
 	})
 }
 

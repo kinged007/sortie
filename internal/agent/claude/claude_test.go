@@ -994,7 +994,7 @@ func TestRunTurn_ParallelToolCalls_DedupesMessageID(t *testing.T) {
 		t.Fatalf("token_usage event count = %d, want 1 (deduplicated by message id); events = %v", len(tokenUsageEvents), eventTypes)
 	}
 
-	wantSnapshot := domain.TokenUsage{InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706}
+	wantSnapshot := domain.TokenUsage{InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706, CacheWriteTokens: 15933}
 	if result.Usage != wantSnapshot {
 		t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantSnapshot)
 	}

@@ -35,14 +35,21 @@ func TestDashboardAndStateAgreeOnCountsAndCost(t *testing.T) {
 
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 	fptr := func(v float64) *float64 { return &v }
-	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0)}}
+	rates := TokenRates{"claude": TokenRateConfig{
+		InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0), CacheReadPerMtok: fptr(1.0), CacheWritePerMtok: fptr(2.0),
+	}}
 
+	// Fresh 700,000 @ $3 + 200,000 cache-read @ $1 + 100,000 cache-write
+	// @ $2 = $2,500,000, or $2.50: the priced entry mixes fresh input,
+	// cache reads, and cache writes so the two surfaces cannot agree by
+	// pricing only one of the three token classes.
 	snap := orchestrator.RuntimeSnapshotResult{
 		GeneratedAt: now,
 		Running: []orchestrator.SnapshotRunningEntry{
 			{
 				IssueID: "priced", Identifier: "MT-PRICED", StartedAt: now.Add(-time.Minute),
 				AgentKind: "claude", UsageMeasured: true, AgentInputTokens: 1_000_000,
+				CacheReadTokens: 200_000, CacheWriteTokens: 100_000,
 				UsageArrival: registry.UsageArrivalIncremental,
 			},
 			{
@@ -101,8 +108,8 @@ func TestDashboardAndStateAgreeOnCountsAndCost(t *testing.T) {
 	if stateResp.ActiveEstimatedCostUSD == nil {
 		t.Fatal("state ActiveEstimatedCostUSD = nil, want a priced total")
 	}
-	if *stateResp.ActiveEstimatedCostUSD != 3.0 {
-		t.Errorf("state ActiveEstimatedCostUSD = %v, want 3.0", *stateResp.ActiveEstimatedCostUSD)
+	if *stateResp.ActiveEstimatedCostUSD != 2.5 {
+		t.Errorf("state ActiveEstimatedCostUSD = %v, want 2.5", *stateResp.ActiveEstimatedCostUSD)
 	}
 	if dashData.EstimatedCostUSD == nil {
 		t.Fatal("dashboard EstimatedCostUSD = nil, want a priced total")
