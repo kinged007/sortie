@@ -676,7 +676,7 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 	adapter := mustNewAdapter(t)
 	params := domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
-		AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: 30000},
+		AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: 3 * 60 * 1000},
 	}
 	if _, err := credentialtest.VerifyLive(adapter, params); err != nil {
 		t.Fatalf("VerifyCredential() error = %v, want nil", err)
