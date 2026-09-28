@@ -1,10 +1,10 @@
 {
   "schema_version": 5,
-  "profile_digest": "c953570dbf620f1c35c9af8342f5b93b82187bdebb47cf0eeba539ac15793fdb",
-  "measured_at": "2026-09-23",
+  "profile_digest": "7f0b29afccb02851f9cd373210ac0e7316082d4114524afbb531bee6c7919039",
+  "measured_at": "2026-09-28",
   "expectation": {
     "Verdict": "not_qualified",
-    "Conformance": "not_qualified",
+    "Conformance": "unmeasured",
     "Grades": [
       {
         "Surface": "protocol",
@@ -105,6 +105,6 @@
   },
   "requested_model": "gemini-3.5-flash",
   "observed_model": null,
-  "provenance_digest": "0794cc4a0828ca25588f44d259377d4ab6434b53a71b7ca4d03415d58a0c87ae",
+  "provenance_digest": "9facfe5c7d603a4b4a17ba30cfe9e9c8c76839e31d16d43dfbbd143df3026ae4",
   "evaluator_version": 1
 }

@@ -113,7 +113,7 @@ func geminiCliInventoryAgreementJournalLines(t *testing.T) []string {
 			Outcome: evidence.LaunchOutcomeCompleted,
 		},
 		Streams: &evidence.StreamCapture{
-			Stdout:      `{"response":{"text":"SORTIE_BASELINE_OK"},"session_id":"3753603d-5beb-435d-83cf-dd4080e4b12e","stats":{"models":{"gemini-3.5-flash":{"tokens":{"prompt":12,"cached":3}}}}}`,
+			Stdout:      `{"response":{"text":"SORTIE_BASELINE_OK"},"session_id":"3753603d-5beb-435d-83cf-dd4080e4b12e","stats":{"models":{"gemini-3.8-flash":{"tokens":{"prompt":12,"cached":3}}}}}`,
 			StdoutBytes: 168,
 			Retention:   evidence.StreamRetentionFull,
 		},
@@ -131,7 +131,7 @@ func geminiCliInventoryAgreementJournalLines(t *testing.T) []string {
 			Outcome: evidence.LaunchOutcomeCompleted,
 		},
 		Streams: &evidence.StreamCapture{
-			Stdout:      `{"response":{"text":"SORTIE_BASELINE_OK"},"session_id":"3753603d-5beb-435d-83cf-dd4080e4b12e","stats":{"models":{"gemini-3.5-flash":{"tokens":{"candidates":7}}}}}`,
+			Stdout:      `{"response":{"text":"SORTIE_BASELINE_OK"},"session_id":"3753603d-5beb-435d-83cf-dd4080e4b12e","stats":{"models":{"gemini-3.8-flash":{"tokens":{"candidates":7}}}}}`,
 			StdoutBytes: 148,
 			Retention:   evidence.StreamRetentionFull,
 		},
@@ -150,7 +150,7 @@ func geminiCliInventoryAgreementJournalLines(t *testing.T) []string {
 			Outcome: evidence.LaunchOutcomeCompleted,
 		},
 		Streams: &evidence.StreamCapture{
-			Stdout:      `{"response":{"text":"STORED"},"session_id":"25857ffd-24ad-45f4-853e-7aca46b2acf3","stats":{"models":{"gemini-3.5-flash":{"tokens":{"thoughts":2}}}}}`,
+			Stdout:      `{"response":{"text":"STORED"},"session_id":"25857ffd-24ad-45f4-853e-7aca46b2acf3","stats":{"models":{"gemini-3.8-flash":{"tokens":{"thoughts":2}}}}}`,
 			StdoutBytes: 148,
 			Retention:   evidence.StreamRetentionFull,
 		},
@@ -170,7 +170,7 @@ func geminiCliInventoryAgreementJournalLines(t *testing.T) []string {
 			Outcome:        evidence.LaunchOutcomeCompleted,
 		},
 		Streams: &evidence.StreamCapture{
-			Stdout:      `{"response":{"text":"SORTIE-NONCE-1234"},"session_id":"25857ffd-24ad-45f4-853e-7aca46b2acf3","stats":{"models":{"gemini-3.5-flash":{"tokens":{"tool":1}}}}}`,
+			Stdout:      `{"response":{"text":"SORTIE-NONCE-1234"},"session_id":"25857ffd-24ad-45f4-853e-7aca46b2acf3","stats":{"models":{"gemini-3.8-flash":{"tokens":{"tool":1}}}}}`,
 			StdoutBytes: 154,
 			Retention:   evidence.StreamRetentionFull,
 		},
@@ -291,7 +291,7 @@ func writeGeminiCliCaptureWithMutatedTokenGrade(t *testing.T, journalLines []str
 func TestRunTokenInventoryMultiPathGradeMismatch(t *testing.T) {
 	t.Parallel()
 
-	const mutatedPath = "/stats/models/gemini-3.5-flash/tokens/prompt"
+	const mutatedPath = "/stats/models/gemini-3.8-flash/tokens/prompt"
 	dir, p := writeGeminiCliCaptureWithMutatedTokenGrade(t, geminiCliInventoryAgreementJournalLines(t), mutatedPath, evidence.GradeCorroborationOnly)
 
 	_, err := Run(Input{CaptureDir: dir, Profile: p})
