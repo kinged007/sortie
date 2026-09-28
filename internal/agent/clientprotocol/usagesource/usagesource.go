@@ -13,7 +13,16 @@ import (
 	"context"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+// Constructor returns a fresh Reader for one session.
+type Constructor func() Reader
+
+// Sources is the registry every source adds itself to, exactly once, from an
+// init function in its own file. The key is the name of the runtime the
+// source reads, a name its Recognize accepts.
+var Sources = registry.NewRegistry[Constructor, struct{}]("usage source")
 
 // Reader is one measurement source. The transport declares its own interface
 // with this method set and holds values of it.
@@ -25,9 +34,17 @@ import (
 type Reader interface {
 	// Claim reports whether this source can measure a session launched against
 	// target and, when it can, arms itself and returns the environment
-	// assignments ("NAME=value") the launch needs. Applicability by runtime is
-	// decided by Recognize, not here.
-	Claim(target agentcore.LaunchTarget) ([]string, bool)
+	// assignments ("NAME=value") the launch needs. It refuses every launch with
+	// target.RemoteCommand set. With runtime empty (the first offer), a source
+	// whose claim returns an assignment or creates a file or directory claims
+	// only a local launch whose command line (target.Command and every element
+	// of target.Args) names the runtime it reads; a claim that returns no
+	// assignment and creates nothing may be made for any local launch. With
+	// runtime non-empty (the relaunch offer, carrying the name the first
+	// start's handshake reported), it claims a local launch exactly when
+	// Recognize(runtime) is true. A refusal returns nil, false and creates
+	// nothing.
+	Claim(target agentcore.LaunchTarget, runtime string) ([]string, bool)
 
 	// Recognize reports whether name, the runtime's own name from the
 	// handshake, is the runtime this source maps. No build is refused by its
@@ -74,8 +91,3 @@ const (
 	// CompletenessAccounted is a figure that reached the turn's own bound.
 	CompletenessAccounted
 )
-
-// Readers returns one fresh value per source, for one session.
-func Readers() []Reader {
-	return []Reader{newGeminiReader()}
-}

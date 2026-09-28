@@ -324,10 +324,9 @@ func measuredSessionTurn(t *testing.T) ([]domain.AgentEvent, turnOutcome) {
 			},
 		}},
 	}
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-		discardLogger(), withUsageReader(reader))
+	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
 	out := newOutboundReader(outPr)
-	publishHandshake(state, "0.59.0")
+	publishHandshake(state, reader)
 	markSessionKnown(state)
 
 	return measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))

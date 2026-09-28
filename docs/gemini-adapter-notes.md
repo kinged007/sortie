@@ -14,7 +14,9 @@ Gemini's own version is never pinned in prose here; the adapter records it per s
 
 ## Entry points
 
-Gemini has no adapter package, no registered kind, no adapter metadata, and no identity branch anywhere in Sortie. The operator reaches it by pointing the generic `agent-client-protocol` kind's `agent.command` at the `gemini` binary with the `--acp` flag; an older `--experimental-acp` spelling still works but is deprecated. Every behavior described below is therefore a property of this one vendor's protocol implementation meeting the generic adapter, not a Gemini-specific code path in Sortie, and there is nowhere in the codebase to special-case a Gemini quirk short of teaching the generic adapter about it.
+Gemini has no adapter package, no registered kind, and no adapter metadata. The operator reaches it by pointing the generic `agent-client-protocol` kind's `agent.command` at the `gemini` binary with the `--acp` flag; an older `--experimental-acp` spelling still works but is deprecated. Every behavior described below is therefore a property of this one vendor's protocol implementation meeting the generic adapter, not a Gemini-specific code path in the generic transport, and there is nowhere in that transport to special-case a Gemini quirk short of teaching the generic adapter about it.
+
+The one exception is token accounting, which lives in Gemini's own vendor-specific measurement source rather than in the generic transport. When `agent.command` names Gemini CLI, the `gemini` executable or a path to it, or the `@google/gemini-cli` package, directly or as a wrapper's argument, that source recognizes the command line and arms token accounting at the first start. A command line that hides which runtime it starts is started a second time, once the handshake has named it, so a Gemini CLI started through such a wrapper still reports token usage.
 
 ## Load-bearing capability observations
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
@@ -54,6 +55,12 @@ type ClientProtocolAdapter struct {
 	// production caller reaches only NewClientProtocolAdapter, which leaves it
 	// at its zero value.
 	drainGrace time.Duration
+
+	// sources is the registry StartSession offers a launch to. Nil means
+	// usagesource.Sources. Set by a test before StartSession, as drainGrace is;
+	// every production caller reaches only NewClientProtocolAdapter, which
+	// leaves it at its zero value.
+	sources *registry.Registry[usagesource.Constructor, struct{}]
 }
 
 // NewClientProtocolAdapter constructs a [ClientProtocolAdapter] from the kind's
