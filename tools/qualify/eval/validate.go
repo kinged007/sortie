@@ -92,6 +92,12 @@ func ClassifyRecord(rec *evidence.Record) (evidence.RowClass, error) {
 		rec.Capability == evidence.CapabilityTurnDisposition &&
 		rec.InputID == evidence.InputE2E && rec.SemanticCase == nil:
 		return evidence.RowEndToEnd, nil
+
+	case rec.Scenario == evidence.ScenarioCeilingStop &&
+		rec.Surface == evidence.SurfaceProtocol &&
+		rec.Capability == evidence.CapabilityTokenCeiling &&
+		rec.InputID == evidence.InputCeilingStop && rec.SemanticCase == nil:
+		return evidence.RowCeilingStop, nil
 	}
 
 	return evidence.RowNone, fmt.Errorf("tuple (%s, %s, %s, %s) is outside the closed table", rec.Scenario, rec.Surface, rec.Capability, rec.InputID)
@@ -373,6 +379,9 @@ func explainComparisonRow(records []evidence.Record, grades map[evidence.Surface
 	if len(evidence.CapabilityCases[capability]) > 0 {
 		return explainSemanticComparisonRow(records, p, capability, measured)
 	}
+	if compensatingRecord(records, capability) != nil {
+		protocolGrade = evidence.GradeUsable
+	}
 	if protocolGrade == evidence.GradeNotObserved {
 		return RowOutcome{Label: label, Standing: StandingUnmeasured, Cause: "protocol surface not measured"}
 	}
@@ -431,11 +440,6 @@ func explainSingletonRow(records []evidence.Record, class evidence.RowClass) Row
 	}
 }
 
-// tokenCeilingStopUnobserved is the cause a received spend figure leaves the
-// token-ceiling conformance row with: no collection observes a run crossing a
-// finite ceiling or the absence of a dispatch after that crossing stopped it.
-const tokenCeilingStopUnobserved = "a spend figure reaches Sortie outside the protocol, but no run crossed a finite ceiling, so the stop and the absence of a dispatch after it stay unobserved"
-
 // compensatingRecord returns the record by which Sortie's code supplies one
 // capability outside the protocol, or nil. Only a usable reading of a completed
 // observation compensates.
@@ -475,8 +479,9 @@ func conformanceCaseStanding(grade evidence.Grade, exclusion evidence.ExclusionK
 }
 
 // explainSemanticConformance derives one semantic capability's product-
-// conformance standing. Unlike the baseline derivation, a case the
-// measurer could not induce is unmeasured here, never dropped.
+// conformance standing. A profile-scoped case the measurer could not induce
+// on this surface is unmeasured here, never dropped; a case no deterministic
+// inducer reaches on any runtime carries no obligation at all.
 func explainSemanticConformance(records []evidence.Record, p profile.RuntimeProfile, capability evidence.Capability) (Standing, string) {
 	observed := map[evidence.Case]*evidence.Record{}
 	for i := range records {
@@ -490,6 +495,10 @@ func explainSemanticConformance(records []evidence.Record, p profile.RuntimeProf
 	obligations := 0
 	unmeasured := ""
 	for _, caseID := range evidence.CapabilityCases[capability] {
+		exclusion := p.CaseExclusion(evidence.SurfaceProtocol, capability, caseID)
+		if exclusion == evidence.ExclusionUninducible {
+			continue
+		}
 		rec, ok := observed[caseID]
 		if !ok {
 			if unmeasured == "" {
@@ -497,7 +506,7 @@ func explainSemanticConformance(records []evidence.Record, p profile.RuntimeProf
 			}
 			continue
 		}
-		standing, carries := conformanceCaseStanding(rec.Grade, p.CaseExclusion(evidence.SurfaceProtocol, capability, caseID))
+		standing, carries := conformanceCaseStanding(rec.Grade, exclusion)
 		if !carries {
 			continue
 		}
@@ -534,18 +543,16 @@ func conformanceCaseCause(caseID evidence.Case, rec *evidence.Record) string {
 // conformance standing: what the operator gets from the effective adapter.
 // A shortfall this runtime's native surfaces share does not excuse it.
 func explainConformanceRow(records []evidence.Record, grades map[evidence.Surface]map[evidence.Capability]evidence.Grade, p profile.RuntimeProfile, capability evidence.Capability) (Standing, string) {
-	// A reading supplied outside the protocol settles that the figure reaches
-	// the operator, but no collection induces the ceiling crossing that
-	// capability's row actually asserts, so the row stays unknown.
-	if compensatingRecord(records, capability) != nil {
-		return StandingUnmeasured, tokenCeilingStopUnobserved
-	}
 	if len(evidence.CapabilityCases[capability]) > 0 {
 		return explainSemanticConformance(records, p, capability)
 	}
 	grade, present := presentGrade(grades, evidence.SurfaceProtocol, capability)
 	if !present {
 		return StandingUnmeasured, "baseline record missing"
+	}
+	if capability == evidence.CapabilityTokenCeiling &&
+		(compensatingRecord(records, capability) != nil || grade == evidence.GradeUsable) {
+		return explainCeilingConformance(records)
 	}
 	switch grade {
 	case evidence.GradeUsable:
@@ -554,6 +561,23 @@ func explainConformanceRow(records []evidence.Record, grades map[evidence.Surfac
 		return StandingBelow, fmt.Sprintf("protocol %s%s, and nothing outside the protocol supplies it", grade, extensionAccount(records, capability))
 	}
 	return StandingUnmeasured, fmt.Sprintf("protocol %s%s", grade, extensionAccount(records, capability))
+}
+
+// explainCeilingConformance derives the token-ceiling conformance standing
+// from the live ceiling-stop record, once a figure is known to reach Sortie
+// on some route.
+func explainCeilingConformance(records []evidence.Record) (Standing, string) {
+	stop := firstRecordOfClass(records, evidence.RowCeilingStop)
+	if stop == nil {
+		return StandingUnmeasured, "ceiling stop record missing"
+	}
+	switch stop.Grade {
+	case evidence.GradeUsable:
+		return StandingSatisfied, ""
+	case evidence.GradeGap:
+		return StandingBelow, "ceiling stop gap: " + stop.Detail
+	}
+	return StandingUnmeasured, "ceiling stop " + string(stop.Outcome) + ": " + stop.Detail
 }
 
 // extensionAccount names what the run read of the protocol's extension
@@ -781,6 +805,10 @@ func (v *setValidation) ClassifyRecords() error {
 			(class != evidence.RowToken || rec.EvidencePath == nil) {
 			return fmt.Errorf("record %d: corroboration_only is valid only on a non-sentinel token_source record", rec.Sequence)
 		}
+		if class == evidence.RowCeilingStop &&
+			rec.Grade != evidence.GradeUsable && rec.Grade != evidence.GradeGap && rec.Grade != evidence.GradeNotObserved {
+			return fmt.Errorf("record %d: ceiling stop record grade must be usable, gap, or not_observed, got %s", rec.Sequence, rec.Grade)
+		}
 		if (rec.Grade == evidence.GradeDeclaredGap || rec.Grade == evidence.GradeNotInducible) && class != evidence.RowSemantic {
 			return fmt.Errorf("record %d: %s is valid only on a semantic probe record", rec.Sequence, rec.Grade)
 		}
@@ -934,6 +962,8 @@ func (v *setValidation) checkUniqueness(rec *evidence.Record, class evidence.Row
 		key = "cleanup"
 	case evidence.RowEndToEnd:
 		key = "e2e"
+	case evidence.RowCeilingStop:
+		key = "ceiling"
 	case evidence.RowSemantic:
 		key = fmt.Sprintf("semantic|%s|%s|%s", rec.Surface, rec.Capability, *rec.SemanticCase)
 	case evidence.RowBaseline:
@@ -974,7 +1004,7 @@ func (v *setValidation) checkSessionRelation(rec *evidence.Record, class evidenc
 		if rec.SessionID == nil {
 			return fmt.Errorf("%s record must reference a non-null session_id", evidence.RowLabel(class))
 		}
-	case evidence.RowEndToEnd:
+	case evidence.RowEndToEnd, evidence.RowCeilingStop:
 		// A launch that never started has no session; one generated to fill the
 		// member would read as a session the workflow actually ran in.
 		if rec.SessionID == nil && rec.Grade != evidence.GradeNotObserved {
@@ -1513,6 +1543,7 @@ func (v *setValidation) checkCardinality() error {
 		evidence.RowMCPDelivery:        singletonRowCount,
 		evidence.RowProcessCleanup:     singletonRowCount,
 		evidence.RowEndToEnd:           singletonRowCount,
+		evidence.RowCeilingStop:        singletonRowCount,
 	}
 	fixedTotal := 0
 	for class, want := range fixed {
@@ -1611,9 +1642,9 @@ func QuestionRationale(question evidence.Question, verdict evidence.Verdict) str
 	case evidence.QuestionTransportParity:
 		switch verdict {
 		case evidence.VerdictQualified:
-			return "Every load-bearing row was measured, and where a native reference was measured, the protocol surface was not below it."
+			return "Every load-bearing row was measured, and where a native reference was measured, the protocol route was not below it, counting what Sortie's own code supplies outside the protocol."
 		case evidence.VerdictNotQualified:
-			return "The protocol surface is below the richest measured native reference on at least one load-bearing row, so the protocol route would cost this runtime's operator something the native route gave them."
+			return "The protocol route is below the richest measured native reference on at least one load-bearing row, even counting what Sortie's own code supplies outside the protocol, so it would cost this runtime's operator something the native route gave them."
 		case evidence.VerdictUnmeasured:
 			return "At least one load-bearing row was not measured. This runtime waits; re-run the profile after the causes listed below are removed."
 		}
@@ -1622,7 +1653,7 @@ func QuestionRationale(question evidence.Question, verdict evidence.Verdict) str
 		case evidence.VerdictQualified:
 			return "The effective adapter meets every load-bearing obligation, counting what Sortie's own code supplies outside the protocol."
 		case evidence.VerdictNotQualified:
-			return "The effective adapter does not meet at least one load-bearing obligation, and nothing outside the protocol supplies it. The capability does not work for the operator on this runtime, whichever route they take."
+			return "The effective adapter does not meet at least one load-bearing obligation, counting what Sortie's own code supplies outside the protocol. The capability does not work for the operator on this runtime, whichever route they take."
 		case evidence.VerdictUnmeasured:
 			return "At least one load-bearing obligation was not measured, so whether the effective adapter meets it is unknown; re-run the profile after the causes listed below are removed."
 		}

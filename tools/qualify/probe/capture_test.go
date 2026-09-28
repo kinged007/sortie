@@ -119,6 +119,7 @@ func fullyObservedCollected(p profile.RuntimeProfile, toolGrade, permissionGrade
 	collected.workspaceSecurity = evidence.Observation{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "workspace security"}
 	collected.processCleanup = evidence.Observation{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "checked_groups=0"}
 	collected.endToEnd = evidence.Record{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "one succeeded history row", SessionID: new("sess-protocol-e2e")}
+	collected.ceilingStop = evidence.Observation{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "stopped at the one-token ceiling", SessionID: "sess-protocol-ceiling"}
 	collected.identityObs = evidence.Observation{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "handshake reported name and version"}
 	collected.identities = protocolSessionIdentities(collected)
 	collected.identityProtocolVersion = 1
@@ -149,6 +150,7 @@ func protocolSessionIdentities(collected collectedObservations) map[string]evide
 	if collected.endToEnd.SessionID != nil {
 		named(*collected.endToEnd.SessionID)
 	}
+	named(collected.ceilingStop.SessionID)
 	return identities
 }
 
@@ -267,4 +269,72 @@ func TestCheckNoBarePair(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestComposeLiveEmitsExactlyOneCeilingStopRecord(t *testing.T) {
+	t.Parallel()
+
+	profilePath := stalenessProfilePaths(t)[0]
+	p, err := profile.Load(mustRepositoryRoot(t), profilePath)
+	if err != nil {
+		t.Fatalf("profile.Load(%s) error = %v, want nil", profilePath, err)
+	}
+
+	tests := []struct {
+		name string
+		obs  evidence.Observation
+	}{
+		{
+			name: "usable stop with a session",
+			obs:  evidence.Observation{Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass, Detail: "stopped at 1 token(s)", SessionID: "sess-protocol-ceiling"},
+		},
+		{
+			name: "not_observed stop with no session",
+			obs:  evidence.Observation{Grade: evidence.GradeNotObserved, Outcome: evidence.OutcomeRuntimeFailed, Detail: "no run under the one-token ceiling ended within the observation bound"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			collected := fullyObservedCollected(p, evidence.GradeUsable, evidence.GradeUsable, evidence.GradeUsable)
+			collected.ceilingStop = tt.obs
+			collected.identities = protocolSessionIdentities(collected)
+
+			records, err := composeLive(p, collected, time.Now().UTC())
+			if err != nil {
+				t.Fatalf("composeLive(...) error = %v, want nil", err)
+			}
+
+			var matches []evidence.Record
+			for _, rec := range records {
+				if rec.Scenario == evidence.ScenarioCeilingStop {
+					matches = append(matches, rec)
+				}
+			}
+			if len(matches) != 1 {
+				t.Fatalf("composeLive(...) emitted %d ceiling stop record(s), want exactly 1", len(matches))
+			}
+
+			rec := matches[0]
+			if rec.Surface != evidence.SurfaceProtocol || rec.Capability != evidence.CapabilityTokenCeiling ||
+				rec.InputID != evidence.InputCeilingStop || rec.SemanticCase != nil {
+				t.Errorf("composeLive(...) ceiling stop record = %+v, want the protocol/token_ceiling/ceiling_stop_v1 tuple with a null case", rec)
+			}
+			if rec.Grade != tt.obs.Grade {
+				t.Errorf("composeLive(...) ceiling stop grade = %s, want %s", rec.Grade, tt.obs.Grade)
+			}
+			if rec.Outcome != tt.obs.Outcome {
+				t.Errorf("composeLive(...) ceiling stop outcome = %s, want %s", rec.Outcome, tt.obs.Outcome)
+			}
+			var wantSession *string
+			if tt.obs.SessionID != "" {
+				wantSession = &tt.obs.SessionID
+			}
+			if !evidence.NullableEqual(rec.SessionID, wantSession) {
+				t.Errorf("composeLive(...) ceiling stop session = %v, want %v", rec.SessionID, wantSession)
+			}
+		})
+	}
 }

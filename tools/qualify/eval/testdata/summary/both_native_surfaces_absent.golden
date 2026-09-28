@@ -1,5 +1,5 @@
 Eligibility: qualified
-Every load-bearing row was measured, and where a native reference was measured, the protocol surface was not below it.
+Every load-bearing row was measured, and where a native reference was measured, the protocol route was not below it, counting what Sortie's own code supplies outside the protocol.
 Product conformance: qualified
 The effective adapter meets every load-bearing obligation, counting what Sortie's own code supplies outside the protocol.
 Declared-absent surfaces:

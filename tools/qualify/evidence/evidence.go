@@ -61,6 +61,7 @@ const (
 	ScenarioWorkspaceSecurity  Scenario = "workspace_security"
 	ScenarioProcessCleanup     Scenario = "process_cleanup"
 	ScenarioEndToEnd           Scenario = "end_to_end"
+	ScenarioCeilingStop        Scenario = "ceiling_stop"
 	ScenarioQualification      Scenario = "qualification"
 )
 
@@ -222,6 +223,7 @@ const (
 	InputSecurity                  InputID = "security_v1"
 	InputCleanup                   InputID = "cleanup_v1"
 	InputE2E                       InputID = "e2e_v1"
+	InputCeilingStop               InputID = "ceiling_stop_v1"
 	InputAggregate                 InputID = "aggregate_v1"
 )
 
@@ -233,7 +235,7 @@ var (
 		ScenarioPermissionRequest, ScenarioToolServer,
 		ScenarioContinuation, ScenarioRuntimeIdentity,
 		ScenarioWorkspaceSecurity, ScenarioProcessCleanup,
-		ScenarioEndToEnd, ScenarioQualification,
+		ScenarioEndToEnd, ScenarioCeilingStop, ScenarioQualification,
 	}
 	Surfaces = []Surface{
 		SurfaceProtocol,
@@ -282,7 +284,7 @@ var (
 		InputPermissionProbe, InputMCPProbe,
 		InputContinuationSeed, InputContinuationRecall,
 		InputIdentity, InputSecurity, InputCleanup,
-		InputE2E, InputAggregate,
+		InputE2E, InputCeilingStop, InputAggregate,
 	}
 )
 
@@ -411,16 +413,21 @@ const (
 	// no account of it, so the case keeps its obligation and the surface fails
 	// it.
 	ExclusionSurfaceSilent
+
+	// ExclusionUninducible means no deterministic inducer reaches the condition
+	// on any runtime, so no measurement can settle the case and it carries no
+	// obligation.
+	ExclusionUninducible
 )
 
 // notInducibleExclusion maps each not_inducible_cases reason onto what its
-// absence means. Only prompt_channel_too_small describes the measurer's reach;
-// the others describe a channel silent on a condition the measurer can create.
+// absence means.
 var notInducibleExclusion = map[string]ExclusionKind{
 	NotInducibleChannelTooSmall:          ExclusionNotInduced,
 	NotInducibleOutputSilentOnFailure:    ExclusionSurfaceSilent,
 	NotInducibleTerminalAtExitOnly:       ExclusionSurfaceSilent,
 	NotInducibleTerminalVocabularyClosed: ExclusionSurfaceSilent,
+	NotInducibleDetail:                   ExclusionUninducible,
 }
 
 // NotInducibleExclusion reports what one not_inducible_cases reason means for
@@ -1049,6 +1056,7 @@ const (
 	RowRuntimeIdentity
 	RowProcessCleanup
 	RowEndToEnd
+	RowCeilingStop
 )
 
 // RowLabel returns the human-readable label for one row class, or
@@ -1079,6 +1087,8 @@ func RowLabel(class RowClass) string {
 		return "process cleanup"
 	case RowEndToEnd:
 		return "end to end"
+	case RowCeilingStop:
+		return "token ceiling stop"
 	}
 	return "unclassified"
 }
@@ -1118,7 +1128,7 @@ var scenarioWriteOrder = []Scenario{
 	ScenarioSemanticProbe, ScenarioSurfaceBaseline,
 	ScenarioTokenSource, ScenarioPermissionRequest,
 	ScenarioToolServer, ScenarioContinuation,
-	ScenarioRuntimeIdentity, ScenarioEndToEnd,
+	ScenarioRuntimeIdentity, ScenarioEndToEnd, ScenarioCeilingStop,
 	ScenarioProcessCleanup, ScenarioQualification,
 }
 

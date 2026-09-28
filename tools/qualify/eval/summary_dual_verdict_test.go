@@ -180,7 +180,7 @@ func TestPublishedSummaryListsConformanceUnmeasuredRows(t *testing.T) {
 	}
 }
 
-func TestCompensationReachesOnlyTheProductAnswer(t *testing.T) {
+func TestCompensationLiftsBothVerdictsInThePublishedSummary(t *testing.T) {
 	t.Parallel()
 
 	fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
@@ -190,25 +190,20 @@ func TestCompensationReachesOnlyTheProductAnswer(t *testing.T) {
 
 	summary := publishedSummary(t, fixture.Records, summaryProfile(fixture))
 
-	if got := summaryValue(t, summary, "Eligibility: "); got != string(evidence.VerdictNotQualified) {
-		t.Errorf("published transport verdict = %q, want %q: the wire still carries nothing", got, evidence.VerdictNotQualified)
+	if got := summaryValue(t, summary, "Eligibility: "); got != string(evidence.VerdictQualified) {
+		t.Errorf("published transport verdict = %q, want %q: a usable compensating record lifts the comparison", got, evidence.VerdictQualified)
 	}
-	if got := summaryValue(t, summary, "Product conformance: "); got != string(evidence.VerdictUnmeasured) {
-		t.Errorf("published product verdict = %q, want %q: the figure arrives and no run crossed a ceiling", got, evidence.VerdictUnmeasured)
+	if got := summaryValue(t, summary, "Product conformance: "); got != string(evidence.VerdictQualified) {
+		t.Errorf("published product verdict = %q, want %q: the figure reaches Sortie and the default ceiling-stop record grades usable", got, evidence.VerdictQualified)
 	}
 	if product := summarySection(t, summary, "Conformance-blocking rows:"); len(product) != 1 || product[0] != "none" {
 		t.Errorf("product blocking rows = %v, want [none]", product)
 	}
-	withheld := summarySection(t, summary, "Conformance-unmeasured rows:")
-	if len(withheld) != 1 || !strings.Contains(withheld[0], string(evidence.CapabilityTokenCeiling)) {
-		t.Fatalf("product unmeasured rows = %v, want the token ceiling row the figure did not settle", withheld)
+	if unmeasured := summarySection(t, summary, "Conformance-unmeasured rows:"); len(unmeasured) != 1 || unmeasured[0] != "none" {
+		t.Errorf("product unmeasured rows = %v, want [none]", unmeasured)
 	}
-	if !strings.Contains(withheld[0], "stop") {
-		t.Errorf("product unmeasured row = %q, want it to name the ceiling stop nothing observed", withheld[0])
-	}
-	parity := summarySection(t, summary, "Blocking rows:")
-	if len(parity) != 1 || !strings.Contains(parity[0], string(evidence.CapabilityTokenCeiling)) {
-		t.Fatalf("transport blocking rows = %v, want the token ceiling", parity)
+	if parity := summarySection(t, summary, "Blocking rows:"); len(parity) != 1 || parity[0] != "none" {
+		t.Errorf("transport blocking rows = %v, want [none]", parity)
 	}
 
 	wantRow := strings.Join([]string{

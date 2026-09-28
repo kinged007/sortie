@@ -87,6 +87,7 @@ func newFixtureAt(observedAt, variant string, absent ...profile.AbsentSurface) *
 		f.addToolServerNotObserved()
 		f.addContinuationNotObserved()
 		f.addEndToEndNotObserved()
+		f.addCeilingStopNotObserved()
 		f.addProcessCleanupNotObserved()
 		return f
 	}
@@ -99,6 +100,7 @@ func newFixtureAt(observedAt, variant string, absent ...profile.AbsentSurface) *
 	f.addToolServer()
 	f.addContinuation()
 	f.addEndToEnd()
+	f.addCeilingStop()
 	f.addProcessCleanup()
 	switch variant {
 	case FixtureNotQualified:
@@ -617,6 +619,21 @@ func (f *Fixture) addEndToEnd() {
 	f.Add(rec)
 }
 
+func (f *Fixture) addCeilingStop() {
+	rec := f.base()
+	rec.Scenario = evidence.ScenarioCeilingStop
+	rec.Surface = evidence.SurfaceProtocol
+	rec.Capability = evidence.CapabilityTokenCeiling
+	rec.Source = evidence.SourceProcessObservation
+	rec.Grade = evidence.GradeUsable
+	rec.Outcome = evidence.OutcomePass
+	rec.InputID = evidence.InputCeilingStop
+	rec.EvidencePath = new("/run_history/status")
+	rec.SessionID = new(FixtureSession(evidence.SurfaceProtocol, "ceiling"))
+	rec.Detail = "stopped at 1 token(s), the issue entered the token budget hold, no dispatch within the quiet window"
+	f.Add(rec)
+}
+
 func (f *Fixture) addProcessCleanup() {
 	rec := f.base()
 	rec.Scenario = evidence.ScenarioProcessCleanup
@@ -827,6 +844,21 @@ func (f *Fixture) addEndToEndNotObserved() {
 	rec.AgentVersion = new(FixtureAgentVer)
 	rec.ProtocolVersion = new(1)
 	rec.Detail = notObservedDetail(evidence.RowEndToEnd)
+	f.Add(rec)
+}
+
+func (f *Fixture) addCeilingStopNotObserved() {
+	rec := f.base()
+	rec.Scenario = evidence.ScenarioCeilingStop
+	rec.Surface = evidence.SurfaceProtocol
+	rec.Capability = evidence.CapabilityTokenCeiling
+	rec.Source = evidence.SourceProcessObservation
+	rec.Grade = evidence.GradeNotObserved
+	rec.Outcome = evidence.OutcomeNotObserved
+	rec.InputID = evidence.InputCeilingStop
+	rec.EvidencePath = new("/run_history/status")
+	rec.SessionID = new(FixtureSession(evidence.SurfaceProtocol, "ceiling"))
+	rec.Detail = notObservedDetail(evidence.RowCeilingStop)
 	f.Add(rec)
 }
 
@@ -1160,6 +1192,27 @@ func (f *Fixture) SetEndToEnd(obs evidence.Observation) error {
 	})
 	if rec == nil {
 		return errors.New("no end-to-end record")
+	}
+	evidence.ApplyObservation(rec, obs)
+	return nil
+}
+
+// SetCeilingStop writes obs onto the isolated ceiling-stop record, requiring a
+// non-empty obs.SessionID unless the run is not_observed.
+func (f *Fixture) SetCeilingStop(obs evidence.Observation) error {
+	if err := evidence.CheckObservationAdmitted(obs); err != nil {
+		return err
+	}
+	if obs.Grade != evidence.GradeNotObserved {
+		if err := requireObservedSession(evidence.RowLabel(evidence.RowCeilingStop), obs); err != nil {
+			return err
+		}
+	}
+	rec := f.FindFirst(func(rec *evidence.Record) bool {
+		return rec.Scenario == evidence.ScenarioCeilingStop && rec.Surface == evidence.SurfaceProtocol
+	})
+	if rec == nil {
+		return errors.New("no ceiling stop record")
 	}
 	evidence.ApplyObservation(rec, obs)
 	return nil

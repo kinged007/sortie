@@ -669,7 +669,7 @@ func decodeNotInducibleCases(raw json.RawMessage, profile RuntimeProfile) ([]Sur
 // is scoped to one surface and read through [evidence.NotInducibleExclusion].
 func (p RuntimeProfile) CaseExclusion(surface evidence.Surface, capability evidence.Capability, caseID evidence.Case) evidence.ExclusionKind {
 	if slices.Contains(evidence.CatalogNotInducibleCases, caseID) {
-		return evidence.ExclusionNotInduced
+		return evidence.NotInducibleExclusion(evidence.NotInducibleDetail)
 	}
 	if _, declared := p.Declared(capability, caseID); declared {
 		return evidence.ExclusionNotApplicable

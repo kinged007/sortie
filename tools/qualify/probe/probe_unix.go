@@ -544,15 +544,17 @@ func Run(t *testing.T, coords Coordinates) Result {
 		induceNativeSemantics(t, coords, fixtureState, collected, surface)
 	}
 
-	identityObs, identities := induceRuntimeIdentity(fixtureState)
-	collected.identityObs = identityObs
-	collected.identities = identities
-	collected.identityProtocolVersion = pinnedProtocolVersionMirror
-
 	// The harness record's agent fields never reach the evidence: the
 	// row is identified from its own session's handshake, so naming
 	// another session's agent here would attribute a reading it never made.
 	collected.endToEnd = induceEndToEnd(t, coords, fixtureState, "", "")
+	collected.ceilingStop = induceCeilingStop(t, coords, fixtureState)
+	fixtureState.journal.append("run", "ceiling_stop", transportGraded(collected.ceilingStop))
+
+	identityObs, identities := induceRuntimeIdentity(fixtureState)
+	collected.identityObs = identityObs
+	collected.identities = identities
+	collected.identityProtocolVersion = pinnedProtocolVersionMirror
 
 	collected.workspaceSecurity = induceWorkspaceSecurity(t, coords, fixtureState)
 	collected.processCleanup = induceProcessCleanup(fixtureState)
