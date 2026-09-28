@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/typeutil"
+	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 // tokenUsageBreakdown is one token-count breakdown inside a
@@ -105,7 +105,8 @@ type accountResult struct {
 // accountLoginNotification is the params payload of an
 // account/login/completed notification.
 type accountLoginNotification struct {
-	Success bool `json:"success"`
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
 }
 
 // normalizeBreakdown converts a raw [tokenUsageBreakdown] into a
@@ -154,30 +155,6 @@ func parseModelRerouted(params json.RawMessage) (modelReroutedParams, error) {
 	return p, nil
 }
 
-// subtractUsage returns a minus b componentwise, floored at zero, with
-// TotalTokens recomputed as InputTokens plus OutputTokens.
-func subtractUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens-b.InputTokens, 0),
-		OutputTokens:    max(a.OutputTokens-b.OutputTokens, 0),
-		CacheReadTokens: max(a.CacheReadTokens-b.CacheReadTokens, 0),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
-}
-
-// maxUsage returns the componentwise maximum of a and b, with
-// TotalTokens recomputed as InputTokens plus OutputTokens.
-func maxUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens, b.InputTokens),
-		OutputTokens:    max(a.OutputTokens, b.OutputTokens),
-		CacheReadTokens: max(a.CacheReadTokens, b.CacheReadTokens),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
-}
-
 // mapCodexErrorInfo maps a codexErrorInfo string to a domain error
 // kind. Retryable vs non-retryable classification is encoded in the
 // AgentErrorKind value.
@@ -202,5 +179,5 @@ func mapCodexErrorInfo(info string) domain.AgentErrorKind {
 // event. Truncated to 200 runes.
 func summarizeItem(itemType, itemID string) string {
 	s := fmt.Sprintf("[%s] %s", itemType, itemID)
-	return typeutil.TruncateRunes(s, 200)
+	return redact.Truncate(s, 200)
 }

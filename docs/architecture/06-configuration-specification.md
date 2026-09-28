@@ -36,6 +36,7 @@ Dynamic reload is required:
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) may require restart unless live rebind is explicitly supported.
 - Sortie also re-validates/reloads defensively during runtime operations (for example before dispatch) in case filesystem watch events are missed.
 - Invalid reloads do not crash the service; Sortie keeps operating with the last known good effective configuration and emits an operator-visible error.
+- A configuration's advisories are recorded once, when the configuration is built or loaded, never on each defensive re-read, and reported once per appearance: the running orchestrator reports one at the tick that first draws it, and again only after a tick whose effective configuration did not draw it; `sortie validate` reports the same advisories as warnings.
 
 ### 6.3 Dispatch Preflight Validation
 
@@ -74,6 +75,7 @@ Validation checks:
 Effort-budget and notification config are validated outside this preflight, by design:
 
 - The per-issue token ceiling (`agent.max_tokens`) is not a scheduler preflight check. It is evaluated on three lanes: the retry path and the poll tick's own rebuild block a re-dispatch, alongside `agent.max_sessions` (Section 8.4), and the event loop stops a run already in flight as each usage figure arrives, so the ceiling bounds a blocked issue and a running session rather than failing startup or a poll tick. Config-level validation rejects a negative `agent.max_tokens` when the config is parsed, which both startup validation and the live-reload fail-safe path consume.
+- The token warning threshold (`agent.token_warning_percent`) is likewise not a scheduler preflight check. It is evaluated on the event loop, alongside the ceiling above, rather than by preflight. Config-level validation rejects a value outside `0` to `99` when the config is parsed. `sortie validate` reports the `ineffective_setting` advisory when the field is set above `0` while `agent.max_tokens` is `0`, since the threshold derives from a ceiling that is not in force.
 - The `notifications` backend list (Section 5.3.11) is structurally validated when the config is parsed: the value must be a sequence, every entry must carry a non-empty string `kind`, and `max_per_session`, when present, must be a non-negative integer. `max_per_session` is optional: an omitted, `null`, or `0` value is accepted and selects the default cap. A malformed section aborts config construction. Backend resolution (an unknown `kind` or a required secret that resolved to the empty string) is validated separately at `sortie mcp-server` sidecar startup, where it is a fatal startup error rather than a partial registration (Section 10.4.5). The scheduler preflight does not resolve notifier backends, because the orchestrator process never delivers notifications; the sidecar does.
 
 **Startup token-scope preflight**
@@ -114,6 +116,9 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `workspace.retention_days`: integer, default `0` (disabled); the maximum age in days of a swept workspace's latest recorded activity before the periodic sweep removes it; `0` disables the bound, a value from `1` to `29` is rejected, and `30` (`WorkspaceRetentionMinDays`) is the smallest permitted non-zero value; expressed in days rather than milliseconds because every other duration field is a sub-hour timing where the millisecond unit is proportionate to the value, while a thirty-day window in milliseconds is unreadable and a dropped digit is destructive; supports the `SORTIE_WORKSPACE_RETENTION_DAYS` environment override; validated offline when the config is parsed, so both startup and the live-reload fail-safe path reject an out-of-range value; reloads dynamically, taking effect on the next sweep pass with no restart
 - `worker.ssh_hosts` (extension): list of SSH host strings, optional; when omitted, work runs locally
 - `worker.max_concurrent_agents_per_host` (extension): positive integer, optional; shared per-host cap applied across configured SSH hosts
+- `worker.ssh_strict_host_key_checking` (extension): string, default `accept-new`; OpenSSH `StrictHostKeyChecking` value applied to a remote launch
+- `worker.ssh_pass_env` (extension): list of environment variable names, optional, default absent; names carried from the orchestrator's own environment into every remote launch; entries are written literally, so an entry produced by a `$VAR` reference is rejected with a warning naming only its position
+- `worker.ssh_disallow_pass_env` (extension): list of environment variable names, optional, default absent; names the orchestrator never carries into a remote launch; entries are written literally, so an entry produced by a `$VAR` reference is rejected with a warning naming only its position
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
@@ -130,6 +135,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `agent.max_sessions`: non-negative integer, default `0` (unlimited); the total per-issue session budget. The separate `agent.max_consecutive_absences` governs the consecutive-absence ceiling
 - `agent.max_tokens`: integer, default `0` (unlimited)
+- `agent.token_warning_percent`: integer, default `0` (off); must be `0` to `99`; the token warning threshold, as a percentage of `agent.max_tokens` rounded up; `SORTIE_AGENT_TOKEN_WARNING_PERCENT` overrides it
 - `agent.max_consecutive_absences`: positive integer, default `3`; `0` and negative values are rejected as a configuration error. Bounds the count of consecutive observed absences, not lifetime effort: any run that produces evidence of work resets the count to zero. Unreachable under `tracker.handoff_evidence: off`, since no verdict is computed and no absence is ever recorded. The separate `agent.max_sessions` governs the total per-issue session budget
 - `agent.stop_grace_ms`: positive integer, default `5000`; the period an adapter waits, after sending a catchable termination signal, for the agent to exit on its own before it force-terminates the process group. `0`, a negative value, and a value above `MaxDurationMS` (the largest millisecond count whose conversion to a duration stays positive, about 292 years) are rejected as a configuration error at parse time; `SORTIE_AGENT_STOP_GRACE_MS` overrides it. Takes effect for future worker attempts, not an in-flight session
 - `ci_feedback.kind`: string, optional, **deprecated**; identifies the CI status provider adapter; presence activates CI feedback; use `reactions.ci_failure` instead
@@ -169,7 +175,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `dispatch.default.template`: path, optional; default template when no rule matches; falls through to the Markdown body
 - `notifications`: list of notifier backend objects, optional; default empty; configures the backends behind the `notify_operator` tool (Section 5.3.11). An empty or absent list leaves the tool unregistered
 - `notifications[].kind`: string, required per entry; registry discriminator; v1 backends are `webhook` and `slack`
-- `notifications[].max_per_session`: integer, optional; per-session `notify_operator` call cap; not a per-entry default; omitted/`null`/`0` contributes nothing and the cap falls back to `20` only when every entry is `0` or unset; never unlimited; negative is rejected
+- `notifications[].max_per_session`: integer, optional; `notify_operator` call cap for the whole agent run, shared by every tool server process of the dispatch; not a per-entry default; omitted/`null`/`0` contributes nothing and the cap falls back to `20` only when every entry is `0` or unset; never unlimited; negative is rejected
 - `notifications[].<backend fields>`: pass-through per `kind`; `webhook` requires `url`, `slack` requires `webhook_url`; secrets SHOULD be `$SORTIE_*` references (only those are guaranteed propagated to the sidecar), resolved at sidecar startup
 - `self_review.enabled`: boolean, default `false`; activates the self-review loop
 - `self_review.max_iterations`: integer, default `3`, range [1, 10]; review iteration cap

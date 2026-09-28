@@ -8,16 +8,22 @@ import (
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 // writeGeneratedMCPConfig writes a real generated MCP config file
-// declaring the given servers to a fresh temp directory, and returns
-// its path. The translated branch reads this file from disk, unlike
-// the other three dispositions, which compare the path alone.
+// declaring the given servers to a fresh temp directory's .sortie
+// subdirectory, and returns its path. The translated branch reads
+// this file from disk, unlike the other three dispositions, which
+// compare the path alone.
 func writeGeneratedMCPConfig(t *testing.T, content string) string {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "mcp.json")
+	dir := filepath.Join(t.TempDir(), workspacekit.SortieDir)
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatalf("Mkdir(%q): %v", dir, err)
+	}
+	path := filepath.Join(dir, "mcp.json")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
 	}
@@ -142,6 +148,7 @@ func TestAssertMCPInjection_Violating(t *testing.T) {
 	translatedPartialPath := writeGeneratedMCPConfig(t, twoServerMCPConfig)
 
 	windowsCommandConfigPath := writeGeneratedMCPConfig(t, `{"mcpServers":{"win-server":{"command":"C:\\Program Files\\sortie\\mcp.exe"}}}`)
+	envDroppedConfigPath := writeGeneratedMCPConfig(t, `{"mcpServers":{"sortie-tools":{"command":"/usr/local/bin/sortie","args":["mcp-server"],"env":{"SORTIE_DISPATCH_ID":"d1","SORTIE_WORKSPACE":"/ws"}}}}`)
 
 	tests := []struct {
 		name          string
@@ -240,6 +247,15 @@ func TestAssertMCPInjection_Violating(t *testing.T) {
 			mcpConfigPath: windowsCommandConfigPath,
 			surface:       MCPLaunchSurface{Wire: []string{`{"argv":["win-server","--other-flag"]}`}},
 			wantSubstr:    `command %q not found on the launch surface`,
+		},
+		{
+			name:          "translated declared but the surface drops a declared env variable name",
+			declared:      registry.MCPInjectionTranslated,
+			mcpConfigPath: envDroppedConfigPath,
+			surface: MCPLaunchSurface{Args: []string{
+				"-c", `mcp_servers.sortie-tools={command="/usr/local/bin/sortie", args=["mcp-server"], env={SORTIE_WORKSPACE="/ws"}}`,
+			}},
+			wantSubstr: `env variable %q not found on the launch surface`,
 		},
 		{
 			// The path appears only as encoding/json would render it

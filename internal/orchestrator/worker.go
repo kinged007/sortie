@@ -7,19 +7,21 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/prompt"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/workspace"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 // WorkerExitKind classifies how the worker attempt terminated.
@@ -27,13 +29,12 @@ type WorkerExitKind string
 
 const (
 	// WorkerExitNormal indicates the turn loop completed without error.
-	// The issue may still be active (max_turns reached) or may have
-	// transitioned to a non-active state.
+	// The issue may still be active (max_turns reached) or transitioned to
+	// a non-active state.
 	WorkerExitNormal WorkerExitKind = "normal"
 
-	// WorkerExitError indicates the worker encountered a fatal error
-	// during workspace preparation, prompt rendering, agent session
-	// lifecycle, or tracker state refresh.
+	// WorkerExitError indicates a fatal error during workspace prep, prompt
+	// rendering, session lifecycle, or tracker refresh.
 	WorkerExitError WorkerExitKind = "error"
 
 	// WorkerExitCancelled indicates the worker's context was cancelled
@@ -41,28 +42,27 @@ const (
 	WorkerExitCancelled WorkerExitKind = "cancelled"
 )
 
-// workerState is the .sortie/state.json shape the running agent reads
-// back through its status tool. The four token members are nil
-// together, exactly when TokensMeasured is false, and a nil member
-// serializes as JSON null rather than being omitted, so the agent
-// cannot mistake an unmeasured session for one that spent nothing.
-// The session-start write states a measured zero: no turn has begun,
-// so the session has provably spent nothing.
+// workerState is the .sortie/state.json shape the running agent reads back
+// through its status tool. The five token members are nil together,
+// exactly when TokensMeasured is false, and a nil member serializes as JSON
+// null rather than being omitted, so the agent cannot mistake an unmeasured
+// session for one that spent nothing. The session-start write states a
+// measured zero: no turn has begun, so nothing has been spent.
 type workerState struct {
-	TurnNumber      int    `json:"turn_number"`
-	MaxTurns        int    `json:"max_turns"`
-	Attempt         *int   `json:"attempt"`
-	StartedAt       string `json:"started_at"`
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
-	TokensMeasured  bool   `json:"tokens_measured"`
+	TurnNumber       int    `json:"turn_number"`
+	MaxTurns         int    `json:"max_turns"`
+	Attempt          *int   `json:"attempt"`
+	StartedAt        string `json:"started_at"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	TokensMeasured   bool   `json:"tokens_measured"`
 }
 
-// withTokens returns s carrying the worker's own measurement mirror
-// and, when that mirror is true, the four figures it has folded so
-// far. It is the one gate every state-file write passes through.
+// withTokens returns s carrying the measurement mirror and, when measured,
+// the five figures folded so far. Every state-file write passes through it.
 func (s workerState) withTokens(usage domain.TokenUsage, measured bool) workerState {
 	s.TokensMeasured = measured
 	if !measured {
@@ -72,230 +72,180 @@ func (s workerState) withTokens(usage domain.TokenUsage, measured bool) workerSt
 	s.OutputTokens = &usage.OutputTokens
 	s.TotalTokens = &usage.TotalTokens
 	s.CacheReadTokens = &usage.CacheReadTokens
+	s.CacheWriteTokens = &usage.CacheWriteTokens
 	return s
 }
 
-// writeWorkerState atomically writes session runtime state to
-// .sortie/state.json inside the workspace. The write uses a
-// temp-file-plus-rename pattern so readers never observe a partial
-// write. Errors are returned to the caller, which logs and continues.
-//
-// The .sortie directory is validated with Lstat to reject symlinks;
-// an agent that replaces .sortie with a symlink cannot trick the
-// orchestrator into writing outside the workspace.
+// writeWorkerState writes session runtime state to .sortie/state.json.
 func writeWorkerState(workspacePath string, state workerState) error {
-	dir := filepath.Join(workspacePath, ".sortie")
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return fmt.Errorf("stat .sortie dir: %w", err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf(".sortie is a symlink, refusing to write state file")
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf(".sortie is not a directory")
-	}
-
 	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal worker state: %w", err)
 	}
-	tmpPath := filepath.Join(dir, "state.json.tmp")
-	outPath := filepath.Join(dir, "state.json")
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
-		return fmt.Errorf("write worker state temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, outPath); err != nil {
-		return fmt.Errorf("rename worker state file: %w", err)
-	}
-	return nil
+	return workspacekit.WriteSortieFile(workspacePath, "state.json", data)
 }
 
 // WorkerResult is the terminal outcome of a single worker attempt,
 // delivered to the orchestrator via [WorkerDeps.OnExit].
 type WorkerResult struct {
-	// IssueID is the tracker-internal issue ID.
 	IssueID string
 
-	// Identifier is the human-readable ticket key.
 	Identifier string
 
 	// ExitKind classifies the exit as normal, error, or cancelled.
 	ExitKind WorkerExitKind
 
-	// Error is the error that caused an abnormal exit. Nil for normal
-	// exits and context cancellations.
+	// Error is the cause of an abnormal exit. Nil for normal exits and
+	// for a cancellation that interrupted no failing operation.
 	Error error
 
-	// TurnsCompleted is the number of turns that ran to completion
-	// (received a TurnResult) before the worker exited.
+	// StoppedByTokenCeiling is true when the worker context's cancellation
+	// cause is the in-flight token ceiling's own stop request.
+	StoppedByTokenCeiling bool
+
+	// TurnsCompleted is the number of turns that received a TurnResult
+	// before exit.
 	TurnsCompleted int
 
-	// TurnsStarted is the number of turns the worker began, counted as
-	// each one starts rather than when it returns, so a turn that
-	// errored or was cancelled still counts. Self-review turns count
-	// too. A reader deciding whether the session ever ran needs this
-	// rather than TurnsCompleted.
+	// TurnsStarted counts turns the worker began (self-review included),
+	// counted at start, so a turn that errored or was cancelled still
+	// counts. Deciding whether the session ever ran needs this rather than
+	// TurnsCompleted.
 	TurnsStarted int
 
-	// SessionID is the adapter-assigned session identifier. Empty if
-	// the worker exited before starting a session. The exit handler
-	// uses this to populate RunningEntry.SessionID and to enable
-	// session continuity on continuation retries.
+	// SessionID is the accepted session identifier at the moment report
+	// hands this result to [WorkerDeps.OnExit]. It is empty when the
+	// working session never started, or started with an empty identifier
+	// that no later report replaced. Enables session continuity on
+	// continuation retries.
 	SessionID string
 
-	// WorkspacePath is the workspace directory used for this attempt.
-	// Empty if workspace preparation failed.
+	// WorkspacePath is the workspace directory for this attempt, empty if
+	// preparation failed.
 	WorkspacePath string
 
-	// HandoffEvidencePolicy is frozen from the run's initial config snapshot
-	// before the baseline decision. Reloads during the run cannot change it.
+	// HandoffEvidencePolicy is frozen from the run's initial config
+	// snapshot; reloads during the run cannot change it.
 	HandoffEvidencePolicy config.HandoffEvidencePolicy
 
-	// HandoffEvidenceBaseline is the Git state captured after workspace
-	// preparation and pre-run hooks, immediately before StartSession. It is nil
-	// when capture failed or the frozen policy is off.
+	// HandoffEvidenceBaseline is the Git state captured after workspace prep
+	// and pre-run hooks, before StartSession. Nil when capture failed or the
+	// frozen policy is off.
 	HandoffEvidenceBaseline *workspace.HandoffEvidenceBaseline
 
-	// HandoffEvidenceBaselineError records why baseline capture failed. It is
-	// nil when capture succeeded or the frozen policy is off.
+	// HandoffEvidenceBaselineError records why baseline capture failed. Nil
+	// when capture succeeded or the frozen policy is off.
 	HandoffEvidenceBaselineError error
 
-	// AgentAdapter is the agent adapter kind string used to dispatch
-	// this attempt. Equals the rule-resolved kind when dispatch routing
-	// selected a non-default agent; otherwise equals the workflow-wide
-	// default kind from config.Agent.Kind.
+	// AgentAdapter is the agent adapter kind used to dispatch this attempt:
+	// the rule-resolved kind, else the workflow-wide default.
 	AgentAdapter string
 
-	// Attempt is the retry attempt parameter passed to the worker.
 	Attempt *int
 
-	// SSHHost is the SSH host the worker executed on. Empty for local
-	// execution. Copied from [WorkerDeps] at exit for host pool release.
+	// SSHHost is the SSH host the worker executed on, empty for local.
 	SSHHost string
 
-	// SoftStop is true when the worker exited because it read a
-	// recognized A2O status signal from .sortie/status. The exit
-	// handler uses this to suppress continuation retry scheduling.
+	// SoftStop is true when the worker exited on a recognized A2O status
+	// signal, which suppresses continuation retry scheduling.
 	SoftStop bool
 
-	// SoftStopReason is the status token that triggered the soft stop
-	// (e.g., "blocked", "needs-human-review"). Empty when SoftStop is
-	// false.
+	// SoftStopReason is the status token that triggered the soft stop, empty
+	// when SoftStop is false.
 	SoftStopReason string
 
-	// ReviewMetadata summarizes the self-review loop outcome.
-	// Nil when self-review is disabled or the worker exited before
-	// the review phase.
+	// ReviewMetadata summarizes the self-review outcome. Nil when self-review
+	// is disabled or the worker exited before the phase.
 	ReviewMetadata *domain.ReviewMetadata
 
-	// StartedAt is copied from the RunningEntry (set by DispatchIssue).
-	// The worker does not set this; it is populated by the exit
-	// handler from the running map entry.
+	// StartedAt is populated by the exit handler from the running entry, not
+	// by the worker.
 	StartedAt time.Time
 
-	// ObservedIssueState is the most recent tracker state a worker state
-	// refresh returned for this issue. A refresh whose response omits the
-	// issue leaves the previous observation in place rather than clearing
-	// it. Empty when no refresh returned a state for the issue: a
-	// dispatch posture that does not drive issue state, or an exit before
-	// the first refresh completed. On a soft-stop exit the value is the
-	// previous turn's observation, because the status-file check runs
-	// before that turn's refresh. The exit handler tests this value for a
-	// terminal state ahead of the dispatch-time snapshot; it is not used
-	// for the active-state classification.
+	// ObservedIssueState is the most recent tracker state a worker refresh
+	// returned. Empty when no refresh returned a state (a posture that does
+	// not drive issue state, or an exit before the first refresh). On a
+	// soft-stop exit it is the previous turn's observation, because the
+	// status-file check precedes that turn's refresh. Tested for a terminal
+	// state ahead of the dispatch-time snapshot; not used for active-state
+	// classification.
 	ObservedIssueState string
 
-	// Usage is the run-cumulative token usage the adapter reported for
-	// this run, as of worker exit. Folded from every usage-bearing
-	// event and every TurnResult.Usage the worker observed; zero for an
-	// exit before the first turn returns. Excludes figures the run's
-	// usage arrival rejects.
+	// Usage is the run-cumulative token usage as of exit, folded from every
+	// usage-bearing event and TurnResult.Usage; zero before the first turn
+	// returns. Excludes figures the run's arrival rejects.
 	Usage domain.TokenUsage
 
-	// UsageMeasured is true when the run's spend is known: either no
-	// agent turn was entered before exit, so a zero spend is exact, or
-	// at least one usage-bearing event, one token_usage event, or one
-	// TurnResult reporting UsageMeasured true was observed since the
-	// first turn began and admitted by the run's usage arrival. False
-	// means the run entered a turn and no admitted measurement ever
-	// arrived, so the spend is unknown rather than zero.
+	// UnaccountedTurns counts turns that spent tokens no figure was proven to
+	// cover, making Usage a lower bound when non-zero. Orthogonal to
+	// UsageMeasured, which reports only whether any figure exists.
+	UnaccountedTurns int
+
+	// UsageMeasured is true when the run's spend is known: either no turn was
+	// entered (a zero spend is exact) or an admitted measurement arrived
+	// since the first turn began. False means a turn ran and no admitted
+	// measurement arrived, so spend is unknown rather than zero.
 	UsageMeasured bool
 
-	// ModelName is the model name carried by the last admitted
-	// token_usage event the worker relayed during this run that carried
-	// one. Empty when no admitted token_usage event carried a model name,
-	// including an exit before the first turn began.
+	// ModelName is the model from the last admitted token_usage event that
+	// carried one. Empty when none did.
 	ModelName string
 
-	// APIRequestCount is the number of admitted token_usage events the
-	// worker relayed during this run, whether or not the orchestrator's
-	// event loop applied them. Zero for an exit before the first turn
-	// began.
+	// APIRequestCount is the number of admitted token_usage events the worker
+	// relayed this run. Zero before the first turn began.
 	APIRequestCount int
 }
 
-// SessionToolRegistryFunc builds the per-session tool registry rendered
-// into the first-turn advertisement. issueID, workspacePath, and
-// sessionID are the gating inputs the worker resolves late: issueID per
-// dispatch, workspacePath after workspace preparation, and sessionID
-// after the agent session starts. The wiring layer has already captured
-// every session-invariant gating input. A nil value means no builder
-// was injected, in which case the worker falls back to the static
-// [WorkerDeps.ToolRegistry].
-type SessionToolRegistryFunc func(ctx context.Context, issueID, workspacePath, sessionID string) (*domain.ToolRegistry, error)
+// SessionToolRegistryFunc builds the first-turn tool advertisement.
+type SessionToolRegistryFunc func(ctx context.Context, issueID, workspacePath string) (*domain.ToolRegistry, error)
 
-// AgentToolChannelFunc reports whether a session of the given agent
-// kind, launched in the given mode, can execute the tools the
-// registry holds. remote is true when the session runs over SSH. A
-// nil [WorkerDeps.AgentToolChannelFunc] means the answer is unknown,
-// not that no channel exists.
+// AgentToolChannelFunc reports whether a session of the given kind, in the
+// given mode, can execute the registry's tools. remote is true for SSH. A
+// nil [WorkerDeps.AgentToolChannelFunc] means the answer is unknown, not
+// that no channel exists.
 type AgentToolChannelFunc func(kind string, remote bool) bool
 
-// DispatchPosture selects the worker behavior for a dispatch. Exactly
-// one posture applies per dispatch; the type makes the invariant
-// representable and eliminates invalid flag combinations.
+// SSHEnvNamesFunc returns the env var names to carry into a remote session
+// of the given kind: the kind's declared credential names plus the
+// operator-listed names, less the operator-disallowed names. A nil
+// [WorkerDeps.SSHEnvNamesFunc] means no name is carried.
+type SSHEnvNamesFunc func(kind string) []string
+
+// DispatchPosture selects the worker behavior for a dispatch. Exactly one
+// posture applies per dispatch; the type makes the invariant representable.
 type DispatchPosture int
 
 const (
-	// PostureNormal is the default work dispatch: full clone via the
-	// operator hooks, and it drives the linked issue's state.
+	// PostureNormal is the default work dispatch: full clone via operator
+	// hooks, and it drives the linked issue's state.
 	PostureNormal DispatchPosture = iota
 
 	// PostureReview is the read-only, no-clone review dispatch
-	// (label-review): a scratch workspace, no operator hooks, no
-	// issue-work side effects, a fresh session.
+	// (label-review): scratch workspace, no hooks, no issue-work side
+	// effects, fresh session.
 	PostureReview
 
-	// PostureFix is the read-write fix dispatch (label-fix): a full
-	// clone via the operator hooks so the agent can check out the PR
-	// head branch and push, a fresh session, and every issue-work side
-	// effect suppressed.
+	// PostureFix is the read-write fix dispatch (label-fix): full clone via
+	// operator hooks so the agent can check out the PR head branch and push,
+	// a fresh session, and every issue-work side effect suppressed.
 	PostureFix
 )
 
-// RunsSetupHooks reports whether the posture runs the operator
-// after_create/before_run setup hooks and the after_run teardown hook.
-// True for PostureNormal and PostureFix; false for PostureReview.
+// RunsSetupHooks reports whether the posture runs the operator setup and
+// teardown hooks. True for PostureNormal and PostureFix.
 func (p DispatchPosture) RunsSetupHooks() bool {
 	return p == PostureNormal || p == PostureFix
 }
 
-// DrivesIssueState reports whether the posture claims and drives the
-// linked issue's tracker state (in-progress transition, dispatch
-// comment, per-turn state refresh and termination gate, self-review,
-// exit-path handoff, and continuation retry). True only for
-// PostureNormal.
+// DrivesIssueState reports whether the posture claims and drives the linked
+// issue's tracker state. True only for PostureNormal.
 func (p DispatchPosture) DrivesIssueState() bool {
 	return p == PostureNormal
 }
 
-// dispatchPostureForReactionKind maps a dispatch reaction kind to its
-// worker posture. Label-command kinds select non-normal postures; every
-// other kind (including the empty string for an initial dispatch)
-// selects PostureNormal. It is the single source of truth for posture
-// selection, shared by the dispatch builder and the exit handler so the
-// two never disagree.
+// dispatchPostureForReactionKind maps a dispatch reaction kind to its worker
+// posture. It is the single source of truth for posture selection, shared by
+// the dispatch builder and the exit handler so the two never disagree.
 func dispatchPostureForReactionKind(kind string) DispatchPosture {
 	switch kind {
 	case ReactionKindLabelReview:
@@ -308,9 +258,8 @@ func dispatchPostureForReactionKind(kind string) DispatchPosture {
 }
 
 // WorkerDeps holds the collaborators injected into the worker attempt
-// function. The orchestrator constructs this once and shares it
-// across all workers. All fields are required unless documented as
-// optional (e.g. ToolRegistry).
+// function. Constructed once and shared across all workers. All fields are
+// required unless documented as optional.
 type WorkerDeps struct {
 	// TrackerAdapter fetches issue states for mid-turn re-checks.
 	TrackerAdapter domain.TrackerAdapter
@@ -318,134 +267,108 @@ type WorkerDeps struct {
 	// AgentAdapter manages agent session lifecycle.
 	AgentAdapter domain.AgentAdapter
 
-	// ConfigFunc returns the current effective config. Called at the
-	// start of each worker attempt so that dynamically reloaded
-	// values take effect for new attempts.
+	// ConfigFunc returns the current effective config, called at each
+	// attempt's start so reloaded values take effect for new attempts.
 	ConfigFunc func() config.ServiceConfig
 
-	// PromptTemplateByIDFunc returns the parsed prompt template
-	// registered under the given ID. The empty-string key selects the
-	// WORKFLOW.md body template. Called once per attempt to resolve
-	// the freeze-on-dispatch template selection.
+	// PromptTemplateByIDFunc returns the parsed template for the given ID;
+	// the empty-string key selects the WORKFLOW.md body template.
 	PromptTemplateByIDFunc func(id string) *prompt.Template
 
-	// TemplateID is the resolved template registry key chosen at
-	// initial dispatch and frozen for the lifetime of the claim.
-	// Empty selects the body template.
+	// TemplateID is the resolved template key frozen at dispatch. Empty
+	// selects the body template.
 	TemplateID string
 
-	// AgentKind is the rule-resolved agent adapter kind frozen at
-	// initial dispatch. Empty falls back to the workflow-wide default
-	// from config.Agent.Kind, preserving pre-routing behavior for
-	// callers that have not wired the freeze-on-dispatch selection.
+	// AgentKind is the rule-resolved kind frozen at dispatch. Empty falls
+	// back to the workflow-wide default.
 	AgentKind string
 
-	// UsageArrival is the usage arrival frozen on the run's entry. The
-	// zero value admits every figure.
+	// UsageArrival is the arrival frozen on the run's entry. The zero value
+	// admits every figure.
 	UsageArrival registry.UsageArrival
 
-	// OnEvent relays agent events to the orchestrator's serialized
-	// event loop. Called from the worker goroutine; must be safe for
-	// concurrent use.
+	// OnEvent relays agent events to the serialized event loop. Called from
+	// the worker goroutine; must be concurrency-safe.
 	OnEvent func(issueID string, event domain.AgentEvent)
 
-	// OnExit reports the worker's terminal outcome to the orchestrator.
-	// Called exactly once, as the last action before the goroutine
-	// returns. Must be safe for concurrent use.
+	// OnExit reports the terminal outcome. Called exactly once, last, before
+	// the goroutine returns. Must be concurrency-safe.
 	OnExit func(issueID string, result WorkerResult)
 
-	// OnTurnStarted reports turnsStarted, the new turn included, before
-	// each coding or self-review turn runs. Called from the worker
-	// goroutine; must be safe for concurrent use. Nil disables it.
+	// OnTurnStarted reports turnsStarted before each turn runs. Called from
+	// the worker goroutine; must be concurrency-safe. Nil disables it.
 	OnTurnStarted func(issueID string, turnsStarted int)
 
-	// ResumeSessionID is the session ID from a previous worker attempt
-	// for the same issue. Non-empty on continuation retries so the
-	// agent adapter can resume the conversation. The orchestrator
-	// populates this from the previous RunningEntry.SessionID.
+	// ResumeSessionID is the previous attempt's session ID, non-empty on
+	// continuation retries so the adapter can resume the conversation.
 	ResumeSessionID string
 
-	// DispatchID is this run's dispatch ID. Empty when the worker was
-	// not started through [Orchestrator.makeWorkerFn].
+	// DispatchID fences session identity to this worker attempt.
 	DispatchID string
 
-	// ToolRegistry holds the tools available to agent sessions. May
-	// be nil when no tools are registered. Read-only after construction.
+	// ToolRegistry holds the tools available to agent sessions. May be nil.
+	// Read-only after construction.
 	ToolRegistry *domain.ToolRegistry
 
-	// SessionToolRegistryFunc builds the per-session tool registry for
-	// the first-turn advertisement, so the advertised tool set matches
-	// the set the MCP sidecar serves for the same session. When non-nil,
-	// the first-turn advertisement renders from the registry it returns
-	// instead of from ToolRegistry. When nil, the worker falls back to
-	// ToolRegistry. Optional.
+	// SessionToolRegistryFunc builds the per-session tool registry so the
+	// advertised set matches what the MCP sidecar serves. When nil, the
+	// worker falls back to ToolRegistry. Optional.
 	SessionToolRegistryFunc SessionToolRegistryFunc
 
-	// AgentToolChannelFunc reports whether a session's agent kind and
-	// launch mode can reach the tools the first-turn advertisement
-	// would name. Nil means the answer is unknown, and the worker
-	// withholds the advertisement rather than risk telling a session
-	// about tools it cannot call. Optional.
+	// AgentToolChannelFunc reports whether the session's kind and mode can
+	// reach the tools the advertisement would name. Nil means unknown, and
+	// the worker withholds the advertisement rather than name uncallable
+	// tools. Optional.
 	AgentToolChannelFunc AgentToolChannelFunc
 
-	// Logger is the structured logger with issue-scoped context fields
-	// already attached (issue_id, issue_identifier).
+	// Logger is the structured logger with issue-scoped context attached.
 	Logger *slog.Logger
 
-	// SSHHost is the SSH destination for this worker's agent sessions.
-	// Empty for local execution. Set by the orchestrator when dispatching
-	// to a remote host.
+	// SSHHost is the SSH destination for this worker's sessions. Empty for
+	// local execution.
 	SSHHost string
 
-	// SSHStrictHostKeyChecking is the OpenSSH StrictHostKeyChecking
-	// value for this worker's agent sessions. Empty means "accept-new".
+	// SSHStrictHostKeyChecking is the OpenSSH StrictHostKeyChecking value.
+	// Empty means "accept-new".
 	SSHStrictHostKeyChecking string
 
-	// Metrics records dispatch-time instrumentation counters.
-	// Always non-nil: NewOrchestrator falls back to NoopMetrics
-	// before wiring WorkerDeps via makeWorkerFn.
+	// SSHEnvNamesFunc returns the env var names to carry into a remote
+	// session. Nil means no name is carried.
+	SSHEnvNamesFunc SSHEnvNamesFunc
+
+	// Metrics records dispatch-time counters. Always non-nil:
+	// NewOrchestrator falls back to NoopMetrics.
 	Metrics domain.Metrics
 
-	// WorkflowPath is the absolute path to the active WORKFLOW.md
-	// file. Used by MCP config generation to pass --workflow to the
-	// mcp-server subcommand. Empty disables MCP config generation.
+	// WorkflowPath is the absolute WORKFLOW.md path, passed to MCP config
+	// generation. Empty disables MCP config generation.
 	WorkflowPath string
 
-	// DBPath is the absolute path to the SQLite database file.
-	// Passed to the MCP server via the config env field for future
-	// Tier 1 tool access.
+	// DBPath is the absolute SQLite database path, passed to the MCP server.
 	DBPath string
 
-	// MCPServerBinary is the absolute path to the sortie binary the
-	// agent runtime spawns as the tool server. Empty resolves to the
-	// running executable.
+	// MCPServerBinary is the absolute path to the sortie binary spawned as
+	// the tool server. Empty resolves to the running executable.
 	MCPServerBinary string
 
-	// ContinuationContext carries reaction continuation data to inject
-	// into the prompt template on the first turn. Non-nil only for
-	// reaction-triggered continuation dispatches.
+	// ContinuationContext carries reaction continuation data to inject into
+	// the first-turn prompt. Non-nil only for reaction continuations.
 	ContinuationContext map[string]any
 
-	// Posture selects the worker behavior for this dispatch. PostureNormal
-	// runs the operator hooks and drives the linked issue's state;
-	// PostureReview runs no hooks and suppresses every issue-work side
-	// effect on a fresh session; PostureFix runs the hooks so the agent
-	// can clone, check out the PR head branch, and push, but suppresses
-	// every issue-work side effect on a fresh session. The predicate
+	// Posture selects the worker behavior for this dispatch. The predicate
 	// methods [DispatchPosture.RunsSetupHooks] and
-	// [DispatchPosture.DrivesIssueState] gate the worker guards. The caller
-	// derives the posture from the dispatch reaction kind via
-	// [dispatchPostureForReactionKind].
+	// [DispatchPosture.DrivesIssueState] gate the worker guards. Derived from
+	// the dispatch reaction kind via [dispatchPostureForReactionKind].
 	Posture DispatchPosture
 
-	// OnProgress relays self-review progress to the orchestrator's event
-	// loop. Called from the worker goroutine; must be safe for concurrent
-	// use. May be nil when self-review is not configured.
+	// OnProgress relays self-review progress to the event loop. Called from
+	// the worker goroutine; must be concurrency-safe. May be nil when
+	// self-review is not configured.
 	OnProgress func(selfReviewProgressMsg)
 }
 
-// normalizeAttempt converts the nullable attempt to a plain integer.
-// nil returns 0; non-nil returns the dereferenced value.
+// normalizeAttempt converts the nullable attempt to a plain integer; nil
+// returns 0.
 func normalizeAttempt(attempt *int) int {
 	if attempt == nil {
 		return 0
@@ -453,33 +376,31 @@ func normalizeAttempt(attempt *int) int {
 	return *attempt
 }
 
-// isActiveState performs a case-insensitive check of state against the
-// active states list. Returns true if state is in the active set.
+// isActiveState case-insensitively reports whether state is in
+// activeStates.
 func isActiveState(state string, activeStates []string) bool {
 	return slices.ContainsFunc(activeStates, func(s string) bool {
 		return strings.EqualFold(s, state)
 	})
 }
 
-// isTerminalState performs a case-insensitive check of state against the
-// terminal states list. Returns false for an empty terminalStates list.
+// isTerminalState case-insensitively reports whether state is in
+// terminalStates. False for an empty list.
 func isTerminalState(state string, terminalStates []string) bool {
 	return slices.ContainsFunc(terminalStates, func(s string) bool {
 		return strings.EqualFold(s, state)
 	})
 }
 
-// isTurnSuccess returns true when the turn result exit reason indicates
-// the turn completed successfully and the worker may continue to the
-// next turn.
+// isTurnSuccess reports whether the turn's exit reason lets the worker
+// continue to the next turn.
 func isTurnSuccess(reason domain.AgentEventType) bool {
 	return reason == domain.EventTurnCompleted
 }
 
 // toDomainAgentConfig converts a config-layer AgentConfig to the
-// domain-layer AgentConfig expected by agent adapters. kind comes from
-// the caller rather than c.Kind because the session's dispatch-frozen
-// kind and the configuration's workflow default can differ.
+// domain-layer one. kind comes from the caller rather than c.Kind because
+// the dispatch-frozen kind and the configuration's default can differ.
 func toDomainAgentConfig(c config.AgentConfig, kind string) domain.AgentConfig {
 	return domain.AgentConfig{
 		Kind:           kind,
@@ -491,18 +412,16 @@ func toDomainAgentConfig(c config.AgentConfig, kind string) domain.AgentConfig {
 	}
 }
 
-// stopSessionDeadline returns the duration a session stop is allowed to
-// spend: the configured agent.stop_grace_ms plus three full graceful
-// teardown periods, one for each bounded drain wait the teardown can
-// spend.
+// stopSessionDeadline returns the duration a session stop may spend:
+// agent.stop_grace_ms plus three graceful teardown periods, one per bounded
+// drain wait the teardown can spend.
 func stopSessionDeadline(cfg config.ServiceConfig) time.Duration {
 	return procutil.StopGrace(cfg.Agent.StopGraceMS) + 3*procutil.DefaultDrainGrace
 }
 
-// stopSessionBestEffort terminates the agent session using a detached
-// context so that teardown proceeds even when the worker's ctx is
-// cancelled. The timeout is [stopSessionDeadline]. Errors are logged
-// and swallowed.
+// stopSessionBestEffort terminates the session using a detached context so
+// teardown proceeds even when the worker's ctx is cancelled. Errors are
+// logged and swallowed.
 func stopSessionBestEffort(
 	ctx context.Context,
 	adapter domain.AgentAdapter,
@@ -520,37 +439,44 @@ func stopSessionBestEffort(
 	}
 }
 
-// exitKindForErr returns WorkerExitCancelled if the context is done,
-// otherwise WorkerExitError.
-func exitKindForErr(ctx context.Context) WorkerExitKind {
-	if ctx.Err() != nil {
+// exitKindAtEnding classifies a worker's exit as observed when the run
+// ended. cancelledAtEnding always yields WorkerExitCancelled; otherwise a
+// live context yields WorkerExitError, and a done context yields
+// WorkerExitError only for the ceiling's own stop cause, so a stop
+// landing during teardown never retroactively cancels a finished run.
+func exitKindAtEnding(ctx context.Context, cancelledAtEnding bool) WorkerExitKind {
+	if cancelledAtEnding {
 		return WorkerExitCancelled
 	}
-	return WorkerExitError
+	if ctx.Err() == nil {
+		return WorkerExitError
+	}
+	if errors.Is(context.Cause(ctx), errTokenCeilingStop) {
+		return WorkerExitError
+	}
+	return WorkerExitCancelled
 }
 
-// defaultTurnTimeoutMS is the fallback bound runBoundedTurn applies
-// when it receives a non-positive turnTimeoutMS. It repeats the config
-// layer's default for agent.turn_timeout_ms. Because that layer rejects
-// a non-positive value outright, the fallback is unreachable from a
-// parsed configuration; it exists so an AgentConfig assembled in code
-// cannot leave a turn unbounded.
+// defaultTurnTimeoutMS is the fallback bound runBoundedTurn applies for a
+// non-positive turnTimeoutMS. Unreachable from a parsed configuration (the
+// config layer rejects a non-positive value); it exists so an AgentConfig
+// assembled in code cannot leave a turn unbounded.
 const defaultTurnTimeoutMS = 3_600_000
 
+func effectiveTurnTimeoutMS(turnTimeoutMS int) int {
+	if turnTimeoutMS > 0 {
+		return turnTimeoutMS
+	}
+	return defaultTurnTimeoutMS
+}
+
 // runBoundedTurn calls adapter.RunTurn under a deadline derived from
-// turnTimeoutMS and classifies the outcome once the call returns. A
-// parent ctx that is already done takes priority over the deadline, so
-// stall detection, tracker-state reconciliation, and shutdown keep
-// reporting their own cancellation rather than a turn timeout; only a
-// turn context that expired while ctx stayed live is reported as
-// [domain.ErrTurnTimeout]. Every other outcome, including a
-// non-timeout adapter error, is returned unchanged.
-//
-// ctx is never replaced or shadowed for the caller: runBoundedTurn
-// derives its own child context for the call and releases it before
-// returning. identity carries the caller's typed attributes naming
-// the turn in the log record an expiry or a non-positive substitution
-// produces; the caller's logger is used unmodified.
+// turnTimeoutMS. A parent ctx already done takes priority over the deadline,
+// so stall detection, reconciliation, and shutdown keep reporting their own
+// cancellation; only a turn context that expired while ctx stayed live is
+// reported as [domain.ErrTurnTimeout]. Every other outcome is returned
+// unchanged. ctx is never replaced for the caller; identity carries the
+// caller's attributes naming the turn in any log record produced.
 func runBoundedTurn(
 	ctx context.Context,
 	adapter domain.AgentAdapter,
@@ -560,11 +486,10 @@ func runBoundedTurn(
 	logger *slog.Logger,
 	identity ...slog.Attr,
 ) (domain.TurnResult, error) {
-	effectiveMS := turnTimeoutMS
-	if effectiveMS <= 0 {
+	effectiveMS := effectiveTurnTimeoutMS(turnTimeoutMS)
+	if turnTimeoutMS <= 0 {
 		attrs := append([]slog.Attr{slog.Int("configured_turn_timeout_ms", turnTimeoutMS)}, identity...)
 		logger.LogAttrs(ctx, slog.LevelWarn, "non-positive turn timeout, applying default", attrs...)
-		effectiveMS = defaultTurnTimeoutMS
 	}
 
 	turnCtx, cancel := context.WithTimeout(ctx, time.Duration(effectiveMS)*time.Millisecond)
@@ -591,40 +516,42 @@ func runBoundedTurn(
 	return result, err
 }
 
-// foldLocalUsage applies the clamped-delta accounting rule to the
-// worker's local token mirror: it computes each component's delta
-// against lastUsage, clamped to zero, adds the deltas to cumulative,
-// and raises lastUsage to the componentwise maximum of its prior value
-// and usage. It returns the updated cumulative total and watermarks.
+// foldLocalUsage applies the clamped-delta rule to the worker's token
+// mirror: each component's delta against lastUsage, clamped to zero, is
+// added to cumulative, and lastUsage is raised to the componentwise max.
 // Confined to the worker goroutine; never touches orchestrator state.
 func foldLocalUsage(usage, cumulative, lastUsage domain.TokenUsage) (newCumulative, newLastUsage domain.TokenUsage) {
-	deltaInput := max(usage.InputTokens-lastUsage.InputTokens, 0)
-	deltaOutput := max(usage.OutputTokens-lastUsage.OutputTokens, 0)
-	deltaTotal := max(usage.TotalTokens-lastUsage.TotalTokens, 0)
-	deltaCacheRead := max(usage.CacheReadTokens-lastUsage.CacheReadTokens, 0)
-
+	delta, newLastUsage := usageDeltaAndWatermark(usage, lastUsage)
 	newCumulative = domain.TokenUsage{
-		InputTokens:     cumulative.InputTokens + deltaInput,
-		OutputTokens:    cumulative.OutputTokens + deltaOutput,
-		TotalTokens:     cumulative.TotalTokens + deltaTotal,
-		CacheReadTokens: cumulative.CacheReadTokens + deltaCacheRead,
-	}
-	newLastUsage = domain.TokenUsage{
-		InputTokens:     max(lastUsage.InputTokens, usage.InputTokens),
-		OutputTokens:    max(lastUsage.OutputTokens, usage.OutputTokens),
-		TotalTokens:     max(lastUsage.TotalTokens, usage.TotalTokens),
-		CacheReadTokens: max(lastUsage.CacheReadTokens, usage.CacheReadTokens),
+		InputTokens:      cumulative.InputTokens + delta.InputTokens,
+		OutputTokens:     cumulative.OutputTokens + delta.OutputTokens,
+		TotalTokens:      cumulative.TotalTokens + delta.TotalTokens,
+		CacheReadTokens:  cumulative.CacheReadTokens + delta.CacheReadTokens,
+		CacheWriteTokens: cumulative.CacheWriteTokens + delta.CacheWriteTokens,
 	}
 	return newCumulative, newLastUsage
 }
 
-// RunWorkerAttempt executes a single worker attempt for the given issue.
-// It prepares the workspace, starts an agent session, runs the
-// multi-turn loop, and performs teardown. The function calls
-// deps.OnExit exactly once before returning, even on panics.
-//
-// RunWorkerAttempt conforms to [WorkerFunc] when partially applied via
-// closure over deps.
+// applyUsageOffset adds offset to a measured usage. A working session
+// counts from its own start, so the verification spend that preceded it
+// must be added explicitly.
+func applyUsageOffset(usage, offset domain.TokenUsage) domain.TokenUsage {
+	if !hasUsage(usage) {
+		return usage
+	}
+	return domain.TokenUsage{
+		InputTokens:      usage.InputTokens + offset.InputTokens,
+		OutputTokens:     usage.OutputTokens + offset.OutputTokens,
+		TotalTokens:      usage.TotalTokens + offset.TotalTokens,
+		CacheReadTokens:  usage.CacheReadTokens + offset.CacheReadTokens,
+		CacheWriteTokens: usage.CacheWriteTokens + offset.CacheWriteTokens,
+	}
+}
+
+// RunWorkerAttempt executes a single worker attempt: it prepares the
+// workspace, starts a session, runs the multi-turn loop, and tears down.
+// deps.OnExit is called exactly once before returning, even on panic.
+// Conforms to [WorkerFunc] when partially applied via closure over deps.
 func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, deps WorkerDeps) {
 	cfg := deps.ConfigFunc()
 	handoffEvidencePolicy := cfg.Tracker.HandoffEvidence.Effective()
@@ -635,9 +562,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		logger = slog.Default()
 	}
 
-	// The rule-resolved kind is authoritative for run-history recording
-	// and dispatch-comment text. Callers that have not wired routing
-	// fall back to the workflow-wide default.
+	// The rule-resolved kind is authoritative for run-history and
+	// dispatch-comment text; callers without routing fall back to the
+	// workflow-wide default.
 	agentKind := deps.AgentKind
 	if agentKind == "" {
 		agentKind = cfg.Agent.Kind
@@ -648,20 +575,16 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	}
 
 	// localMeasured mirrors the run's measurement state on the worker
-	// goroutine. It starts true because a run that never enters a turn
-	// spent exactly zero; it flips to false immediately before the
-	// worker's first RunTurn call, and back to true on the first
-	// usage-bearing event, the first token_usage event, or the first
-	// TurnResult reporting UsageMeasured true. localUsage is the
-	// worker's own mirror of the run-cumulative token counters, folded
-	// from any usage-bearing event on the worker goroutine;
-	// localLastUsage holds the matching last-reported watermarks.
-	// localModelName mirrors the last relayed token_usage event's model
-	// name, and localRequestCount counts relayed token_usage events.
-	// localUsage and localMeasured feed .sortie/state.json, and all four
-	// feed the matching WorkerResult fields; this mirror never touches
-	// orchestrator state and never calls applyUsageDelta.
+	// goroutine. It starts true (a run that never enters a turn spent
+	// exactly zero), flips false before the first RunTurn, and back true on
+	// the first admitted measurement. localUsage/localLastUsage mirror the
+	// run-cumulative counters and their watermarks; localModelName and
+	// localRequestCount mirror the last relayed token_usage event's model
+	// and count. This mirror never touches orchestrator state.
+	// localUnaccounted is summed, not latched: each turn carries its own
+	// spend-unaccounted verdict.
 	localMeasured := true
+	localUnaccounted := 0
 	discardWarned := false
 	var (
 		localUsage        domain.TokenUsage
@@ -670,8 +593,8 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		localRequestCount int
 	)
 
-	// admitMeasurement reports whether the run's usage arrival admits a
-	// figure. It warns on the first rejection only, not once per turn.
+	// admitMeasurement reports whether the run's arrival admits a figure,
+	// warning on the first rejection only.
 	admitMeasurement := func() bool {
 		if admitsUsageFigures(deps.UsageArrival) {
 			return true
@@ -685,12 +608,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		return false
 	}
 
-	// foldRelayedEvent is the only code in RunWorkerAttempt that folds a
-	// relayed event into the worker mirror. Both the main-turn relay and
-	// the self-review relay call it for every event they receive from
-	// the adapter, so the mirror covers every turn of the run. A
-	// rejected measurement reports false, so the caller skips the
-	// state-file write.
+	// foldRelayedEvent is the only code that folds a relayed event into the
+	// worker mirror. A rejected measurement reports false so the caller
+	// skips the state-file write.
 	foldRelayedEvent := func(event domain.AgentEvent) (measurementArrived bool) {
 		measurementArrived = event.Type == domain.EventTokenUsage || hasUsage(event.Usage)
 		if measurementArrived && !admitMeasurement() {
@@ -711,31 +631,61 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		return measurementArrived
 	}
 
+	foldTurnResult := func(result domain.TurnResult) (carriesMeasurement bool) {
+		if result.SpendUnaccounted {
+			localUnaccounted++
+		}
+		carriesMeasurement = hasUsage(result.Usage) || result.UsageMeasured
+		if carriesMeasurement && !admitMeasurement() {
+			carriesMeasurement = false
+		} else if hasUsage(result.Usage) {
+			localUsage, localLastUsage = foldLocalUsage(result.Usage, localUsage, localLastUsage)
+		}
+		if carriesMeasurement {
+			localMeasured = true
+		}
+		return carriesMeasurement
+	}
+
+	// reported guards against double-reporting from the panic recovery.
+	reported := false
+
+	var acceptedSessionID string
+
+	// cancelledAtEnding is read right after the call that last ended a run attempt.
+	var cancelledAtEnding bool
+
+	report := func(result WorkerResult) {
+		result.StoppedByTokenCeiling = result.ExitKind == WorkerExitCancelled && errors.Is(context.Cause(ctx), errTokenCeilingStop)
+		result.SessionID = acceptedSessionID
+		reported = true
+		deps.OnExit(issue.ID, result)
+	}
+
 	if tmpl == nil {
 		logger.Error("prompt template lookup returned nil",
 			slog.String("template_id", deps.TemplateID),
 		)
-		deps.OnExit(issue.ID, WorkerResult{
-			IssueID:         issue.ID,
-			Identifier:      issue.Identifier,
-			ExitKind:        WorkerExitError,
-			Error:           fmt.Errorf("prompt template %q is not registered", deps.TemplateID),
-			AgentAdapter:    agentKind,
-			Attempt:         attempt,
-			SSHHost:         deps.SSHHost,
-			Usage:           localUsage,
-			UsageMeasured:   localMeasured,
-			ModelName:       localModelName,
-			APIRequestCount: localRequestCount,
+		report(WorkerResult{
+			IssueID:          issue.ID,
+			Identifier:       issue.Identifier,
+			ExitKind:         WorkerExitError,
+			Error:            fmt.Errorf("prompt template %q is not registered", deps.TemplateID),
+			AgentAdapter:     agentKind,
+			Attempt:          attempt,
+			SSHHost:          deps.SSHHost,
+			Usage:            localUsage,
+			UsageMeasured:    localMeasured,
+			UnaccountedTurns: localUnaccounted,
+			ModelName:        localModelName,
+			APIRequestCount:  localRequestCount,
 		})
 		return
 	}
 
-	// Dispatch-time in-progress transition: move the issue to the
-	// configured in-progress tracker state before workspace prep.
-	// Failure is non-fatal; the worker continues regardless. A dispatch
-	// that does not drive issue state changes no issue state, so it is
-	// suppressed there.
+	// Move the issue to the in-progress state before workspace prep.
+	// Failure is non-fatal. A dispatch that does not drive issue state
+	// changes none, so it is suppressed there.
 	if cfg.Tracker.InProgressState != "" && deps.Posture.DrivesIssueState() {
 		if strings.EqualFold(issue.State, cfg.Tracker.InProgressState) {
 			logger.Debug("skipped in-progress transition, issue already in target state",
@@ -760,14 +710,11 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 	}
 
-	// Dispatch comment: post a tracker comment acknowledging claim.
-	// Fires after in-progress transition, before workspace preparation.
-	// Failure is non-fatal; the worker continues regardless. A dispatch
-	// that does not drive issue state is not a work claim, so it posts no
-	// dispatch comment.
+	// Post a claim-acknowledging comment, after the transition and before
+	// workspace prep. Failure is non-fatal. A dispatch that does not drive
+	// issue state is not a work claim, so it posts none.
 	if cfg.Tracker.Comments.OnDispatch && deps.Posture.DrivesIssueState() {
-		text := buildDispatchComment(agentKind, attemptInt)
-		if err := deps.TrackerAdapter.CommentIssue(ctx, issue.ID, text); err != nil {
+		if err := deps.TrackerAdapter.CommentIssue(ctx, issue.ID, dispatchComment); err != nil {
 			logger.Warn("dispatch comment failed", slog.Any("error", err))
 			deps.Metrics.IncTrackerComments("dispatch", "error")
 		} else {
@@ -776,13 +723,8 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 	}
 
-	// reported tracks whether OnExit has been called. The deferred
-	// panic recovery checks this to avoid double-reporting.
-	reported := false
-
 	// Pre-declared so the panic recovery defer can access them.
 	var workspacePath string
-	var sessionID string
 	var turnsCompleted int
 	var turnsStarted int
 	var observedIssueState string
@@ -813,14 +755,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				})
 			}
 			if !reported {
-				deps.OnExit(issue.ID, WorkerResult{
+				report(WorkerResult{
 					IssueID:            issue.ID,
 					Identifier:         issue.Identifier,
 					ExitKind:           WorkerExitError,
 					Error:              fmt.Errorf("worker panic: %v", r),
 					TurnsCompleted:     turnsCompleted,
 					TurnsStarted:       turnsStarted,
-					SessionID:          sessionID,
 					WorkspacePath:      workspacePath,
 					AgentAdapter:       agentKind,
 					Attempt:            attempt,
@@ -828,6 +769,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					ObservedIssueState: observedIssueState,
 					Usage:              localUsage,
 					UsageMeasured:      localMeasured,
+					UnaccountedTurns:   localUnaccounted,
 					ModelName:          localModelName,
 					APIRequestCount:    localRequestCount,
 				})
@@ -835,42 +777,41 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 	}()
 
-	// Prepare the workspace directory. A dispatch that runs no setup hooks
-	// obtains a scratch directory via workspace.Ensure and runs no operator
-	// after_create/before_run hooks (no clone, no build); a hook-running
-	// dispatch runs the full lifecycle.
+	// A dispatch with no setup hooks gets a scratch directory via
+	// workspace.Ensure (no clone, no build); a hook-running dispatch runs
+	// the full lifecycle.
 	var wsResult workspace.PrepareResult
 	var err error
 	if !deps.Posture.RunsSetupHooks() {
 		// workspace.Ensure does not inspect the context, so honor an
-		// already-cancelled dispatch here before any filesystem work,
-		// matching the normal path's workspace.Prepare early return.
+		// already-cancelled dispatch here, matching the normal path's early
+		// return.
 		var ensureResult workspace.EnsureResult
 		prepErr := ctx.Err()
 		if prepErr == nil {
 			ensureResult, prepErr = workspace.Ensure(cfg.Workspace.Root, issue.Identifier)
 		}
+		cancelledAtEnding = ctx.Err() != nil
 		if prepErr != nil {
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
-				IssueID:         issue.ID,
-				Identifier:      issue.Identifier,
-				ExitKind:        exitKindForErr(ctx),
-				Error:           fmt.Errorf("workspace preparation: %w", prepErr),
-				AgentAdapter:    agentKind,
-				Attempt:         attempt,
-				SSHHost:         deps.SSHHost,
-				Usage:           localUsage,
-				UsageMeasured:   localMeasured,
-				ModelName:       localModelName,
-				APIRequestCount: localRequestCount,
+			report(WorkerResult{
+				IssueID:          issue.ID,
+				Identifier:       issue.Identifier,
+				ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
+				Error:            fmt.Errorf("workspace preparation: %w", prepErr),
+				AgentAdapter:     agentKind,
+				Attempt:          attempt,
+				SSHHost:          deps.SSHHost,
+				Usage:            localUsage,
+				UsageMeasured:    localMeasured,
+				UnaccountedTurns: localUnaccounted,
+				ModelName:        localModelName,
+				APIRequestCount:  localRequestCount,
 			})
 			return
 		}
-		// The read-only path reuses the per-issue workspace directory, which
-		// may hold a stale .sortie/status from a prior session. Clear it so a
-		// stale recognized status does not end the review on turn one, the
-		// same best-effort cleanup the normal path runs via PreRunFunc.
+		// The read-only path reuses the per-issue directory, which may hold
+		// a stale .sortie/status; clear it so a stale recognized status does
+		// not end the review on turn one.
 		workspace.CleanupStatusFile(ensureResult.Path, logger)
 		wsResult = workspace.PrepareResult(ensureResult)
 	} else {
@@ -888,20 +829,21 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				workspace.CleanupStatusFile(wsPath, logger)
 			},
 		})
+		cancelledAtEnding = ctx.Err() != nil
 		if err != nil {
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
-				IssueID:         issue.ID,
-				Identifier:      issue.Identifier,
-				ExitKind:        exitKindForErr(ctx),
-				Error:           fmt.Errorf("workspace preparation: %w", err),
-				AgentAdapter:    agentKind,
-				Attempt:         attempt,
-				SSHHost:         deps.SSHHost,
-				Usage:           localUsage,
-				UsageMeasured:   localMeasured,
-				ModelName:       localModelName,
-				APIRequestCount: localRequestCount,
+			report(WorkerResult{
+				IssueID:          issue.ID,
+				Identifier:       issue.Identifier,
+				ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
+				Error:            fmt.Errorf("workspace preparation: %w", err),
+				AgentAdapter:     agentKind,
+				Attempt:          attempt,
+				SSHHost:          deps.SSHHost,
+				Usage:            localUsage,
+				UsageMeasured:    localMeasured,
+				UnaccountedTurns: localUnaccounted,
+				ModelName:        localModelName,
+				APIRequestCount:  localRequestCount,
 			})
 			return
 		}
@@ -910,11 +852,10 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	workspacePath = wsResult.Path
 	logger.Info("workspace prepared", slog.String("workspace", wsResult.Path))
 
-	// finishWorkspace runs the after_run hook best-effort on every exit
-	// path after successful workspace preparation.
+	// finishWorkspace runs the after_run hook best-effort on every exit path
+	// after successful preparation.
 	finishWorkspace := func() {
-		// A dispatch that runs no operator setup hook has no operator
-		// teardown hook to run on its scratch workspace.
+		// A dispatch with no setup hook has no teardown hook to run.
 		if !deps.Posture.RunsSetupHooks() {
 			return
 		}
@@ -930,27 +871,26 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		})
 	}
 
-	// Generate MCP config so the agent session can invoke Sortie tools.
 	if deps.WorkflowPath == "" {
 		logger.Debug("skipped mcp config generation, workflow path empty")
 	} else {
 		execPath, execErr := resolveToolServerBinary(deps.MCPServerBinary)
 		if execErr != nil {
 			finishWorkspace()
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
-				IssueID:         issue.ID,
-				Identifier:      issue.Identifier,
-				ExitKind:        WorkerExitError,
-				Error:           fmt.Errorf("mcp config generation: %w", execErr),
-				WorkspacePath:   wsResult.Path,
-				AgentAdapter:    agentKind,
-				Attempt:         attempt,
-				SSHHost:         deps.SSHHost,
-				Usage:           localUsage,
-				UsageMeasured:   localMeasured,
-				ModelName:       localModelName,
-				APIRequestCount: localRequestCount,
+			report(WorkerResult{
+				IssueID:          issue.ID,
+				Identifier:       issue.Identifier,
+				ExitKind:         WorkerExitError,
+				Error:            fmt.Errorf("mcp config generation: %w", execErr),
+				WorkspacePath:    wsResult.Path,
+				AgentAdapter:     agentKind,
+				Attempt:          attempt,
+				SSHHost:          deps.SSHHost,
+				Usage:            localUsage,
+				UsageMeasured:    localMeasured,
+				UnaccountedTurns: localUnaccounted,
+				ModelName:        localModelName,
+				APIRequestCount:  localRequestCount,
 			})
 			return
 		}
@@ -964,7 +904,6 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			IssueID:               issue.ID,
 			Identifier:            issue.Identifier,
 			DBPath:                deps.DBPath,
-			SessionID:             "",
 			DispatchID:            deps.DispatchID,
 			Attempt:               attempt,
 			AgentKind:             agentKind,
@@ -973,20 +912,20 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		})
 		if genErr != nil {
 			finishWorkspace()
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
-				IssueID:         issue.ID,
-				Identifier:      issue.Identifier,
-				ExitKind:        WorkerExitError,
-				Error:           fmt.Errorf("mcp config generation: %w", genErr),
-				WorkspacePath:   wsResult.Path,
-				AgentAdapter:    agentKind,
-				Attempt:         attempt,
-				SSHHost:         deps.SSHHost,
-				Usage:           localUsage,
-				UsageMeasured:   localMeasured,
-				ModelName:       localModelName,
-				APIRequestCount: localRequestCount,
+			report(WorkerResult{
+				IssueID:          issue.ID,
+				Identifier:       issue.Identifier,
+				ExitKind:         WorkerExitError,
+				Error:            fmt.Errorf("mcp config generation: %w", genErr),
+				WorkspacePath:    wsResult.Path,
+				AgentAdapter:     agentKind,
+				Attempt:          attempt,
+				SSHHost:          deps.SSHHost,
+				Usage:            localUsage,
+				UsageMeasured:    localMeasured,
+				UnaccountedTurns: localUnaccounted,
+				ModelName:        localModelName,
+				APIRequestCount:  localRequestCount,
 			})
 			return
 		}
@@ -998,24 +937,73 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			slog.String("operator_mcp_config_path", settings.MCPConfigPath))
 	}
 
-	// Check context between workspace preparation and session start.
+	writeDispatchIdentity := func(sessionID string) {
+		if mcpConfigPath == "" || deps.DispatchID == "" {
+			return
+		}
+		if err := workspace.WriteDispatchIdentity(wsResult.Path, workspace.DispatchIdentity{
+			DispatchID: deps.DispatchID,
+			SessionID:  sessionID,
+		}); err != nil {
+			logger.Warn("failed to write dispatch identity record", slog.Any("error", err))
+		}
+	}
+
 	if ctx.Err() != nil {
 		finishWorkspace()
-		reported = true
-		deps.OnExit(issue.ID, WorkerResult{
-			IssueID:         issue.ID,
-			Identifier:      issue.Identifier,
-			ExitKind:        WorkerExitCancelled,
-			WorkspacePath:   wsResult.Path,
-			AgentAdapter:    agentKind,
-			Attempt:         attempt,
-			SSHHost:         deps.SSHHost,
-			Usage:           localUsage,
-			UsageMeasured:   localMeasured,
-			ModelName:       localModelName,
-			APIRequestCount: localRequestCount,
+		report(WorkerResult{
+			IssueID:          issue.ID,
+			Identifier:       issue.Identifier,
+			ExitKind:         WorkerExitCancelled,
+			WorkspacePath:    wsResult.Path,
+			AgentAdapter:     agentKind,
+			Attempt:          attempt,
+			SSHHost:          deps.SSHHost,
+			Usage:            localUsage,
+			UsageMeasured:    localMeasured,
+			UnaccountedTurns: localUnaccounted,
+			ModelName:        localModelName,
+			APIRequestCount:  localRequestCount,
 		})
 		return
+	}
+
+	var sshEnvNames []string
+	if strings.TrimSpace(deps.SSHHost) != "" && deps.SSHEnvNamesFunc != nil {
+		sshEnvNames = deps.SSHEnvNamesFunc(agentKind)
+	}
+
+	params := domain.StartSessionParams{
+		WorkspacePath:            wsResult.Path,
+		AgentConfig:              toDomainAgentConfig(cfg.Agent, agentKind),
+		ResumeSessionID:          deps.ResumeSessionID,
+		SSHHost:                  deps.SSHHost,
+		SSHStrictHostKeyChecking: deps.SSHStrictHostKeyChecking,
+		SSHEnvNames:              sshEnvNames,
+		MCPConfigPath:            mcpConfigPath,
+	}
+
+	deps.OnEvent(issue.ID, domain.AgentEvent{
+		Type:      domain.EventNotification,
+		Timestamp: time.Now().UTC(),
+		Message:   "verifying the agent credential",
+	})
+
+	relayVerificationEvent := func(event domain.AgentEvent) {
+		foldRelayedEvent(event)
+		relayType := domain.EventNotification
+		var model string
+		if event.Type == domain.EventTokenUsage {
+			relayType = domain.EventTokenUsage
+			model = event.Model
+		}
+		deps.OnEvent(issue.ID, domain.AgentEvent{
+			Type:      relayType,
+			Timestamp: event.Timestamp,
+			Message:   "verifying the agent credential",
+			Usage:     event.Usage,
+			Model:     model,
+		})
 	}
 
 	if handoffEvidencePolicy != config.HandoffEvidenceOff {
@@ -1027,42 +1015,77 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 	}
 
-	session, err = deps.AgentAdapter.StartSession(ctx, domain.StartSessionParams{
-		WorkspacePath:            wsResult.Path,
-		AgentConfig:              toDomainAgentConfig(cfg.Agent, agentKind),
-		ResumeSessionID:          deps.ResumeSessionID,
-		SSHHost:                  deps.SSHHost,
-		SSHStrictHostKeyChecking: deps.SSHStrictHostKeyChecking,
-		MCPConfigPath:            mcpConfigPath,
+	redact.AddEnviron(config.DotEnvEntries())
+
+	verificationStarted := time.Now()
+	verificationResult, verificationErr := agentcore.VerifyCredential(ctx, deps.AgentAdapter, agentcore.CredentialVerification{
+		Session:   params,
+		Issue:     issue,
+		TurnBound: time.Duration(effectiveTurnTimeoutMS(cfg.Agent.TurnTimeoutMS)) * time.Millisecond,
+		StopBound: stopSessionDeadline(cfg),
+		OnRequest: func() { localMeasured = false },
+		OnEvent:   relayVerificationEvent,
+		Logger:    logger,
 	})
+	cancelledAtEnding = ctx.Err() != nil
+
+	foldTurnResult(verificationResult)
+
+	verificationSpend := localLastUsage
+
+	if verificationErr != nil {
+		finishWorkspace()
+		report(WorkerResult{
+			IssueID:          issue.ID,
+			Identifier:       issue.Identifier,
+			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
+			Error:            fmt.Errorf("agent session start: %w", verificationErr),
+			WorkspacePath:    wsResult.Path,
+			AgentAdapter:     agentKind,
+			Attempt:          attempt,
+			SSHHost:          deps.SSHHost,
+			Usage:            localUsage,
+			UsageMeasured:    localMeasured,
+			UnaccountedTurns: localUnaccounted,
+			ModelName:        localModelName,
+			APIRequestCount:  localRequestCount,
+		})
+		return
+	}
+
+	logger.Info("agent credential verified", slog.Int64("duration_ms", time.Since(verificationStarted).Milliseconds()))
+
+	session, err = deps.AgentAdapter.StartSession(ctx, params)
+	cancelledAtEnding = ctx.Err() != nil
 	if err != nil {
 		finishWorkspace()
-		reported = true
-		deps.OnExit(issue.ID, WorkerResult{
-			IssueID:         issue.ID,
-			Identifier:      issue.Identifier,
-			ExitKind:        exitKindForErr(ctx),
-			Error:           fmt.Errorf("agent session start: %w", err),
-			WorkspacePath:   wsResult.Path,
-			AgentAdapter:    agentKind,
-			Attempt:         attempt,
-			SSHHost:         deps.SSHHost,
-			Usage:           localUsage,
-			UsageMeasured:   localMeasured,
-			ModelName:       localModelName,
-			APIRequestCount: localRequestCount,
+		report(WorkerResult{
+			IssueID:          issue.ID,
+			Identifier:       issue.Identifier,
+			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
+			Error:            fmt.Errorf("agent session start: %w", err),
+			WorkspacePath:    wsResult.Path,
+			AgentAdapter:     agentKind,
+			Attempt:          attempt,
+			SSHHost:          deps.SSHHost,
+			Usage:            localUsage,
+			UsageMeasured:    localMeasured,
+			UnaccountedTurns: localUnaccounted,
+			ModelName:        localModelName,
+			APIRequestCount:  localRequestCount,
 		})
 		return
 	}
 
 	sessionStarted = true
-	sessionID = session.ID
 	logger = logging.WithSession(logger, session.ID)
 	logger.Info("agent session started")
 
+	acceptedSessionID = session.ID
+	writeDispatchIdentity(acceptedSessionID)
+
 	sessionStartedAt = time.Now().UTC()
 
-	// Execute turns until the issue leaves an active state or max_turns is reached.
 	maxTurns := cfg.Agent.MaxTurns
 	if maxTurns < 1 {
 		logger.Warn("clamped agent max_turns to 1", slog.Int("configured_max_turns", cfg.Agent.MaxTurns))
@@ -1071,24 +1094,99 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	turnNumber := 1
 	activeStates := cfg.Tracker.ActiveStates
 
-	// pendingSoftStopReason holds the recognized status token once a
-	// post-turn read admits one, so the single post-loop teardown can
-	// report it after the self-review phase has had a chance to run.
-	var pendingSoftStopReason string
-
-	if mcpConfigPath != "" {
-		if err := writeWorkerState(wsResult.Path, workerState{
-			TurnNumber: 0,
+	publishWorkerState := func(turn int) error {
+		if mcpConfigPath == "" {
+			return nil
+		}
+		return writeWorkerState(wsResult.Path, workerState{
+			TurnNumber: turn,
 			MaxTurns:   maxTurns,
 			Attempt:    attempt,
 			StartedAt:  sessionStartedAt.Format(time.RFC3339Nano),
-		}.withTokens(localUsage, localMeasured)); err != nil {
-			logger.Warn("failed to write status state file at session start", slog.Any("error", err))
+		}.withTokens(localUsage, localMeasured))
+	}
+
+	acceptSessionID := func(id string) bool {
+		if id == "" || id == acceptedSessionID {
+			return false
+		}
+		previous := acceptedSessionID
+		logger.Info("agent session id accepted",
+			slog.String("previous_session_id", previous),
+			slog.String("accepted_session_id", id),
+		)
+		acceptedSessionID = id
+		return true
+	}
+
+	relayTurnEvent := func(event domain.AgentEvent) {
+		// Defensive copy in the worker goroutine, before the event crosses
+		// the goroutine boundary, so the orchestrator never iterates a map
+		// the adapter may still mutate.
+		if event.RateLimits != nil {
+			event.RateLimits = maps.Clone(event.RateLimits)
+		}
+		event.Usage = applyUsageOffset(event.Usage, verificationSpend)
+		if foldRelayedEvent(event) {
+			if err := publishWorkerState(turnNumber); err != nil {
+				logger.Warn("failed to write status state file on token event", slog.Any("error", err))
+			}
+		}
+		if event.Type == domain.EventSessionStarted && event.SessionID != "" {
+			acceptSessionID(event.SessionID)
+			writeDispatchIdentity(acceptedSessionID)
+		}
+		deps.OnEvent(issue.ID, event)
+	}
+
+	// An adapter may report a session's only measurement here rather than
+	// through an event; on the last turn no later write would carry it, so
+	// the file would keep denying a measurement that exists.
+	handleTurnResult := func(result domain.TurnResult) {
+		result.Usage = applyUsageOffset(result.Usage, verificationSpend)
+		if foldTurnResult(result) {
+			if err := publishWorkerState(turnNumber); err != nil {
+				logger.Warn("failed to write status state file after turn result", slog.Any("error", err))
+			}
+		}
+		if acceptSessionID(result.SessionID) {
+			writeDispatchIdentity(acceptedSessionID)
 		}
 	}
 
+	// pendingSoftStopReason holds the recognized status token once a
+	// post-turn read admits one, so the single post-loop teardown can report
+	// it after self-review has had a chance to run.
+	var pendingSoftStopReason string
+
+	if err := publishWorkerState(0); err != nil {
+		logger.Warn("failed to write status state file at session start", slog.Any("error", err))
+	}
+
 	for {
-		// Render the prompt template for this turn.
+		if ctx.Err() != nil {
+			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
+			finishWorkspace()
+			report(WorkerResult{
+				IssueID:            issue.ID,
+				Identifier:         issue.Identifier,
+				ExitKind:           WorkerExitCancelled,
+				TurnsCompleted:     turnsCompleted,
+				TurnsStarted:       turnsStarted,
+				WorkspacePath:      wsResult.Path,
+				AgentAdapter:       agentKind,
+				Attempt:            attempt,
+				SSHHost:            deps.SSHHost,
+				ObservedIssueState: observedIssueState,
+				Usage:              localUsage,
+				UsageMeasured:      localMeasured,
+				UnaccountedTurns:   localUnaccounted,
+				ModelName:          localModelName,
+				APIRequestCount:    localRequestCount,
+			})
+			return
+		}
+
 		issueMap := issue.ToTemplateMap()
 		var renderOpts []prompt.RenderOption
 		if turnNumber == 1 {
@@ -1101,18 +1199,17 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			}
 		}
 		rendered, err := prompt.BuildTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, renderOpts...)
+		cancelledAtEnding = ctx.Err() != nil
 		if err != nil {
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 			finishWorkspace()
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
+			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
-				ExitKind:           exitKindForErr(ctx),
+				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
 				Error:              fmt.Errorf("prompt render (turn %d): %w", turnNumber, err),
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
-				SessionID:          session.ID,
 				WorkspacePath:      wsResult.Path,
 				AgentAdapter:       agentKind,
 				Attempt:            attempt,
@@ -1120,6 +1217,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				ObservedIssueState: observedIssueState,
 				Usage:              localUsage,
 				UsageMeasured:      localMeasured,
+				UnaccountedTurns:   localUnaccounted,
 				ModelName:          localModelName,
 				APIRequestCount:    localRequestCount,
 			})
@@ -1137,7 +1235,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					slog.String("agent_kind", agentKind), slog.Bool("remote", remote))
 			default:
 				if deps.SessionToolRegistryFunc != nil {
-					sessionReg, err := deps.SessionToolRegistryFunc(ctx, issue.ID, wsResult.Path, session.ID)
+					sessionReg, err := deps.SessionToolRegistryFunc(ctx, issue.ID, wsResult.Path)
 					if err != nil {
 						logger.Warn("failed to build session tool advertisement", slog.Any("error", err))
 					} else if sessionReg != nil && sessionReg.Len() > 0 {
@@ -1156,97 +1254,34 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			deps.OnTurnStarted(issue.ID, turnsStarted)
 		}
 
-		if turnNumber == 1 {
-			localMeasured = false
-		}
+		writeDispatchIdentity(acceptedSessionID)
 
-		// The turn-start write follows the flip above: publishing it
-		// earlier would put a measured verdict on disk for the whole of
-		// turn one, which an agent reading its own spend would take as a
-		// measurement of zero.
-		if mcpConfigPath != "" {
-			if err := writeWorkerState(wsResult.Path, workerState{
-				TurnNumber: turnNumber,
-				MaxTurns:   maxTurns,
-				Attempt:    attempt,
-				StartedAt:  sessionStartedAt.Format(time.RFC3339Nano),
-			}.withTokens(localUsage, localMeasured)); err != nil {
-				logger.Warn("failed to write status state file at turn start",
-					slog.Int("turn_number", turnNumber),
-					slog.Any("error", err),
-				)
-			}
+		if err := publishWorkerState(turnNumber); err != nil {
+			logger.Warn("failed to write status state file at turn start",
+				slog.Int("turn_number", turnNumber),
+				slog.Any("error", err),
+			)
 		}
 
 		turnResult, err := runBoundedTurn(ctx, deps.AgentAdapter, session, domain.RunTurnParams{
-			Prompt: rendered,
-			Issue:  issue,
-			OnEvent: func(event domain.AgentEvent) {
-				// Defensive copy: RateLimits is a reference type. Copying
-				// here, in the worker goroutine, before the event crosses
-				// the goroutine boundary ensures the orchestrator never
-				// iterates a map that the adapter may still mutate.
-				if event.RateLimits != nil {
-					event.RateLimits = maps.Clone(event.RateLimits)
-				}
-				measurementArrived := foldRelayedEvent(event)
-				if measurementArrived && mcpConfigPath != "" {
-					if err := writeWorkerState(wsResult.Path, workerState{
-						TurnNumber: turnNumber,
-						MaxTurns:   maxTurns,
-						Attempt:    attempt,
-						StartedAt:  sessionStartedAt.Format(time.RFC3339Nano),
-					}.withTokens(localUsage, localMeasured)); err != nil {
-						logger.Warn("failed to write status state file on token event", slog.Any("error", err))
-					}
-				}
-				deps.OnEvent(issue.ID, event)
-			},
+			Prompt:  rendered,
+			Issue:   issue,
+			OnEvent: relayTurnEvent,
 		}, cfg.Agent.TurnTimeoutMS, logger, slog.Int("turn_number", turnNumber))
+		cancelledAtEnding = ctx.Err() != nil
 
-		// Fold TurnResult.Usage into the local mirror on both the success
-		// and the error path, so a run-cumulative figure the adapter
-		// reported only on TurnResult (not through an event) is not lost.
-		// A figure the adapter reports here is a measurement whether or
-		// not it also sets the flag, which is how the event path above
-		// already reads a non-zero payload.
-		resultCarriesMeasurement := hasUsage(turnResult.Usage) || turnResult.UsageMeasured
-		if resultCarriesMeasurement && !admitMeasurement() {
-			resultCarriesMeasurement = false
-		} else if hasUsage(turnResult.Usage) {
-			localUsage, localLastUsage = foldLocalUsage(turnResult.Usage, localUsage, localLastUsage)
-		}
-		if resultCarriesMeasurement {
-			localMeasured = true
-		}
-
-		// An adapter may report a session's only measurement here rather
-		// than through an event, and on the last turn no later write
-		// would carry it, so the file would keep denying a measurement
-		// that exists.
-		if resultCarriesMeasurement && mcpConfigPath != "" {
-			if err := writeWorkerState(wsResult.Path, workerState{
-				TurnNumber: turnNumber,
-				MaxTurns:   maxTurns,
-				Attempt:    attempt,
-				StartedAt:  sessionStartedAt.Format(time.RFC3339Nano),
-			}.withTokens(localUsage, localMeasured)); err != nil {
-				logger.Warn("failed to write status state file after turn result", slog.Any("error", err))
-			}
-		}
+		handleTurnResult(turnResult)
 
 		if err != nil {
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 			finishWorkspace()
-			reported = true
-			deps.OnExit(issue.ID, WorkerResult{
+			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
-				ExitKind:           exitKindForErr(ctx),
+				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
 				Error:              fmt.Errorf("agent turn %d: %w", turnNumber, err),
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
-				SessionID:          session.ID,
 				WorkspacePath:      wsResult.Path,
 				AgentAdapter:       agentKind,
 				Attempt:            attempt,
@@ -1254,6 +1289,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				ObservedIssueState: observedIssueState,
 				Usage:              localUsage,
 				UsageMeasured:      localMeasured,
+				UnaccountedTurns:   localUnaccounted,
 				ModelName:          localModelName,
 				APIRequestCount:    localRequestCount,
 			})
@@ -1267,20 +1303,17 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		if !isTurnSuccess(turnResult.ExitReason) {
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 			finishWorkspace()
-			reported = true
-			exitKind := exitKindForErr(ctx)
 			logger.Warn("turn exit reason indicates failure",
 				slog.Int("turn_number", turnNumber),
 				slog.Any("exit_reason", turnResult.ExitReason),
 			)
-			deps.OnExit(issue.ID, WorkerResult{
+			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
-				ExitKind:           exitKind,
+				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
 				Error:              fmt.Errorf("agent turn %d ended: %s", turnNumber, turnResult.ExitReason),
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
-				SessionID:          session.ID,
 				WorkspacePath:      wsResult.Path,
 				AgentAdapter:       agentKind,
 				Attempt:            attempt,
@@ -1288,16 +1321,16 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				ObservedIssueState: observedIssueState,
 				Usage:              localUsage,
 				UsageMeasured:      localMeasured,
+				UnaccountedTurns:   localUnaccounted,
 				ModelName:          localModelName,
 				APIRequestCount:    localRequestCount,
 			})
 			return
 		}
 
-		// Read the A2O status file to detect agent-reported blockage
-		// before making a tracker API call that would be wasted. A
-		// recognized signal leaves the loop rather than returning, so
-		// the single post-loop teardown below is the only exit path.
+		// Read the A2O status file to detect agent-reported blockage before
+		// a wasted tracker call. A recognized signal leaves the loop so the
+		// single post-loop teardown is the only exit path.
 		statusSignal := workspace.ReadStatusFile(wsResult.Path, logger)
 		if statusSignal.IsRecognized() {
 			pendingSoftStopReason = string(statusSignal)
@@ -1305,24 +1338,21 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 
 		// A dispatch that does not drive issue state skips the per-turn
-		// tracker refresh and its active-state termination gate; the loop
-		// then rests solely on max_turns or the agent's own .sortie/status
-		// self-signal.
+		// refresh and its active-state gate, resting only on max_turns or the
+		// agent's own .sortie/status signal.
 		if deps.Posture.DrivesIssueState() {
-			// Refresh the tracker state to detect external transitions.
-			refreshed, err := deps.TrackerAdapter.FetchIssueStatesByIDs(ctx, []string{issue.ID})
+			refreshed, err := deps.TrackerAdapter.FetchIssueStatesByIDs(runContextFrom(ctx), []string{issue.ID})
+			cancelledAtEnding = ctx.Err() != nil
 			if err != nil {
 				stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 				finishWorkspace()
-				reported = true
-				deps.OnExit(issue.ID, WorkerResult{
+				report(WorkerResult{
 					IssueID:            issue.ID,
 					Identifier:         issue.Identifier,
-					ExitKind:           exitKindForErr(ctx),
+					ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
 					Error:              fmt.Errorf("issue state refresh (turn %d): %w", turnNumber, err),
 					TurnsCompleted:     turnsCompleted,
 					TurnsStarted:       turnsStarted,
-					SessionID:          session.ID,
 					WorkspacePath:      wsResult.Path,
 					AgentAdapter:       agentKind,
 					Attempt:            attempt,
@@ -1330,6 +1360,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					ObservedIssueState: observedIssueState,
 					Usage:              localUsage,
 					UsageMeasured:      localMeasured,
+					UnaccountedTurns:   localUnaccounted,
 					ModelName:          localModelName,
 					APIRequestCount:    localRequestCount,
 				})
@@ -1355,21 +1386,21 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		turnNumber++
 	}
 
-	// Self-review phase: run verification commands and iterate with the
-	// agent before final exit. Re-read config for dynamic reload. A
-	// pending status reason admits the phase only when it is empty (the
-	// loop left on max_turns or a non-active tracker state) or names
-	// the completion signal; a pending blocked reason skips the phase.
+	// Self-review phase: verify and iterate before final exit, on freshly
+	// reloaded config. A pending status reason admits the phase only when it
+	// is empty or names the completion signal; a pending blocked reason
+	// skips it.
 	reviewCfg := deps.ConfigFunc()
 	var reviewMeta *domain.ReviewMetadata
 	var phaseErr error
+	var phaseCut bool
 
 	signalAdmits := pendingSoftStopReason == "" ||
 		pendingSoftStopReason == string(workspace.StatusNeedsHumanReview) ||
 		pendingSoftStopReason == string(workspace.StatusNoChangeNeeded)
-	selfReviewGate := reviewCfg.SelfReview.Enabled && isActiveState(issue.State, activeStates) && ctx.Err() == nil && deps.Posture.DrivesIssueState() && signalAdmits
+	selfReviewAdmitted := reviewCfg.SelfReview.Enabled && isActiveState(issue.State, activeStates) && deps.Posture.DrivesIssueState() && signalAdmits
 
-	if selfReviewGate {
+	if selfReviewAdmitted && ctx.Err() == nil {
 		if pendingSoftStopReason != "" {
 			logger.Info("agent signaled a status admitting self-review, entering the phase",
 				slog.String("status", pendingSoftStopReason),
@@ -1378,26 +1409,20 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			workspace.CleanupStatusFile(wsResult.Path, logger)
 		}
 		var phaseSignal workspace.StatusSignal
-		reviewMeta, phaseSignal, phaseErr = runSelfReviewLoop(ctx, RunSelfReviewParams{
+		reviewMeta, phaseSignal, cancelledAtEnding, phaseErr = runSelfReviewLoop(ctx, RunSelfReviewParams{
 			Session:       session,
 			Issue:         issue,
 			WorkspacePath: wsResult.Path,
 			Config:        reviewCfg.SelfReview,
 			AgentAdapter:  deps.AgentAdapter,
-			OnEvent: func(issueID string, event domain.AgentEvent) {
-				// Defensive copy: RateLimits is a reference type. Copying
-				// here, in the worker goroutine, before the event crosses
-				// the goroutine boundary ensures the orchestrator never
-				// iterates a map that the adapter may still mutate.
-				if event.RateLimits != nil {
-					event.RateLimits = maps.Clone(event.RateLimits)
-				}
-				foldRelayedEvent(event)
-				deps.OnEvent(issueID, event)
+			OnEvent: func(_ string, event domain.AgentEvent) {
+				relayTurnEvent(event)
 			},
-			OnProgress: deps.OnProgress,
+			OnTurnResult: handleTurnResult,
+			OnProgress:   deps.OnProgress,
 			OnTurnStarted: func() {
 				turnsStarted++
+				writeDispatchIdentity(acceptedSessionID)
 				if deps.OnTurnStarted != nil {
 					deps.OnTurnStarted(issue.ID, turnsStarted)
 				}
@@ -1408,11 +1433,14 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			TurnTimeoutMS:  cfg.Agent.TurnTimeoutMS,
 		})
 		// A blocked signal read inside the phase becomes the run's soft-stop
-		// reason unconditionally, on whichever admission path the run took.
+		// reason unconditionally.
 		if phaseSignal == workspace.StatusBlocked {
 			pendingSoftStopReason = string(workspace.StatusBlocked)
 		}
 		pendingSoftStopReason = retractUnconfirmedNoChangeDeclaration(pendingSoftStopReason, reviewMeta, logger)
+		phaseCut = phaseErr == nil && cancelledAtEnding
+	} else if selfReviewAdmitted {
+		phaseCut = true
 	} else if pendingSoftStopReason != "" {
 		logger.Info("agent signaled status, exiting worker",
 			slog.String("status", pendingSoftStopReason),
@@ -1431,21 +1459,15 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		default:
 			selfReviewStatus = "error"
 		}
-		reviewSummaryPath := filepath.Join(wsResult.Path, ".sortie", "review_summary.md")
-		sortieDirInfo, dirErr := os.Lstat(filepath.Join(wsResult.Path, ".sortie"))
-		if dirErr == nil && sortieDirInfo.Mode()&os.ModeSymlink == 0 && sortieDirInfo.IsDir() {
-			summaryInfo, sumErr := os.Lstat(reviewSummaryPath)
-			if sumErr == nil && summaryInfo.Mode()&os.ModeSymlink == 0 && summaryInfo.Mode().IsRegular() {
-				selfReviewSummaryPath = reviewSummaryPath
-			}
+		if f, summaryErr := workspacekit.OpenSortieFile(wsResult.Path, "review_summary.md"); summaryErr == nil {
+			_ = f.Close() //nolint:errcheck // the handle only confirms the summary is readable; nothing is read from it here
+			selfReviewSummaryPath = filepath.Join(wsResult.Path, workspacekit.SortieDir, "review_summary.md")
 		}
 	}
 
-	// A self-review turn's deadline expiry fails the attempt: the phase
-	// already ran its tail work above, so teardown here mirrors the
-	// normal exit's teardown, carrying the phase's own status and
-	// summary path rather than the empty values finishWorkspace() would
-	// pass to a hook that reads them.
+	// A self-review turn's deadline expiry fails the attempt. Teardown here
+	// mirrors the normal exit's, carrying the phase's own status and summary
+	// path rather than the empty values finishWorkspace() would pass.
 	if phaseErr != nil {
 		stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 		if deps.Posture.RunsSetupHooks() {
@@ -1462,16 +1484,14 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				SelfReviewSummaryPath: selfReviewSummaryPath,
 			})
 		}
-		reported = true
-		deps.OnExit(issue.ID, WorkerResult{
+		report(WorkerResult{
 			IssueID:            issue.ID,
 			Identifier:         issue.Identifier,
-			ExitKind:           exitKindForErr(ctx),
+			ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
 			Error:              phaseErr,
 			ReviewMetadata:     reviewMeta,
 			TurnsCompleted:     turnsCompleted,
 			TurnsStarted:       turnsStarted,
-			SessionID:          session.ID,
 			WorkspacePath:      wsResult.Path,
 			AgentAdapter:       agentKind,
 			Attempt:            attempt,
@@ -1479,6 +1499,46 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			ObservedIssueState: observedIssueState,
 			Usage:              localUsage,
 			UsageMeasured:      localMeasured,
+			UnaccountedTurns:   localUnaccounted,
+			ModelName:          localModelName,
+			APIRequestCount:    localRequestCount,
+		})
+		return
+	}
+
+	// A ceiling stop that cut the phase short, or kept it from starting,
+	// exits as a ceiling stop; any other cancellation falls through below.
+	if phaseCut && errors.Is(context.Cause(ctx), errTokenCeilingStop) {
+		stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
+		if deps.Posture.RunsSetupHooks() {
+			workspace.Finish(ctx, workspace.FinishParams{
+				Path:                  wsResult.Path,
+				Identifier:            issue.Identifier,
+				IssueID:               issue.ID,
+				Attempt:               attemptInt,
+				AfterRun:              cfg.Hooks.AfterRun,
+				HookTimeoutMS:         cfg.Hooks.TimeoutMS,
+				Logger:                logger,
+				SSHHost:               deps.SSHHost,
+				SelfReviewStatus:      selfReviewStatus,
+				SelfReviewSummaryPath: selfReviewSummaryPath,
+			})
+		}
+		report(WorkerResult{
+			IssueID:            issue.ID,
+			Identifier:         issue.Identifier,
+			ExitKind:           WorkerExitCancelled,
+			ReviewMetadata:     reviewMeta,
+			TurnsCompleted:     turnsCompleted,
+			TurnsStarted:       turnsStarted,
+			WorkspacePath:      wsResult.Path,
+			AgentAdapter:       agentKind,
+			Attempt:            attempt,
+			SSHHost:            deps.SSHHost,
+			ObservedIssueState: observedIssueState,
+			Usage:              localUsage,
+			UsageMeasured:      localMeasured,
+			UnaccountedTurns:   localUnaccounted,
 			ModelName:          localModelName,
 			APIRequestCount:    localRequestCount,
 		})
@@ -1506,14 +1566,12 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		slog.Int("turns_completed", turnsCompleted),
 	)
 
-	reported = true
-	deps.OnExit(issue.ID, WorkerResult{
+	report(WorkerResult{
 		IssueID:                      issue.ID,
 		Identifier:                   issue.Identifier,
 		ExitKind:                     WorkerExitNormal,
 		TurnsCompleted:               turnsCompleted,
 		TurnsStarted:                 turnsStarted,
-		SessionID:                    session.ID,
 		WorkspacePath:                wsResult.Path,
 		HandoffEvidencePolicy:        handoffEvidencePolicy,
 		HandoffEvidenceBaseline:      handoffEvidenceBaseline,
@@ -1529,19 +1587,15 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		ModelName:                    localModelName,
 		APIRequestCount:              localRequestCount,
 		UsageMeasured:                localMeasured,
+		UnaccountedTurns:             localUnaccounted,
 	})
 }
 
 // retractUnconfirmedNoChangeDeclaration clears pendingSoftStopReason when it
 // declares no change was needed and the self-review phase did not confirm
-// that declaration. The phase confirms the declaration only when it
-// recorded exactly one iteration, that iteration ended on a "pass"
-// verdict, and no verification result failed; a phase that ran no
-// verification command still confirms.
-//
-// reviewMeta is nil when the self-review gate did not admit the run, in
-// which case the declaration is left unchanged. Any other reason, and a
-// nil reviewMeta, pass through unchanged.
+// it. Confirmation requires exactly one iteration ending on "pass" with no
+// failed verification; a phase that ran no verification still confirms. A
+// nil reviewMeta (the gate did not admit the run) passes through unchanged.
 func retractUnconfirmedNoChangeDeclaration(pendingSoftStopReason string, reviewMeta *domain.ReviewMetadata, logger *slog.Logger) string {
 	if pendingSoftStopReason != string(workspace.StatusNoChangeNeeded) {
 		return pendingSoftStopReason
@@ -1574,8 +1628,7 @@ func retractUnconfirmedNoChangeDeclaration(pendingSoftStopReason string, reviewM
 }
 
 // buildToolAdvertisement formats a Markdown section documenting the
-// tools available in the registry. Appended to the agent prompt on
-// the first turn so the agent knows what tools exist.
+// registry's tools, appended to the first-turn prompt.
 func buildToolAdvertisement(reg *domain.ToolRegistry, project string) string {
 	var sb strings.Builder
 	sb.WriteString("## Available Sortie tools\n\n")
@@ -1601,8 +1654,8 @@ func buildToolAdvertisement(reg *domain.ToolRegistry, project string) string {
 	return sb.String()
 }
 
-// buildDispatchComment returns the tracker comment text for a session
-// dispatch event.
-func buildDispatchComment(agentKind string, attempt int) string {
-	return fmt.Sprintf("Sortie session started.\nSession: pending\nAgent: %s\nWorkspace: pending\nAttempt: %d", agentKind, attempt)
-}
+// dispatchComment is the tracker comment text posted on every session
+// dispatch, for every agent kind and every tracker kind alike: a
+// business reader of the issue needs only that a session started, not
+// an internal integration name or a dispatch counter.
+const dispatchComment = "Sortie session started."

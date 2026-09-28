@@ -1065,7 +1065,7 @@ func TestToStateResponse(t *testing.T) {
 
 		fptr := func(v float64) *float64 { return &v }
 
-		// 2M input @ $3/Mtok = $6, 1M output @ $15/Mtok = $15 → $21
+		// 2M input @ $3/Mtok = $6, 1M output @ $15/Mtok = $15 -> $21
 		snap := orchestrator.RuntimeSnapshotResult{
 			GeneratedAt: time.Now().UTC(),
 			Running: []orchestrator.SnapshotRunningEntry{
@@ -1117,7 +1117,7 @@ func TestToStateResponse(t *testing.T) {
 		}
 
 		rates := TokenRates{
-			"claude": TokenRateConfig{InputPerMtok: fptr(3.0)},
+			"claude": TokenRateConfig{InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)},
 		}
 
 		got := toStateResponse(snap, rates)
@@ -1170,7 +1170,7 @@ func TestToStateResponse(t *testing.T) {
 		}
 
 		rates := TokenRates{
-			"claude": TokenRateConfig{InputPerMtok: fptr(5.0)},
+			"claude": TokenRateConfig{InputPerMtok: fptr(5.0), OutputPerMtok: fptr(15.0)},
 		}
 
 		got := toStateResponse(snap, rates)
@@ -1257,7 +1257,7 @@ func TestToStateResponse(t *testing.T) {
 		}
 
 		rates := TokenRates{
-			"claude": TokenRateConfig{InputPerMtok: fptr(3.0)},
+			"claude": TokenRateConfig{InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)},
 		}
 
 		got := toStateResponse(snap, rates)
@@ -1334,7 +1334,7 @@ func TestToStateResponse_CostUnpricedRunning(t *testing.T) {
 
 	fptr := func(v float64) *float64 { return &v }
 	rates := TokenRates{
-		"claude": TokenRateConfig{InputPerMtok: fptr(3.0)},
+		"claude": TokenRateConfig{InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)},
 	}
 
 	t.Run("measured session with no configured rate is counted", func(t *testing.T) {
@@ -1350,6 +1350,27 @@ func TestToStateResponse_CostUnpricedRunning(t *testing.T) {
 		got := toStateResponse(snap, rates)
 
 		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 1)
+	})
+
+	t.Run("measured session under an incomplete entry is counted with no cost", func(t *testing.T) {
+		t.Parallel()
+
+		incompleteRates := TokenRates{
+			"claude-code": TokenRateConfig{OutputPerMtok: fptr(15.0)},
+		}
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: time.Now().UTC(),
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "d", Identifier: "MT-D", AgentKind: "claude-code", UsageMeasured: true, AgentInputTokens: 1000},
+			},
+		}
+
+		got := toStateResponse(snap, incompleteRates)
+
+		requireCostUnpricedRunning(t, got.CostUnpricedRunning, 1)
+		if got.ActiveEstimatedCostUSD != nil {
+			t.Errorf("ActiveEstimatedCostUSD = %v, want nil (the only entry is incomplete)", *got.ActiveEstimatedCostUSD)
+		}
 	})
 
 	t.Run("measured session with a configured rate is not counted", func(t *testing.T) {

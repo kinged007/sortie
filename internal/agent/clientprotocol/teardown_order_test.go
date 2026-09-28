@@ -10,12 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// teardownOrderRecorder records, in order and under a mutex, the
-// teardown-relevant events a test observes from another goroutine.
 type teardownOrderRecorder struct {
 	mu     sync.Mutex
 	events []string
@@ -33,12 +32,9 @@ func (r *teardownOrderRecorder) snapshot() []string {
 	return append([]string(nil), r.events...)
 }
 
-// orderedStdinWriter wraps an *io.PipeWriter that also serves as the
-// session's stdinCloser, exactly as the real stdin pipe does in
-// production, and records three events: the permission reply write
-// completing (deliberately delayed, so it is still in flight when
-// teardown begins), the session/close request being written, and
-// stdin being closed.
+// orderedStdinWriter wraps the session's stdinCloser and records the permission
+// reply write completing (deliberately delayed, so it is still in flight when
+// teardown begins), the session/close request being written, and stdin closing.
 type orderedStdinWriter struct {
 	w                 *io.PipeWriter
 	rec               *teardownOrderRecorder
@@ -51,9 +47,8 @@ func (o *orderedStdinWriter) Write(p []byte) (int, error) {
 	switch {
 	case strings.Contains(line, `"outcome"`):
 		o.once.Do(func() { close(o.replyWriteStarted) })
-		// Simulates a reply the runtime is slow to accept: without
-		// answer_open's own flush, teardown's later steps could run
-		// while this write is still in flight.
+		// A reply the runtime is slow to accept: without answer_open's flush,
+		// teardown's later steps could run while this write is still in flight.
 		time.Sleep(100 * time.Millisecond)
 		o.rec.record("permission_reply")
 	case strings.Contains(line, `"method":"session/close"`):
@@ -67,11 +62,6 @@ func (o *orderedStdinWriter) Close() error {
 	return o.w.Close()
 }
 
-// TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose checks
-// that the answer to an open session/request_permission reaches the
-// wire before close_session's own request is sent and before stdin
-// closes: awaitAnswerOpen's flush must wait out a reply write already
-// in progress, not merely one still queued.
 func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T) {
 	t.Parallel()
 
@@ -83,7 +73,8 @@ func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T)
 	writer := &orderedStdinWriter{w: outPw, rec: rec, replyWriteStarted: make(chan struct{})}
 
 	state := &sessionState{
-		caps:           newCapabilityRecord(false),
+		caps:           newCapabilityRecord(false, false),
+		usage:          agentcore.NewTurnEndUsage(),
 		stopCh:         make(chan struct{}),
 		pumpDone:       make(chan struct{}),
 		logger:         discardLogger(),
@@ -98,11 +89,9 @@ func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T)
 
 	go runPump(state)
 	markSessionKnown(state)
-	// A single cleanup, in this order: closing inPw first is what ends
-	// the connection's reader (conn.Done()), which is the only thing
-	// that lets runPump's own select start observing state.stopCh; a
-	// cleanup that stopped the pump before that would deadlock waiting
-	// on pumpDone forever.
+	// Closing inPw first ends the connection's reader (conn.Done()), which is
+	// the only thing that lets runPump's select start observing state.stopCh;
+	// stopping the pump before that would deadlock waiting on pumpDone.
 	t.Cleanup(func() {
 		_ = inPw.Close()
 		state.stopOnce.Do(func() { close(state.stopCh) })
@@ -126,9 +115,6 @@ func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T)
 
 	awaitAnswerOpen(graceCtx, grace)(state)
 
-	// The reply write was still in progress (deliberately, via the
-	// artificial delay) at the moment answer_open started; its own
-	// flush must not return until that write has actually completed.
 	if got := rec.snapshot(); len(got) != 1 || got[0] != "permission_reply" {
 		t.Fatalf("recorded events right after answer_open returned = %v, want exactly [permission_reply] (answer_open must wait for the in-flight write, not just enqueue the request to answer it)", got)
 	}
@@ -158,9 +144,6 @@ func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T)
 	}
 }
 
-// TestLogCloseSessionOutcome checks the three outcomes
-// logCloseSessionOutcome classifies: the step's own bound elapsing,
-// the caller's own deadline ending the wait, and any other failure.
 func TestLogCloseSessionOutcome(t *testing.T) {
 	t.Parallel()
 
@@ -170,7 +153,7 @@ func TestLogCloseSessionOutcome(t *testing.T) {
 		var buf bytes.Buffer
 		state := &sessionState{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 
-		logCloseSessionOutcome(state, context.Background(), 500*time.Millisecond, closeCallOutcome{err: context.DeadlineExceeded})
+		logCloseSessionOutcome(state, context.Background(), 500*time.Millisecond, methodSessionClose, closeCallOutcome{err: context.DeadlineExceeded})
 
 		output := buf.String()
 		if !strings.Contains(output, "level=WARN") {
@@ -196,7 +179,7 @@ func TestLogCloseSessionOutcome(t *testing.T) {
 		callerCtx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		logCloseSessionOutcome(state, callerCtx, 500*time.Millisecond, closeCallOutcome{err: context.Canceled})
+		logCloseSessionOutcome(state, callerCtx, 500*time.Millisecond, methodSessionClose, closeCallOutcome{err: context.Canceled})
 
 		output := buf.String()
 		if !strings.Contains(output, `outcome="caller deadline"`) {
@@ -210,7 +193,7 @@ func TestLogCloseSessionOutcome(t *testing.T) {
 		var buf bytes.Buffer
 		state := &sessionState{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 
-		logCloseSessionOutcome(state, context.Background(), 500*time.Millisecond, closeCallOutcome{err: jsonrpc.ErrClosed})
+		logCloseSessionOutcome(state, context.Background(), 500*time.Millisecond, methodSessionClose, closeCallOutcome{err: jsonrpc.ErrClosed})
 
 		output := buf.String()
 		if strings.Contains(output, "level=WARN") {
@@ -225,11 +208,6 @@ func TestLogCloseSessionOutcome(t *testing.T) {
 	})
 }
 
-// TestAwaitAnswerOpen_PumpNeverAnswersReturnsWithinBound checks that
-// awaitAnswerOpen returns within its own bound even when nothing ever
-// takes the answerOpen control message off the inbox (a pump that
-// never answers), and that teardown continues with the steps after
-// it.
 func TestAwaitAnswerOpen_PumpNeverAnswersReturnsWithinBound(t *testing.T) {
 	t.Parallel()
 
@@ -264,15 +242,10 @@ func TestAwaitAnswerOpen_PumpNeverAnswersReturnsWithinBound(t *testing.T) {
 	}
 }
 
-// TestStopSessionReturnsBoundedWithReaderGenuinelyParked asserts that
-// StopSession still returns inside a bounded time once the release has
-// already abandoned a connection whose reader stays parked for the
-// whole test: the pipes StartOutputRelease closes on give-up are never
-// wired to this connection (newTestSessionWithRelease's own Pipes are
-// unconnected real files), so nothing but the abandonment-armed stop
-// arm in runPump's own select can end the pump. Removing that arm
-// leaves the pump waiting on a reader nothing here will ever unpark,
-// and this test times out instead of passing.
+// The pipes StartOutputRelease closes on give-up are never wired to this
+// connection, so nothing but the abandonment-armed stop arm in runPump's select
+// can end the pump. Removing that arm leaves the pump waiting on a reader
+// nothing here unparks, and this test times out.
 func TestStopSessionReturnsBoundedWithReaderGenuinelyParked(t *testing.T) {
 	t.Parallel()
 

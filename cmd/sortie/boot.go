@@ -15,7 +15,9 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/server"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
@@ -23,6 +25,15 @@ const (
 	defaultServerPort = 7678
 	defaultServerHost = "127.0.0.1"
 )
+
+// workflowAdvisories is the shared advisory hook every [workflow.Manager]
+// the program constructs wires through [workflow.WithAdvisoryFunc], so a
+// workflow reaching a deprecated agent kind or an invalid token_rates
+// entry draws the same advisory on every load path.
+var workflowAdvisories workflow.AdvisoryFunc = func(cfg config.ServiceConfig) []config.Advisory {
+	advisories := orchestrator.AgentKindDeprecations(cfg, registry.Agents.Meta)
+	return append(advisories, server.TokenRateAdvisories(cfg)...)
+}
 
 type bootParams struct {
 	args   []string
@@ -146,10 +157,12 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 		effectiveFormat = parsedFmt
 	}
 	logger := logging.Setup(p.stderr, effectiveLevel, effectiveFormat)
+	redact.AddEnviron(os.Environ())
 
 	mgr, err := workflow.NewManager(path, logger,
 		workflow.WithValidateFunc(orchestrator.ValidateConfigForPromotion),
-		workflow.WithAgentKindProbe(registry.Agents.Has))
+		workflow.WithAgentKindProbe(registry.Agents.Has),
+		workflow.WithAdvisoryFunc(workflowAdvisories))
 	if err != nil {
 		fmt.Fprintf(p.stderr, "sortie: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return bootResult{}, 1
@@ -204,6 +217,7 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 	}
 	if needResetup {
 		logger = logging.Setup(p.stderr, effectiveLevel, effectiveFormat)
+		redact.AddEnviron(os.Environ())
 		mgr.SetLogger(logger)
 	}
 
@@ -244,7 +258,7 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 		blockerResolver = resolver
 	}
 
-	// Transfer ownership of mgr to the caller — suppress the deferred Stop.
+	// Transfer ownership of mgr to the caller; suppress the deferred Stop.
 	mgrStarted = false
 
 	return bootResult{

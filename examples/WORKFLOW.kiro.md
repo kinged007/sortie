@@ -64,6 +64,10 @@ server:
 
 {{/* Sortie sample workflow, GitHub Issues + Kiro CLI.
 
+     The "kiro" agent kind is deprecated in favor of "agent-client-protocol";
+     see examples/WORKFLOW.agent-client-protocol.kiro.md for the migrated
+     example.
+
      The Kiro adapter launches one "kiro-cli chat --no-interactive"
      subprocess per turn. Headless Kiro emits no structured output, so
      budget enforcement is time-based: turn_timeout_ms above is the
@@ -75,17 +79,19 @@ server:
                              permission for the tracker adapter.
        SORTIE_GITHUB_PROJECT Repository in owner/repo format.
        SORTIE_REPO_URL       Git clone URL for the repository.
-       KIRO_API_KEY          API key for the Kiro CLI. Requires a Kiro
-                             Pro, Pro+, or Power subscription; the
-                             headless path is gated behind that tier.
+       KIRO_API_KEY          API key for the Kiro CLI, unless a stored
+                             device login already authenticates it.
+                             Requires a Kiro Pro, Pro+, or Power
+                             subscription; the headless path is gated
+                             behind that tier.
 
      Optional:
        SORTIE_WORKSPACE_ROOT Base directory for per-issue workspaces
                              (defaults to system temp).
 
      Kiro-specific constraints (see docs/kiro-adapter-notes.md):
-       1. KIRO_API_KEY is required and the account needs a Kiro Pro,
-          Pro+, or Power subscription.
+       1. KIRO_API_KEY or a stored login is required, and the account
+          needs a Kiro Pro, Pro+, or Power subscription.
        2. The model is pinned through the "model" field above because
           Kiro has no headless model switch.
        3. Budget enforcement is time-based only; the headless path
@@ -110,7 +116,7 @@ that manages your session, retries failures, and monitors progress.
 
 Before making changes, read:
 
-- `CLAUDE.md` or `CONTRIBUTING.md` for build commands and project conventions
+- `AGENTS.md.md` or `CONTRIBUTING.md` for build commands and project conventions
 - Any existing tests in the area you are modifying
 - Related source files to understand current patterns
 

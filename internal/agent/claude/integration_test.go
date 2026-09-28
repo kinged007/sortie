@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -222,7 +224,7 @@ func TestIntegration_RunTurn(t *testing.T) {
 	// Verify at least one EventToolResult with a correlated ToolName.
 	// The prompt causes Claude Code to use the Read tool, producing
 	// tool_use + tool_result content blocks. Asserting != "unknown"
-	// validates that tool_use↔tool_result correlation succeeded.
+	// validates that tool_use and tool_result correlation succeeded.
 	var foundToolResult bool
 	for _, e := range collected {
 		if e.Type == domain.EventToolResult && e.ToolName != "" && e.ToolName != "unknown" {
@@ -420,4 +422,88 @@ func TestIntegration_SessionResume(t *testing.T) {
 		t.Errorf("resumed turn SessionID = %q, want %q: the turn did not resume the first turn's session",
 			result2.SessionID, result1.SessionID)
 	}
+}
+
+func TestIntegration_CredentialVerification(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	adapter, err := NewClaudeCodeAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewClaudeCodeAdapter: %v", err)
+	}
+	params := func(t *testing.T) domain.StartSessionParams {
+		return domain.StartSessionParams{
+			WorkspacePath: t.TempDir(),
+			AgentConfig:   domain.AgentConfig{Command: integrationCommand(t), ReadTimeoutMS: 30000},
+		}
+	}
+
+	t.Run("working credential verifies", func(t *testing.T) {
+		if _, err := credentialtest.VerifyLive(adapter, params(t)); err != nil {
+			t.Fatalf("VerifyCredential() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
+		// Not parallel: t.Setenv carries the invalid credential.
+		credentialtest.SetRefusedCredential(t, "SORTIE_CLAUDE_CREDENTIAL_ENV")
+
+		_, err := credentialtest.VerifyLive(adapter, params(t))
+		credentialtest.RequireRefused(t, err)
+	})
+}
+
+func TestIntegration_EarlyExit(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	adapter, err := NewClaudeCodeAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewClaudeCodeAdapter: %v", err)
+	}
+	unknownSwitchConfig := domain.AgentConfig{Command: integrationCommand(t) + " --sortie-unknown-switch", ReadTimeoutMS: 30000}
+
+	t.Run("verification session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{WorkspacePath: t.TempDir(), AgentConfig: unknownSwitchConfig}
+		if _, err := credentialtest.VerifyLive(adapter, params); err == nil {
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
+
+	t.Run("working session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{WorkspacePath: t.TempDir(), AgentConfig: unknownSwitchConfig}
+		if err := credentialtest.RunWorkingLive(adapter, params); err == nil {
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
+}
+
+func TestIntegration_ToolServerIdentity(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	agenttest.AssertToolServerIdentity(t, func(ctx context.Context, workspacePath, mcpConfigPath string) error {
+		adapter, err := NewClaudeCodeAdapter(singleTurnIntegrationConfig(t))
+		if err != nil {
+			return err
+		}
+
+		session, err := adapter.StartSession(ctx, domain.StartSessionParams{
+			WorkspacePath: workspacePath,
+			AgentConfig:   domain.AgentConfig{Command: integrationCommand(t)},
+			MCPConfigPath: mcpConfigPath,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = adapter.StopSession(context.Background(), session) }()
+
+		_, err = adapter.RunTurn(ctx, session, domain.RunTurnParams{
+			Prompt:  "Say exactly: hello",
+			OnEvent: func(domain.AgentEvent) {},
+		})
+		return err
+	})
 }

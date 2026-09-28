@@ -15,6 +15,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/tool/budget"
 	"github.com/sortie-ai/sortie/internal/tool/history"
@@ -23,9 +24,9 @@ import (
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
-// defaultMaxPerSession is the per-session notification cap selected when
-// no backend declares a non-zero max_per_session. 0 in config selects
-// this default; it never means unlimited.
+// defaultMaxPerSession is the notification cap selected when no backend
+// declares a non-zero max_per_session. 0 in config selects this default;
+// it never means unlimited.
 const defaultMaxPerSession = 20
 
 func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -58,6 +59,7 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 	}
 
 	logger := logging.Setup(stderr, slog.LevelInfo, logging.FormatText)
+	redact.AddEnviron(os.Environ())
 
 	wf, err := workflow.Load(*workflowFlag)
 	if err != nil {
@@ -71,7 +73,6 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		return 1
 	}
 
-	// Construct tracker adapter if the tracker section is present.
 	var trackerAdapter domain.TrackerAdapter
 	if cfg.Tracker.Kind != "" {
 		trackerCtor, trackerErr := registry.Trackers.Get(cfg.Tracker.Kind)
@@ -98,11 +99,8 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		trackerAdapter = adapter
 	}
 
-	// Build the per-session tool registry through the shared builder so
-	// the served tool set matches the set the worker advertises in the
-	// first-turn prompt. A notifier misconfiguration is fatal here, as
-	// before; a read-only DB-open failure is non-fatal and skips the two
-	// database-backed tools.
+	// A notifier misconfiguration is fatal; a read-only DB-open failure is
+	// non-fatal and skips the two database-backed tools.
 	sessionTools, err := BuildSessionToolRegistry(ctx, logger, sessionToolParamsFromEnv(os.Getenv, cfg, trackerAdapter))
 	if err != nil {
 		logger.Error("failed to build session tool registry", slog.Any("error", err))
@@ -122,9 +120,8 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 }
 
 // sessionToolParamsFromEnv builds the per-session tool registry inputs
-// from the sidecar's process environment, read only through getenv.
-// SORTIE_ATTEMPT maps to Attempt when it parses as an integer; a
-// non-integer or absent value leaves Attempt nil.
+// from the sidecar's process environment via getenv. SORTIE_ATTEMPT maps
+// to Attempt when it parses as an integer; otherwise Attempt stays nil.
 func sessionToolParamsFromEnv(getenv func(string) string, cfg config.ServiceConfig, trackerAdapter domain.TrackerAdapter) SessionToolParams {
 	var attempt *int
 	if raw := getenv("SORTIE_ATTEMPT"); raw != "" {
@@ -133,31 +130,28 @@ func sessionToolParamsFromEnv(getenv func(string) string, cfg config.ServiceConf
 		}
 	}
 	return SessionToolParams{
-		TrackerAdapter: trackerAdapter,
-		Project:        cfg.Tracker.Project,
-		WorkspacePath:  getenv("SORTIE_WORKSPACE"),
-		DBPath:         getenv("SORTIE_DB_PATH"),
-		IssueID:        getenv("SORTIE_ISSUE_ID"),
-		Identifier:     getenv("SORTIE_ISSUE_IDENTIFIER"),
-		SessionID:      getenv("SORTIE_SESSION_ID"),
-		DispatchID:     getenv("SORTIE_DISPATCH_ID"),
-		Attempt:        attempt,
-		AgentKind:      getenv("SORTIE_SESSION_AGENT_KIND"),
-		MaxTokens:      cfg.Agent.MaxTokens,
-		MaxSessions:    cfg.Agent.MaxSessions,
-		Notifications:  cfg.Notifications.Backends,
+		TrackerAdapter:        trackerAdapter,
+		Project:               cfg.Tracker.Project,
+		WorkspacePath:         getenv("SORTIE_WORKSPACE"),
+		DBPath:                getenv("SORTIE_DB_PATH"),
+		IssueID:               getenv("SORTIE_ISSUE_ID"),
+		Identifier:            getenv("SORTIE_ISSUE_IDENTIFIER"),
+		DispatchID:            getenv("SORTIE_DISPATCH_ID"),
+		Attempt:               attempt,
+		AgentKind:             getenv("SORTIE_SESSION_AGENT_KIND"),
+		MaxTokens:             cfg.Agent.MaxTokens,
+		MaxSessions:           cfg.Agent.MaxSessions,
+		TokenWarningThreshold: cfg.Agent.TokenWarningThreshold(),
+		Notifications:         cfg.Notifications.Backends,
 	}
 }
 
-// buildNotifyTool resolves the configured notifier backends and returns
-// the notify_operator tool. It returns (nil, nil) when no backend is
-// configured, so the caller skips registration. An unknown kind or a
-// constructor error (including a required secret that resolved to the
-// empty string) is fatal and returned as a non-nil error rather than a
-// partial registration. The caller supplies env: the function reads no
-// process environment itself, so the gating decision stays a pure
-// function of explicit inputs.
-func buildNotifyTool(configured []config.NotificationBackend, env notify.NotificationEnvelopeContext) (domain.AgentTool, error) {
+// buildNotifyTool resolves the configured notifier backends into the
+// notify_operator tool, returning (nil, nil) when none are configured. An
+// unknown kind or constructor error (including a required secret that
+// resolved empty) is fatal and returned as a non-nil error rather than a
+// partial registration.
+func buildNotifyTool(configured []config.NotificationBackend, env notify.NotificationEnvelopeContext, sessionID notify.SessionIDFunc, reserveSlot notify.SlotReserver) (domain.AgentTool, error) {
 	if len(configured) == 0 {
 		return nil, nil
 	}
@@ -175,14 +169,13 @@ func buildNotifyTool(configured []config.NotificationBackend, env notify.Notific
 		backends = append(backends, notifier)
 	}
 
-	return notify.New(backends, env, resolveNotificationCap(configured)), nil
+	return notify.New(backends, env, sessionID, resolveNotificationCap(configured), reserveSlot), nil
 }
 
-// resolveNotificationCap selects the single per-session cap for the tool
-// from the configured backends. It returns the maximum non-zero
-// max_per_session across entries and falls back to defaultMaxPerSession
-// when every entry is 0 or unset. The cap counts notify_operator calls,
-// not per-backend sends, so it is a tool-level property.
+// resolveNotificationCap returns the maximum non-zero max_per_session
+// across the backends, falling back to defaultMaxPerSession when every
+// entry is 0. The cap counts notify_operator calls, not per-backend
+// sends.
 func resolveNotificationCap(backends []config.NotificationBackend) int {
 	maxCap := 0
 	for _, b := range backends {
@@ -207,13 +200,12 @@ func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
 			CompletedTotalTokens: completed.TotalTokens,
 			CompletedSessions:    completed.Sessions,
 			UnmeasuredSessions:   completed.UnmeasuredSessions,
+			UnaccountedTurns:     completed.UnaccountedTurns,
 		}
 
-		// The running session's recorded spend lives in session_metadata,
-		// which survives session exit. Add it only when the stored
-		// dispatch ID matches the live dispatch ID supplied out of band,
-		// so neither a stale earlier dispatch's row nor a session-exit
-		// write's cleared row is ever double counted.
+		// Add the running session's spend only when its stored dispatch ID
+		// matches the live one, so neither a stale dispatch's row nor a
+		// session-exit cleared row is double counted.
 		if runningDispatchID == "" {
 			return usage, nil
 		}

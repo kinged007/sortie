@@ -1,10 +1,4 @@
-// Package notify implements [domain.AgentTool] for the notify_operator
-// tool. The tool fills a system-owned envelope from session context the
-// agent cannot forge, validates the agent-supplied message, enforces a
-// per-session cap, and delivers a normalized [domain.Notification] to
-// the configured backends in configuration order, stopping at the first
-// backend that fails. It knows nothing about Slack or HTTP; backends
-// arrive as a resolved slice of [domain.Notifier].
+// Package notify implements the notify_operator agent tool.
 package notify
 
 import (
@@ -34,14 +28,12 @@ var inputSchema = json.RawMessage(`{
   "additionalProperties": false
 }`)
 
-// validSeverities is the closed set of accepted severity values.
 var validSeverities = map[string]bool{
 	"info":     true,
 	"warning":  true,
 	"critical": true,
 }
 
-// validCategories is the closed set of accepted optional category values.
 var validCategories = map[string]bool{
 	"decision_needed": true,
 	"progress":        true,
@@ -50,8 +42,18 @@ var validCategories = map[string]bool{
 	"other":           true,
 }
 
-// NotificationEnvelopeContext carries the system-owned envelope inputs
-// read from the sidecar environment. The agent supplies none of these.
+// SessionIDFunc returns the session ID for the envelope being built, or
+// "" when none is available.
+type SessionIDFunc func() string
+
+// SlotReserver claims a dispatch-scoped notification slot. It returns
+// (release, true, nil) when a slot under limit is claimed, (nil, false,
+// nil) when every slot is occupied, and (nil, false, err) when the
+// reservation could not be evaluated. release removes the claimed slot
+// and is called at most once.
+type SlotReserver func(limit int) (release func(), reserved bool, err error)
+
+// NotificationEnvelopeContext contains system-owned notification metadata.
 type NotificationEnvelopeContext struct {
 	// IssueID is the tracker-internal issue id.
 	IssueID string
@@ -59,8 +61,8 @@ type NotificationEnvelopeContext struct {
 	// Identifier is the human-readable issue key.
 	Identifier string
 
-	// SessionID is the agent session id; may be empty.
-	SessionID string
+	// DispatchID is empty outside a Sortie dispatch.
+	DispatchID string
 
 	// Attempt is the retry or continuation attempt; nil on the first run.
 	Attempt *int
@@ -74,28 +76,32 @@ type NotificationEnvelopeContext struct {
 }
 
 // NotifyTool implements [domain.AgentTool] for notify_operator.
-// Construct via [New] with the resolved backends and the session
-// envelope context.
 type NotifyTool struct {
 	backends      []domain.Notifier
 	env           NotificationEnvelopeContext
+	sessionID     SessionIDFunc
 	maxPerSession int
-	count         int
+	reserveSlot   SlotReserver
 }
 
-// New returns a [NotifyTool]. backends is the ordered set of resolved
-// notifiers; the caller gates registration on a configured backend, so
-// New panics when backends is empty (programming error). env carries
-// the system-owned envelope context, and maxPerSession is the effective
-// per-session cap after default resolution.
-func New(backends []domain.Notifier, env NotificationEnvelopeContext, maxPerSession int) *NotifyTool {
+// New returns a [NotifyTool]. It panics when backends is empty or when
+// sessionID or reserveSlot is nil. New touches no file.
+func New(backends []domain.Notifier, env NotificationEnvelopeContext, sessionID SessionIDFunc, maxPerSession int, reserveSlot SlotReserver) *NotifyTool {
 	if len(backends) == 0 {
 		panic("notify.New: backends must not be empty")
+	}
+	if sessionID == nil {
+		panic("notify.New: sessionID must not be nil")
+	}
+	if reserveSlot == nil {
+		panic("notify.New: reserveSlot must not be nil")
 	}
 	return &NotifyTool{
 		backends:      backends,
 		env:           env,
+		sessionID:     sessionID,
 		maxPerSession: maxPerSession,
+		reserveSlot:   reserveSlot,
 	}
 }
 
@@ -110,9 +116,7 @@ func (t *NotifyTool) Description() string {
 		"issue, session, and agent context is attached automatically."
 }
 
-// InputSchema returns the JSON Schema for notify_operator input. The
-// agent supplies only the message; the envelope is system-owned and
-// absent from the schema. The returned slice is a defensive copy.
+// InputSchema returns a copy of the JSON Schema for notify_operator input.
 func (t *NotifyTool) InputSchema() json.RawMessage {
 	out := make(json.RawMessage, len(inputSchema))
 	copy(out, inputSchema)
@@ -127,13 +131,15 @@ type toolInput struct {
 	Category string `json:"category,omitempty"`
 }
 
-// Execute validates the message, enforces the per-session cap, and
+// Execute validates the message, claims a slot through reserveSlot, and
 // delivers one [domain.Notification] to the configured backends in
-// configuration order. The first backend that fails short-circuits the
-// loop and yields a send_failed result; partial delivery across
-// backends is not reported in this version. Domain failures are encoded
-// in the JSON result with success: false and a nil Go error. The Go
-// error return is reserved for a result-marshal failure.
+// configuration order. A reservation error yields state_unavailable and
+// sends nothing; an exhausted cap yields rate_limited. The first backend
+// that fails short-circuits the loop, releases the claimed slot when no
+// backend has yet accepted the notification, and yields a send_failed
+// result. Domain failures are encoded in the JSON result with success:
+// false and a nil Go error. The Go error return is reserved for a
+// result-marshal failure.
 func (t *NotifyTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
 	var in toolInput
 	dec := json.NewDecoder(bytes.NewReader(input))
@@ -159,7 +165,11 @@ func (t *NotifyTool) Execute(ctx context.Context, input json.RawMessage) (json.R
 		return toolresult.Failure("backend_unavailable", "no notification backend is configured")
 	}
 
-	if t.count >= t.maxPerSession {
+	release, reserved, err := t.reserveSlot(t.maxPerSession)
+	if err != nil {
+		return toolresult.Failure("state_unavailable", "the notification count could not be established, nothing was sent")
+	}
+	if !reserved {
 		return toolresult.Failure("rate_limited", "per-session notification cap reached")
 	}
 
@@ -176,21 +186,20 @@ func (t *NotifyTool) Execute(ctx context.Context, input json.RawMessage) (json.R
 	delivered := 0
 	for _, backend := range t.backends {
 		if err := backend.Send(ctx, notification); err != nil {
+			if delivered == 0 {
+				release()
+			}
 			return toolresult.Failure("send_failed", fmt.Sprintf("notification delivery failed: %s", err))
 		}
 		delivered++
 	}
 
-	t.count++
 	return toolresult.Success(map[string]any{
 		"delivered":       delivered,
 		"notification_id": notification.Envelope.NotificationID,
 	})
 }
 
-// buildEnvelope generates the notification id and timestamp at call time
-// and copies the session context from the stored envelope context. The
-// agent cannot set any envelope field.
 func (t *NotifyTool) buildEnvelope() domain.NotificationEnvelope {
 	source := t.env.Source
 	if source == "" {
@@ -205,7 +214,8 @@ func (t *NotifyTool) buildEnvelope() domain.NotificationEnvelope {
 		Source:         source,
 		IssueID:        t.env.IssueID,
 		Identifier:     t.env.Identifier,
-		SessionID:      t.env.SessionID,
+		DispatchID:     t.env.DispatchID,
+		SessionID:      t.sessionID(),
 		Attempt:        t.env.Attempt,
 		Agent:          t.env.Agent,
 	}

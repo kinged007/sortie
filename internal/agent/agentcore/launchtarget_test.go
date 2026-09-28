@@ -1,11 +1,19 @@
 package agentcore
 
 import (
+	"context"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -17,6 +25,20 @@ func fakeSSHDir(t *testing.T) string {
 	dir := t.TempDir()
 	agenttest.FakeRuntime(t, dir, "ssh", agenttest.OutputScenario, agenttest.Output{})
 	return dir
+}
+
+// unsetEnvForTest removes name for the duration of the test and
+// restores whatever value the surrounding environment held. t.Setenv
+// registers that restore before the variable is removed; a name the
+// environment did not hold needs no restore.
+func unsetEnvForTest(t *testing.T, name string) {
+	t.Helper()
+	if prior, ok := os.LookupEnv(name); ok {
+		t.Setenv(name, prior)
+	}
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("Unsetenv(%s): %v", name, err)
+	}
 }
 
 // emptyDir returns a temp directory that contains no binaries.
@@ -227,5 +249,283 @@ func TestResolveLaunchTarget(t *testing.T) {
 				t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, tt.wantMsg)
 			}
 		})
+	}
+}
+
+// TestResolveLaunchTarget_SSHEnvNames asserts that ResolveLaunchTarget
+// sets LaunchTarget.SSHEnvNames from params.SSHEnvNames in SSH mode and
+// leaves it nil in local mode, even when the caller sets it.
+func TestResolveLaunchTarget_SSHEnvNames(t *testing.T) {
+	// Not parallel: the SSH-mode subtest uses t.Setenv.
+	dir := t.TempDir()
+	binPath := agenttest.FakeRuntime(t, t.TempDir(), "agent", agenttest.OutputScenario, agenttest.Output{})
+
+	t.Run("ssh mode carries the resolved names", func(t *testing.T) {
+		t.Setenv("PATH", fakeSSHDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		params := makeParams(t, dir, "user@host", "claude")
+		params.SSHEnvNames = []string{"EXAMPLE_TOKEN"}
+
+		lt, agentErr := ResolveLaunchTarget(params, "claude")
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget() error = %v", agentErr)
+		}
+		if !slices.Equal(lt.SSHEnvNames, []string{"EXAMPLE_TOKEN"}) {
+			t.Errorf("LaunchTarget.SSHEnvNames = %v, want %v", lt.SSHEnvNames, []string{"EXAMPLE_TOKEN"})
+		}
+	})
+
+	t.Run("local mode leaves SSHEnvNames nil even when params set it", func(t *testing.T) {
+		t.Parallel()
+
+		params := makeParams(t, dir, "", binPath)
+		params.SSHEnvNames = []string{"EXAMPLE_TOKEN"}
+
+		lt, agentErr := ResolveLaunchTarget(params, binPath)
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget() error = %v", agentErr)
+		}
+		if lt.SSHEnvNames != nil {
+			t.Errorf("LaunchTarget.SSHEnvNames = %v, want nil in local mode", lt.SSHEnvNames)
+		}
+	})
+}
+
+// TestLaunchTarget_SSHOptions asserts the resolution order:
+// t.SSHEnvNames is walked in order, a name already claimed by
+// settings or already carried is skipped, each remaining name is
+// looked up and carried only when its value holds a non-whitespace
+// character, then every settings entry whose Value is non-empty is
+// appended, keeping the first entry for a name a later entry repeats.
+func TestLaunchTarget_SSHOptions(t *testing.T) {
+	// Not parallel: sets process environment via t.Setenv.
+	t.Setenv("SSH_OPTIONS_TEST_B", "b-value")
+	t.Setenv("SSH_OPTIONS_TEST_A", "a-value")
+	t.Setenv("SSH_OPTIONS_TEST_C", "")
+	t.Setenv("SSH_OPTIONS_TEST_W", " \t\r\n ")
+	unsetEnvForTest(t, "SSH_OPTIONS_TEST_D")
+
+	target := LaunchTarget{
+		SSHStrictHostKeyChecking: "yes",
+		SSHEnvNames: []string{
+			"SSH_OPTIONS_TEST_B", "SSH_OPTIONS_TEST_A", "SSH_OPTIONS_TEST_B",
+			"SSH_OPTIONS_TEST_C", "SSH_OPTIONS_TEST_W", "SSH_OPTIONS_TEST_D",
+		},
+	}
+	settings := []sshutil.EnvVar{
+		{Name: "SSH_OPTIONS_TEST_C", Value: "managed"},
+		{Name: "SSH_OPTIONS_TEST_E", Value: ""},
+		{Name: "SSH_OPTIONS_TEST_C", Value: "managed-again"},
+	}
+
+	got := target.SSHOptions(settings...)
+
+	want := []sshutil.EnvVar{
+		{Name: "SSH_OPTIONS_TEST_B", Value: "b-value"},
+		{Name: "SSH_OPTIONS_TEST_A", Value: "a-value"},
+		{Name: "SSH_OPTIONS_TEST_C", Value: "managed"},
+	}
+	if !slices.Equal(got.Env, want) {
+		t.Errorf("SSHOptions(...).Env = %+v, want %+v", got.Env, want)
+	}
+	if got.StrictHostKeyChecking != "yes" {
+		t.Errorf("SSHOptions(...).StrictHostKeyChecking = %q, want %q", got.StrictHostKeyChecking, "yes")
+	}
+
+	t.Run("no names and no settings yields nil Env", func(t *testing.T) {
+		var empty LaunchTarget
+		if got := empty.SSHOptions(); got.Env != nil {
+			t.Errorf("SSHOptions() Env = %v, want nil", got.Env)
+		}
+	})
+}
+
+func TestLaunchTarget_BindWorkspace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid workspace sets Dir", func(t *testing.T) {
+		t.Parallel()
+		ws := t.TempDir()
+		target := LaunchTarget{WorkspacePath: ws}
+		cmd := exec.Command("true")
+
+		if agentErr := target.BindWorkspace(cmd); agentErr != nil {
+			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
+		}
+		if cmd.Dir != ws {
+			t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, ws)
+		}
+	})
+
+	t.Run("existing PWD entry is replaced with the workspace path", func(t *testing.T) {
+		t.Parallel()
+		ws := t.TempDir()
+		target := LaunchTarget{WorkspacePath: ws}
+		cmd := exec.Command("true")
+		cmd.Env = []string{"FOO=bar", "PWD=/some/other/path"}
+
+		if agentErr := target.BindWorkspace(cmd); agentErr != nil {
+			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
+		}
+
+		want := []string{"FOO=bar", "PWD=" + ws}
+		if !slices.Equal(cmd.Env, want) {
+			t.Errorf("BindWorkspace().Env = %v, want %v", cmd.Env, want)
+		}
+	})
+
+	t.Run("nil Env becomes os.Environ() plus one PWD entry", func(t *testing.T) {
+		t.Parallel()
+		ws := t.TempDir()
+		target := LaunchTarget{WorkspacePath: ws}
+		cmd := exec.Command("true")
+
+		if agentErr := target.BindWorkspace(cmd); agentErr != nil {
+			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
+		}
+
+		want := setPWD(os.Environ(), ws)
+		if !slices.Equal(cmd.Env, want) {
+			t.Errorf("BindWorkspace().Env = %v, want os.Environ() plus PWD=%s", cmd.Env, ws)
+		}
+	})
+
+	t.Run("linked workspace leaves Dir empty and returns an error", func(t *testing.T) {
+		t.Parallel()
+		linkTarget := t.TempDir()
+		link := filepath.Join(t.TempDir(), "workspace-link")
+		if err := os.Symlink(linkTarget, link); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skip("symlink creation requires elevated privileges on Windows")
+			}
+			t.Fatalf("Symlink: %v", err)
+		}
+		target := LaunchTarget{WorkspacePath: link}
+		cmd := exec.Command("true")
+
+		agentErr := target.BindWorkspace(cmd)
+
+		if agentErr == nil {
+			t.Fatal("BindWorkspace(linked workspace) error = nil, want non-nil")
+		}
+		if cmd.Dir != "" {
+			t.Errorf("cmd.Dir = %q, want empty on a bind failure", cmd.Dir)
+		}
+	})
+}
+
+func TestLaunchTarget_AuxiliaryCommand_Local(t *testing.T) {
+	t.Parallel()
+
+	ws := t.TempDir()
+	target := LaunchTarget{
+		Command:       "/usr/bin/agent",
+		Args:          []string{"app-server"},
+		WorkspacePath: ws,
+	}
+	stdin := strings.NewReader("aux-stdin")
+
+	cmd, agentErr := target.AuxiliaryCommand(context.Background(), []string{"whoami"}, stdin, []string{"A=1"})
+	if agentErr != nil {
+		t.Fatalf("AuxiliaryCommand() error = %v, want nil", agentErr)
+	}
+
+	wantArgs := []string{target.Command, "app-server", "whoami"}
+	if cmd.Path != target.Command || !slices.Equal(cmd.Args, wantArgs) {
+		t.Errorf("AuxiliaryCommand() = %q %v, want %q %v", cmd.Path, cmd.Args, target.Command, wantArgs)
+	}
+	if cmd.Dir != ws {
+		t.Errorf("AuxiliaryCommand().Dir = %q, want %q", cmd.Dir, ws)
+	}
+	if want := []string{"A=1", "PWD=" + ws}; !slices.Equal(cmd.Env, want) {
+		t.Errorf("AuxiliaryCommand().Env = %v, want %v", cmd.Env, want)
+	}
+	if cmd.Stdin != stdin {
+		t.Errorf("AuxiliaryCommand().Stdin = %v, want the passed-in reader", cmd.Stdin)
+	}
+
+	nilEnv, agentErr := target.AuxiliaryCommand(context.Background(), nil, nil, nil)
+	if agentErr != nil {
+		t.Fatalf("AuxiliaryCommand(env=nil) error = %v, want nil", agentErr)
+	}
+	if want := setPWD(os.Environ(), ws); !slices.Equal(nilEnv.Env, want) {
+		t.Errorf("AuxiliaryCommand(env=nil).Env = %v, want os.Environ() with PWD replaced", nilEnv.Env)
+	}
+}
+
+func TestLaunchTarget_AuxiliaryCommand_LinkedWorkspaceRefused(t *testing.T) {
+	t.Parallel()
+
+	linkTarget := t.TempDir()
+	link := filepath.Join(t.TempDir(), "workspace-link")
+	if err := os.Symlink(linkTarget, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink creation requires elevated privileges on Windows")
+		}
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	target := LaunchTarget{
+		Command:       "/usr/bin/agent",
+		WorkspacePath: link,
+	}
+
+	cmd, agentErr := target.AuxiliaryCommand(context.Background(), []string{"whoami"}, nil, nil)
+	if agentErr == nil {
+		t.Fatal("AuxiliaryCommand(linked workspace) error = nil, want non-nil")
+	}
+	if cmd != nil {
+		t.Errorf("AuxiliaryCommand(linked workspace) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestLaunchTarget_AuxiliaryCommand_Remote(t *testing.T) {
+	// Not parallel: t.Setenv carries the SSH environment variable.
+	t.Setenv("AUX_CARRIED_VAR", "carried-value")
+	ws := t.TempDir()
+	target := LaunchTarget{
+		Command:       "/usr/bin/ssh",
+		WorkspacePath: ws,
+		RemoteCommand: "kiro-cli",
+		SSHHost:       "worker-host",
+		SSHEnvNames:   []string{"AUX_CARRIED_VAR"},
+	}
+
+	cmd, agentErr := target.AuxiliaryCommand(context.Background(), []string{"whoami"}, strings.NewReader("aux-stdin"), nil)
+	if agentErr != nil {
+		t.Fatalf("AuxiliaryCommand() error = %v, want nil", agentErr)
+	}
+
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "cd --") || strings.Index(joined, "cd --") > strings.Index(joined, "kiro-cli") {
+		t.Errorf("AuxiliaryCommand().Args = %v, want the ssh command to enter the workspace directory before the remote command", cmd.Args)
+	}
+	if cmd.Dir != ws {
+		t.Errorf("AuxiliaryCommand().Dir = %q, want %q", cmd.Dir, ws)
+	}
+	got, err := io.ReadAll(cmd.Stdin)
+	if err != nil {
+		t.Fatalf("io.ReadAll(cmd.Stdin): %v", err)
+	}
+	if !strings.Contains(string(got), "AUX_CARRIED_VAR") || !strings.HasSuffix(string(got), "aux-stdin") {
+		t.Errorf("cmd.Stdin = %q, want the preamble followed by the caller's own stdin", got)
+	}
+}
+
+func TestAuxiliaryTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		readTimeoutMS int
+		want          time.Duration
+	}{
+		{0, 30 * time.Second},
+		{1000, 2 * time.Second},
+		{20000, 30 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := AuxiliaryTimeout(domain.AgentConfig{ReadTimeoutMS: tt.readTimeoutMS}); got != tt.want {
+			t.Errorf("AuxiliaryTimeout(ReadTimeoutMS=%d) = %v, want %v", tt.readTimeoutMS, got, tt.want)
+		}
 	}
 }

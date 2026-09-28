@@ -2,14 +2,28 @@ package orchestrator
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+func eventTestSecret(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	return "event-secret-" + hex.EncodeToString(buf)
+}
 
 // newStateWithEntry returns a *State containing a single RunningEntry under
 // issueID. Helpers call this to avoid repetitive setup in every test.
@@ -77,8 +91,55 @@ func TestHandleAgentEvent_BasicFields(t *testing.T) {
 	}
 }
 
-// TestHandleAgentEvent_SessionStarted verifies that EventSessionStarted
-// populates SessionID and AgentPID on the entry.
+func TestHandleAgentEvent_MasksRegisteredValueInLastAgentMessage(t *testing.T) {
+	t.Parallel()
+
+	value := eventTestSecret(t)
+	redact.Add("test.event last agent message", value)
+
+	state, entry := newStateWithEntry("MASK-1")
+
+	HandleAgentEvent(state, "MASK-1", domain.AgentEvent{
+		Type:      domain.EventNotification,
+		Timestamp: time.Now().UTC(),
+		Message:   "carrying credential " + value,
+	}, slog.Default(), nil)
+
+	if strings.Contains(entry.LastAgentMessage, value) {
+		t.Fatalf("LastAgentMessage = %q, leaked the registered value", entry.LastAgentMessage)
+	}
+	if !strings.Contains(entry.LastAgentMessage, redact.Marker) {
+		t.Errorf("LastAgentMessage = %q, want it to contain %q", entry.LastAgentMessage, redact.Marker)
+	}
+}
+
+func TestHandleAgentEvent_MasksRegisteredValueInToolCallCompletedRecord(t *testing.T) {
+	t.Parallel()
+
+	value := eventTestSecret(t)
+	redact.Add("test.event tool call completed", value)
+
+	var buf bytes.Buffer
+	logger := debugLogger(t, &buf)
+	state, _ := newStateWithEntry("MASK-2")
+
+	HandleAgentEvent(state, "MASK-2", domain.AgentEvent{
+		Type:      domain.EventToolResult,
+		Timestamp: time.Now().UTC(),
+		ToolName:  "Bash",
+		ToolError: true,
+		Message:   "failed reading credential " + value,
+	}, logger, nil)
+
+	out := buf.String()
+	if strings.Contains(out, value) {
+		t.Fatalf("tool call completed record leaked the registered value:\n%s", out)
+	}
+	if !strings.Contains(out, redact.Marker) {
+		t.Errorf("tool call completed record = %q, want it to contain %q", out, redact.Marker)
+	}
+}
+
 func TestHandleAgentEvent_SessionStarted(t *testing.T) {
 	t.Parallel()
 
@@ -703,7 +764,7 @@ func TestHandleAgentEvent_CacheReadTokens_Delta(t *testing.T) {
 		t.Errorf("after 1st: AgentTotals.CacheReadTokens = %d, want 500", state.AgentTotals.CacheReadTokens)
 	}
 
-	// Second report: cumulative 800 → delta +300.
+	// Second report: cumulative 800 -> delta +300.
 	HandleAgentEvent(state, "CR-1", domain.AgentEvent{
 		Type:      domain.EventTokenUsage,
 		Timestamp: ts,
@@ -717,7 +778,7 @@ func TestHandleAgentEvent_CacheReadTokens_Delta(t *testing.T) {
 		t.Errorf("after 2nd: AgentTotals.CacheReadTokens = %d, want 800", state.AgentTotals.CacheReadTokens)
 	}
 
-	// Duplicate report: 800 again → zero delta.
+	// Duplicate report: 800 again -> zero delta.
 	HandleAgentEvent(state, "CR-1", domain.AgentEvent{
 		Type:      domain.EventTokenUsage,
 		Timestamp: ts,
@@ -728,7 +789,7 @@ func TestHandleAgentEvent_CacheReadTokens_Delta(t *testing.T) {
 		t.Errorf("after dup: CacheReadTokens = %d, want 800 (no double-count)", entry.CacheReadTokens)
 	}
 
-	// Regression: 600 → delta clamped to zero, baseline stays at 800.
+	// Regression: 600 -> delta clamped to zero, baseline stays at 800.
 	HandleAgentEvent(state, "CR-1", domain.AgentEvent{
 		Type:      domain.EventTokenUsage,
 		Timestamp: ts,
@@ -770,7 +831,7 @@ func TestHandleAgentEvent_ModelTracking(t *testing.T) {
 		t.Errorf("RequestsByModel[sonnet] = %d, want 1", entry.RequestsByModel["claude-sonnet-4-20250514"])
 	}
 
-	// Second report with empty model → falls back to last-known.
+	// Second report with empty model -> falls back to last-known.
 	HandleAgentEvent(state, "MOD-1", domain.AgentEvent{
 		Type:      domain.EventTokenUsage,
 		Timestamp: ts,
@@ -824,7 +885,7 @@ func TestHandleAgentEvent_APIRequestCount(t *testing.T) {
 		t.Errorf("after non-token events: APIRequestCount = %d, want 0", entry.APIRequestCount)
 	}
 
-	// Three token_usage events → count 3.
+	// Three token_usage events -> count 3.
 	for i := range 3 {
 		HandleAgentEvent(state, "ARC-1", domain.AgentEvent{
 			Type:      domain.EventTokenUsage,
@@ -1175,6 +1236,130 @@ func TestApplyUsageDelta_RepeatedCumulative_AppliesZeroDelta(t *testing.T) {
 	if state.AgentTotals.TotalTokens != usage.TotalTokens {
 		t.Errorf("AgentTotals.TotalTokens after repeated cumulative = %d, want %d (no double count)", state.AgentTotals.TotalTokens, usage.TotalTokens)
 	}
+}
+
+// tokenUsageComponentFields returns the domain.TokenUsage int64 field
+// names every shared fold combines componentwise, excluding
+// TotalTokens, which each fold recomputes from InputTokens plus
+// OutputTokens rather than carrying independently. A future counter
+// added to the struct is picked up here with no change needed, so a
+// fold that forgets to carry it fails immediately.
+func tokenUsageComponentFields(t *testing.T) []string {
+	t.Helper()
+
+	var names []string
+	for f := range reflect.TypeFor[domain.TokenUsage]().Fields() {
+		if f.Type.Kind() != reflect.Int64 || f.Name == "TotalTokens" {
+			continue
+		}
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+// markerTokenUsage builds a domain.TokenUsage whose every component in
+// fields carries a distinct, non-zero value derived from its position,
+// so a fold that silently drops one component produces a detectably
+// wrong result rather than a coincidental match against a shared
+// constant.
+func markerTokenUsage(fields []string) domain.TokenUsage {
+	var usage domain.TokenUsage
+	v := reflect.ValueOf(&usage).Elem()
+	for i, name := range fields {
+		v.FieldByName(name).SetInt(int64(1000 + i*137))
+	}
+	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	return usage
+}
+
+// assertComponentsSurvive fails t unless got carries, for every field
+// named in fields, the same value want does, and unless got.TotalTokens
+// equals got.InputTokens plus got.OutputTokens.
+func assertComponentsSurvive(t *testing.T, subject string, fields []string, want, got domain.TokenUsage) {
+	t.Helper()
+
+	wv := reflect.ValueOf(want)
+	gv := reflect.ValueOf(got)
+	for _, name := range fields {
+		wantVal := wv.FieldByName(name).Int()
+		gotVal := gv.FieldByName(name).Int()
+		if gotVal != wantVal {
+			t.Errorf("%s: field %s = %d, want %d (component dropped)", subject, name, gotVal, wantVal)
+		}
+	}
+	if got.TotalTokens != got.InputTokens+got.OutputTokens {
+		t.Errorf("%s: TotalTokens = %d, want InputTokens+OutputTokens = %d", subject, got.TotalTokens, got.InputTokens+got.OutputTokens)
+	}
+}
+
+// TestTokenUsageComponentsSurviveEveryFold enumerates domain.TokenUsage's
+// int64 components by reflection and drives a marker value, distinct
+// per component, through every shared arithmetic helper and
+// orchestrator fold that combines two domain.TokenUsage values. Each
+// call folds the marker against the zero value, so a fold that carries
+// a component correctly reproduces the marker's own value for it; one
+// that drops a component reports zero instead, and this test catches
+// that without needing an update when the counter set changes, because
+// it discovers the fields itself rather than naming them.
+func TestTokenUsageComponentsSurviveEveryFold(t *testing.T) {
+	t.Parallel()
+
+	fields := tokenUsageComponentFields(t)
+	if len(fields) == 0 {
+		t.Fatal("reflection found no domain.TokenUsage int64 component fields")
+	}
+	marker := markerTokenUsage(fields)
+
+	t.Run("agentcore.SubtractUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.SubtractUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "SubtractUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.MaxUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.MaxUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "MaxUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.AddUsage", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.AddUsage(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "AddUsage", fields, marker, got)
+	})
+
+	t.Run("agentcore.RunUsage clamp", func(t *testing.T) {
+		t.Parallel()
+		got := agentcore.NewRunUsage().SetRunCumulative(marker)
+		assertComponentsSurvive(t, "RunUsage.SetRunCumulative", fields, marker, got)
+	})
+
+	t.Run("applyUsageDelta", func(t *testing.T) {
+		t.Parallel()
+		state, entry := newStateWithEntry("MT-REFLECT-DELTA")
+		got := applyUsageDelta(state, entry, marker, &domain.NoopMetrics{})
+		assertComponentsSurvive(t, "applyUsageDelta return value", fields, marker, got)
+
+		entryUsage := domain.TokenUsage{
+			InputTokens: entry.AgentInputTokens, OutputTokens: entry.AgentOutputTokens,
+			TotalTokens: entry.AgentTotalTokens, CacheReadTokens: entry.CacheReadTokens,
+			CacheWriteTokens: entry.CacheWriteTokens,
+		}
+		assertComponentsSurvive(t, "applyUsageDelta entry accumulation", fields, marker, entryUsage)
+	})
+
+	t.Run("foldLocalUsage", func(t *testing.T) {
+		t.Parallel()
+		gotCumulative, gotLastUsage := foldLocalUsage(marker, domain.TokenUsage{}, domain.TokenUsage{})
+		assertComponentsSurvive(t, "foldLocalUsage cumulative", fields, marker, gotCumulative)
+		assertComponentsSurvive(t, "foldLocalUsage watermark", fields, marker, gotLastUsage)
+	})
+
+	t.Run("applyUsageOffset", func(t *testing.T) {
+		t.Parallel()
+		got := applyUsageOffset(marker, domain.TokenUsage{})
+		assertComponentsSurvive(t, "applyUsageOffset", fields, marker, got)
+	})
 }
 
 // TestHandleAgentEvent_ModelTracking_NoModel verifies that when no model

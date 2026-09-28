@@ -17,8 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"math"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -41,15 +39,16 @@ var inputSchema = json.RawMessage(`{
 // false and those figures are ignored rather than published under a
 // qualifier that contradicts them.
 type stateFile struct {
-	TurnNumber      int    `json:"turn_number"`
-	MaxTurns        int    `json:"max_turns"`
-	Attempt         *int   `json:"attempt"`
-	StartedAt       string `json:"started_at"`
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
-	TokensMeasured  bool   `json:"tokens_measured"`
+	TurnNumber       int    `json:"turn_number"`
+	MaxTurns         int    `json:"max_turns"`
+	Attempt          *int   `json:"attempt"`
+	StartedAt        string `json:"started_at"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	TokensMeasured   bool   `json:"tokens_measured"`
 }
 
 type statusResponse struct {
@@ -62,33 +61,34 @@ type statusResponse struct {
 	TokensMeasured         bool    `json:"tokens_measured"`
 }
 
-// tokens carries the session's four token figures. The members are
+// tokens carries the session's five token figures. The members are
 // nil together, exactly when the response's TokensMeasured is false,
 // and each serializes as JSON null rather than being omitted.
 type tokens struct {
-	InputTokens     *int64 `json:"input_tokens"`
-	OutputTokens    *int64 `json:"output_tokens"`
-	TotalTokens     *int64 `json:"total_tokens"`
-	CacheReadTokens *int64 `json:"cache_read_tokens"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	TotalTokens      *int64 `json:"total_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
 }
 
 // StatusTool implements [domain.AgentTool] for the sortie_status tool.
 // Construct via [New]; it is safe for concurrent use after construction.
 type StatusTool struct {
-	stateFilePath string
+	readSortieFile func(name string, maxBytes int64) ([]byte, error)
 }
 
-// New returns a [StatusTool] that reads session state from the
-// .sortie/state.json file inside workspacePath.
+// New returns a [StatusTool] that reads session state through
+// readSortieFile, which resolves a name inside the session workspace's
+// .sortie directory and returns at most maxBytes of its content.
 //
-// workspacePath must be an absolute path to the session workspace
-// directory. New panics if workspacePath is empty (programming error).
-func New(workspacePath string) *StatusTool {
-	if workspacePath == "" {
-		panic("status.New: workspacePath must not be empty")
+// New panics if readSortieFile is nil (programming error).
+func New(readSortieFile func(name string, maxBytes int64) ([]byte, error)) *StatusTool {
+	if readSortieFile == nil {
+		panic("status.New: readSortieFile must not be nil")
 	}
 	return &StatusTool{
-		stateFilePath: filepath.Join(workspacePath, ".sortie", "state.json"),
+		readSortieFile: readSortieFile,
 	}
 }
 
@@ -117,18 +117,7 @@ func (t *StatusTool) InputSchema() json.RawMessage {
 // unreadable, or contains invalid JSON. The Go error return is non-nil
 // only for internal marshal failures.
 func (t *StatusTool) Execute(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
-	fi, err := os.Lstat(t.stateFilePath)
-	if err != nil {
-		return toolresult.Failure("state_unavailable", "state file unavailable: "+err.Error())
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return toolresult.Failure("state_unavailable", "state file is a symlink")
-	}
-	if fi.Size() > maxStateFileBytes {
-		return toolresult.Failure("state_unavailable", "state file exceeds size limit")
-	}
-
-	data, err := os.ReadFile(t.stateFilePath)
+	data, err := t.readSortieFile("state.json", maxStateFileBytes)
 	if err != nil {
 		return toolresult.Failure("state_unavailable", "state file unavailable: "+err.Error())
 	}
@@ -157,10 +146,11 @@ func (t *StatusTool) Execute(_ context.Context, _ json.RawMessage) (json.RawMess
 	}
 	if sf.TokensMeasured {
 		resp.Tokens = tokens{
-			InputTokens:     sf.InputTokens,
-			OutputTokens:    sf.OutputTokens,
-			TotalTokens:     sf.TotalTokens,
-			CacheReadTokens: sf.CacheReadTokens,
+			InputTokens:      sf.InputTokens,
+			OutputTokens:     sf.OutputTokens,
+			TotalTokens:      sf.TotalTokens,
+			CacheReadTokens:  sf.CacheReadTokens,
+			CacheWriteTokens: sf.CacheWriteTokens,
 		}
 	}
 

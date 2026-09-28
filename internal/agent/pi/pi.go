@@ -28,8 +28,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
-	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 func init() {
@@ -190,13 +190,13 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 
 	var cmd *exec.Cmd
 	if state.target.RemoteCommand != "" {
-		sshArgs := sshutil.BuildSSHArgs(
+		sshArgs := sshutil.BuildSSHLaunch(
 			state.target.SSHHost,
 			state.target.WorkspacePath,
 			state.target.RemoteCommand,
 			cmdArgs,
 			sshutil.SSHOptions{StrictHostKeyChecking: state.target.SSHStrictHostKeyChecking},
-		)
+		).Args
 		cmd = exec.CommandContext(ctx, state.target.Command, sshArgs...) //nolint:gosec // args are constructed programmatically with shell quoting
 	} else {
 		allArgs := append(slices.Clone(state.target.Args), cmdArgs...)
@@ -297,7 +297,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				resetTimer(readTimer, readTimeout)
 			}
 
-			plainText := typeutil.TruncateRunes(parsed.PlainText, 500)
+			plainText := redact.Truncate(parsed.PlainText, 500)
 			emit(domain.AgentEvent{
 				Type:      domain.EventMalformed,
 				Timestamp: time.Now().UTC(),
@@ -389,7 +389,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			}
 			if text := msg.text(); text != "" {
 				runtime.work.ObserveAssistantOutput()
-				agentcore.EmitNotification(emit, typeutil.TruncateRunes(text, 500))
+				agentcore.EmitNotification(emit, redact.Truncate(text, 500))
 			}
 
 		case "turn_end":
@@ -407,7 +407,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				}
 				if text := msg.text(); text != "" {
 					runtime.work.ObserveAssistantOutput()
-					agentcore.EmitNotification(emit, typeutil.TruncateRunes(text, 500))
+					agentcore.EmitNotification(emit, redact.Truncate(text, 500))
 				}
 			}
 			if msg.Role == "assistant" && msg.Usage != nil {
@@ -857,7 +857,7 @@ func stderrExcerpt(lines []string) string {
 			break
 		}
 	}
-	return typeutil.TruncateRunes(strings.Join(kept, "; "), stderrExcerptRunes)
+	return redact.Truncate(strings.Join(kept, "; "), stderrExcerptRunes)
 }
 
 // drainLinesBounded takes whatever the reader has already produced and

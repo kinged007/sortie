@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,10 +15,227 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
+
+// scenarioCodexSSHStandIn names the Go fake runtime registered below
+// into fakeScenarios.
+const scenarioCodexSSHStandIn = "codex.ssh-stand-in"
+
+func init() {
+	fakeScenarios[scenarioCodexSSHStandIn] = agenttest.Typed(runCodexSSHStandIn)
+}
+
+// sshStandInParams configures [runCodexSSHStandIn]: PATH is the PATH
+// value its dropped-environment child receives.
+type sshStandInParams struct {
+	PATH string
+}
+
+// runCodexSSHStandIn is a stand-in "ssh" runtime: it ignores every
+// argument ahead of the last one, the remote command
+// sshutil.BuildSSHLaunch produced, and runs that command through sh -c
+// with its own environment dropped and replaced by params.PATH alone,
+// and its standard input, output, and error inherited. Dropping the
+// environment is what proves a carried variable reaches the remote
+// command only through the SSH session's standard input, never through
+// this process's own inherited environment.
+func runCodexSSHStandIn(args []string, params sshStandInParams) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "ssh stand-in: no arguments")
+		return 2
+	}
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ssh stand-in: sh not found: %v\n", err)
+		return 2
+	}
+
+	remoteCommand := args[len(args)-1]
+	cmd := exec.Command(shPath, "-c", remoteCommand) //nolint:gosec // remoteCommand is the launch this test built
+	cmd.Env = []string{"PATH=" + params.PATH}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "ssh stand-in: %v\n", err)
+		return 2
+	}
+	return 0
+}
+
+// sshStandInEnvPath returns the PATH value the ssh stand-in's dropped-
+// environment child should receive: a directory holding only a
+// symlink to sh, and, when includeDD is true, a symlink to dd as well.
+// Building an isolated directory rather than reusing sh's own
+// directory matters because a real sh and a real dd usually share one
+// directory (/usr/bin, /bin), so reusing it for the no-dd case would
+// resolve dd anyway.
+func sshStandInEnvPath(t *testing.T, includeDD bool) string {
+	t.Helper()
+
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh not found on PATH: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := os.Symlink(shPath, filepath.Join(dir, "sh")); err != nil {
+		t.Fatalf("Symlink(sh): %v", err)
+	}
+
+	if includeDD {
+		ddPath, err := exec.LookPath("dd")
+		if err != nil {
+			t.Skipf("dd not found on PATH: %v", err)
+		}
+		if err := os.Symlink(ddPath, filepath.Join(dir, "dd")); err != nil {
+			t.Fatalf("Symlink(dd): %v", err)
+		}
+	}
+	return dir
+}
+
+// writeCodexHandshakeScriptWithEnvCapture writes carriedName's value to
+// capturePath before answering codex's three-call handshake exactly as
+// writeFakeAppServerScript does, then idles on standard input until it
+// closes. It idles on the read built-in rather than on sleep because
+// the stand-in's PATH holds only sh and dd, so a sleep loop would spin
+// on a command that cannot resolve.
+func writeCodexHandshakeScriptWithEnvCapture(t *testing.T, dir, carriedName, capturePath string) string {
+	t.Helper()
+	content := "printf '%s' \"$" + carriedName + "\" > '" + capturePath + "'\n" +
+		"read -r _init_req\n" +
+		"printf '{\"id\":1,\"result\":{}}\\n'\n" +
+		"read -r _initialized_notif\n" +
+		"read -r _account_read_req\n" +
+		"printf '{\"id\":2,\"result\":{}}\\n'\n" +
+		"read -r _thread_start_req\n" +
+		"printf '{\"id\":3,\"result\":{\"thread\":{\"id\":\"fake-thread-1\"}}}\\n'\n" +
+		"printf '{\"method\":\"thread/started\",\"params\":{}}\\n'\n" +
+		"while IFS= read -r _; do :; done\n"
+	return agenttest.WriteScript(t, dir, "fake-codex-app-server-env", content)
+}
+
+// TestStartSession_SSH_CarriesEnvironmentVariable drives a remote
+// session through the stand-in ssh runtime and asserts that the fake
+// app-server observes a carried variable's value, delivered only
+// through the SSH session's standard input rather than through the
+// stand-in's own inherited environment, since the stand-in drops its
+// environment before running the remote command.
+//
+// Not run with t.Parallel(): it pins CODEX_API_KEY via t.Setenv, and
+// sets PATH and the carried variable the same way.
+func TestStartSession_SSH_CarriesEnvironmentVariable(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "")
+
+	tmpDir := t.TempDir()
+	sshDir := t.TempDir()
+
+	agenttest.FakeRuntime(t, sshDir, "ssh", scenarioCodexSSHStandIn, sshStandInParams{PATH: sshStandInEnvPath(t, true)})
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	const carriedName = "CODEX_TEST_CARRY"
+	const carriedValue = "carried-value-codex"
+	t.Setenv(carriedName, carriedValue)
+
+	capturePath := filepath.Join(tmpDir, "captured.txt")
+	agentScript := writeCodexHandshakeScriptWithEnvCapture(t, tmpDir, carriedName, capturePath)
+
+	adapter, err := NewCodexAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewCodexAdapter() error = %v, want nil", err)
+	}
+
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		AgentConfig:   domain.AgentConfig{Command: agentScript},
+		SSHHost:       "user@stand-in-host",
+		SSHEnvNames:   []string{carriedName},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := adapter.StopSession(context.Background(), session); err != nil {
+			t.Errorf("StopSession() error = %v, want nil", err)
+		}
+	})
+
+	got, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("ReadFile(captured.txt): %v", err)
+	}
+	if string(got) != carriedValue {
+		t.Errorf("remote app-server observed %q, want %q", string(got), carriedValue)
+	}
+}
+
+// TestStartSession_SSH_NoDDEndsAsPortExit asserts that a remote host
+// without dd fails StartSession as port_exit, the shared early-exit
+// report carrying the guard's own exit status and standard error, and
+// never confuses it with a missing agent binary.
+//
+// Not run with t.Parallel(): it pins CODEX_API_KEY via t.Setenv, and
+// sets PATH and the carried variable the same way.
+func TestStartSession_SSH_NoDDEndsAsPortExit(t *testing.T) {
+	t.Setenv("CODEX_API_KEY", "")
+
+	tmpDir := t.TempDir()
+	sshDir := t.TempDir()
+
+	agenttest.FakeRuntime(t, sshDir, "ssh", scenarioCodexSSHStandIn, sshStandInParams{PATH: sshStandInEnvPath(t, false)})
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	const carriedName = "CODEX_TEST_CARRY_NODD"
+	t.Setenv(carriedName, "some-value")
+
+	capturePath := filepath.Join(tmpDir, "captured.txt")
+	agentScript := writeCodexHandshakeScriptWithEnvCapture(t, tmpDir, carriedName, capturePath)
+
+	adapter, err := NewCodexAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewCodexAdapter() error = %v, want nil", err)
+	}
+
+	_, err = adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		AgentConfig:   domain.AgentConfig{Command: agentScript},
+		SSHHost:       "user@stand-in-host",
+		SSHEnvNames:   []string{carriedName},
+	})
+
+	const ddMissingMessage = "sortie: dd is required on the remote host to receive environment variables"
+
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("StartSession() error = %v (%T), want a non-nil *domain.AgentError", err, err)
+	}
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("StartSession() error kind = %q, want %q (never the agent-not-found category)", agentErr.Kind, domain.ErrPortExit)
+	}
+	var earlyExitErr *agentcore.EarlyExitError
+	if !errors.As(agentErr.Err, &earlyExitErr) {
+		t.Fatalf("StartSession() error = %v, chain does not hold an *agentcore.EarlyExitError", agentErr)
+	}
+	if earlyExitErr.Status() != "exit status 1" {
+		t.Errorf("EarlyExitError.Status() = %q, want %q", earlyExitErr.Status(), "exit status 1")
+	}
+	if !strings.Contains(earlyExitErr.Output(), ddMissingMessage) {
+		t.Errorf("EarlyExitError.Output() = %q, want it to contain %q", earlyExitErr.Output(), ddMissingMessage)
+	}
+
+	if _, statErr := os.Stat(capturePath); statErr == nil {
+		t.Error("the fake app-server ran with no dd on PATH, want it never to run")
+	}
+}
 
 // writeDescendantScript creates the script the fake app-server spawns as
 // a background job. It publishes its own PID to pidFile, then idles until
@@ -241,9 +459,8 @@ func TestStartSession_CancelSignalsProcessGroup(t *testing.T) {
 // then answers one turn/start call (id 4, the next identifier
 // jsonrpc.Conn allocates after the handshake's three calls) and starts a
 // setsid grandchild that inherits standard output and exits without
-// waiting for it. Property P12 uses it to drive a real turn whose
-// runtime exits while an escaped descendant still holds the output
-// handle.
+// waiting for it, to drive a real turn whose runtime exits while an
+// escaped descendant still holds the output handle.
 func writeFakeAppServerScriptEscapedTurn(t *testing.T, dir, pidFile string) string {
 	t.Helper()
 	content := fmt.Sprintf(`read -r _init_req
@@ -264,7 +481,7 @@ exit 0
 }
 
 // TestStartSession_ReleaseEndsTurnWhenEscapedDescendantHoldsOutput
-// covers property P12: a session whose runtime exits while an escaped
+// asserts that a session whose runtime exits while an escaped
 // descendant holds the output handle publishes the turn's outcome and
 // completes StopSession within the injected CodexAdapter.drainGrace
 // bound, leaving no goroutine of the session running.

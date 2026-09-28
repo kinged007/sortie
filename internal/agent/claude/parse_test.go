@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 func loadFixture(t *testing.T, name string) []byte {
@@ -287,7 +287,7 @@ func TestUsageFromResult(t *testing.T) {
 				},
 			},
 			wantUsage: domain.TokenUsage{
-				InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706,
+				InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706, CacheWriteTokens: 15933,
 			},
 			wantModel: "claude-haiku-4-5-20251001",
 		},
@@ -300,7 +300,7 @@ func TestUsageFromResult(t *testing.T) {
 				},
 			},
 			wantUsage: domain.TokenUsage{
-				InputTokens: 9800, OutputTokens: 2000, TotalTokens: 11800, CacheReadTokens: 1500,
+				InputTokens: 9800, OutputTokens: 2000, TotalTokens: 11800, CacheReadTokens: 1500, CacheWriteTokens: 300,
 			},
 			wantModel: "claude-haiku-4-5-20251001",
 		},
@@ -320,7 +320,7 @@ func TestUsageFromResult(t *testing.T) {
 			event: rawEvent{
 				Usage: &rawUsage{InputTokens: 200, OutputTokens: 80, CacheReadInputTokens: 8000, CacheCreationInputTokens: 2000},
 			},
-			wantUsage: domain.TokenUsage{InputTokens: 10200, OutputTokens: 80, TotalTokens: 10280, CacheReadTokens: 8000},
+			wantUsage: domain.TokenUsage{InputTokens: 10200, OutputTokens: 80, TotalTokens: 10280, CacheReadTokens: 8000, CacheWriteTokens: 2000},
 			wantModel: "",
 		},
 		{
@@ -349,6 +349,50 @@ func TestUsageFromResult(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCacheWriteTokensMapping drives a non-zero cache-write count
+// through every path that maps claude-code's raw usage into
+// domain.TokenUsage: the assistant event's own usage object, the
+// result event's modelUsage map, and the result event's usage
+// fallback. Each event carries its own turn-cumulative usage, rising
+// across the sequence, so agenttest.AssertUsageContract also exercises
+// the shared monotonicity and cache-sum invariants against real
+// mapping output rather than a hand-built fixture.
+func TestCacheWriteTokensMapping(t *testing.T) {
+	t.Parallel()
+
+	assistantUsage := usageFromAssistant(&rawUsage{
+		InputTokens: 12000, OutputTokens: 3000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 4000,
+	})
+	if assistantUsage.CacheWriteTokens != 4000 {
+		t.Errorf("usageFromAssistant().CacheWriteTokens = %d, want 4000", assistantUsage.CacheWriteTokens)
+	}
+
+	modelUsageResult, _ := usageFromResult(rawEvent{
+		ModelUsage: map[string]rawModelUsage{
+			"claude-sonnet-4-5-20250929": {
+				InputTokens: 20000, OutputTokens: 5000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 6000,
+			},
+		},
+	})
+	if modelUsageResult.CacheWriteTokens != 6000 {
+		t.Errorf("usageFromResult() modelUsage path CacheWriteTokens = %d, want 6000", modelUsageResult.CacheWriteTokens)
+	}
+
+	fallbackResult, _ := usageFromResult(rawEvent{
+		Usage: &rawUsage{InputTokens: 30000, OutputTokens: 7000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 9000},
+	})
+	if fallbackResult.CacheWriteTokens != 9000 {
+		t.Errorf("usageFromResult() usage-fallback path CacheWriteTokens = %d, want 9000", fallbackResult.CacheWriteTokens)
+	}
+
+	events := []domain.AgentEvent{
+		{Type: domain.EventTokenUsage, Usage: assistantUsage},
+		{Type: domain.EventTokenUsage, Usage: modelUsageResult},
+		{Type: domain.EventTurnCompleted, Usage: fallbackResult},
+	}
+	agenttest.AssertUsageContract(t, events)
 }
 
 func TestSummarizeAssistant(t *testing.T) {
@@ -438,33 +482,6 @@ func TestRawEventSummary(t *testing.T) {
 			got := tt.ev.summary()
 			if got != tt.want {
 				t.Errorf("summary() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestTruncate(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		input  string
-		maxLen int
-		want   string
-	}{
-		{"short string", "hello", 10, "hello"},
-		{"exact length", "hello", 5, "hello"},
-		{"over limit", "hello world", 5, "hello…"},
-		{"unicode safe", "日本語テスト", 3, "日本語…"},
-		{"empty string", "", 5, ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := typeutil.TruncateRunes(tt.input, tt.maxLen)
-			if got != tt.want {
-				t.Errorf("TruncateRunes(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
 			}
 		})
 	}
@@ -742,7 +759,7 @@ func TestEmitToolResult_ParallelToolUse(t *testing.T) {
 	now := time.Now().UTC()
 	events := collectToolEvents(t, ev, tracker, now)
 
-	// No tool_result blocks → no EventToolResult events.
+	// No tool_result blocks -> no EventToolResult events.
 	if len(events) != 0 {
 		t.Errorf("collectToolEvents() = %d events, want 0", len(events))
 	}

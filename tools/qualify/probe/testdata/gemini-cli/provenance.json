@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-23T23:03:15Z",
+  "profile_digest": "c953570dbf620f1c35c9af8342f5b93b82187bdebb47cf0eeba539ac15793fdb",
+  "collector_digest": "e16553df8abc7ce440466d25e4cdb0c97f1fb4c39d008bb05180ce0fd98773f0",
+  "evidence_file": "evidence.jsonl",
+  "evidence_digest": "83670611d599555a8a46e270917eee3d6c30e4b274508a24c9f4adfd52918c8a",
+  "requested_model": "gemini-3.5-flash",
+  "protocol_version": 1,
+  "session_agents": {
+    "1dc54dd3-0f36-4570-9510-df1f552226ca": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "221205c8-2b4c-4e4a-a626-435a0d1b8d4e": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "3fc7a40e-5a92-4508-adff-74e8b5ca49ec": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "54b7d0ca-4a96-4a3f-a5b3-80d5df953032": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "55be0eeb-a89f-4595-9410-a1c393d712c7": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "6551be5b-9a9c-484a-8bb7-be8e101c3634": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "7d6eaad4-80ce-443e-bdff-1223fb907cc7": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "9d8ff41b-b628-4128-a4ec-0cbc0195eda6": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "b29c3157-37f9-4711-9f4c-3db9e4679d7e": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    },
+    "f4f32f7f-f109-4bad-a1f5-717734a6fe38": {
+      "name": "gemini-cli",
+      "version": "0.60.0"
+    }
+  },
+  "credential_mode": {
+    "GEMINI_API_KEY": "present"
+  }
+}

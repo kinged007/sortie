@@ -14,7 +14,7 @@ Run the coding agents you already use on tasks from your issue tracker - in para
 [![codecov](https://codecov.io/gh/sortie-ai/sortie/graph/badge.svg?token=K2TPXBCbvb)](https://codecov.io/gh/sortie-ai/sortie)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sortie-ai/sortie.svg)](https://pkg.go.dev/github.com/sortie-ai/sortie)
 
-[Website](https://sortie-ai.com) · [Documentation](https://docs.sortie-ai.com) · [Contributing](CONTRIBUTING.md)
+[Website](https://sortie-ai.com) · [Documentation](https://docs.sortie-ai.com) · [Discord](https://discord.gg/MCNrc8Wf9M) · [Contributing](CONTRIBUTING.md)
 
 **English | [简体中文](README.zh-CN.md)**
 
@@ -64,7 +64,7 @@ Full configuration reference, CLI usage, and getting started guide: [docs.sortie
 
 ## Prior Art
 
-Sortie's architecture is informed by [OpenAI Symphony](https://github.com/openai/symphony).
+Sortie's architecture is informed by [OpenAI Symphony](https://github.com/openai/symphony), a spec-first orchestration framework with an Elixir reference implementation. Sortie diverges in language (Go for deployment simplicity), persistence (SQLite instead of in-memory state), extensibility (pluggable adapters for any tracker or agent, not hardcoded to Linear and Codex), and completion signaling (orchestrator-managed handoff transitions instead of relying solely on agent-initiated tracker writes).
 
 ## License
 

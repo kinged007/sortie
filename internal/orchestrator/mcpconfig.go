@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/sortie-ai/sortie/internal/redact"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 // resolveToolServerBinary returns the absolute, symlink-free path to the
@@ -58,9 +61,6 @@ type MCPConfigParams struct {
 	// DBPath is the absolute path to the SQLite database.
 	DBPath string
 
-	// SessionID is the agent session identifier (may be empty).
-	SessionID string
-
 	// DispatchID is written to the tool server environment as
 	// SORTIE_DISPATCH_ID.
 	DispatchID string
@@ -86,8 +86,8 @@ type MCPConfigParams struct {
 	// indirection in the workflow file (e.g., tracker credentials).
 	//
 	// Per-session variables (IssueID, Identifier, WorkspacePath,
-	// DBPath, SessionID, DispatchID) take precedence over same-named
-	// keys in ProcessEnv.
+	// DBPath, DispatchID) take precedence over same-named keys in
+	// ProcessEnv.
 	ProcessEnv map[string]string
 }
 
@@ -104,11 +104,12 @@ func GenerateMCPConfig(params MCPConfigParams) (string, error) {
 	// (higher precedence, always win).
 	env := make(map[string]string, len(params.ProcessEnv)+6)
 	maps.Copy(env, params.ProcessEnv)
+
+	delete(env, "SORTIE_SESSION_ID")
 	env["SORTIE_ISSUE_ID"] = params.IssueID
 	env["SORTIE_ISSUE_IDENTIFIER"] = params.Identifier
 	env["SORTIE_WORKSPACE"] = params.WorkspacePath
 	env["SORTIE_DB_PATH"] = params.DBPath
-	env["SORTIE_SESSION_ID"] = params.SessionID
 	env["SORTIE_DISPATCH_ID"] = params.DispatchID
 	env["SORTIE_SESSION_AGENT_KIND"] = params.AgentKind
 	if params.Attempt != nil {
@@ -118,12 +119,8 @@ func GenerateMCPConfig(params MCPConfigParams) (string, error) {
 	entry := map[string]any{
 		"type":    "stdio",
 		"command": params.BinaryPath,
-		// WorkflowPath is an absolute path supplied by the orchestrator at
-		// workspace allocation time. The agent runtime already operates within
-		// the workspace directory and has full access to the filesystem, so
-		// passing the absolute workflow path here does not expand its access.
-		"args": []string{"mcp-server", "--workflow", params.WorkflowPath},
-		"env":  env,
+		"args":    []string{"mcp-server", "--workflow", params.WorkflowPath},
+		"env":     env,
 	}
 
 	var merged map[string]any
@@ -166,15 +163,16 @@ func GenerateMCPConfig(params MCPConfigParams) (string, error) {
 		merged = parsed
 	}
 
-	dir := filepath.Join(params.WorkspacePath, ".sortie")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return "", fmt.Errorf("creating .sortie directory: %w", err)
-	}
+	registerToolServerCredentials(merged)
 
-	// Exclude all .sortie/ contents from git. Written on every call so
-	// it is restored if an agent or hook removes it between runs.
-	gitignorePath := filepath.Join(dir, ".gitignore")
-	if err := os.WriteFile(gitignorePath, []byte("*\n"), 0o600); err != nil {
+	sortieDir, err := workspacekit.OpenSortieDir(params.WorkspacePath, true)
+	if err != nil {
+		return "", fmt.Errorf("open .sortie directory: %w", err)
+	}
+	defer sortieDir.Close() //nolint:errcheck // the handle is not needed once both files are written
+
+	// Restore this rule when an agent or hook removes it between runs.
+	if err := workspacekit.ReplaceFile(sortieDir, ".gitignore", []byte("*\n")); err != nil {
 		return "", fmt.Errorf("writing .sortie gitignore: %w", err)
 	}
 
@@ -183,17 +181,50 @@ func GenerateMCPConfig(params MCPConfigParams) (string, error) {
 		return "", fmt.Errorf("marshalling MCP config: %w", err)
 	}
 
-	tmpPath := filepath.Join(dir, "mcp.json.tmp")
-	outPath := filepath.Join(dir, "mcp.json")
-
-	if err := os.WriteFile(tmpPath, encoded, 0o600); err != nil {
-		return "", fmt.Errorf("writing MCP config temp file: %w", err)
-	}
-	if err := os.Rename(tmpPath, outPath); err != nil {
-		return "", fmt.Errorf("renaming MCP config file: %w", err)
+	if err := workspacekit.ReplaceFile(sortieDir, "mcp.json", encoded); err != nil {
+		return "", fmt.Errorf("writing MCP config file: %w", err)
 	}
 
-	return outPath, nil
+	return filepath.Join(params.WorkspacePath, workspacekit.SortieDir, "mcp.json"), nil
+}
+
+// registerToolServerCredentials registers every credential merged's
+// "mcpServers" entries carry with [internal/redact], so a launch that
+// hands a runtime this document has already made its values maskable
+// before the file is written: each string member of a server's "env"
+// and "headers" objects under its own name, and a server's "url"
+// userinfo.
+func registerToolServerCredentials(merged map[string]any) {
+	servers, ok := merged["mcpServers"].(map[string]any)
+	if !ok {
+		return
+	}
+	for name, raw := range servers {
+		server, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		registerToolServerNamedStrings(fmt.Sprintf("mcpServers.%s.env", name), server["env"])
+		registerToolServerNamedStrings(fmt.Sprintf("mcpServers.%s.headers", name), server["headers"])
+		if url, ok := server["url"].(string); ok {
+			redact.AddURLCredentials(fmt.Sprintf("mcpServers.%s.url", name), url)
+		}
+	}
+}
+
+func registerToolServerNamedStrings(source string, raw any) {
+	switch m := raw.(type) {
+	case map[string]any:
+		for key, v := range m {
+			if s, ok := v.(string); ok {
+				redact.AddNamed(source+"."+key, key, s)
+			}
+		}
+	case map[string]string:
+		for key, s := range m {
+			redact.AddNamed(source+"."+key, key, s)
+		}
+	}
 }
 
 // CollectSortieEnv scans the process environment and returns all

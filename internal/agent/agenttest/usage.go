@@ -18,17 +18,6 @@ func AssertUsageContract(t *testing.T, events []domain.AgentEvent) {
 	assertUsageContract(t, events)
 }
 
-// usageContractReporter is the minimal reporting surface
-// assertUsageContract needs; [*testing.T] satisfies it. Splitting the
-// check out from [AssertUsageContract] lets a package-internal test
-// drive the same failure-detection logic against a lightweight double,
-// since a *testing.T's own failure state cannot itself be inspected
-// without failing the enclosing test.
-type usageContractReporter interface {
-	Helper()
-	Errorf(format string, args ...any)
-}
-
 // AssertMeasurementAbsent fails t when the given events or result assert a
 // usage measurement that a runtime reporting nothing must not produce: any
 // event of type [domain.EventTokenUsage], any event carrying a non-zero
@@ -38,7 +27,7 @@ func AssertMeasurementAbsent(t *testing.T, events []domain.AgentEvent, result do
 	assertMeasurementAbsent(t, events, result)
 }
 
-func assertMeasurementAbsent(t usageContractReporter, events []domain.AgentEvent, result domain.TurnResult) {
+func assertMeasurementAbsent(t contractReporter, events []domain.AgentEvent, result domain.TurnResult) {
 	t.Helper()
 
 	for i, event := range events {
@@ -63,7 +52,7 @@ func AssertModelReported(t *testing.T, events []domain.AgentEvent, wantModel str
 	assertModelReported(t, events, wantModel)
 }
 
-func assertModelReported(t usageContractReporter, events []domain.AgentEvent, wantModel string) {
+func assertModelReported(t contractReporter, events []domain.AgentEvent, wantModel string) {
 	t.Helper()
 
 	seen := false
@@ -81,7 +70,7 @@ func assertModelReported(t usageContractReporter, events []domain.AgentEvent, wa
 	}
 }
 
-func assertUsageContract(t usageContractReporter, events []domain.AgentEvent) {
+func assertUsageContract(t contractReporter, events []domain.AgentEvent) {
 	t.Helper()
 
 	var prev domain.TokenUsage
@@ -91,16 +80,17 @@ func assertUsageContract(t usageContractReporter, events []domain.AgentEvent) {
 			continue
 		}
 
-		if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CacheReadTokens < 0 || usage.TotalTokens < 0 {
+		if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CacheReadTokens < 0 ||
+			usage.CacheWriteTokens < 0 || usage.TotalTokens < 0 {
 			t.Errorf("event %d: Usage has a negative component: %+v", i, usage)
 		}
 		if usage.TotalTokens != usage.InputTokens+usage.OutputTokens {
 			t.Errorf("event %d: TotalTokens = %d, want InputTokens+OutputTokens = %d",
 				i, usage.TotalTokens, usage.InputTokens+usage.OutputTokens)
 		}
-		if usage.CacheReadTokens > usage.InputTokens {
-			t.Errorf("event %d: CacheReadTokens = %d, want <= InputTokens (%d)",
-				i, usage.CacheReadTokens, usage.InputTokens)
+		if usage.CacheReadTokens+usage.CacheWriteTokens > usage.InputTokens {
+			t.Errorf("event %d: CacheReadTokens+CacheWriteTokens = %d, want <= InputTokens (%d)",
+				i, usage.CacheReadTokens+usage.CacheWriteTokens, usage.InputTokens)
 		}
 		if usage.InputTokens < prev.InputTokens {
 			t.Errorf("event %d: InputTokens decreased from %d to %d", i, prev.InputTokens, usage.InputTokens)
@@ -113,6 +103,9 @@ func assertUsageContract(t usageContractReporter, events []domain.AgentEvent) {
 		}
 		if usage.CacheReadTokens < prev.CacheReadTokens {
 			t.Errorf("event %d: CacheReadTokens decreased from %d to %d", i, prev.CacheReadTokens, usage.CacheReadTokens)
+		}
+		if usage.CacheWriteTokens < prev.CacheWriteTokens {
+			t.Errorf("event %d: CacheWriteTokens decreased from %d to %d", i, prev.CacheWriteTokens, usage.CacheWriteTokens)
 		}
 		prev = usage
 	}
@@ -144,7 +137,7 @@ func AssertUsageReporting(t *testing.T, kind string, cases []UsageReportingCase)
 // entry's When matched.
 const unreachedRuleIndex = -1
 
-func assertUsageReporting(t usageContractReporter, kind string, cases []UsageReportingCase) {
+func assertUsageReporting(t contractReporter, kind string, cases []UsageReportingCase) {
 	t.Helper()
 
 	meta, registered := registry.Agents.Meta(kind)
@@ -187,7 +180,7 @@ func assertUsageReporting(t usageContractReporter, kind string, cases []UsageRep
 // against the pair meta.UsageDisposition resolved for it, per the two
 // admissible shapes UsageArrivalIncremental and UsageArrivalTurnEnd
 // are exact complements of on a stream that can tell them apart.
-func assertResolvedUsageReporting(t usageContractReporter, tc UsageReportingCase, arrival registry.UsageArrival, attribution registry.UsageAttribution) {
+func assertResolvedUsageReporting(t contractReporter, tc UsageReportingCase, arrival registry.UsageArrival, attribution registry.UsageAttribution) {
 	t.Helper()
 
 	var usageIdx []int
@@ -279,7 +272,8 @@ func dominates(result, figure domain.TokenUsage) bool {
 	return result.InputTokens >= figure.InputTokens &&
 		result.OutputTokens >= figure.OutputTokens &&
 		result.TotalTokens >= figure.TotalTokens &&
-		result.CacheReadTokens >= figure.CacheReadTokens
+		result.CacheReadTokens >= figure.CacheReadTokens &&
+		result.CacheWriteTokens >= figure.CacheWriteTokens
 }
 
 // turnTerminalEventTypes lists the event types that end a turn, the set

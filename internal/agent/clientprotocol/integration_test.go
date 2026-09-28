@@ -7,8 +7,7 @@
 //	SORTIE_CLIENTPROTOCOL_COMMAND    the protocol-speaking binary's launch
 //	                                  command, including whatever flag
 //	                                  puts it into Agent Client Protocol
-//	                                  mode (for example "copilot --acp" or
-//	                                  "opencode acp")
+//	                                  mode
 //
 // This suite names no default binary: the kind is generic, with no
 // runtime of its own, and naming one would make a single vendor the
@@ -41,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -187,9 +187,12 @@ func assertLiveProtocolConformance(t *testing.T, capture liveProtocolCapture) {
 	if capture.events != nil {
 		events = capture.events()
 	}
-	shapeViolations, observed := recordedShapeViolations(capturedJSONLines(t, capture.clientPath), capturedJSONLines(t, capture.agentPath), events, capture.expect)
+	shapeViolations, shapeObservations, observed := recordedShapeViolations(capturedJSONLines(t, capture.clientPath), capturedJSONLines(t, capture.agentPath), events, capture.expect)
 	for _, v := range shapeViolations {
 		t.Errorf("live shape violation: %s", v)
+	}
+	for _, o := range shapeObservations {
+		t.Logf("live shape observation: %s", o)
 	}
 	t.Logf("live shape observation: %+v", observed)
 }
@@ -459,4 +462,77 @@ func TestIntegration_SessionContinuation(t *testing.T) {
 	} else {
 		t.Log("session continuation was not confirmed by this runtime; the entry was lowered and the run fell back to a fresh session cleanly")
 	}
+}
+
+func TestIntegration_CredentialVerification(t *testing.T) {
+	skipUnlessClientProtocolIntegration(t)
+
+	adapter, err := NewClientProtocolAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewClientProtocolAdapter() error = %v", err)
+	}
+	params := func(t *testing.T) domain.StartSessionParams {
+		return domain.StartSessionParams{
+			WorkspacePath: gitInitWorkspace(t),
+			AgentConfig: domain.AgentConfig{
+				Command:       os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND"),
+				TurnTimeoutMS: 300000,
+				ReadTimeoutMS: 30000,
+			},
+		}
+	}
+
+	t.Run("working credential verifies", func(t *testing.T) {
+		if _, err := credentialtest.VerifyLive(adapter, params(t)); err != nil {
+			t.Fatalf("VerifyCredential() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
+		// Not parallel: t.Setenv carries the invalid credential.
+		credentialtest.SetRefusedCredential(t, "SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV")
+
+		_, err := credentialtest.VerifyLive(adapter, params(t))
+		credentialtest.RequireRefused(t, err)
+	})
+}
+
+func TestIntegration_EarlyExit(t *testing.T) {
+	skipUnlessClientProtocolIntegration(t)
+
+	adapter, err := NewClientProtocolAdapter(map[string]any{})
+	if err != nil {
+		t.Fatalf("NewClientProtocolAdapter() error = %v", err)
+	}
+	unknownSwitchConfig := domain.AgentConfig{
+		Command:       os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND") + " --sortie-unknown-switch",
+		TurnTimeoutMS: 300000,
+		ReadTimeoutMS: 30000,
+	}
+
+	t.Run("verification session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{
+			WorkspacePath: gitInitWorkspace(t),
+			AgentConfig:   unknownSwitchConfig,
+		}
+		if _, err := credentialtest.VerifyLive(adapter, params); err == nil {
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
+
+	t.Run("working session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{
+			WorkspacePath: gitInitWorkspace(t),
+			AgentConfig:   unknownSwitchConfig,
+		}
+		session, err := adapter.StartSession(context.Background(), params)
+		if err == nil {
+			_ = adapter.StopSession(context.Background(), session)
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
 }

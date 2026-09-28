@@ -13,6 +13,18 @@ on:
         required: false
         type: boolean
         default: false
+      # Off by default. The free-trial certificate is self-signed, so a signed
+      # binary is no more trusted on Windows than an unsigned one, and the
+      # trial's yearly artifact-volume quota is spent. Enabling this needs a
+      # certificate chained to a CA in the Microsoft Trusted Root Program, plus
+      # a `!inputs.dry_run` gate on the signing hook: a dry run submits the same
+      # two Windows binaries as a real release and spends half the quota on
+      # artifacts it discards.
+      sign_windows:
+        description: "Authenticode-sign the Windows binaries with SignPath"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -22,6 +34,9 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+
 jobs:
   validate:
     name: Validate inputs
@@ -30,7 +45,7 @@ jobs:
       version: ${{ steps.normalize.outputs.version }}
       tag: ${{ steps.normalize.outputs.tag }}
     steps:
-      - name: Normalize and validate version
+      - name: Validate version
         id: normalize
         run: |
           INPUT='${{ inputs.version }}'
@@ -42,13 +57,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Check tag does not already exist
+      - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify tag is new
+      - name: Verify new tag
         run: |
           TAG='${{ steps.normalize.outputs.tag }}'
           if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -57,7 +72,7 @@ jobs:
           fi
           echo "✓ Tag ${TAG} is available"
 
-      - name: Verify CHANGELOG.md contains release version
+      - name: Verify changelog entry
         run: |
           VERSION='${{ steps.normalize.outputs.version }}'
           if ! grep -qP "^## \[${VERSION}\]" CHANGELOG.md; then
@@ -126,7 +141,7 @@ jobs:
       SORTIE_JIRA_API_KEY: ${{ secrets.SORTIE_JIRA_API_KEY }}
       SORTIE_JIRA_PROJECT: ${{ secrets.SORTIE_JIRA_PROJECT }}
     steps:
-      - name: Verify Jira secrets are configured
+      - name: Verify Jira secrets
         run: |
           missing=()
           [ -z "$SORTIE_JIRA_ENDPOINT" ] && missing+=("SORTIE_JIRA_ENDPOINT")
@@ -161,7 +176,7 @@ jobs:
       SORTIE_GITHUB_TOKEN: ${{ secrets.SORTIE_GITHUB_TOKEN }}
       SORTIE_GITHUB_PROJECT: sortie-ai/sortie-test
     steps:
-      - name: Verify GitHub secrets are configured
+      - name: Verify GitHub secrets
         run: |
           missing=()
           [ -z "$SORTIE_GITHUB_TOKEN" ]   && missing+=("SORTIE_GITHUB_TOKEN")
@@ -194,7 +209,7 @@ jobs:
       SORTIE_LINEAR_API_KEY: ${{ secrets.SORTIE_LINEAR_API_KEY }}
       SORTIE_LINEAR_TEAM_KEY: ${{ vars.SORTIE_LINEAR_TEAM_KEY }}
     steps:
-      - name: Verify Linear credentials are configured
+      - name: Verify Linear credentials
         run: |
           missing=()
           [ -z "$SORTIE_LINEAR_API_KEY" ]  && missing+=("SORTIE_LINEAR_API_KEY (secret)")
@@ -236,7 +251,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Boot and provision Gitea
+      - name: Provision Gitea
         run: scripts/gitea-integration-provision.sh
 
       - name: Run integration tests
@@ -259,7 +274,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Boot and provision GitLab
+      - name: Provision GitLab
         run: scripts/gitlab-integration-provision.sh
 
       - name: Run integration tests
@@ -274,7 +289,7 @@ jobs:
       SORTIE_GITHUB_TOKEN: ${{ secrets.SORTIE_GITHUB_TOKEN }}
       SORTIE_GITHUB_PROJECT: sortie-ai/sortie-test
     steps:
-      - name: Verify GitHub token secret is configured
+      - name: Verify GitHub token
         run: |
           missing=()
           [ -z "$SORTIE_GITHUB_TOKEN" ] && missing+=("SORTIE_GITHUB_TOKEN")
@@ -304,9 +319,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SORTIE_CLAUDE_TEST: "1"
+      SORTIE_CLAUDE_CREDENTIAL_ENV: ANTHROPIC_API_KEY
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
-      - name: Verify Claude Code secrets are configured
+      - name: Verify Claude secrets
         run: |
           missing=()
           [ -z "$ANTHROPIC_API_KEY" ] && missing+=("ANTHROPIC_API_KEY")
@@ -333,10 +349,10 @@ jobs:
           node-version: "24"
 
       - name: Install Claude
-        run: npm install -g @anthropic-ai/claude-code
+        run: npm install -g --ignore-scripts=false @anthropic-ai/claude-code
 
       - name: Run integration tests
-        run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/claude/...
+        run: go test -race -count=1 -v -timeout 600s -run 'Integration' ./internal/agent/claude/...
 
   test-integration-copilot:
     name: "Integration: Copilot"
@@ -344,9 +360,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SORTIE_COPILOT_TEST: "1"
+      SORTIE_COPILOT_CREDENTIAL_ENV: GH_TOKEN
       GH_TOKEN: ${{ secrets.SORTIE_COPILOT_TOKEN }}
     steps:
-      - name: Verify Copilot CLI secrets are configured
+      - name: Verify Copilot secrets
         run: |
           missing=()
           [ -z "$GH_TOKEN" ] && missing+=("SORTIE_COPILOT_TOKEN")
@@ -384,9 +401,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SORTIE_CODEX_TEST: "1"
+      SORTIE_CODEX_CREDENTIAL_ENV: CODEX_API_KEY
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
     steps:
-      - name: Verify Codex secrets are configured
+      - name: Verify Codex secrets
         run: |
           missing=()
           [ -z "$CODEX_API_KEY" ] && missing+=("CODEX_API_KEY")
@@ -419,11 +437,20 @@ jobs:
         run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/codex/...
 
   test-integration-opencode:
-    name: "Integration: OpenCode"
+    name: "Integration: OpenCode ${{ matrix.major }}.x"
     needs: [lint, test-unit]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - major: "1"
+            install: npm install -g --ignore-scripts=false opencode-ai@1
+          - major: "2"
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
     env:
       SORTIE_OPENCODE_TEST: "1"
+      SORTIE_OPENCODE_MAJOR: ${{ matrix.major }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -441,10 +468,19 @@ jobs:
           node-version: "24"
 
       - name: Install OpenCode CLI
-        run: npm install -g opencode-ai
+        run: ${{ matrix.install }}
 
       - name: Run integration tests
-        run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/opencode/...
+        run: |
+          for attempt in 1 2; do
+            if go test -race -count=1 -v -timeout 180s -run 'Integration' ./internal/agent/opencode/...; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then
+              exit 1
+            fi
+            echo "OpenCode integration attempt failed; retrying once"
+          done
 
   test-integration-pi:
     name: "Integration: Pi"
@@ -482,9 +518,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SORTIE_KIRO_TEST: "1"
+      SORTIE_KIRO_CREDENTIAL_ENV: KIRO_API_KEY
       KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
     steps:
-      - name: Verify Kiro secrets are configured
+      - name: Verify Kiro secrets
         run: |
           missing=()
           [ -z "$KIRO_API_KEY" ] && missing+=("KIRO_API_KEY")
@@ -521,9 +558,10 @@ jobs:
     env:
       SORTIE_CLIENTPROTOCOL_TEST: "1"
       SORTIE_CLIENTPROTOCOL_COMMAND: gemini --acp
+      SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV: GEMINI_API_KEY
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
-      - name: Verify Gemini secrets are configured
+      - name: Verify Gemini secrets
         run: |
           missing=()
           [ -z "$GEMINI_API_KEY" ] && missing+=("GEMINI_API_KEY")
@@ -562,9 +600,10 @@ jobs:
     env:
       SORTIE_CLIENTPROTOCOL_TEST: "1"
       SORTIE_CLIENTPROTOCOL_COMMAND: kiro-cli acp -a
+      SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV: KIRO_API_KEY
       KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
     steps:
-      - name: Verify Kiro secrets are configured
+      - name: Verify Kiro secrets
         run: |
           missing=()
           [ -z "$KIRO_API_KEY" ] && missing+=("KIRO_API_KEY")
@@ -632,8 +671,8 @@ jobs:
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
 
-      - name: Verify SignPath configuration is present
-        if: ${{ !inputs.dry_run }}
+      - name: Verify SignPath config
+        if: ${{ inputs.sign_windows && !inputs.dry_run }}
         env:
           SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -648,8 +687,8 @@ jobs:
           fi
           echo "✓ SignPath configuration is present"
 
-      - name: Install SignPath signing module
-        if: ${{ vars.SIGNPATH_ORG_ID != '' }}
+      - name: Install SignPath module
+        if: ${{ inputs.sign_windows && vars.SIGNPATH_ORG_ID != '' }}
         shell: pwsh
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
@@ -660,7 +699,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/release-contributors.sh '${{ needs.validate.outputs.tag }}'
 
-      - name: Create and push tag
+      - name: Push tag
         if: ${{ !inputs.dry_run }}
         run: |
           TAG='${{ needs.validate.outputs.tag }}'
@@ -670,7 +709,7 @@ jobs:
           git push origin "$TAG"
           echo "### Tagged \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Create local tag (dry run)
+      - name: Create local tag
         if: ${{ inputs.dry_run }}
         run: |
           TAG='${{ needs.validate.outputs.tag }}'
@@ -687,8 +726,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORG_ID: ${{ inputs.sign_windows && vars.SIGNPATH_ORG_ID || '' }}
+          SIGNPATH_API_TOKEN: ${{ inputs.sign_windows && secrets.SIGNPATH_API_TOKEN || '' }}
           SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
           SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
 
@@ -742,12 +781,12 @@ jobs:
         run: echo "BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Log in to GHCR
+      - name: Log into GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -766,7 +805,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64

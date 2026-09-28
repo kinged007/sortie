@@ -1,6 +1,41 @@
 package clientprotocol
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+
+	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/redact"
+)
+
+// quoteJSONRPCError renders e for display only; no behavior may depend
+// on its Message or Data.
+func quoteJSONRPCError(e *jsonrpc.Error) string {
+	if e == nil {
+		return ""
+	}
+	text := e.Message
+	if data := formatErrorData(e.Data); data != "" {
+		text += ": " + data
+	}
+	return redact.Truncate(text, messageTruncateLimit)
+}
+
+func formatErrorData(data json.RawMessage) string {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err == nil {
+		return compact.String()
+	}
+	return string(trimmed)
+}
 
 // sessionUpdateKind identifies which of the eleven pinned session/update
 // variants a decoded notification carried.
@@ -76,12 +111,12 @@ func parseSessionUpdate(raw json.RawMessage) (event sessionUpdateEvent, found bo
 		}
 	case sessionUpdateToolCall:
 		event.kind = updateToolCall
-		if err := json.Unmarshal(raw, &event.toolCallBegin); err != nil {
+		if err := json.Unmarshal(dropMalformedToolCallName(raw), &event.toolCallBegin); err != nil {
 			return event, false
 		}
 	case sessionUpdateToolCallUpdate:
 		event.kind = updateToolCallUpdate
-		if err := json.Unmarshal(raw, &event.toolCallUpdate); err != nil {
+		if err := json.Unmarshal(dropMalformedToolCallName(raw), &event.toolCallUpdate); err != nil {
 			return event, false
 		}
 	case sessionUpdatePlan:
@@ -105,4 +140,27 @@ func parseSessionUpdate(raw json.RawMessage) (event sessionUpdateEvent, found bo
 	}
 
 	return event, true
+}
+
+// dropMalformedToolCallName drops a wrong-typed "name" member so it decodes
+// as absent rather than failing the tool call that carries it.
+func dropMalformedToolCallName(object json.RawMessage) json.RawMessage {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(object, &fields); err != nil {
+		return object
+	}
+	name, present := fields["name"]
+	if !present {
+		return object
+	}
+	trimmed := bytes.TrimSpace(name)
+	if len(trimmed) > 0 && (trimmed[0] == '"' || string(trimmed) == "null") {
+		return object
+	}
+	delete(fields, "name")
+	adapted, err := json.Marshal(fields)
+	if err != nil {
+		return object
+	}
+	return adapted
 }

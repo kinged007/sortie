@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,8 +12,28 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+func TestAuxiliaryCommand_SuccessYieldsNilError(t *testing.T) {
+	t.Parallel()
+
+	state := &sessionState{
+		target: agentcore.LaunchTarget{
+			Command:       "/usr/bin/opencode",
+			WorkspacePath: t.TempDir(),
+		},
+	}
+
+	cmd, err := auxiliaryCommand(context.Background(), state, []string{"session", "list"})
+	if err != nil {
+		t.Fatalf("auxiliaryCommand() error = %v, want nil", err)
+	}
+	if cmd == nil {
+		t.Fatal("auxiliaryCommand() cmd = nil, want non-nil")
+	}
+}
 
 // envLookup returns the value for key in an env []string slice.
 func envLookup(env []string, key string) (string, bool) {
@@ -274,18 +295,23 @@ func TestMCPInjectionConformance(t *testing.T) {
 	t.Run("local launch delivers the translated document", func(t *testing.T) {
 		t.Parallel()
 
-		document, err := buildMCPConfigContent(mcpConfigPath, false)
+		servers, err := translateMCPServers(mcpConfigPath, false)
 		if err != nil {
-			t.Fatalf("buildMCPConfigContent() error = %v", err)
+			t.Fatalf("translateMCPServers() error = %v", err)
+		}
+		document, err := json.Marshal(mcpConfigDocument{MCP: servers})
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
 		}
 
 		state := newTestSessionState("/workspace", "")
+		state.major = major1
 		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{})
+		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{}, major1)
 		if err != nil {
 			t.Fatalf("buildRunEnv() error = %v", err)
 		}
-		env = appendMCPConfigEnv(env, document)
+		env = append(env, "OPENCODE_CONFIG_CONTENT="+string(document))
 
 		agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
 	})
@@ -294,8 +320,9 @@ func TestMCPInjectionConformance(t *testing.T) {
 		t.Parallel()
 
 		state := newTestSessionState("/workspace", "")
+		state.major = major1
 		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{})
+		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{}, major1)
 		if err != nil {
 			t.Fatalf("buildRunEnv() error = %v", err)
 		}
@@ -307,10 +334,10 @@ func TestMCPInjectionConformance(t *testing.T) {
 	})
 }
 
-// TestRenderMCPConfigDocument_DeclaresEveryServer asserts that the
-// translated document declares every server from the generated file,
-// in the runtime's own "local"/"remote" entry shapes.
-func TestRenderMCPConfigDocument_DeclaresEveryServer(t *testing.T) {
+// TestBuildMCPConfigEntries_DeclaresEveryServer asserts that the
+// translated entries declare every server from the generated file, in
+// the runtime's own "local"/"remote" entry shapes.
+func TestBuildMCPConfigEntries_DeclaresEveryServer(t *testing.T) {
 	t.Parallel()
 
 	servers := []mcpconfig.Server{
@@ -329,19 +356,14 @@ func TestRenderMCPConfigDocument_DeclaresEveryServer(t *testing.T) {
 		},
 	}
 
-	document, err := renderMCPConfigDocument(servers)
+	entries, err := buildMCPConfigEntries(servers)
 	if err != nil {
-		t.Fatalf("renderMCPConfigDocument() error = %v", err)
+		t.Fatalf("buildMCPConfigEntries() error = %v", err)
 	}
 
-	var doc mcpConfigDocument
-	if err := json.Unmarshal([]byte(document), &doc); err != nil {
-		t.Fatalf("renderMCPConfigDocument() produced invalid JSON: %v; document = %q", err, document)
-	}
-
-	local, ok := doc.MCP["sortie-tools"]
+	local, ok := entries["sortie-tools"]
 	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"sortie-tools\" entry")
+		t.Fatal("buildMCPConfigEntries() entries missing \"sortie-tools\" entry")
 	}
 	if local.Type != "local" {
 		t.Errorf("sortie-tools entry Type = %q, want %q", local.Type, "local")
@@ -357,9 +379,9 @@ func TestRenderMCPConfigDocument_DeclaresEveryServer(t *testing.T) {
 		t.Error("sortie-tools entry Enabled = false, want true (nil Server.Enabled defaults true)")
 	}
 
-	remote, ok := doc.MCP["remote-tools"]
+	remote, ok := entries["remote-tools"]
 	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"remote-tools\" entry")
+		t.Fatal("buildMCPConfigEntries() entries missing \"remote-tools\" entry")
 	}
 	if remote.Type != "remote" {
 		t.Errorf("remote-tools entry Type = %q, want %q", remote.Type, "remote")
@@ -372,10 +394,9 @@ func TestRenderMCPConfigDocument_DeclaresEveryServer(t *testing.T) {
 	}
 }
 
-// TestRenderMCPConfigDocument_EnabledFalseRoundTrips asserts that an
-// entry carrying enabled: false round-trips into the rendered document
-// as a disabled server.
-func TestRenderMCPConfigDocument_EnabledFalseRoundTrips(t *testing.T) {
+// TestBuildMCPConfigEntries_EnabledFalseRoundTrips asserts that an
+// entry carrying enabled: false round-trips as a disabled server.
+func TestBuildMCPConfigEntries_EnabledFalseRoundTrips(t *testing.T) {
 	t.Parallel()
 
 	disabled := false
@@ -388,22 +409,148 @@ func TestRenderMCPConfigDocument_EnabledFalseRoundTrips(t *testing.T) {
 		},
 	}
 
-	document, err := renderMCPConfigDocument(servers)
+	entries, err := buildMCPConfigEntries(servers)
 	if err != nil {
-		t.Fatalf("renderMCPConfigDocument() error = %v", err)
+		t.Fatalf("buildMCPConfigEntries() error = %v", err)
 	}
 
-	var doc mcpConfigDocument
-	if err := json.Unmarshal([]byte(document), &doc); err != nil {
-		t.Fatalf("renderMCPConfigDocument() produced invalid JSON: %v", err)
-	}
-
-	entry, ok := doc.MCP["sortie-tools"]
+	entry, ok := entries["sortie-tools"]
 	if !ok {
-		t.Fatal("renderMCPConfigDocument() document missing \"sortie-tools\" entry")
+		t.Fatal("buildMCPConfigEntries() entries missing \"sortie-tools\" entry")
 	}
 	if entry.Enabled {
 		t.Error("sortie-tools entry Enabled = true, want false (Server.Enabled = false must round-trip)")
+	}
+}
+
+// TestTranslateMCPServers asserts translateMCPServers returns nil for
+// a remote launch, an empty path, and a configuration declaring no
+// server, and otherwise returns the same entries buildMCPConfigEntries
+// builds for a stdio and an HTTP server.
+func TestTranslateMCPServers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".sortie"), 0o750); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	mcpConfigPath := filepath.Join(dir, ".sortie", "mcp.json")
+	const generatedConfig = `{"mcpServers":{"sortie-tools":{"type":"stdio","command":"/usr/local/bin/sortie","args":["mcp-server"]},"remote-tools":{"type":"http","url":"https://example.invalid/mcp"}}}`
+	if err := os.WriteFile(mcpConfigPath, []byte(generatedConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	emptyConfigPath := filepath.Join(dir, ".sortie", "empty.json")
+	if err := os.WriteFile(emptyConfigPath, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	nilCases := []struct {
+		name   string
+		path   string
+		remote bool
+	}{
+		{name: "remote launch", path: mcpConfigPath, remote: true},
+		{name: "empty path", path: "", remote: false},
+		{name: "no server configured", path: emptyConfigPath, remote: false},
+	}
+	for _, tt := range nilCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := translateMCPServers(tt.path, tt.remote)
+			if err != nil {
+				t.Fatalf("translateMCPServers() error = %v", err)
+			}
+			if got != nil {
+				t.Errorf("translateMCPServers(%q, remote=%v) = %v, want nil", tt.path, tt.remote, got)
+			}
+		})
+	}
+
+	t.Run("local launch matches buildMCPConfigEntries", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := translateMCPServers(mcpConfigPath, false)
+		if err != nil {
+			t.Fatalf("translateMCPServers() error = %v", err)
+		}
+		want, err := buildMCPConfigEntries([]mcpconfig.Server{
+			{Name: "sortie-tools", Transport: mcpconfig.TransportStdio, Command: "/usr/local/bin/sortie", Args: []string{"mcp-server"}},
+			{Name: "remote-tools", Transport: mcpconfig.TransportHTTP, URL: "https://example.invalid/mcp"},
+		})
+		if err != nil {
+			t.Fatalf("buildMCPConfigEntries() error = %v", err)
+		}
+
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("json.Marshal(got): %v", err)
+		}
+		wantJSON, err := json.Marshal(want)
+		if err != nil {
+			t.Fatalf("json.Marshal(want): %v", err)
+		}
+		if string(gotJSON) != string(wantJSON) {
+			t.Errorf("translateMCPServers() = %s, want %s", gotJSON, wantJSON)
+		}
+	})
+}
+
+// TestBuildInlineConfig asserts the 2.x inline document's marshaled
+// shape: share is always present as "disabled"; permission, compaction,
+// and mcp are each present only when their source data is non-empty.
+func TestBuildInlineConfig(t *testing.T) {
+	t.Parallel()
+
+	servers := map[string]mcpConfigDocumentEntry{
+		"sortie-tools": {Type: "local", Command: []string{"/usr/local/bin/sortie"}, Enabled: true},
+	}
+
+	tests := []struct {
+		name        string
+		pt          passthroughConfig
+		servers     map[string]mcpConfigDocumentEntry
+		wantPerm    bool
+		wantCompact bool
+		wantMCP     bool
+	}{
+		{name: "bare configuration carries only share"},
+		{name: "a tool policy adds permission", pt: passthroughConfig{AllowedTools: []string{"read"}}, wantPerm: true},
+		{name: "disable_autocompact adds compaction", pt: passthroughConfig{DisableAutocompact: true}, wantCompact: true},
+		{name: "servers add mcp", servers: servers, wantMCP: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			encoded, err := buildInlineConfig(tt.pt, tt.servers)
+			if err != nil {
+				t.Fatalf("buildInlineConfig() error = %v", err)
+			}
+
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(encoded), &doc); err != nil {
+				t.Fatalf("json.Unmarshal(%q): %v", encoded, err)
+			}
+
+			if string(doc["share"]) != `"disabled"` {
+				t.Errorf("buildInlineConfig() share = %s, want %q", doc["share"], "disabled")
+			}
+			if _, ok := doc["permission"]; ok != tt.wantPerm {
+				t.Errorf("buildInlineConfig() permission present = %v, want %v", ok, tt.wantPerm)
+			}
+			compaction, hasCompaction := doc["compaction"]
+			if hasCompaction != tt.wantCompact {
+				t.Errorf("buildInlineConfig() compaction present = %v, want %v", hasCompaction, tt.wantCompact)
+			} else if hasCompaction && string(compaction) != `{"auto":false}` {
+				t.Errorf("buildInlineConfig() compaction = %s, want %s", compaction, `{"auto":false}`)
+			}
+			if _, ok := doc["mcp"]; ok != tt.wantMCP {
+				t.Errorf("buildInlineConfig() mcp present = %v, want %v", ok, tt.wantMCP)
+			}
+		})
 	}
 }
 
@@ -416,7 +563,7 @@ func TestRunTurn_InheritedOpencodeConfigContentScrubbed(t *testing.T) {
 
 	base := []string{"OPENCODE_CONFIG_CONTENT=inherited-from-parent-process", "PATH=/usr/bin"}
 
-	env, err := buildRunEnv(base, passthroughConfig{})
+	env, err := buildRunEnv(base, passthroughConfig{}, major1)
 	if err != nil {
 		t.Fatalf("buildRunEnv() error = %v", err)
 	}
@@ -537,6 +684,52 @@ func TestBuildRunArgs_DefaultConfigurationSkipsPermissions(t *testing.T) {
 	assertHasFlag(t, args, "--dangerously-skip-permissions")
 }
 
+// TestSortedEnvVars asserts that sortedEnvVars converts a managed map
+// into a name-sorted []sshutil.EnvVar slice, nil for an empty or nil
+// map.
+func TestSortedEnvVars(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		managed map[string]string
+		want    []sshutil.EnvVar
+	}{
+		{
+			name:    "nil map yields nil",
+			managed: nil,
+			want:    nil,
+		},
+		{
+			name:    "empty map yields nil",
+			managed: map[string]string{},
+			want:    nil,
+		},
+		{
+			name: "sorted by name regardless of map iteration order",
+			managed: map[string]string{
+				"OPENCODE_DISABLE_AUTOUPDATE": "true",
+				"OPENCODE_AUTO_SHARE":         "false",
+			},
+			want: []sshutil.EnvVar{
+				{Name: "OPENCODE_AUTO_SHARE", Value: "false"},
+				{Name: "OPENCODE_DISABLE_AUTOUPDATE", Value: "true"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := sortedEnvVars(tt.managed)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("sortedEnvVars(%v) = %+v, want %+v", tt.managed, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRunEnv(t *testing.T) {
 	t.Parallel()
 
@@ -641,7 +834,7 @@ func TestBuildRunEnv(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			env, err := buildRunEnv(tt.base, tt.pt)
+			env, err := buildRunEnv(tt.base, tt.pt, major1)
 			if err != nil {
 				t.Fatalf("buildRunEnv() error = %v", err)
 			}
@@ -650,72 +843,4 @@ func TestBuildRunEnv(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSSHRemoteCommand(t *testing.T) {
-	t.Parallel()
-
-	t.Run("env_prefixed", func(t *testing.T) {
-		t.Parallel()
-
-		extra := map[string]string{
-			"KEY_A": "value_a",
-			"KEY_B": "value_b",
-		}
-		got := buildSSHRemoteCommand("opencode", extra)
-
-		if !strings.Contains(got, "KEY_A=") {
-			t.Errorf("result %q missing KEY_A", got)
-		}
-		if !strings.Contains(got, "KEY_B=") {
-			t.Errorf("result %q missing KEY_B", got)
-		}
-		if !strings.HasSuffix(got, " opencode") {
-			t.Errorf("result %q does not end with remote command", got)
-		}
-	})
-
-	t.Run("values_shell_quoted", func(t *testing.T) {
-		t.Parallel()
-
-		extra := map[string]string{
-			"KEY": "value with spaces",
-		}
-		got := buildSSHRemoteCommand("opencode", extra)
-
-		// ShellQuote wraps in single quotes.
-		if !strings.Contains(got, "'value with spaces'") {
-			t.Errorf("result %q: value with spaces not single-quoted", got)
-		}
-	})
-
-	t.Run("no_extra_env_returns_command", func(t *testing.T) {
-		t.Parallel()
-
-		got := buildSSHRemoteCommand("opencode run --format json", nil)
-		if got != "opencode run --format json" {
-			t.Errorf("result = %q, want %q", got, "opencode run --format json")
-		}
-	})
-
-	t.Run("no_arbitrary_env", func(t *testing.T) {
-		t.Parallel()
-
-		extra := map[string]string{
-			"MY_KEY": "my_val",
-		}
-		got := buildSSHRemoteCommand("opencode", extra)
-
-		// Only MY_KEY should appear as an env prefix; no other KEY= patterns.
-		parts := strings.Fields(got)
-		envCount := 0
-		for _, p := range parts {
-			if strings.Contains(p, "=") && p != "opencode" {
-				envCount++
-			}
-		}
-		if envCount != 1 {
-			t.Errorf("env prefix count = %d, want 1; result = %q", envCount, got)
-		}
-	})
 }

@@ -321,7 +321,7 @@ func turnEndUsageRegistrationFacts(fset *token.FileSet, files []*ast.File) turnE
 	return facts
 }
 
-// checkTurnEndUsageWiring evaluates the turn_end wiring rule (P13) for
+// checkTurnEndUsageWiring evaluates the turn_end wiring rule for
 // one package's facts. Packages that do not declare
 // registry.UsageArrivalTurnEnd draw no violation: this rule only binds
 // a package whose declared arrival requires the shared report. A
@@ -377,7 +377,7 @@ func checkTurnEndUsageWiring(arrival string, facts turnEndUsageFacts) []usageCon
 // UsageAttribution, or with exactly one of the two set to its none
 // selector.
 //
-// internal/agent/ is the walk root. internal/qualification/e2e/e2e_unix.go
+// internal/agent/ is the walk root. tools/qualify/e2e/e2e_unix.go
 // also calls registry.Agents.RegisterWithMeta, for
 // "qualification-e2e-fixture", deliberately outside this root: it
 // registers a name rather than an adapter, its constructor returning
@@ -679,7 +679,7 @@ func init() {
 }
 
 // TestCheckTurnEndUsageWiring_DetectsViolations pins the turn_end
-// wiring rule's (P13) own checker logic against inline source fixtures,
+// wiring rule's own checker logic against inline source fixtures,
 // independent of the current state of any real adapter package.
 func TestCheckTurnEndUsageWiring_DetectsViolations(t *testing.T) {
 	t.Parallel()

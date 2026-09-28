@@ -5,6 +5,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -120,12 +121,69 @@ func overflowOnTerminateScenario(_ []string, _ json.RawMessage) int {
 	return 0
 }
 
+// trapAndExitScenario installs a handler for the graceful termination
+// signal, writes nothing readable to standard output, and on receipt
+// exits with its own fixed status rather than dying by the signal, so
+// a caller can drive Stop against a process that survives the signal
+// with an ordinary exit.
+func trapAndExitScenario(_ []string, _ json.RawMessage) int {
+	terminate := make(chan os.Signal, 1)
+	signal.Notify(terminate, syscall.SIGTERM)
+	<-terminate
+	return 5
+}
+
 func init() {
 	scenarios["pgidLeader"] = agenttest.Typed(pgidLeaderScenario)
 	scenarios["escapedPgidLeader"] = agenttest.Typed(escapedPgidLeaderScenario)
 	scenarios["stderrOnlyLeader"] = agenttest.Typed(stderrOnlyLeaderScenario)
 	scenarios["selfSignal"] = selfSignalScenario
 	scenarios["overflowOnTerminate"] = overflowOnTerminateScenario
+	scenarios["trapAndExit"] = trapAndExitScenario
+}
+
+// TestForkPerTurnSession_EarlyExit_StopSignaledTrappedSuppressesReport
+// pins that a process that traps the signal Stop sends and exits with
+// a status of its own, having written nothing readable, still reports
+// today's non-zero-exit outcome rather than the early-exit report,
+// because stopSignaled was true when the skeleton reaped it.
+func TestForkPerTurnSession_EarlyExit_StopSignaledTrappedSuppressesReport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", "trapAndExit", nil)
+	target := newTestTarget(tmpDir, script)
+	sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
+
+	emit, events := sinkEvents()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sess.RunTurn(context.Background(), "p", emit)
+		done <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let the subprocess install its handler
+	if err := sess.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() = %v", err)
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("RunTurn did not return within 6s after Stop")
+	}
+
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrPortExit {
+		t.Fatalf("RunTurn() error = %v, want a port_exit *domain.AgentError", err)
+	}
+	if agentErr.Message != "exit code 5" {
+		t.Errorf("AgentError.Message = %q, want %q (Stop suppresses the early-exit report even for a trapped exit)", agentErr.Message, "exit code 5")
+	}
+	if !hasEventType(*events, domain.EventTurnFailed) {
+		t.Errorf("EventTurnFailed not emitted; got %v", *events)
+	}
 }
 
 // writePgidScript builds a leader fake runtime that spawns a long-running
@@ -232,10 +290,12 @@ func assertPgidProcessDead(t *testing.T, pid int, timeout time.Duration) {
 }
 
 // TestForkPerTurnSession_Arm5_ExternalSIGTERM verifies that a subprocess
-// killed by an external signal it never asked for is classified through
-// procutil.WasSignaled as a cancelled turn, not a plain non-zero exit, and
-// that the turn carries the session's usage snapshot and measurement
-// verdict through that classification.
+// killed by a signal Sortie itself never sent, and which wrote nothing
+// readable before dying, is classified as the early-exit report rather
+// than a cancelled turn: today's turn_cancelled names an orchestrator
+// cancellation that never happened, so the report corrects it. The turn
+// still carries the session's usage snapshot and measurement verdict
+// through that classification.
 func TestForkPerTurnSession_Arm5_ExternalSIGTERM(t *testing.T) {
 	t.Parallel()
 
@@ -257,12 +317,30 @@ func TestForkPerTurnSession_Arm5_ExternalSIGTERM(t *testing.T) {
 			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
 			hooks := noopHooks()
 			hooks.GetUsage = getUsage
+			hooks.OnFinalize = func(emit func(domain.AgentEvent), _ any, exitCode int, _ []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
+				usage, measured := getUsage()
+				return FinalizeTurn(emit, slog.Default(), TurnEvidence{
+					ExitObserved: true,
+					ExitCode:     exitCode,
+					EarlyExit:    earlyExit,
+				}, TurnMeta{Usage: usage, UsageMeasured: measured})
+			}
 			sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
 
 			emit, events := sinkEvents()
 			result, err := sess.RunTurn(context.Background(), "p", emit)
 
-			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnCancelled, domain.ErrTurnCancelled, measured, *calls)
+			assertUsageVerdictCarried(t, result, err, *events, domain.EventTurnFailed, domain.ErrPortExit, measured, *calls)
+
+			var agentErr *domain.AgentError
+			errors.As(err, &agentErr)
+			var earlyExitErr *EarlyExitError
+			if !errors.As(agentErr.Err, &earlyExitErr) {
+				t.Fatalf("AgentError.Err = %v, want an *EarlyExitError", agentErr.Err)
+			}
+			if !strings.Contains(earlyExitErr.Status(), "signal") {
+				t.Errorf("EarlyExitError.Status() = %q, want it to name the signal", earlyExitErr.Status())
+			}
 		})
 	}
 }
@@ -350,7 +428,7 @@ func TestForkPerTurnSession_DescendantHoldsStderrOnly(t *testing.T) {
 
 	var gotStderrLines []string
 	hooks := noopHooks()
-	hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+	hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 		gotStderrLines = stderrLines
 		EmitTurnCompleted(emit, "ok", 0, domain.TokenUsage{})
 		return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
@@ -400,14 +478,14 @@ func TestForkPerTurnSession_DescendantHoldsStderrOnly(t *testing.T) {
 
 // TestForkPerTurnSession_InGroupDescendantHoldsStdout drives
 // writePgidScript's in-group descendant through a cancelled RunTurn and
-// asserts property P5 (the descendant is dead once the turn returns)
-// and that the group kill releases the stdout reader before
-// sess.drainGrace can fire, so no abandonment record is emitted. This is
-// the unabandoned half of property P7's comparison against
+// asserts that the descendant is dead once the turn returns and that the
+// group kill releases the stdout reader before sess.drainGrace can fire,
+// so no abandonment record is emitted. This is the unabandoned half of
+// the comparison against
 // TestForkPerTurnSession_EscapedDescendantHoldsStdout: both scripts spawn
 // a descendant that inherits the standard-output handle and both turns
-// are ended by the same context cancellation, so an identical disposition
-// and error between the two is what P7 requires.
+// are ended by the same context cancellation, so the two must end with
+// an identical disposition and error.
 func TestForkPerTurnSession_InGroupDescendantHoldsStdout(t *testing.T) {
 	t.Parallel()
 
@@ -461,12 +539,11 @@ func TestForkPerTurnSession_InGroupDescendantHoldsStdout(t *testing.T) {
 // TestForkPerTurnSession_EscapedDescendantHoldsStdout drives
 // writeEscapedPgidScript's setsid descendant, which survives the group
 // kill and keeps holding the standard-output handle open, through a
-// cancelled RunTurn. It asserts property P1 (the turn publishes within
+// cancelled RunTurn. It asserts that the turn publishes within
 // sess.drainGrace, measured from the reap rather than from the turn's
-// start), property P3 (the abandonment record fires exactly once), and,
-// together with TestForkPerTurnSession_InGroupDescendantHoldsStdout,
-// property P7 (the same disposition and error as the identical
-// unabandoned turn).
+// start, that the abandonment record fires exactly once, and, together
+// with TestForkPerTurnSession_InGroupDescendantHoldsStdout, that it ends
+// with the same disposition and error as the identical unabandoned turn.
 func TestForkPerTurnSession_EscapedDescendantHoldsStdout(t *testing.T) {
 	t.Parallel()
 

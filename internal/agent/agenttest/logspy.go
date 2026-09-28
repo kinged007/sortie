@@ -14,11 +14,14 @@ type LogSpyEntry struct {
 	Level slog.Level
 	Msg   string
 	Line  string // value of the "line" slog.Attr, if present
+
+	// Attrs holds every non-group slog.Attr, keyed by name and rendered through
+	// [slog.Value.String]. A group's own key is not an entry.
+	Attrs map[string]string
 }
 
-// LogSpy is a [slog.Handler] that records every log record. It returns
-// itself from WithAttrs and WithGroup so that all loggers derived from
-// a spy-backed [slog.Logger] funnel into the same record slice.
+// LogSpy is a [slog.Handler] that records every log record. It returns itself
+// from WithAttrs and WithGroup so all derived loggers funnel into one slice.
 type LogSpy struct {
 	mu      sync.Mutex
 	entries []LogSpyEntry
@@ -34,6 +37,12 @@ func (s *LogSpy) Handle(_ context.Context, r slog.Record) error {
 		if a.Key == "line" {
 			e.Line = a.Value.String()
 		}
+		if a.Value.Kind() != slog.KindGroup {
+			if e.Attrs == nil {
+				e.Attrs = map[string]string{}
+			}
+			e.Attrs[a.Key] = a.Value.String()
+		}
 		return true
 	})
 	s.mu.Lock()
@@ -42,16 +51,14 @@ func (s *LogSpy) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-// WithAttrs returns the receiver unchanged so derived loggers share
-// the same entry slice.
+// WithAttrs returns the receiver so derived loggers share the entry slice.
 func (s *LogSpy) WithAttrs(_ []slog.Attr) slog.Handler { return s }
 
-// WithGroup returns the receiver unchanged so derived loggers share
-// the same entry slice.
+// WithGroup returns the receiver so derived loggers share the entry slice.
 func (s *LogSpy) WithGroup(_ string) slog.Handler { return s }
 
-// WarnLines returns the "line" attribute values from every record
-// logged at WARN with message "agent stderr".
+// WarnLines returns the "line" attribute values from every record logged at
+// WARN with message "agent stderr".
 func (s *LogSpy) WarnLines() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -73,9 +80,8 @@ func (s *LogSpy) Entries() []LogSpyEntry {
 	return cp
 }
 
-// InstallLogSpy replaces [slog.Default] with a spy logger for the
-// duration of the test. The original default is restored via
-// [testing.T.Cleanup].
+// InstallLogSpy replaces [slog.Default] with a spy logger for the test,
+// restoring the original via [testing.T.Cleanup].
 func InstallLogSpy(t *testing.T) *LogSpy {
 	t.Helper()
 	spy := &LogSpy{}
@@ -85,9 +91,8 @@ func InstallLogSpy(t *testing.T) *LogSpy {
 	return spy
 }
 
-// RequireWarnLines asserts that spy captured at least one WARN
-// "agent stderr" line and returns the matched lines. On failure it
-// dumps all captured entries to aid CI debugging.
+// RequireWarnLines asserts spy captured at least one WARN "agent stderr" line
+// and returns the matched lines, dumping all entries on failure.
 func RequireWarnLines(t *testing.T, spy *LogSpy, label string) []string {
 	t.Helper()
 	lines := spy.WarnLines()

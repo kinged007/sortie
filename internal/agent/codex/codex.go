@@ -28,8 +28,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
-	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 func init() {
@@ -39,6 +39,7 @@ func init() {
 		MCPInjection:        registry.MCPInjectionTranslated,
 		UsageArrival:        registry.UsageArrivalIncremental,
 		UsageAttribution:    registry.UsageAttributionPerModel,
+		CredentialEnv:       registry.DeclareCredentialEnv(),
 	})
 }
 
@@ -154,6 +155,33 @@ type sessionState struct {
 	// reader has exited and inbox has been closed.
 	inbox      *jsonrpc.Inbox[jsonrpc.Message]
 	readerDone chan struct{}
+
+	reaper *procutil.Reaper
+
+	credentialVerification bool
+}
+
+func (state *sessionState) sshConnectionFailed() bool {
+	return agentcore.ReaperConnectionFailed(state.target.RemoteCommand != "", state.reaper, state.drainGrace)
+}
+
+func connectionFailureErr(state *sessionState) *domain.AgentError {
+	if !state.sshConnectionFailed() {
+		return nil
+	}
+	return agentcore.ConnectionFailedError()
+}
+
+// earlyExitObservation records the shared early-exit observation for a
+// startup handshake step's error, or the zero value when err carries
+// no [errConnectionLost] sentinel. Call it before state.closeConn and
+// killOnError, so the reaper it reads has not yet been signalled by
+// either.
+func earlyExitObservation(ctx context.Context, err error, target agentcore.LaunchTarget, state *sessionState) agentcore.EarlyExit {
+	if !errors.Is(err, errConnectionLost) {
+		return agentcore.EarlyExit{}
+	}
+	return agentcore.ObserveEarlyExit(ctx, target, state.reaper, state.drainGrace)
 }
 
 // closeConn closes state.conn when it is non-nil, tolerating a
@@ -383,25 +411,26 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	}
 
 	state := &sessionState{
-		target:      target,
-		agentConfig: params.AgentConfig,
-		acc:         agentcore.NewRunUsage(),
+		target:                 target,
+		agentConfig:            params.AgentConfig,
+		acc:                    agentcore.NewRunUsage(),
+		credentialVerification: params.CredentialVerification,
 	}
 
 	var cmd *exec.Cmd
+	var launch sshutil.SSHLaunch
 	if target.RemoteCommand != "" {
-		remoteCmd := buildSSHRemoteCmd(target.RemoteCommand, os.Getenv("CODEX_API_KEY"))
-		sshArgs := sshutil.BuildSSHArgs(target.SSHHost, target.WorkspacePath, remoteCmd, nil, sshutil.SSHOptions{
-			StrictHostKeyChecking: target.SSHStrictHostKeyChecking,
-		})
-		cmd = exec.CommandContext(ctx, target.Command, sshArgs...) //nolint:gosec // args are constructed programmatically with shell quoting
+		launch = sshutil.BuildSSHLaunch(target.SSHHost, target.WorkspacePath, target.RemoteCommand, nil, target.SSHOptions())
+		cmd = exec.CommandContext(ctx, target.Command, launch.Args...) //nolint:gosec // args are constructed programmatically with shell quoting
 	} else {
 		cmd = exec.CommandContext(ctx, target.Command, target.Args...) //nolint:gosec // args are constructed programmatically
 	}
 	grace := procutil.StopGrace(state.agentConfig.StopGraceMS)
 	procutil.SetGroupCancel(cmd, grace)
-	cmd.Dir = target.WorkspacePath
 	cmd.Env = os.Environ()
+	if bindErr := target.BindWorkspace(cmd); bindErr != nil {
+		return domain.Session{}, bindErr
+	}
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -411,6 +440,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			Err:     err,
 		}
 	}
+	prefixedStdin := launch.PrefixStdin(stdinPipe)
 
 	logger := slog.Default().With(slog.String("component", "codex-adapter"))
 	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
@@ -452,7 +482,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	}
 
 	state.proc = cmd.Process
-	state.stdin = stdinPipe
+	state.stdin = prefixedStdin
 	state.pipes = pipes
 	state.drainGrace = a.drainGrace
 	if state.drainGrace <= 0 {
@@ -462,6 +492,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 
 	reaper := procutil.StartReaper(cmd, logger)
 	state.waitCh = reaper.Done()
+	state.reaper = reaper
 
 	// killOnError is a cleanup closure used if any handshake step fails.
 	killOnError := func() {
@@ -499,7 +530,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	state.inbox = jsonrpc.NewInbox[jsonrpc.Message]()
 	state.readerDone = make(chan struct{})
 
-	state.conn = jsonrpc.NewConn(stdinPipe, pipes.Stdout, jsonrpc.Deliver(state.inbox, identity))
+	state.conn = jsonrpc.NewConn(prefixedStdin, pipes.Stdout, jsonrpc.Deliver(state.inbox, identity))
 	// Started before the handshake so the handshake wait loops observe
 	// a closed inbox, rather than timing out, when stdout ends mid-handshake.
 	go watchTermination(state)
@@ -519,8 +550,15 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	})
 
 	if err := initializeHandshake(ctx, state); err != nil {
+		observation := earlyExitObservation(ctx, err, target, state)
 		state.closeConn()
 		killOnError()
+		if report := observation.Report(state.stderrCollector); report != nil {
+			return domain.Session{}, report
+		}
+		if sshErr := connectionFailureErr(state); sshErr != nil {
+			return domain.Session{}, sshErr
+		}
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
 			Message: fmt.Sprintf("handshake failed: %v", err),
@@ -529,11 +567,20 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	}
 
 	if err := authenticateIfNeeded(ctx, state, logger); err != nil {
-		state.closeConn()
-		killOnError()
 		var agentErr *domain.AgentError
 		if ok := isAgentError(err, &agentErr); ok {
+			state.closeConn()
+			killOnError()
 			return domain.Session{}, agentErr
+		}
+		observation := earlyExitObservation(ctx, err, target, state)
+		state.closeConn()
+		killOnError()
+		if report := observation.Report(state.stderrCollector); report != nil {
+			return domain.Session{}, report
+		}
+		if sshErr := connectionFailureErr(state); sshErr != nil {
+			return domain.Session{}, sshErr
 		}
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
@@ -552,8 +599,15 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 				slog.Any("error", resumeErr))
 			tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
 			if startErr != nil {
+				observation := earlyExitObservation(ctx, startErr, target, state)
 				state.closeConn()
 				killOnError()
+				if report := observation.Report(state.stderrCollector); report != nil {
+					return domain.Session{}, report
+				}
+				if sshErr := connectionFailureErr(state); sshErr != nil {
+					return domain.Session{}, sshErr
+				}
 				return domain.Session{}, &domain.AgentError{
 					Kind:    domain.ErrResponseError,
 					Message: fmt.Sprintf("thread/start failed: %v", startErr),
@@ -569,8 +623,15 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	} else {
 		tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
 		if startErr != nil {
+			observation := earlyExitObservation(ctx, startErr, target, state)
 			state.closeConn()
 			killOnError()
+			if report := observation.Report(state.stderrCollector); report != nil {
+				return domain.Session{}, report
+			}
+			if sshErr := connectionFailureErr(state); sshErr != nil {
+				return domain.Session{}, sshErr
+			}
 			return domain.Session{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: fmt.Sprintf("thread/start failed: %v", startErr),
@@ -663,6 +724,9 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 		// must not wait for a drain that cannot finish.
 		if state.readerEnded() {
 			state.reportStderr(logger)
+			if sshErr := connectionFailureErr(state); sshErr != nil {
+				return domain.TurnResult{UsageMeasured: state.usageMeasured}, sshErr
+			}
 		}
 		return domain.TurnResult{UsageMeasured: state.usageMeasured}, &domain.AgentError{
 			Kind:    domain.ErrPortExit,
@@ -740,6 +804,12 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 					Terminal:          agentcore.TerminalFailure,
 					TerminalErrorKind: domain.ErrPortExit,
 					TerminalMessage:   state.release.TurnEndMessage("subprocess stdout closed unexpectedly"),
+				}
+				if agentcore.ConnectionFailedForRequest(state.sshConnectionFailed(), false) {
+					connErr := agentcore.ConnectionFailedError()
+					ev.TerminalErrorKind = connErr.Kind
+					ev.TerminalMessage = connErr.Message
+					ev.Cause = connErr.Err
 				}
 				meta := agentcore.TurnMeta{
 					SessionID:     state.threadID,
@@ -819,14 +889,14 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 					turnID = p.TurnID
 				}
 				if p.TurnID != turnID {
-					state.baseline = maxUsage(state.baseline, normalizeBreakdown(p.TokenUsage.Total))
+					state.baseline = agentcore.MaxUsage(state.baseline, normalizeBreakdown(p.TokenUsage.Total))
 					continue
 				}
 				if !state.baselineSet {
-					state.baseline = subtractUsage(normalizeBreakdown(p.TokenUsage.Total), normalizeBreakdown(p.TokenUsage.Last))
+					state.baseline = agentcore.SubtractUsage(normalizeBreakdown(p.TokenUsage.Total), normalizeBreakdown(p.TokenUsage.Last))
 					state.baselineSet = true
 				}
-				snapshot := state.acc.SetRunCumulative(subtractUsage(normalizeBreakdown(p.TokenUsage.Total), state.baseline))
+				snapshot := state.acc.SetRunCumulative(agentcore.SubtractUsage(normalizeBreakdown(p.TokenUsage.Total), state.baseline))
 				params.OnEvent(domain.AgentEvent{
 					Type:      domain.EventTokenUsage,
 					Timestamp: now,
@@ -917,7 +987,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 					})
 				}
 				if item.Type == "agentMessage" && item.Text != "" {
-					agentcore.EmitNotification(params.OnEvent, typeutil.TruncateRunes(item.Text, 200))
+					agentcore.EmitNotification(params.OnEvent, redact.Truncate(item.Text, 200))
 				}
 
 			case "item/agentMessage/delta", "item/commandExecution/outputDelta":

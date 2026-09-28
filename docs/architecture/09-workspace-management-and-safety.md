@@ -62,6 +62,7 @@ Supported hooks:
 
 Execution contract:
 
+- A hook and the reaction triage command start only once the workspace path has been verified, immediately before the start, as a directory rather than a link (Invariant 9); a failed verification takes that hook's own failure semantics below.
 - Execute in a local shell context appropriate to the host OS, with the workspace directory as `cwd`.
 - On POSIX systems, `sh -c <script>` is the conforming default; `bash -lc <script>` may be used when a login shell environment is required. Termination when the shell exits, times out, or is cancelled kills the entire process group, not just the direct child, followed by a drain that resends the kill until the group reports no member left, bounded at 2 seconds.
 - On Windows, `cmd.exe /C <script>` is the conforming default. The hook subprocess is created suspended and assigned to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before it is resumed, so no unsupervised execution window exists in which a spawned descendant could start before the job assignment takes effect. Termination when the shell exits, times out, or is cancelled kills the entire process tree, not just the direct child, followed by a drain that resends the termination until the job reports no active process, bounded at 2 seconds. Job Object creation is not a precondition for running the hook: when it fails, the failure is logged, the hook still runs, and that run has no process-tree termination guarantee.
@@ -142,17 +143,33 @@ The `.sortie/scm.json` file is a workspace-level file that carries SCM metadata 
 Safety and parsing rules:
 
 - Maximum file size: 4096 bytes. Oversized files are rejected and logged at warn level.
-- Symlink rejection: both `.sortie/` and `.sortie/scm.json` are checked via `Lstat` before reading. If either is a symbolic link, the file is rejected and logged at warn level. This prevents symlink-based path escape attacks.
+- Symlink rejection: the read goes through the workspace directory and `.sortie/` under Invariant 7. A link, a wrong entry type, or an entry replaced while it is being opened, at either directory or at the file, rejects the file with a warn record.
 - Malformed JSON is rejected and logged at warn level.
 - The function never returns an error to the caller; all failure modes degrade gracefully to a zero-value metadata struct (CI queries are skipped).
 
 #### 9.5.1 `.sortie/status` lifecycle
 
-A run that enters the self-review phase has the file removed at four points in its lifetime, all best-effort and all subject to the same `Lstat` symlink rejection described for `.sortie/scm.json` above: no removal follows a symbolic link at `.sortie/` or at the file itself, and a rejected or failed removal is logged and does not affect the run.
+A run that enters the self-review phase has the file removed at four points in its lifetime, all best-effort and all subject to the same symlink rejection described for `.sortie/scm.json` above: no removal follows a link at the workspace directory, `.sortie/`, or the file; such a link stays in place and is logged, and a rejected or failed removal is logged and does not affect the run.
 
 The first removal happens before each new dispatch to a workspace, so a stale value from a previous run cannot affect the new one. The second happens during a run, at the moment the orchestrator acts on a recognized value that admits the run to the self-review phase: the removal runs immediately before the phase's first review turn, so the phase's own first read does not observe the value that admitted it. The third and fourth happen inside the phase itself, after each review turn and after each fix turn, whenever the value read there is recognized. Together these four removals keep the file stating what the agent has said since the phase last acted on it, rather than carrying forward a value already acted on.
 
 The read after each completed coding turn, outside the self-review phase, removes nothing: a recognized value read there is left in the file, and a run that never enters the phase carries that value through to teardown.
+
+#### 9.5.2 Dispatch identity record (`.sortie/dispatch.json`)
+
+The `.sortie/dispatch.json` file records, for the current dispatch, the latest session id the worker has accepted from the agent runtime. The worker keeps it current through the same writer every `.sortie/` file uses, and its write follows Invariant 7 below. The worker writes the record when the agent session starts, before each coding and self-review turn, whenever a relayed event reports a new session id, and whenever a coding or self-review turn's result reports a session id other than the accepted one, so a tool server process reading it always sees the worker's most recent acceptance for the dispatch that wrote it. Section 10.2 states the acceptance rule.
+
+The record holds one JSON object with two fields, `dispatch_id` and `session_id`. A reader accepts the recorded session id only when the record's `dispatch_id` equals its own dispatch id, so a tool server process outliving its dispatch, or reading a record a later dispatch has since overwritten, never observes a session id that is not its own. The reader rejects a `.sortie` directory or a record that is a symbolic link or not the expected type, and also rejects a workspace directory that is a link or changes while being opened; it opens the record without waiting for a writer and reads at most 4096 bytes; any rejection yields an empty session id rather than an error. Like `.sortie/mcp.json`, the agent may also write this file directly.
+
+### 9.5.3 Notification slot directory (`.sortie/notification_slots/`)
+
+The `.sortie/notification_slots/` directory holds the shared count `notify_operator`'s rate limit enforces for one dispatch (Section 10.4.5). It is created, mode `0o750`, the first time any tool server process of the dispatch claims a slot; a dispatch that never calls `notify_operator` never creates it.
+
+Layout: one empty regular file per notification currently counted against the cap, named `<dispatch_id>-<n>` where `n` runs from `1` without leading zeros. Its exclusive creation is the claim: the file existing is what counts a slot as taken, and no other state records the count. A slot is removed only when the notification it claimed reached no backend, freeing that `n` for reuse by a later call.
+
+Every tool server process of the dispatch creates and removes slots in this directory identically, whatever agent kind spawned it and whether it runs for one turn or the whole session; the shared count is what lets the cap bound one run instead of one process. The directory's lifetime matches the workspace's: a release removes only the slot its own call claimed, and only when the notification reached no backend; nothing else ever removes a slot, so a delivered notification's file accumulates until the workspace itself is removed.
+
+The agent can write anywhere under `.sortie/`, so it can reset its own count by removing slot files, or exhaust it early by planting occupying entries; the cap bounds a cooperating agent, not an adversarial one.
 
 ### 9.6 Safety Invariants
 
@@ -181,3 +198,9 @@ Invariant 4a: A workspace key held by a pending reaction entry is a sweep candid
 Invariant 5: `workspace.retention_days` cannot be configured below its floor, and that floor in days equals the pending-reaction recovery lookback in days. Any workspace the age bound may remove is one that pending reaction recovery would already have skipped as stale, so removing it cannot silently break recovery for an issue recovery still regards as live.
 
 Invariant 6: The age bound performs no tracker write, no source-control write, no reaction fingerprint write, and no creation or deletion of a pending reaction entry. Reaction state is read-only to the age bound. Every removal it performs routes through the same workspace removal path as the terminal gate, so key sanitization, containment under the workspace root, and the `before_remove` hook apply unchanged. The age bound introduces no new way to reach the filesystem.
+
+Invariant 7: Every write, read, and removal the orchestrator and the tool servers perform against a workspace's `.sortie/` directory runs through a verified handle on the workspace directory and on `.sortie/`. A write replaces its destination through an exclusive create under a fresh name and a rename, with every step resolved inside that verified `.sortie/`. A link, a non-directory, or an entry replaced while it is being opened, at either the workspace directory or `.sortie/`, fails the operation. The boundary the invariant holds is the verified `.sortie/`, not the workspace at large: a directory renamed into the workspace path is the workspace for every later operation, and putting a directory there takes rename access to the workspace path itself.
+
+Invariant 8: Every notification slot a tool server process creates or removes resolves through the same verified-handle boundary Invariant 7 holds, extended to a verified `.sortie/notification_slots/` handle. A link, a non-directory, or an entry replaced while it is being opened, at the workspace directory, `.sortie/`, or `.sortie/notification_slots/`, is refused, and the only removal a release performs is of the plain file the same call created.
+
+Invariant 9: Every subprocess started with a workspace as its working directory, whether the coding agent per session, per turn, or for an auxiliary command, a hook, the reaction triage command, a verification command, or a source-control inspection, starts only after the workspace path is verified, immediately before the start, as a directory rather than a link. The check is point-in-time, because a working directory is set by path rather than by a held handle.

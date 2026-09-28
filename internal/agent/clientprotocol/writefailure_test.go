@@ -6,27 +6,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// alwaysFailWriter fails every Write with err, standing in for a
-// connection whose writer goroutine can never deliver anything.
+// alwaysFailWriter fails every Write with err.
 type alwaysFailWriter struct{ err error }
 
 func (w alwaysFailWriter) Write(p []byte) (int, error) { return 0, w.err }
 
-// newFailWriteSession builds a *sessionState like newTestSession, but
-// with its connection's writer replaced by one that fails every write,
-// so a turn's own prompt send fails asynchronously once
-// handleStartTurn's SendRequest has already enqueued and returned.
-func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr error) (*sessionState, *io.PipeWriter) {
+// newFailWriteSession is newTestSession with its connection's writer replaced
+// by one that fails every write, so a turn's prompt send fails asynchronously
+// after handleStartTurn's SendRequest has enqueued and returned.
+func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr error, opts ...func(*sessionState)) (*sessionState, *io.PipeWriter) {
 	t.Helper()
 
 	inPr, inPw := io.Pipe()
 	state := &sessionState{
 		agentConfig: agentConfig,
-		caps:        newCapabilityRecord(false),
+		caps:        newCapabilityRecord(false, false),
+		usage:       agentcore.NewTurnEndUsage(),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      discardLogger(),
@@ -35,6 +35,10 @@ func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr 
 	state.inbox = jsonrpc.NewInbox[pumpItem]()
 	state.conn = jsonrpc.NewConn(alwaysFailWriter{err: writeErr}, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
+
+	for _, opt := range opts {
+		opt(state)
+	}
 
 	go runPump(state)
 	t.Cleanup(func() {
@@ -47,10 +51,6 @@ func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr 
 	return state, inPw
 }
 
-// TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound checks that
-// when the runtime's stream ends within agent.read_timeout_ms of a
-// write failure, the stream-end path finalizes the turn (its
-// process-exit row), not the send-failure message.
 func TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound(t *testing.T) {
 	t.Parallel()
 
@@ -60,10 +60,8 @@ func TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound(t *testing.T) {
 
 	turnCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: func(domain.AgentEvent) {}})
 
-	// Wait for the prompt send's write to actually fail before ending
-	// the stream, so the turn is genuinely active (its prompt already
-	// sent) when the stream ends, rather than racing the turn's own
-	// acceptance and being rejected as never having started.
+	// Wait for the write to fail before ending the stream, so the turn is
+	// genuinely active when the stream ends rather than racing acceptance.
 	select {
 	case <-state.conn.WriteFailed():
 	case <-time.After(awaitTimeout):
@@ -85,10 +83,6 @@ func TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound(t *testing.T) {
 	}
 }
 
-// TestPump_WriteFailureDuringTurn_SendFailureWinsAfterBound checks that
-// when the reader stays alive past agent.read_timeout_ms with the
-// write failure unresolved, the turn ends with the send-failure
-// outcome, and only once that bound has actually elapsed.
 func TestPump_WriteFailureDuringTurn_SendFailureWinsAfterBound(t *testing.T) {
 	t.Parallel()
 
@@ -121,10 +115,6 @@ func TestPump_WriteFailureDuringTurn_SendFailureWinsAfterBound(t *testing.T) {
 	}
 }
 
-// TestPumpState_WriteFailureWithNoActiveTurn checks that a write
-// failure observed with no turn active neither arms a deadline nor
-// does anything once handled: armWriteFailedDeadline reports no
-// deadline, and handleWriteFailed is a safe no-op.
 func TestPumpState_WriteFailureWithNoActiveTurn(t *testing.T) {
 	t.Parallel()
 

@@ -10,52 +10,54 @@ import (
 
 const reactionRecoveryMaxCandidates = 200
 
-// HandoffAbsenceErrorPrefix is the reserved prefix used when a handoff is
-// withheld because the orchestrator observed no work (or treats an
-// undeterminable verdict as absence under the strict policy). Keeping the
-// marker stable lets the retry and polling paths reconstruct the consecutive
-// absence sequence from run_history without adding a verdict column.
+// HandoffAbsenceErrorPrefix marks a run_history error where a handoff was
+// withheld because no work was observed. Keeping it stable lets the retry
+// and polling paths reconstruct the consecutive-absence sequence without a
+// verdict column.
 const HandoffAbsenceErrorPrefix = "handoff withheld: "
 
-// RunHistory represents a single completed run attempt persisted in the
-// run_history table. The ID field is assigned by the database on insert and
-// should be left zero when calling [Store.AppendRunHistory].
+// RunHistory is a single completed run attempt in the run_history table.
+// ID is assigned by the database on insert; leave it zero when calling
+// [Store.AppendRunHistory].
 type RunHistory struct {
-	ID             int64   // Auto-increment primary key; zero on insert, set on read.
-	IssueID        string  // Tracker-internal issue ID.
-	Identifier     string  // Human-readable ticket key (e.g. "PROJ-42").
-	DisplayID      string  // Qualified display form (e.g. "owner/repo#9"); empty when Identifier is self-explanatory.
-	Attempt        int     // Attempt number at time of run (1-based).
-	AgentAdapter   string  // Agent adapter kind used (e.g. "claude-code", "mock").
-	Workspace      string  // Workspace path used for this run.
-	StartedAt      string  // ISO-8601 timestamp of run start.
-	CompletedAt    string  // ISO-8601 timestamp of run completion.
-	Status         string  // Terminal status: "succeeded", "failed", "cancelled", "ci_failed", "needs_person", or "budget_stopped".
-	Error          *string // Error message if failed; nil on success.
-	WorkflowFile   string  // Base filename of the WORKFLOW.md file; empty for pre-migration rows.
-	TurnsCompleted int     // Number of coding turns completed in this run.
-	ReviewMetadata *string // JSON-serialized ReviewMetadata; nil when self-review did not run.
-	RuleName       string  // Dispatch rule name frozen at initial dispatch; empty for legacy rows and fallback dispatches.
-	TemplateID     string  // Resolved template path frozen at initial dispatch; empty for legacy rows and the workflow body template.
+	ID             int64
+	IssueID        string
+	Identifier     string
+	DisplayID      string // Qualified form (e.g. "owner/repo#9"); empty when Identifier suffices.
+	Attempt        int
+	AgentAdapter   string
+	Workspace      string
+	StartedAt      string
+	CompletedAt    string
+	Status         string // "succeeded", "failed", "cancelled", "ci_failed", "needs_person", or "budget_stopped".
+	Error          *string
+	WorkflowFile   string // Base filename; empty for pre-migration rows.
+	TurnsCompleted int
+	ReviewMetadata *string // JSON ReviewMetadata; nil when self-review did not run.
+	RuleName       string  // Frozen at initial dispatch; empty for legacy rows and fallback dispatches.
+	TemplateID     string  // Frozen at initial dispatch; empty for legacy rows and the workflow body template.
 
-	InputTokens     int64 // Accumulated input tokens for the run; 0 for pre-migration rows.
-	OutputTokens    int64 // Accumulated output tokens for the run; 0 for pre-migration rows.
-	TotalTokens     int64 // Accumulated total tokens for the run; 0 for pre-migration rows.
-	CacheReadTokens int64 // Accumulated cache-read tokens for the run; 0 for pre-migration rows.
+	InputTokens      int64 // 0 for pre-migration rows.
+	OutputTokens     int64 // 0 for pre-migration rows.
+	TotalTokens      int64 // 0 for pre-migration rows.
+	CacheReadTokens  int64 // 0 for pre-migration rows.
+	CacheWriteTokens int64 // 0 for pre-migration rows.
 
-	// TokensMeasured is true when the row's four token columns carry a
-	// figure the coding agent's runtime reported, and false when the
-	// run's spend is unknown rather than zero. Every writer must set
-	// this field explicitly: the column's SQL default is 1, which does
-	// not match this field's Go zero value of false, so a writer that
-	// omits it records an unmeasured run rather than inheriting the
-	// column default.
+	// TokensMeasured is true when the token columns carry a runtime-reported
+	// figure and false when spend is unknown rather than zero. Every writer
+	// must set it explicitly: the column's SQL default is 1, so an omitted
+	// field records an unmeasured run rather than inheriting the default.
 	TokensMeasured bool
+
+	// UnaccountedTurns counts turns that spent tokens no figure was proven
+	// to cover; that overspend reaches none of the token columns, so a
+	// non-zero count makes this row's total a lower bound. Orthogonal to
+	// TokensMeasured.
+	UnaccountedTurns int
 }
 
-// AppendRunHistory inserts a completed run attempt into run_history. The ID
-// field of the input is ignored; the database assigns an auto-increment key.
-// Returns the inserted record with ID populated.
+// AppendRunHistory inserts a completed run attempt. The input ID is
+// ignored; the returned record has the database-assigned ID.
 func (s *Store) AppendRunHistory(ctx context.Context, run RunHistory) (RunHistory, error) {
 	errVal := sql.NullString{}
 	if run.Error != nil {
@@ -79,12 +81,13 @@ func (s *Store) AppendRunHistory(ctx context.Context, run RunHistory) (RunHistor
 
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO run_history
-			(issue_id, identifier, display_identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(issue_id, identifier, display_identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.IssueID, run.Identifier, dispIDVal, run.Attempt, run.AgentAdapter,
 		run.Workspace, run.StartedAt, run.CompletedAt, run.Status, errVal, wfVal,
 		run.TurnsCompleted, reviewMetaVal, run.RuleName, run.TemplateID,
-		run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens, run.TokensMeasured,
+		run.InputTokens, run.OutputTokens, run.TotalTokens, run.CacheReadTokens, run.CacheWriteTokens, run.TokensMeasured,
+		run.UnaccountedTurns,
 	)
 	if err != nil {
 		return RunHistory{}, fmt.Errorf("append run history for %q: %w", run.IssueID, err)
@@ -98,14 +101,13 @@ func (s *Store) AppendRunHistory(ctx context.Context, run RunHistory) (RunHistor
 	return run, nil
 }
 
-// QueryRunHistoryByIssue returns all run history entries for the given issue
-// ID, ordered by id descending (most recent first). Returns an empty non-nil
-// slice when no entries exist.
+// QueryRunHistoryByIssue returns all entries for the issue, ordered by id
+// descending. Returns an empty non-nil slice when none exist.
 func (s *Store) QueryRunHistoryByIssue(ctx context.Context, issueID string) ([]RunHistory, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 			started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-			input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured
+			input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 		FROM run_history
 		WHERE issue_id = ?
 		ORDER BY id DESC`, issueID)
@@ -122,7 +124,8 @@ func (s *Store) QueryRunHistoryByIssue(ctx context.Context, issueID string) ([]R
 			&r.ID, &r.IssueID, &r.Identifier, &dispIDVal, &r.Attempt, &r.AgentAdapter,
 			&r.Workspace, &r.StartedAt, &r.CompletedAt, &r.Status, &errVal, &wfVal,
 			&r.TurnsCompleted, &reviewMetaVal, &r.RuleName, &r.TemplateID,
-			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.TokensMeasured,
+			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.TokensMeasured,
+			&r.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("scan run history: %w", err)
 		}
@@ -147,10 +150,10 @@ func (s *Store) QueryRunHistoryByIssue(ctx context.Context, issueID string) ([]R
 }
 
 // LoadLatestSuccessfulRunsForReactionRecovery returns at most limit latest
-// successful run_history rows, one per issue, for rows with non-empty
-// workspace paths and completed_at >= completedAfter. Results are ordered by
-// descending run_history id. The limit is clamped to the recovery maximum
-// before querying. Returns an empty non-nil slice when no rows qualify.
+// successful rows, one per issue, for rows with non-empty workspace and
+// completed_at >= completedAfter, ordered by descending id. limit is
+// clamped to the recovery maximum. Returns an empty non-nil slice when
+// none qualify.
 func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context, completedAfter time.Time, limit int) ([]RunHistory, error) {
 	if limit <= 0 {
 		limit = 1
@@ -176,7 +179,8 @@ func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context,
 		SELECT r.id, r.issue_id, r.identifier, r.display_identifier, r.attempt, r.agent_adapter,
 			r.workspace, r.started_at, r.completed_at, r.status, r.error, r.workflow_file,
 			r.turns_completed, r.review_metadata, r.rule_name, r.template_id,
-			r.input_tokens, r.output_tokens, r.total_tokens, r.cache_read_tokens, r.tokens_measured
+			r.input_tokens, r.output_tokens, r.total_tokens, r.cache_read_tokens, r.cache_write_tokens, r.tokens_measured,
+			r.unaccounted_turns
 		FROM run_history AS r
 		JOIN bounded ON bounded.latest_id = r.id
 		ORDER BY r.id DESC`, completedAfter.UTC().Format(time.RFC3339), limit)
@@ -193,7 +197,8 @@ func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context,
 			&run.ID, &run.IssueID, &run.Identifier, &dispIDVal, &run.Attempt, &run.AgentAdapter,
 			&run.Workspace, &run.StartedAt, &run.CompletedAt, &run.Status, &errVal, &wfVal,
 			&run.TurnsCompleted, &reviewMetaVal, &run.RuleName, &run.TemplateID,
-			&run.InputTokens, &run.OutputTokens, &run.TotalTokens, &run.CacheReadTokens, &run.TokensMeasured,
+			&run.InputTokens, &run.OutputTokens, &run.TotalTokens, &run.CacheReadTokens, &run.CacheWriteTokens, &run.TokensMeasured,
+			&run.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("load recovery runs: %w", err)
 		}
@@ -217,11 +222,10 @@ func (s *Store) LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context,
 	return entries, nil
 }
 
-// QueryRecentRunHistory returns the most recent run history entries across all
-// issues, ordered by id descending. The limit parameter caps the number of
-// returned rows (clamped to a minimum of 1). For cursor-based pagination, pass
-// the smallest id from the previous page as afterID; pass 0 to start from the
-// most recent entry. Returns an empty non-nil slice when no entries exist.
+// QueryRecentRunHistory returns the most recent entries across all issues,
+// ordered by id descending, capped by limit (min 1). For pagination pass
+// the smallest id from the previous page as afterID, or 0 to start from the
+// most recent. Returns an empty non-nil slice when none exist.
 func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID int64) ([]RunHistory, error) {
 	if limit <= 0 {
 		limit = 1
@@ -233,7 +237,7 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 				started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-				input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured
+				input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 			FROM run_history
 			WHERE id < ?
 			ORDER BY id DESC
@@ -242,7 +246,7 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT id, issue_id, identifier, display_identifier, attempt, agent_adapter, workspace,
 				started_at, completed_at, status, error, workflow_file, turns_completed, review_metadata, rule_name, template_id,
-				input_tokens, output_tokens, total_tokens, cache_read_tokens, tokens_measured
+				input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, tokens_measured, unaccounted_turns
 			FROM run_history
 			ORDER BY id DESC
 			LIMIT ?`, limit)
@@ -260,7 +264,8 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 			&r.ID, &r.IssueID, &r.Identifier, &dispIDVal, &r.Attempt, &r.AgentAdapter,
 			&r.Workspace, &r.StartedAt, &r.CompletedAt, &r.Status, &errVal, &wfVal,
 			&r.TurnsCompleted, &reviewMetaVal, &r.RuleName, &r.TemplateID,
-			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.TokensMeasured,
+			&r.InputTokens, &r.OutputTokens, &r.TotalTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.TokensMeasured,
+			&r.UnaccountedTurns,
 		); err != nil {
 			return nil, fmt.Errorf("scan run history: %w", err)
 		}
@@ -284,8 +289,8 @@ func (s *Store) QueryRecentRunHistory(ctx context.Context, limit int, afterID in
 	return entries, nil
 }
 
-// CountRunHistoryByIssue returns the number of run_history entries for the
-// given issue ID. Returns (0, nil) when no entries exist.
+// CountRunHistoryByIssue returns the number of entries for the issue, or
+// (0, nil) when none exist.
 func (s *Store) CountRunHistoryByIssue(ctx context.Context, issueID string) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
@@ -297,13 +302,11 @@ func (s *Store) CountRunHistoryByIssue(ctx context.Context, issueID string) (int
 	return count, nil
 }
 
-// CountWorkerRunsCompletedSince returns the number of worker-session
-// run_history rows for the given issue whose completed_at is at or
-// after since. Rows whose status is "ci_failed" are excluded by name
-// rather than by an inclusion list of qualifying statuses, because that
-// status records a CI verdict the reconcile pass observed rather than a
-// worker session, and a status added later must count as a worker
-// session by default. Returns (0, nil) when no row qualifies.
+// CountWorkerRunsCompletedSince returns the number of worker-session rows
+// for the issue with completed_at at or after since, or (0, nil) when none
+// qualify. "ci_failed" rows are excluded by name rather than by an
+// inclusion list, so a status added later counts as a worker session by
+// default.
 func (s *Store) CountWorkerRunsCompletedSince(ctx context.Context, issueID string, since time.Time) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
@@ -319,17 +322,15 @@ func (s *Store) CountWorkerRunsCompletedSince(ctx context.Context, issueID strin
 	return count, nil
 }
 
-// QueryConsecutiveHandoffAbsenceCounts returns the number of handoff-absence
-// failures for each requested issue since the run at which
-// [Store.ResetHandoffAbsenceSequence] last ended that issue's sequence. Issues
-// with no qualifying rows are omitted from the returned map.
+// QueryConsecutiveHandoffAbsenceCounts returns the handoff-absence failure
+// count per requested issue since [Store.ResetHandoffAbsenceSequence] last
+// ended that issue's sequence. Issues with no qualifying rows are omitted.
 //
-// Only a work-observed verdict resets the sequence. A terminal status of
-// "succeeded" does not, because it is also recorded for outcomes that carry no
-// verdict at all: a blocked soft stop, a run that does not drive issue state, a
-// run whose evidence was not determinable, and every run under the off policy.
-// Counting those as a reset would let an absence sequence alternate below the
-// ceiling indefinitely.
+// Only a work-observed verdict resets the sequence; "succeeded" does not,
+// because it is also recorded for outcomes carrying no verdict (a blocked
+// soft stop, a run that does not drive issue state, an undeterminable run,
+// every run under the off policy). Counting those as a reset would let an
+// absence sequence alternate below the ceiling indefinitely.
 func (s *Store) QueryConsecutiveHandoffAbsenceCounts(ctx context.Context, issueIDs []string) (map[string]int, error) {
 	counts := make(map[string]int)
 	if len(issueIDs) == 0 {
@@ -380,14 +381,13 @@ func (s *Store) QueryConsecutiveHandoffAbsenceCounts(ctx context.Context, issueI
 	return counts, nil
 }
 
-// ResetHandoffAbsenceSequence ends the issue's consecutive handoff-absence
-// sequence at its most recently recorded run, so
-// [Store.QueryConsecutiveHandoffAbsenceCounts] reports zero until a further
-// absence is recorded.
+// ResetHandoffAbsenceSequence ends the issue's consecutive absence sequence
+// at its most recent run, so [Store.QueryConsecutiveHandoffAbsenceCounts]
+// reports zero until a further absence is recorded.
 //
 // The reset point is read from run_history inside the statement rather than
 // supplied by the caller, so a work-observed run whose own history row could
-// not be persisted still clears the absences recorded before it.
+// not be persisted still clears the absences before it.
 func (s *Store) ResetHandoffAbsenceSequence(ctx context.Context, issueID string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.ExecContext(ctx, `
@@ -404,10 +404,9 @@ func (s *Store) ResetHandoffAbsenceSequence(ctx context.Context, issueID string)
 	return nil
 }
 
-// QueryBudgetExhaustedIssues returns, for each candidate in candidateIDs
-// whose run_history entry count meets or exceeds maxSessions, that count
-// keyed by issue ID. Returns an empty non-nil map when no issues qualify
-// or candidateIDs is empty.
+// QueryBudgetExhaustedIssues returns, for each candidate whose entry count
+// meets or exceeds maxSessions, that count keyed by issue ID. Returns an
+// empty non-nil map when none qualify or candidateIDs is empty.
 func (s *Store) QueryBudgetExhaustedIssues(ctx context.Context, candidateIDs []string, maxSessions int) (map[string]int, error) {
 	if len(candidateIDs) == 0 {
 		return map[string]int{}, nil
@@ -448,57 +447,62 @@ func (s *Store) QueryBudgetExhaustedIssues(ctx context.Context, candidateIDs []s
 	return exhausted, nil
 }
 
-// IssueTokenUsage is the per-issue token spend read by the token
-// ceiling and by the cost_budget tool: a summed total, a row count, a
-// count of rows whose spend is unknown rather than zero, and a count
-// of rows recording a session the in-flight token ceiling stopped
-// while it was running.
+// IssueTokenUsage is the per-issue token spend read by the token ceiling
+// and the cost_budget tool.
 type IssueTokenUsage struct {
 	TotalTokens        int64
 	Sessions           int
 	UnmeasuredSessions int
 
-	// StoppedInFlight counts the issue's rows recording a session the
-	// token ceiling stopped while it was running.
+	// StoppedInFlight counts rows recording a session the token ceiling
+	// stopped while running.
 	StoppedInFlight int
+
+	// UnaccountedTurns is the summed count of turns that spent tokens no
+	// figure was proven to cover, so a non-zero value makes TotalTokens a
+	// lower bound even when every row is measured.
+	UnaccountedTurns int
 }
 
-// TokenUsageByIssue returns the summed total_tokens, the row count, the
-// count of unmeasured rows, and the count of rows the token ceiling
-// stopped in flight, across all run_history rows for the issue.
-// Returns the zero [IssueTokenUsage] and a nil error when the issue has
-// no rows. An unmeasured row's token columns are zero, so a non-zero
-// UnmeasuredSessions makes the summed total a lower bound on what the
-// issue really spent rather than the whole of it.
+// SpendIncomplete reports whether TotalTokens is a lower bound rather than
+// the whole of the issue's spend. Either count that leaves spend out of the
+// sum answers true.
+func (u IssueTokenUsage) SpendIncomplete() bool {
+	return u.UnmeasuredSessions > 0 || u.UnaccountedTurns > 0
+}
+
+// TokenUsageByIssue returns the summed total_tokens, row count, unmeasured
+// row count, and in-flight-stopped count across all rows for the issue, or
+// the zero [IssueTokenUsage] when the issue has no rows. An unmeasured row's
+// token columns are zero, so a non-zero UnmeasuredSessions makes the total a
+// lower bound.
 func (s *Store) TokenUsageByIssue(ctx context.Context, issueID string) (IssueTokenUsage, error) {
 	var usage IssueTokenUsage
 	row := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(total_tokens), 0), COUNT(*), SUM(CASE WHEN tokens_measured = 0 THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status = 'budget_stopped' THEN 1 ELSE 0 END)
+		SUM(CASE WHEN status = 'budget_stopped' THEN 1 ELSE 0 END), COALESCE(SUM(unaccounted_turns), 0)
 		FROM run_history WHERE issue_id = ?`, issueID,
 	)
-	var unmeasured, stoppedInFlight sql.NullInt64
-	if err := row.Scan(&usage.TotalTokens, &usage.Sessions, &unmeasured, &stoppedInFlight); err != nil {
+	var unmeasured, stoppedInFlight, unaccounted sql.NullInt64
+	if err := row.Scan(&usage.TotalTokens, &usage.Sessions, &unmeasured, &stoppedInFlight, &unaccounted); err != nil {
 		return IssueTokenUsage{}, fmt.Errorf("token usage by issue %q: %w", issueID, err)
 	}
 	usage.UnmeasuredSessions = int(unmeasured.Int64)
 	usage.StoppedInFlight = int(stoppedInFlight.Int64)
+	usage.UnaccountedTurns = int(unaccounted.Int64)
 	return usage, nil
 }
 
-// latestRunCompletionChunkSize is the maximum number of identifiers
-// batched into a single IN (...) query. The on-disk workspace directory
-// count that feeds this lookup is unbounded by construction, unlike the
-// tracker-page-bounded inputs of the other IN (...) queries in this file.
+// latestRunCompletionChunkSize caps identifiers per IN (...) query. The
+// on-disk workspace directory count feeding this lookup is unbounded,
+// unlike the tracker-page-bounded inputs of the other IN (...) queries
+// here.
 const latestRunCompletionChunkSize = 500
 
-// LatestRunCompletionByIdentifier returns the most recent completed_at
-// value for each of the given identifiers.
-//
-// Identifiers with no run_history rows are omitted from the result. An
-// empty input returns an empty non-nil map without querying. Identifiers
-// are queried in batches of at most [latestRunCompletionChunkSize] and
-// the per-batch results are merged.
+// LatestRunCompletionByIdentifier returns the most recent completed_at per
+// identifier. Identifiers with no rows are omitted; an empty input returns
+// an empty non-nil map without querying. Identifiers are queried in batches
+// of at most [latestRunCompletionChunkSize] and merged.
 func (s *Store) LatestRunCompletionByIdentifier(ctx context.Context, identifiers []string) (map[string]string, error) {
 	result := make(map[string]string, len(identifiers))
 	if len(identifiers) == 0 {
@@ -546,12 +550,10 @@ func (s *Store) LatestRunCompletionByIdentifier(ctx context.Context, identifiers
 	return result, nil
 }
 
-// QueryTokenBudgetUsage returns one [IssueTokenUsage] per candidate in
-// candidateIDs that has at least one run_history row. A candidate with
-// no rows is absent from the returned map; the caller reads that as
-// zero on every count the shape carries. An empty candidateIDs
-// returns an empty non-nil map without querying. The threshold
-// comparison against a token ceiling is the caller's responsibility.
+// QueryTokenBudgetUsage returns one [IssueTokenUsage] per candidate with at
+// least one row; a candidate with no rows is absent, which the caller reads
+// as zero on every count. An empty candidateIDs returns an empty non-nil map
+// without querying. Comparing against a ceiling is the caller's job.
 func (s *Store) QueryTokenBudgetUsage(ctx context.Context, candidateIDs []string) (map[string]IssueTokenUsage, error) {
 	usage := map[string]IssueTokenUsage{}
 	if len(candidateIDs) == 0 {
@@ -568,7 +570,7 @@ func (s *Store) QueryTokenBudgetUsage(ctx context.Context, candidateIDs []string
 
 	query := fmt.Sprintf( //nolint:gosec // placeholders is "?,?,..." built from len(candidateIDs); no user data in format string
 		`SELECT issue_id, COALESCE(SUM(total_tokens), 0), COUNT(*), SUM(CASE WHEN tokens_measured = 0 THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status = 'budget_stopped' THEN 1 ELSE 0 END)
+		SUM(CASE WHEN status = 'budget_stopped' THEN 1 ELSE 0 END), COALESCE(SUM(unaccounted_turns), 0)
 		FROM run_history WHERE issue_id IN (%s) GROUP BY issue_id`,
 		placeholders,
 	)
@@ -582,12 +584,13 @@ func (s *Store) QueryTokenBudgetUsage(ctx context.Context, candidateIDs []string
 	for rows.Next() {
 		var issueID string
 		var issueUsage IssueTokenUsage
-		var unmeasured, stoppedInFlight sql.NullInt64
-		if err := rows.Scan(&issueID, &issueUsage.TotalTokens, &issueUsage.Sessions, &unmeasured, &stoppedInFlight); err != nil {
+		var unmeasured, stoppedInFlight, unaccounted sql.NullInt64
+		if err := rows.Scan(&issueID, &issueUsage.TotalTokens, &issueUsage.Sessions, &unmeasured, &stoppedInFlight, &unaccounted); err != nil {
 			return nil, fmt.Errorf("scan token budget usage: %w", err)
 		}
 		issueUsage.UnmeasuredSessions = int(unmeasured.Int64)
 		issueUsage.StoppedInFlight = int(stoppedInFlight.Int64)
+		issueUsage.UnaccountedTurns = int(unaccounted.Int64)
 		usage[issueID] = issueUsage
 	}
 	if err := rows.Err(); err != nil {

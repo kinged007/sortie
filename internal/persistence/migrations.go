@@ -2,9 +2,9 @@ package persistence
 
 import _ "embed" // enables //go:embed directives for SQL migration files
 
-// Migration represents a single numbered schema migration. Migrations are
-// applied sequentially by [Store.Migrate]. The SQL field may contain multiple
-// statements separated by semicolons.
+// Migration is a single numbered schema migration applied sequentially
+// by [Store.Migrate]. SQL may contain multiple semicolon-separated
+// statements.
 type Migration struct {
 	Version     int
 	Description string
@@ -65,6 +65,12 @@ var migration017SQL string
 //go:embed sql/018_aggregate_metrics_unmeasured_sessions.sql
 var migration018SQL string
 
+//go:embed sql/019_run_history_unaccounted_turns.sql
+var migration019SQL string
+
+//go:embed sql/020_cache_write_tokens.sql
+var migration020SQL string
+
 var migrations = []Migration{
 	{Version: 1, Description: "core persistence tables", SQL: migration001SQL},
 	{Version: 2, Description: "extended token metrics", SQL: migration002SQL},
@@ -84,4 +90,6 @@ var migrations = []Migration{
 	{Version: 16, Description: "api_requests_measured column on session_metadata", SQL: migration016SQL},
 	{Version: 17, Description: "dispatch_id column on session_metadata", SQL: migration017SQL},
 	{Version: 18, Description: "unmeasured_sessions column on aggregate_metrics", SQL: migration018SQL},
+	{Version: 19, Description: "unaccounted_turns column on run_history", SQL: migration019SQL},
+	{Version: 20, Description: "cache_write_tokens column on run_history, session_metadata, and aggregate_metrics", SQL: migration020SQL},
 }

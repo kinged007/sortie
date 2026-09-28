@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/maputil"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
@@ -89,6 +90,11 @@ type ServiceConfig struct {
 	// only through that constructor, can read it. Zero value (nil
 	// Backends) means no notifier backend is configured.
 	Notifications NotificationsConfig
+
+	// advisories holds the advisories recorded while this configuration
+	// was built or loaded. Read and written only through
+	// [ServiceConfig.Advisories] and [ServiceConfig.AddAdvisories].
+	advisories []Advisory
 }
 
 // SetDispatch attaches a parsed [DispatchConfig] to the service
@@ -119,6 +125,31 @@ func (c ServiceConfig) ExtensionSection(name string) map[string]any {
 func (c ServiceConfig) ExtensionValue(name string) (any, bool) {
 	v, ok := c.extensions[name]
 	return v, ok
+}
+
+// ExtensionEnvRefPaths returns the set of field paths under the
+// top-level extension section name whose configured text held a $VAR
+// or ${VAR} reference, keyed relative to that section (for example
+// "ssh_pass_env[0]"). It returns nil when no field under the section
+// held one.
+//
+// A resolved value carries no record of the reference that produced
+// it, so a caller whose field must be written literally reads this
+// set to tell the two apart.
+func (c ServiceConfig) ExtensionEnvRefPaths(name string) map[string]bool {
+	prefix := name + "."
+	var paths map[string]bool
+	for path := range c.extensionsPreResolution {
+		relative, found := strings.CutPrefix(path, prefix)
+		if !found {
+			continue
+		}
+		if paths == nil {
+			paths = make(map[string]bool)
+		}
+		paths[relative] = true
+	}
+	return paths
 }
 
 // SetExtensionSection replaces the top-level extension section named
@@ -232,6 +263,13 @@ type AgentConfig struct {
 	// event loop for the run already in flight. 0 means unlimited.
 	MaxTokens int
 
+	// TokenWarningPercent is the percentage of MaxTokens, 0 to 99,
+	// at which the event loop warns that the ceiling is near. 0
+	// disables the warning threshold. Call [AgentConfig.TokenWarningThreshold]
+	// to convert this to a token count; no other code performs that
+	// conversion.
+	TokenWarningPercent int
+
 	// MaxConsecutiveAbsences bounds how many runs in a row may be
 	// observed to have produced no evidence of work before the issue
 	// is parked. It is not an effort budget: any run that produces
@@ -242,6 +280,19 @@ type AgentConfig struct {
 	// deployment that wants no absence checking sets
 	// tracker.handoff_evidence to off instead.
 	MaxConsecutiveAbsences int
+}
+
+// TokenWarningThreshold returns the token count at which the warning
+// threshold fires: the least integer not below MaxTokens times
+// TokenWarningPercent divided by 100. It returns 0, disabling the
+// warning, when MaxTokens or TokenWarningPercent is not positive.
+func (a AgentConfig) TokenWarningThreshold() int {
+	if a.MaxTokens <= 0 || a.TokenWarningPercent <= 0 {
+		return 0
+	}
+	q := a.MaxTokens / 100
+	r := a.MaxTokens % 100
+	return q*a.TokenWarningPercent + (r*a.TokenWarningPercent+99)/100
 }
 
 // ExtensionBlockPresence reports what the front matter carries under a
@@ -452,10 +503,12 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		raw = map[string]any{}
 	}
 
-	envKeys, err := applyEnvOverrides(raw)
+	envKeys, envAdvisories, err := applyEnvOverrides(raw)
 	if err != nil {
 		return ServiceConfig{}, err
 	}
+	var advisories []Advisory
+	advisories = append(advisories, envAdvisories...)
 
 	rawTracker := extractSubMap(raw, "tracker")
 	tracker, err := buildTrackerConfig(rawTracker, envKeys)
@@ -572,15 +625,22 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 			return ServiceConfig{}, err
 		}
 		if hasCIFeedbackSection {
-			slog.Warn("ci_feedback section is deprecated; using reactions.ci_failure instead",
-				slog.String("hint", "remove the ci_feedback section from your WORKFLOW.md"))
+			advisories = append(advisories, Advisory{
+				Check:   "ci_feedback.deprecated",
+				Text:    "ci_feedback is deprecated and ignored because reactions.ci_failure is set; remove the ci_feedback section",
+				Message: "ci_feedback section is deprecated; using reactions.ci_failure instead",
+				Attrs:   []slog.Attr{slog.String("hint", "remove the ci_feedback section from your WORKFLOW.md")},
+			})
 		}
 		delete(reactions, "ci_failure")
 	}
 
-	labelCommands, err := buildLabelCommandsConfig(extractSubMap(extractSubMap(raw, "reactions"), "label_commands"))
+	labelCommands, labelCommandsAdvisory, err := buildLabelCommandsConfig(extractSubMap(extractSubMap(raw, "reactions"), "label_commands"))
 	if err != nil {
 		return ServiceConfig{}, err
+	}
+	if labelCommandsAdvisory != nil {
+		advisories = append(advisories, *labelCommandsAdvisory)
 	}
 
 	notifications, err := buildNotificationsConfig(raw)
@@ -597,7 +657,9 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 
 	preResolution := resolveExtensionEnvRefs(extensions)
 
-	return ServiceConfig{
+	registerConfigSecrets(tracker, reactions, notifications, extensions)
+
+	cfg := ServiceConfig{
 		Tracker:                 tracker,
 		Polling:                 polling,
 		Workspace:               workspace,
@@ -611,7 +673,69 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		extensions:              extensions,
 		extensionsPreResolution: preResolution,
 		Notifications:           notifications,
-	}, nil
+	}
+	cfg.AddAdvisories(advisories...)
+	return cfg, nil
+}
+
+// registerConfigSecrets registers every resolved credential a
+// [ServiceConfig] load carries with [internal/redact], so a log record,
+// a stored row, or a runtime-derived text can mask it later. Call it
+// once every value has its final, environment-resolved form.
+func registerConfigSecrets(tracker TrackerConfig, reactions map[string]ReactionConfig, notifications NotificationsConfig, extensions map[string]any) {
+	redact.Add("tracker.api_key", tracker.APIKey)
+	redact.AddURLCredentials("tracker.endpoint", tracker.Endpoint)
+
+	for kind, reaction := range reactions {
+		if len(reaction.Extra) == 0 {
+			continue
+		}
+		registerCredentialLeaves(fmt.Sprintf("reactions.%s.extra", kind), reaction.Extra, false)
+	}
+
+	for i, backend := range notifications.Backends {
+		if len(backend.Config) == 0 {
+			continue
+		}
+		registerCredentialLeaves(fmt.Sprintf("notifications[%d]", i), backend.Config, true)
+	}
+
+	registerCredentialLeaves("", extensions, false)
+}
+
+// registerCredentialLeaves walks m at any depth, registering each
+// string leaf, and each string held directly in a list, under its own
+// key through [redact.AddNamed]. When registerURLsWhole holds, a
+// string leaf carrying "://" is also registered whole through
+// [redact.Add], because a notification endpoint grants access to
+// whoever holds it. An empty source names each leaf by its key path
+// from m alone.
+func registerCredentialLeaves(source string, m map[string]any, registerURLsWhole bool) {
+	for key, v := range m {
+		path := key
+		if source != "" {
+			path = source + "." + key
+		}
+		switch value := v.(type) {
+		case string:
+			registerCredentialString(path, key, value, registerURLsWhole)
+		case map[string]any:
+			registerCredentialLeaves(path, value, registerURLsWhole)
+		case []any:
+			for _, elem := range value {
+				if s, ok := elem.(string); ok {
+					registerCredentialString(path, key, s, registerURLsWhole)
+				}
+			}
+		}
+	}
+}
+
+func registerCredentialString(path, key, value string, registerURLsWhole bool) {
+	redact.AddNamed(path, key, value)
+	if registerURLsWhole && strings.Contains(value, "://") {
+		redact.Add(path, value)
+	}
 }
 
 func buildTrackerConfig(m map[string]any, envKeys map[string]bool) (TrackerConfig, error) {
@@ -975,6 +1099,17 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		}
 	}
 
+	tokenWarningPercent, err := coerceIntField(m, "token_warning_percent", "agent.token_warning_percent")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+	if tokenWarningPercent < 0 || tokenWarningPercent > 99 {
+		return AgentConfig{}, &ConfigError{
+			Field:   "agent.token_warning_percent",
+			Message: "must be between 0 and 99",
+		}
+	}
+
 	// max_consecutive_absences: unlike max_sessions and max_tokens, 0
 	// is rejected rather than read as unlimited, so a presence test
 	// is required to tell an absent key (which defaults to 3) apart
@@ -1010,6 +1145,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		MaxConcurrentByState:   byState,
 		MaxSessions:            maxSessions,
 		MaxTokens:              maxTokens,
+		TokenWarningPercent:    tokenWarningPercent,
 		MaxConsecutiveAbsences: maxConsecutiveAbsences,
 	}, nil
 }
@@ -1950,17 +2086,18 @@ type LabelCommandsConfig struct {
 // Returns a zero-value config with Provider == "" when the block is absent
 // or empty. Returns a [*ConfigError] when a field has the wrong type, when
 // poll_interval_ms is not an integer, or when provider is set while both
-// command labels resolve to empty.
-func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
+// command labels resolve to empty. The second return value is non-nil
+// exactly when poll_interval_ms was clamped to its floor.
+func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, *Advisory, error) {
 	if len(m) == 0 {
-		return LabelCommandsConfig{}, nil
+		return LabelCommandsConfig{}, nil, nil
 	}
 
 	// The block is rejected wholesale rather than ignored, because
 	// label commands have no escalation to invoke and so could not
 	// honor one of the three dispositions.
 	if _, exists := m["triage"]; exists {
-		return LabelCommandsConfig{}, &ConfigError{
+		return LabelCommandsConfig{}, nil, &ConfigError{
 			Field:   "reactions.label_commands.triage",
 			Message: triageUnsupportedKindMessage,
 		}
@@ -1968,45 +2105,49 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 
 	provider, _, err := requireStringField(m, "provider", "reactions.label_commands.provider")
 	if err != nil {
-		return LabelCommandsConfig{}, err
+		return LabelCommandsConfig{}, nil, err
 	}
 
 	// An absent or empty provider makes the whole block inert. Its other
 	// fields are ignored, so they are neither validated, clamped, nor
 	// defaulted here.
 	if provider == "" {
-		return LabelCommandsConfig{}, nil
+		return LabelCommandsConfig{}, nil, nil
 	}
 
 	// An absent label key defaults to the conventional label; an explicit
 	// empty string is a deliberate disable and must be preserved.
 	reviewLabel := "sortie:review"
 	if s, found, rErr := requireStringField(m, "review_label", "reactions.label_commands.review_label"); rErr != nil {
-		return LabelCommandsConfig{}, rErr
+		return LabelCommandsConfig{}, nil, rErr
 	} else if found {
 		reviewLabel = s
 	}
 
 	fixLabel := "sortie:fix"
 	if s, found, fErr := requireStringField(m, "fix_label", "reactions.label_commands.fix_label"); fErr != nil {
-		return LabelCommandsConfig{}, fErr
+		return LabelCommandsConfig{}, nil, fErr
 	} else if found {
 		fixLabel = s
 	}
 
 	pollIntervalMS := 60000
+	var advisory *Advisory
 	if raw, exists := m["poll_interval_ms"]; exists && raw != nil {
 		n, pErr := coerceInt(raw)
 		if pErr != nil {
-			return LabelCommandsConfig{}, &ConfigError{
+			return LabelCommandsConfig{}, nil, &ConfigError{
 				Field:   "reactions.label_commands.poll_interval_ms",
 				Message: integerFaultMessage(pErr, fmt.Sprintf("invalid integer value: %v", raw)),
 			}
 		}
 		if n < 30000 {
-			slog.Warn("clamped label_commands poll_interval_ms to floor",
-				slog.Int("configured_ms", n),
-				slog.Int("floor_ms", 30000))
+			advisory = &Advisory{
+				Check:   "reactions.label_commands.poll_interval_ms.clamped",
+				Text:    fmt.Sprintf("reactions.label_commands.poll_interval_ms is %d, below the minimum of 30000; 30000 is used", n),
+				Message: "clamped label_commands poll_interval_ms to floor",
+				Attrs:   []slog.Attr{slog.Int("configured_ms", n), slog.Int("floor_ms", 30000)},
+			}
 			n = 30000
 		}
 		pollIntervalMS = n
@@ -2015,7 +2156,7 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 	// An active provider with both command labels disabled is a loud
 	// misconfiguration: the block does nothing but is not silently inert.
 	if provider != "" && reviewLabel == "" && fixLabel == "" {
-		return LabelCommandsConfig{}, &ConfigError{
+		return LabelCommandsConfig{}, nil, &ConfigError{
 			Field:   "reactions.label_commands",
 			Message: "an active provider requires at least one non-empty command label (review_label or fix_label)",
 		}
@@ -2026,7 +2167,7 @@ func buildLabelCommandsConfig(m map[string]any) (LabelCommandsConfig, error) {
 		ReviewLabel:    reviewLabel,
 		FixLabel:       fixLabel,
 		PollIntervalMS: pollIntervalMS,
-	}, nil
+	}, advisory, nil
 }
 
 func normalizeByStateMap(raw any) (map[string]int, error) {

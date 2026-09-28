@@ -22,6 +22,11 @@ import (
 // [orchestrator.TickResolution] constructed at offset zero for the
 // whole cycle.
 func runDryRun(ctx context.Context, cfg config.ServiceConfig, logger *slog.Logger, trackerAdapter domain.TrackerAdapter, resolver orchestrator.BlockerResolver) int {
+	wc := orchestrator.ParseWorkerConfig(cfg.ExtensionSection("worker"), cfg.ExtensionEnvRefPaths("worker"))
+	hostPool := orchestrator.NewHostPool(wc.SSHHosts, wc.MaxPerHost)
+
+	orchestrator.LogAdvisories(ctx, logger, append(cfg.Advisories(), wc.Warnings...))
+
 	issues, err := trackerAdapter.FetchCandidateIssues(ctx)
 	if err != nil {
 		logger.Error("dry-run: failed to fetch candidate issues", slog.Any("error", err))
@@ -37,12 +42,6 @@ func runDryRun(ctx context.Context, cfg config.ServiceConfig, logger *slog.Logge
 		cfg.Agent.MaxConcurrentByState,
 		orchestrator.AgentTotals{},
 	)
-
-	wc := orchestrator.ParseWorkerConfig(cfg.ExtensionSection("worker"))
-	for _, w := range wc.Warnings {
-		logger.LogAttrs(ctx, slog.LevelWarn, w.Message, w.Attrs...) //nolint:sloglint // WorkerWarning.Message is one of two fixed string constants from parseSSHStrictHostKeyChecking
-	}
-	hostPool := orchestrator.NewHostPool(wc.SSHHosts, wc.MaxPerHost)
 
 	activeSet := dryRunStateSet(cfg.Tracker.ActiveStates)
 	terminalSet := dryRunStateSet(cfg.Tracker.TerminalStates)

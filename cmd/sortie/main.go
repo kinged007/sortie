@@ -317,8 +317,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	}
 	br.logger.Info("sortie starting", logAttrs...)
 
-	// --- Database open, migrate, and recovery ---
-
 	workflowDir := filepath.Dir(br.path)
 	dbPath := resolveDBPath(br.cfg.DBPath, workflowDir)
 	br.logger.Info("database path resolved", slog.String("db_path", dbPath))
@@ -350,6 +348,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			OutputTokens:       metrics.OutputTokens,
 			TotalTokens:        metrics.TotalTokens,
 			CacheReadTokens:    metrics.CacheReadTokens,
+			CacheWriteTokens:   metrics.CacheWriteTokens,
 			SecondsRunning:     metrics.SecondsRunning,
 			UnmeasuredSessions: metrics.UnmeasuredSessions,
 		}
@@ -362,6 +361,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		br.cfg.Agent.MaxConcurrentByState,
 		totals,
 	)
+	state.TokenWarningThreshold = br.cfg.Agent.TokenWarningThreshold()
 	orchestrator.PopulateRetries(state, pendingRetries, br.logger)
 
 	parkedRows, err := store.ListParkedIssues(ctx)
@@ -377,8 +377,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	} else {
 		orchestrator.PopulateBudgetHoldNotices(state, budgetHoldNoticeRows, br.logger)
 	}
-
-	// --- Agent adapter construction ---
 
 	agentCtor, err := registry.Agents.Get(br.cfg.Agent.Kind)
 	if err != nil {
@@ -414,8 +412,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	}()
 	agentAdapterByKind := makeAgentAdapterByKind(agentAdapterCache)
 
-	// --- Startup terminal workspace cleanup ---
-
 	keys, err := workspace.ListWorkspaceKeys(br.cfg.Workspace.Root)
 	if err != nil {
 		br.logger.Warn("failed to list workspace keys, skipping cleanup", slog.Any("error", err))
@@ -447,8 +443,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			}
 		}
 	}
-
-	// --- Orchestrator construction and event loop ---
 
 	br.logger.Info("sortie started")
 
@@ -796,22 +790,22 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	// renders into the first-turn advertisement, so the advertised set
 	// matches the set the MCP sidecar serves over tools/list. It captures
 	// the session-invariant gating inputs and receives the late-bound
-	// inputs (issue id, workspace path, session id) at call time. The
-	// read-only store the builder opens to make the database-backed tools
+	// inputs (issue id, workspace path) at call time. The read-only
+	// store the builder opens to make the database-backed tools
 	// constructible is closed before the registry is returned: the worker
 	// reads only tool metadata, never executing the tools, so the
 	// connection is not needed beyond construction.
-	sessionToolFunc := func(ctx context.Context, issueID, workspacePath, sessionID string) (*domain.ToolRegistry, error) {
+	sessionToolFunc := func(ctx context.Context, issueID, workspacePath string) (*domain.ToolRegistry, error) {
 		sessionTools, err := BuildSessionToolRegistry(ctx, br.logger, SessionToolParams{
-			TrackerAdapter: br.trackerAdapter,
-			Project:        br.cfg.Tracker.Project,
-			DBPath:         dbPath,
-			MaxTokens:      br.cfg.Agent.MaxTokens,
-			MaxSessions:    br.cfg.Agent.MaxSessions,
-			Notifications:  br.cfg.Notifications.Backends,
-			IssueID:        issueID,
-			WorkspacePath:  workspacePath,
-			SessionID:      sessionID,
+			TrackerAdapter:        br.trackerAdapter,
+			Project:               br.cfg.Tracker.Project,
+			DBPath:                dbPath,
+			MaxTokens:             br.cfg.Agent.MaxTokens,
+			MaxSessions:           br.cfg.Agent.MaxSessions,
+			TokenWarningThreshold: br.mgr.Config().Agent.TokenWarningThreshold(),
+			Notifications:         br.cfg.Notifications.Backends,
+			IssueID:               issueID,
+			WorkspacePath:         workspacePath,
 		})
 		if err != nil {
 			return nil, err
@@ -858,10 +852,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	var srv *server.Server
 	if serverEnabled {
 		rawTokenRates, tokenRatesPresent := br.cfg.ExtensionValue("token_rates")
-		tokenRates, trWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
-		for _, w := range trWarnings {
-			br.logger.Warn("skipped invalid token rate entry", slog.String("detail", w))
-		}
+		tokenRates, _ := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
 		addr := net.JoinHostPort(br.serverHost, strconv.Itoa(br.serverPort))
 		srv = server.New(server.Params{

@@ -49,6 +49,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- A workspace directory swapped for a symbolic link after preparation refuses every `.sortie` write, read, and removal for that workspace and leaves the link's target unchanged
+- Every workspace launch, including a per-turn or auxiliary one, refuses a linked workspace path and starts no subprocess
 - Hook environment variables (`SORTIE_ISSUE_ID`, `SORTIE_ISSUE_IDENTIFIER`, `SORTIE_WORKSPACE`, `SORTIE_ATTEMPT`) are set correctly
 - The periodic sweep excludes workspace keys held by running entries and scheduled retries, and keys held by a pending reaction entry whose kind pins its workspace, while a non-pinning kind leaves its key a candidate
 - Within one sweep pass the terminal check runs before the age bound, and a key removed by the terminal check is not re-evaluated by the age bound
@@ -257,6 +259,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.5 Coding-Agent Adapter Client
 
 - Launch command uses workspace cwd and execs the resolved binary directly with an argument vector
+- A remote launch invokes the local `ssh` binary, runs the agent in the remote workspace, and delivers every carried variable on the session's standard input ahead of the agent command, with no carried value in any argument; a remote host without `dd` fails the launch with the operator-visible message instead of running the agent, a preamble that arrives incomplete fails the launch rather than starting the agent without its variables, and a local launch carries none of it
 - Startup handshake sequence is adapter-defined and tested per adapter
 - Policy-related startup payloads use the implementation's documented approval/sandbox settings
 - Session identifiers are parsed and `session_started` event is emitted
@@ -284,6 +287,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - An adapter whose runtime publishes a task-completion report carries a test driving both a turn the agent declared complete and a turn the runtime ended without that report through the adapter, asserting the two dispositions differ
 - A turn whose subprocess standard-error handle is held open by a surviving descendant still publishes its outcome and cleans up its process group within a bounded time
 - A turn whose subprocess standard-output handle is held open by a surviving descendant still ends within the adapter's own bound, naming the runtime's exit, rather than reaching the orchestrator's stall timeout
+- Each kind that launches a runtime carries the shared credential-verification conformance assertion (§10.9), driven against a working, a refused, and, for every kind requiring an agent command, an SSH connection-failure case; registry-enumerated completeness fails, naming the kind, when any registered kind lacks a runnable test calling that assertion
+- Each gated live suite, its own environment variable set, adds a working-credential case and, when its credential-override coordinate is set, a refused-credential case proving the run ends before any working session with `credential_unverified`, or the shared early-exit report when the runtime states the refusal only by exiting before it responds, and no retryable kind is reported any other way
+- Each kind that launches a runtime carries the shared early-exit conformance assertion, driven against a verification session, a working session, a working session through a stand-in `ssh`, and a working session whose runtime first writes a line that is not JSON, each working session covering its first turn when its start succeeds; the fourth case ends with the early-exit report for a kind with a structured output format and without it for a plain-text one; registry-enumerated completeness, keyed on a kind's declared requirement for an agent command, fails, naming the kind, when such a kind lacks a runnable test calling that assertion
+- Each gated live suite for such a kind adds a case appending an unknown switch to the configured command, proving a verification request and a working session through its first turn both end with the shared early-exit report, and skips with a logged reason when the real runtime accepts the switch; the `kiro` live suite also adds a no-login case proving the guard's credential verdict rests on the runtime's own structured answer, not a changed exit-status convention
 - The Pi adapter's JSON parser is exercised against fixtures derived from the installed Pi 0.85.1 event schema, including top-level tool error flags, assistant stop reasons, malformed nested payloads, compaction usage, and unknown event types
 - Pi's native `--thinking`, `--tools`, `--exclude-tools`, and project-trust arguments are covered by exact argument-vector tests, and every accepted or refused `pi` configuration key is covered by the shared validation path
 - Pi live integration tests are gated by `SORTIE_PI_TEST=1`, use the pinned Pi CLI, and cover a fresh turn, same-workspace resume, tool/usage behavior, invalid-model failure, and cancellation
@@ -298,6 +305,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - If humanized event summaries are implemented, they cover key agent event classes without changing orchestrator behavior
 - An unmeasured run is distinguishable from a zero-consumption run in the persisted row, in both `sortie stats` output forms, on the dashboard, and in the `cost_budget` result; an unmeasured run creates no Prometheus series
 - A running row's `turn_count` equals the number of agent turns its worker has started, self-review turns included, whether the agent kind emits `session_started` on every turn, only on its first turn, or never
+- Every record a logger `Setup` builds is masked in both formats, holding `[redacted]` for a registered secret value and staying byte-identical when none is present; a contract test fails production code that builds its own `log/slog` handler or writes directly to the process's standard streams outside `internal/logging` and `package main`; the run history, retry entries, and the running-session view carry masked text for a registered value a worker error, an agent event message, or a review document held
+- `sortie validate` reports exactly one warning per distinct configuration advisory, after the preflight warnings, in both output formats, with `valid` and the exit code unchanged from the same workflow without it; a workflow naming the deprecated `kiro` agent kind yields one `agent.kind.deprecated` entry
+- A configuration reaching no deprecated agent kind, including one naming only `agent-client-protocol`, a leftover unreferenced `kiro:` block, or `token_rates.kiro`, draws no agent-kind-deprecation advisory
+- Across at least three ticks on an unchanged effective configuration, the run log carries exactly one record per advisory it draws; a tick following a failed reload logs none; a tick whose configuration stops drawing an advisory logs nothing for it, and a later tick whose configuration draws it again logs it once more
+- Building a configuration or loading a workflow that draws every load-path advisory writes no record at `Warn` level or above to any logger, the default logger included; the advisories are recorded on the configuration instead, and `sortie stats` and `sortie mcp-server` print none of them
 
 ### 17.7 CLI and Host Lifecycle
 
@@ -316,6 +328,9 @@ These checks are recommended for production readiness and may be skipped in CI w
 - Real integration tests should use isolated test identifiers/workspaces and clean up tracker artifacts when practical.
 - A skipped real-integration test should be reported as skipped, not silently treated as passed.
 - If a real-integration profile is explicitly enabled in CI or release validation, failures should fail that job.
+- NITE (Nightly Incident Triage Engine) applies a consecutive-sample stability policy to each shard's real-integration run: a configurable number of consecutive failing samples opens or reopens one durable incident per shard, and a configurable number of consecutive passing samples closes it, rather than a single failing or passing sample changing the incident's state by itself.
+- A shard's own job still fails on its first failing sample regardless of the incident's state; the stability policy governs only the durable incident, never the shard's pass/fail conclusion.
+- A degraded read of the incident listing or of the prior-sample history downgrades an incident-opening, reopening, or closing action and raises a visible annotation on the run, rather than silently filing nothing or asserting a recovery the read could not confirm.
 
 ### 17.9 Source-control Adapter and CI Provider Roles (Core Conformance)
 

@@ -544,3 +544,65 @@ func TestRunDryRun_ReadBudgetPerCycle(t *testing.T) {
 		t.Errorf("blockers_not_read count = %d, want %d", got, needyCount-len(resolver.calls))
 	}
 }
+
+// TestRunDryRun_AdvisoriesLoggedBeforeCandidates asserts that a
+// configuration carrying no advisory produces no Warn-or-above record,
+// and that once advisories are present runDryRun logs one record per
+// distinct advisory of its configuration and its worker section, ahead
+// of the first "dry-run: candidate" line.
+func TestRunDryRun_AdvisoriesLoggedBeforeCandidates(t *testing.T) {
+	t.Parallel()
+
+	tracker := &dryRunFakeTracker{issues: []domain.Issue{
+		{ID: "1", Identifier: "X-1", Title: "T", State: "To Do"},
+	}}
+
+	var noneStderr bytes.Buffer
+	if code := runDryRun(context.Background(), dryRunTestConfig(10), discardStdoutLogger(&noneStderr), tracker, nil); code != 0 {
+		t.Fatalf("runDryRun = %d, want 0", code)
+	}
+	if got := noneStderr.String(); strings.Contains(got, "level=WARN") {
+		t.Errorf("stderr contains a WARN record with no advisories present, want none: %s", got)
+	}
+
+	cfg := dryRunTestConfig(10)
+	cfg.AddAdvisories(config.Advisory{
+		Message: "clamped label_commands poll_interval_ms to floor",
+		Attrs:   []slog.Attr{slog.Int("configured_ms", 5000), slog.Int("floor_ms", 30000)},
+	})
+	cfg.SetExtensionSection("worker", map[string]any{
+		"ssh_strict_host_key_checking": "bogus",
+	})
+
+	var stderr bytes.Buffer
+	code := runDryRun(context.Background(), cfg, discardStdoutLogger(&stderr), tracker, nil)
+	if code != 0 {
+		t.Fatalf("runDryRun = %d, want 0", code)
+	}
+
+	got := stderr.String()
+	const configAdvisory = "clamped label_commands poll_interval_ms to floor"
+	const workerAdvisory = "rejected unrecognized ssh_strict_host_key_checking value"
+	configAt := strings.Index(got, configAdvisory)
+	workerAt := strings.Index(got, workerAdvisory)
+	candidateAt := strings.Index(got, "dry-run: candidate")
+
+	if configAt == -1 {
+		t.Fatalf("stderr missing the configuration advisory: %s", got)
+	}
+	if workerAt == -1 {
+		t.Fatalf("stderr missing the worker advisory: %s", got)
+	}
+	if candidateAt == -1 {
+		t.Fatalf("stderr missing %q: %s", "dry-run: candidate", got)
+	}
+	if configAt > candidateAt {
+		t.Errorf("configuration advisory logged at byte %d, want before %q at byte %d", configAt, "dry-run: candidate", candidateAt)
+	}
+	if workerAt > candidateAt {
+		t.Errorf("worker advisory logged at byte %d, want before %q at byte %d", workerAt, "dry-run: candidate", candidateAt)
+	}
+	if n := strings.Count(got[:candidateAt], "level=WARN"); n != 2 {
+		t.Errorf("WARN records before %q = %d, want 2\nstderr:\n%s", "dry-run: candidate", n, got)
+	}
+}

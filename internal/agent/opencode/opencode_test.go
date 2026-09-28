@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,13 +25,64 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 // writeOpenCodeScript writes an executable shell script named fake-opencode
-// in dir with the given body and returns its path.
+// in dir with the given body and returns its path. Every script answers a
+// leading --version argument with a fixed 1.x version string before body
+// runs, so a session start against it always detects major1 without
+// disturbing body's own turn-fixture behavior.
 func writeOpenCodeScript(t *testing.T, dir, body string) string {
 	t.Helper()
-	return agenttest.WriteScript(t, dir, "fake-opencode", body)
+	return agenttest.WriteScript(t, dir, "fake-opencode", versionAnsweringScript(body))
+}
+
+// versionAnsweringScript prepends a branch answering a leading --version
+// argument to body, unconditionally.
+func versionAnsweringScript(body string) string {
+	return "case \"$1\" in\n  --version) echo '1.18.32'; exit 0;;\nesac\n" + body
+}
+
+// fakeMinimalRuntime returns the path to a fake opencode binary that
+// answers --version and otherwise exits 0 with no output, for a test
+// that only needs StartSession to succeed and never inspects a turn's
+// subprocess behavior.
+func fakeMinimalRuntime(t *testing.T) string {
+	t.Helper()
+	return writeOpenCodeScript(t, t.TempDir(), "exit 0")
+}
+
+// writeOpenCodeScriptMajor2 is [writeOpenCodeScript]'s major2
+// counterpart: it answers a leading --version argument with a 2.x
+// version string, so a session start against it detects major2.
+func writeOpenCodeScriptMajor2(t *testing.T, dir, body string) string {
+	t.Helper()
+	return agenttest.WriteScript(t, dir, "fake-opencode", "case \"$1\" in\n  --version) echo 'opencode v2.0.18'; exit 0;;\nesac\n"+body)
+}
+
+// writeRunFixtureScriptMajor2 is [writeRunFixtureScript]'s major2
+// counterpart: the usage-recovery invocation is "session export", not
+// "export", so the case match is on the first two arguments.
+func writeRunFixtureScriptMajor2(t *testing.T, dir, fixtureName string) string {
+	t.Helper()
+
+	runPath := filepath.Join(dir, fixtureName)
+	if err := os.WriteFile(runPath, loadFixture(t, fixtureName), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", fixtureName, err)
+	}
+
+	exportPath := filepath.Join(dir, "export.json")
+	if err := os.WriteFile(exportPath, []byte(`{"info":{"id":""},"messages":[]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(export.json): %v", err)
+	}
+
+	body := `case "$1 $2" in
+  "session export") cat '` + exportPath + `'; exit 0;;
+esac
+cat '` + runPath + `'`
+
+	return writeOpenCodeScriptMajor2(t, dir, body)
 }
 
 // mustStartSession starts a session with the given command or fatals.
@@ -44,6 +96,32 @@ func mustStartSession(t *testing.T, a domain.AgentAdapter, workDir, cmd string) 
 		t.Fatalf("StartSession() error = %v", err)
 	}
 	return session
+}
+
+// mustBuildSSHSessionWithLocalScript builds a session whose SSH-mode
+// target execs script directly in place of the local ssh binary,
+// bypassing StartSession's version query so these tests exercise
+// RunTurn's SSH launch machinery against a local fixture rather than a
+// real network host.
+func mustBuildSSHSessionWithLocalScript(t *testing.T, workDir, script, sshHost string) domain.Session {
+	t.Helper()
+	pt, fault := parsePassthroughConfig(map[string]any{})
+	if fault != nil {
+		t.Fatalf("parsePassthroughConfig() error = %v", fault)
+	}
+	return domain.Session{Internal: &sessionState{
+		target: agentcore.LaunchTarget{
+			Command:       script,
+			WorkspacePath: workDir,
+			RemoteCommand: "opencode",
+			SSHHost:       sshHost,
+		},
+		passthrough: pt,
+		major:       major1,
+		baseLogger:  slog.Default(),
+		usage:       agentcore.NewTurnEndUsage(),
+		drainGrace:  procutil.DefaultDrainGrace,
+	}}
 }
 
 func writeRunFixtureScript(t *testing.T, dir, fixtureName string) string {
@@ -217,7 +295,7 @@ func TestStartSession_ResumeSession(t *testing.T) {
 	resumeID := "ses_resume123"
 	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath:   t.TempDir(),
-		AgentConfig:     domain.AgentConfig{Command: "/bin/sh"},
+		AgentConfig:     domain.AgentConfig{Command: fakeMinimalRuntime(t)},
 		ResumeSessionID: resumeID,
 	})
 	if err != nil {
@@ -234,11 +312,17 @@ func TestStartSession_ResumeSession(t *testing.T) {
 }
 
 func TestStartSession_MCPConfigContent(t *testing.T) {
-	t.Parallel()
+	// Not parallel at this level: the "remote launch" case below calls
+	// t.Setenv on its own subtest, which panics if any ancestor called
+	// t.Parallel.
 
 	write := func(t *testing.T, content string) string {
 		t.Helper()
-		path := filepath.Join(t.TempDir(), "mcp.json")
+		dir := filepath.Join(t.TempDir(), workspacekit.SortieDir)
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+		path := filepath.Join(dir, "mcp.json")
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatalf("WriteFile() error = %v", err)
 		}
@@ -260,12 +344,22 @@ func TestStartSession_MCPConfigContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			command := fakeMinimalRuntime(t)
+			if tt.sshHost == "" {
+				t.Parallel()
+			} else {
+				// Not parallel: places a fake ssh stand-in first on PATH
+				// through t.Setenv, so the version query never reaches a
+				// real network host.
+				sshDir := t.TempDir()
+				agenttest.FakeRuntime(t, sshDir, "ssh", agenttest.OutputScenario, agenttest.Output{Stdout: "1.18.32\n"})
+				t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			}
 
 			a, _ := NewOpenCodeAdapter(map[string]any{})
 			session, err := a.StartSession(context.Background(), domain.StartSessionParams{
 				WorkspacePath: t.TempDir(),
-				AgentConfig:   domain.AgentConfig{Command: "/bin/sh"},
+				AgentConfig:   domain.AgentConfig{Command: command},
 				MCPConfigPath: write(t, tt.content),
 				SSHHost:       tt.sshHost,
 			})
@@ -277,8 +371,8 @@ func TestStartSession_MCPConfigContent(t *testing.T) {
 			if !ok {
 				t.Fatalf("session.Internal = %T, want *sessionState", session.Internal)
 			}
-			if got := state.mcpConfigContent != ""; got != tt.want {
-				t.Errorf("StartSession() delivered content = %v, want %v (content %q)", got, tt.want, state.mcpConfigContent)
+			if got := state.turnConfigContent != ""; got != tt.want {
+				t.Errorf("StartSession() delivered content = %v, want %v (content %q)", got, tt.want, state.turnConfigContent)
 			}
 		})
 	}
@@ -314,7 +408,7 @@ func TestRunTurn_ClosedSession(t *testing.T) {
 
 	a, _ := NewOpenCodeAdapter(map[string]any{})
 	tmpDir := t.TempDir()
-	session := mustStartSession(t, a, tmpDir, "/bin/sh")
+	session := mustStartSession(t, a, tmpDir, fakeMinimalRuntime(t))
 
 	state := session.Internal.(*sessionState)
 	state.mu.Lock()
@@ -337,12 +431,49 @@ func TestRunTurn_ClosedSession(t *testing.T) {
 	}
 }
 
+func TestRunTurn_LinkedWorkspaceRefusedBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	tmpDir := t.TempDir()
+	marker := filepath.Join(tmpDir, "marker")
+	script := writeOpenCodeScript(t, t.TempDir(), "#!/bin/sh\ntouch "+marker+"\n")
+
+	session := mustStartSession(t, a, tmpDir, script)
+
+	if err := os.RemoveAll(tmpDir); err != nil {
+		t.Fatalf("RemoveAll(workspace): %v", err)
+	}
+	linkTarget := t.TempDir()
+	if err := os.Symlink(linkTarget, tmpDir); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	_, err := a.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "work",
+		OnEvent: func(_ domain.AgentEvent) {},
+	})
+	if err == nil {
+		t.Fatal("RunTurn(linked workspace) error = nil, want non-nil")
+	}
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("error type = %T, want *domain.AgentError", err)
+	}
+	if agentErr.Kind != domain.ErrInvalidWorkspaceCwd {
+		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrInvalidWorkspaceCwd)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("marker file exists, want the subprocess never to start")
+	}
+}
+
 func TestRunTurn_ConcurrentRunRejected(t *testing.T) {
 	t.Parallel()
 
 	a, _ := NewOpenCodeAdapter(map[string]any{})
 	tmpDir := t.TempDir()
-	session := mustStartSession(t, a, tmpDir, "/bin/sh")
+	session := mustStartSession(t, a, tmpDir, fakeMinimalRuntime(t))
 
 	state := session.Internal.(*sessionState)
 	state.mu.Lock()
@@ -428,7 +559,7 @@ func TestStopSession_NoActiveTurn(t *testing.T) {
 
 	a, _ := NewOpenCodeAdapter(map[string]any{})
 	tmpDir := t.TempDir()
-	session := mustStartSession(t, a, tmpDir, "/bin/sh")
+	session := mustStartSession(t, a, tmpDir, fakeMinimalRuntime(t))
 
 	if err := a.StopSession(context.Background(), session); err != nil {
 		t.Fatalf("StopSession() error = %v, want nil", err)
@@ -966,6 +1097,7 @@ func TestRunTurn_SessionStartedOnce(t *testing.T) {
 	if n := countType(turn1Events, domain.EventSessionStarted); n != 1 {
 		t.Errorf("turn 1: session_started count = %d, want 1", n)
 	}
+	agenttest.AssertSessionIDContract(t, []string{session.ID}, turn1Events, result1)
 
 	// Second turn on the same session: session_started must not fire again.
 	turn2Events, result2, err := collectEvents(t, a, session, "second prompt")
@@ -1186,7 +1318,7 @@ func TestRunTurn_MaskedErrorRecoversModelNotFound(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("turn_failed count = %d, want 1 (the recovered detail replaces the masked relay), messages=%q", len(messages), messages)
 	}
-	const wantMessage = "Model not found: nonexistent/nonexistent"
+	const wantMessage = "Model not found: nonexistent/nonexistent; the runtime lists no nonexistent model, which is how it presents a provider with no credential"
 	if messages[0] != wantMessage {
 		t.Errorf("turn_failed message = %q, want %q", messages[0], wantMessage)
 	}
@@ -1312,6 +1444,69 @@ func TestRunTurn_MaskedErrorNoModelConfigured(t *testing.T) {
 		Work:              agentcore.WorkAbsent,
 		WorkDetail:        "no assistant output on the run stream",
 	}, result, err)
+}
+
+// TestRunTurn_FreeTierRefusalNamesDeniedTools pins that a 1.x free-tier
+// refusal against a policy denying bash names the denied tool in the
+// turn_failed message, appended to the vendor text.
+func TestRunTurn_FreeTierRefusalNamesDeniedTools(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := writeRunFixtureScript(t, tmpDir, "free_tier_refusal.jsonl")
+
+	a, err := NewOpenCodeAdapter(map[string]any{"allowed_tools": []any{"read", "glob"}})
+	if err != nil {
+		t.Fatalf("NewOpenCodeAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, _ := collectEvents(t, a, session, "work")
+
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+	failed := turnFailedEvents(events)
+	if len(failed) != 1 {
+		t.Fatalf("turn_failed event count = %d, want 1; got %v", len(failed), events)
+	}
+	const wantMessage = "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode" +
+		"; the opencode.allowed_tools and opencode.denied_tools settings deny bash, a tool the runtime's free tier requires"
+	if failed[0].Message != wantMessage {
+		t.Errorf("turn_failed Message = %q, want %q", failed[0].Message, wantMessage)
+	}
+}
+
+// TestRunTurn_FreeTierRefusalNamesDeniedTools_Major2 is the 2.x
+// counterpart of TestRunTurn_FreeTierRefusalNamesDeniedTools: the same
+// policy and the same denied-tool clause hold against the 2.x error
+// envelope shape.
+func TestRunTurn_FreeTierRefusalNamesDeniedTools_Major2(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := writeRunFixtureScriptMajor2(t, tmpDir, "free_tier_refusal_v2.jsonl")
+
+	a, err := NewOpenCodeAdapter(map[string]any{"allowed_tools": []any{"read", "glob"}})
+	if err != nil {
+		t.Fatalf("NewOpenCodeAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, _ := collectEvents(t, a, session, "work")
+
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+	failed := turnFailedEvents(events)
+	if len(failed) != 1 {
+		t.Fatalf("turn_failed event count = %d, want 1; got %v", len(failed), events)
+	}
+	const wantMessage = "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode" +
+		"; the opencode.allowed_tools and opencode.denied_tools settings deny bash, a tool the runtime's free tier requires"
+	if failed[0].Message != wantMessage {
+		t.Errorf("turn_failed Message = %q, want %q", failed[0].Message, wantMessage)
+	}
 }
 
 func TestRunTurn_OversizedStdoutLine(t *testing.T) {
@@ -1452,16 +1647,7 @@ func TestRunTurn_EventAgentPID(t *testing.T) {
 		script := writeRunFixtureScript(t, tmpDir, "simple_turn.jsonl")
 
 		a, _ := NewOpenCodeAdapter(map[string]any{})
-		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-			WorkspacePath: tmpDir,
-			AgentConfig:   domain.AgentConfig{Command: "opencode"},
-			SSHHost:       "example.test",
-		})
-		if err != nil {
-			t.Fatalf("StartSession() error = %v", err)
-		}
-		state := session.Internal.(*sessionState)
-		state.target.Command = script
+		session := mustBuildSSHSessionWithLocalScript(t, tmpDir, script, "example.test")
 
 		events, result, err := collectEvents(t, a, session, "work")
 		if err != nil {
@@ -2058,9 +2244,11 @@ printf '{"type":"step_finish","timestamp":1001,"sessionID":"ses_c1","part":{"id"
 }
 
 // TestRunTurn_ExitZeroNoJSONEventAtAll pins an emptier variant of the
-// no-output case: the process exits 0 having emitted nothing parseable
-// at all. It routes to the same zero-work row rather than letting the
-// adapter pre-classify a bare exit 0 as a success.
+// no-output case: the process exits 0 having written nothing readable
+// on standard output at all, so it fails with the early-exit report
+// rather than letting the adapter pre-classify a bare exit 0 as a
+// success or reach the zero-work row a readable-but-empty transcript
+// would.
 func TestRunTurn_ExitZeroNoJSONEventAtAll(t *testing.T) {
 	t.Parallel()
 
@@ -2078,10 +2266,10 @@ exit 0`)
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
 	}
 	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrTurnFailed {
-		t.Fatalf("RunTurn() error = %v, want AgentError{Kind: %q}", err, domain.ErrTurnFailed)
+	if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrPortExit {
+		t.Fatalf("RunTurn() error = %v, want AgentError{Kind: %q}", err, domain.ErrPortExit)
 	}
-	const wantMessage = "agent exited without producing output: no message from the agent and no tool call"
+	const wantMessage = "the agent runtime exited before responding: exit status 0"
 	if agentErr.Message != wantMessage {
 		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, wantMessage)
 	}
@@ -2090,13 +2278,46 @@ exit 0`)
 	if len(failedEvents) != 1 {
 		t.Fatalf("turn_failed event count = %d, want 1", len(failedEvents))
 	}
+}
 
-	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
-		ExitObserved: true,
-		ExitCode:     0,
-		Work:         agentcore.WorkAbsent,
-		WorkDetail:   "no message from the agent and no tool call",
-	}, result, err)
+// TestRunTurn_UnparseableLineDoesNotCountAsResponse pins that a line the
+// JSON decoder rejects never counts as the turn's response, even though
+// the runtime wrote it and exited cleanly: only a line that decodes as
+// a run event satisfies OutputWatch.
+func TestRunTurn_UnparseableLineDoesNotCountAsResponse(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := writeOpenCodeScript(t, tmpDir, `case "$1" in
+  export) echo '{"messages":[]}'; exit 0;;
+esac
+echo 'Usage: opencode [options]'
+exit 0`)
+
+	a, _ := NewOpenCodeAdapter(map[string]any{})
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, result, err := collectEvents(t, a, session, "work")
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("RunTurn() error = %v, want *domain.AgentError", err)
+	}
+	if _, ok := errors.AsType[*agentcore.EarlyExitError](agentErr.Err); !ok {
+		t.Errorf("RunTurn() error = %v, want a chain carrying an *agentcore.EarlyExitError", err)
+	}
+
+	var malformedCount int
+	for _, e := range events {
+		if e.Type == domain.EventMalformed {
+			malformedCount++
+		}
+	}
+	if malformedCount != 1 {
+		t.Errorf("EventMalformed count = %d, want 1; got %v", malformedCount, events)
+	}
 }
 
 // TestRunTurn_NonZeroExitNoTerminalReport pins the non-zero-exit
@@ -2472,15 +2693,15 @@ exit 0
 	return writeOpenCodeScript(t, dir, body)
 }
 
-// TestRunTurn_DescendantHoldsStdout drives the two scripts above through
-// the normal waitCh/postExitC completion path (never through cancellation
-// or StopSession) and asserts properties P1, P3, P5, and P7: the
-// in-group descendant is dead once the turn returns and no abandonment
-// record fires, because the reaper's unconditional group kill releases
-// the reader before sessionState.drainGrace can fire; the escaped
-// descendant survives, the turn still publishes within that bound, and
-// exactly one abandonment record is emitted; and both variants publish
-// the identical disposition and error.
+// TestRunTurn_DescendantHoldsStdout drives the two scripts above
+// through the normal waitCh/postExitC completion path (never through
+// cancellation or StopSession) and asserts that the in-group descendant
+// is dead once the turn returns and no abandonment record fires,
+// because the reaper's unconditional group kill releases the reader
+// before sessionState.drainGrace can fire; the escaped descendant
+// survives, the turn still publishes within that bound, and exactly one
+// abandonment record is emitted; and both variants publish the
+// identical disposition and error.
 func TestRunTurn_DescendantHoldsStdout(t *testing.T) {
 	t.Parallel()
 
@@ -2541,19 +2762,19 @@ func TestRunTurn_DescendantHoldsStdout(t *testing.T) {
 		elapsed := time.Since(start)
 
 		if elapsed > 3*time.Second {
-			t.Errorf("RunTurn() took %v, want well under 3s (property P1: bounded by sessionState.drainGrace)", elapsed)
+			t.Errorf("RunTurn() took %v, want well under 3s (bounded by sessionState.drainGrace)", elapsed)
 		}
 
 		if got := abandonmentWarnCount(spy); got != 1 {
-			t.Errorf("abandonment WARN count = %d, want exactly 1 (property P3)", got)
+			t.Errorf("abandonment WARN count = %d, want exactly 1", got)
 		}
 
 		if result.ExitReason != domain.EventTurnFailed {
-			t.Errorf("ExitReason = %q, want %q (same disposition as the unabandoned in-group variant, property P7)", result.ExitReason, domain.EventTurnFailed)
+			t.Errorf("ExitReason = %q, want %q (same disposition as the unabandoned in-group variant)", result.ExitReason, domain.EventTurnFailed)
 		}
 		var agentErr *domain.AgentError
 		if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrTurnFailed {
-			t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q} (property P7)", err, domain.ErrTurnFailed)
+			t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q} (same error as the unabandoned in-group variant)", err, domain.ErrTurnFailed)
 		}
 	})
 }
@@ -2608,12 +2829,13 @@ exit 0
 	}
 }
 
-// TestRunTurn_ContextCancellationArm_BoundedDrain exercises property P8
-// on opencode's context-cancellation early-return arm: with a descendant
-// holding the standard-output handle, the turn still publishes within
-// sessionState.drainGrace and emits exactly one abandonment record; with
-// no descendant, or one that dies with the group, it publishes without
-// spending the bound and without the record.
+// TestRunTurn_ContextCancellationArm_BoundedDrain exercises the bounded
+// drain on opencode's context-cancellation early-return arm: with a
+// descendant holding the standard-output handle, the turn still
+// publishes within sessionState.drainGrace and emits exactly one
+// abandonment record; with no descendant, or one that dies with the
+// group, it publishes without spending the bound and without the
+// record.
 func TestRunTurn_ContextCancellationArm_BoundedDrain(t *testing.T) {
 	t.Parallel()
 
@@ -2728,8 +2950,8 @@ sleep 3600
 	}
 }
 
-// TestRunTurn_SessionMismatchArm_BoundedDrain exercises property P8 on
-// opencode's session-mismatch early-return arm: with an escaped
+// TestRunTurn_SessionMismatchArm_BoundedDrain exercises the bounded
+// drain on opencode's session-mismatch early-return arm: with an escaped
 // descendant holding the standard-output handle, the mismatch turn still
 // publishes within sessionState.drainGrace and emits exactly one
 // abandonment record.
@@ -2782,8 +3004,8 @@ sleep 3600
 	}
 }
 
-// TestRunTurn_ReadTimeoutDoesNotFireAfterObservedExit covers guarantee
-// O12 and the second half of property P8: agent.read_timeout_ms is
+// TestRunTurn_ReadTimeoutDoesNotFireAfterObservedExit asserts that an
+// observed exit disarms the read timer: agent.read_timeout_ms is
 // configured shorter than the injected sessionState.drainGrace, and the
 // subprocess exits without ever emitting a JSON event while an escaped
 // descendant holds the output handle. The published disposition must be
@@ -2820,14 +3042,14 @@ esac
 
 	var agentErr *domain.AgentError
 	if errors.As(runErr, &agentErr) && agentErr.Kind == domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() reported ErrResponseTimeout, want the exit-based disposition (guarantee O12): err = %v", runErr)
+		t.Fatalf("RunTurn() reported ErrResponseTimeout, want the exit-based disposition: err = %v", runErr)
 	}
 	if result.ExitReason != domain.EventTurnFailed {
 		t.Errorf("ExitReason = %q, want %q (exit 0, no output at all)", result.ExitReason, domain.EventTurnFailed)
 	}
 }
 
-// writeOpenCodeLatchMoveScript builds the fixture the P8 latch-move case
+// writeOpenCodeLatchMoveScript builds the fixture the latch-move case
 // needs: a direct child that writes one standard-error line, writes
 // nothing to standard output, and exits; and an escaped descendant that
 // inherits the standard-output handle alone (never standard error too),
@@ -2852,9 +3074,8 @@ exit 0
 	return writeOpenCodeScript(t, dir, body)
 }
 
-// TestRunTurn_LatchSetDuringPostExitDrain covers P8's third case: a turn
-// whose first JSON event is received only after the exit has been
-// observed must still set the first-JSON latch, so finalizeExitedTurn
+// A turn whose first JSON event is received only after the exit has
+// been observed must still set the first-JSON latch, so finalizeExitedTurn
 // does not re-emit the direct child's standard error at WARN on a turn
 // that otherwise succeeded. The gate opens no earlier than
 // agent.read_timeout_ms after the direct child has already exited and
@@ -3150,4 +3371,259 @@ sleep 1000`)
 		t.Errorf("Usage = in:%d out:%d, want in:7 out:3",
 			result.Usage.InputTokens, result.Usage.OutputTokens)
 	}
+}
+
+// writeRunFixtureScriptWithCapture is [writeRunFixtureScript] extended
+// to record, only for the primary run invocation (not the export
+// sub-invocation the case statement intercepts first), the argument
+// vector and the whole of standard input it received.
+func writeRunFixtureScriptWithCapture(t *testing.T, dir, fixtureName, argvPath, stdinPath string) string {
+	t.Helper()
+
+	runPath := filepath.Join(dir, fixtureName)
+	if err := os.WriteFile(runPath, loadFixture(t, fixtureName), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", fixtureName, err)
+	}
+
+	exportPath := filepath.Join(dir, "export.json")
+	if err := os.WriteFile(exportPath, []byte(`{"messages":[]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(export.json): %v", err)
+	}
+
+	body := `case "$1" in
+  export) cat '` + exportPath + `'; exit 0;;
+esac
+cat > '` + stdinPath + `'
+printf '%s\n' "$@" > '` + argvPath + `'
+cat '` + runPath + `'`
+
+	return writeOpenCodeScript(t, dir, body)
+}
+
+// TestRunTurn_LocalLaunchIgnoresSSHEnvNames asserts that a local turn
+// (RemoteCommand empty) sends the same argument vector and empty
+// standard input whether or not LaunchTarget.SSHEnvNames names a set
+// variable: RunTurn's local branch never consults it. This reddens if
+// that branch starts treating a non-empty SSHEnvNames as a signal to
+// take the remote path, which would replace the local argument vector
+// with an SSH option vector and attach a non-empty preamble to
+// standard input.
+func TestRunTurn_LocalLaunchIgnoresSSHEnvNames(t *testing.T) {
+	// Not parallel: sets the carried variable via t.Setenv.
+	const varName = "SORTIE_OPENCODE_RUNTURN_LOCAL_INVARIANCE"
+	t.Setenv(varName, "should-never-reach-a-local-launch")
+
+	for _, tc := range []struct {
+		name        string
+		sshEnvNames []string
+	}{
+		{"SSHEnvNames absent", nil},
+		{"SSHEnvNames naming a set variable", []string{varName}},
+	} {
+		tmpDir := t.TempDir()
+		argvPath := filepath.Join(tmpDir, "argv.txt")
+		stdinPath := filepath.Join(tmpDir, "stdin.txt")
+		script := writeRunFixtureScriptWithCapture(t, tmpDir, "simple_turn.jsonl", argvPath, stdinPath)
+
+		a, err := NewOpenCodeAdapter(map[string]any{})
+		if err != nil {
+			t.Fatalf("%s: NewOpenCodeAdapter() error = %v, want nil", tc.name, err)
+		}
+		session := mustStartSession(t, a, tmpDir, script)
+		state, ok := session.Internal.(*sessionState)
+		if !ok {
+			t.Fatalf("%s: session.Internal type = %T, want *sessionState", tc.name, session.Internal)
+		}
+		state.target.SSHEnvNames = tc.sshEnvNames
+
+		events, result, err := collectEvents(t, a, session, "work")
+		if err != nil {
+			t.Fatalf("%s: RunTurn() error = %v, want nil", tc.name, err)
+		}
+		if result.ExitReason != domain.EventTurnCompleted {
+			t.Errorf("%s: ExitReason = %q, want %q", tc.name, result.ExitReason, domain.EventTurnCompleted)
+		}
+		if len(events) == 0 {
+			t.Errorf("%s: events = 0, want > 0", tc.name)
+		}
+
+		argv, err := os.ReadFile(argvPath)
+		if err != nil {
+			t.Fatalf("%s: ReadFile(argv.txt): %v", tc.name, err)
+		}
+		if strings.Contains(string(argv), "StrictHostKeyChecking") {
+			t.Errorf("%s: argv = %q, want the local argument vector, not an SSH option vector", tc.name, argv)
+		}
+
+		stdin, err := os.ReadFile(stdinPath)
+		if err != nil {
+			t.Fatalf("%s: ReadFile(stdin.txt): %v", tc.name, err)
+		}
+		if len(stdin) != 0 {
+			t.Errorf("%s: subprocess standard input = %q, want empty on a local launch", tc.name, stdin)
+		}
+	}
+}
+
+// newHookTestState builds a sessionState pointing to a local fake
+// runtime, for a test-only hook that reads a session's own auxiliary
+// commands directly rather than through StartSession.
+func newHookTestState(t *testing.T, major runtimeMajor, scriptBody string) *sessionState {
+	t.Helper()
+
+	script := agenttest.WriteScript(t, t.TempDir(), "fake-opencode", scriptBody)
+	pt, fault := parsePassthroughConfig(map[string]any{})
+	if fault != nil {
+		t.Fatalf("parsePassthroughConfig() error = %v", fault)
+	}
+	return &sessionState{
+		target: agentcore.LaunchTarget{
+			Command:       script,
+			WorkspacePath: t.TempDir(),
+		},
+		passthrough: pt,
+		major:       major,
+		baseLogger:  slog.Default(),
+	}
+}
+
+func TestRuntimeMajorForTest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wrong internal type", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := RuntimeMajorForTest(domain.Session{Internal: "not a sessionState"}); err == nil {
+			t.Fatal("RuntimeMajorForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("major never detected", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := RuntimeMajorForTest(domain.Session{Internal: &sessionState{major: majorUnknown}}); err == nil {
+			t.Fatal("RuntimeMajorForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("detected major is returned", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := RuntimeMajorForTest(domain.Session{Internal: &sessionState{major: major2}})
+		if err != nil {
+			t.Fatalf("RuntimeMajorForTest() error = %v", err)
+		}
+		if got != 2 {
+			t.Errorf("RuntimeMajorForTest() = %d, want 2", got)
+		}
+	})
+}
+
+func TestEffectivePermissionsForTest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wrong internal type", func(t *testing.T) {
+		t.Parallel()
+
+		if _, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: "not a sessionState"}); err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("major never detected", func(t *testing.T) {
+		t.Parallel()
+
+		if _, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: &sessionState{major: majorUnknown}}); err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("workspace re-verification failure fails the build", func(t *testing.T) {
+		t.Parallel()
+
+		state := &sessionState{
+			target: agentcore.LaunchTarget{
+				Command:       "/usr/bin/opencode",
+				WorkspacePath: filepath.Join(t.TempDir(), "missing"),
+			},
+			major:      major1,
+			baseLogger: slog.Default(),
+		}
+		if _, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state}); err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("a missing binary fails to start", func(t *testing.T) {
+		t.Parallel()
+
+		state := &sessionState{
+			target: agentcore.LaunchTarget{
+				Command:       filepath.Join(t.TempDir(), "no-such-binary"),
+				WorkspacePath: t.TempDir(),
+			},
+			major:      major1,
+			baseLogger: slog.Default(),
+		}
+		if _, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state}); err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("a non-zero exit is an error", func(t *testing.T) {
+		t.Parallel()
+
+		state := newHookTestState(t, major1, "exit 1")
+		if _, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state}); err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+	})
+
+	t.Run("output that does not decode is an error", func(t *testing.T) {
+		t.Parallel()
+
+		state := newHookTestState(t, major1, "echo 'not json'")
+		effective, raw, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state})
+		if err == nil {
+			t.Fatal("EffectivePermissionsForTest() error = nil, want non-nil")
+		}
+		if effective != nil {
+			t.Errorf("EffectivePermissionsForTest() effective = %v, want nil", effective)
+		}
+		if !strings.Contains(string(raw), "not json") {
+			t.Errorf("EffectivePermissionsForTest() raw = %q, want it to carry the command's own output", raw)
+		}
+	})
+
+	t.Run("1.x permission object", func(t *testing.T) {
+		t.Parallel()
+
+		state := newHookTestState(t, major1, `printf '{"permission":{"bash":"deny","read":"allow"}}'`)
+		effective, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state})
+		if err != nil {
+			t.Fatalf("EffectivePermissionsForTest() error = %v", err)
+		}
+		want := map[string]string{"bash": "deny", "read": "allow"}
+		if !maps.Equal(effective, want) {
+			t.Errorf("EffectivePermissionsForTest() effective = %v, want %v", effective, want)
+		}
+	})
+
+	t.Run("2.x a later document rule overwrites an earlier one", func(t *testing.T) {
+		t.Parallel()
+
+		const doc = `[{"type":"document","info":{"permissions":[{"resource":"*","action":"bash","effect":"allow"}]}},` +
+			`{"type":"document","info":{"permissions":[{"resource":"*","action":"bash","effect":"deny"},{"resource":"*","action":"read","effect":"allow"}]}},` +
+			`{"type":"other","info":{"permissions":[{"resource":"*","action":"webfetch","effect":"allow"}]}}]`
+
+		state := newHookTestState(t, major2, "printf '"+doc+"'")
+		effective, _, err := EffectivePermissionsForTest(context.Background(), domain.Session{Internal: state})
+		if err != nil {
+			t.Fatalf("EffectivePermissionsForTest() error = %v", err)
+		}
+		want := map[string]string{"bash": "deny", "read": "allow"}
+		if !maps.Equal(effective, want) {
+			t.Errorf("EffectivePermissionsForTest() effective = %v, want %v", effective, want)
+		}
+	})
 }

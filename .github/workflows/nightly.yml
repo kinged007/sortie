@@ -3,17 +3,19 @@ name: Nightly
 
 on:
   schedule:
-    # 02:17 UTC daily. Off the hour to avoid GitHub's on-the-hour scheduling lag.
     - cron: "17 2 * * *"
   workflow_dispatch:
 
 permissions:
-  # Checkout only. Issues are filed with CICDBOT_TOKEN, not the workflow token.
   contents: read
+  actions: read
 
 concurrency:
   group: nightly
   cancel-in-progress: false
+
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
 
 jobs:
   integration:
@@ -43,11 +45,12 @@ jobs:
             adapter: claude
             kind: agent
             guard: SORTIE_CLAUDE_TEST
+            credential_env: ANTHROPIC_API_KEY
             run_filter: Integration
             test_path: ./internal/agent/claude/...
-            timeout: 300s
+            timeout: 600s
             node: true
-            install: npm install -g @anthropic-ai/claude-code
+            install: npm install -g --ignore-scripts=false @anthropic-ai/claude-code
             version_cmd: claude --version
             source: "npm: @anthropic-ai/claude-code (unpinned, installs latest)"
 
@@ -55,6 +58,7 @@ jobs:
             adapter: codex
             kind: agent
             guard: SORTIE_CODEX_TEST
+            credential_env: CODEX_API_KEY
             run_filter: Integration
             test_path: ./internal/agent/codex/...
             timeout: 300s
@@ -67,6 +71,7 @@ jobs:
             adapter: copilot
             kind: agent
             guard: SORTIE_COPILOT_TEST
+            credential_env: GH_TOKEN
             run_filter: Integration
             test_path: ./internal/agent/copilot/...
             timeout: 300s
@@ -83,9 +88,23 @@ jobs:
             test_path: ./internal/agent/opencode/...
             timeout: 300s
             node: true
-            install: npm install -g opencode-ai
+            install: npm install -g --ignore-scripts=false opencode-ai@1
             version_cmd: opencode --version
-            source: "npm: opencode-ai (unpinned, installs latest)"
+            source: "npm: opencode-ai@1 (latest 1.x)"
+            opencode_major: "1"
+
+          - name: OpenCode 2.x
+            adapter: opencode-2
+            kind: agent
+            guard: SORTIE_OPENCODE_TEST
+            run_filter: Integration
+            test_path: ./internal/agent/opencode/...
+            timeout: 300s
+            node: true
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
+            version_cmd: opencode --version
+            source: "npm: @opencode/cli@2 (latest 2.x)"
+            opencode_major: "2"
 
           - name: Pi
             adapter: pi
@@ -103,6 +122,7 @@ jobs:
             adapter: kiro
             kind: agent
             guard: SORTIE_KIRO_TEST
+            credential_env: KIRO_API_KEY
             run_filter: Integration
             test_path: ./internal/agent/kiro/...
             timeout: 300s
@@ -115,6 +135,7 @@ jobs:
             adapter: acp-gemini
             kind: agent
             guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: GEMINI_API_KEY
             run_filter: Integration
             test_path: ./internal/agent/clientprotocol/...
             timeout: 900s
@@ -123,12 +144,13 @@ jobs:
             version_cmd: gemini --version
             source: "npm: @google/gemini-cli (unpinned, installs latest)"
             clientprotocol_command: "gemini --acp"
-            clientprotocol_profile: internal/qualification/profiles/gemini-cli.json
+            clientprotocol_profile: tools/qualify/profiles/gemini-cli.json
 
           - name: Kiro - ACP
             adapter: acp-kiro
             kind: agent
             guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: KIRO_API_KEY
             run_filter: Integration
             test_path: ./internal/agent/clientprotocol/...
             timeout: 900s
@@ -137,7 +159,7 @@ jobs:
             version_cmd: kiro-cli --version
             source: "curl https://cli.kiro.dev/install (unpinned, installs latest)"
             clientprotocol_command: "kiro-cli acp -a"
-            clientprotocol_profile: internal/qualification/profiles/kiro-cli.json
+            clientprotocol_profile: tools/qualify/profiles/kiro-cli.json
 
           - name: Jira
             adapter: jira
@@ -239,13 +261,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Build NITE
+        run: go build -o "$RUNNER_TEMP/nite" ./tools/nite
+
       - name: Set up Node.js
         if: ${{ matrix.node }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
-      - name: Publish hosted GitLab coordinates
+      - name: Publish GitLab coordinates
         if: ${{ matrix.hosted }}
         env:
           HOSTED_TOKEN: ${{ secrets.SORTIE_GITLAB_TOKEN }}
@@ -274,7 +299,7 @@ jobs:
 
           exit 0
 
-      - name: Boot and provision the containerized instance
+      - name: Provision container
         if: ${{ matrix.provision_script != '' }}
         run: ${{ matrix.provision_script }} "${{ matrix.container_image }}"
 
@@ -283,20 +308,15 @@ jobs:
         env:
           ADAPTER: ${{ matrix.adapter }}
           GUARD: ${{ matrix.guard }}
+          CREDENTIAL_ENV: ${{ matrix.credential_env }}
           INSTALL_CMD: ${{ matrix.install }}
           VERSION_CMD: ${{ matrix.version_cmd }}
           RUN_FILTER: ${{ matrix.run_filter }}
           TEST_PATH: ${{ matrix.test_path }}
           TIMEOUT: ${{ matrix.timeout }}
-          # Empty on every shard but the client-protocol ones, which name a
-          # runtime each. Two shards drive that one adapter against two
-          # different binaries, so the coordinates belong to the shard rather
-          # than to the job, and they are declared under their real names here
-          # so the reachability guard can still read them out of the workflow.
           SORTIE_CLIENTPROTOCOL_COMMAND: ${{ matrix.clientprotocol_command }}
           SORTIE_CLIENTPROTOCOL_PROFILE: ${{ matrix.clientprotocol_profile }}
-          # Consumed only by the copilot adapter's test, which reads GH_TOKEN.
-          # The issue-reporting steps override GH_TOKEN with CICDBOT_TOKEN.
+          SORTIE_OPENCODE_MAJOR: ${{ matrix.opencode_major }}
           GH_TOKEN: ${{ secrets.SORTIE_COPILOT_TOKEN }}
         run: |
           # The runner's default bash uses -e; disable it so a failing test is
@@ -326,6 +346,13 @@ jobs:
           # Enable only the targeted adapter's integration tests.
           export "${GUARD}=1"
 
+          # The refused-credential case's coordinate name follows the
+          # guard's own name; opencode sets none, since its suite
+          # defaults to the runtime's free model.
+          if [ -n "${CREDENTIAL_ENV}" ]; then
+            export "${GUARD%_TEST}_CREDENTIAL_ENV=${CREDENTIAL_ENV}"
+          fi
+
           TIMEOUT_FLAG=()
           if [ -n "${TIMEOUT}" ]; then TIMEOUT_FLAG=(-timeout "${TIMEOUT}"); fi
 
@@ -338,87 +365,26 @@ jobs:
             echo "outcome=success" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: File or update failure issue
-        if: steps.check.outputs.outcome == 'failure'
+      - name: Decide incident state
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.CICDBOT_TOKEN }}
+          RUN_HISTORY_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NITE_BIN: ${{ runner.temp }}/nite
           ADAPTER: ${{ matrix.adapter }}
           ADAPTER_NAME: ${{ matrix.name }}
           KIND: ${{ matrix.kind }}
           SOURCE: ${{ matrix.source }}
-        run: |
-          # Backticks in the printf formats below are literal Markdown for the
-          # issue body, not command substitution.
-          # shellcheck disable=SC2016
-          set -euo pipefail
-          export TITLE="Nightly integration failure: ${ADAPTER_NAME}"
+          # See  `gh api orgs/sortie-ai/issue-types`
+          TEST_ISSUE_TYPE_ID: IT_kwDOEAsIKM4B7Iak
+          JOB_NAME: "Integration: ${{ matrix.name }}"
+          TEST_REPORT_PATH: gotest.json
+          OUTCOME: ${{ steps.check.outputs.outcome }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: scripts/nightly-issue.sh decide
 
-          FAILED=""
-          LOG="Install step failed before tests ran; no test output captured."
-          if [ -f gotest.json ]; then
-            FAILED="$(jq -rR 'fromjson? | select(.Action == "fail" and (.Test != null)) | .Test' gotest.json 2>/dev/null | sort -u)"
-            LOG="$(jq -jR 'fromjson? | select(.Action == "output") | .Output' gotest.json 2>/dev/null | tail -c 6000)"
-            if [ -z "${LOG}" ]; then LOG="$(tail -c 6000 gotest.json)"; fi
-          fi
-
-          if [ -n "${FAILED}" ]; then
-            FAILED_MD="$(printf '%s\n' "${FAILED}" | sed 's/^/- `/; s/$/`/')"
-          else
-            FAILED_MD="_No test-level failures parsed (build error, panic, timeout, or install failure). See the log excerpt._"
-          fi
-
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          NOW="$(date -u '+%Y-%m-%d %H:%M UTC')"
-
-          {
-            printf 'Nightly integration tests failed for `%s`.\n\n' "${ADAPTER}"
-            printf '| Field | Value |\n|---|---|\n'
-            printf '| Adapter | `%s` (%s) |\n' "${ADAPTER}" "${KIND}"
-            printf '| Tested version | %s |\n' "${ADAPTER_VERSION}"
-            printf '| Install source | %s |\n' "${SOURCE}"
-            printf '| Run | %s |\n' "${RUN_URL}"
-            printf '| Commit | `%s` |\n' "${GITHUB_SHA}"
-            printf '| Date | %s |\n\n' "${NOW}"
-            printf '### Failing tests\n\n%s\n\n' "${FAILED_MD}"
-            printf '### Log excerpt\n\n```\n%s\n```\n\n' "${LOG}"
-            printf '%s\n' "_Filed by the nightly integration monitor. It comments on recurrence and closes automatically when this adapter passes again._"
-          } > body.md
-
-          NUM="$(gh issue list --state open --limit 100 --search "in:title \"${TITLE}\"" --json number,title \
-            | jq -r --arg t "${TITLE}" '[.[] | select(.title == $t) | .number] | (first // empty)')"
-
-          if [ -n "${NUM}" ]; then
-            gh issue comment "${NUM}" --body-file body.md
-            echo "Updated existing issue #${NUM}"
-          else
-            gh label create ci-nightly --color D73A4A --description "Nightly integration test failures" --force >/dev/null 2>&1 || true
-            gh issue create --title "${TITLE}" --label ci-nightly --body-file body.md
-          fi
-
-      - name: Close resolved issue
-        if: steps.check.outputs.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.CICDBOT_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          ADAPTER: ${{ matrix.adapter }}
-          ADAPTER_NAME: ${{ matrix.name }}
-        run: |
-          set -euo pipefail
-          export TITLE="Nightly integration failure: ${ADAPTER_NAME}"
-
-          NUM="$(gh issue list --state open --limit 100 --search "in:title \"${TITLE}\"" --json number,title \
-            | jq -r --arg t "${TITLE}" '[.[] | select(.title == $t) | .number] | (first // empty)')"
-
-          if [ -n "${NUM}" ]; then
-            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            NOW="$(date -u '+%Y-%m-%d %H:%M UTC')"
-            gh issue comment "${NUM}" --body "Recovered: \`${ADAPTER}\` integration tests passed on ${NOW}. Closing. Run: ${RUN_URL}"
-            gh issue close "${NUM}"
-            echo "Closed issue #${NUM} (recovered)"
-          fi
-
-      - name: Fail job on integration failure
+      - name: Report integration failure
         if: steps.check.outputs.outcome == 'failure'
         env:
           ADAPTER: ${{ matrix.adapter }}
@@ -442,7 +408,82 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run the hook stress harness
+      - name: Run hook stress
         env:
           SORTIE_HOOKSTRESS_TEST: "1"
         run: go test -v -count=1 -timeout 15m ./internal/workspace/...
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs: [integration, hook-stress]
+    # A failed or cancelled nightly is the one worth reporting.
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Post nightly outcome
+        # A notification failure must not redden a nightly whose tests passed.
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_CI }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          INTEGRATION: ${{ needs.integration.result }}
+          HOOK_STRESS: ${{ needs.hook-stress.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK}" ]; then
+            echo "::warning::DISCORD_WEBHOOK_CI is not configured; skipping"
+            exit 0
+          fi
+
+          if [ "${INTEGRATION}" = "success" ] && [ "${HOOK_STRESS}" = "success" ]; then
+            printf 'Nightly passed. Integration and Windows hook stress are both green.\n' >message.txt
+            scripts/discord-notify.sh <message.txt
+          else
+            # Without the job list the summary still names the failed groups.
+            if ! gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped") | {name, url: .html_url, conclusion}]' \
+              >jobs.json; then
+              echo '[]' >jobs.json
+            fi
+
+            jq -n \
+              --arg integration "${INTEGRATION}" \
+              --arg hook_stress "${HOOK_STRESS}" \
+              --arg url "${RUN_URL}" \
+              --slurpfile jobs jobs.json \
+              '(if $jobs[0] == [] then
+                  [["Integration", $integration], ["Windows hook stress", $hook_stress]]
+                  | map(select(.[1] != "success") | {name: .[0], conclusion: .[1]})
+                else
+                  $jobs[0] | map(.name |= ltrimstr("Integration: "))
+                end
+                | map(.failed = (.conclusion == "failure" or .conclusion == "timed_out"))) as $checks
+              | ($checks | map(select(.failed)) | length) as $failed
+              | {
+                  title: (
+                    if $failed == 1 then "1 nightly check failed"
+                    elif $failed > 1 then "\($failed) nightly checks failed"
+                    else "Nightly didn’t finish" end
+                  ),
+                  url: $url,
+                  color: (if $failed > 0 then 15548997 else 9807270 end),
+                  description: (
+                    $checks
+                    | map(
+                        (if .url then "[\(.name)](\(.url))" else .name end)
+                        + (if $failed > 0 and (.failed | not) then " (didn’t finish)" else "" end)
+                      )
+                    | join("\n")
+                  )
+                }' >embed.json
+            scripts/discord-notify.sh --embed <embed.json
+          fi

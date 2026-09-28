@@ -578,7 +578,7 @@
                 }
             ],
             "title": "Token Consumption",
-            "description": "Tokens per minute by type (input, output, cache_read).",
+            "description": "Tokens per minute by type (input, output, cache_read, cache_write).",
             "type": "timeseries"
         },
         {

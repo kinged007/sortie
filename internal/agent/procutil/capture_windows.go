@@ -74,12 +74,11 @@ func defaultResumeProcess(pid int) error {
 }
 
 // startAndAssign creates cmd suspended within a new process group,
-// starts it, and assigns, registers, and resumes it, following S2
-// through S4 of the capture sequence. keepJobHandle requests a
-// duplicate Job Object handle for a caller that drains the job itself
-// later (a Capture); the returned handle is zero when keepJobHandle is
-// false, when assignment failed, or when Unix has no Job Object
-// analogue.
+// starts it, and assigns, registers, and resumes it. keepJobHandle
+// requests a duplicate Job Object handle for a caller that drains the
+// job itself later (a Capture); the returned handle is zero when
+// keepJobHandle is false, when assignment failed, or when Unix has no
+// Job Object analogue.
 //
 // A returned error with a nil cmd.Process means cmd.Start failed. Any
 // other error means the process started but could not be resumed: by
@@ -97,6 +96,16 @@ func startAndAssign(cmd *exec.Cmd, logger *slog.Logger, keepJobHandle bool) (job
 	}
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
 
+	// os/exec may run Cancel as soon as Start returns, and a cancellation
+	// that looked up the job before its registration would miss it.
+	registered := make(chan struct{})
+	if cancel := cmd.Cancel; cancel != nil {
+		cmd.Cancel = func() error {
+			<-registered
+			return cancel()
+		}
+	}
+
 	if startErr := cmd.Start(); startErr != nil {
 		return 0, time.Time{}, startErr
 	}
@@ -112,6 +121,7 @@ func startAndAssign(cmd *exec.Cmd, logger *slog.Logger, keepJobHandle bool) (job
 			slog.Any("error", assignErr))
 	}
 	registerJobAssignment(cmd.Process.Pid, cmd.Process, job)
+	close(registered)
 
 	resumeSeam()
 
@@ -248,14 +258,14 @@ type jobTeardown struct {
 // tree still alive after its drain returned. Only a test replaces it.
 var scanSurvivorsFunc = scanSurvivors
 
-// drainCaptureJob runs D1 to D3 of the capture sequence: it drains job
-// (D1, skipped when job is zero, meaning assignment never produced
-// one), reads its member list and probes the direct child identified by
-// cmd.Process, scanning the process list for survivors only when there
-// is no Job Object, the drain ended with an active process, or a drain
-// query failed (D2), logs the teardown record, and closes job (D3).
-// startedAt is the moment cmd.Start returned, for the root probe's
-// PID-reuse guard; waitMS is the reap duration the caller measured.
+// drainCaptureJob drains job (skipped when job is zero, meaning
+// assignment never produced one), reads its member list and probes the
+// direct child identified by cmd.Process, scanning the process list for
+// survivors only when there is no Job Object, the drain ended with an
+// active process, or a drain query failed, logs the teardown record,
+// and closes job. startedAt is the moment cmd.Start returned, for the
+// root probe's PID-reuse guard; waitMS is the reap duration the caller
+// measured.
 func drainCaptureJob(job uintptr, cmd *exec.Cmd, startedAt time.Time, waitMS int64, logger *slog.Logger) {
 	jobHandle := windows.Handle(job)
 	hasJob := jobHandle != 0

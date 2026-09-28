@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -171,7 +173,6 @@ func TestBuildSessionToolRegistry_AllToolsPresent(t *testing.T) {
 		WorkspacePath:  tmpDir,
 		DBPath:         dbPath,
 		IssueID:        "issue-1",
-		SessionID:      "sess-1",
 		MaxTokens:      100000,
 		MaxSessions:    10,
 		Notifications:  []config.NotificationBackend{webhookBackend(t)},
@@ -194,6 +195,83 @@ func TestBuildSessionToolRegistry_AllToolsPresent(t *testing.T) {
 		t.Errorf("tools/list len = %d, registry.Len() = %d; want equal", len(mcpNames), len(registryNames))
 	}
 	assertContainsAll(t, "tools/list", mcpNames, want)
+}
+
+// TestBuildSessionToolRegistry_TokenWarningThreshold verifies that
+// SessionToolParams.TokenWarningThreshold reaches the registered
+// cost_budget tool's behavior, and that a zero value produces a
+// pre-change byte-identical result.
+func TestBuildSessionToolRegistry_TokenWarningThreshold(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "warning.db")
+	seedDB(t, dbPath)
+
+	baseParams := SessionToolParams{
+		TrackerAdapter: &stubTrackerAdapter{},
+		Project:        "TESTPROJ",
+		WorkspacePath:  tmpDir,
+		DBPath:         dbPath,
+		IssueID:        "issue-warning",
+		MaxTokens:      1000,
+		MaxSessions:    10,
+	}
+
+	// The subtests share one database file, and on Windows a second
+	// read-only open racing the first can fail, which silently drops
+	// cost_budget from the registry; they run one at a time for that.
+	executeCostBudget := func(t *testing.T, params SessionToolParams) map[string]any {
+		t.Helper()
+		result, err := BuildSessionToolRegistry(context.Background(), slog.New(slog.DiscardHandler), params)
+		if err != nil {
+			t.Fatalf("BuildSessionToolRegistry: %v", err)
+		}
+		t.Cleanup(func() { closeResult(t, result) })
+
+		tool, ok := result.Registry.Get("cost_budget")
+		if !ok {
+			t.Fatal("cost_budget tool not registered")
+		}
+		out, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatalf("cost_budget Execute: %v", err)
+		}
+		var top map[string]any
+		if err := json.Unmarshal(out, &top); err != nil {
+			t.Fatalf("unmarshal cost_budget response %q: %v", out, err)
+		}
+		data, ok := top["data"].(map[string]any)
+		if !ok {
+			t.Fatalf("cost_budget data = %T, want map", top["data"])
+		}
+		return data
+	}
+
+	t.Run("non-zero threshold reaches the cost_budget tool", func(t *testing.T) {
+		params := baseParams
+		params.TokenWarningThreshold = 800
+
+		data := executeCostBudget(t, params)
+
+		got, ok := data["warning_tokens"].(float64)
+		if !ok || int64(got) != 800 {
+			t.Errorf("cost_budget data.warning_tokens = %v, want 800", data["warning_tokens"])
+		}
+	})
+
+	t.Run("zero threshold produces a pre-change byte-identical result", func(t *testing.T) {
+		params := baseParams
+		params.TokenWarningThreshold = 0
+
+		data := executeCostBudget(t, params)
+
+		for _, key := range []string{"warning_tokens", "warning_reached"} {
+			if _, present := data[key]; present {
+				t.Errorf("cost_budget data has key %q, want absent when TokenWarningThreshold is 0", key)
+			}
+		}
+	})
 }
 
 // TestBuildSessionToolRegistry_GatingPreserved verifies that unset gates
@@ -509,5 +587,120 @@ func TestBuildSessionToolRegistry_StoreOpenedThenNotifierError(t *testing.T) {
 				t.Errorf("BuildSessionToolRegistry(%q) result.Registry non-nil on error, want nil", tt.name)
 			}
 		})
+	}
+}
+
+func TestBuildSessionToolRegistry_NotifyOperatorWithoutIdentity(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".sortie"), 0o750); err != nil {
+		t.Fatalf("MkdirAll(.sortie): %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		workspacePath string
+		dispatchID    string
+	}{
+		{name: "missing workspace path", workspacePath: "", dispatchID: "dispatch-1"},
+		{name: "missing dispatch id", workspacePath: tmpDir, dispatchID: ""},
+		{name: "both missing", workspacePath: "", dispatchID: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var captured []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured, _ = io.ReadAll(r.Body)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			params := SessionToolParams{
+				WorkspacePath: tt.workspacePath,
+				DispatchID:    tt.dispatchID,
+				Notifications: []config.NotificationBackend{
+					{Kind: "webhook", Config: map[string]any{"url": srv.URL}},
+				},
+			}
+
+			result, err := BuildSessionToolRegistry(context.Background(), slog.New(slog.DiscardHandler), params)
+			if err != nil {
+				t.Fatalf("BuildSessionToolRegistry(%q) error = %v, want nil", tt.name, err)
+			}
+			t.Cleanup(func() { closeResult(t, result) })
+
+			names := toolNamesFromResult(result)
+			if !slices.Contains(names, "notify_operator") {
+				t.Fatalf("BuildSessionToolRegistry(%q) tool names = %v, want notify_operator present", tt.name, names)
+			}
+
+			tool, ok := result.Registry.Get("notify_operator")
+			if !ok {
+				t.Fatalf("BuildSessionToolRegistry(%q): notify_operator not retrievable from registry", tt.name)
+			}
+
+			raw, execErr := tool.Execute(context.Background(), json.RawMessage(`{"severity":"info","title":"T","body":"B"}`))
+			if execErr != nil {
+				t.Fatalf("Execute: %v", execErr)
+			}
+			var result2 struct {
+				Success bool `json:"success"`
+				Error   struct {
+					Kind string `json:"kind"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(raw, &result2); err != nil {
+				t.Fatalf("unmarshal Execute result: %v", err)
+			}
+			if result2.Success {
+				t.Fatalf("Execute result success = true, want false: %s", raw)
+			}
+			if result2.Error.Kind != "state_unavailable" {
+				t.Errorf("Execute result error.kind = %q, want %q", result2.Error.Kind, "state_unavailable")
+			}
+
+			if captured != nil {
+				t.Errorf("backend received a request %q, want none reached without dispatch identity", captured)
+			}
+		})
+	}
+}
+
+func TestBuildSessionToolRegistry_CreatesNoFileBeforeExecute(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".sortie"), 0o750); err != nil {
+		t.Fatalf("MkdirAll(.sortie): %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	params := SessionToolParams{
+		WorkspacePath: tmpDir,
+		DispatchID:    "dispatch-construction",
+		Notifications: []config.NotificationBackend{
+			{Kind: "webhook", Config: map[string]any{"url": srv.URL}},
+		},
+	}
+
+	result, err := BuildSessionToolRegistry(context.Background(), slog.New(slog.DiscardHandler), params)
+	if err != nil {
+		t.Fatalf("BuildSessionToolRegistry error = %v, want nil", err)
+	}
+	t.Cleanup(func() { closeResult(t, result) })
+
+	entries, readErr := os.ReadDir(filepath.Join(tmpDir, ".sortie", "notification_slots"))
+	if readErr == nil {
+		t.Errorf("notification_slots directory exists with entries %v before Execute, want absent", entries)
+	} else if !os.IsNotExist(readErr) {
+		t.Fatalf("ReadDir(notification_slots) unexpected error: %v", readErr)
 	}
 }

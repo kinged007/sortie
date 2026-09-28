@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +51,7 @@ func makeNotification() domain.Notification {
 			Source:         "test-host",
 			IssueID:        "issue-7",
 			Identifier:     "PROJ-7",
+			DispatchID:     "dispatch-uuid-001",
 			SessionID:      "sess-xyz",
 			Attempt:        new(2),
 			Agent:          "claude-code",
@@ -167,6 +169,7 @@ func TestWebhook_Send_PostsEnvelopeAndMessage(t *testing.T) {
 		"source":          "test-host",
 		"issue_id":        "issue-7",
 		"identifier":      "PROJ-7",
+		"dispatch_id":     "dispatch-uuid-001",
 		"session_id":      "sess-xyz",
 		"agent":           "claude-code",
 		"severity":        "warning",
@@ -189,6 +192,39 @@ func TestWebhook_Send_PostsEnvelopeAndMessage(t *testing.T) {
 		t.Error("body[\"attempt\"] missing")
 	} else if attempt, ok := attemptRaw.(float64); !ok || int(attempt) != 2 {
 		t.Errorf("body[\"attempt\"] = %v, want 2", attemptRaw)
+	}
+}
+
+func TestWebhook_Send_EmptySessionIDPostsEmptyString(t *testing.T) {
+	t.Parallel()
+
+	srv, getBody := captureServer(t, http.StatusOK)
+
+	n, err := newNotifier(map[string]any{"url": srv.URL})
+	if err != nil {
+		t.Fatalf("newNotifier: %v", err)
+	}
+
+	notif := makeNotification()
+	notif.Envelope.SessionID = ""
+	if err := n.Send(context.Background(), notif); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(getBody(), &m); err != nil {
+		t.Fatalf("Send body unmarshal: %v", err)
+	}
+
+	got, ok := m["session_id"]
+	if !ok {
+		t.Fatal("body[\"session_id\"] key absent, want present with an empty value")
+	}
+	if got != "" {
+		t.Errorf("body[\"session_id\"] = %v, want empty string", got)
+	}
+	if got, _ := m["dispatch_id"].(string); got != notif.Envelope.DispatchID {
+		t.Errorf("body[\"dispatch_id\"] = %q, want %q", got, notif.Envelope.DispatchID)
 	}
 }
 
@@ -233,14 +269,30 @@ func TestWebhook_Send_Non2xxReturnsClassifiedError(t *testing.T) {
 	}
 }
 
+func connectionDroppingURL(t *testing.T) string {
+	t.Helper()
+	// Held open for the whole test: a closed port can be reused by a parallel test's server.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
 func TestWebhook_Send_TransportFailureReturnsClassifiedError(t *testing.T) {
 	t.Parallel()
 
-	// Use a server that is immediately closed so the transport fails.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Close()
-
-	n, err := newNotifier(map[string]any{"url": srv.URL})
+	n, err := newNotifier(map[string]any{"url": connectionDroppingURL(t)})
 	if err != nil {
 		t.Fatalf("newNotifier: %v", err)
 	}

@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/typeutil"
+	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 // rawEvent is the intermediate representation of a Claude Code JSONL
@@ -24,13 +25,12 @@ type rawEvent struct {
 	ToolName string `json:"tool_name,omitempty"`
 
 	// Result fields.
-	Result      string  `json:"result,omitempty"`
-	IsError     bool    `json:"is_error,omitempty"`
-	TotalCost   float64 `json:"total_cost_usd,omitempty"`
-	DurationMS  int64   `json:"duration_ms,omitempty"`
-	DurationAPI int64   `json:"duration_api_ms,omitempty"`
-	NumTurns    int     `json:"num_turns,omitempty"`
-	StopReason  string  `json:"stop_reason,omitempty"`
+	Result      string `json:"result,omitempty"`
+	IsError     bool   `json:"is_error,omitempty"`
+	DurationMS  int64  `json:"duration_ms,omitempty"`
+	DurationAPI int64  `json:"duration_api_ms,omitempty"`
+	NumTurns    int    `json:"num_turns,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
 
 	// Usage (present in result events).
 	Usage *rawUsage `json:"usage,omitempty"`
@@ -115,10 +115,11 @@ func usageFromAssistant(raw *rawUsage) domain.TokenUsage {
 	}
 	input := raw.InputTokens + raw.CacheReadInputTokens + raw.CacheCreationInputTokens
 	return domain.TokenUsage{
-		InputTokens:     input,
-		OutputTokens:    raw.OutputTokens,
-		TotalTokens:     input + raw.OutputTokens,
-		CacheReadTokens: raw.CacheReadInputTokens,
+		InputTokens:      input,
+		OutputTokens:     raw.OutputTokens,
+		TotalTokens:      input + raw.OutputTokens,
+		CacheReadTokens:  raw.CacheReadInputTokens,
+		CacheWriteTokens: raw.CacheCreationInputTokens,
 	}
 }
 
@@ -140,6 +141,7 @@ func usageFromResult(event rawEvent) (usage domain.TokenUsage, model string) {
 			usage.InputTokens += input
 			usage.OutputTokens += mu.OutputTokens
 			usage.CacheReadTokens += mu.CacheReadInputTokens
+			usage.CacheWriteTokens += mu.CacheCreationInputTokens
 			if mu.OutputTokens > bestOutput || (mu.OutputTokens == bestOutput && name < model) {
 				bestOutput = mu.OutputTokens
 				model = name
@@ -151,29 +153,13 @@ func usageFromResult(event rawEvent) (usage domain.TokenUsage, model string) {
 	return usageFromAssistant(event.Usage), ""
 }
 
-// componentwiseMaxUsage returns the componentwise maximum of a and b,
-// with TotalTokens recomputed as InputTokens plus OutputTokens.
-func componentwiseMaxUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:     max(a.InputTokens, b.InputTokens),
-		OutputTokens:    max(a.OutputTokens, b.OutputTokens),
-		CacheReadTokens: max(a.CacheReadTokens, b.CacheReadTokens),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
-}
-
 // sumTurnMessages sums every stored per-message-id usage into one
-// turn-provisional [domain.TokenUsage], with TotalTokens recomputed as
-// InputTokens plus OutputTokens.
+// turn-provisional [domain.TokenUsage].
 func sumTurnMessages(turnMessages map[string]domain.TokenUsage) domain.TokenUsage {
 	var sum domain.TokenUsage
 	for _, usage := range turnMessages {
-		sum.InputTokens += usage.InputTokens
-		sum.OutputTokens += usage.OutputTokens
-		sum.CacheReadTokens += usage.CacheReadTokens
+		sum = agentcore.AddUsage(sum, usage)
 	}
-	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
 	return sum
 }
 
@@ -203,7 +189,7 @@ func summarizeAssistant(event rawEvent) string {
 		switch b.Type {
 		case "text":
 			if b.Text != "" {
-				parts = append(parts, typeutil.TruncateRunes(b.Text, 200))
+				parts = append(parts, redact.Truncate(b.Text, 200))
 			}
 		case "tool_use":
 			parts = append(parts, fmt.Sprintf("[tool: %s]", b.Name))

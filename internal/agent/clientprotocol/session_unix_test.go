@@ -6,27 +6,49 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
-// mcpHandshakeScript is a fake agent that answers exactly the two
-// calls startSession makes before returning: initialize (always id 1,
-// since it is the connection's first call) and session/new (always id
-// 2). It captures the raw session/new request line to captureFile
-// before answering it, so a test can inspect the exact bytes the
-// adapter wrote for its own tool-server delivery.
+func startTestSession(ctx context.Context, a *ClientProtocolAdapter, params domain.StartSessionParams) (domain.Session, error) {
+	return startSession(ctx, a, params, agentcore.NewTurnEndUsage())
+}
+
+// syncBuffer is a bytes.Buffer guarded by a mutex, for a logger a
+// background release goroutine writes to concurrently with the test
+// goroutine reading it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func mcpHandshakeScript(captureFile string) string {
 	return `capture='` + captureFile + `'
 while IFS= read -r line; do
@@ -43,12 +65,6 @@ done
 `
 }
 
-// TestStartSessionMCPInjectionWire calls agenttest.AssertMCPInjection
-// with the wire channel populated from the actual session/new request
-// bytes the adapter wrote, and is what gives cmd/sortie's
-// TestEveryAgentKindHasMCPInjectionCoverage a call site for this
-// kind. It launches a shell-script agent, so it runs only where
-// /bin/sh exists.
 func TestStartSessionMCPInjectionWire(t *testing.T) {
 	t.Parallel()
 
@@ -63,7 +79,7 @@ func TestStartSessionMCPInjectionWire(t *testing.T) {
 		MCPConfigPath: mcpConfigPath,
 	}
 
-	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, params)
+	session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, params)
 	if err != nil {
 		t.Fatalf("startSession() error = %v", err)
 	}
@@ -88,19 +104,11 @@ func TestStartSessionMCPInjectionWire(t *testing.T) {
 	})
 }
 
-// mcpHandshakeThenGracefulExitScript installs a handler for the
-// graceful signal that waits delaySeconds and writes evidencePath
-// before exiting, then answers startSession's handshake exactly as
-// mcpHandshakeScript does, so a test can tell a catchable signal from
-// an uncatchable kill.
-//
-// The handler is installed before the handshake rather than after it.
-// A caller signals only once startSession has returned, which cannot
-// happen until the handshake below has been answered, so installing
-// first leaves no window in which the default disposition applies and
-// the evidence is never written. The idle loop sleeps in short
-// intervals because the handler does not run until the command it
-// interrupts has finished.
+// mcpHandshakeThenGracefulExitScript installs a TERM handler that waits
+// delaySeconds and writes evidencePath, then answers the handshake. The handler
+// is installed before the handshake so there is no window in which the default
+// disposition applies: a caller signals only after startSession has returned,
+// which cannot happen until the handshake is answered.
 func mcpHandshakeThenGracefulExitScript(evidencePath, delaySeconds string) string {
 	return `trap 'sleep ` + delaySeconds + `; touch "` + evidencePath + `"; exit 0' TERM
 while IFS= read -r line; do
@@ -118,15 +126,10 @@ while :; do sleep 0.05; done
 `
 }
 
-// TestStartSessionCancelledLaunchContextSignalsGracefully:
-// cancelling the context a session was started with, without calling
-// stopSession at all, delivers the catchable termination signal to the
-// agent rather than an uncatchable kill, and the agent's handler
-// evidence shows it. The property fails if either startSession's
-// cmd.Cancel or its cmd.WaitDelay is removed: without them,
-// exec.CommandContext's default cancellation path SIGKILLs the direct
-// child instead, the handler this fixture depends on never runs, and
-// the evidence file this test waits for never appears.
+// Cancelling the launch context signals the agent gracefully rather than with
+// an uncatchable kill. Without startSession's cmd.Cancel and cmd.WaitDelay,
+// exec.CommandContext SIGKILLs the child, the handler never runs, and the
+// evidence file never appears.
 func TestStartSessionCancelledLaunchContextSignalsGracefully(t *testing.T) {
 	t.Parallel()
 
@@ -135,7 +138,7 @@ func TestStartSessionCancelledLaunchContextSignalsGracefully(t *testing.T) {
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeThenGracefulExitScript(evidencePath, "0.4"))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	session, err := startSession(ctx, &ClientProtocolAdapter{}, domain.StartSessionParams{
+	session, err := startTestSession(ctx, &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -152,22 +155,47 @@ func TestStartSessionCancelledLaunchContextSignalsGracefully(t *testing.T) {
 	waitForFile(t, evidencePath)
 }
 
-// stderrThenExitScript is a fake agent that writes marker to stderr
-// and exits immediately without reading or answering anything on
-// stdin, so startSession's initialize call fails against a closed
-// connection rather than a timeout.
+func TestStartSessionLocalWorkspaceIsSymlink(t *testing.T) {
+	t.Parallel()
+
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "workspace-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	_, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+		WorkspacePath: link,
+		AgentConfig:   domain.AgentConfig{Command: "/nonexistent/sortie-clientprotocol-fixture"},
+	})
+	if err == nil {
+		t.Fatal("startSession(linked workspace) error = nil, want non-nil")
+	}
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("error type = %T, want *domain.AgentError", err)
+	}
+	if agentErr.Kind != domain.ErrInvalidWorkspaceCwd {
+		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrInvalidWorkspaceCwd)
+	}
+
+	entries, readErr := os.ReadDir(target)
+	if readErr != nil {
+		t.Fatalf("ReadDir(target): %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("link target gained entries %v, want none (no subprocess started)", entries)
+	}
+}
+
+// stderrThenExitScript writes marker to stderr and exits without answering
+// stdin, so initialize fails against a closed connection rather than a timeout.
 func stderrThenExitScript(marker string) string {
 	return `printf '%s\n' '` + marker + `' 1>&2
 exit 1
 `
 }
 
-// TestStartSessionEmitsCollectedStderrAtWarnOnFailedInitialize confirms
-// that a fake agent which exits before answering initialize still gets
-// its collected stderr surfaced at Warn before startSession returns its
-// error. The test fails if the EmitWarnLines call following
-// doInitialize's failure branch is removed: the returned error would be
-// unaffected, but the marker line would never reach the logger.
 func TestStartSessionEmitsCollectedStderrAtWarnOnFailedInitialize(t *testing.T) {
 	// No t.Parallel(): installs a process-wide slog default.
 
@@ -181,7 +209,7 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedInitialize(t *testing.T) 
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
-	_, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+	_, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -199,26 +227,21 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedInitialize(t *testing.T) 
 	}
 }
 
-// mcpHandshakeWithDetachedChildScript answers the handshake exactly as
-// mcpHandshakeScript does, but first backgrounds a helper process
-// under setsid: a new session and process group leader, escaping the
-// group procutil.SetGroupCancel placed this script's own process in.
-// The helper records its own pid to pidFile and idles, so a test can
-// wait for it to exist and then check its liveness directly.
+// mcpHandshakeWithDetachedChildScript backgrounds a helper under setsid, a new
+// session and group leader that escapes the group SetGroupCancel placed this
+// script in.
 func mcpHandshakeWithDetachedChildScript(pidFile string) string {
 	return mcpHandshakeWithChildScript("setsid ", pidFile)
 }
 
-// mcpHandshakeWithGroupChildScript answers the handshake and leaves one
-// idle child inside the process group procutil.SetGroupCancel placed
-// this script in, so teardown's group-directed termination reaches it.
+// mcpHandshakeWithGroupChildScript leaves one idle child inside the script's
+// process group, so teardown's group-directed termination reaches it.
 func mcpHandshakeWithGroupChildScript(pidFile string) string {
 	return mcpHandshakeWithChildScript("", pidFile)
 }
 
-// mcpHandshakeWithChildScript builds both of the above. launcher
-// prefixes the child's own command and is what decides whether the
-// child keeps the script's process group or leaves it.
+// mcpHandshakeWithChildScript builds both of the above; launcher decides whether
+// the child keeps the script's process group or leaves it.
 func mcpHandshakeWithChildScript(launcher, pidFile string) string {
 	return launcher + `sh -c 'echo $$ >"` + pidFile + `"; while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 &
 while IFS= read -r line; do
@@ -236,11 +259,9 @@ while :; do sleep 0.05; done
 `
 }
 
-// killLaunchedGroup signals the process group the launched agent leads,
-// tolerating a pid that has already gone. A child that stayed in that
-// group leads no group of its own, so a kill aimed at the child's own
-// pid reaches nothing; killHelperGroup is right only for the detached
-// child below, which setsid makes a leader.
+// killLaunchedGroup signals the process group the launched agent leads. A child
+// that stayed in that group leads no group of its own, so killHelperGroup is
+// right only for the detached child, which setsid makes a leader.
 func killLaunchedGroup(agentPID string) {
 	pid, err := strconv.Atoi(strings.TrimSpace(agentPID))
 	if err != nil || pid <= 0 {
@@ -249,9 +270,9 @@ func killLaunchedGroup(agentPID string) {
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
-// initThenStderrExitScript answers initialize, writes marker to stderr,
-// and exits before answering session/new, so startSession's failure
-// arrives from resolveSession rather than from doInitialize.
+// initThenStderrExitScript answers initialize, writes marker to stderr, and
+// exits before session/new, so the failure arrives from resolveSession rather
+// than doInitialize.
 func initThenStderrExitScript(marker string) string {
 	return `while IFS= read -r line; do
   case "$line" in
@@ -265,11 +286,6 @@ done
 `
 }
 
-// TestStartSessionEmitsCollectedStderrAtWarnOnFailedResolveSession
-// mirrors the initialize-failure case above for the resolve-session
-// failure branch. startSession emits collected stderr on two failure
-// branches, and a control that reaches only the first lets the
-// second's emission be deleted without a test going red.
 func TestStartSessionEmitsCollectedStderrAtWarnOnFailedResolveSession(t *testing.T) {
 	// No t.Parallel(): installs a process-wide slog default.
 
@@ -283,7 +299,7 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedResolveSession(t *testing
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
-	_, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+	_, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -301,12 +317,10 @@ func TestStartSessionEmitsCollectedStderrAtWarnOnFailedResolveSession(t *testing
 	}
 }
 
-// TestStopSessionReachesGroupChild is the other half of the property
-// the escaped-member test below evidences. Teardown does reach a
-// descendant that stays in the group it was launched into, so a
-// survivor outside that group means the group was escaped rather than
-// that teardown reaches nothing at all. Removing procutil.SetGroupCancel
-// from startSession fails this test and not that one.
+// Teardown reaches a descendant that stays in the group it was launched into,
+// so a survivor outside that group means the group was escaped rather than that
+// teardown reaches nothing. Removing SetGroupCancel fails this test, not the
+// escaped-member one.
 func TestStopSessionReachesGroupChild(t *testing.T) {
 	t.Parallel()
 
@@ -314,7 +328,7 @@ func TestStopSessionReachesGroupChild(t *testing.T) {
 	pidPath := filepath.Join(dir, "group-child.pid")
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeWithGroupChildScript(pidPath))
 
-	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+	session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -332,13 +346,9 @@ func TestStopSessionReachesGroupChild(t *testing.T) {
 	assertProcessGone(t, childPID, awaitTimeout)
 }
 
-// TestStopSessionDoesNotReachEscapedProcessGroupMember confirms that a
-// descendant which detaches into its own process group before the
-// parent exits survives stopSession's group-directed termination, so a
-// leaked survivor is demonstrably detectable by a direct
-// process-liveness check rather than merely assumed. This is not a
-// defect in stopSession; procutil.SetGroupCancel
-// and kill_process_group can only ever reach the group they targeted.
+// A descendant that detaches into its own process group survives the
+// group-directed termination. This is not a defect: kill_process_group can only
+// reach the group it targeted.
 func TestStopSessionDoesNotReachEscapedProcessGroupMember(t *testing.T) {
 	t.Parallel()
 	agenttest.RequireSetsid(t)
@@ -347,7 +357,7 @@ func TestStopSessionDoesNotReachEscapedProcessGroupMember(t *testing.T) {
 	pidPath := filepath.Join(dir, "escaped.pid")
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", mcpHandshakeWithDetachedChildScript(pidPath))
 
-	session, err := startSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+	session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -367,15 +377,10 @@ func TestStopSessionDoesNotReachEscapedProcessGroupMember(t *testing.T) {
 	}
 }
 
-// stderrThenExitWithDetachedHolderScript writes marker to standard
-// error, backgrounds a setsid descendant that inherits this script's
-// own standard-output handle (a plain shell background job keeps the
-// parent's file descriptors unless it redirects them, and setsid is
-// what lets the descendant survive teardown's group-directed kill),
-// then exits before ever reading or answering the initialize call. The
-// runtime is gone, but the escaped descendant keeps the output pipe
-// from reaching end of file, so a handshake call is still in flight
-// when the release gives up on it.
+// stderrThenExitWithDetachedHolderScript backgrounds a setsid descendant that
+// inherits this script's stdout handle, then exits before answering initialize.
+// The runtime is gone, but the escaped descendant keeps the output pipe from
+// reaching EOF, so a handshake call is still in flight when the release gives up.
 func stderrThenExitWithDetachedHolderScript(marker, pidFile string) string {
 	return `setsid sh -c 'echo $$ > ` + pidFile + `; sleep 3600' 2>/dev/null &
 while [ ! -s ` + pidFile + ` ]; do sleep 0.01; done
@@ -384,12 +389,6 @@ exit 7
 `
 }
 
-// TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit
-// asserts that a runtime that exits during the handshake while an
-// escaped descendant still holds the output handle fails StartSession
-// at the reap plus the injected grace with domain.ErrPortExit, and the
-// runtime's own stderr line still reaches the operator.
-//
 // No t.Parallel(): installs a process-wide slog default.
 func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *testing.T) {
 	agenttest.RequireSetsid(t)
@@ -400,7 +399,7 @@ func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *t
 	t.Cleanup(func() { killHelperGroup(pidPath) })
 	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", stderrThenExitWithDetachedHolderScript(marker, pidPath))
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	orig := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
@@ -409,7 +408,7 @@ func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *t
 	adapter := &ClientProtocolAdapter{drainGrace: grace}
 
 	start := time.Now()
-	_, err := startSession(context.Background(), adapter, domain.StartSessionParams{
+	_, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -422,9 +421,15 @@ func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *t
 	if agentErr.Kind != domain.ErrPortExit {
 		t.Errorf("startSession() error kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
 	}
-	const wantMessage = "agent connection ended before responding"
-	if agentErr.Message != wantMessage {
-		t.Errorf("startSession() error message = %q, want %q", agentErr.Message, wantMessage)
+	var earlyExitErr *agentcore.EarlyExitError
+	if !errors.As(agentErr.Err, &earlyExitErr) {
+		t.Fatalf("startSession() error = %v, chain does not hold an *agentcore.EarlyExitError", agentErr)
+	}
+	if earlyExitErr.Status() != "exit status 7" {
+		t.Errorf("EarlyExitError.Status() = %q, want %q", earlyExitErr.Status(), "exit status 7")
+	}
+	if !strings.Contains(earlyExitErr.Output(), marker) {
+		t.Errorf("EarlyExitError.Output() = %q, want it to contain %q", earlyExitErr.Output(), marker)
 	}
 	if elapsed > 10*time.Second {
 		t.Errorf("startSession() took %v, want well under the 30s handshake timeout it would have hit without the release", elapsed)
@@ -436,14 +441,9 @@ func TestStartSessionHandshakeAbandonedByEscapedDescendantFailsWithPortExit(t *t
 	}
 }
 
-// hasWarnStderrLineRecord reports whether output contains one log
-// record, on a single line, that carries level=WARN, msg="agent
-// stderr", and line=marker together: the three fields a
-// procutil.EmitWarnLines call produces for a collected stderr line.
-// The collector's own Debug-level record for the same line carries
-// the same message and line fields but a different level, so the
-// three checks must hold on one record rather than anywhere in the
-// buffer.
+// hasWarnStderrLineRecord reports whether one log line carries level=WARN,
+// msg="agent stderr", and line=marker together. The collector logs the same
+// line at Debug, so the three checks must hold on one record, not anywhere.
 func hasWarnStderrLineRecord(output, marker string) bool {
 	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, "level=WARN") &&
@@ -455,12 +455,9 @@ func hasWarnStderrLineRecord(output, marker string) bool {
 	return false
 }
 
-// handshakeThenExitWithDetachedHolderScript answers the two calls
-// startSession makes before returning, then spawns a setsid
-// descendant that inherits this script's own standard-output handle
-// and exits without waiting for it, so a real subprocess reproduces
-// "the runtime exits, its descendant survives holding the write end"
-// for a session that has already started.
+// handshakeThenExitWithDetachedHolderScript answers the two startup calls, then
+// spawns a setsid descendant that inherits this script's stdout handle and
+// exits, so the runtime is gone while its descendant still holds the write end.
 func handshakeThenExitWithDetachedHolderScript(pidFile string) string {
 	return `while IFS= read -r line; do
   case "$line" in
@@ -479,16 +476,10 @@ exit 0
 `
 }
 
-// TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess
-// asserts that, with the runtime gone and an escaped descendant still
-// holding the standard-output handle, once the release has abandoned,
-// StopSession still returns inside its pinned teardown ceiling against
-// a real subprocess. On Linux the release's own CloseStdout already
-// unparks the connection's reader by the time this runs, so this alone
-// does not exercise the post-abandonment stop arm runPump's select
-// falls back to when a reader stays genuinely parked; that arm is
-// proven separately, by an untagged test whose pipes are never wired
-// to the connection under test.
+// On Linux the release's CloseStdout already unparks the reader by the time
+// this runs, so this does not exercise the post-abandonment stop arm runPump
+// falls back to when a reader stays genuinely parked; that arm is proven
+// separately by an untagged test whose pipes are never wired to the connection.
 func TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess(t *testing.T) {
 	t.Parallel()
 	agenttest.RequireSetsid(t)
@@ -500,7 +491,7 @@ func TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess(t *testi
 
 	const grace = 200 * time.Millisecond
 	adapter := &ClientProtocolAdapter{drainGrace: grace}
-	session, err := startSession(context.Background(), adapter, domain.StartSessionParams{
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: scriptPath},
 	})
@@ -530,12 +521,9 @@ func TestStopSessionReturnsBoundedAfterReleaseAbandonsOnARealSubprocess(t *testi
 	}
 }
 
-// promptThenExitWithDetachedHolderScript answers the two calls
-// startSession makes, then, once the first session/prompt arrives,
-// spawns a setsid descendant that inherits this script's own
-// standard-output handle and exits without answering, so a turn is in
-// flight when the runtime is gone and its descendant still holds the
-// write end.
+// promptThenExitWithDetachedHolderScript answers the two startup calls, then on
+// the first session/prompt spawns a setsid descendant holding this script's
+// stdout handle and exits, so a turn is in flight when the runtime is gone.
 func promptThenExitWithDetachedHolderScript(pidFile string) string {
 	return `while IFS= read -r line; do
   case "$line" in
@@ -556,12 +544,6 @@ exit 0
 `
 }
 
-// TestRunTurnEndsBoundedWhenRuntimeExitsWithEscapedDescendantHoldingOutput
-// asserts that, through a real session, a turn whose runtime exits while
-// an escaped descendant still holds the standard-output handle ends
-// within the injected grace with domain.ErrPortExit and the release's
-// message rather than reaching the orchestrator's stall timeout, and
-// that StopSession still returns inside its pinned ceiling afterward.
 func TestRunTurnEndsBoundedWhenRuntimeExitsWithEscapedDescendantHoldingOutput(t *testing.T) {
 	t.Parallel()
 	agenttest.RequireSetsid(t)
@@ -612,5 +594,218 @@ func TestRunTurnEndsBoundedWhenRuntimeExitsWithEscapedDescendantHoldingOutput(t 
 	ceiling := procutil.DefaultStopGrace + 3*procutil.DefaultDrainGrace + teardownReturnOverhead
 	if stopElapsed := time.Since(stopStart); stopElapsed >= ceiling {
 		t.Errorf("StopSession() took %v, want under %v (the pinned teardown ceiling)", stopElapsed, ceiling)
+	}
+}
+
+// sshStandInEnvPath returns a PATH directory holding a symlink to sh, and to dd
+// when includeDD is set. An isolated directory matters because a real sh and dd
+// usually share one directory, so reusing it for the no-dd case would resolve
+// dd anyway.
+func sshStandInEnvPath(t *testing.T, includeDD bool) string {
+	t.Helper()
+
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh not found on PATH: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := os.Symlink(shPath, filepath.Join(dir, "sh")); err != nil {
+		t.Fatalf("Symlink(sh): %v", err)
+	}
+
+	if includeDD {
+		ddPath, err := exec.LookPath("dd")
+		if err != nil {
+			t.Skipf("dd not found on PATH: %v", err)
+		}
+		if err := os.Symlink(ddPath, filepath.Join(dir, "dd")); err != nil {
+			t.Fatalf("Symlink(dd): %v", err)
+		}
+	}
+	return dir
+}
+
+func TestStartSessionSSH_CarriesEnvironmentVariable(t *testing.T) {
+	// Not parallel: sets PATH and the carried variable via t.Setenv.
+	dir := t.TempDir()
+	sshDir := t.TempDir()
+
+	agenttest.FakeRuntime(t, sshDir, "ssh", scenarioSSHStandIn, sshStandInParams{PATH: sshStandInEnvPath(t, true)})
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	const carriedName = "CLIENTPROTOCOL_TEST_CARRY"
+	const carriedValue = "carried-value-clientprotocol"
+	t.Setenv(carriedName, carriedValue)
+
+	capturePath := filepath.Join(dir, "captured.txt")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:      true,
+		EnvCaptureName: carriedName,
+		EnvCapturePath: capturePath,
+	})
+
+	session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+		SSHHost:       "user@stand-in-host",
+		SSHEnvNames:   []string{carriedName},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("ReadFile(captured.txt): %v", err)
+	}
+	if string(got) != carriedValue {
+		t.Errorf("remote agent observed %q, want %q", string(got), carriedValue)
+	}
+}
+
+func TestStartSessionSSH_NoDDEndsAsPortExitNotAgentNotFound(t *testing.T) {
+	// Not parallel: installs a process-wide slog default and sets PATH
+	// and the carried variable via t.Setenv.
+	const ddMissingMessage = "sortie: dd is required on the remote host to receive environment variables"
+
+	dir := t.TempDir()
+	sshDir := t.TempDir()
+
+	agenttest.FakeRuntime(t, sshDir, "ssh", scenarioSSHStandIn, sshStandInParams{PATH: sshStandInEnvPath(t, false)})
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	const carriedName = "CLIENTPROTOCOL_TEST_CARRY_NODD"
+	t.Setenv(carriedName, "some-value")
+
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{Handshake: true})
+
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	_, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+		SSHHost:       "user@stand-in-host",
+		SSHEnvNames:   []string{carriedName},
+	})
+
+	agentErr, ok := errors.AsType[*domain.AgentError](err)
+	if !ok {
+		t.Fatalf("startSession() error = %v (%T), want a non-nil *domain.AgentError", err, err)
+	}
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("startSession() error kind = %q, want %q (never the agent-not-found category)", agentErr.Kind, domain.ErrPortExit)
+	}
+	var earlyExitErr *agentcore.EarlyExitError
+	if !errors.As(agentErr.Err, &earlyExitErr) {
+		t.Fatalf("startSession() error = %v, chain does not hold an *agentcore.EarlyExitError", agentErr)
+	}
+	if earlyExitErr.Status() != "exit status 1" {
+		t.Errorf("EarlyExitError.Status() = %q, want %q", earlyExitErr.Status(), "exit status 1")
+	}
+	if !strings.Contains(earlyExitErr.Output(), ddMissingMessage) {
+		t.Errorf("EarlyExitError.Output() = %q, want it to contain %q", earlyExitErr.Output(), ddMissingMessage)
+	}
+
+	output := buf.String()
+	wantLineAttr := fmt.Sprintf("line=%q", ddMissingMessage)
+	found := false
+	for line := range strings.SplitSeq(output, "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, `msg="agent stderr"`) && strings.Contains(line, wantLineAttr) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("startSession() output = %s, want a WARN agent stderr record carrying the guard's message %q", output, ddMissingMessage)
+	}
+}
+
+// captureCwdAndFirstLineThenHandshakeScript captures, ahead of the handshake,
+// the working directory and the raw bytes of the first stdin line. A remote
+// launch would land its preamble ahead of initialize on that first line and
+// would never set cmd.Dir, so both are observable signs the wrong branch ran.
+func captureCwdAndFirstLineThenHandshakeScript(cwdPath, firstLinePath string) string {
+	return `pwd > '` + cwdPath + `'
+first='` + firstLinePath + `'
+capture_first=1
+while IFS= read -r line; do
+  if [ "$capture_first" = "1" ]; then
+    printf '%s' "$line" > "$first"
+    capture_first=0
+  fi
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+      ;;
+  esac
+done
+`
+}
+
+func TestStartSessionLocalLaunchIgnoresSSHEnvNames(t *testing.T) {
+	// Not parallel: sets the carried variable via t.Setenv.
+	const varName = "CLIENTPROTOCOL_TEST_LOCAL_INVARIANCE"
+	t.Setenv(varName, "should-never-reach-a-local-launch")
+
+	for _, tc := range []struct {
+		name        string
+		sshEnvNames []string
+	}{
+		{"SSHEnvNames absent", nil},
+		{"SSHEnvNames naming a set variable", []string{varName}},
+	} {
+		dir := t.TempDir()
+		cwdPath := filepath.Join(dir, "cwd.txt")
+		firstLinePath := filepath.Join(dir, "first_line.txt")
+		scriptPath := agenttest.WriteScript(t, dir, "agent.sh", captureCwdAndFirstLineThenHandshakeScript(cwdPath, firstLinePath))
+
+		workspacePath := t.TempDir()
+		session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
+			WorkspacePath: workspacePath,
+			AgentConfig:   domain.AgentConfig{Command: scriptPath},
+			SSHEnvNames:   tc.sshEnvNames,
+		})
+		if err != nil {
+			t.Fatalf("%s: startSession() error = %v, want nil", tc.name, err)
+		}
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("%s: stopSession() error = %v", tc.name, err)
+		}
+
+		firstLine, err := os.ReadFile(firstLinePath)
+		if err != nil {
+			t.Fatalf("%s: ReadFile(first_line.txt): %v", tc.name, err)
+		}
+		if !strings.HasPrefix(string(firstLine), "{") {
+			t.Errorf("%s: first stdin line = %q, want it to start with the initialize request's own %q", tc.name, firstLine, "{")
+		}
+
+		wantCwd, err := filepath.EvalSymlinks(workspacePath)
+		if err != nil {
+			t.Fatalf("%s: EvalSymlinks(workspacePath): %v", tc.name, err)
+		}
+		gotCwdRaw, err := os.ReadFile(cwdPath)
+		if err != nil {
+			t.Fatalf("%s: ReadFile(cwd.txt): %v", tc.name, err)
+		}
+		gotCwd, err := filepath.EvalSymlinks(strings.TrimSpace(string(gotCwdRaw)))
+		if err != nil {
+			t.Fatalf("%s: EvalSymlinks(captured cwd): %v", tc.name, err)
+		}
+		if gotCwd != wantCwd {
+			t.Errorf("%s: runtime cwd = %q, want the configured workspace %q", tc.name, gotCwd, wantCwd)
+		}
 	}
 }

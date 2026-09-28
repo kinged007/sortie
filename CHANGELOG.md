@@ -2,10 +2,100 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.25.0] - 2026-09-27
+
+### Added
+
+- A run on the `agent-client-protocol` kind now reports token usage when its runtime is a Gemini CLI started on the machine running Sortie, so `agent.max_tokens` applies to it, its spend joins the token and cost totals, and it is no longer counted among the sessions whose usage was never recorded. Sortie reads the counts from the usage records Gemini CLI writes to disk rather than from the protocol, and falls back to the runtime's session journal when those records are unavailable; the figures cover input tokens, output tokens including reasoning, and cache reads. A turn whose spend was never fully reported, a cancelled turn above all, is now recorded as spend of an unknown amount: whatever figure did arrive still counts toward the totals, what that figure leaves out does not, and `used_tokens_complete` in the `cost_budget` tool reads `false`, so the issue's spend reads as a lower bound instead of passing for the whole of it as it did before. A session on a Gemini CLI build other than `0.59.0`, and a runtime started on a remote host through `worker.ssh_hosts`, stay unmeasured with `agent.max_tokens` inactive, because a figure is reported only for a build it was measured against.
+  ([#1057](https://github.com/sortie-ai/sortie/issues/1057))
+
+- Sortie now verifies the agent's credential before it starts work on an issue, on every agent kind, locally and on `worker.ssh_hosts`. A credential the agent cannot use stops the run before any work with an error naming the credential, and the run is retried. Stored logins now pass on `kiro` and `copilot-cli`, which previously required an API key or token variable. The check costs one short model request per run.
+  ([#1047](https://github.com/sortie-ai/sortie/issues/1047))
+
+- A new `agent.token_warning_percent` setting warns before `agent.max_tokens` stops a run: set it to a percentage of the ceiling, and a run that reaches it logs one warning and reports the condition through the `cost_budget` tool, so the agent can wrap up or hand off and the operator can raise the ceiling before the run is stopped. Leaving it unset changes nothing.
+  ([#1070](https://github.com/sortie-ai/sortie/issues/1070))
+
+- The `opencode` agent kind now works with OpenCode 2.x as well as 1.x: Sortie reads the installed version at the start of each session and drives whichever one is configured, stopping the run with an error naming the version when it is neither. On OpenCode 2.x, `opencode.pure` and an `opencode.variant` set without an `opencode.model` are refused the same way.
+  ([#960](https://github.com/sortie-ai/sortie/issues/960))
+
+- Tokens that `claude-code`, `copilot-cli`, and `opencode` write to the prompt cache now show separately on the dashboard, in the JSON API, in `sortie stats`, and in metrics, and can be priced with the new `token_rates` rate `cache_write_per_mtok`. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
+### Changed
+
+- Workflows that use the `copilot-cli` agent kind now need GitHub Copilot CLI 1.0.51 or later.
+  ([#1047](https://github.com/sortie-ai/sortie/issues/1047))
+
+- The comment posted when a session starts (`tracker.comments.on_dispatch`) now reads only "Sortie session started.", without the session and workspace lines that always read `pending`, the agent kind, or the attempt count. The comments posted when a session ends (`tracker.comments.on_completion`, `tracker.comments.on_failure`) no longer show the agent's session identifier, and the failure comment no longer quotes the error; it gives the duration and whether the issue will be retried, and the cause stays available in the log, the run history, and the dashboard.
+  ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
+
+- A `token_rates` entry now needs both `input_per_mtok` and `output_per_mtok`: an agent whose entry lacks either one gets no cost estimate, and `sortie validate` warns about such an entry and about any rate name it does not recognize. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
+### Deprecated
+
+- The `kiro` agent kind is deprecated. Kiro CLI now runs through the `agent-client-protocol` kind with `kiro-cli acp -a`, which delivers Sortie's tools under a stored login. Workflows naming `kiro` keep working; each run and `sortie validate` warn once, naming `agent-client-protocol`. A later release removes the kind.
+  ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
+
+### Fixed
+
+- A run that ends having reported no token usage, while `agent.max_tokens` is set, now says so in the log, naming the agent kind and the ceiling the run could not be held to. Before this, only an agent kind that declares up front that it never reports token usage drew a warning, so a kind that declares figures do arrive while the runtime it starts reports none left the ceiling doing nothing and said nothing about it. The dashboard no longer describes such a session as not having reported its tokens yet: once the point its agent reports at has passed with nothing counted, the session's Tokens row reads "not reported", and the footer counts the session among those running an agent that reports no token usage rather than among those still to report.
+  ([#1112](https://github.com/sortie-ai/sortie/issues/1112))
+
+- A `copilot-cli` session could resume another issue's conversation on the same host; it now always continues its own.
+  ([#1047](https://github.com/sortie-ai/sortie/issues/1047))
+
+- Kiro CLI on the `agent-client-protocol` kind no longer times out at startup when it signs in with an API key.
+  ([#1047](https://github.com/sortie-ai/sortie/issues/1047))
+
+- Runs that the `agent.max_tokens` ceiling did not stop are no longer reported as stopped by it. A run that finished, failed, stalled, or was cancelled by a tracker state change or shutdown keeps its real outcome in the run history, the `sortie_runs_stopped_by_budget_total` counter, the log, and the budget hold notice. A run whose final turn reaches the ceiling finishes normally, but if the ceiling cuts its self-review short or keeps it from starting, the run is recorded as stopped by the ceiling and its issue does not move to the handoff state.
+  ([#1101](https://github.com/sortie-ai/sortie/issues/1101))
+
+- Memory use of a long-running Sortie process no longer grows with every completed run.
+  ([#1158](https://github.com/sortie-ai/sortie/issues/1158))
+
+- During the self-review phase the `sortie_status` tool now includes the tokens the review and fix turns spend, where it previously kept reporting the last coding turn's figures, below the session's recorded total.
+  ([#1103](https://github.com/sortie-ai/sortie/issues/1103))
+
+- `notify_operator`'s `max_per_session` cap now limits a whole agent run on every agent kind; on `claude-code`, `copilot-cli`, and `opencode` it used to reset with every turn. A notification that reached at least one configured channel now counts against the limit even when another channel failed to receive it. When Sortie cannot keep the count, `notify_operator` now sends nothing and tells the agent so, instead of sending anyway; this also covers a `sortie mcp-server` started by hand, outside a Sortie run.
+  ([#1118](https://github.com/sortie-ai/sortie/issues/1118))
+
+- When the agent runtime reports a session ID other than the one a run started with, a continuation now resumes under the ID the runtime reported last, where it previously used the earlier one and could fail to rejoin the conversation the previous run left off in. The session ID recorded for the run and shown in its tracker comments now matches the one its operator notifications carry.
+  ([#1120](https://github.com/sortie-ai/sortie/issues/1120))
+
+- A workspace directory replaced by a symbolic link no longer redirects Sortie's workspace files, hooks, or agent launches to the link's target; the affected step now fails instead. A workspace directory removed before the agent starts now fails that dispatch attempt instead of being recreated empty.
+  ([#1121](https://github.com/sortie-ai/sortie/issues/1121))
+
+- A coding agent that exits before it responds, such as on a misspelled switch in `agent.command`, now fails with its exit status and the end of what it printed to standard error, instead of a lost connection, a bare exit code, or a credential problem. This covers every agent kind, both in the check Sortie runs before work starts and on every working turn. An agent that rejects its credential only by printing a message and exiting, as `copilot-cli` and `kiro` do, is now reported the same way, carrying that message, rather than as a credential problem. An agent whose program cannot start, such as a script whose interpreter is missing, is reported the same way too, except where the `copilot-cli` version check catches it first, and now waits out the retry backoff between runs instead of running again on every poll. Update an alert that matches on an exit code or on "produced no output" for a run that fails this way.
+  ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
+
+- Credentials no longer appear in the log, the run history, the retry list, or the dashboard when an agent, a hook, or a verification command prints them. Every value Sortie knows to be a credential, from its environment, its configuration including the `.env` file, and the tool servers it hands an agent, now shows as `[redacted]`; one too short to hide is instead named in a warning.
+  ([#1125](https://github.com/sortie-ai/sortie/issues/1125))
+
+- On OpenCode's free models, a run whose `opencode.allowed_tools` or `opencode.denied_tools` denies the tools that tier requires was refused every time; the error now names the denied tool instead of carrying only the free tier's own message.
+  ([#960](https://github.com/sortie-ai/sortie/issues/960))
+
+- A tool call the `opencode` runtime refuses because `opencode.dangerously_skip_permissions` is `false` is now reported, where it previously went unnoticed.
+  ([#960](https://github.com/sortie-ai/sortie/issues/960))
+
+- An agent that prints only text Sortie cannot read on standard output, such as its usage text, before it exits is now reported like one that exits before it responds, with its exit status and the end of what it printed to standard error. This covers `claude-code`, `copilot-cli`, and `opencode`.
+  ([#960](https://github.com/sortie-ai/sortie/issues/960))
+
+- Configuration warnings (a deprecated `ci_feedback` section, a `label_commands` prompt template missing its branch or a poll interval below its minimum, a missing env file, an environment override replacing a section that is not a mapping) now appear once when they first apply instead of on every poll. `sortie validate` reports them as warnings instead of printing log lines. `sortie stats` and `sortie mcp-server` no longer print them.
+  ([#1126](https://github.com/sortie-ai/sortie/issues/1126))
+
+- Estimated costs on the dashboard, in the JSON API, and in `sortie stats` no longer charge tokens read from the prompt cache twice, which made them several times too high for sessions that use the cache heavily. `sortie stats` shows the corrected cost for past runs as well. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
+### Migrations
+
+- Add `unaccounted_turns INTEGER NOT NULL DEFAULT 0` to `run_history`, counting the run's turns that spent tokens no figure was proven to account for, whether no figure arrived at all or the one that did fell short of the turn. A pre-migration row reads back zero and so presents as fully accounted, but nothing measured it: before the upgrade a turn that spent tokens without reporting a figure was indistinguishable from one that cost nothing, and because `run_history` is an append-only record no later run can correct, that zero stays. A historical run's spend therefore reads as complete because nothing can now establish otherwise, not because it was verified.
+  ([#1057](https://github.com/sortie-ai/sortie/issues/1057))
+
+- Add `cache_write_tokens INTEGER NOT NULL DEFAULT 0` to `run_history`, `session_metadata`, and `aggregate_metrics`. ([#1181](https://github.com/sortie-ai/sortie/issues/1181))
+
+## [1.24.1] - 2026-09-17
 
 ### Added
 
@@ -15,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The dashboard and `GET /api/v1/state` now disclose, by reason, how many sessions the token and cost totals leave out: `running_unreported` for a running session that has not reported usage yet, `running_non_reporting` for a running session whose agent reports no usage at all, `unmeasured_sessions` for an already-ended session whose usage was never recorded, and `cost_unpriced_running` for a running session left out of `Est. Cost` because no rate is configured for its agent. The dashboard's footer note for each reason now reads correctly for a single session instead of always using the plural. The already-ended count survives a restart and, after the upgrade, also includes earlier sessions that ended without recorded usage, back to v1.19.0.
   ([#1066](https://github.com/sortie-ai/sortie/issues/1066))
+
+- Agents that Sortie starts on a remote host through `worker.ssh_hosts` can now receive environment variables from Sortie's own environment: list their names under the new `worker.ssh_pass_env` setting. A variable named under the new `worker.ssh_disallow_pass_env` setting is one Sortie never sends, so the value or login the remote host holds stays in effect; an `ssh_config` of your own that lists the variable under `SendEnv` still forwards it, which Sortie cannot suppress. Both settings take variable names literally: an entry written as a `$VAR` reference is ignored, and the warning that reports it gives the entry's position, never its value.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
 
 ### Fixed
 
@@ -56,10 +149,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An integer setting in `WORKFLOW.md`, or its `SORTIE_*` override, set to a number too large or too small for Sortie to hold, such as `agent.turn_timeout_ms: 99999999999999999999`, is now rejected with a message naming the setting and the range an integer setting accepts. Previously the message named an unrelated fault, such as the value having to be greater than 0, or the setting silently took a different value, so a very large `agent.max_turns` could limit every session to one turn. A workflow that loaded with such a value, including one in `hooks.timeout_ms` or `agent.max_concurrent_agents_by_state`, now fails to load until the value is within range.
   ([#1038](https://github.com/sortie-ai/sortie/issues/1038))
 
+- The `KIRO_API_KEY` of a remote `kiro` agent and the `CODEX_API_KEY` of a remote `codex` agent no longer appear in the process list of the machine running Sortie or of the remote host. A remote `codex` agent no longer finds `CODEX_API_KEY` in its environment; Sortie still signs the agent in with that key, as it does on a local launch.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
+
+- A workflow that sets `worker.ssh_hosts` no longer warns at startup that `worker.max_concurrent_agents_per_host`, `worker.ssh_pass_env`, or `worker.ssh_disallow_pass_env` has no effect. Those settings took effect from the first poll onward; only the startup message was wrong.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
+
+- An agent Sortie starts on a remote host now runs only after it has entered the workspace directory and delivered the environment variables the launch carries. An `agent.command` containing a shell operator such as `||` or `;` could previously run part of itself even when neither of those steps succeeded, starting the agent in the wrong directory or without the variables it was to receive. An `agent.command` that ends in `;` or `&`, and one written as a `command: |` block, now also receive the arguments Sortie passes the agent; the remote shell previously ran the first of those arguments as a command of its own, and the launch failed without ever starting the agent properly. Sortie waits for the agent it starts and talks to it, so a command ending in `&` detaches the agent and the session cannot work.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
+
+- A retry that came due while Sortie was stopped now starts on one of the hosts `worker.ssh_hosts` names and carries the variables `worker.ssh_pass_env` names, even when it is the first work Sortie dispatches after the restart. Such a retry could previously start on the machine running Sortie, or start remotely without those variables, because it could be dispatched before Sortie had read the `worker` settings for the first time.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
+
+- Cancelling a local agent process now terminates every process still in its process group when graceful shutdown expires, instead of leaving descendants running against the workspace.
+  ([#1035](https://github.com/sortie-ai/sortie/issues/1035))
+
+- `webhook` notifications now carry a `dispatch_id`, identifying the agent run that sent them, and `session_id` now carries the agent's own session ID once the agent reports one, instead of staying empty for the whole run.
+  ([#1104](https://github.com/sortie-ai/sortie/issues/1104))
+
+- Sortie no longer writes through a symbolic link placed in a workspace's `.sortie` directory, and a run whose `.sortie` directory is itself a symbolic link now fails before the agent starts.
+  ([#1104](https://github.com/sortie-ai/sortie/issues/1104))
+
 ### Changed
 
 - On Linux and macOS, a process that a workspace hook, the reaction triage command, or a self-review verification command leaves running is now terminated when the command exits, matching what Windows hooks already did; a verification command's leftover processes on Windows are now terminated too. A service meant to outlive the command now has to start through a supervisor, which the workflow reference documents per platform, and hooks and the reaction triage command now receive `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` so they can reach the user's service manager. Two log messages are new: `leftover processes terminated after the command exited`, logged when that termination reached a process the command left behind, and `subprocess group termination failed after the launch returned`, logged whenever Sortie cannot confirm that a command's or an agent session's processes are gone. On Windows, the warnings `hook process tree did not settle`, `hook job object creation failed; child tree may survive timeout`, and `hook process resume failed` are renamed `subprocess tree did not settle`, `process group assignment failed`, and `process resume failed` and now cover launches other than hooks, while `hook job termination after wait failed; drain may not settle`, `hook job accounting query failed; drain skipped`, and `hook job processes still active after drain deadline` are no longer logged; an alert built on any of the old text stops matching.
   ([#1080](https://github.com/sortie-ai/sortie/issues/1080), [#1099](https://github.com/sortie-ai/sortie/issues/1099))
+
+- A remote `claude-code` or `copilot-cli` agent now receives the credential variables its agent kind reads when Sortie's environment sets them: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN` for `claude-code`, and `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` for `copilot-cli`. Such a variable takes precedence over a login stored on the remote host, so if Sortie's environment sets one for another purpose, `GITHUB_TOKEN` for the tracker for example, while your hosts sign in on their own, name it under `worker.ssh_disallow_pass_env`. A remote host now needs the standard `dd` utility for any launch that sends a variable, which includes every remote `opencode` launch; a launch on a host without it fails and logs a message saying so.
+  ([#1048](https://github.com/sortie-ai/sortie/issues/1048))
 
 ### Migrations
 
@@ -942,7 +1059,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI pipeline with `golangci-lint`, `gofmt` enforcement, and test execution via GitHub Actions.
 - Architecture Decision Records (ADR-0001 through ADR-0005).
 
-[Unreleased]: https://github.com/sortie-ai/sortie/compare/v1.24.0...HEAD
+[Unreleased]: https://github.com/sortie-ai/sortie/compare/v1.25.0...HEAD
+[1.25.0]: https://github.com/sortie-ai/sortie/compare/v1.24.1...v1.25.0
+[1.24.1]: https://github.com/sortie-ai/sortie/compare/v1.24.0...v1.24.1
 [1.24.0]: https://github.com/sortie-ai/sortie/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/sortie-ai/sortie/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/sortie-ai/sortie/compare/v1.21.0...v1.22.0

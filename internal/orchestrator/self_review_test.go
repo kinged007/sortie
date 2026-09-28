@@ -2,10 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,8 +20,101 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
+
+func selfReviewTestSecret(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	return "self-review-secret-" + hex.EncodeToString(buf)
+}
+
+func TestCappedWriter_RetainsUpToMaxBytes(t *testing.T) {
+	t.Parallel()
+
+	w := &cappedWriter{max: 10}
+	if _, err := w.Write([]byte("0123456789ABCDEFGHIJ")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if got, want := w.String(), "0123456789"; got != want {
+		t.Errorf("String() = %q, want %q (excess silently discarded)", got, want)
+	}
+}
+
+func TestCappedWriter_WriteAlwaysReportsFullLength(t *testing.T) {
+	t.Parallel()
+
+	w := &cappedWriter{max: 4}
+	p := []byte("far more than the cap")
+	n, err := w.Write(p)
+	if err != nil {
+		t.Fatalf("Write() error = %v, want nil", err)
+	}
+	if n != len(p) {
+		t.Errorf("Write() = %d, want %d", n, len(p))
+	}
+}
+
+func TestCappedWriter_MasksAValueStraddlingTheCap(t *testing.T) {
+	t.Parallel()
+
+	value := selfReviewTestSecret(t)
+	redact.Add("test.cappedWriter straddle", value)
+
+	// cappedWriter retains the head, so the cap must land inside the
+	// value's own raw byte span (after a short prefix, not after enough
+	// padding to already exhaust the cap) to straddle it.
+	prefix := "abcd"
+	w := &cappedWriter{max: len(prefix) + len(value)/2}
+	if _, err := w.Write([]byte(prefix)); err != nil {
+		t.Fatalf("Write(prefix) error = %v", err)
+	}
+	if _, err := w.Write([]byte(value)); err != nil {
+		t.Fatalf("Write(value) error = %v", err)
+	}
+
+	got := w.String()
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("String() = %q, want it to start with %q", got, prefix)
+	}
+	if !strings.Contains(got, redact.Marker) {
+		t.Fatalf("String() = %q, want it to contain %q", got, redact.Marker)
+	}
+	if strings.Contains(got, value) {
+		t.Fatalf("String() = %q, leaked the full value straddling the cap", got)
+	}
+	if head := value[:len(value)/2]; strings.Contains(got, head) {
+		t.Fatalf("String() = %q, leaked a byte run %q from the value straddling the cap", got, head)
+	}
+}
+
+func TestCappedWriter_MasksAValueSplitAcrossWrites(t *testing.T) {
+	t.Parallel()
+
+	value := selfReviewTestSecret(t)
+	redact.Add("test.cappedWriter split write", value)
+
+	w := &cappedWriter{max: 4096}
+	half := len(value) / 2
+	if _, err := w.Write([]byte("start-" + value[:half])); err != nil {
+		t.Fatalf("Write(first half) error = %v", err)
+	}
+	if _, err := w.Write([]byte(value[half:] + "-end")); err != nil {
+		t.Fatalf("Write(second half) error = %v", err)
+	}
+
+	got := w.String()
+	if strings.Contains(got, value) {
+		t.Fatalf("String() = %q, still contains a value split across two Write calls", got)
+	}
+	if !strings.Contains(got, redact.Marker) {
+		t.Errorf("String() = %q, want it to contain %q", got, redact.Marker)
+	}
+}
 
 // writeVerdictFile writes a ReviewVerdict as JSON to <wsPath>/.sortie/review_verdict.json.
 func writeVerdictFile(t *testing.T, wsPath string, verdict domain.ReviewVerdict) {
@@ -396,6 +492,26 @@ func TestReadReviewVerdict_OversizedFile(t *testing.T) {
 	}
 }
 
+func TestReadReviewVerdict_LinkedSortieDirYieldsRefusalReasonNotAbsent(t *testing.T) {
+	t.Parallel()
+
+	wsPath := t.TempDir()
+	target := t.TempDir()
+	mustSymlink(t, target, filepath.Join(wsPath, ".sortie"))
+
+	verdict, _, parseErr := readReviewVerdict(wsPath)
+
+	if verdict != nil {
+		t.Error("verdict should be nil when .sortie is a symlink")
+	}
+	if !strings.HasPrefix(parseErr, "refusing to read verdict file:") {
+		t.Errorf("parseErr = %q, want prefix %q", parseErr, "refusing to read verdict file:")
+	}
+	if parseErr == "verdict file not found" {
+		t.Error("parseErr equals the absent-file reason, want the refusal reason")
+	}
+}
+
 func TestReadReviewVerdict_SymlinkRejection(t *testing.T) {
 	t.Parallel()
 
@@ -411,8 +527,8 @@ func TestReadReviewVerdict_SymlinkRejection(t *testing.T) {
 	if verdict != nil {
 		t.Error("verdict should be nil when .sortie is a symlink")
 	}
-	if !strings.Contains(parseErr, "symlink") {
-		t.Errorf("parseErr = %q, want to contain %q", parseErr, "symlink")
+	if !strings.Contains(parseErr, "symbolic link") {
+		t.Errorf("parseErr = %q, want to contain %q", parseErr, "symbolic link")
 	}
 }
 
@@ -668,6 +784,67 @@ func TestWriteReviewSummary_SymlinkRejected(t *testing.T) {
 	}
 }
 
+func TestWriteReviewSummary_SymlinkAtDestinationReplacedNotFollowed(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"review_summary.md", "review_summary.md.tmp"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			wsPath := t.TempDir()
+			sortieDirPath := filepath.Join(wsPath, ".sortie")
+			if err := os.MkdirAll(sortieDirPath, 0o755); err != nil {
+				t.Fatalf("MkdirAll(.sortie): %v", err)
+			}
+
+			outsideDir := t.TempDir()
+			targetPath := filepath.Join(outsideDir, "target-"+name)
+			if err := os.WriteFile(targetPath, []byte("outside-content"), 0o600); err != nil {
+				t.Fatalf("WriteFile(target): %v", err)
+			}
+			linkPath := filepath.Join(sortieDirPath, name)
+			mustSymlink(t, targetPath, linkPath)
+
+			meta := domain.ReviewMetadata{Enabled: true, FinalVerdict: "pass", TotalIterations: 1}
+			writeReviewSummary(wsPath, meta, discardLogger())
+
+			targetData, err := os.ReadFile(targetPath)
+			if err != nil {
+				t.Fatalf("ReadFile(target): %v", err)
+			}
+			if string(targetData) != "outside-content" {
+				t.Errorf("symlink target for %q content = %q, want unchanged %q", name, targetData, "outside-content")
+			}
+
+			if name == "review_summary.md.tmp" {
+				fi, err := os.Lstat(linkPath)
+				if err != nil {
+					t.Fatalf("Lstat(%q): %v", name, err)
+				}
+				if fi.Mode()&os.ModeSymlink == 0 {
+					t.Errorf("%q is no longer a symlink, want untouched (writeReviewSummary uses a fresh temp name)", name)
+				}
+				return
+			}
+
+			fi, err := os.Lstat(linkPath)
+			if err != nil {
+				t.Fatalf("Lstat(%q): %v", name, err)
+			}
+			if fi.Mode()&os.ModeSymlink != 0 {
+				t.Errorf("%q is still a symlink, want a regular file (link replaced, not followed)", name)
+			}
+			destData, err := os.ReadFile(linkPath)
+			if err != nil {
+				t.Fatalf("ReadFile(%q): %v", name, err)
+			}
+			if !strings.Contains(string(destData), "Self-Review Summary") {
+				t.Errorf("%q content = %q, want the rendered summary", name, destData)
+			}
+		})
+	}
+}
+
 func TestRunVerification_Success(t *testing.T) {
 	t.Parallel()
 
@@ -878,6 +1055,90 @@ func TestGenerateDiff_NoGit(t *testing.T) {
 	}
 }
 
+func TestRunSingleVerification_LinkedWorkspaceRefusedBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "workspace-link")
+	mustSymlink(t, target, link)
+	marker := filepath.Join(target, "marker")
+
+	result := runSingleVerification(context.Background(), "touch "+marker, link, 5000, discardLogger(), &reviewMetricsCount{})
+
+	if result.ExitCode != -1 {
+		t.Errorf("ExitCode = %d, want -1", result.ExitCode)
+	}
+	if result.ExecutionError == "" {
+		t.Error("ExecutionError is empty, want a verification error")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("marker file exists, want the verification command never to start")
+	}
+}
+
+func TestSelfReviewLoop_VerdictCleanupKeepsLinkedFileAndWarns(t *testing.T) {
+	t.Parallel()
+
+	wsPath := t.TempDir()
+	target := t.TempDir()
+	planted := filepath.Join(target, "review_verdict.json")
+	if err := os.WriteFile(planted, []byte(`{"verdict":"pass","summary":"planted"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(planted): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsPath, ".sortie"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.sortie): %v", err)
+	}
+	linkPath := filepath.Join(wsPath, ".sortie", "review_verdict.json")
+	mustSymlink(t, planted, linkPath)
+
+	cfg := selfReviewCfg()
+	cfg.MaxIterations = 1
+
+	var logBuf syncWorkerLogBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	m := &reviewMetricsCount{}
+	turns := 0
+	adapter := &verdictWriter{wsPath: wsPath}
+
+	meta, _, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+		Session:        domain.Session{ID: "sess"},
+		Issue:          selfReviewIssue(),
+		WorkspacePath:  wsPath,
+		Config:         cfg,
+		AgentAdapter:   adapter,
+		OnEvent:        func(_ string, _ domain.AgentEvent) {},
+		Logger:         logger,
+		Metrics:        m,
+		TurnsCompleted: &turns,
+	})
+
+	if meta == nil {
+		t.Fatal("meta = nil, want non-nil")
+	}
+	if meta.FinalVerdict == "pass" {
+		t.Errorf("FinalVerdict = %q, want not pass: the linked verdict is refused, never read", meta.FinalVerdict)
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("Lstat(review_verdict.json): %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("review_verdict.json is no longer a symlink, want it kept in place")
+	}
+	plantedData, err := os.ReadFile(planted)
+	if err != nil {
+		t.Fatalf("ReadFile(planted): %v", err)
+	}
+	if !strings.Contains(string(plantedData), "planted") {
+		t.Errorf("planted verdict content = %q, want unchanged", plantedData)
+	}
+
+	if !strings.Contains(logBuf.String(), "self-review verdict cleanup failed") {
+		t.Errorf("log output = %q, want a warning about the refused verdict cleanup", logBuf.String())
+	}
+}
+
 func TestSelfReviewLoop_PassOnFirst(t *testing.T) {
 	t.Parallel()
 
@@ -890,7 +1151,7 @@ func TestSelfReviewLoop_PassOnFirst(t *testing.T) {
 		verdicts: []domain.ReviewVerdict{{Verdict: "pass", Summary: "looks good"}},
 	}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, cancelledAtEnding, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -902,6 +1163,9 @@ func TestSelfReviewLoop_PassOnFirst(t *testing.T) {
 		TurnsCompleted: &turns,
 	})
 
+	if cancelledAtEnding {
+		t.Error("cancelledAtEnding = true, want false: the phase ended on its own with a pass verdict")
+	}
 	if meta == nil {
 		t.Fatal("meta = nil, want non-nil")
 	}
@@ -940,9 +1204,9 @@ func TestSelfReviewLoop_IterateThenPass(t *testing.T) {
 	turns := 0
 
 	// Turn sequence (zero-indexed verdictWriter.callIdx):
-	//   0 = review turn 1 → iterate
-	//   1 = fix turn 1    → no verdict
-	//   2 = review turn 2 → pass
+	//   0 = review turn 1, iterate
+	//   1 = fix turn 1, no verdict
+	//   2 = review turn 2, pass
 	adapter := &verdictWriter{
 		wsPath: wsPath,
 		verdicts: []domain.ReviewVerdict{
@@ -952,7 +1216,7 @@ func TestSelfReviewLoop_IterateThenPass(t *testing.T) {
 		},
 	}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -991,9 +1255,9 @@ func TestSelfReviewLoop_CapReached(t *testing.T) {
 	cfg.MaxIterations = 2
 
 	// Turn sequence:
-	//   0 = review turn 1 → iterate
-	//   1 = fix turn 1    → no verdict
-	//   2 = review turn 2 → iterate (cap reached after this)
+	//   0 = review turn 1, iterate
+	//   1 = fix turn 1, no verdict
+	//   2 = review turn 2, iterate (cap reached after this)
 	adapter := &verdictWriter{
 		wsPath: wsPath,
 		verdicts: []domain.ReviewVerdict{
@@ -1003,7 +1267,7 @@ func TestSelfReviewLoop_CapReached(t *testing.T) {
 		},
 	}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, cancelledAtEnding, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1015,6 +1279,9 @@ func TestSelfReviewLoop_CapReached(t *testing.T) {
 		TurnsCompleted: &turns,
 	})
 
+	if cancelledAtEnding {
+		t.Error("cancelledAtEnding = true, want false: the phase ended on its own by reaching the iteration cap")
+	}
 	if !meta.CapReached {
 		t.Error("CapReached = false, want true")
 	}
@@ -1044,7 +1311,7 @@ func TestSelfReviewLoop_MissingVerdict(t *testing.T) {
 	// Adapter writes no verdict file.
 	adapter := &verdictWriter{wsPath: wsPath, verdicts: nil}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1072,7 +1339,7 @@ func TestSelfReviewLoop_TurnError(t *testing.T) {
 
 	adapter := &failOnFirstAdapter{wsPath: wsPath}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, cancelledAtEnding, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1084,9 +1351,69 @@ func TestSelfReviewLoop_TurnError(t *testing.T) {
 		TurnsCompleted: &turns,
 	})
 
+	if cancelledAtEnding {
+		t.Error("cancelledAtEnding = true, want false: the turn failed on its own with the context still live")
+	}
+
 	// Loop should break on error; TurnsCompleted must not increment.
 	if turns != 0 {
 		t.Errorf("TurnsCompleted = %d, want 0 after turn error", turns)
+	}
+	if meta.TotalIterations != 1 {
+		t.Errorf("TotalIterations = %d, want 1 (partial record appended)", meta.TotalIterations)
+	}
+}
+
+// cancelOnMessageHandler stands in for a stop request landing while the
+// loop is still writing a log record, before the loop reads the cancellation.
+type cancelOnMessageHandler struct {
+	message string
+	cancel  context.CancelCauseFunc
+	cause   error
+}
+
+func (h *cancelOnMessageHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *cancelOnMessageHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.message {
+		h.cancel(h.cause)
+	}
+	return nil
+}
+func (h *cancelOnMessageHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *cancelOnMessageHandler) WithGroup(string) slog.Handler      { return h }
+
+func TestSelfReviewLoop_CancelledDuringTurnFailureLogging(t *testing.T) {
+	t.Parallel()
+
+	wsPath := t.TempDir()
+	turns := 0
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	logger := slog.New(&cancelOnMessageHandler{
+		message: "self-review turn failed",
+		cancel:  cancel,
+		cause:   errTokenCeilingStop,
+	})
+
+	adapter := &failOnFirstAdapter{wsPath: wsPath}
+
+	meta, _, cancelledAtEnding, phaseErr := runSelfReviewLoop(ctx, RunSelfReviewParams{
+		Session:        domain.Session{ID: "sess"},
+		Issue:          selfReviewIssue(),
+		WorkspacePath:  wsPath,
+		Config:         selfReviewCfg(),
+		AgentAdapter:   adapter,
+		OnEvent:        func(_ string, _ domain.AgentEvent) {},
+		Logger:         logger,
+		Metrics:        &domain.NoopMetrics{},
+		TurnsCompleted: &turns,
+	})
+
+	if phaseErr != nil {
+		t.Fatalf("phaseErr = %v, want nil", phaseErr)
+	}
+	if cancelledAtEnding {
+		t.Error("cancelledAtEnding = true, want false: the turn failed on its own before the stop request landed")
 	}
 	if meta.TotalIterations != 1 {
 		t.Errorf("TotalIterations = %d, want 1 (partial record appended)", meta.TotalIterations)
@@ -1102,7 +1429,7 @@ func TestSelfReviewLoop_StatusBlocked(t *testing.T) {
 	// Adapter writes "blocked" status signal during the first review turn.
 	adapter := &statusWriterAdapter{wsPath: wsPath, status: "blocked"}
 
-	meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, _, cancelledAtEnding, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1113,6 +1440,10 @@ func TestSelfReviewLoop_StatusBlocked(t *testing.T) {
 		Metrics:        &domain.NoopMetrics{},
 		TurnsCompleted: &turns,
 	})
+
+	if cancelledAtEnding {
+		t.Error("cancelledAtEnding = true, want false: a blocked signal ended the phase on its own")
+	}
 
 	// TurnsCompleted increments because the turn itself succeeded even though
 	// the status signal triggered an abort. turns == 1.
@@ -1141,7 +1472,7 @@ func TestSelfReviewLoop_ContextCancelled(t *testing.T) {
 		verdicts: []domain.ReviewVerdict{{Verdict: "pass", Summary: "done"}},
 	}
 
-	meta, _, _ := runSelfReviewLoop(ctx, RunSelfReviewParams{
+	meta, _, cancelledAtEnding, _ := runSelfReviewLoop(ctx, RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1155,6 +1486,9 @@ func TestSelfReviewLoop_ContextCancelled(t *testing.T) {
 
 	if meta.TotalIterations != 0 {
 		t.Errorf("TotalIterations = %d, want 0 for pre-cancelled context", meta.TotalIterations)
+	}
+	if !cancelledAtEnding {
+		t.Error("cancelledAtEnding = false, want true: the per-iteration check found the context already done")
 	}
 }
 
@@ -1174,7 +1508,7 @@ func TestSelfReviewLoop_ProgressEvents(t *testing.T) {
 		verdicts: []domain.ReviewVerdict{{Verdict: "pass", Summary: "good"}},
 	}
 
-	_, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	_, _, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1217,7 +1551,7 @@ func TestSelfReviewLoop_ReviewSummaryWritten(t *testing.T) {
 		verdicts: []domain.ReviewVerdict{{Verdict: "pass", Summary: "ok"}},
 	}
 
-	_, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	_, _, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1358,7 +1692,7 @@ func TestSelfReviewLoop_TerminalStatusSignal(t *testing.T) {
 				cancel()
 			}
 
-			_, signal, _ := runSelfReviewLoop(ctx, RunSelfReviewParams{
+			_, signal, _, _ := runSelfReviewLoop(ctx, RunSelfReviewParams{
 				Session:        domain.Session{ID: "sess"},
 				Issue:          selfReviewIssue(),
 				WorkspacePath:  wsPath,
@@ -1409,7 +1743,7 @@ func TestSelfReviewLoop_NeedsHumanReviewOnFixTurnContinues(t *testing.T) {
 		},
 	}
 
-	meta, signal, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, signal, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1452,7 +1786,7 @@ func TestSelfReviewLoop_NeedsHumanReviewEveryTurnHitsCap(t *testing.T) {
 
 	adapter := &repeatingNeedsReviewAdapter{t: t, wsPath: wsPath}
 
-	meta, signal, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+	meta, signal, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 		Session:        domain.Session{ID: "sess"},
 		Issue:          selfReviewIssue(),
 		WorkspacePath:  wsPath,
@@ -1583,7 +1917,7 @@ func TestSelfReviewLoop_FixTurnTimeoutAnnotatesIteration(t *testing.T) {
 			cfg.MaxIterations = 2
 			adapter := &fixTurnTimeoutAdapter{t: t, wsPath: wsPath, verdict: tt.verdict, rawVerdict: tt.rawVerdict}
 
-			meta, _, phaseErr := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+			meta, _, cancelledAtEnding, phaseErr := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 				Session:        domain.Session{ID: "sess"},
 				Issue:          selfReviewIssue(),
 				WorkspacePath:  wsPath,
@@ -1606,6 +1940,9 @@ func TestSelfReviewLoop_FixTurnTimeoutAnnotatesIteration(t *testing.T) {
 			}
 			if agentErr.Kind != domain.ErrTurnTimeout {
 				t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnTimeout)
+			}
+			if cancelledAtEnding {
+				t.Error("cancelledAtEnding = true, want false: a deadline expiry is reported through the error, not the cancellation flag")
 			}
 			if meta == nil {
 				t.Fatal("ReviewMetadata = nil, want the iteration record to survive the failure exit")
@@ -1678,7 +2015,7 @@ func TestSelfReviewLoop_OnTurnStartedCalledBeforeEachTurn(t *testing.T) {
 			log: &log,
 		}
 
-		meta, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+		meta, _, _, _ := runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 			Session:        domain.Session{ID: "sess"},
 			Issue:          selfReviewIssue(),
 			WorkspacePath:  wsPath,
@@ -1721,7 +2058,7 @@ func TestSelfReviewLoop_OnTurnStartedCalledBeforeEachTurn(t *testing.T) {
 			log:          &log,
 		}
 
-		_, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
+		_, _, _, _ = runSelfReviewLoop(context.Background(), RunSelfReviewParams{
 			Session:        domain.Session{ID: "sess"},
 			Issue:          selfReviewIssue(),
 			WorkspacePath:  wsPath,

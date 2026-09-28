@@ -6,18 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/workspace"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 // selfReviewProgressMsg carries self-review loop progress from the
@@ -37,7 +38,10 @@ type RunSelfReviewParams struct {
 	Config        config.SelfReviewConfig
 	AgentAdapter  domain.AgentAdapter
 	OnEvent       func(issueID string, event domain.AgentEvent)
-	OnProgress    func(selfReviewProgressMsg)
+	// OnTurnResult, when non-nil, receives the result of each review and
+	// fix turn.
+	OnTurnResult func(domain.TurnResult)
+	OnProgress   func(selfReviewProgressMsg)
 	// OnTurnStarted, when non-nil, is called on the worker goroutine
 	// before each review and fix turn.
 	OnTurnStarted func()
@@ -55,30 +59,58 @@ type RunSelfReviewParams struct {
 const maxVerdictFileBytes = 65536
 
 // cappedWriter captures up to max bytes of written data, silently
-// discarding excess. Write always reports the full input length so the
+// discarding excess, after masking every registered secret value in
+// the stream. Write always reports the full input length so the
 // writing subprocess never blocks on a full pipe buffer.
 type cappedWriter struct {
-	buf strings.Builder
-	max int
+	buf        strings.Builder
+	max        int
+	masker     *redact.Writer
+	maskerOnce sync.Once
+}
+
+func (w *cappedWriter) ensureMasker() {
+	w.maskerOnce.Do(func() {
+		w.masker = redact.NewWriter(&cappedWriterSink{w: w})
+	})
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
-	if w.buf.Len() < w.max {
-		remaining := min(w.max-w.buf.Len(), len(p))
-		w.buf.Write(p[:remaining])
+	w.ensureMasker()
+	if _, err := w.masker.Write(p); err != nil {
+		return 0, err
 	}
 	return len(p), nil
 }
 
+// String flushes the masker so a registered value straddling the cap
+// is masked before the cap sees it, then returns the retained text.
 func (w *cappedWriter) String() string {
+	w.ensureMasker()
+	_ = w.masker.Flush() // the underlying sink never returns an error
 	return w.buf.String()
+}
+
+// cappedWriterSink applies cappedWriter's byte cap to already-masked
+// bytes, so the retention decision never sees raw, unmasked input.
+type cappedWriterSink struct {
+	w *cappedWriter
+}
+
+func (s *cappedWriterSink) Write(p []byte) (int, error) {
+	if s.w.buf.Len() < s.w.max {
+		remaining := min(s.w.max-s.w.buf.Len(), len(p))
+		s.w.buf.Write(p[:remaining])
+	}
+	return len(p), nil
 }
 
 func generateWorkspaceDiff(ctx context.Context, workspacePath string, maxDiffBytes int) (diff string, originalSize int, truncated bool, err error) {
 	// Stage intent-to-add so new files appear in the diff. Best-effort:
 	// its outcome is ignored, as before.
-	intentCmd := workspace.GitCommand(ctx, workspacePath, "add", "--intent-to-add", ".")
-	_, _ = procutil.RunCapture(intentCmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
+	if intentCmd, intentErr := workspace.GitCommand(ctx, workspacePath, "add", "--intent-to-add", "."); intentErr == nil {
+		_, _ = procutil.RunCapture(intentCmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
+	}
 
 	output, cmdErr := runGitDiffCombined(ctx, workspacePath, "diff", "HEAD")
 	if cmdErr != nil {
@@ -103,7 +135,10 @@ func generateWorkspaceDiff(ctx context.Context, workspacePath string, maxDiffByt
 // merged into one sink, matching the combined-output shape the
 // self-review prompt has always embedded.
 func runGitDiffCombined(ctx context.Context, workspacePath string, args ...string) ([]byte, error) {
-	cmd := workspace.GitCommand(ctx, workspacePath, args...)
+	cmd, err := workspace.GitCommand(ctx, workspacePath, args...)
+	if err != nil {
+		return nil, err
+	}
 	var combined bytes.Buffer
 	result, err := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
 	if err != nil {
@@ -132,6 +167,20 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 	}
 	defer cancel()
 
+	start := time.Now()
+	if verifyErr := workspacekit.VerifyDir(workspacePath); verifyErr != nil {
+		logger.Warn("verification command failed to start",
+			slog.String("command", command),
+			slog.Any("error", verifyErr),
+		)
+		return domain.VerificationResult{
+			Command:        command,
+			ExitCode:       -1,
+			DurationMS:     time.Since(start).Milliseconds(),
+			ExecutionError: verifyErr.Error(),
+		}
+	}
+
 	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command) //nolint:gosec // command comes from operator-controlled config
 	cmd.Dir = workspacePath
 
@@ -141,7 +190,6 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 	stdoutBuf.max = int(domain.MaxVerificationOutputBytes)
 	stderrBuf.max = int(domain.MaxVerificationOutputBytes)
 
-	start := time.Now()
 	result, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{
 		Stdout: &stdoutBuf,
 		Stderr: &stderrBuf,
@@ -222,45 +270,21 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 }
 
 func readReviewVerdict(workspacePath string) (*domain.ReviewVerdict, string, string) {
-	dir := filepath.Join(workspacePath, ".sortie")
-	fi, err := os.Lstat(dir)
+	data, err := workspacekit.ReadSortieFile(workspacePath, "review_verdict.json", maxVerdictFileBytes)
 	if err != nil {
-		return nil, "", "verdict directory not found"
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, "", "refusing to read from symlinked .sortie"
-	}
-
-	path := filepath.Join(dir, "review_verdict.json")
-
-	// Reject symlinked verdict files to prevent reading arbitrary host files.
-	fileFI, fileErr := os.Lstat(path)
-	if fileErr != nil {
-		if os.IsNotExist(fileErr) {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			return nil, "", "verdict file not found"
+		case errors.Is(err, workspacekit.ErrLink),
+			errors.Is(err, workspacekit.ErrNotDirectory),
+			errors.Is(err, workspacekit.ErrNotPlainFile),
+			errors.Is(err, workspacekit.ErrChanged):
+			return nil, "", "refusing to read verdict file: " + err.Error()
+		case errors.Is(err, workspacekit.ErrTooLarge):
+			return nil, "", "verdict file exceeds 64 KB size limit"
+		default:
+			return nil, "", "verdict read error: " + err.Error()
 		}
-		return nil, "", fmt.Sprintf("verdict stat error: %v", fileErr)
-	}
-	if fileFI.Mode()&os.ModeSymlink != 0 {
-		return nil, "", "refusing to read symlinked verdict file"
-	}
-	if !fileFI.Mode().IsRegular() {
-		return nil, "", "verdict path is not a regular file"
-	}
-
-	f, err := os.Open(path) //nolint:gosec // path is constructed from operator-controlled workspace root
-	if err != nil {
-		return nil, "", fmt.Sprintf("verdict open error: %v", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	limited := io.LimitReader(f, maxVerdictFileBytes+1)
-	data, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, "", fmt.Sprintf("verdict read error: %v", err)
-	}
-	if len(data) > maxVerdictFileBytes {
-		return nil, "", "verdict file exceeds 64 KB size limit"
 	}
 
 	var verdict domain.ReviewVerdict
@@ -399,18 +423,6 @@ func buildFixPrompt(verdict *domain.ReviewVerdict, parseErr string, iteration, m
 }
 
 func writeReviewSummary(workspacePath string, meta domain.ReviewMetadata, logger *slog.Logger) {
-	dir := filepath.Join(workspacePath, ".sortie")
-
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		logger.Warn("review summary: cannot stat .sortie directory", slog.Any("error", err))
-		return
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		logger.Warn("review summary: .sortie is a symlink, refusing to write")
-		return
-	}
-
 	var sb strings.Builder
 	sb.WriteString("## Self-Review Summary\n\n")
 
@@ -459,14 +471,8 @@ func writeReviewSummary(workspacePath string, meta domain.ReviewMetadata, logger
 		sb.WriteString("\n")
 	}
 
-	tmpPath := filepath.Join(dir, "review_summary.md.tmp")
-	outPath := filepath.Join(dir, "review_summary.md")
-	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0o600); err != nil {
+	if err := workspacekit.WriteSortieFile(workspacePath, "review_summary.md", []byte(sb.String())); err != nil {
 		logger.Warn("review summary write failed", slog.Any("error", err))
-		return
-	}
-	if err := os.Rename(tmpPath, outPath); err != nil {
-		logger.Warn("review summary rename failed", slog.Any("error", err))
 	}
 }
 
@@ -485,12 +491,17 @@ func readAndConsumeStatusSignal(workspacePath string, logger *slog.Logger) works
 	return signal
 }
 
-func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain.ReviewMetadata, workspace.StatusSignal, error) {
+func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain.ReviewMetadata, workspace.StatusSignal, bool, error) {
 	maxIter := params.Config.MaxIterations
 	iterations := make([]domain.ReviewIterationRecord, 0, maxIter)
 	logger := params.Logger
 	terminalSignal := workspace.StatusNone
 	var expiryErr error
+
+	// cancelledAtEnding is read at each cut point rather than once the loop
+	// returns, so a phase that ended on its own is never reclassified by a
+	// stop request landing afterward.
+	var cancelledAtEnding bool
 
 	if params.OnProgress != nil {
 		params.OnProgress(selfReviewProgressMsg{
@@ -503,6 +514,7 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 	for i := 1; i <= maxIter; i++ {
 		if ctx.Err() != nil {
+			cancelledAtEnding = true
 			break
 		}
 
@@ -524,34 +536,31 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 		reviewPrompt := assembleReviewPrompt(params.Issue, diff, truncated, verificationResults, i, maxIter)
 
-		// Remove previous verdict file only when .sortie is a real directory.
-		sortieDirPath := filepath.Join(params.WorkspacePath, ".sortie")
-		sortieInfo, sortieErr := os.Lstat(sortieDirPath)
-		if sortieErr == nil {
-			if sortieInfo.Mode()&os.ModeSymlink == 0 && sortieInfo.IsDir() {
-				_ = os.Remove(filepath.Join(sortieDirPath, "review_verdict.json"))
-			} else {
-				logger.Warn("self-review verdict cleanup skipped: .sortie is a symlink or not a directory",
-					slog.Int("iteration", i),
-				)
-			}
-		} else if !os.IsNotExist(sortieErr) {
+		if removeErr := workspacekit.RemoveSortieFile(params.WorkspacePath, "review_verdict.json"); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
 			logger.Warn("self-review verdict cleanup failed",
 				slog.Int("iteration", i),
-				slog.Any("error", sortieErr),
+				slog.Any("error", removeErr),
 			)
 		}
 
+		if ctx.Err() != nil {
+			cancelledAtEnding = true
+			break
+		}
 		if params.OnTurnStarted != nil {
 			params.OnTurnStarted()
 		}
-		_, turnErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
+		reviewResult, turnErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
 			Prompt: reviewPrompt,
 			Issue:  params.Issue,
 			OnEvent: func(event domain.AgentEvent) {
 				params.OnEvent(params.Issue.ID, event)
 			},
 		}, params.TurnTimeoutMS, logger, slog.Int("iteration", i), slog.String("review_turn", "review"))
+		cutByCancel := ctx.Err() != nil
+		if params.OnTurnResult != nil {
+			params.OnTurnResult(reviewResult)
+		}
 		if turnErr != nil {
 			logger.Warn("self-review turn failed",
 				slog.Int("iteration", i),
@@ -567,6 +576,8 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 			var agentErr *domain.AgentError
 			if errors.As(turnErr, &agentErr) && agentErr.Kind == domain.ErrTurnTimeout {
 				expiryErr = fmt.Errorf("self-review review turn (iteration %d): %w", i, turnErr)
+			} else if cutByCancel {
+				cancelledAtEnding = true
 			}
 			break
 		}
@@ -652,16 +663,24 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 		fixPrompt := buildFixPrompt(verdict, parseErr, i, maxIter)
 
+		if ctx.Err() != nil {
+			cancelledAtEnding = true
+			break
+		}
 		if params.OnTurnStarted != nil {
 			params.OnTurnStarted()
 		}
-		_, fixErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
+		fixResult, fixErr := runBoundedTurn(ctx, params.AgentAdapter, params.Session, domain.RunTurnParams{
 			Prompt: fixPrompt,
 			Issue:  params.Issue,
 			OnEvent: func(event domain.AgentEvent) {
 				params.OnEvent(params.Issue.ID, event)
 			},
 		}, params.TurnTimeoutMS, logger, slog.Int("iteration", i), slog.String("review_turn", "fix"))
+		fixCutByCancel := ctx.Err() != nil
+		if params.OnTurnResult != nil {
+			params.OnTurnResult(fixResult)
+		}
 		if fixErr != nil {
 			logger.Warn("self-review fix turn failed",
 				slog.Int("iteration", i),
@@ -677,6 +696,8 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 				} else {
 					last.VerdictParseError += "; " + note
 				}
+			} else if fixCutByCancel {
+				cancelledAtEnding = true
 			}
 			break
 		}
@@ -727,5 +748,5 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 	params.Metrics.IncSelfReviewSessions(finalVerdict)
 
-	return meta, terminalSignal, expiryErr
+	return meta, terminalSignal, cancelledAtEnding, expiryErr
 }

@@ -19,8 +19,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
-	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 func init() {
@@ -31,6 +31,7 @@ func init() {
 		SessionResumeBlockedBy: sessionResumeBlockedBy,
 		UsageArrival:           registry.UsageArrivalIncremental,
 		UsageAttribution:       registry.UsageAttributionPerModel,
+		CredentialEnv:          registry.DeclareCredentialEnv("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
 	})
 }
 
@@ -62,6 +63,8 @@ type sessionState struct {
 
 	// mcpConfigPath is the worker-generated MCP config file path.
 	mcpConfigPath string
+
+	credentialVerification bool
 
 	// forkSession owns the subprocess lifecycle for this session.
 	forkSession *agentcore.ForkPerTurnSession
@@ -148,17 +151,26 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 		sessionUUID = params.ResumeSessionID
 		isContinuation = true
 	} else {
-		sessionUUID = newUUID()
+		uuid, uuidErr := agentcore.NewUUIDv4()
+		if uuidErr != nil {
+			return domain.Session{}, &domain.AgentError{
+				Kind:    domain.ErrAgentNotFound,
+				Message: "could not generate a session id",
+				Err:     uuidErr,
+			}
+		}
+		sessionUUID = uuid
 	}
 
 	state := &sessionState{
-		target:          target,
-		claudeSessionID: sessionUUID,
-		isContinuation:  isContinuation,
-		agentConfig:     params.AgentConfig,
-		baseLogger:      slog.Default().With(slog.String("component", "claude-adapter")),
-		mcpConfigPath:   params.MCPConfigPath,
-		acc:             agentcore.NewRunUsage(),
+		target:                 target,
+		claudeSessionID:        sessionUUID,
+		isContinuation:         isContinuation,
+		agentConfig:            params.AgentConfig,
+		baseLogger:             slog.Default().With(slog.String("component", "claude-adapter")),
+		mcpConfigPath:          params.MCPConfigPath,
+		credentialVerification: params.CredentialVerification,
+		acc:                    agentcore.NewRunUsage(),
 	}
 
 	hooks := agentcore.ForkPerTurnHooks{
@@ -223,7 +235,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 						if meta.Usage != nil && meta.ID != "" {
 							candidate := usageFromAssistant(meta.Usage)
 							prior, seen := state.turnMessages[meta.ID]
-							state.turnMessages[meta.ID] = componentwiseMaxUsage(prior, candidate)
+							state.turnMessages[meta.ID] = agentcore.MaxUsage(prior, candidate)
 							provisional := sumTurnMessages(state.turnMessages)
 							snapshot := state.acc.SetTurnProvisional(provisional)
 
@@ -297,7 +309,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 		},
 		GetUsage:     func() (domain.TokenUsage, bool) { return state.acc.Snapshot(), state.usageMeasured },
 		GetSessionID: func() string { return state.claudeSessionID },
-		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			usage := state.acc.Snapshot()
 
 			// A recognized request that only a person could answer, observed
@@ -318,6 +330,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 			ev := agentcore.TurnEvidence{
 				ExitObserved: true,
 				ExitCode:     exitCode,
+				EarlyExit:    earlyExit,
 			}
 			ev.Work, ev.WorkDetail = state.work.Report()
 
@@ -330,10 +343,14 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 				}
 				if lastResult.Subtype == "success" && !lastResult.IsError {
 					ev.Terminal = agentcore.TerminalSuccess
-					ev.TerminalMessage = typeutil.TruncateRunes(lastResult.Result, 500)
+					ev.TerminalMessage = redact.Truncate(lastResult.Result, 500)
 				} else {
 					ev.Terminal = agentcore.TerminalFailure
-					ev.TerminalMessage = lastResult.Subtype
+					if strings.TrimSpace(lastResult.Result) != "" {
+						ev.TerminalMessage = redact.Truncate(lastResult.Result, 500)
+					} else {
+						ev.TerminalMessage = lastResult.Subtype
+					}
 				}
 			}
 
@@ -533,7 +550,7 @@ func processToolBlocks(
 			msg := "tool_result: " + toolName
 			if block.IsError {
 				if errText := toolResultText(block); errText != "" {
-					msg = truncateToolError(stripClaudeMarkup(errText), maxToolErrorLen)
+					msg = truncateToolError(redact.Mask(stripClaudeMarkup(errText)), maxToolErrorLen)
 				}
 			}
 			onEvent(domain.AgentEvent{

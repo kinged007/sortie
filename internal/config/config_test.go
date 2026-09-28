@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -9,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 func TestNewServiceConfig(t *testing.T) {
@@ -1190,6 +1194,70 @@ func TestNewServiceConfig(t *testing.T) {
 		assertConfigErrorField(t, err, "agent.max_tokens")
 	})
 
+	t.Run("TokenWarningPercent/DefaultIsZero", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Agent.TokenWarningPercent", 0, cfg.Agent.TokenWarningPercent)
+	})
+
+	t.Run("TokenWarningPercent/ExplicitZero", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": 0},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Agent.TokenWarningPercent", 0, cfg.Agent.TokenWarningPercent)
+	})
+
+	t.Run("TokenWarningPercent/InRange", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": 80},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertIntEqual(t, "Agent.TokenWarningPercent", 80, cfg.Agent.TokenWarningPercent)
+	})
+
+	t.Run("TokenWarningPercent/NegativeRejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": -1},
+		})
+		assertConfigErrorField(t, err, "agent.token_warning_percent")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", "must be between 0 and 99", ce.Message)
+	})
+
+	t.Run("TokenWarningPercent/AboveRangeRejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": 100},
+		})
+		assertConfigErrorField(t, err, "agent.token_warning_percent")
+		var ce *ConfigError
+		errors.As(err, &ce)
+		assertStringEqual(t, "ConfigError.Message", "must be between 0 and 99", ce.Message)
+	})
+
+	t.Run("TokenWarningPercent/IndependentOfMaxTokens", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": 99, "max_tokens": 0},
+		})
+		if err != nil {
+			t.Fatalf("token_warning_percent above an unset max_tokens must not error: %v", err)
+		}
+		assertIntEqual(t, "Agent.TokenWarningPercent", 99, cfg.Agent.TokenWarningPercent)
+	})
+
 	t.Run("InProgressState/Absent", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
@@ -1530,6 +1598,38 @@ func TestNewServiceConfig(t *testing.T) {
 	})
 }
 
+func TestAgentConfig_TokenWarningThreshold(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		maxTokens           int
+		tokenWarningPercent int
+		want                int
+	}{
+		{name: "2000000 tokens at 80 percent", maxTokens: 2000000, tokenWarningPercent: 80, want: 1600000},
+		{name: "150 tokens at 80 percent", maxTokens: 150, tokenWarningPercent: 80, want: 120},
+		{name: "7 tokens at 50 percent", maxTokens: 7, tokenWarningPercent: 50, want: 4},
+		{name: "101 tokens at 99 percent", maxTokens: 101, tokenWarningPercent: 99, want: 100},
+		{name: "threshold equal to the ceiling", maxTokens: 1, tokenWarningPercent: 99, want: 1},
+		{name: "max_tokens zero disables the threshold", maxTokens: 0, tokenWarningPercent: 80, want: 0},
+		{name: "percent zero disables the threshold", maxTokens: 1000000, tokenWarningPercent: 0, want: 0},
+		{name: "both zero disables the threshold", maxTokens: 0, tokenWarningPercent: 0, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := AgentConfig{MaxTokens: tt.maxTokens, TokenWarningPercent: tt.tokenWarningPercent}
+			if got := a.TokenWarningThreshold(); got != tt.want {
+				t.Errorf("AgentConfig{MaxTokens: %d, TokenWarningPercent: %d}.TokenWarningThreshold() = %d, want %d",
+					tt.maxTokens, tt.tokenWarningPercent, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReactionsTriage asserts that triage is accepted on exactly the
 // four members of TriageSupportedReactionKeys and rejected elsewhere,
 // timeout_ms defaults and clamps to its documented range, and script
@@ -1816,7 +1916,7 @@ func TestBuildLabelCommandsConfig_Defaults(t *testing.T) {
 
 	t.Run("absent block is a zero-value config, no error", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(nil)
+		got, _, err := buildLabelCommandsConfig(nil)
 		if err != nil {
 			t.Fatalf("buildLabelCommandsConfig(nil): unexpected error: %v", err)
 		}
@@ -1827,7 +1927,7 @@ func TestBuildLabelCommandsConfig_Defaults(t *testing.T) {
 
 	t.Run("provider only fills in every default", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider": "github",
 		})
 		if err != nil {
@@ -1851,7 +1951,7 @@ func TestBuildLabelCommandsConfig_EmptyProviderIgnoresFields(t *testing.T) {
 	// With no active provider the block is inert, so a below-floor poll
 	// interval and a type-invalid label field are neither clamped nor
 	// rejected: the whole block is ignored and yields a zero-value config.
-	got, err := buildLabelCommandsConfig(map[string]any{
+	got, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":         "",
 		"poll_interval_ms": 5,
 		"review_label":     123,
@@ -1867,7 +1967,7 @@ func TestBuildLabelCommandsConfig_EmptyProviderIgnoresFields(t *testing.T) {
 func TestBuildLabelCommandsConfig_ReviewLabelDisabled(t *testing.T) {
 	t.Parallel()
 
-	got, err := buildLabelCommandsConfig(map[string]any{
+	got, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":     "github",
 		"review_label": "",
 		"fix_label":    "sortie:fix",
@@ -1906,7 +2006,7 @@ func TestBuildLabelCommandsConfig_FixLabelParsedNotWired(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := buildLabelCommandsConfig(tt.m)
+			got, _, err := buildLabelCommandsConfig(tt.m)
 			if err != nil {
 				t.Fatalf("buildLabelCommandsConfig(%+v): unexpected error: %v", tt.m, err)
 			}
@@ -1922,7 +2022,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("below floor clamps to 30000", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, advisory, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 5000,
 		})
@@ -1932,11 +2032,21 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 		if got.PollIntervalMS != 30000 {
 			t.Errorf("PollIntervalMS = %d, want 30000 (clamped)", got.PollIntervalMS)
 		}
+		if advisory == nil {
+			t.Fatal("buildLabelCommandsConfig advisory = nil, want non-nil when poll_interval_ms is clamped")
+		}
+		assertStringEqual(t, "advisory.Check", "reactions.label_commands.poll_interval_ms.clamped", advisory.Check)
+		assertStringEqual(t, "advisory.Text", "reactions.label_commands.poll_interval_ms is 5000, below the minimum of 30000; 30000 is used", advisory.Text)
+		assertStringEqual(t, "advisory.Message", "clamped label_commands poll_interval_ms to floor", advisory.Message)
+		if len(advisory.Attrs) != 2 || advisory.Attrs[0].Key != "configured_ms" || advisory.Attrs[0].Value.Int64() != 5000 ||
+			advisory.Attrs[1].Key != "floor_ms" || advisory.Attrs[1].Value.Int64() != 30000 {
+			t.Errorf("advisory.Attrs = %v, want [configured_ms=5000 floor_ms=30000]", advisory.Attrs)
+		}
 	})
 
 	t.Run("at floor is unchanged", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, advisory, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 30000,
 		})
@@ -1946,11 +2056,14 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 		if got.PollIntervalMS != 30000 {
 			t.Errorf("PollIntervalMS = %d, want 30000", got.PollIntervalMS)
 		}
+		if advisory != nil {
+			t.Errorf("buildLabelCommandsConfig advisory = %+v, want nil when poll_interval_ms is not clamped", advisory)
+		}
 	})
 
 	t.Run("above floor is unchanged", func(t *testing.T) {
 		t.Parallel()
-		got, err := buildLabelCommandsConfig(map[string]any{
+		got, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": 90000,
 		})
@@ -1964,7 +2077,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("non-integer value is a ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": "not-a-number",
 		})
@@ -1973,7 +2086,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("out-of-range uint64 value is a range ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": uint64(9223372036854775808),
 		})
@@ -1985,7 +2098,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 
 	t.Run("out-of-range float64 value is a range ConfigError", func(t *testing.T) {
 		t.Parallel()
-		_, err := buildLabelCommandsConfig(map[string]any{
+		_, _, err := buildLabelCommandsConfig(map[string]any{
 			"provider":         "github",
 			"poll_interval_ms": float64(1e20),
 		})
@@ -1999,7 +2112,7 @@ func TestBuildLabelCommandsConfig_PollIntervalFloorClamp(t *testing.T) {
 func TestBuildLabelCommandsConfig_BothLabelsEmptyErrors(t *testing.T) {
 	t.Parallel()
 
-	_, err := buildLabelCommandsConfig(map[string]any{
+	_, _, err := buildLabelCommandsConfig(map[string]any{
 		"provider":     "github",
 		"review_label": "",
 		"fix_label":    "",
@@ -2209,6 +2322,17 @@ func assertStringEqual(t *testing.T, name, want, got string) {
 	}
 }
 
+// hasAdvisory reports whether advisories carries one whose Check and
+// Message equal the given values.
+func hasAdvisory(advisories []Advisory, check, message string) bool {
+	for _, a := range advisories {
+		if a.Check == check && a.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
 func assertIntEqual(t *testing.T, name string, want, got int) {
 	t.Helper()
 	if got != want {
@@ -2347,7 +2471,7 @@ func TestNewServiceConfigEnvOverrides(t *testing.T) {
 
 	t.Run("APIKeyDollarNotExpanded", func(t *testing.T) {
 		// A dollar + numeric prefix would be truncated by os.ExpandEnv
-		// (e.g. "tok$5abc" → "tok" if $5 is treated as a variable reference).
+		// (e.g. "tok$5abc" -> "tok" if $5 is treated as a variable reference).
 		// The env override layer must preserve literal dollar signs.
 		t.Setenv("SORTIE_TRACKER_API_KEY", "tok$5abc")
 		cfg, err := NewServiceConfig(map[string]any{})
@@ -2423,7 +2547,7 @@ func TestNewServiceConfigEnvOverrides(t *testing.T) {
 	})
 
 	t.Run("CommentsOnCompletionOverrideFalse", func(t *testing.T) {
-		// Override an existing YAML true → false via env.
+		// Override an existing YAML true -> false via env.
 		t.Setenv("SORTIE_TRACKER_COMMENTS_ON_COMPLETION", "false")
 		cfg, err := NewServiceConfig(map[string]any{
 			"tracker": map[string]any{
@@ -2515,6 +2639,7 @@ func TestNewServiceConfigEnvOverrides(t *testing.T) {
 		t.Setenv("SORTIE_AGENT_MAX_RETRY_BACKOFF_MS", "99999")
 		t.Setenv("SORTIE_AGENT_MAX_SESSIONS", "3")
 		t.Setenv("SORTIE_AGENT_MAX_TOKENS", "750000")
+		t.Setenv("SORTIE_AGENT_TOKEN_WARNING_PERCENT", "80")
 
 		cfg, err := NewServiceConfig(map[string]any{})
 		if err != nil {
@@ -2528,6 +2653,7 @@ func TestNewServiceConfigEnvOverrides(t *testing.T) {
 		assertIntEqual(t, "Agent.MaxRetryBackoffMS", 99999, cfg.Agent.MaxRetryBackoffMS)
 		assertIntEqual(t, "Agent.MaxSessions", 3, cfg.Agent.MaxSessions)
 		assertIntEqual(t, "Agent.MaxTokens", 750000, cfg.Agent.MaxTokens)
+		assertIntEqual(t, "Agent.TokenWarningPercent", 80, cfg.Agent.TokenWarningPercent)
 	})
 
 	t.Run("MaxTokensOverrideBeatsFrontMatter", func(t *testing.T) {
@@ -2539,6 +2665,23 @@ func TestNewServiceConfigEnvOverrides(t *testing.T) {
 			t.Fatalf("NewServiceConfig: %v", err)
 		}
 		assertIntEqual(t, "Agent.MaxTokens", 200000, cfg.Agent.MaxTokens)
+	})
+
+	t.Run("TokenWarningPercentOverrideBeatsFrontMatter", func(t *testing.T) {
+		t.Setenv("SORTIE_AGENT_TOKEN_WARNING_PERCENT", "90")
+		cfg, err := NewServiceConfig(map[string]any{
+			"agent": map[string]any{"token_warning_percent": 50},
+		})
+		if err != nil {
+			t.Fatalf("NewServiceConfig: %v", err)
+		}
+		assertIntEqual(t, "Agent.TokenWarningPercent", 90, cfg.Agent.TokenWarningPercent)
+	})
+
+	t.Run("TokenWarningPercentOverrideOutOfRangeFailsConfigConstruction", func(t *testing.T) {
+		t.Setenv("SORTIE_AGENT_TOKEN_WARNING_PERCENT", "100")
+		_, err := NewServiceConfig(map[string]any{})
+		assertEnvOverrideError(t, err, "agent.token_warning_percent", "must be between 0 and 99")
 	})
 
 	t.Run("MaxTokensDynamicReload", func(t *testing.T) {
@@ -2715,6 +2858,35 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 			t.Error("ci_feedback leaked into cfg.extensions; want absent")
 		}
 	})
+}
+
+func TestNewServiceConfig_CIFeedbackAndLabelCommandsAdvisoriesAccumulate(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := NewServiceConfig(map[string]any{
+		"ci_feedback": map[string]any{"kind": "github"},
+		"reactions": map[string]any{
+			"ci_failure": map[string]any{"provider": "github-actions"},
+			"label_commands": map[string]any{
+				"provider":         "github",
+				"poll_interval_ms": 5000,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServiceConfig: unexpected error: %v", err)
+	}
+
+	got := cfg.Advisories()
+	if len(got) != 2 {
+		t.Fatalf("Advisories() = %+v, want 2 entries", got)
+	}
+	if !hasAdvisory(got, "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
+		t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", got)
+	}
+	if !hasAdvisory(got, "reactions.label_commands.poll_interval_ms.clamped", "clamped label_commands poll_interval_ms to floor") {
+		t.Errorf("Advisories() = %+v, want the poll_interval_ms.clamped advisory", got)
+	}
 }
 
 func TestNewServiceConfig_SelfReview(t *testing.T) {
@@ -3280,7 +3452,7 @@ func TestPopulateCIFeedbackFromReactions(t *testing.T) {
 }
 
 // TestCIFailureMigration verifies the full precedence logic for the
-// reactions.ci_failure → CIFeedback migration path through NewServiceConfig.
+// reactions.ci_failure -> CIFeedback migration path through NewServiceConfig.
 func TestCIFailureMigration(t *testing.T) {
 	t.Parallel()
 
@@ -3431,6 +3603,10 @@ func TestCIFailureMigration(t *testing.T) {
 		assertIntEqual(t, "CIFeedback.MaxLogLines", 75, cfg.CIFeedback.MaxLogLines)
 		assertStringEqual(t, "CIFeedback.Escalation", "comment", cfg.CIFeedback.Escalation)
 		assertStringEqual(t, "CIFeedback.EscalationLabel", "ci-blocked", cfg.CIFeedback.EscalationLabel)
+
+		if !hasAdvisory(cfg.Advisories(), "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
+			t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", cfg.Advisories())
+		}
 	})
 
 	t.Run("Precedence/CIFeedbackOnly", func(t *testing.T) {
@@ -3477,6 +3653,38 @@ func TestCIFailureMigration(t *testing.T) {
 		}
 		assertStringEqual(t, "Reactions[review_comments].Provider", "github", rc.Provider)
 	})
+}
+
+// TestExtensionEnvRefPaths covers the section-relative view of the
+// pre-resolution snapshot: a slice element and a nested field under the
+// named section are reported with the section prefix stripped, a leaf
+// under another section is excluded, and a section holding no reference
+// reports nil.
+func TestExtensionEnvRefPaths(t *testing.T) {
+	t.Parallel()
+
+	cfg := ServiceConfig{
+		extensionsPreResolution: map[string]string{
+			"worker.ssh_pass_env[1]": "$SORTIE_TEST_ENV_REF_PATHS",
+			"worker.nested.field":    "${SORTIE_TEST_ENV_REF_PATHS}",
+			"other.key":              "$SORTIE_TEST_ENV_REF_PATHS",
+		},
+	}
+
+	got := cfg.ExtensionEnvRefPaths("worker")
+	want := map[string]bool{"ssh_pass_env[1]": true, "nested.field": true}
+	if len(got) != len(want) {
+		t.Fatalf("ExtensionEnvRefPaths(\"worker\") = %v, want %v", got, want)
+	}
+	for path := range want {
+		if !got[path] {
+			t.Errorf("ExtensionEnvRefPaths(\"worker\") = %v, want it to report %q", got, path)
+		}
+	}
+
+	if got := cfg.ExtensionEnvRefPaths("absent"); got != nil {
+		t.Errorf("ExtensionEnvRefPaths(\"absent\") = %v, want nil", got)
+	}
 }
 
 // TestResolveExtensionEnvRefs covers the recursive walker at the unit level:
@@ -4479,4 +4687,146 @@ func TestSetExtensionSection(t *testing.T) {
 			t.Error("host survived the replacement, want the section replaced wholesale")
 		}
 	})
+}
+
+func randomConfigSecret(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	return "config-secret-" + hex.EncodeToString(buf)
+}
+
+func requireConfigMasked(t *testing.T, value string) {
+	t.Helper()
+	if got := redact.Mask(value); got == value {
+		t.Errorf("redact.Mask(%q) = %q, want it masked", value, got)
+	}
+}
+
+func requireConfigUnmasked(t *testing.T, value string) {
+	t.Helper()
+	if got := redact.Mask(value); got != value {
+		t.Errorf("redact.Mask(%q) = %q, want it unchanged", value, got)
+	}
+}
+
+func TestNewServiceConfig_RegistersTrackerAPIKeyFromFrontMatter(t *testing.T) {
+	t.Parallel()
+
+	value := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"tracker": map[string]any{"api_key": value},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersTrackerAPIKeyFromDollarVarReference(t *testing.T) {
+	// Not parallel: mutates the process environment via t.Setenv.
+	value := randomConfigSecret(t)
+	t.Setenv("SORTIE_CONFIG_TEST_TRACKER_KEY", value)
+
+	if _, err := NewServiceConfig(map[string]any{
+		"tracker": map[string]any{"api_key": "$SORTIE_CONFIG_TEST_TRACKER_KEY"},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersTrackerAPIKeyFromEnvOverride(t *testing.T) {
+	// Not parallel: mutates the process environment via t.Setenv.
+	value := randomConfigSecret(t)
+	t.Setenv("SORTIE_TRACKER_API_KEY", value)
+
+	if _, err := NewServiceConfig(map[string]any{}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersTrackerEndpointURLCredentials(t *testing.T) {
+	t.Parallel()
+
+	user := randomConfigSecret(t)
+	pass := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"tracker": map[string]any{"endpoint": "https://" + user + ":" + pass + "@example.com"},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, user+":"+pass)
+}
+
+func TestNewServiceConfig_RegistersReactionExtraLeafUnderAcceptedKey(t *testing.T) {
+	t.Parallel()
+
+	value := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"reactions": map[string]any{
+			"ci": map[string]any{"extra_token": value},
+		},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersExtensionSectionLeafUnderAcceptedKey(t *testing.T) {
+	t.Parallel()
+
+	value := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"codex": map[string]any{"env": map[string]any{"OPENAI_API_KEY": value}},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_ReactionExtraLeafUnderRejectedKeyStaysReadable(t *testing.T) {
+	t.Parallel()
+
+	value := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"reactions": map[string]any{
+			"ci": map[string]any{"auth": map[string]any{"username": value}},
+		},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigUnmasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersNotificationBackendConfigLeafUnderAcceptedKey(t *testing.T) {
+	t.Parallel()
+
+	value := randomConfigSecret(t)
+	if _, err := NewServiceConfig(map[string]any{
+		"notifications": []any{
+			map[string]any{"kind": "webhook", "api_token": value},
+		},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, value)
+}
+
+func TestNewServiceConfig_RegistersNotificationBackendURLWhole(t *testing.T) {
+	t.Parallel()
+
+	user := randomConfigSecret(t)
+	pass := randomConfigSecret(t)
+	url := "https://" + user + ":" + pass + "@example.com/hook"
+	if _, err := NewServiceConfig(map[string]any{
+		"notifications": []any{
+			map[string]any{"kind": "webhook", "webhook_url": url},
+		},
+	}); err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	requireConfigMasked(t, url)
 }

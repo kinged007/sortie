@@ -2,11 +2,15 @@ package kiro_test
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/sortie-ai/sortie/internal/agent/kiro"
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
+	"github.com/sortie-ai/sortie/internal/agent/kiro"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -100,4 +104,115 @@ func TestKiroAdapter_Integration(t *testing.T) {
 	if err := adapter.StopSession(context.Background(), session); err != nil {
 		t.Errorf("StopSession(): %v", err)
 	}
+}
+
+func TestIntegration_CredentialVerification(t *testing.T) {
+	skipIfNotEnabled(t)
+
+	adapter := mustNewAdapter(t)
+	params := func(t *testing.T) domain.StartSessionParams {
+		return domain.StartSessionParams{
+			WorkspacePath: t.TempDir(),
+			AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: 30000},
+		}
+	}
+
+	t.Run("working credential verifies and leaves no conversation", func(t *testing.T) {
+		sessionParams := params(t)
+		// Listed through a launch target resolved independently of the
+		// adapter, so the check does not trust the adapter's own deletion.
+		target, targetErr := agentcore.ResolveLaunchTarget(sessionParams, "kiro-cli")
+		if targetErr != nil {
+			t.Fatalf("ResolveLaunchTarget: %v", targetErr)
+		}
+		list := func() []kiro.SessionListingForTest {
+			listing, err := kiro.ListWorkspaceConversationsForTest(context.Background(), target, agentcore.AuxiliaryTimeout(sessionParams.AgentConfig), 0)
+			if err != nil {
+				t.Fatalf("ListWorkspaceConversationsForTest(): %v", err)
+			}
+			return listing
+		}
+
+		before := list()
+		if _, err := credentialtest.VerifyLive(adapter, sessionParams); err != nil {
+			t.Fatalf("VerifyCredential() error = %v, want nil", err)
+		}
+		if kiro.VerificationConversationFoundForTest(before, list()) {
+			t.Error("a verification conversation is still listed after the step, want it deleted")
+		}
+	})
+
+	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
+		// Not parallel: t.Setenv carries the invalid credential.
+		credentialtest.SetRefusedCredential(t, "SORTIE_KIRO_CREDENTIAL_ENV")
+
+		_, err := credentialtest.VerifyLive(adapter, params(t))
+		credentialtest.RequireRefused(t, err)
+	})
+}
+
+// TestIntegration_NoLoginCredentialVerification runs the guard against
+// a home directory with no stored login and no KIRO_API_KEY, proving
+// the runtime's no-account answer, not a changed exit-status
+// convention, is what the guard reads. It needs no credential: whoami
+// without a stored login answers at once, so the device-login hang
+// skipIfNotEnabled otherwise guards against does not apply here.
+func TestIntegration_NoLoginCredentialVerification(t *testing.T) {
+	if os.Getenv("SORTIE_KIRO_TEST") != "1" {
+		t.Skip("set SORTIE_KIRO_TEST=1 to run kiro integration tests")
+	}
+
+	adapter := mustNewAdapter(t)
+
+	t.Setenv("KIRO_API_KEY", "")
+
+	emptyRoot := t.TempDir()
+	for _, name := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"} {
+		t.Setenv(name, emptyRoot)
+	}
+
+	sessionParams := domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: 30000},
+	}
+
+	_, err := credentialtest.VerifyLive(adapter, sessionParams)
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrCredentialUnverified {
+		t.Fatalf("VerifyCredential() error = %v, want a credential_unverified *domain.AgentError", err)
+	}
+	if !strings.Contains(agentErr.Message, "whoami reports no signed-in account") {
+		t.Errorf("error message = %q, want it to contain %q", agentErr.Message, "whoami reports no signed-in account")
+	}
+}
+
+func TestIntegration_EarlyExit(t *testing.T) {
+	skipIfNotEnabled(t)
+
+	adapter := mustNewAdapter(t)
+	unknownSwitchConfig := domain.AgentConfig{
+		Command:       integrationCommand() + " --sortie-unknown-switch",
+		ReadTimeoutMS: 30000,
+	}
+
+	t.Run("verification session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{WorkspacePath: t.TempDir(), AgentConfig: unknownSwitchConfig}
+		if _, err := credentialtest.VerifyLive(adapter, params); err == nil {
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
+
+	// This working case sits behind the package's own credential guard
+	// (skipIfNotEnabled), because a chat turn without a credential
+	// blocks on device login.
+	t.Run("working session with an unknown switch", func(t *testing.T) {
+		params := domain.StartSessionParams{WorkspacePath: t.TempDir(), AgentConfig: unknownSwitchConfig}
+		if err := credentialtest.RunWorkingLive(adapter, params); err == nil {
+			t.Skip("configured runtime accepted --sortie-unknown-switch, so it cannot exercise the early-exit report")
+		} else {
+			credentialtest.RequireEarlyExitReport(t, err)
+		}
+	})
 }

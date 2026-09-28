@@ -54,16 +54,33 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      - name: Lint module
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         env:
           GOOS: ${{ matrix.goos }}
         with:
-          version-file: .tool-versions
+          version: latest
           verify: false
           # Skip the action's analysis cache: stale entries cause flaky
           # false positives (golangci-lint#5979) that reproduce on no rerun.
           # A cache shared across the matrix would also carry a result over
           # from the wrong GOOS. setup-go's caches are unaffected.
+          skip-cache: true
+
+      # Comment style does not depend on GOOS, so one matrix leg checks it.
+      - name: Check comments
+        if: matrix.goos == 'linux'
+        run: scripts/comments.sh
+
+      - name: Lint tool module
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        if: matrix.goos != 'windows'
+        env:
+          GOOS: ${{ matrix.goos }}
+        with:
+          version: latest
+          verify: false
+          working-directory: tools/qualify
           skip-cache: true
 
   lint-shell:
@@ -121,16 +138,29 @@ jobs:
       # The main Lint job counts a reference from a test as a use, so
       # production code reachable only from its own test never turns up
       # there. This job is the only one that can fail on that class.
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      - name: Lint shipped code
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         env:
           GOOS: ${{ matrix.goos }}
         with:
-          version-file: .tool-versions
+          version: latest
           verify: false
           args: --config .golangci-no-tests.yml --tests=false ./...
           # Skip the action's analysis cache: this job runs a different
           # analyzer scope than the main Lint job, and a cache shared
           # between the two could carry a result over from the wrong scope.
+          skip-cache: true
+
+      - name: Lint shipped tools
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        if: matrix.goos != 'windows'
+        env:
+          GOOS: ${{ matrix.goos }}
+        with:
+          version: latest
+          verify: false
+          working-directory: tools/qualify
+          args: --config ../../.golangci-no-tests.yml --tests=false ./...
           skip-cache: true
 
   test:
@@ -156,8 +186,14 @@ jobs:
       - name: Run tests
         run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
 
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - name: Test tool module
+        run: make test-tools
+
+      - name: Test shell scripts
+        run: make test-shell
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         if: success() && env.CODECOV_TOKEN != ''
         with:
           fail_ci_if_error: false
@@ -182,10 +218,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Maintainer tooling under tools/ is not supported on Windows.
       - name: Run tests
-        run: go test -count=1 ./...
+        shell: bash
+        run: go test -count=1 $(go list ./... | grep -v '/tools/')
 
-      - name: Run workspace tests verbosely
+      - name: Test workspace verbosely
         run: go test -v -count=1 ./internal/workspace/...
 
   build:

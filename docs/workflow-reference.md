@@ -574,10 +574,10 @@ agent:
 
 | Field                            | Type                              | Required                            | Default         | Dynamic Reload                             | Description                                                                                                                                                                      |
 | -------------------------------- | --------------------------------- | ----------------------------------- | --------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kind`                           | string                            | No                                  | `claude-code`   | Future dispatches                          | Agent adapter identifier. This is the default kind used when no `dispatch.rules` entry (and no `dispatch.default.agent`) overrides it. Built-in adapters: `claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, `mock`, and `agent-client-protocol`. Other kinds (for example, HTTP-based adapters) are available only if you register them separately. |
-| `command`                        | string (argument vector)          | When adapter requires local process | Adapter-defined | Future dispatches                          | Command to launch the agent for adapters that run as a local subprocess (`claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, and `agent-client-protocol`). When the agent runs locally, the value is split on whitespace into an argument vector and run without a shell, so shell syntax is not interpreted and `~` and `$VAR` are not expanded; when `worker.ssh_hosts` sends the agent to a remote host, the value is passed to the remote shell unsplit. Adapters that do not start a local process ignore this field. |
+| `kind`                           | string                            | No                                  | `claude-code`   | Future dispatches                          | Agent adapter identifier. This is the default kind used when no `dispatch.rules` entry (and no `dispatch.default.agent`) overrides it. Built-in adapters: `claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, `mock`, and `agent-client-protocol`. Other kinds (for example, HTTP-based adapters) are available only if you register them separately. `kiro` is deprecated and will be removed in a later release; use `agent-client-protocol` instead. Workflows naming `kiro` keep working, and `sortie validate` and the running orchestrator each warn once. |
+| `command`                        | string (argument vector)          | When adapter requires local process | Adapter-defined | Future dispatches                          | Command to launch the agent for adapters that run as a local subprocess (`claude-code`, `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, and `agent-client-protocol`). When the agent runs locally, the value is split on whitespace into an argument vector and run without a shell, so shell syntax is not interpreted and `~` and `$VAR` are not expanded; when `worker.ssh_hosts` sends the agent to a remote host, the value is passed to the remote shell unsplit. Sortie waits for the agent it starts and talks to it, so a value ending in `&` detaches the agent and the session cannot work. Adapters that do not start a local process ignore this field. |
 | `turn_timeout_ms`                | integer                           | No                                  | `3600000` (1h)  | Future worker attempts                     | Wall-clock bound on a single agent turn, enforced by the orchestrator. Must be positive.                                                                                         |
-| `read_timeout_ms`                | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | Request/response timeout during startup and synchronous operations.                                                                                                              |
+| `read_timeout_ms`                | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | Request/response timeout during startup and synchronous operations. The Agent Client Protocol adapter's `initialize` wait is the larger of this value and 60 seconds, so a runtime that establishes its credential with its backend before answering does not fail every run at a short configured value.                                                                                                              |
 | `stall_timeout_ms`               | integer                           | No                                  | `300000` (5m)   | Future worker attempts                     | Inactivity timeout based on event stream gaps. Set to `0` or negative to **disable** stall detection.                                                                            |
 | `stop_grace_ms`                  | integer                           | No                                  | `5000` (5s)     | Future worker attempts                     | The period an adapter waits, after sending a catchable termination signal, for the agent to exit on its own before it force-terminates the process group. Must be positive; overridable through `SORTIE_AGENT_STOP_GRACE_MS`. In `claude-code`, `copilot-cli`, `kiro`, `opencode`, and `pi`, the same value also bounds a cancelled turn's escalation to a force kill; `mock` launches no process, so it has no such period. The per-session stop deadline derives from this field alone, no longer from `agent.read_timeout_ms`, which shortens that deadline for a deployment that had set `read_timeout_ms` above `20000`. Raising this field also lengthens graceful shutdown by the same amount: a session still stopping when Sortie is asked to shut down is waited for rather than abandoned, and at the default the worker drain alone is 50s. A second Ctrl-C during shutdown ends every remaining shutdown wait at once, so a raised grace never strands the operator without an escape. |
 | `max_concurrent_agents`          | integer or string integer         | No                                  | `10`            | **Yes** — affects subsequent dispatch      | Global concurrency limit across all issues.                                                                                                                                      |
@@ -585,10 +585,13 @@ agent:
 | `max_retry_backoff_ms`           | integer or string integer         | No                                  | `300000` (5m)   | **Yes** — affects future retry scheduling  | Maximum delay cap for exponential backoff on retries.                                                                                                                            |
 | `max_concurrent_agents_by_state` | map of `state → positive integer` | No                                  | `{}` (empty)    | **Yes** — affects subsequent dispatch      | Per-state concurrency limits. State keys are normalized to lowercase for lookup. An entry outside the integer range, positive or negative, fails config load; other non-positive or non-numeric entries are silently ignored.                                       |
 | `max_sessions`                   | integer                           | No                                  | `0` (unlimited) | **Yes** — affects future retry evaluations | Maximum completed worker sessions per issue before the orchestrator stops re-dispatching. Counted from run history. `0` disables the budget (unlimited). Must be non-negative. The separate `max_consecutive_absences` governs the consecutive-absence ceiling. Reaching the ceiling also posts one comment on the issue naming the session budget and `agent.max_sessions` as the setting that raises it. |
-| `max_tokens`                     | integer                           | No                                  | `0` (unlimited) | **Yes** — stops a run already in flight and affects future retry evaluations | Cumulative per-issue token ceiling. The orchestrator sums `total_tokens` across the issue's run history, adds the running session's own reported spend, and stops re-dispatching once the sum reaches the limit; reaching the ceiling also stops a run already in flight, on the event loop, as soon as a usage figure carries the sum there. A run whose coding agent reported no token usage contributes nothing to the sum, and such a run makes the ceiling report that it could not be fully evaluated (a warning is logged and the dispatch proceeds). `0` disables the budget (unlimited). Must be non-negative. Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight. |
+| `max_tokens`                     | integer                           | No                                  | `0` (unlimited) | **Yes** — stops a run already in flight and affects future retry evaluations | Cumulative per-issue token ceiling. The orchestrator sums `total_tokens` across the issue's run history, adds the running session's own reported spend, and stops re-dispatching once the sum reaches the limit; reaching the ceiling also stops a run already in flight, on the event loop, as soon as a usage figure carries the sum there. A run whose coding agent reported no token usage contributes nothing to the sum, and a turn whose spend was never fully reported contributes less than it cost; either one makes the ceiling report that it could not be fully evaluated (a warning is logged and the dispatch proceeds). `0` disables the budget (unlimited). Must be non-negative. Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight. A kind whose usage-reporting declaration resolves to no token usage never reaches this ceiling at all: `sortie validate` reports that combination under the check `agent.kind.no_usage_reporting`, naming the kind, and every dispatch of such a run logs it. The declaration belongs to the kind, not to the runtime the kind reaches, so a transport kind that declares figures do arrive, driving a runtime that reports none, leaves the ceiling equally unreachable and draws neither of those two signals; each such run instead logs once as it ends, naming the kind and the ceiling it could not be bound by. `token_warning_percent`, below, warns before this ceiling stops a run. |
+| `token_warning_percent`          | integer                           | No                                  | `0` (off)       | **Yes** — an unwarned run in flight is evaluated against the new value from its next usage figure; future dispatches use it from the start | Token warning threshold, as a percentage of `agent.max_tokens`, `0` to `99`. The threshold in tokens is that percentage of the ceiling, rounded up; it is never validated against `agent.max_tokens`, so lowering the ceiling can never make this field reject a reload. Evaluated on the event loop against the same live per-issue figure the ceiling reads, ahead of the ceiling's own evaluation. Once a run's figure reaches the threshold, one warning is logged for that run and the running session's `cost_budget` tool result reports the condition, so the agent can wrap up or hand off before the ceiling stops the run. `0` disables the threshold; it also has no effect while `agent.max_tokens` is `0`, which `sortie validate` reports under the check `ineffective_setting`. Overridable through `SORTIE_AGENT_TOKEN_WARNING_PERCENT`. |
 | `max_consecutive_absences`       | integer                           | No                                  | `3`             | **Yes** — affects future worker exits, retry evaluations, and poll-tick park sweeps | Bounds how many runs in a row may be observed to have produced no evidence of work before the issue is parked. Any run that produces evidence of work resets the count to zero. `0` and negative values are rejected as a configuration error. The separate `max_sessions` governs the total per-issue session budget. |
 
 **Orchestrator vs adapter fields:** The fields above are consumed by the orchestrator for scheduling, concurrency, and retry decisions. They are **not** passed through to the agent adapter. Adapter-specific configuration uses separate pass-through blocks — see [Section 4.4](#44-adapter-specific-pass-through-config).
+
+**Credential verification:** Before the working session's first turn, every worker run proves the runtime completes one model request with its credential, on every agent kind and every remote host. There is nothing to configure. The step costs one model request at the configured model's rate and one short runtime start each time Sortie starts work on an issue. A failure stops the run before any work and is retried with exponential backoff, `credential_unverified` in the log and the run history. An agent that exits before it responds, on a switch in `agent.command` it does not accept or on a credential it rejects only by printing a message and exiting, is reported as `port_exit` with its exit status and the end of what it wrote to standard error, not as `credential_unverified`. A working turn whose agent exits before it responds is reported the same way. A protocol runtime that offers no way to delete its own session keeps one small leftover conversation per worker run; every other kind leaves none.
 
 ---
 
@@ -619,7 +622,7 @@ db_path: /var/lib/sortie/state.db
 
 ### 2.8 `ci_feedback` — CI Feedback Loop (**deprecated**)
 
-> **Deprecated.** Use `reactions.ci_failure` instead (Section 2.10). When both `ci_feedback` and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and a deprecation warning is logged at startup.
+> **Deprecated.** Use `reactions.ci_failure` instead (Section 2.10). When both `ci_feedback` and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and the warning logs once while the workflow carries both sections; `sortie validate` reports it as `ci_feedback.deprecated`.
 
 ```yaml
 ci_feedback:
@@ -1018,9 +1021,9 @@ Fields:
 
 **Validation:** Setting `provider` while both `review_label` and `fix_label` are empty is a configuration error. Because the defaults are non-empty, this occurs only when the operator explicitly sets both labels to `""`. The rule is a config-shape check and surfaces offline via `sortie validate`. A `provider` naming an unregistered SCM adapter is also a `validate` error, reported under the check name `scm_adapter` by the activation checks that fold every active SCM reaction kind, `label_commands` included, into one provider set.
 
-**Operator prerequisite:** Enabling `review_label` requires the active prompt template to contain a `{{ if .label_review }}` branch that fetches the PR diff and posts review comments using the agent's own SCM tooling (see the `label_review` continuation key in Section 5.2). The orchestrator injects only the PR coordinates, never the diff text and never a posted comment, so without this branch a label-review dispatch runs the normal work prompt and posts no review. The orchestrator emits an info log at each dispatch and a warning at prompt load when the template omits the `label_review` token, so the inert outcome is diagnosable.
+**Operator prerequisite:** Enabling `review_label` requires the active prompt template to contain a `{{ if .label_review }}` branch that fetches the PR diff and posts review comments using the agent's own SCM tooling (see the `label_review` continuation key in Section 5.2). The orchestrator injects only the PR coordinates, never the diff text and never a posted comment, so without this branch a label-review dispatch runs the normal work prompt and posts no review. The orchestrator emits an info log at each dispatch; when a loaded workflow first lacks the `label_review` branch, the load records one warning, which `sortie validate` reports under `reactions.label_commands.review_branch_missing`, so the inert outcome is diagnosable.
 
-**Operator prerequisite (fix):** Enabling `fix_label` requires the active prompt template to contain a `{{ if .label_fix }}` branch that checks out `label_fix.branch`, fetches and addresses the outstanding review comments, pushes the fixes to that branch, posts a summary comment, and writes `.sortie/status` to signal completion (see the `label_fix` continuation key in Section 5.2). The completion signal matters more here than for review: a review is naturally one turn, but a fix is multi-turn, so without it a completed fix session runs to `agent.max_turns` and wastes turns. Unlike the review case, a missing `label_fix` branch is not a structural no-op: the fix command clones and checks out a real workspace with content-write scope, so an applied fix label without the template branch runs the normal work prompt against a real checkout that can push. The workflow loader MUST (not SHOULD) emit a warning at prompt load when `label_commands` is active with a non-empty fix label but the template omits the `label_fix` token, and the orchestrator emits an info log at each fix dispatch, so the misconfiguration stays diagnosable.
+**Operator prerequisite (fix):** Enabling `fix_label` requires the active prompt template to contain a `{{ if .label_fix }}` branch that checks out `label_fix.branch`, fetches and addresses the outstanding review comments, pushes the fixes to that branch, posts a summary comment, and writes `.sortie/status` to signal completion (see the `label_fix` continuation key in Section 5.2). The completion signal matters more here than for review: a review is naturally one turn, but a fix is multi-turn, so without it a completed fix session runs to `agent.max_turns` and wastes turns. Unlike the review case, a missing `label_fix` branch is not a structural no-op: the fix command clones and checks out a real workspace with content-write scope, so an applied fix label without the template branch runs the normal work prompt against a real checkout that can push. The loaded configuration MUST (not SHOULD) carry the omission as an advisory when `label_commands` is active with a non-empty fix label but the template omits the `label_fix` token: recorded once when a loaded workflow first lacks the branch, and reported by `sortie validate` under `reactions.label_commands.fix_branch_missing`. The orchestrator also emits an info log at each fix dispatch, so the misconfiguration stays diagnosable.
 
 **Default-on activation:** `fix_label` defaults to `sortie:fix`, so shipping the fix command activates it for every deployment that already sets `provider` for `label_commands`, including a deployment that enabled only the review command. A review-only deployment MUST set `reactions.label_commands.fix_label: ""` to opt out.
 
@@ -1267,7 +1270,7 @@ The value is a sequence, not a single object. A second channel is a second list 
 | Field | Type | Required | Default | Description |
 | ----- | ---- | -------- | ------- | ----------- |
 | `kind` | string | Yes | _(none)_ | Backend discriminator. v1 backends are `webhook` and `slack`. |
-| `max_per_session` | int | No | `20` | Per-session notification cap. `0` selects the default (`20`); it never means unlimited. A negative value is rejected. |
+| `max_per_session` | int | No | `20` | Notification cap for the whole agent run. `0` selects the default (`20`); it never means unlimited. A negative value is rejected. |
 
 Per-backend fields depend on `kind` and are passed through to the backend untyped:
 
@@ -1278,7 +1281,25 @@ Per-backend fields depend on `kind` and are passed through to the backend untype
 
 The `notifications` `webhook` backend is an outbound POST to an operator-supplied endpoint. It is unrelated to inbound tracker webhooks ([architecture §20](architecture/25-webhook-support.md)), which trigger reconciliation. The two share a name but not a direction.
 
-When the list configures more than one backend, the effective per-session cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap counts `notify_operator` calls, not per-backend sends.
+When the list configures more than one backend, the effective cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap covers one agent run on every agent kind: every turn and every tool server process of that run share one count, which Sortie keeps as files in the workspace's `.sortie/notification_slots/` directory. A retry or a continuation starts a new run and a new count. A call counts once at least one backend accepts the notification, not once per backend that accepts it; if no backend accepts it, the reserved slot is released and the call does not count.
+
+The `webhook` backend posts a JSON object whose keys use the generic notifier vocabulary, so any consumer can correlate and route without backend-specific knowledge:
+
+| Key | Type | Meaning |
+| --- | ---- | ------- |
+| `notification_id` | string | Generated unique id for this notification. |
+| `timestamp` | string | Send time, ISO-8601 UTC. |
+| `source` | string | The Sortie instance identifier; the hostname by default. |
+| `issue_id` | string | Tracker-internal issue id. |
+| `identifier` | string | Human-readable issue key. |
+| `dispatch_id` | string | Identifies the one agent run that sent the notification. New on every retry and continuation. |
+| `session_id` | string | The agent's own session id once reported; `""` until then, and always `""` for an agent that reports none. Repeats across runs that continue one conversation. |
+| `attempt` | integer or null | Retry or continuation attempt; `null` on the first run. |
+| `agent` | string | Dispatch-frozen agent kind. |
+| `severity` | string | `info`, `warning`, or `critical`. |
+| `title` | string | Short summary the agent supplied. |
+| `body` | string | Notification detail the agent supplied. |
+| `category` | string | Optional: `decision_needed`, `progress`, `blocked`, `completed`, or `other`. Absent when the agent did not set it. |
 
 **`SORTIE_`-prefixed secret rule:**
 
@@ -1353,6 +1374,7 @@ Each variable maps to exactly one config field. The naming convention is `SORTIE
 | `SORTIE_AGENT_MAX_RETRY_BACKOFF_MS`  | `agent.max_retry_backoff_ms`  | int    |       |
 | `SORTIE_AGENT_MAX_SESSIONS`          | `agent.max_sessions`          | int    |       |
 | `SORTIE_AGENT_MAX_TOKENS`            | `agent.max_tokens`            | int    |       |
+| `SORTIE_AGENT_TOKEN_WARNING_PERCENT` | `agent.token_warning_percent` | int    |       |
 | `SORTIE_AGENT_MAX_CONSECUTIVE_ABSENCES` | `agent.max_consecutive_absences` | int |    |
 
 #### Top-level
@@ -1573,7 +1595,8 @@ Returns the system-wide runtime state including running sessions, retry queue, a
         "input_tokens": 1200,
         "output_tokens": 800,
         "total_tokens": 2000,
-        "cache_read_tokens": 400
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 100
       },
       "model_name": "claude-sonnet-4-20250514",
       "api_request_count": 3,
@@ -1614,6 +1637,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
     "output_tokens": 2400,
     "total_tokens": 7400,
     "cache_read_tokens": 1500,
+    "cache_write_tokens": 300,
     "seconds_running": 1834.2,
     "unmeasured_sessions": 2,
     "running_unreported": 1,
@@ -1627,14 +1651,15 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 
 | Field               | Type              | Description                                                                                                                                |
 | ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `tokens`                  | object            | Token counts for this session. Each of the four members, `input_tokens`, `output_tokens`, `total_tokens`, and `cache_read_tokens`, is an integer or `null`. The four are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
+| `tokens`                  | object            | Token counts for this session. Each of the five members, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, and `cache_write_tokens`, is an integer or `null`. The five are `null` together, exactly when `tokens_measured` is `false`, and each carries its figure otherwise. |
 | `tokens.cache_read_tokens` | integer or `null` | Cumulative cache-read token count. Reflects tokens served from the LLM provider's prompt cache rather than reprocessed. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache data. |
+| `tokens.cache_write_tokens` | integer or `null` | Cumulative cache-write token count. Reflects input tokens written to the LLM provider's prompt cache. `null` when `tokens_measured` is `false`; `0` when the session is measured and the agent adapter reports no cache-write count. |
 | `model_name`              | string or absent  | LLM model identifier reported by the agent (e.g. `"claude-sonnet-4-20250514"`). Omitted when the adapter does not report a model, and when `usage_arrival` is `none`.         |
 | `api_request_count` | integer or `null` | Number of `token_usage` events received during this session, and a count of actual API requests only when `api_requests_measured` is `true`. `null` exactly when that field is `false`. |
 | `requests_by_model` | object or absent  | Map of model name to request count (e.g. `{"claude-sonnet-4-20250514": 3}`). Omitted when `api_requests_measured` is `false`, and when `usage_attribution` does not name a model. Enables tracking model usage when the agent switches models mid-session. |
 | `tool_time_percent` | number or `null`  | Cumulative tool call execution time as a percentage of session wall-clock time. Computed at response time. `null` when no tool timing data has been received. |
 | `api_time_percent`  | number or `null`  | Cumulative LLM API response wait time as a percentage of session wall-clock time. Computed at response time. `null` when no API timing data has been received. |
-| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The four members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
+| `tokens_measured`    | boolean           | True once at least one usage measurement has been reported in this session. The five members of `tokens` are `null` when it is `false`. False for a session whose `usage_arrival` is `none`, whatever its runtime reports.   |
 | `usage_arrival`      | string            | The session's kind's declared usage-reporting arrival, frozen at dispatch: `incremental`, `turn_end`, `none`, or `""` when undeclared.    |
 | `usage_attribution`  | string            | The session's kind's declared usage-reporting attribution, frozen at dispatch: `per_model`, `session_total`, `none`, or `""` when undeclared. |
 | `tokens_pending`     | boolean           | True only when `usage_arrival` is `turn_end`, the session is measured, and the turn that figure would settle for is still in flight.      |
@@ -1648,6 +1673,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 | `output_tokens`     | integer | Total output tokens consumed.                                                                           |
 | `total_tokens`      | integer | Total tokens consumed.                                                                                  |
 | `cache_read_tokens` | integer | Total cache-read tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
+| `cache_write_tokens` | integer | Total cache-write tokens across all sessions. Follows the same cumulative-delta accounting as other token counters. |
 | `seconds_running`   | number  | Aggregate wall-clock runtime — completed-session time plus elapsed time from currently running sessions. |
 | `unmeasured_sessions` | integer | Ended sessions whose token usage was never recorded, which the token totals above leave out. Survives a restart. |
 | `running_unreported` | integer | Running sessions whose `usage_arrival` reports usage but that have not reported a figure yet. |
@@ -1655,7 +1681,7 @@ Returns the system-wide runtime state including running sessions, retry queue, a
 
 A session whose `usage_arrival` is `none` contributes nothing to the token totals, even when its runtime reports a figure.
 
-`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` configures a rate for any agent kind, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
+`cost_unpriced_running` is a top-level field, present, zero included, whenever `token_rates` holds an entry for any agent kind, complete or not, and omitted otherwise. It counts the running, measured sessions that `active_estimated_cost_usd` leaves out because their agent kind has no rate, or an incomplete one. `active_estimated_cost_usd` sums the estimated USD cost of the running, measured sessions that have one, and is omitted when none of them prices.
 
 #### `GET /api/v1/{identifier}` — Per-Issue Detail
 
@@ -1686,7 +1712,8 @@ Returns issue-specific runtime and debug details for a single issue. Returns `40
       "input_tokens": 1200,
       "output_tokens": 800,
       "total_tokens": 2000,
-      "cache_read_tokens": 400
+      "cache_read_tokens": 400,
+      "cache_write_tokens": 100
     },
     "model_name": "claude-sonnet-4-20250514",
     "api_request_count": 3,
@@ -1768,7 +1795,7 @@ The endpoint uses a dedicated `prometheus.Registry` (not the Go default global) 
 | `sortie_sessions_retrying`                      | Gauge     | —                           | Number of issues in the retry queue.                           |
 | `sortie_slots_available`                        | Gauge     | —                           | Remaining dispatch capacity under current concurrency limits.  |
 | `sortie_active_sessions_elapsed_seconds`        | Gauge     | —                           | Cumulative wall-clock elapsed time across running sessions.    |
-| `sortie_tokens_total`                           | Counter   | `type`                      | Tokens consumed, by type (`input`, `output`, `cache_read`).    |
+| `sortie_tokens_total`                           | Counter   | `type`                      | Tokens consumed, by type (`input`, `output`, `cache_read`, `cache_write`). `cache_read` and `cache_write` are subsets of `input`, so summing across every `type` double-counts them. |
 | `sortie_agent_runtime_seconds_total`            | Counter   | —                           | Cumulative agent-session wall-clock time for completed sessions. |
 | `sortie_dispatches_total`                       | Counter   | `outcome`                   | Dispatch attempts (`success`, `error`).                        |
 | `sortie_worker_exits_total`                     | Counter   | `exit_type`                 | Worker exits (`normal`, `error`, `cancelled`, `soft_stop`).    |
@@ -1817,6 +1844,11 @@ worker:
     - build02.internal
   max_concurrent_agents_per_host: 2
   ssh_strict_host_key_checking: accept-new
+  ssh_pass_env:
+    - EXAMPLE_API_KEY
+    - EXAMPLE_PROJECT
+  ssh_disallow_pass_env:
+    - GITHUB_TOKEN
 ```
 
 When `worker.ssh_hosts` is configured, Sortie dispatches agent runs to remote hosts over SSH using the system `ssh` binary. Each dispatch selects the host with the fewest active sessions (least-loaded selection). When a per-host concurrency cap is set, hosts at capacity are skipped. On retry, the previous host is preferred if it still has capacity.
@@ -1828,6 +1860,8 @@ When `worker.ssh_hosts` is absent or empty, all agents run locally on the host w
 | `worker.ssh_hosts`                      | list of strings  | No       | _(absent — work runs locally)_ | SSH host targets for remote agent execution.                                                |
 | `worker.max_concurrent_agents_per_host` | positive integer | No       | _(absent)_                     | Per-host concurrency cap shared across configured SSH hosts. Hosts at capacity are skipped. |
 | `worker.ssh_strict_host_key_checking`   | string           | No       | `accept-new`                   | OpenSSH `StrictHostKeyChecking` value: `accept-new`, `yes`, or `no`.                       |
+| `worker.ssh_pass_env`                   | list of strings  | No       | _(absent)_                     | Names of environment variables to carry from Sortie's own environment into a remote session. Written literally; an entry given as a `$VAR` reference is ignored. |
+| `worker.ssh_disallow_pass_env`          | list of strings  | No       | _(absent)_                     | Names of environment variables Sortie never carries into a remote session. Written literally; an entry given as a `$VAR` reference is ignored. |
 
 #### SSH Hook Environment
 
@@ -1852,6 +1886,10 @@ ssh "$SORTIE_SSH_HOST" "rm -rf \"$SORTIE_WORKSPACE\""
 - **SSH connectivity is validated at dispatch time**, not at startup. Hosts that are temporarily unreachable cause the worker to fail and retry with exponential backoff.
 - **Process lifecycle:** The remote agent process receives stdin EOF when the SSH connection closes (e.g., on cancellation or stall timeout). The agent should terminate on stdin EOF or SIGHUP.
 - **SSH options:** Sortie sets `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and `StrictHostKeyChecking=accept-new` by default. The `StrictHostKeyChecking` value is configurable via `worker.ssh_strict_host_key_checking`. Set to `yes` when `known_hosts` is pre-populated by configuration management; set to `no` only in isolated test environments. Invalid values fall back to `accept-new` with a warning. Operators should ensure SSH key-based authentication is configured for all target hosts.
+- **Carrying environment variables to a remote agent:** `worker.ssh_pass_env` names environment variables, never values, that Sortie reads from its own process environment and sends to every remote agent launch. Each agent kind also carries a fixed set of credential variables on a remote launch, without being listed: `claude-code` carries `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN`; `copilot-cli` carries `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN`; `kiro` carries `KIRO_API_KEY`. A variable carried this way, whether listed or carried automatically for the kind, overrides any value or login already present on the remote host. A listed name that is unset in Sortie's own environment, or whose value is empty or only whitespace, is skipped and logged as a warning; a name carried automatically for the kind is skipped silently in those same cases, unless `worker.ssh_pass_env` lists that name too, which restores the warning. `worker.ssh_disallow_pass_env` names variables Sortie never carries, whether they come from `worker.ssh_pass_env` or from the kind's own credential set; Sortie sends nothing of its own for a disallowed name, so the remote host's own value or login stays in effect. Both keys take variable names literally: an entry written as a `$VAR` reference arrives holding that variable's value rather than a name, so Sortie ignores the entry and warns with its position, never its value. Neither key affects a local (non-SSH) launch, and neither key affects a setting an agent kind computes for itself. A change to either key on reload takes effect for sessions dispatched after the reload; a session already running keeps the names it started with.
+- **Keeping a remote host's own login:** an agent kind's automatically carried credential takes precedence over a login already stored on the remote host. For example, if Sortie's own environment sets `GITHUB_TOKEN` for another purpose (say, `tracker.api_key: $GITHUB_TOKEN`) while `copilot-cli` hosts are meant to sign in on their own, name `GITHUB_TOKEN` under `worker.ssh_disallow_pass_env` to keep the host's own login in effect.
+- **What is exposed and how to avoid it:** a carried variable's value travels over the SSH connection's standard input, never as part of a command line, so it never appears in the argument list of a process on either the machine running Sortie or the remote host. The local `ssh` process still inherits Sortie's own environment, as every process Sortie starts does. On the remote host the value sits in the launched agent's own environment, readable by that account and by root, the same as it would be on a local launch. To keep Sortie's own value from reaching a remote host, name it under `worker.ssh_disallow_pass_env`; Sortie then sends nothing of its own for that name, and the host's own value or login stays in effect. This governs what Sortie sends, not what the SSH client sends on its own: a variable listed under `SendEnv` in your `ssh_config` that the remote server accepts under `AcceptEnv` is forwarded by `ssh` out of Sortie's environment, and Sortie cannot suppress that from the command line. Remove the `SendEnv` entry from your SSH configuration when a variable must not reach the host.
+- **Remote host requirements for carried variables:** a remote host must offer a POSIX-compatible login shell, and it must have the standard `dd` utility installed for any launch that carries a variable, which includes every remote `opencode` launch regardless of configuration. A host missing `dd` fails the launch, logs `sortie: dd is required on the remote host to receive environment variables`, and the failed launch is retried the same way any other failed remote launch is.
 
 #### Complete SSH-Mode Example
 
@@ -1900,10 +1938,12 @@ token_rates:
     input_per_mtok: 3.00
     output_per_mtok: 15.00
     cache_read_per_mtok: 0.30
+    cache_write_per_mtok: 3.75
   copilot-cli:
     input_per_mtok: 2.00
     output_per_mtok: 8.00
     cache_read_per_mtok: 0.20
+    cache_write_per_mtok: 2.50
   codex:
     input_per_mtok: 2.50
     output_per_mtok: 10.00
@@ -1912,6 +1952,8 @@ token_rates:
 
 When `token_rates` is configured, the dashboard displays estimated USD cost for currently running sessions, and the `sortie stats` subcommand prices the runs it aggregates from run history. Keys are agent adapter kind strings (e.g., `"claude-code"`, `"copilot-cli"`, `"codex"`, `"opencode"`, `"pi"`). All rates are in USD per 1 million tokens.
 
+Every figure Sortie prices is a fresh-input token, a cache-read token, a cache-write token, or an output token, priced once each at its own rate. An unset `cache_read_per_mtok` or `cache_write_per_mtok` prices that class at `input_per_mtok`, so a configuration that sets neither keeps pricing every input token, cached or not, at the input rate. `claude-code`, `copilot-cli`, and `opencode` report a cache-write count; an operator of one of those kinds sets `cache_write_per_mtok` to that provider's cache-write rate to price it separately.
+
 When `token_rates` is absent or empty, the dashboard shows raw token counts without cost estimates and `sortie stats` reports no cost figures.
 
 An entry keyed to a kind whose usage-reporting declaration resolves to no token usage for the sessions a configuration produces has no effect: no cost can be estimated for it. `sortie validate` reports this under the check `agent.kind.no_cost_estimate`, naming the kind, so an operator who prices a non-reporting kind learns why the dashboard's Est. Cost column stays blank rather than discovering it by reading source.
@@ -1919,18 +1961,21 @@ An entry keyed to a kind whose usage-reporting declaration resolves to no token 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `token_rates` | map | _(absent)_ | Top-level extension key. Keys are agent adapter kind strings. |
-| `token_rates.<kind>.input_per_mtok` | number | _(not set)_ | USD per million input tokens. |
-| `token_rates.<kind>.output_per_mtok` | number | _(not set)_ | USD per million output tokens. |
-| `token_rates.<kind>.cache_read_per_mtok` | number | _(not set)_ | USD per million cache-read tokens. |
+| `token_rates.<kind>.input_per_mtok` | number | _(not set)_ | USD per million input tokens. Required, with `output_per_mtok`, for the kind to price at all. |
+| `token_rates.<kind>.output_per_mtok` | number | _(not set)_ | USD per million output tokens. Required, with `input_per_mtok`, for the kind to price at all. |
+| `token_rates.<kind>.cache_read_per_mtok` | number | _(not set)_ | USD per million cache-read tokens; unset prices cache reads at `input_per_mtok`. |
+| `token_rates.<kind>.cache_write_per_mtok` | number | _(not set)_ | USD per million cache-write tokens; unset prices cache writes at `input_per_mtok`. |
 
 **Validation rules:**
 
 - `token_rates` MUST be a map when present. Non-map values produce a warning (not a fatal error).
 - Each `<kind>` value MUST be a map. Non-map values produce a warning for that kind.
-- Rate values MUST be non-negative numbers. Negative values produce a warning and are treated as not configured.
-- Missing rate fields within a kind are valid. Partial rates (e.g., only `output_per_mtok`) compute cost from the configured fields only.
+- Rate values MUST be non-negative, finite numbers. A negative, non-finite, or non-numeric value produces a warning and is treated as not configured.
+- An unrecognized key inside a kind's entry produces a warning and is ignored.
+- An entry needs both `input_per_mtok` and `output_per_mtok` to price anything. An entry missing either one, or holding neither, prices nothing: its kind counts as unpriced on the dashboard, the JSON API, and `sortie stats`, the same as a kind `token_rates` never names. This holds even when the incomplete entry is the only one `token_rates` configures.
 - Zero-valued rates are valid and produce `$0.00` for that token type.
 - An entry keyed to the empty string is dropped and produces a warning; it prices no kind.
+- Every warning above is a configuration advisory under check `token_rates` (Section 8): it reaches the run log once per configuration change, `sortie validate`'s diagnostics without affecting `valid` or the exit status, and the dry run. `sortie stats` also lists its own `token_rates` warnings in its report, because they decide which runs it prices.
 
 **Reload behavior:** Token rates do not reload dynamically. Changes require a process restart, consistent with `server.port` and `server.host`.
 
@@ -2011,7 +2056,7 @@ copilot-cli:
   experimental: true
 ```
 
-The `copilot-cli` block is forwarded to the Copilot CLI adapter, which runs `copilot -p --output-format json -s --autopilot --no-ask-user` once per turn and maps these fields to CLI flags. The adapter adds `--resume <session_id>` once a session ID is known, either because the orchestrator resumed the session or because an earlier turn reported one. The first turn of a new session carries neither flag, and a turn that ends with no session ID, on a session where none was known already, is followed by `--continue`, which resumes the most recent conversation in the workspace directory. The adapter validates none of these values and forwards each as written, except in the two cases described below: a non-positive `max_autopilot_continues` is replaced by `50`, and `mcp_config` is reformatted before it reaches `--additional-mcp-config`. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `copilot-cli.<key>.wrong_type`. The adapter reads the runtime's own task-completion report as the turn's outcome, not solely the terminal event's exit code.
+The `copilot-cli` block is forwarded to the Copilot CLI adapter, which runs `copilot -p --output-format json -s --autopilot --no-ask-user` once per turn and maps these fields to CLI flags. The adapter mints its own session identifier, a v4 UUID, when it starts a session: the first turn of a session it created carries `--session-id <uuid>`, and every later turn carries `--resume <uuid>`. No launch ever carries `--continue`, which resumed whichever session the home directory saw most recently, possibly another issue's. The adapter validates none of these values and forwards each as written, except in the two cases described below: a non-positive `max_autopilot_continues` is replaced by `50`, and `mcp_config` is reformatted before it reaches `--additional-mcp-config`. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `copilot-cli.<key>.wrong_type`. The adapter reads the runtime's own task-completion report as the turn's outcome, not solely the terminal event's exit code. Copilot CLI 1.0.51 or later is required for `--session-id`; an older CLI rejects the flag. The credential-verification session (Section 2.6) is deleted at the end of that step with a `session.delete` call over the runtime's `--server --stdio` interface, so it leaves no stored conversation behind.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -2081,26 +2126,30 @@ opencode:
     - bash
 ```
 
-The `opencode` block is forwarded to the OpenCode adapter. The adapter runs `opencode run --format json --dir <workspace>` once per turn, appends `--session <session_id>` when continuing a session, and recovers final token usage with `opencode export --sanitize <session_id>` when the session ID is known. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `opencode.<key>.wrong_type`.
+The `opencode` block is forwarded to the OpenCode adapter, which supports OpenCode 1.x and 2.x and detects which one `agent.command` names by querying its version at the start of each session, refusing a version it cannot read and any major other than 1 or 2. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `opencode.<key>.wrong_type`.
+
+On 1.x the adapter runs `opencode run --format json --dir <workspace>` once per turn with the prompt as the final positional argument, appends `--session <session_id>` when continuing a session, and recovers final token usage with `opencode export --sanitize <session_id>` when the session ID is known. On 2.x it runs `opencode run --format json --standalone` with the prompt on standard input instead, and recovers usage with `opencode session export --standalone --sanitize <session_id>`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `opencode.model` | string | _(absent)_ | Value forwarded to `opencode run --model`. OpenCode interprets provider and model selection from this string. |
-| `opencode.agent` | string | _(absent)_ | Value forwarded to `opencode run --agent`. Selects the OpenCode agent profile for the turn. |
-| `opencode.variant` | string | _(absent)_ | Value forwarded to `opencode run --variant`. Selects an OpenCode provider-specific variant. |
-| `opencode.thinking` | boolean | `false` | Adds `--thinking` to the run command. |
-| `opencode.pure` | boolean | `false` | Adds `--pure` to the run command. |
-| `opencode.dangerously_skip_permissions` | boolean | `true` | Adds `--dangerously-skip-permissions` when `true`. When `false`, OpenCode headless permission prompts can surface as tool errors instead of auto-approved tool execution. |
-| `opencode.disable_autocompact` | boolean | `true` | Sets `OPENCODE_DISABLE_AUTOCOMPACT`. The adapter always also sets `OPENCODE_AUTO_SHARE=false`, `OPENCODE_DISABLE_AUTOUPDATE=true`, and `OPENCODE_DISABLE_LSP_DOWNLOAD=true`. |
-| `opencode.allowed_tools` | list of strings | `[]` | Builds `OPENCODE_PERMISSION` allow rules. Listed keys become `allow`; known OpenCode permission keys not listed become `deny`. Unknown keys are forwarded unchanged. |
-| `opencode.denied_tools` | list of strings | `[]` | Builds explicit `deny` rules in `OPENCODE_PERMISSION`. |
+| `opencode.model` | string | _(absent)_ | Value forwarded to `opencode run --model` on both majors. On 2.x, a non-empty `opencode.variant` is appended after a `#`. |
+| `opencode.agent` | string | _(absent)_ | Value forwarded to `opencode run --agent` on both majors. Selects the OpenCode agent profile for the turn. |
+| `opencode.variant` | string | _(absent)_ | On 1.x, forwarded to `opencode run --variant`. On 2.x, folded into `opencode.model` as a `#`-separated suffix; setting it without `opencode.model`, or with a model that already carries a `#`, fails session start on 2.x. |
+| `opencode.thinking` | boolean | `false` | Adds `--thinking` to the run command on both majors. |
+| `opencode.pure` | boolean | `false` | Adds `--pure` to the run command on 1.x. OpenCode 2.x accepts no equivalent switch, so a `true` value fails session start on that major. |
+| `opencode.dangerously_skip_permissions` | boolean | `true` | Adds `--dangerously-skip-permissions` when `true`, on both majors. When `false`, the runtime refuses every permissioned tool call instead of performing it; OpenCode 2.x also ends the turn at the first refusal. |
+| `opencode.disable_autocompact` | boolean | `true` | On 1.x, sets `OPENCODE_DISABLE_AUTOCOMPACT`; the adapter always also sets `OPENCODE_AUTO_SHARE=false`, `OPENCODE_DISABLE_AUTOUPDATE=true`, and `OPENCODE_DISABLE_LSP_DOWNLOAD=true`. On 2.x, sets the turn's inline configuration document's `compaction.auto` to `false`; the adapter always sets that document's `share` to `disabled` and, in the launch environment, `OPENCODE_DISABLE_AUTOUPDATE=true`. |
+| `opencode.allowed_tools` | list of strings | `[]` | On 1.x, builds `OPENCODE_PERMISSION` allow rules. On 2.x, builds the turn's inline configuration document's `permission` member instead. On both majors, listed keys become `allow`; known OpenCode permission keys not listed become `deny`; unknown keys are forwarded unchanged. |
+| `opencode.denied_tools` | list of strings | `[]` | Builds explicit `deny` rules in the same policy `opencode.allowed_tools` builds, per major. |
 
 **Validation rules:**
 
 - `opencode.allowed_tools` and `opencode.denied_tools` MUST NOT overlap.
-- The adapter always removes any inherited `OPENCODE_PERMISSION` value before launching OpenCode. If either tool list is non-empty, it replaces that value with the adapter-managed JSON policy.
+- The adapter always removes any inherited `OPENCODE_PERMISSION` or `OPENCODE_CONFIG_CONTENT` value before launching OpenCode. If either tool list is non-empty, it replaces the tool policy with the adapter-managed one for the detected major.
 
 **Kiro adapter:**
+
+> **Deprecated.** The `kiro` kind is deprecated and will be removed in a later release; use `agent-client-protocol` instead (below), driving `kiro-cli acp`. A workflow naming `kiro` keeps working; `sortie validate` and the running orchestrator each warn once, naming `agent-client-protocol`.
 
 ```yaml
 agent:
@@ -2135,7 +2184,7 @@ The `kiro` block is forwarded to the Kiro adapter, which runs `kiro-cli chat --n
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `KIRO_API_KEY` | Yes (local mode) | Headless credential. Requires a Kiro Pro, Pro+, or Power subscription. The adapter rejects a missing key in `StartSession` and runs a `kiro-cli whoami` canary to reject a present-but-invalid key, because headless `chat` with no credential blocks on an interactive device-login flow with no self-timeout. In SSH mode the canary is skipped and the orchestrator forwards `KIRO_API_KEY` from its environment into the remote command instead. |
+| `KIRO_API_KEY` | No, alongside a stored login | Headless credential. Requires a Kiro Pro, Pro+, or Power subscription. Either this key or a stored `kiro-cli` login satisfies the credential-verification step (Section 2.6): its `kiro-cli whoami` guard runs only on that step's own session, deciding on the runtime's own answer in its JSON output format, because headless `chat` with no credential blocks on an interactive device-login flow with no self-timeout; see [Section 4.3](#43-worker--ssh-worker-extension) for how the key reaches a remote session. |
 
 **Token usage and budgets:** The Kiro adapter emits no token-usage events. `kiro-cli` does not report token counts on the headless path (only an abstract credits figure on stderr), so `TurnResult.Usage` is the zero value and `token_rates.kiro` produces no cost estimate. Token-based budget enforcement does not apply to Kiro; `agent.turn_timeout_ms` is the wall-clock budget bound. A turn that goes silent is caught first by `agent.stall_timeout_ms`.
 
@@ -2749,6 +2798,7 @@ Sortie watches `WORKFLOW.md` for filesystem changes and automatically re-reads a
 | `agent.max_concurrent_agents_by_state` | **Immediate** — affects subsequent dispatch decisions.                                         |
 | `agent.max_sessions`                   | **Immediate** — affects future retry timer evaluations.                                        |
 | `agent.max_tokens`                     | **Immediate** — the poll tick carries the new ceiling to the event loop, and the first usage figure after it stops a run already over the ceiling; also affects future retry timer evaluations. |
+| `agent.token_warning_percent`          | **Immediate** — the poll tick carries the new threshold to the event loop; an unwarned run in flight is evaluated against it from its next usage figure, a warned run never warns again, and a run dispatched after the tick is evaluated against it from dispatch. |
 | `agent.max_consecutive_absences`       | **Immediate** — affects future worker exits, retry timer evaluations, and poll-tick park sweeps. |
 | `db_path`                              | **No effect** — requires restart. In-memory config updated, but database connection unchanged. |
 | `ci_feedback.kind`                     | **No effect** — requires restart. CI provider is created once at process start.                |
@@ -2832,6 +2882,19 @@ A `handoff_state` or `in_progress_state` that collides with `active_states` or `
 
 These offline checks never contact Linear and never log the API key value. State-name existence against the team and credential validity are checked by the online preflight at adapter construction, not by `sortie validate`.
 
+**Configuration advisories.** A configuration advisory is recorded once, when the configuration that draws it is built or loaded, and never printed at that point. Every advisory reaches an operator through the same three surfaces: `sortie validate` reports it once as a `warning` diagnostic and never fails the run for it; the running orchestrator logs it once at the tick that first draws it, and again only after a tick whose configuration did not draw it; a dry run logs it once, before it fetches candidate issues. `sortie mcp-server` never prints an advisory. `sortie stats` is the one exception: it lists its own `token_rates` warnings in its report, because they decide which runs it prices.
+
+| Check                                                     | Condition                                                                                          |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `ci_feedback.deprecated`                                    | A `ci_feedback` section is present and `reactions.ci_failure` is also configured.                    |
+| `reactions.label_commands.poll_interval_ms.clamped`         | `reactions.label_commands` names a provider and its `poll_interval_ms` is below 30000.               |
+| `env_file.missing`                                          | An env file path is set (`--env-file` or `SORTIE_ENV_FILE`) and no file exists there.                |
+| `env_override.section_replaced`                             | A `SORTIE_*` override targets a section whose value is present and not a mapping.                    |
+| `reactions.label_commands.review_branch_missing`            | `reactions.label_commands` names a provider, the review label is non-empty, and the prompt template has no `label_review` branch. |
+| `reactions.label_commands.fix_branch_missing`               | `reactions.label_commands` names a provider, the fix label is non-empty, and the prompt template has no `label_fix` branch. |
+| `agent.kind.deprecated`                                     | A kind the configuration reaches (`agent.kind`, `dispatch.default.agent`, or a `dispatch.rules[*].agent`) is registered as deprecated. |
+| `token_rates`                                               | `token_rates` or one of its entries is not a map, an entry has an empty agent kind, a rate is not a finite, non-negative number, an entry names a key Sortie does not recognize, or an entry lacks `input_per_mtok` or `output_per_mtok`. |
+
 ---
 
 ## 9. Error Reference
@@ -2858,6 +2921,7 @@ These errors are raised during typed config construction from the parsed front m
 | `config: <field>: value is outside the range an integer setting accepts, -9223372036854775808 to 9223372036854775807` | An integer too large or too small for Sortie to hold, in any integer field. | Use a value within the range. The field's own limits still apply.                                                                   |
 | `config: agent.max_sessions: must be non-negative`                              | Negative value for `max_sessions`.                                       | Use `0` (unlimited) or a positive integer.                                                                                           |
 | `config: agent.max_tokens: must be non-negative`                                | Negative value for `max_tokens`.                                         | Use `0` (unlimited) or a positive integer.                                                                                           |
+| `config: agent.token_warning_percent: must be between 0 and 99`                 | Value for `token_warning_percent` below `0` or above `99`.               | Use an integer from `0` (off) to `99`.                                                                                               |
 | `config: agent.max_consecutive_absences: must be greater than 0`                | `0` or a negative value for `max_consecutive_absences`.                  | Use a positive integer, or remove the key to take the default of `3`.                                                                |
 | `config: agent.max_consecutive_absences: invalid integer value: <val>`          | Non-integer value for `max_consecutive_absences`.                        | Use a plain integer (e.g., `3`) or a quoted string integer (e.g., `"3"`).                                                            |
 | `config: agent.kind: expected string, got <type>`                               | `agent.kind` is not a string (e.g., integer, boolean, list).             | Ensure the value is a string, quoted if necessary.                                                                                   |
@@ -2972,6 +3036,7 @@ A flat reference of every configuration field, for quick lookup. The "Env Overri
 | `agent.max_concurrent_agents_by_state`  | `map[string]int` | `{}`                         | —                                        | Keys lowercased; dynamic reload                                                        |
 | `agent.max_sessions`                    | integer          | `0`                          | `SORTIE_AGENT_MAX_SESSIONS`              | Unlimited; dynamic reload                                                              |
 | `agent.max_tokens`                      | integer          | `0`                          | `SORTIE_AGENT_MAX_TOKENS`                | Unlimited; dynamic reload                                                              |
+| `agent.token_warning_percent`           | integer          | `0`                          | `SORTIE_AGENT_TOKEN_WARNING_PERCENT`     | Off; `0` to `99`; dynamic reload                                                       |
 | `agent.max_consecutive_absences`        | integer          | `3`                          | `SORTIE_AGENT_MAX_CONSECUTIVE_ABSENCES`  | `0` and negative rejected; dynamic reload                                              |
 | `db_path`                               | path             | `.sortie.db`                 | `SORTIE_DB_PATH`                         | Restart required; `$VAR` skipped for env-sourced values                                |
 | `ci_feedback.kind`                      | string           | _(absent)_                   | —                                        | **Deprecated;** absent = disabled; restart required                                    |
@@ -3010,7 +3075,7 @@ A flat reference of every configuration field, for quick lookup. The "Env Overri
 | `self_review.reviewer`                  | string           | `"same"`                     | —                                        | Only `"same"` in v1                                                                    |
 | `notifications`                         | `[map]`          | _(absent)_                   | —                                        | Notifier backend list; `notify_operator` tool; absent = tool unregistered             |
 | `notifications[].kind`                  | string           | _(required)_                 | —                                        | Backend discriminator; v1: `webhook`, `slack`                                          |
-| `notifications[].max_per_session`       | integer          | `20`                         | —                                        | Per-session `notify_operator` cap; `0` selects the default; never unlimited; non-negative |
+| `notifications[].max_per_session`       | integer          | `20`                         | —                                        | `notify_operator` cap for the whole agent run; `0` selects the default; never unlimited; non-negative |
 | **Extensions**                          |                  |                              |                                          |                                                                                        |
 | `server.port`                           | integer          | `7678`                       | —                                        | CLI `--port` overrides; `0` disables server                                    |
 | `server.host`                           | string (IP)      | `127.0.0.1`                  | —                                        | CLI `--host` overrides                                                         |
@@ -3018,6 +3083,8 @@ A flat reference of every configuration field, for quick lookup. The "Env Overri
 | `worker.ssh_hosts`                      | `[string]`       | _(absent)_                   | —                                        | SSH host targets; dynamic reload                                                       |
 | `worker.max_concurrent_agents_per_host` | integer          | _(absent)_                   | —                                        | Per-host cap; dynamic reload                                                           |
 | `worker.ssh_strict_host_key_checking`   | string           | `accept-new`                 | —                                        | `accept-new`, `yes`, `no`; dynamic reload                                              |
+| `worker.ssh_pass_env`                   | `[string]`       | _(absent)_                   | —                                        | Names of variables to carry into a remote session; dynamic reload                     |
+| `worker.ssh_disallow_pass_env`          | `[string]`       | _(absent)_                   | —                                        | Names of variables Sortie never carries into a remote session; dynamic reload          |
 
 ---
 

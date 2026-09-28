@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/tool/mcpserver"
 	"github.com/sortie-ai/sortie/internal/tool/notify"
 	"github.com/sortie-ai/sortie/internal/tool/status"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 func TestRunMCPServer_Help_ReturnsZero(t *testing.T) {
@@ -128,7 +130,9 @@ func TestMCPServer_StatusTool_Dispatch(t *testing.T) {
 	})
 
 	reg := domain.NewToolRegistry()
-	reg.Register(status.New(dir))
+	reg.Register(status.New(func(name string, maxBytes int64) ([]byte, error) {
+		return workspacekit.ReadSortieFile(dir, name, maxBytes)
+	}))
 
 	input := buildMCPRequest(t, "tools/call", 1, map[string]any{
 		"name":      "sortie_status",
@@ -523,7 +527,6 @@ func TestSessionToolParamsFromEnv(t *testing.T) {
 		"SORTIE_DB_PATH":            "/db.sqlite",
 		"SORTIE_ISSUE_ID":           "issue-1",
 		"SORTIE_ISSUE_IDENTIFIER":   "PROJ-1",
-		"SORTIE_SESSION_ID":         "sess-1",
 		"SORTIE_DISPATCH_ID":        "dispatch-1",
 		"SORTIE_ATTEMPT":            "3",
 		"SORTIE_SESSION_AGENT_KIND": "mock",
@@ -537,14 +540,13 @@ func TestSessionToolParamsFromEnv(t *testing.T) {
 	t.Setenv("SORTIE_DB_PATH", "/process-db.sqlite")
 	t.Setenv("SORTIE_ISSUE_ID", "process-issue")
 	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "PROC-1")
-	t.Setenv("SORTIE_SESSION_ID", "process-sess")
 	t.Setenv("SORTIE_DISPATCH_ID", "process-dispatch")
 	t.Setenv("SORTIE_ATTEMPT", "9")
 	t.Setenv("SORTIE_SESSION_AGENT_KIND", "process-agent")
 
 	cfg := config.ServiceConfig{
 		Tracker: config.TrackerConfig{Project: "PROJ"},
-		Agent:   config.AgentConfig{MaxTokens: 1000, MaxSessions: 5},
+		Agent:   config.AgentConfig{MaxTokens: 1000, MaxSessions: 5, TokenWarningPercent: 80},
 	}
 	tracker := &stubTrackerAdapter{}
 
@@ -561,9 +563,6 @@ func TestSessionToolParamsFromEnv(t *testing.T) {
 	}
 	if params.Identifier != "PROJ-1" {
 		t.Errorf("Identifier = %q, want %q", params.Identifier, "PROJ-1")
-	}
-	if params.SessionID != "sess-1" {
-		t.Errorf("SessionID = %q, want %q", params.SessionID, "sess-1")
 	}
 	if params.DispatchID != "dispatch-1" {
 		t.Errorf("DispatchID = %q, want %q", params.DispatchID, "dispatch-1")
@@ -582,6 +581,9 @@ func TestSessionToolParamsFromEnv(t *testing.T) {
 	}
 	if params.MaxSessions != 5 {
 		t.Errorf("MaxSessions = %d, want 5", params.MaxSessions)
+	}
+	if want := cfg.Agent.TokenWarningThreshold(); params.TokenWarningThreshold != want {
+		t.Errorf("TokenWarningThreshold = %d, want %d (cfg.Agent.TokenWarningThreshold())", params.TokenWarningThreshold, want)
 	}
 	if params.TrackerAdapter != tracker {
 		t.Error("TrackerAdapter does not equal the adapter passed in")
@@ -615,10 +617,16 @@ func TestSessionToolParamsFromEnv_Attempt(t *testing.T) {
 	}
 }
 
+func testNotifySessionIDFunc() string { return "" }
+
+// testAlwaysReserveSlot is a [notify.SlotReserver] test double that claims
+// unconditionally.
+func testAlwaysReserveSlot(int) (func(), bool, error) { return func() {}, true, nil }
+
 func TestBuildNotifyTool_EmptyBackends_ReturnsNilNil(t *testing.T) {
 	t.Parallel()
 
-	tool, err := buildNotifyTool(nil, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool(nil, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err != nil {
 		t.Fatalf("buildNotifyTool(nil) error = %v, want nil", err)
 	}
@@ -630,7 +638,7 @@ func TestBuildNotifyTool_EmptyBackends_ReturnsNilNil(t *testing.T) {
 func TestBuildNotifyTool_EmptySlice_ReturnsNilNil(t *testing.T) {
 	t.Parallel()
 
-	tool, err := buildNotifyTool([]config.NotificationBackend{}, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool([]config.NotificationBackend{}, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err != nil {
 		t.Fatalf("buildNotifyTool(empty) error = %v, want nil", err)
 	}
@@ -656,7 +664,7 @@ func TestBuildNotifyTool_ValidWebhookBackend_ReturnsNonNilTool(t *testing.T) {
 		},
 	}
 
-	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err != nil {
 		t.Fatalf("buildNotifyTool(webhook) error = %v, want nil", err)
 	}
@@ -665,6 +673,60 @@ func TestBuildNotifyTool_ValidWebhookBackend_ReturnsNonNilTool(t *testing.T) {
 	}
 	if tool.Name() != "notify_operator" {
 		t.Errorf("tool.Name() = %q, want %q", tool.Name(), "notify_operator")
+	}
+}
+
+func TestBuildNotifyTool_PropagatesSessionID(t *testing.T) {
+	t.Parallel()
+
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read posted body: %v", err)
+		}
+		captured = b
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	backends := []config.NotificationBackend{
+		{Kind: "webhook", Config: map[string]any{"url": srv.URL}},
+	}
+	env := notify.NotificationEnvelopeContext{DispatchID: "dispatch-reaches-tool"}
+	sessionID := func() string { return "session-reaches-tool" }
+
+	tool, err := buildNotifyTool(backends, env, sessionID, testAlwaysReserveSlot)
+	if err != nil {
+		t.Fatalf("buildNotifyTool: %v", err)
+	}
+	if tool == nil {
+		t.Fatal("buildNotifyTool tool = nil, want non-nil")
+	}
+
+	raw, execErr := tool.Execute(context.Background(), json.RawMessage(`{"severity":"info","title":"T","body":"B"}`))
+	if execErr != nil {
+		t.Fatalf("Execute: %v", execErr)
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("unmarshal Execute result: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Execute result success = false: %s", raw)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(captured, &body); err != nil {
+		t.Fatalf("unmarshal posted body %q: %v", captured, err)
+	}
+	if got, _ := body["dispatch_id"].(string); got != env.DispatchID {
+		t.Errorf("posted body[dispatch_id] = %q, want %q", got, env.DispatchID)
+	}
+	if got, _ := body["session_id"].(string); got != sessionID() {
+		t.Errorf("posted body[session_id] = %q, want %q", got, sessionID())
 	}
 }
 
@@ -683,7 +745,7 @@ func TestBuildNotifyTool_ValidSlackBackend_ReturnsNonNilTool(t *testing.T) {
 		},
 	}
 
-	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err != nil {
 		t.Fatalf("buildNotifyTool(slack) error = %v, want nil", err)
 	}
@@ -702,7 +764,7 @@ func TestBuildNotifyTool_UnknownKind_ReturnsError(t *testing.T) {
 		},
 	}
 
-	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err == nil {
 		t.Fatal("buildNotifyTool(unknown kind) error = nil, want non-nil error")
 	}
@@ -739,7 +801,7 @@ func TestBuildNotifyTool_EmptyRequiredSecret_ReturnsError(t *testing.T) {
 				{Kind: tt.kind, Config: tt.config},
 			}
 
-			tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{})
+			tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 			if err == nil {
 				t.Fatalf("buildNotifyTool(%q, empty secret) error = nil, want fatal constructor error", tt.kind)
 			}
@@ -765,7 +827,7 @@ func TestBuildNotifyTool_PartialFailureIsTotal(t *testing.T) {
 		{Kind: "unknown-kind-for-partial-test", Config: map[string]any{"url": srv.URL}},
 	}
 
-	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{})
+	tool, err := buildNotifyTool(backends, notify.NotificationEnvelopeContext{}, testNotifySessionIDFunc, testAlwaysReserveSlot)
 	if err == nil {
 		t.Fatal("buildNotifyTool(partial failure) = nil error, want non-nil (no partial registration)")
 	}
@@ -875,7 +937,6 @@ func TestRunMCPServer_SuccessPath_ReturnsZero(t *testing.T) {
 	t.Setenv("SORTIE_DB_PATH", dbPath)
 	t.Setenv("SORTIE_ISSUE_ID", "issue-99")
 	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "PROJ-99")
-	t.Setenv("SORTIE_SESSION_ID", "sess-99")
 	t.Setenv("SORTIE_SESSION_AGENT_KIND", "mock")
 
 	var stdout, stderr bytes.Buffer
@@ -951,7 +1012,6 @@ func TestBuildSessionToolRegistry_EnvFree(t *testing.T) {
 		WorkspacePath:  tmpDir,
 		DBPath:         dbPath,
 		IssueID:        "issue-envfree",
-		SessionID:      "sess-envfree",
 		MaxTokens:      50000,
 		MaxSessions:    5,
 		Notifications:  []config.NotificationBackend{webhookBackend(t)},
@@ -972,7 +1032,6 @@ func TestBuildSessionToolRegistry_EnvFree(t *testing.T) {
 	t.Setenv("SORTIE_DB_PATH", dbPath)
 	t.Setenv("SORTIE_ISSUE_ID", "env-issue-override")
 	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "ENV-1")
-	t.Setenv("SORTIE_SESSION_ID", "env-session-override")
 	t.Setenv("SORTIE_ATTEMPT", "3")
 	t.Setenv("SORTIE_SESSION_AGENT_KIND", "env-agent")
 

@@ -13,13 +13,17 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 )
 
+// scenarios is filled by this package's test files before TestMain runs, so a
+// scenario only one platform can carry stays in the file that platform builds.
+var scenarios = map[string]agenttest.Scenario{
+	"echo-args": agenttest.Typed(func(args []string, prefix string) int {
+		fmt.Print(prefix + strings.Join(args, " "))
+		return 3
+	}),
+}
+
 func TestMain(m *testing.M) {
-	agenttest.Main(m, map[string]agenttest.Scenario{
-		"echo-args": agenttest.Typed(func(args []string, prefix string) int {
-			fmt.Print(prefix + strings.Join(args, " "))
-			return 3
-		}),
-	})
+	agenttest.Main(m, scenarios)
 }
 
 func TestFakeRuntime(t *testing.T) {
@@ -88,6 +92,70 @@ func TestFakeRuntime(t *testing.T) {
 	}
 }
 
+func TestFakeRuntime_WhenArg(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		params     agenttest.Output
+		args       []string
+		wantStdout string
+		wantStderr string
+		wantCode   int
+	}{
+		{
+			name:       "launch carrying the named argument replays the configured output",
+			params:     agenttest.Output{Stdout: "out\n", Stderr: "err\n", ExitCode: 7, WhenArg: "--sortie-unknown-switch"},
+			args:       []string{"--sortie-unknown-switch"},
+			wantStdout: "out\n",
+			wantStderr: "err\n",
+			wantCode:   7,
+		},
+		{
+			name:   "launch not carrying the named argument writes nothing and exits 0",
+			params: agenttest.Output{Stdout: "out\n", Stderr: "err\n", ExitCode: 7, WhenArg: "--sortie-unknown-switch"},
+			args:   []string{"--version"},
+		},
+		{
+			name:       "empty WhenArg keeps the unconditional behavior",
+			params:     agenttest.Output{Stdout: "out\n", Stderr: "err\n", ExitCode: 7},
+			args:       []string{"--version"},
+			wantStdout: "out\n",
+			wantStderr: "err\n",
+			wantCode:   7,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, tt.params)
+			cmd := exec.Command(path, tt.args...) //nolint:gosec // path is a fake runtime under t.TempDir()
+			var stdout, stderr strings.Builder
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+			code := 0
+			var exitErr *exec.ExitError
+			if err := cmd.Run(); errors.As(err, &exitErr) {
+				code = exitErr.ExitCode()
+			} else if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+
+			if stdout.String() != tt.wantStdout {
+				t.Errorf("stdout = %q, want %q", stdout.String(), tt.wantStdout)
+			}
+			if stderr.String() != tt.wantStderr {
+				t.Errorf("stderr = %q, want %q", stderr.String(), tt.wantStderr)
+			}
+			if code != tt.wantCode {
+				t.Errorf("exit code = %d, want %d", code, tt.wantCode)
+			}
+		})
+	}
+}
+
 func TestFakeRuntime_Hang(t *testing.T) {
 	t.Parallel()
 
@@ -111,10 +179,6 @@ func TestFakeRuntime_Hang(t *testing.T) {
 	<-done
 }
 
-// TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes pins the ordering the
-// Windows cleanup depends on: the fake runtime and its config are gone by the
-// time the directory that holds them is removed, so `t.TempDir()`'s own
-// cleanup never meets a file another process is still holding.
 func TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes(t *testing.T) {
 	t.Parallel()
 
@@ -128,7 +192,6 @@ func TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes(t *testing.T) {
 		}
 	})
 
-	// The subtest has finished, so its cleanups have run.
 	if _, err := os.Stat(exe); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("fake runtime still present after cleanup: %v", err)
 	}
@@ -138,9 +201,6 @@ func TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes(t *testing.T) {
 	}
 }
 
-// TestFakeRuntimeCleanupSurvivesAnUnremovableFile keeps the cleanup from
-// turning a slow handle into a hard failure: the directory owner reports a
-// removal that never succeeds, this helper does not.
 func TestFakeRuntimeCleanupSurvivesAnUnremovableFile(t *testing.T) {
 	t.Parallel()
 

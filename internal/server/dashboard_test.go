@@ -351,7 +351,7 @@ func TestBuildDashboardData(t *testing.T) {
 	t.Run("available slots clamped to zero", func(t *testing.T) {
 		t.Parallel()
 
-		// slotFunc returns 1 but 2 running → clamped to 0.
+		// slotFunc returns 1 but 2 running -> clamped to 0.
 		data := buildDashboardData(snap, "v1", startedAt, func() int { return 1 }, now, nil)
 		if data.AvailableSlots != 0 {
 			t.Errorf("AvailableSlots = %d, want 0", data.AvailableSlots)
@@ -495,9 +495,6 @@ func TestBuildDashboardData(t *testing.T) {
 	})
 }
 
-// TestBuildDashboardData_Budget fails if the budget-blocked rows stop
-// carrying the identifier, the humanized reason, or the ceiling-relative
-// numbers an operator reads at a glance.
 func TestBuildDashboardData_Budget(t *testing.T) {
 	t.Parallel()
 
@@ -630,7 +627,7 @@ func TestBuildDashboardData_Budget(t *testing.T) {
 
 // TestHandleDashboard_Budget covers the HTML surface: the card and table
 // render only when something is blocked, and no rendered string names a
-// setting as a thing to change.
+// setting to change.
 func TestHandleDashboard_Budget(t *testing.T) {
 	t.Parallel()
 
@@ -851,12 +848,9 @@ func TestDashboard_HTMLEscaping(t *testing.T) {
 
 	dr := getDashboard(t, ts, "/")
 
-	// html/template must escape the script tag.
-	// Check for the XSS payload specifically; the legitimate accordion script block is also present.
 	if strings.Contains(dr.Body, "<script>alert") {
 		t.Error("body contains unescaped XSS payload — XSS vulnerability")
 	}
-	// The escaped version should be present.
 	if !strings.Contains(dr.Body, "&lt;script&gt;") {
 		t.Error("body missing HTML-escaped script tag")
 	}
@@ -920,11 +914,9 @@ func TestHandleDashboard_NoSSHHostColumn(t *testing.T) {
 	}
 }
 
-// TestBuildDashboardData_ExtendedFields verifies that the
-// CacheReadTokens, ModelName, and API request-count fields are passed
-// through buildDashboardData to the template data structures. The
-// request count reaches the template only through its pre-formatted
-// row, which is the panel's one guarded reader of the raw figure.
+// TestBuildDashboardData_ExtendedFields verifies CacheReadTokens, ModelName,
+// and API request count pass through to the template data. The request count
+// reaches the template only through its pre-formatted row.
 func TestBuildDashboardData_ExtendedFields(t *testing.T) {
 	t.Parallel()
 
@@ -976,8 +968,6 @@ func TestBuildDashboardData_ExtendedFields(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_ExtendedFieldsRendered verifies that the extended
-// fields appear in the HTML output.
 func TestHandleDashboard_ExtendedFieldsRendered(t *testing.T) {
 	t.Parallel()
 
@@ -1180,7 +1170,6 @@ func TestHandleDashboard_NoRunHistoryFn(t *testing.T) {
 		GeneratedAt: time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC),
 	}
 
-	// No RunHistoryFn → run history section must be omitted entirely.
 	ts := dashboardServer(t, fixedSnapshot(snap), "1.0.0", nil)
 	dr := getDashboard(t, ts, "/")
 
@@ -1278,9 +1267,9 @@ func TestBuildDashboardData_FallsBackToIdentifier(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_FooterCacheReadLabel verifies that the dashboard footer uses
-// the "Cache Read:" label (not the ambiguous "Cache:") and includes a tooltip
-// explaining the metric for users unfamiliar with prompt caching.
+// TestHandleDashboard_FooterCacheReadLabel verifies the footer uses the
+// "Cache Read:" label (not the ambiguous "Cache:") with an explaining
+// tooltip.
 func TestHandleDashboard_FooterCacheReadLabel(t *testing.T) {
 	t.Parallel()
 
@@ -1300,47 +1289,55 @@ func TestHandleDashboard_FooterCacheReadLabel(t *testing.T) {
 		t.Fatalf("GET / status = %d, want %d", dr.StatusCode, http.StatusOK)
 	}
 
-	// The footer must use "Cache Read:" as the label.
 	if !strings.Contains(dr.Body, "Cache Read:") {
 		t.Error(`footer body missing "Cache Read:" label`)
 	}
 
-	// The span must carry the tooltip explaining the metric.
 	wantTitle := `title="Prompt cache read tokens`
 	if !strings.Contains(dr.Body, wantTitle) {
 		t.Errorf("footer body missing tooltip attribute %q", wantTitle)
 	}
 
-	// The cache read token value must appear formatted.
 	if !strings.Contains(dr.Body, "2,077,449") {
 		t.Error(`footer body missing formatted cache read token count "2,077,449"`)
 	}
 }
 
-// TestHandleDashboard_SessionsCachedTokensTooltip verifies that the
-// running-session detail panel's Tokens row renders the cached-token
-// annotation when CacheReadTokens is non-zero.
 func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		name            string
-		cacheReadTokens int64
-		wantTooltip     bool
-		wantFormatted   string
+		name             string
+		cacheReadTokens  int64
+		cacheWriteTokens int64
+		wantAnnotation   string
+		wantFormatted    []string
 	}{
 		{
 			name:            "non-zero cache read tokens renders tooltip",
 			cacheReadTokens: 763850,
-			wantTooltip:     true,
-			wantFormatted:   "763,850",
+			wantAnnotation:  "(763,850 cache read)",
+			wantFormatted:   []string{"763,850"},
 		},
 		{
-			name:            "zero cache read tokens omits annotation",
+			name:             "non-zero cache write tokens renders tooltip",
+			cacheWriteTokens: 38948,
+			wantAnnotation:   "(38,948 cache write)",
+			wantFormatted:    []string{"38,948"},
+		},
+		{
+			name:             "cache read and cache write both non-zero render the combined form",
+			cacheReadTokens:  154053,
+			cacheWriteTokens: 38948,
+			wantAnnotation:   "(154,053 cache read, 38,948 cache write)",
+			wantFormatted:    []string{"154,053", "38,948"},
+		},
+		{
+			name:            "zero cache read and cache write tokens omits annotation",
 			cacheReadTokens: 0,
-			wantTooltip:     false,
+			wantAnnotation:  "",
 		},
 	}
 
@@ -1358,6 +1355,7 @@ func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 						StartedAt:        now.Add(-5 * time.Minute),
 						AgentTotalTokens: 1000,
 						CacheReadTokens:  tt.cacheReadTokens,
+						CacheWriteTokens: tt.cacheWriteTokens,
 						UsageMeasured:    true,
 						UsageArrival:     registry.UsageArrivalIncremental,
 						UsageAttribution: registry.UsageAttributionPerModel,
@@ -1372,17 +1370,20 @@ func TestHandleDashboard_SessionsCachedTokensTooltip(t *testing.T) {
 				t.Fatalf("GET / status = %d, want %d", dr.StatusCode, http.StatusOK)
 			}
 
-			// The Tokens row's cached-count annotation is plain text,
-			// pre-formatted in Go by usageTokensRow, and present only
-			// when cached tokens are non-zero.
-			wantAnnotation := "(" + FormatInt(tt.cacheReadTokens) + " cached)"
-			gotTooltip := strings.Contains(dr.Body, wantAnnotation)
-			if gotTooltip != tt.wantTooltip {
-				t.Errorf("body contains cached-count annotation %q = %v, want %v", wantAnnotation, gotTooltip, tt.wantTooltip)
+			if tt.wantAnnotation == "" {
+				for _, forbidden := range []string{" cache read)", " cache write)"} {
+					if strings.Contains(dr.Body, forbidden) {
+						t.Errorf("body unexpectedly contains a cache annotation %q for a zero-cache row", forbidden)
+					}
+				}
+			} else if !strings.Contains(dr.Body, tt.wantAnnotation) {
+				t.Errorf("body missing cache annotation %q", tt.wantAnnotation)
 			}
 
-			if tt.wantFormatted != "" && !strings.Contains(dr.Body, tt.wantFormatted) {
-				t.Errorf("body missing formatted cache read count %q", tt.wantFormatted)
+			for _, formatted := range tt.wantFormatted {
+				if !strings.Contains(dr.Body, formatted) {
+					t.Errorf("body missing formatted cache token count %q", formatted)
+				}
 			}
 		})
 	}
@@ -1649,9 +1650,6 @@ func TestDashboard_DetailRowColspan(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_AccordionToggleRefactor verifies that accordion rows use
-// a <button> in the first cell rather than role="button" on the <tr>. It covers
-// all three table sections (running, retrying, run history).
 func TestHandleDashboard_AccordionToggleRefactor(t *testing.T) {
 	t.Parallel()
 
@@ -1659,7 +1657,7 @@ func TestHandleDashboard_AccordionToggleRefactor(t *testing.T) {
 	snap := orchestrator.RuntimeSnapshotResult{
 		GeneratedAt: now,
 		Running: []orchestrator.SnapshotRunningEntry{
-			// StartedAt ascending → R0 is index 0, R1 is index 1 after sort.
+			// StartedAt ascending -> MT-R0 is index 0, MT-R1 is index 1 after sort.
 			{IssueID: "id-r0", Identifier: "MT-R0", State: "In Progress", StartedAt: now.Add(-5 * time.Minute)},
 			{IssueID: "id-r1", Identifier: "MT-R1", State: "In Progress", StartedAt: now.Add(-3 * time.Minute)},
 		},
@@ -1709,13 +1707,11 @@ func TestHandleDashboard_AccordionToggleRefactor(t *testing.T) {
 
 	t.Run("aria-expanded=false is on button not on tr", func(t *testing.T) {
 		t.Parallel()
-		// Positive: aria-expanded must appear somewhere in the body.
 		if !strings.Contains(body, `aria-expanded="false"`) {
 			t.Error(`body missing aria-expanded="false"`)
 		}
-		// Negative: accordion header <tr> elements must not carry aria-expanded.
-		// The refactor moved that state onto the nested button, so any
-		// accordion-header row containing aria-expanded indicates a regression.
+		// The refactor moved aria-expanded onto the nested button, so an
+		// accordion-header row carrying it is a regression.
 		if strings.Contains(body, `class="accordion-header" aria-expanded="`) ||
 			strings.Contains(body, `aria-expanded="false" class="accordion-header"`) ||
 			strings.Contains(body, `aria-expanded="true" class="accordion-header"`) {
@@ -1725,7 +1721,6 @@ func TestHandleDashboard_AccordionToggleRefactor(t *testing.T) {
 
 	t.Run("aria-controls on button matches id of detail row", func(t *testing.T) {
 		t.Parallel()
-		// Each table section uses its own ID prefix with 0-based row counter.
 		pairs := [][2]string{
 			{`aria-controls="detail-running-0"`, `id="detail-running-0"`},
 			{`aria-controls="detail-running-1"`, `id="detail-running-1"`},
@@ -1744,8 +1739,7 @@ func TestHandleDashboard_AccordionToggleRefactor(t *testing.T) {
 
 	t.Run("no tabindex=0 on tr", func(t *testing.T) {
 		t.Parallel()
-		// tabindex="0" was only ever used on accordion <tr> rows; its absence
-		// confirms the attribute was removed from table rows.
+		// tabindex="0" was only ever on accordion <tr> rows.
 		if strings.Contains(body, `tabindex="0"`) {
 			t.Error(`body contains tabindex="0" — must not appear after accordion toggle refactor`)
 		}
@@ -1768,7 +1762,7 @@ func TestBuildDashboardData_TokenRates(t *testing.T) {
 	t.Run("with rates and matching AgentKind computes aggregate cost", func(t *testing.T) {
 		t.Parallel()
 
-		// 2M input @ $3/Mtok = $6, 1M output @ $15/Mtok = $15 → $21
+		// 2M input @ $3/Mtok = $6, 1M output @ $15/Mtok = $15 -> $21
 		snap := orchestrator.RuntimeSnapshotResult{
 			GeneratedAt: now,
 			Running: []orchestrator.SnapshotRunningEntry{
@@ -1852,11 +1846,9 @@ func TestBuildDashboardData_TokenRates(t *testing.T) {
 		if !data.HasTokenRates {
 			t.Error("HasTokenRates = false, want true")
 		}
-		// No matching kind → no aggregate cost.
 		if data.EstimatedCostUSD != nil {
 			t.Errorf("EstimatedCostUSD = %q, want nil (no matching kind)", *data.EstimatedCostUSD)
 		}
-		// Per-entry cost string should be empty.
 		if data.Running[0].EstimatedCostUSD != "" {
 			t.Errorf("Running[0].EstimatedCostUSD = %q, want empty", data.Running[0].EstimatedCostUSD)
 		}
@@ -2011,6 +2003,60 @@ func TestHandleDashboard_WithTokenRates(t *testing.T) {
 	}
 }
 
+// TestHandleDashboard_IncompleteTokenRateEntryDashesActiveEstCost
+// drives a running, measured claude-code session under a token_rates
+// entry missing input_per_mtok: the dashboard must show Active Est.
+// Cost as a dash rather than a number, and name the excluded session
+// in the same note complete rates render for an unnamed kind.
+func TestHandleDashboard_IncompleteTokenRateEntryDashesActiveEstCost(t *testing.T) {
+	t.Parallel()
+
+	fptr := func(v float64) *float64 { return &v }
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	snap := orchestrator.RuntimeSnapshotResult{
+		GeneratedAt: now,
+		Running: []orchestrator.SnapshotRunningEntry{
+			{
+				IssueID:           "id-incomplete",
+				Identifier:        "MT-INCOMPLETE",
+				State:             "In Progress",
+				StartedAt:         now.Add(-5 * time.Minute),
+				AgentKind:         "claude-code",
+				AgentInputTokens:  1_000_000,
+				AgentOutputTokens: 500_000,
+				UsageMeasured:     true,
+				UsageArrival:      registry.UsageArrivalIncremental,
+			},
+		},
+	}
+
+	srv := New(Params{
+		SnapshotFn: fixedSnapshot(snap),
+		RefreshFn:  acceptingRefresh(),
+		Logger:     slog.New(slog.DiscardHandler),
+		StartedAt:  now.Add(-1 * time.Hour),
+		TokenRates: TokenRates{
+			"claude-code": TokenRateConfig{OutputPerMtok: fptr(15.0)},
+		},
+	})
+	ts := httptest.NewServer(srv.Mux())
+	t.Cleanup(ts.Close)
+
+	dr := getDashboard(t, ts, "/")
+	if dr.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", dr.StatusCode, http.StatusOK)
+	}
+
+	if !strings.Contains(dr.Body, "&mdash;") {
+		t.Error("body missing the dash render for an unpriced Active Est. Cost")
+	}
+	wantNote := "1 running session is excluded from Est. Cost because token_rates has no price for its agent."
+	if !strings.Contains(dr.Body, wantNote) {
+		t.Errorf("body missing the cost-unpriced note %q", wantNote)
+	}
+}
+
 func TestHandleDashboard_WithoutTokenRates(t *testing.T) {
 	t.Parallel()
 
@@ -2031,7 +2077,7 @@ func TestHandleDashboard_WithoutTokenRates(t *testing.T) {
 		},
 	}
 
-	// No TokenRates set → the Est. Cost row still renders, per the
+	// No TokenRates set -> the Est. Cost row still renders, per the
 	// usageEstCostRow rates-unconfigured arm, but with the dash.
 	ts := dashboardServer(t, fixedSnapshot(snap), "1.0.0", nil)
 
@@ -2049,10 +2095,9 @@ func TestHandleDashboard_WithoutTokenRates(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_UnmeasuredRunningEntry verifies the rendered
-// markers for a running session that has reported no measurement: the
-// Tokens cell reads "not reported", the Est. Cost cell keeps its
-// existing missing-value marker, and the footer note names the count.
+// TestHandleDashboard_UnmeasuredRunningEntry verifies an unmeasured running
+// session renders "not reported" in the Tokens cell, keeps the missing-value
+// marker for Est. Cost, and gets a footer note naming the count.
 func TestHandleDashboard_UnmeasuredRunningEntry(t *testing.T) {
 	t.Parallel()
 
@@ -2088,8 +2133,6 @@ func TestHandleDashboard_UnmeasuredRunningEntry(t *testing.T) {
 	}
 }
 
-// TestCountedNote verifies the singular/plural selection and the
-// empty-string result for a non-positive count.
 func TestCountedNote(t *testing.T) {
 	t.Parallel()
 
@@ -2121,14 +2164,12 @@ func TestCountedNote(t *testing.T) {
 	}
 }
 
-// TestBuildDashboardData_ExclusionNotes verifies each footer note's text,
-// singular/plural form, and that none leaks an internal identifier.
 func TestBuildDashboardData_ExclusionNotes(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 	fptr := func(v float64) *float64 { return &v }
-	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0)}}
+	rates := TokenRates{"claude": TokenRateConfig{InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)}}
 
 	t.Run("singular forms", func(t *testing.T) {
 		t.Parallel()
@@ -2371,9 +2412,6 @@ func TestHandleDashboard_NoUsageArrivalAndEndedUnmeasuredNotesRendered(t *testin
 	}
 }
 
-// TestHandleDashboard_NoUnmeasuredEntries_NoFooterNote verifies that the
-// unmeasured-sessions footer note is absent when every running entry has
-// reported a measurement.
 func TestHandleDashboard_NoUnmeasuredEntries_NoFooterNote(t *testing.T) {
 	t.Parallel()
 
@@ -2403,9 +2441,9 @@ func TestHandleDashboard_NoUnmeasuredEntries_NoFooterNote(t *testing.T) {
 	}
 }
 
-// usageArrivalValues and usageAttributionValues enumerate every value
-// in each vocabulary, including its undeclared zero value, so a
-// totality test can cover the full combination space.
+// usageArrivalValues and usageAttributionValues enumerate every value,
+// including the undeclared zero value, so a totality test covers the full
+// combination space.
 var (
 	usageArrivalValues = []registry.UsageArrival{
 		registry.UsageArrivalUndeclared,
@@ -2421,10 +2459,6 @@ var (
 	}
 )
 
-// TestUsageRowFunctions_Totality proves each row function returns a
-// non-empty string for every combination of the four UsageArrival
-// values, the four UsageAttribution values, UsageMeasured, and
-// TokensPending.
 func TestUsageRowFunctions_Totality(t *testing.T) {
 	t.Parallel()
 
@@ -2458,8 +2492,11 @@ func TestUsageRowFunctions_Totality(t *testing.T) {
 					if got := usageAPIRequestsRow(arrival, measured, 3, map[string]int{"a": 1, "b": 2}); got == "" {
 						t.Errorf("usageAPIRequestsRow(%q, %v, 3, breakdown) = empty, want non-empty (%s)", arrival, measured, name)
 					}
-					if got := usageTokensRow(arrival, measured, pending, "1,234"); got == "" {
-						t.Errorf("usageTokensRow(%q, %v, %v, \"1,234\") = empty, want non-empty (%s)", arrival, measured, pending, name)
+					if got := usageTokensRow(arrival, measured, true, pending, "1,234"); got == "" {
+						t.Errorf("usageTokensRow(%q, %v, true, %v, \"1,234\") = empty, want non-empty (%s)", arrival, measured, pending, name)
+					}
+					if got := usageTokensRow(arrival, measured, false, pending, "1,234"); got == "" {
+						t.Errorf("usageTokensRow(%q, %v, false, %v, \"1,234\") = empty, want non-empty (%s)", arrival, measured, pending, name)
 					}
 					if got := usageEstCostRow(arrival, true, pending, "$1.23"); got == "" {
 						t.Errorf("usageEstCostRow(%q, true, %v, \"$1.23\") = empty, want non-empty (%s)", arrival, pending, name)
@@ -2473,8 +2510,6 @@ func TestUsageRowFunctions_Totality(t *testing.T) {
 	}
 }
 
-// TestUsageReportingRow_Golden pins the exact rendered string for
-// every declared arrival/attribution combination.
 func TestUsageReportingRow_Golden(t *testing.T) {
 	t.Parallel()
 
@@ -2503,8 +2538,6 @@ func TestUsageReportingRow_Golden(t *testing.T) {
 	}
 }
 
-// TestUsageModelRow_Golden pins the exact rendered string for every
-// declared attribution.
 func TestUsageModelRow_Golden(t *testing.T) {
 	t.Parallel()
 
@@ -2532,8 +2565,6 @@ func TestUsageModelRow_Golden(t *testing.T) {
 	}
 }
 
-// TestUsageAPIRequestsRow_Golden pins the exact rendered string for
-// every declared arrival.
 func TestUsageAPIRequestsRow_Golden(t *testing.T) {
 	t.Parallel()
 
@@ -2561,8 +2592,9 @@ func TestUsageAPIRequestsRow_Golden(t *testing.T) {
 	}
 }
 
-// TestUsageTokensRow_Golden pins the exact rendered string for every
-// declared arrival and the not-reported-yet and pending arms.
+// TestUsageTokensRow_Golden pins the rendered string per arrival. The two
+// unmeasured arms differ by one word: only a session whose figure may still
+// arrive is offered as one the operator can wait for.
 func TestUsageTokensRow_Golden(t *testing.T) {
 	t.Parallel()
 
@@ -2570,30 +2602,32 @@ func TestUsageTokensRow_Golden(t *testing.T) {
 		name          string
 		arrival       registry.UsageArrival
 		usageMeasured bool
+		tokensAwaited bool
 		tokensPending bool
 		want          string
 	}{
-		{"none arrival", registry.UsageArrivalNone, false, false, dashPlaceholder},
-		{"not measured yet", registry.UsageArrivalIncremental, false, false, "not reported yet"},
-		{"pending", registry.UsageArrivalTurnEnd, true, true, "1,234, excludes the turn in progress"},
-		{"incremental settled", registry.UsageArrivalIncremental, true, false, "1,234"},
-		{"turn_end settled", registry.UsageArrivalTurnEnd, true, false, "1,234"},
-		{"undeclared arrival", registry.UsageArrivalUndeclared, true, false, "1,234, usage reporting not declared"},
+		{name: "none arrival", arrival: registry.UsageArrivalNone, want: dashPlaceholder},
+		{name: "not measured, figure still to come", arrival: registry.UsageArrivalIncremental, tokensAwaited: true, want: "not reported yet"},
+		{name: "not measured, figure was due and never came", arrival: registry.UsageArrivalTurnEnd, want: "not reported"},
+		{name: "pending", arrival: registry.UsageArrivalTurnEnd, usageMeasured: true, tokensPending: true, want: "1,234, excludes the turn in progress"},
+		{name: "incremental settled", arrival: registry.UsageArrivalIncremental, usageMeasured: true, want: "1,234"},
+		{name: "turn_end settled", arrival: registry.UsageArrivalTurnEnd, usageMeasured: true, want: "1,234"},
+		{name: "undeclared arrival", arrival: registry.UsageArrivalUndeclared, usageMeasured: true, want: "1,234, usage reporting not declared"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := usageTokensRow(tt.arrival, tt.usageMeasured, tt.tokensPending, "1,234"); got != tt.want {
-				t.Errorf("usageTokensRow(%q, %v, %v, \"1,234\") = %q, want %q", tt.arrival, tt.usageMeasured, tt.tokensPending, got, tt.want)
+			got := usageTokensRow(tt.arrival, tt.usageMeasured, tt.tokensAwaited, tt.tokensPending, "1,234")
+			if got != tt.want {
+				t.Errorf("usageTokensRow(%q, %v, %v, %v, \"1,234\") = %q, want %q",
+					tt.arrival, tt.usageMeasured, tt.tokensAwaited, tt.tokensPending, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestUsageEstCostRow_Golden pins the exact rendered string for every
-// declared arrival, the rates-unconfigured arm, and the pending arm.
 func TestUsageEstCostRow_Golden(t *testing.T) {
 	t.Parallel()
 
@@ -2624,8 +2658,7 @@ func TestUsageEstCostRow_Golden(t *testing.T) {
 }
 
 // usageReportingKindStrings names every registered agent kind, so the
-// dashboard's absent-string test can confirm none of them leaks into
-// operator-facing copy.
+// absent-string test can confirm none leaks into operator-facing copy.
 var usageReportingKindStrings = []string{
 	"agent-client-protocol",
 	"claude-code",
@@ -2638,10 +2671,9 @@ var usageReportingKindStrings = []string{
 }
 
 // TestHandleDashboard_UsageReportingPanel_NoAdapterOrLaunchModeStrings
-// asserts that no rendered dashboard output names an agent kind or a
-// launch mode: a session narrowed by its launch mode reads as a
-// session that reports nothing, and the preflight diagnostic, not the
-// dashboard, is where the cause and the remedy are stated.
+// asserts no rendered output names an agent kind or launch mode: a session
+// narrowed by its launch mode reads as one that reports nothing, and the
+// preflight diagnostic, not the dashboard, states cause and remedy.
 func TestHandleDashboard_UsageReportingPanel_NoAdapterOrLaunchModeStrings(t *testing.T) {
 	t.Parallel()
 
@@ -2690,10 +2722,9 @@ func TestHandleDashboard_UsageReportingPanel_NoAdapterOrLaunchModeStrings(t *tes
 	}
 }
 
-// TestHandleDashboard_UsageReportingPanel_StatesOnceAndFirst asserts that
-// a rendered running-session panel states a usage-reporting fact
-// once, and the Usage reporting row precedes Model, API Requests,
-// Tokens, and Est. Cost in document order.
+// TestHandleDashboard_UsageReportingPanel_StatesOnceAndFirst asserts a
+// rendered panel states a usage-reporting fact once, and the Usage reporting
+// row precedes Model, API Requests, Tokens, and Est. Cost in document order.
 func TestHandleDashboard_UsageReportingPanel_StatesOnceAndFirst(t *testing.T) {
 	t.Parallel()
 
@@ -2736,10 +2767,9 @@ func TestHandleDashboard_UsageReportingPanel_StatesOnceAndFirst(t *testing.T) {
 	}
 }
 
-// extractDashboardRow returns the rendered text between the <dt>label</dt>
-// and its following <dd>...</dd>, or fails the test when the label is
-// absent. Used to read a specific detail row's own value out of the
-// rendered body rather than searching the whole page for a substring.
+// extractDashboardRow returns the text of the <dd> following <dt>label</dt>,
+// so a test can read one row's own value rather than searching the whole
+// page for a substring.
 func extractDashboardRow(t *testing.T, body, label string) string {
 	t.Helper()
 	re := regexp.MustCompile(`(?s)<dt>` + regexp.QuoteMeta(label) + `</dt>\s*<dd>(.*?)</dd>`)
@@ -2750,15 +2780,12 @@ func extractDashboardRow(t *testing.T, body, label string) string {
 	return strings.TrimSpace(m[1])
 }
 
-// TestRequestCountStateMatrix_RenderedRowAndWire walks the full state
-// matrix over a SnapshotRunningEntry, the struct both presenters consume,
-// and for each row marshals a
-// runningEntryResponse and renders the panel. The wire half checks that
-// api_request_count is null exactly when the verdict is false; the
-// rendered half extracts the API Requests row's own value from the body
-// and matches it against exactly one of the three admissible strings,
-// rather than searching the page for the absence of a numeral, which
-// can never fail because the page always carries other numbers.
+// TestRequestCountStateMatrix_RenderedRowAndWire walks the full state matrix
+// and checks both presenters. The wire half checks api_request_count is null
+// exactly when the verdict is false; the rendered half matches the API
+// Requests row's own value against the admissible strings, rather than
+// searching the page for an absent numeral, which the page's other numbers
+// would defeat.
 func TestRequestCountStateMatrix_RenderedRowAndWire(t *testing.T) {
 	t.Parallel()
 
@@ -2833,13 +2860,10 @@ func TestRequestCountStateMatrix_RenderedRowAndWire(t *testing.T) {
 	}
 }
 
-// TestHandleDashboard_TurnEndMeasuredTokensUnmeasuredRequests is a full
-// end-to-end reproduction, run rather than isolated at either row
-// function alone: a session whose runtime delivers usage on a
-// turn-final event
-// but never a token_usage event renders "not measured" in the API
-// Requests row and its real, non-zero token total in the Tokens row,
-// on the same card, with no zero standing in for either fact.
+// TestHandleDashboard_TurnEndMeasuredTokensUnmeasuredRequests is an
+// end-to-end check: a session that delivers usage on a turn-final event but
+// never a token_usage event renders "not measured" in API Requests and its
+// real non-zero total in Tokens, with no zero standing in for either fact.
 func TestHandleDashboard_TurnEndMeasuredTokensUnmeasuredRequests(t *testing.T) {
 	t.Parallel()
 
@@ -2879,5 +2903,73 @@ func TestHandleDashboard_TurnEndMeasuredTokensUnmeasuredRequests(t *testing.T) {
 	}
 	if requestsRow == "0" || tokensRow == "0" {
 		t.Errorf("a row states a fabricated zero: API Requests=%q, Tokens=%q", requestsRow, tokensRow)
+	}
+}
+
+// TestDashboard_SessionPastItsArrivalPointReportsNothing: a turn-end kind
+// whose turn ended with no figure must not be offered as one still to come.
+func TestDashboard_SessionPastItsArrivalPointReportsNothing(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	state := orchestrator.NewState(5000, 4, 500_000, nil, orchestrator.AgentTotals{})
+	state.Running["iss"] = &orchestrator.RunningEntry{
+		Identifier:     "MT-INERT",
+		Issue:          domain.Issue{ID: "iss", State: "In Progress"},
+		StartedAt:      now.Add(-time.Minute),
+		AgentKind:      "transport",
+		TurnCount:      1,
+		LastAgentEvent: domain.EventTurnCompleted,
+		UsageArrival:   registry.UsageArrivalTurnEnd,
+	}
+
+	data := buildDashboardData(orchestrator.RuntimeSnapshot(state, now), "test", now.Add(-time.Hour), nil, now, nil)
+
+	if len(data.Running) != 1 {
+		t.Fatalf("dashboard rendered %d running rows, want 1", len(data.Running))
+	}
+	if got := data.Running[0].TokensRow; got != "not reported" {
+		t.Errorf("Tokens row = %q, want %q", got, "not reported")
+	}
+	if got := data.RunningUnreportedNote; got != "" {
+		t.Errorf("RunningUnreportedNote = %q, want empty: this session's figures are not still to come", got)
+	}
+	want := "1 running session runs an agent that reports no token usage; the totals above exclude it."
+	if got := data.RunningNonReportingNote; got != want {
+		t.Errorf("RunningNonReportingNote = %q, want %q", got, want)
+	}
+}
+
+// TestDashboard_SessionInsideItsFirstTurnStillAwaitsFigures is the control:
+// the same absent figure, but the settling turn has not ended, so the panel
+// keeps saying the figure has not arrived yet.
+func TestDashboard_SessionInsideItsFirstTurnStillAwaitsFigures(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+
+	state := orchestrator.NewState(5000, 4, 500_000, nil, orchestrator.AgentTotals{})
+	state.Running["iss"] = &orchestrator.RunningEntry{
+		Identifier:     "MT-PENDING",
+		Issue:          domain.Issue{ID: "iss", State: "In Progress"},
+		StartedAt:      now.Add(-time.Minute),
+		AgentKind:      "transport",
+		TurnCount:      1,
+		LastAgentEvent: domain.EventOtherMessage,
+		UsageArrival:   registry.UsageArrivalTurnEnd,
+	}
+
+	data := buildDashboardData(orchestrator.RuntimeSnapshot(state, now), "test", now.Add(-time.Hour), nil, now, nil)
+
+	if got := data.Running[0].TokensRow; got != "not reported yet" {
+		t.Errorf("Tokens row = %q, want %q", got, "not reported yet")
+	}
+	want := "1 running session has not reported token usage yet; the totals above exclude it."
+	if got := data.RunningUnreportedNote; got != want {
+		t.Errorf("RunningUnreportedNote = %q, want %q", got, want)
+	}
+	if got := data.RunningNonReportingNote; got != "" {
+		t.Errorf("RunningNonReportingNote = %q, want empty", got)
 	}
 }

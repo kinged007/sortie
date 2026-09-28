@@ -170,6 +170,7 @@ Fields:
   - Other kinds (for example, HTTP-based adapters) are available only if you register them separately.
   - Parallels `tracker.kind`.
   - This is the default agent kind used when no `dispatch.rules` entry overrides it; see §5.3.10 for the override mechanism.
+  - `kiro` is deprecated, with `agent-client-protocol` as its replacement. The kind stays registered and a configuration naming it keeps working.
 - `command` (string)
   - The command the agent adapter uses to launch the agent process. A local subprocess adapter splits it on whitespace into an argument vector; an SSH worker passes it to the remote shell unsplit. Adapter-defined default.
   - When `agent.kind` requires a local command, this field must be present and non-empty.
@@ -210,6 +211,14 @@ Fields:
   - Overridable through `SORTIE_AGENT_MAX_TOKENS`. `0` disables the budget.
   - Changes are re-applied at runtime: a lowered ceiling reaches a run already in flight from the next poll tick onward, and it affects future retry timer evaluations.
   - Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight.
+  - `token_warning_percent`, below, warns before this ceiling stops a run.
+- `token_warning_percent` (integer)
+  - Default: `0` (off).
+  - Must be between `0` and `99`; rejected as a configuration error at parse time otherwise. It is never validated against `agent.max_tokens`, so lowering the ceiling can never make this field reject a reload.
+  - The warning threshold, in tokens, is this percentage of `agent.max_tokens`, rounded up to the nearest whole token. It has no effect while `agent.max_tokens` is `0`.
+  - Evaluated on the event loop, against the same live per-issue figure the ceiling reads, ahead of the ceiling's own evaluation. Once a run's figure reaches the threshold, one warning is logged for that run and the running session's `cost_budget` tool result reports the condition, so the agent can wrap up or hand off before the ceiling stops the run.
+  - Overridable through `SORTIE_AGENT_TOKEN_WARNING_PERCENT`.
+  - Changes are re-applied at runtime: a run already in flight that has not yet reached the previous threshold is evaluated against the new one from its next usage figure, and a run dispatched after the reload is evaluated against the new value from dispatch.
 - `max_consecutive_absences` (integer)
   - Default: `3`.
   - Bounds how many runs in a row may be observed to have produced no evidence of work before the issue is parked. Any run that produces evidence of work resets the count to zero.
@@ -508,14 +517,14 @@ Per-entry fields:
 - `kind` (string)
   - Required. The registry discriminator, resolved against the notifier registry (Section 10.4.7) at sidecar startup. v1 backends are `webhook` and `slack`.
 - `max_per_session` (integer, optional)
-  - The per-session `notify_operator` call cap. It is not a per-entry default: an omitted, `null`, or `0` value contributes nothing to cap selection, which then falls back to the default of `20` only when every entry is `0` or unset (see "Validation and resolution" below). `0` never means unlimited. A negative value is rejected at config parse time.
+  - The `notify_operator` call cap for the whole agent run, shared by every tool server process of the dispatch (Section 10.4.5). It is not a per-entry default: an omitted, `null`, or `0` value contributes nothing to cap selection, which then falls back to the default of `20` only when every entry is `0` or unset (see "Validation and resolution" below). `0` never means unlimited. A negative value is rejected at config parse time.
 - backend-specific fields
   - Passed through to the backend constructor untyped, with `$VAR` references resolved. The `webhook` backend requires `url`; the `slack` backend requires `webhook_url`.
 
 Validation and resolution:
 
 - The list is structurally validated when the config is parsed: a non-sequence value, an entry that is not a map, an entry with an empty `kind`, or a negative `max_per_session` aborts config construction (Section 6.3).
-- When more than one backend is configured, the effective per-session cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap counts `notify_operator` calls, not per-backend sends.
+- When more than one backend is configured, the effective cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap belongs to the dispatch (Section 10.4.5): a runtime that starts a new tool server process for each turn shares the same count across every turn of the run rather than restarting it.
 - A backend secret SHOULD be given as a reference to a `SORTIE_`-prefixed environment variable (`$SORTIE_NAME` or `${SORTIE_NAME}`). The `notify_operator` tool runs in a separate `sortie mcp-server` process whose environment is constructed by the agent's MCP host. The orchestrator guarantees that only its `SORTIE_`-prefixed variables are propagated into that process for `$VAR` resolution; the host MAY additionally inherit other variables from its own environment, so a reference without the prefix is not guaranteed to resolve and MAY resolve to the empty string. References are expanded against the sidecar process environment with no prefix enforcement, so the `SORTIE_` prefix is the way to guarantee a secret resolves regardless of host. When a required secret resolves to the empty string, the backend rejects it, which surfaces as a fatal sidecar startup error rather than a notification posted nowhere.
 
 ### 5.4 Prompt Template Contract

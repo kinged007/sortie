@@ -1106,7 +1106,7 @@ func TestManager_PromptTemplateByID_KnownRuleTemplate(t *testing.T) {
 // invariant that the per-rule template index is keyed by the canonical,
 // EvalSymlinks-resolved absolute path, even when the workflow file is
 // reached through a symlinked workflow directory. Windows CI runners
-// surfaced this contract via 8.3 short-name paths (RUNNER~1 → long
+// surfaced this contract via 8.3 short-name paths (RUNNER~1 -> long
 // form); creating an explicit symlink reproduces the same canonical-
 // vs-raw drift on Linux and macOS so the regression is caught on every
 // supported runner. Skips gracefully on hosts where os.Symlink is
@@ -1303,6 +1303,17 @@ func labelCommandsWorkflow(promptBody string) []byte {
 
 const labelReviewWarnMessage = "label_commands active but prompt template has no label_review branch"
 
+// hasAdvisoryMessage reports whether advisories carries one whose
+// Message equals message.
+func hasAdvisoryMessage(advisories []config.Advisory, message string) bool {
+	for _, a := range advisories {
+		if a.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
 // TestManager_WarnsWhenLabelReviewTokenMissing asserts that with
 // label_commands active and a prompt body that never references
 // label_review, load emits a Warn; the same active block with a
@@ -1329,8 +1340,8 @@ func TestManager_WarnsWhenLabelReviewTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if !strings.Contains(buf.String(), labelReviewWarnMessage) {
-			t.Errorf("logger output = %q, want the missing-token warning", buf.String())
+		if !hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want the missing-token advisory", mgr.Config().Advisories())
 		}
 	})
 
@@ -1350,8 +1361,8 @@ func TestManager_WarnsWhenLabelReviewTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if strings.Contains(buf.String(), labelReviewWarnMessage) {
-			t.Errorf("logger output = %q, want no warning when the prompt references label_review", buf.String())
+		if hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want no advisory when the prompt references label_review", mgr.Config().Advisories())
 		}
 	})
 
@@ -1371,8 +1382,8 @@ func TestManager_WarnsWhenLabelReviewTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if strings.Contains(buf.String(), labelReviewWarnMessage) {
-			t.Errorf("logger output = %q, want no warning when label_commands is inactive", buf.String())
+		if hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want no advisory when label_commands is inactive", mgr.Config().Advisories())
 		}
 	})
 }
@@ -1432,8 +1443,8 @@ func TestManager_WarnsWhenLabelFixTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if !strings.Contains(buf.String(), labelFixWarnMessage) {
-			t.Errorf("logger output = %q, want the missing-token warning", buf.String())
+		if !hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want the missing-token advisory", mgr.Config().Advisories())
 		}
 	})
 
@@ -1453,8 +1464,8 @@ func TestManager_WarnsWhenLabelFixTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if strings.Contains(buf.String(), labelFixWarnMessage) {
-			t.Errorf("logger output = %q, want no warning when the prompt references label_fix", buf.String())
+		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want no advisory when the prompt references label_fix", mgr.Config().Advisories())
 		}
 	})
 
@@ -1474,8 +1485,8 @@ func TestManager_WarnsWhenLabelFixTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if strings.Contains(buf.String(), labelFixWarnMessage) {
-			t.Errorf("logger output = %q, want no warning when fix_label is disabled", buf.String())
+		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want no advisory when fix_label is disabled", mgr.Config().Advisories())
 		}
 	})
 
@@ -1495,8 +1506,8 @@ func TestManager_WarnsWhenLabelFixTokenMissing(t *testing.T) {
 		}
 		mgr.Stop()
 
-		if strings.Contains(buf.String(), labelFixWarnMessage) {
-			t.Errorf("logger output = %q, want no warning when label_commands is inactive", buf.String())
+		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
+			t.Errorf("Config().Advisories() = %+v, want no advisory when label_commands is inactive", mgr.Config().Advisories())
 		}
 	})
 

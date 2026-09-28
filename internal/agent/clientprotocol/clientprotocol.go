@@ -1,21 +1,20 @@
-// Package clientprotocol implements [domain.AgentAdapter] for the Agent
-// Client Protocol, a generic newline-delimited JSON-RPC protocol any
-// conforming runtime can speak. It launches the runtime named by
-// agent.command as a persistent local subprocess, or over SSH, and
-// drives it through a session that persists across turns, each turn a
-// single open request that ends with a declared stop reason.
+// Package clientprotocol implements [domain.AgentAdapter] for the Agent Client
+// Protocol, a newline-delimited JSON-RPC protocol any conforming runtime can
+// speak. It launches the runtime named by agent.command as a persistent local
+// subprocess, or over SSH, and drives it through a session that persists across
+// turns, each turn a single open request that ends with a declared stop reason.
 package clientprotocol
 
 import (
 	"context"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
-// mcpConfigKey is the one settings-block key this adapter reads.
 const mcpConfigKey = "mcp_config"
 
 func init() {
@@ -23,39 +22,45 @@ func init() {
 		RequiresCommand:     true,
 		ValidateAgentConfig: validateConfig,
 		MCPInjection:        registry.MCPInjectionTranslated,
-		UsageArrival:        registry.UsageArrivalNone,
-		UsageAttribution:    registry.UsageAttributionNone,
+		UsageArrival:        registry.UsageArrivalTurnEnd,
+		UsageAttribution:    registry.UsageAttributionPerModel,
+		CredentialEnv:       registry.DeclareCredentialEnv(),
+		UsageSessionRules: []registry.UsageSessionRule{
+			{
+				// The measurement source reads a local filesystem, while a
+				// worker over SSH writes its measurements on the far host. This
+				// pins what a remote session reports today, not what it can ever
+				// report.
+				When:        func(passthrough map[string]any, remote bool) bool { return remote },
+				Arrival:     registry.UsageArrivalNone,
+				Attribution: registry.UsageAttributionNone,
+			},
+		},
 	})
 }
 
-// Compile-time interface satisfaction check.
 var _ domain.AgentAdapter = (*ClientProtocolAdapter)(nil)
 
-// ClientProtocolAdapter satisfies [domain.AgentAdapter] for the Agent
-// Client Protocol. One adapter instance serves every concurrent
-// session; per-session state lives in [sessionState], reached through
-// [domain.Session.Internal], while origins is the adapter's own
-// mutable state, shared by every session the adapter starts and
-// outliving any one of them.
+// ClientProtocolAdapter satisfies [domain.AgentAdapter] for the Agent Client
+// Protocol. One instance serves every concurrent session; per-session state
+// lives in [sessionState], while origins is the adapter's own mutable state,
+// shared by every session and outliving any one of them.
 type ClientProtocolAdapter struct {
 	origins sessionOrigins
 
-	// drainGrace bounds the post-reap release's wait for the
-	// connection's own reader to end normally, once startSession copies
-	// it into sessionState.drainGrace. A non-positive value resolves to
-	// procutil.DefaultDrainGrace. Set by a test in this package before
-	// StartSession; every production caller reaches only
-	// NewClientProtocolAdapter, which leaves it at its zero value.
+	// drainGrace bounds the post-reap release's wait for the connection's own
+	// reader to end normally. A non-positive value resolves to
+	// procutil.DefaultDrainGrace. Set by a test before StartSession; every
+	// production caller reaches only NewClientProtocolAdapter, which leaves it
+	// at its zero value.
 	drainGrace time.Duration
 }
 
-// NewClientProtocolAdapter constructs a [ClientProtocolAdapter] from the
-// kind's own configuration block. It reads exactly one key, mcp_config,
-// without keeping its value: the path an agent's session actually uses
-// arrives per session through StartSessionParams.MCPConfigPath rather
-// than through this block. It succeeds when the block is absent or
-// empty; it refuses construction only when mcp_config is present with
-// the wrong YAML type.
+// NewClientProtocolAdapter constructs a [ClientProtocolAdapter] from the kind's
+// configuration block. It reads mcp_config without keeping its value: the path
+// a session uses arrives per session through StartSessionParams.MCPConfigPath.
+// It refuses construction only when mcp_config is present with the wrong YAML
+// type.
 func NewClientProtocolAdapter(config map[string]any) (domain.AgentAdapter, error) {
 	if _, fault := typeutil.StringField(config, mcpConfigKey); fault != nil {
 		return nil, fault
@@ -63,18 +68,17 @@ func NewClientProtocolAdapter(config map[string]any) (domain.AgentAdapter, error
 	return &ClientProtocolAdapter{}, nil
 }
 
-// StartSession launches the runtime, performs the initialize handshake,
-// and creates a session with session/new.
+// StartSession launches the runtime, performs the initialize handshake, and
+// creates a session with session/new. The usage accumulator is built here so
+// exactly one exists per session and the pump inherits it.
 func (a *ClientProtocolAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	return startSession(ctx, a, params)
+	return startSession(ctx, a, params, agentcore.NewTurnEndUsage())
 }
 
-// RunTurn runs one prompt turn on an existing session.
 func (a *ClientProtocolAdapter) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 	return runTurn(ctx, session, params)
 }
 
-// StopSession tears down the session's subprocess and connection.
 func (a *ClientProtocolAdapter) StopSession(ctx context.Context, session domain.Session) error {
 	return stopSession(ctx, session)
 }

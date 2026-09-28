@@ -1042,6 +1042,40 @@ func TestDispatchIssue(t *testing.T) {
 		}
 	})
 
+	t.Run("WorkerDone is open at dispatch and closes once the worker context is cancelled", func(t *testing.T) {
+		t.Parallel()
+
+		s := newTestState()
+		workerStarted := make(chan struct{})
+		workerDone := make(chan struct{})
+
+		DispatchIssue(context.Background(), s, testIssue("ISS-WD"), nil, "", func(ctx context.Context, _ domain.Issue, _ *int) {
+			close(workerStarted)
+			<-ctx.Done()
+			close(workerDone)
+		})
+		<-workerStarted
+
+		entry := s.Running["ISS-WD"]
+		if entry.WorkerDone == nil {
+			t.Fatal("RunningEntry.WorkerDone = nil, want non-nil")
+		}
+		select {
+		case <-entry.WorkerDone:
+			t.Fatal("RunningEntry.WorkerDone already closed before cancellation")
+		default:
+		}
+
+		entry.CancelFunc()
+		<-workerDone
+
+		select {
+		case <-entry.WorkerDone:
+		case <-time.After(time.Second):
+			t.Fatal("RunningEntry.WorkerDone did not close within 1 second of cancellation")
+		}
+	})
+
 	t.Run("StartedAt is recent UTC", func(t *testing.T) {
 		t.Parallel()
 
@@ -1209,6 +1243,67 @@ func TestDispatchIssue(t *testing.T) {
 
 		DispatchIssue(context.Background(), s, testIssue("ISS-P"), nil, "", nil)
 	})
+}
+
+func TestDispatchIssue_TokenCeilingContexts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		trigger     func(entry *RunningEntry)
+		wantCause   error
+		wantRunDone bool
+	}{
+		{
+			name:      "TokenCeilingCancelFunc cancels the worker context with the ceiling cause and leaves the run context live",
+			trigger:   func(entry *RunningEntry) { entry.TokenCeilingCancelFunc() },
+			wantCause: errTokenCeilingStop,
+		},
+		{
+			name:        "CancelFunc cancels both the run and worker contexts with context.Canceled",
+			trigger:     func(entry *RunningEntry) { entry.CancelFunc() },
+			wantCause:   context.Canceled,
+			wantRunDone: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestState()
+			ch := make(chan context.Context, 1)
+			DispatchIssue(context.Background(), s, testIssue("ISS-TC"), nil, "", func(ctx context.Context, _ domain.Issue, _ *int) {
+				ch <- ctx
+			})
+
+			var workerCtx context.Context
+			select {
+			case workerCtx = <-ch:
+			case <-time.After(time.Second):
+				t.Fatal("worker did not execute within 1 second")
+			}
+
+			entry := s.Running["ISS-TC"]
+			if entry.TokenCeilingCancelFunc == nil {
+				t.Fatal("RunningEntry.TokenCeilingCancelFunc = nil, want non-nil")
+			}
+			tt.trigger(entry)
+
+			select {
+			case <-workerCtx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("worker context was not cancelled")
+			}
+			if cause := context.Cause(workerCtx); !errors.Is(cause, tt.wantCause) {
+				t.Errorf("context.Cause(workerCtx) = %v, want %v", cause, tt.wantCause)
+			}
+
+			if runDone := runContextFrom(workerCtx).Err() != nil; runDone != tt.wantRunDone {
+				t.Errorf("run context done = %v, want %v", runDone, tt.wantRunDone)
+			}
+		})
+	}
 }
 
 // TestDispatchIssue_DispatchID covers dispatch-ID minting and context
@@ -1783,9 +1878,9 @@ func TestEvaluateCandidate_ReadBudgetWindow(t *testing.T) {
 		t.Errorf("total reads across %d passes = %d, want %d (every needy candidate read within the starvation bound)", wantPasses, totalReads, needyCount)
 	}
 
-	// The candidates a read was attempted on, across every pass in
-	// order, are pass 1's four followed by pass 2's two: the rotation
-	// covers the whole population without repeating anyone early.
+	// The candidates a read was attempted on, across every pass in order,
+	// are the first pass's four followed by the second pass's two: the
+	// rotation covers the whole population without repeating anyone early.
 	var gotOrder []string
 	for _, reads := range perPassReads {
 		gotOrder = append(gotOrder, reads...)

@@ -22,9 +22,10 @@ import (
 const envSurfaceAllowlistFile = "env_surface_contract_test.go"
 
 var envSurfaceOwnedNames = map[string]bool{
-	"SORTIE_CLIENTPROTOCOL_TEST":    true,
-	"SORTIE_CLIENTPROTOCOL_COMMAND": true,
-	"SORTIE_CLIENTPROTOCOL_PROFILE": true,
+	"SORTIE_CLIENTPROTOCOL_TEST":           true,
+	"SORTIE_CLIENTPROTOCOL_COMMAND":        true,
+	"SORTIE_CLIENTPROTOCOL_PROFILE":        true,
+	"SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV": true,
 }
 
 // envSurfaceCallSelectors are the selector names an environment-access
@@ -282,7 +283,7 @@ func TestEnvSurfaceIsTransportNamed(t *testing.T) {
 import "os"
 
 func f() string {
-	v, _ := os.LookupEnv("SORTIE_QWEN_TEST")
+	v, _ := os.LookupEnv("SORTIE_OTHERKIND_TEST")
 	return v
 }
 `)
@@ -296,7 +297,7 @@ func f() string {
 
 		violations := envSurfaceScanInline(t, `package fixture
 
-const qwenGateEnv = "SORTIE_QWEN_TEST"
+const otherKindGateEnv = "SORTIE_OTHERKIND_TEST"
 `)
 		if len(violations) != 1 {
 			t.Fatalf("violations = %d, want 1: %v", len(violations), violations)
@@ -308,7 +309,7 @@ const qwenGateEnv = "SORTIE_QWEN_TEST"
 
 		violations := envSurfaceScanInline(t, `package fixture
 
-const geminiGateEnv = "SORTIE_CLIENTPROTOCOL_GEMINI_TEST"
+const extraGateEnv = "SORTIE_CLIENTPROTOCOL_EXTRA_TEST"
 `)
 		if len(violations) != 1 {
 			t.Fatalf("violations = %d, want 1: %v", len(violations), violations)
@@ -341,7 +342,7 @@ func f(output string) bool {
 import "os"
 
 func f() string {
-	name := "SORTIE_QWEN_TEST"
+	name := "SORTIE_OTHERKIND_TEST"
 	return os.Getenv(name)
 }
 `)
@@ -358,7 +359,7 @@ func f() string {
 var name string
 
 func f() {
-	name = "SORTIE_QWEN_TEST"
+	name = "SORTIE_OTHERKIND_TEST"
 }
 `)
 		if len(violations) != 1 {
@@ -374,7 +375,7 @@ func f() {
 func helper(src string) string { return src }
 
 func f() string {
-	v := helper("SORTIE_QWEN_TEST")
+	v := helper("SORTIE_OTHERKIND_TEST")
 	return v
 }
 `)
@@ -388,7 +389,7 @@ func f() string {
 
 		violations := envSurfaceScanInline(t, `package fixture
 
-const qwenGate = "SORTIE_QWEN_TEST"
+const otherKindGate = "SORTIE_OTHERKIND_TEST"
 `)
 		if len(violations) != 1 {
 			t.Fatalf("violations = %d, want 1: %v", len(violations), violations)

@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -90,11 +92,29 @@ func noopHooks() ForkPerTurnHooks {
 		ParseLine:    func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) { return nil, nil },
 		GetUsage:     func() (domain.TokenUsage, bool) { return domain.TokenUsage{}, false },
 		GetSessionID: func() string { return "" },
-		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnCompleted(emit, "ok", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
 		},
 	}
+}
+
+// hooksWithEarlyExitDisposition returns a ForkPerTurnHooks whose
+// OnFinalize copies earlyExit onto TurnEvidence.EarlyExit and decides
+// through the shared FinalizeTurn, the way every production adapter's
+// own OnFinalize hook does. Tests exercising the skeleton's early-exit
+// computation use this in place of noopHooks, whose default OnFinalize
+// ignores earlyExit entirely.
+func hooksWithEarlyExitDisposition() ForkPerTurnHooks {
+	hooks := noopHooks()
+	hooks.OnFinalize = func(emit func(domain.AgentEvent), _ any, exitCode int, _ []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
+		return FinalizeTurn(emit, slog.Default(), TurnEvidence{
+			ExitObserved: true,
+			ExitCode:     exitCode,
+			EarlyExit:    earlyExit,
+		}, TurnMeta{})
+	}
+	return hooks
 }
 
 // sinkEvents returns an emit function and a pointer to the captured
@@ -391,13 +411,44 @@ func TestForkPerTurnSession(t *testing.T) {
 		requireAgentError(t, err, domain.ErrTurnCancelled)
 	})
 
-	t.Run("Arm4_Exit127", func(t *testing.T) {
+	t.Run("Arm4_Exit127_NoOutputYieldsEarlyExitReport", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "cmd not found\n", ExitCode: 127})
 		spy := &agenttest.LogSpy{}
 		target := newTestTarget(tmpDir, script)
-		sess := NewForkPerTurnSession(target, noopHooks(), slog.New(spy), 0)
+		sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.New(spy), 0)
+
+		emit, events := sinkEvents()
+		_, err := sess.RunTurn(context.Background(), "p", emit)
+
+		requireAgentError(t, err, domain.ErrPortExit)
+		if !hasEventType(*events, domain.EventTurnFailed) {
+			t.Errorf("EventTurnFailed not emitted; got %v", *events)
+		}
+		var agentErr *domain.AgentError
+		errors.As(err, &agentErr)
+		const wantMessage = "the agent runtime exited before responding: exit status 127"
+		if agentErr.Message != wantMessage {
+			t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, wantMessage)
+		}
+		var earlyExitErr *EarlyExitError
+		if !errors.As(agentErr.Err, &earlyExitErr) {
+			t.Fatalf("AgentError.Err = %v, want an *EarlyExitError", agentErr.Err)
+		}
+		if earlyExitErr.Output() != "cmd not found" {
+			t.Errorf("EarlyExitError.Output() = %q, want %q", earlyExitErr.Output(), "cmd not found")
+		}
+		agenttest.RequireWarnLines(t, spy, "Arm4")
+	})
+
+	t.Run("Arm4_Exit127_ReadableLineKeepsAgentNotFound", func(t *testing.T) {
+		t.Parallel()
+		tmpDir := t.TempDir()
+		script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: "a readable line\n", ExitCode: 127})
+		spy := &agenttest.LogSpy{}
+		target := newTestTarget(tmpDir, script)
+		sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.New(spy), 0)
 
 		emit, events := sinkEvents()
 		_, err := sess.RunTurn(context.Background(), "p", emit)
@@ -406,7 +457,6 @@ func TestForkPerTurnSession(t *testing.T) {
 		if !hasEventType(*events, domain.EventTurnFailed) {
 			t.Errorf("EventTurnFailed not emitted; got %v", *events)
 		}
-		agenttest.RequireWarnLines(t, spy, "Arm4")
 	})
 
 	for _, tc := range []struct {
@@ -472,7 +522,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		t.Run("Arm4_UsageVerdict_Exit127_"+tc.name, func(t *testing.T) {
 			t.Parallel()
 			tmpDir := t.TempDir()
-			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{ExitCode: 127})
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: "a readable line\n", ExitCode: 127})
 			target := newTestTarget(tmpDir, script)
 
 			getUsage, calls := usageVerdictDouble(wantUsageVerdictSnapshot, measured)
@@ -577,7 +627,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		hooks.ParseLine = func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) {
 			return &resultToken{}, nil
 		}
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			if lastParsed == nil {
 				return domain.TurnResult{}, &domain.AgentError{Kind: domain.ErrTurnFailed, Message: "no result"}
 			}
@@ -605,7 +655,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnFailed(emit, "finalize error", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnFailed}, &domain.AgentError{
 				Kind:    domain.ErrTurnFailed,
@@ -632,7 +682,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnFailed(emit, "non-zero exit", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnFailed}, &domain.AgentError{
 				Kind:    domain.ErrPortExit,
@@ -659,7 +709,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnFailed(emit, "no output", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnFailed}, &domain.AgentError{
 				Kind:    domain.ErrTurnFailed,
@@ -685,7 +735,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		target := newTestTarget(tmpDir, script)
 
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			EmitTurnCompleted(emit, "implicit success", 0, domain.TokenUsage{OutputTokens: 10})
 			return domain.TurnResult{
 				ExitReason: domain.EventTurnCompleted,
@@ -721,7 +771,7 @@ func TestForkPerTurnSession(t *testing.T) {
 
 		var gotStderrLines []string
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			gotStderrLines = stderrLines
 			EmitTurnCompleted(emit, "ok", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
@@ -758,7 +808,7 @@ func TestForkPerTurnSession(t *testing.T) {
 
 		var gotStderrLines []string
 		hooks := noopHooks()
-		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string) (domain.TurnResult, *domain.AgentError) {
+		hooks.OnFinalize = func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, _ *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			gotStderrLines = stderrLines
 			EmitTurnCompleted(emit, "ok", 0, domain.TokenUsage{})
 			return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
@@ -837,7 +887,7 @@ func TestForkPerTurnSession(t *testing.T) {
 		}
 		sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
 
-		// First call: cmd.Start() fails → s.turns must stay 0.
+		// First call: cmd.Start() fails, so s.turns must stay 0.
 		_, err := sess.RunTurn(context.Background(), "p", func(domain.AgentEvent) {})
 		if err == nil {
 			t.Fatal("RunTurn() with invalid command returned nil error")
@@ -854,4 +904,310 @@ func TestForkPerTurnSession(t *testing.T) {
 			t.Errorf("BuildArgs turn after failed-start retry = %d, want 1 (turns must not be incremented on failed start)", lastTurn)
 		}
 	})
+}
+
+// TestForkPerTurnSession_EarlyExit_StderrOnlyAcrossExitStatuses pins
+// that a turn whose runtime writes only to standard error and exits on
+// its own, with no readable line on standard output, makes
+// RunTurn return the early-exit report exactly once regardless of exit
+// status, with Status() matching the exit and Output() the rendered
+// stderr, and emits exactly one turn_failed event carrying the report's
+// message.
+func TestForkPerTurnSession_EarlyExit_StderrOnlyAcrossExitStatuses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		exitCode   int
+		wantStatus string
+	}{
+		{name: "exit status 0", exitCode: 0, wantStatus: "exit status 0"},
+		{name: "exit status 1", exitCode: 1, wantStatus: "exit status 1"},
+		{name: "exit status 2", exitCode: 2, wantStatus: "exit status 2"},
+		{name: "exit status 127", exitCode: 127, wantStatus: "exit status 127"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stderr: "boom\n", ExitCode: tt.exitCode})
+			target := newTestTarget(tmpDir, script)
+			sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
+
+			emit, events := sinkEvents()
+			_, err := sess.RunTurn(context.Background(), "p", emit)
+
+			requireAgentError(t, err, domain.ErrPortExit)
+			var agentErr *domain.AgentError
+			errors.As(err, &agentErr)
+			var earlyExitErr *EarlyExitError
+			if !errors.As(agentErr.Err, &earlyExitErr) {
+				t.Fatalf("AgentError.Err = %v, want an *EarlyExitError", agentErr.Err)
+			}
+			if earlyExitErr.Status() != tt.wantStatus {
+				t.Errorf("EarlyExitError.Status() = %q, want %q", earlyExitErr.Status(), tt.wantStatus)
+			}
+			if earlyExitErr.Output() != "boom" {
+				t.Errorf("EarlyExitError.Output() = %q, want %q", earlyExitErr.Output(), "boom")
+			}
+
+			failed := 0
+			for _, e := range *events {
+				if e.Type == domain.EventTurnFailed {
+					failed++
+					if e.Message != agentErr.Message {
+						t.Errorf("turn_failed Message = %q, want %q", e.Message, agentErr.Message)
+					}
+				}
+			}
+			if failed != 1 {
+				t.Errorf("turn_failed event count = %d, want 1", failed)
+			}
+		})
+	}
+}
+
+// TestForkPerTurnSession_EarlyExit_UnreadableStdoutVariants pins that a
+// turn whose standard output held only empty lines, white space, or
+// escape sequences yields the same report an empty stream does.
+func TestForkPerTurnSession_EarlyExit_UnreadableStdoutVariants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stdout string
+	}{
+		{name: "empty line", stdout: "\n"},
+		{name: "whitespace-only line", stdout: "   \t  \n"},
+		{name: "escape-sequence-only line", stdout: "\x1b[31m\x1b[0m\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: tt.stdout, Stderr: "boom\n", ExitCode: 1})
+			target := newTestTarget(tmpDir, script)
+			sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
+
+			emit, _ := sinkEvents()
+			_, err := sess.RunTurn(context.Background(), "p", emit)
+
+			requireAgentError(t, err, domain.ErrPortExit)
+		})
+	}
+}
+
+// TestForkPerTurnSession_EarlyExit_ReadableLineKeepsExitCodeOutcome
+// pins that a turn that wrote one readable line, JSON or plain text,
+// keeps today's non-zero-exit outcome instead of the early-exit
+// report.
+func TestForkPerTurnSession_EarlyExit_ReadableLineKeepsExitCodeOutcome(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stdout string
+	}{
+		{name: "JSON event", stdout: `{"type":"notification"}` + "\n"},
+		{name: "plain text", stdout: "the runtime answered\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: tt.stdout, ExitCode: 1})
+			target := newTestTarget(tmpDir, script)
+			sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
+
+			emit, _ := sinkEvents()
+			_, err := sess.RunTurn(context.Background(), "p", emit)
+
+			var agentErr *domain.AgentError
+			if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrPortExit {
+				t.Fatalf("RunTurn() error = %v, want a port_exit *domain.AgentError", err)
+			}
+			if agentErr.Message != "exit code 1" {
+				t.Errorf("AgentError.Message = %q, want %q (the early-exit report must not apply once a line was read)", agentErr.Message, "exit code 1")
+			}
+		})
+	}
+}
+
+// TestForkPerTurnSession_EarlyExit_RejectedLineIsNotAResponse pins that
+// a line ParseLine rejects never counts as the turn's response, even
+// though the runtime wrote it and exited cleanly: only a line the
+// adapter's own decoder accepts satisfies OutputWatch.
+func TestForkPerTurnSession_EarlyExit_RejectedLineIsNotAResponse(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Stdout: "not valid JSON\n"})
+	target := newTestTarget(tmpDir, script)
+	hooks := hooksWithEarlyExitDisposition()
+	hooks.ParseLine = func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) {
+		return nil, errors.New("line is not valid JSON")
+	}
+	sess := NewForkPerTurnSession(target, hooks, slog.Default(), 0)
+
+	emit, events := sinkEvents()
+	_, err := sess.RunTurn(context.Background(), "p", emit)
+
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("RunTurn() error = %v, want *domain.AgentError", err)
+	}
+	if _, ok := errors.AsType[*EarlyExitError](agentErr.Err); !ok {
+		t.Errorf("RunTurn() error = %v, want a chain carrying an *EarlyExitError", err)
+	}
+	if !hasEventType(*events, domain.EventMalformed) {
+		t.Errorf("EventMalformed not emitted for the rejected line; got %v", *events)
+	}
+}
+
+// TestForkPerTurnSession_EarlyExit_StopSignaledSuppressesReport pins
+// that a turn whose process Stop signaled reports today's cancellation
+// outcome, never the early-exit report, even though the runtime wrote
+// nothing readable before it died.
+func TestForkPerTurnSession_EarlyExit_StopSignaledSuppressesReport(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{Hang: true})
+	target := newTestTarget(tmpDir, script)
+	sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
+
+	emit, events := sinkEvents()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sess.RunTurn(context.Background(), "p", emit)
+		done <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let the subprocess start
+	if err := sess.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() = %v", err)
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("RunTurn did not return within 6s after Stop")
+	}
+
+	requireAgentError(t, err, domain.ErrTurnCancelled)
+	if !hasEventType(*events, domain.EventTurnCancelled) {
+		t.Errorf("EventTurnCancelled not emitted; got %v", *events)
+	}
+}
+
+// TestForkPerTurnSession_EarlyExit_WarnLinesEmittedOnce pins that a
+// turn failing with the early-exit report still emits its "agent
+// stderr" WARN records once per collected line, unaffected by the row
+// selection.
+func TestForkPerTurnSession_EarlyExit_WarnLinesEmittedOnce(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{
+		Stderr:   "first stderr line\nsecond stderr line\n",
+		ExitCode: 1,
+	})
+	spy := &agenttest.LogSpy{}
+	target := newTestTarget(tmpDir, script)
+	sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.New(spy), 0)
+
+	emit, _ := sinkEvents()
+	_, err := sess.RunTurn(context.Background(), "p", emit)
+
+	requireAgentError(t, err, domain.ErrPortExit)
+	lines := agenttest.RequireWarnLines(t, spy, "EarlyExit_WarnLinesEmittedOnce")
+	want := []string{"first stderr line", "second stderr line"}
+	if !slices.Equal(lines, want) {
+		t.Errorf("WARN agent stderr lines = %v, want %v", lines, want)
+	}
+}
+
+// TestForkPerTurnSession_LocalLaunchIgnoresSSHEnvNames asserts that a
+// local launch (RemoteCommand empty) behaves identically whether or
+// not LaunchTarget.SSHEnvNames names a set variable: the local branch
+// never reads SSHEnvNames, so both launches complete the same way.
+//
+// Not a subtest of TestForkPerTurnSession: that function calls
+// t.Parallel(), and t.Setenv panics under a parallel ancestor.
+func TestForkPerTurnSession_LocalLaunchIgnoresSSHEnvNames(t *testing.T) {
+	const varName = "SORTIE_FORKPERTURN_LOCAL_INVARIANCE"
+	t.Setenv(varName, "should-never-reach-a-local-launch")
+
+	tmpDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", agenttest.OutputScenario, agenttest.Output{})
+
+	baseline := newTestTarget(tmpDir, script)
+	withNames := &LaunchTarget{
+		Command:       baseline.Command,
+		WorkspacePath: baseline.WorkspacePath,
+		SSHEnvNames:   []string{varName},
+	}
+
+	for _, tc := range []struct {
+		name   string
+		target *LaunchTarget
+	}{
+		{"SSHEnvNames absent", baseline},
+		{"SSHEnvNames naming a set variable", withNames},
+	} {
+		sess := NewForkPerTurnSession(tc.target, noopHooks(), slog.Default(), 0)
+		emit, events := sinkEvents()
+		result, err := sess.RunTurn(context.Background(), "p", emit)
+		if err != nil {
+			t.Fatalf("%s: RunTurn() error = %v, want nil", tc.name, err)
+		}
+		if result.ExitReason != domain.EventTurnCompleted {
+			t.Errorf("%s: ExitReason = %q, want %q", tc.name, result.ExitReason, domain.EventTurnCompleted)
+		}
+		if !hasEventType(*events, domain.EventTurnCompleted) {
+			t.Errorf("%s: EventTurnCompleted not emitted; got %v", tc.name, *events)
+		}
+	}
+}
+
+func TestForkPerTurnSession_RunTurn_LinkedWorkspaceRefusedBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	scriptDir := t.TempDir()
+	script := agenttest.FakeRuntime(t, scriptDir, "agent", agenttest.OutputScenario, agenttest.Output{})
+
+	linkTarget := t.TempDir()
+	link := filepath.Join(t.TempDir(), "workspace-link")
+	if err := os.Symlink(linkTarget, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink creation requires elevated privileges on Windows")
+		}
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	target := newTestTarget(link, script)
+	sess := NewForkPerTurnSession(target, noopHooks(), slog.Default(), 0)
+
+	emit, events := sinkEvents()
+	result, err := sess.RunTurn(context.Background(), "p", emit)
+
+	requireAgentError(t, err, domain.ErrInvalidWorkspaceCwd)
+	if hasEventType(*events, domain.EventSessionStarted) {
+		t.Errorf("RunTurn(linked workspace) emitted session_started; want none, got %v", *events)
+	}
+	if result.SessionID != "" {
+		t.Errorf("RunTurn(linked workspace) result.SessionID = %q, want empty", result.SessionID)
+	}
+
+	if !sess.mu.TryLock() {
+		t.Fatal("session mutex is still held after a bind failure, want it released")
+	}
+	sess.mu.Unlock()
 }

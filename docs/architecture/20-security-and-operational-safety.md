@@ -27,8 +27,8 @@ Recommended additional hardening:
 ### 15.3 Secret Handling
 
 - Support `$VAR` indirection in workflow config.
-- Do not log API tokens or secret env values.
 - Validate presence of secrets without printing them.
+- Every log record and every runtime-derived text Sortie stores or shows an operator has each secret value it holds replaced by a fixed marker. The values are those Sortie holds under a name that marks a credential (its environment variables and environment file, configuration keys, and the environment entries and headers of the tool servers it hands a runtime), the tracker API key, the credentials in a URL's userinfo, and notification endpoint URLs, which grant access to whoever holds them. A value too short to mask is named in a warning, never shown. Matching is exact, and every bound that cuts such text applies after masking. A value Sortie never held, one it holds under a name no convention marks as a credential, or one its producer transforms before printing it, is outside what masking recognizes.
 
 ### 15.4 Hook Script Safety
 
@@ -71,7 +71,7 @@ The workspace Sortie creates and hands over is the boundary that matters, and tw
 
 Sortie launches a local agent with the orchestrator's environment, so any credential present there is readable by an agent running with approvals disabled in a write-capable sandbox. Whether a tracker credential is present depends on how it is supplied. A value named indirectly through an environment variable, or supplied by an environment override, sits in the orchestrator's environment and is inherited. A value written literally into workflow configuration does not, and reaches the tracker client without passing through the environment, although it then sits in the configuration file instead.
 
-Dispatching a run to a remote host bounds this differently. Only an explicitly constructed set of variables crosses with the command, so the remote agent inherits that set rather than the orchestrator's environment, and the exposure is the size of that set.
+Dispatching a run to a remote host bounds this differently. Only the variables the operator names plus the credential variables the agent kind declares, less the variables the operator disallows, cross to the remote host, delivered outside any process argument list, so the remote agent inherits that set rather than the orchestrator's environment, and the exposure is still the size of that set.
 
 The sandbox does not help in either case. It governs filesystem and network reach, not what a process reads from the environment it was started with.
 

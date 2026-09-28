@@ -71,7 +71,7 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 		return 1
 	}
 
-	// wf.Config is the post-env-override raw map. Sole ownership — safe to read.
+	// wf.Config is the post-env-override raw map. Sole ownership, so safe to read.
 	var warningDiags []validateDiag
 	for _, w := range config.ValidateFrontMatter(wf.Config, cfg) {
 		msg := w.Message
@@ -101,7 +101,8 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 
 	mgr, err := workflow.NewManager(path, logger,
 		workflow.WithValidateFunc(orchestrator.ValidateConfigForPromotion),
-		workflow.WithAgentKindProbe(registry.Agents.Has))
+		workflow.WithAgentKindProbe(registry.Agents.Has),
+		workflow.WithAdvisoryFunc(workflowAdvisories))
 	if err != nil {
 		emitDiags(stdout, stderr, *format, mapManagerError(err), warningDiags)
 		return 1
@@ -122,6 +123,10 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 			Check:    w.Check,
 			Message:  w.Message,
 		})
+	}
+
+	for _, a := range mgr.Config().Advisories() {
+		warningDiags = append(warningDiags, validateDiag{Severity: "warning", Check: a.Check, Message: a.Text})
 	}
 
 	// Fold the offline forge diagnostics into the same exit decision as
