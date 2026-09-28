@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
@@ -17,10 +16,6 @@ import (
 )
 
 const geminiAgentName = "gemini-cli"
-
-// geminiConfirmedVersions are the builds this source was measured against; it
-// supplies no figure for any other.
-var geminiConfirmedVersions = []string{"0.59.0"}
 
 const (
 	geminiSourceTelemetry = "telemetry"
@@ -36,9 +31,8 @@ const (
 )
 
 const (
-	geminiMaxTelemetryBytes = 64 * 1024 * 1024
-	geminiMaxJournalBytes   = 64 * 1024 * 1024
-	geminiMaxJournalLine    = 10 * 1024 * 1024
+	geminiMaxJournalBytes = 64 * 1024 * 1024
+	geminiMaxJournalLine  = 10 * 1024 * 1024
 )
 
 // geminiTelemetryEvent is the one record shape carrying every counter, among
@@ -51,8 +45,8 @@ type geminiRecord struct {
 
 // geminiAttributes is the attribute block of one telemetry record. The counters
 // are pointers because the runtime writes this record for every completed
-// request whether or not the response carried a usage block, and only a field's
-// absence tells an announcement from a measurement.
+// request whether or not the response carried a usage block; fold treats a
+// record as unmapped unless every counter is present.
 type geminiAttributes struct {
 	EventName string `json:"event.name"`
 	SessionID string `json:"session.id"`
@@ -72,10 +66,10 @@ type geminiJournalLine struct {
 }
 
 type geminiJournalTokens struct {
-	Input    int64 `json:"input"`
-	Output   int64 `json:"output"`
-	Cached   int64 `json:"cached"`
-	Thoughts int64 `json:"thoughts"`
+	Input    *int64 `json:"input"`
+	Output   *int64 `json:"output"`
+	Cached   *int64 `json:"cached"`
+	Thoughts *int64 `json:"thoughts"`
 }
 
 // geminiFigure is one source's whole reading of this run. basis counts input
@@ -166,16 +160,15 @@ func (r *geminiReader) Claim(target agentcore.LaunchTarget) ([]string, bool) {
 		"GEMINI_TELEMETRY_ENABLED=true",
 		"GEMINI_TELEMETRY_TARGET=local",
 		"GEMINI_TELEMETRY_OUTFILE=" + r.outfile,
+		"GEMINI_TELEMETRY_LOG_PROMPTS=false",
 	}, true
 }
 
-// Recognize accepts only the name and versions this source was measured
-// against.
-func (r *geminiReader) Recognize(name, version string) bool {
-	if name != geminiAgentName {
-		return false
-	}
-	return slices.Contains(geminiConfirmedVersions, version)
+// Recognize reports whether name identifies the runtime this source maps. No
+// build of the runtime is refused: a record is accepted or refused on whether
+// it carries the fields the mapping needs, not on the version that wrote it.
+func (r *geminiReader) Recognize(name string) bool {
+	return name == geminiAgentName
 }
 
 // Open records the session whose records count and the starting position in
@@ -356,9 +349,6 @@ func (r *geminiReader) readTelemetry() {
 	if err != nil || info.Size() <= r.offset {
 		return
 	}
-	if info.Size() > geminiMaxTelemetryBytes {
-		return
-	}
 
 	file, err := os.Open(r.outfile) //nolint:gosec // the path is this source's own temporary file
 	if err != nil {
@@ -373,31 +363,39 @@ func (r *geminiReader) readTelemetry() {
 	decoder := json.NewDecoder(file)
 	consumed := int64(0)
 	for {
-		var record geminiRecord
-		if err := decoder.Decode(&record); err != nil {
+		// Decoding into a json.RawMessage succeeds for any syntactically complete
+		// value whatever its shape, so a failure here is only a trailing value
+		// still being written or a genuine syntax error; either ends the pass.
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
 			break
 		}
 		consumed = decoder.InputOffset()
+
+		var record geminiRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			continue
+		}
 		r.fold(record)
 	}
 	r.offset += consumed
 }
 
 // fold adds one telemetry record's counters to the run-cumulative figure when
-// it belongs to this session and carries a counter block. Input already
-// includes the cached read, so cached is recorded as a subset and never added
-// on top; output carries the separately priced thought tokens.
+// it belongs to this session and carries every counter the mapping needs. A
+// record missing one is left unmapped rather than treated as zero. Input
+// already includes the cached read, so cached is recorded as a subset and
+// never added on top; output carries the separately priced thought tokens.
 func (r *geminiReader) fold(record geminiRecord) {
 	attrs := record.Attributes
 	if attrs.EventName != geminiTelemetryEvent || attrs.SessionID != r.sessionID {
 		return
 	}
-	if attrs.Input == nil || attrs.Output == nil {
+	if attrs.Input == nil || attrs.Output == nil || attrs.Cached == nil || attrs.Thoughts == nil {
 		return
 	}
 
-	input, output := *attrs.Input, *attrs.Output
-	cached, thoughts := counterOrZero(attrs.Cached), counterOrZero(attrs.Thoughts)
+	input, output, cached, thoughts := *attrs.Input, *attrs.Output, *attrs.Cached, *attrs.Thoughts
 
 	r.total.InputTokens += input
 	r.total.OutputTokens += output + thoughts
@@ -411,13 +409,6 @@ func (r *geminiReader) fold(record geminiRecord) {
 	if attrs.Model != "" {
 		r.model = attrs.Model
 	}
-}
-
-func counterOrZero(counter *int64) int64 {
-	if counter == nil {
-		return 0
-	}
-	return *counter
 }
 
 // readJournal sums the token-bearing messages this session appended after the
@@ -453,6 +444,9 @@ func (r *geminiReader) readJournal(lowerBound int64) geminiFigure {
 		if line.ID == "" || line.Tokens == nil {
 			continue
 		}
+		if line.Tokens.Input == nil || line.Tokens.Output == nil || line.Tokens.Cached == nil || line.Tokens.Thoughts == nil {
+			continue
+		}
 		if _, inherited := r.inherited[line.ID]; inherited {
 			continue
 		}
@@ -465,11 +459,12 @@ func (r *geminiReader) readJournal(lowerBound int64) geminiFigure {
 	figure := geminiFigure{}
 	for _, id := range order {
 		e := latest[id]
-		figure.usage.InputTokens += e.tokens.Input
-		figure.usage.OutputTokens += e.tokens.Output + e.tokens.Thoughts
-		figure.usage.CacheReadTokens += e.tokens.Cached
-		figure.basis += e.tokens.Input + e.tokens.Output
-		if e.tokens.Input > 0 || e.tokens.Output > 0 || e.tokens.Cached > 0 || e.tokens.Thoughts > 0 {
+		input, output, cached, thoughts := *e.tokens.Input, *e.tokens.Output, *e.tokens.Cached, *e.tokens.Thoughts
+		figure.usage.InputTokens += input
+		figure.usage.OutputTokens += output + thoughts
+		figure.usage.CacheReadTokens += cached
+		figure.basis += input + output
+		if input > 0 || output > 0 || cached > 0 || thoughts > 0 {
 			figure.measured = true
 		}
 		if e.model != "" {

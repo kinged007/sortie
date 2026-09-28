@@ -10,15 +10,15 @@ import (
 
 // usageReader supplies token measurements read outside the wire, for a
 // runtime whose protocol carries no spend counter. A reader must claim the
-// resolved launch target, recognize the build the handshake reports, and
-// produce a record on its first drain; failing any of those drops the reader
-// and leaves the session unmeasured with the token ceiling inactive.
+// resolved launch target, recognize the runtime name the handshake reports,
+// and produce a record on its first drain; failing any of those drops the
+// reader and leaves the session unmeasured with the token ceiling inactive.
 //
 // Drain reports whether a measurement exists at all; Completeness grades how
 // far the figure it just returned was proven to reach.
 type usageReader interface {
 	Claim(target agentcore.LaunchTarget) ([]string, bool)
-	Recognize(name, version string) bool
+	Recognize(name string) bool
 	Open(sessionID string)
 	Drain(ctx context.Context, lowerBound int64) (agentcore.RecoveredUsage, string, bool)
 	Completeness() usagesource.Completeness
