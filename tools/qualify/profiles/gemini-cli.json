@@ -12,7 +12,7 @@
   ],
   "version_args": ["--version"],
   "model_args": ["--model", "{model}"],
-  "capability_gap_labels": ["token counts"],
+  "capability_gap_labels": [],
   "config_root_env_names": ["GEMINI_CLI_HOME"],
   "probe_prompts": {
     "success": "Reply with exactly SORTIE_BASELINE_OK and do not call any tool.",

@@ -4,9 +4,9 @@
 //
 // Every source here is vendor-specific by construction; the transport names
 // none of them and asks each the same three questions in order: does it claim
-// this launch, does the handshake report name a build it was measured against,
-// and what has it read for this session so far. A no to either of the first two
-// leaves the session unmeasured.
+// this launch, does the handshake report the runtime's name, and what has it
+// read for this session so far. A no to either of the first two leaves the
+// session unmeasured.
 package usagesource
 
 import (
@@ -29,9 +29,10 @@ type Reader interface {
 	// decided by Recognize, not here.
 	Claim(target agentcore.LaunchTarget) ([]string, bool)
 
-	// Recognize reports whether the build named by the handshake report is one
-	// this source was measured against.
-	Recognize(name, version string) bool
+	// Recognize reports whether name, the runtime's own name from the
+	// handshake, is the runtime this source maps. No build is refused by its
+	// version.
+	Recognize(name string) bool
 
 	// Open records the session identifier whose records this source counts and
 	// the position in its own output the session starts at, so a resumed

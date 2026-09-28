@@ -740,9 +740,6 @@ func validateCapabilityGapLabels(labels []string) error {
 		}
 		seen[label] = true
 	}
-	if !slices.Contains(labels, capabilityGapLabelTokenCounts) {
-		return fmt.Errorf("must contain %q", capabilityGapLabelTokenCounts)
-	}
 	return nil
 }
 

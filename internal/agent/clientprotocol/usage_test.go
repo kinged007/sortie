@@ -36,11 +36,12 @@ type fakeUsageReader struct {
 	entered chan struct{}
 	once    sync.Once
 
-	opened       string
-	drainCalls   int
-	lowerBounds  []int64
-	completeness usagesource.Completeness
-	closed       bool
+	opened         string
+	recognizedWith string
+	drainCalls     int
+	lowerBounds    []int64
+	completeness   usagesource.Completeness
+	closed         bool
 }
 
 func (r *fakeUsageReader) Claim(target agentcore.LaunchTarget) ([]string, bool) {
@@ -50,9 +51,10 @@ func (r *fakeUsageReader) Claim(target agentcore.LaunchTarget) ([]string, bool) 
 	return []string{"FAKE_USAGE_OUTFILE=/dev/null"}, true
 }
 
-func (r *fakeUsageReader) Recognize(name, version string) bool {
+func (r *fakeUsageReader) Recognize(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.recognizedWith = name
 	return r.recognizes
 }
 
@@ -108,6 +110,12 @@ func (r *fakeUsageReader) openedSession() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.opened
+}
+
+func (r *fakeUsageReader) recognizedName() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.recognizedWith
 }
 
 func (r *fakeUsageReader) observedLowerBounds() []int64 {
@@ -281,7 +289,7 @@ func TestUsageMeasurementExistenceIsNotItsCompleteness(t *testing.T) {
 	})
 }
 
-func TestUsageReaderDroppedOnUnrecognizedBuild(t *testing.T) {
+func TestUsageReaderDroppedOnUnrecognizedRuntimeName(t *testing.T) {
 	t.Parallel()
 
 	reader := &fakeUsageReader{
@@ -298,7 +306,7 @@ func TestUsageReaderDroppedOnUnrecognizedBuild(t *testing.T) {
 
 	agenttest.AssertMeasurementAbsent(t, events, outcome.result)
 	if state.caps.tokenCounts != capabilityGap {
-		t.Errorf("tokenCounts = %q, want %q for a build the source was not measured against",
+		t.Errorf("tokenCounts = %q, want %q for a runtime name the source does not recognize",
 			state.caps.tokenCounts, capabilityGap)
 	}
 	if reader.observedLowerBounds() != nil {
@@ -306,6 +314,34 @@ func TestUsageReaderDroppedOnUnrecognizedBuild(t *testing.T) {
 	}
 	if !hasNoticeContaining(events, capabilityLabelTokenCounts) {
 		t.Errorf("no gap notice named %q; the session must say what it cannot report", capabilityLabelTokenCounts)
+	}
+}
+
+func TestUsageReaderRecognizeReceivesTheHandshakeNameNotItsTitle(t *testing.T) {
+	t.Parallel()
+
+	reader := &fakeUsageReader{
+		recognizes: true,
+		drains: []fakeDrain{{
+			found: true,
+			usage: agentcore.RecoveredUsage{Run: domain.TokenUsage{InputTokens: 100, OutputTokens: 5, TotalTokens: 105}},
+		}},
+	}
+	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
+		discardLogger(), withUsageReader(reader))
+	out := newOutboundReader(outPr)
+
+	title := "Other Runtime"
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{
+		agentInfo:        implementation{Name: "other-cli", Title: &title, Version: "1.0.0"},
+		agentInfoPresent: true,
+	}}})
+	markSessionKnown(state)
+
+	measuredTurn(t, state, inPw, out, quotaMeta(100, 5))
+
+	if got := reader.recognizedName(); got != "other-cli" {
+		t.Errorf("Recognize() name = %q, want %q", got, "other-cli")
 	}
 }
 

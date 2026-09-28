@@ -41,8 +41,12 @@ var capabilityGapLabelSet = []string{
 // in arrival order and separated, searched once per label. The
 // separator is what keeps the reading honest: concatenating the
 // messages directly lets one message's suffix and the next one's
-// prefix spell a label no notification ever reported.
-func liveCapabilityGapLabels(events []domain.AgentEvent) []string {
+// prefix spell a label no notification ever reported. A turn whose
+// result reports no measured usage also counts as a live token-counts
+// gap, since a capability lowered after the once-per-session notice
+// leaves no notification of its own for the notice-derived reading to
+// find.
+func liveCapabilityGapLabels(events []domain.AgentEvent, result domain.TurnResult) []string {
 	var joined strings.Builder
 	for _, event := range events {
 		if event.Type == domain.EventNotification {
@@ -59,6 +63,9 @@ func liveCapabilityGapLabels(events []domain.AgentEvent) []string {
 		if strings.Contains(text, label) {
 			labels = append(labels, label)
 		}
+	}
+	if !result.UsageMeasured && !slices.Contains(labels, capabilityLabelTokenCounts) {
+		labels = append(labels, capabilityLabelTokenCounts)
 	}
 	sort.Strings(labels)
 	return labels
@@ -82,15 +89,16 @@ type capabilityGapLabelsDocument struct {
 
 // assertCapabilityGapLabelsMatchProfile reads the runtime profile named
 // by SORTIE_CLIENTPROTOCOL_PROFILE and compares the live capability-gap
-// label set events' notification stream carries against the profile's
-// own capability_gap_labels, failing on a difference in either
-// direction. It skips cleanly when the coordinate is absent, so an
-// operator running the conformance suite as today is unaffected; a
-// value naming a file it cannot read fails rather than skips, so a
-// typo cannot pass green. It carries no Test prefix of its own by
-// design: it is called from the event stream an existing conformance
-// turn already collects, spending no turn of its own.
-func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEvent) {
+// label set, derived from events' notification stream and result's own
+// UsageMeasured verdict, against the profile's own capability_gap_labels,
+// failing on a difference in either direction. It skips cleanly when the
+// coordinate is absent, so an operator running the conformance suite as
+// today is unaffected; a value naming a file it cannot read fails rather
+// than skips, so a typo cannot pass green. It carries no Test prefix of
+// its own by design: it is called from the event stream and turn result
+// an existing conformance turn already collects, spending no turn of its
+// own.
+func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEvent, result domain.TurnResult) {
 	t.Helper()
 
 	profilePath, present := os.LookupEnv(capabilityDriftProfileEnv)
@@ -110,12 +118,13 @@ func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEv
 		t.Fatalf("decode the profile %s names, %q: %v", capabilityDriftProfileEnv, profilePath, err)
 	}
 
-	live := liveCapabilityGapLabels(events)
+	live := liveCapabilityGapLabels(events, result)
 	want := slices.Clone(doc.CapabilityGapLabels)
 	sort.Strings(want)
 
 	if !slices.Equal(live, want) {
-		t.Fatalf("live capability-gap labels %v differ from profile %s's capability_gap_labels %v", live, profilePath, want)
+		t.Fatalf("live capability-gap labels %v differ from profile %s's capability_gap_labels %v (UsageMeasured=%v, ExitReason=%q)",
+			live, profilePath, want, result.UsageMeasured, result.ExitReason)
 	}
 }
 
@@ -272,6 +281,55 @@ func nightlyMatrixValue(row map[string]string, value string) string {
 }
 
 var nightlyMatrixExpression = regexp.MustCompile(`^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$`)
+
+func TestLiveCapabilityGapLabelsAddsTokenCountsOnlyWhenUnmeasured(t *testing.T) {
+	t.Parallel()
+
+	notify := func(messages ...string) []domain.AgentEvent {
+		events := make([]domain.AgentEvent, 0, len(messages))
+		for _, message := range messages {
+			events = append(events, domain.AgentEvent{Type: domain.EventNotification, Message: message})
+		}
+		return events
+	}
+
+	tests := []struct {
+		name   string
+		events []domain.AgentEvent
+		result domain.TurnResult
+		want   []string
+	}{
+		{
+			name:   "an unmeasured result adds token counts to a notice naming a different gap",
+			events: notify(capabilityGapNoticeStem + capabilityLabelAgentVersion),
+			result: domain.TurnResult{UsageMeasured: false},
+			want:   []string{capabilityLabelAgentVersion, capabilityLabelTokenCounts},
+		},
+		{
+			name:   "an unmeasured result whose notice already names token counts adds nothing more",
+			events: notify(capabilityGapNoticeStem + capabilityLabelTokenCounts),
+			result: domain.TurnResult{UsageMeasured: false},
+			want:   []string{capabilityLabelTokenCounts},
+		},
+		{
+			name:   "a measured result leaves notice-derived labels unchanged",
+			events: notify(capabilityGapNoticeStem + capabilityLabelToolServers),
+			result: domain.TurnResult{UsageMeasured: true},
+			want:   []string{capabilityLabelToolServers},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := liveCapabilityGapLabels(tt.events, tt.result)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("liveCapabilityGapLabels(...) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 // TestNightlyReachability confirms the nightly workflow's own matrix
 // rows and go-test steps actually reach and arm

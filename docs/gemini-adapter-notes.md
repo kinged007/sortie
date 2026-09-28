@@ -4,9 +4,9 @@ Working notes for anyone dealing with Gemini CLI through Sortie's generic Agent 
 
 Eligibility: not_qualified
 
-Product conformance: not_qualified
+Product conformance: unmeasured
 
-The two answers are computed separately and both fall on token accounting. The protocol surface is below the richest measured native reference on that row, so the protocol route would cost an operator something the native route gave them. Product conformance does not hold: the protocol surface resolves no token-bearing path, its extension block is present but not admitted, and nothing outside the protocol supplies a figure, so the effective adapter does not meet the token-accounting obligation.
+The two answers are computed separately and both turn on token accounting. The protocol surface is below the richest measured native reference on that row, so the protocol route would cost an operator something the native route gave them. Product conformance is unmeasured rather than failed: a spend figure reaches Sortie from a measurement source outside the protocol, but no run crossed a finite ceiling, so whether a ceiling built on that figure actually stops a turn and holds it stopped stays unobserved.
 
 ## Where to get the volatile facts
 
@@ -24,7 +24,7 @@ Session continuation works on every surface, and the protocol route is no weaker
 
 Retry classification does not read the same way on the protocol and native surfaces. On the protocol surface the human-input case is excluded as not applicable, and the row grades usable on the cases that remain. The exclusion rests on the consent request the asking-posture launch raised and the client refused inside the protocol: the request offered a refusing option, the refusal was answered there, and the turn went on. It does not cover a question addressed to a person. Both native surfaces have no terminal vocabulary for the human-input outcome at all.
 
-Token accounting is a real shortfall on the protocol route. The protocol surface resolves no token-bearing path. The prompt result does carry an extension block, and it carries input and output counts, but it omits cache-read, reasoning, and tool counters and is not admitted to a budget, so it is a presence signal and a lower bound rather than the accounting figure. Both native surfaces resolve their token paths instead: the JSON surface reports prompt, cached, candidate, thought, and tool counts per model, and the streaming JSON surface reports its own flatter cached, input, output, and total counts. No run on any surface crossed a finite ceiling, so ceiling enforcement itself stays unverified: what is established is that the counts are there to read, not that a ceiling built on them would stop a turn and hold it stopped.
+Token accounting is a real shortfall on the protocol route's own wire. The protocol surface resolves no token-bearing path of its own: the prompt result does carry an extension block, and it carries input and output counts, but it omits cache-read, reasoning, and tool counters and is not admitted to a budget, so it is a presence signal and a lower bound rather than the accounting figure. A measurement source outside the protocol supplies a corroborating figure for the session instead, read from the runtime's own telemetry and its session journal, and it is that figure, not the wire, that reaches the effective adapter's budget. Both native surfaces resolve their token paths directly on the wire: the JSON surface reports prompt, cached, candidate, thought, and tool counts per model, and the streaming JSON surface reports its own flatter cached, input, output, and total counts. No run on any surface crossed a finite ceiling, so ceiling enforcement itself stays unverified: what is established is that a figure reaches Sortie on every measured surface, not that a ceiling built on it would stop a turn and hold it stopped.
 
 - protocol turn_disposition: Observed: usable
 - protocol retry_classification: Observed: usable

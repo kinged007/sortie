@@ -400,7 +400,7 @@ func (p *pumpState) applyHandshakeCapabilityLowering(facts *handshakeFacts) {
 	if facts.toolServersWithheld {
 		p.lowerCapability(&p.state.caps.toolServers, capabilityLabelToolServers)
 	}
-	if p.reader != nil && !p.reader.Recognize(facts.agentInfo.Name, facts.agentInfo.Version) {
+	if p.reader != nil && !p.reader.Recognize(facts.agentInfo.Name) {
 		p.dropReader()
 	}
 }
