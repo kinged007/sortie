@@ -521,7 +521,7 @@ func buildSSHArgsForTest(state *sessionState, cmdArgs []string) []string {
 	target := state.target
 	target.RemoteCommand = "pi"
 	target.SSHHost = "host"
-	return sshutil.BuildSSHArgs(target.SSHHost, target.WorkspacePath, target.RemoteCommand, cmdArgs, sshutil.SSHOptions{})
+	return sshutil.BuildSSHLaunch(target.SSHHost, target.WorkspacePath, target.RemoteCommand, cmdArgs, sshutil.SSHOptions{}).Args
 }
 
 // TestValidateConfig_NoFaultsForSupportedConfiguration asserts a pi

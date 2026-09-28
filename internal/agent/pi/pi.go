@@ -39,6 +39,7 @@ func init() {
 		MCPInjection:        registry.MCPInjectionUnsupported,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
+		CredentialEnv:       registry.DeclareCredentialEnv(),
 	})
 }
 
@@ -82,6 +83,11 @@ type turnRuntime struct {
 	firstJSONSeen   bool
 	waitMu          sync.Mutex
 	waitRes         waitResult
+
+	// output records whether the runtime has written any readable line
+	// this turn, which is what separates an early exit from a turn that
+	// responded and then failed.
+	output agentcore.OutputWatch
 
 	// drainGrace is the bound startWait and every post-exit reader wait
 	// applies once the subprocess has been reaped. Recorded from
@@ -203,8 +209,11 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		cmd = exec.CommandContext(ctx, state.target.Command, allArgs...) //nolint:gosec // args are constructed programmatically
 	}
 	procutil.SetGroupCancel(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS))
-	cmd.Dir = state.target.WorkspacePath
 	cmd.Env = env
+	if bindErr := state.target.BindWorkspace(cmd); bindErr != nil {
+		state.mu.Unlock()
+		return domain.TurnResult{}, bindErr
+	}
 
 	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
 	if err != nil {
@@ -311,6 +320,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			return domain.TurnResult{}, nil, false
 		}
 
+		runtime.output.Observe(line)
 		runtime.firstJSONSeen = true
 		if readTimeoutC != nil {
 			stopTimer(readTimer)
@@ -600,7 +610,21 @@ func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState,
 	}
 	ev.Work, ev.WorkDetail = runtime.work.Report()
 
+	if ctx.Err() == nil && !state.isClosed() {
+		ev.EarlyExit = runtime.output.ExitedBeforeOutput(state.target, exit.err).Report(runtime.stderrCollector)
+	}
+
+	sshFailed := state.target.RemoteCommand != "" && sshutil.ConnectionFailed(exit.exitCode)
+	hasTerminalResult := runtime.assistantFailure != ""
+
 	switch {
+	case agentcore.ConnectionFailedForRequest(sshFailed, hasTerminalResult):
+		connErr := agentcore.ConnectionFailedError()
+		ev.Terminal = agentcore.TerminalFailure
+		ev.TerminalErrorKind = connErr.Kind
+		ev.TerminalMessage = connErr.Message
+		ev.Cause = connErr.Err
+
 	case ctx.Err() != nil || state.isClosed():
 		ev.Terminal = agentcore.TerminalCancelled
 		ev.TerminalMessage = "turn cancelled"
