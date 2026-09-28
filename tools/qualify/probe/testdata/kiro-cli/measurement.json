@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "profile_digest": "7841fa2bb9bd5c6af0209bf51b91be42a2c81e8aa851af6b8ca385e310413856",
-  "measured_at": "2026-09-23",
+  "measured_at": "2026-09-28",
   "expectation": {
     "Verdict": "qualified",
     "Conformance": "not_qualified",
@@ -70,7 +70,7 @@
     "Excluded": [
       "retry_classification human_input: not applicable on protocol: the request offered a refusing option and was answered inside the protocol, so the turn went on and no human-input outcome arose",
       "retry_classification non_retryable_refusal: declared outcome_never_produced",
-      "retry_classification unknown_outcome: no deterministic inducer, so neither the condition nor the surface's account of it was established",
+      "retry_classification unknown_outcome: no deterministic inducer on any runtime, so the case carries no obligation",
       "turn_disposition cancellation: induced, and the surface reported no outcome (terminal_written_at_exit_only), so the case keeps its obligation",
       "turn_disposition limit_reached: not induced (prompt_channel_too_small), so the case stays unmeasured on this surface",
       "turn_disposition runtime_failure: induced, and the surface reported no outcome (output_channel_silent_on_failure), so the case keeps its obligation",
@@ -80,6 +80,6 @@
   },
   "requested_model": "claude-haiku-4.5",
   "observed_model": null,
-  "provenance_digest": "334f6a5c79466bcd902c6c40ec409517c2238e2fcf00392c6065c3138fb345f3",
-  "evaluator_version": 1
+  "provenance_digest": "03af28fd23914355907ef90798b53245c08282ace5f9eab3af374e74decce7de",
+  "evaluator_version": 2
 }
