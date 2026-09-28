@@ -3,6 +3,7 @@ package usagesource
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -299,11 +300,11 @@ func TestGeminiClaimRefusesARemoteLaunch(t *testing.T) {
 	reader := newGeminiReader()
 	t.Cleanup(reader.Close)
 
-	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}); claimed {
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}, ""); claimed {
 		t.Error("Claim(remote) = true, want false")
 	}
 
-	env, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"})
+	env, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, "")
 	if !claimed {
 		t.Fatal("Claim(local) = false, want true")
 	}
@@ -312,11 +313,22 @@ func TestGeminiClaimRefusesARemoteLaunch(t *testing.T) {
 	}
 }
 
+func TestGeminiClaimRefusesARemoteLaunchOnTheRelaunchOffer(t *testing.T) {
+	t.Parallel()
+
+	reader := newGeminiReader()
+	t.Cleanup(reader.Close)
+
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}, geminiAgentName); claimed {
+		t.Error("Claim(remote, gemini-cli) = true, want false: the remote refusal runs before the runtime check")
+	}
+}
+
 func TestGeminiCloseRemovesWhatClaimArmed(t *testing.T) {
 	t.Parallel()
 
 	reader := newGeminiReader()
-	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}); !claimed {
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, ""); !claimed {
 		t.Fatal("Claim(local) = false, want true")
 	}
 	dir := reader.dir
@@ -1153,5 +1165,105 @@ func TestGeminiATurnNothingMeasuredIsStillOwed(t *testing.T) {
 	}
 	if got := reader.Completeness(); got != CompletenessPartial {
 		t.Errorf("second Completeness() = %v, want %v: the first turn's whole bound is still uncovered", got, CompletenessPartial)
+	}
+}
+
+func TestGeminiClaimMatchesTheCommandLineTable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		command string
+		args    string
+		claimed bool
+	}{
+		{"bare executable", "/usr/local/bin/gemini", "--acp", true},
+		{"windows launcher suffix, forward slashes", "C:/Users/u/AppData/Roaming/npm/gemini.cmd", "--acp", true},
+		{"windows launcher suffix, backslashes", `C:\Users\u\AppData\Roaming\npm\gemini.cmd`, "--acp", true},
+		{"versioned npx package", "/usr/bin/npx", "-y @google/gemini-cli@0.61.0 --acp", true},
+		{"node_modules path", "/usr/bin/node", "/usr/lib/node_modules/@google/gemini-cli/dist/index.js --acp", true},
+		{"bundle path as an option value", "/usr/bin/node", "--no-warnings /opt/gemini-cli/bundle/gemini.js --acp", true},
+		{"wrapper script naming it bare", "/tmp/t/capture.sh", "gemini --acp", true},
+		{"preceded by an inline assignment", "/usr/bin/env", "GEMINI_CLI_HOME=/h gemini --acp", true},
+		{"after a double-dash separator", "/usr/bin/mise", "exec -- gemini --acp", true},
+		{"a path option value naming another flag", "/usr/local/bin/copilot", "--acp --add-dir /home/u/src/gemini", true},
+		{"a bare option value with no path separator", "/usr/local/bin/wrapper", "--verbose gemini --acp", false},
+		{"a short-flag option value", "/usr/local/bin/kiro-cli", "acp -a gemini", false},
+		{"a model flag's bare option value", "/usr/local/bin/opencode", "acp --model gemini", false},
+		{"a model flag naming a path-like model id", "/usr/local/bin/opencode", "acp --model google/gemini-2.5-pro", false},
+		{"a model flag naming a version-like model id", "/usr/local/bin/copilot", "--acp --model gemini-3-pro-preview", false},
+		{"a short flag with no value at all", "/usr/local/bin/kiro-cli", "acp -a", false},
+		{"an unrelated scoped package", "/usr/bin/npx", "@zed-industries/claude-code-acp", false},
+		{"a differently named scoped package", "/usr/bin/npx", "@google/gemini-cli-core", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := agentcore.LaunchTarget{Command: tt.command, Args: strings.Fields(tt.args)}
+
+			for _, runtime := range []string{"", geminiAgentName, "other-runtime"} {
+				want := tt.claimed
+				switch runtime {
+				case geminiAgentName:
+					want = true
+				case "other-runtime":
+					want = false
+				}
+
+				reader := newGeminiReader()
+				t.Cleanup(reader.Close)
+
+				env, claimed := reader.Claim(target, runtime)
+
+				if claimed != want {
+					t.Errorf("Claim(%+v, %q) claimed = %v, want %v", target, runtime, claimed, want)
+				}
+				if !claimed {
+					if env != nil {
+						t.Errorf("Claim(%+v, %q) env = %v, want nil on refusal", target, runtime, env)
+					}
+					if reader.dir != "" {
+						t.Errorf("Claim(%+v, %q) created directory %q, want none on refusal", target, runtime, reader.dir)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGeminiCloseRetriesAFailedRemoval(t *testing.T) {
+	t.Parallel()
+
+	reader := newGeminiReader()
+	failedOnce := false
+	reader.remove = func(path string) error {
+		if !failedOnce {
+			failedOnce = true
+			return errors.New("boom")
+		}
+		return os.RemoveAll(path)
+	}
+
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, ""); !claimed {
+		t.Fatal("Claim(local) = false, want true")
+	}
+	dir := reader.dir
+
+	reader.Close()
+	if reader.dir != dir {
+		t.Errorf("dir after a failed removal = %q, want it kept at %q so a later Close retries it", reader.dir, dir)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("stat directory after a failed removal = %v, want it still present", err)
+	}
+
+	reader.Close()
+	if reader.dir != "" || reader.outfile != "" {
+		t.Errorf("dir=%q outfile=%q after the retried removal succeeds, want both empty", reader.dir, reader.outfile)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("stat directory after the retried removal succeeds = %v, want it removed", err)
 	}
 }

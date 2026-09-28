@@ -36,25 +36,23 @@ type fakeUsageReader struct {
 	entered chan struct{}
 	once    sync.Once
 
-	opened         string
-	recognizedWith string
-	drainCalls     int
-	lowerBounds    []int64
-	completeness   usagesource.Completeness
-	closed         bool
+	opened       string
+	drainCalls   int
+	lowerBounds  []int64
+	completeness usagesource.Completeness
+	closed       bool
 }
 
-func (r *fakeUsageReader) Claim(target agentcore.LaunchTarget) ([]string, bool) {
+func (r *fakeUsageReader) Claim(target agentcore.LaunchTarget, runtime string) ([]string, bool) {
 	if target.RemoteCommand != "" {
 		return nil, false
 	}
 	return []string{"FAKE_USAGE_OUTFILE=/dev/null"}, true
 }
 
-func (r *fakeUsageReader) Recognize(name string) bool {
+func (r *fakeUsageReader) Recognize(string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.recognizedWith = name
 	return r.recognizes
 }
 
@@ -112,12 +110,6 @@ func (r *fakeUsageReader) openedSession() string {
 	return r.opened
 }
 
-func (r *fakeUsageReader) recognizedName() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.recognizedWith
-}
-
 func (r *fakeUsageReader) observedLowerBounds() []int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -159,31 +151,6 @@ func measuredTurn(t *testing.T, state *sessionState, inPw interface {
 	return events, outcome
 }
 
-func TestSelectUsageReaderRefusesRemoteLaunch(t *testing.T) {
-	t.Parallel()
-
-	local, localEnv := selectUsageReader(agentcore.LaunchTarget{Command: "agent", WorkspacePath: "/w"})
-	if local == nil {
-		t.Error("selectUsageReader(local) reader = nil, want a source")
-	}
-	if len(localEnv) == 0 {
-		t.Error("selectUsageReader(local) env = empty, want the source's own assignments")
-	}
-
-	remote, remoteEnv := selectUsageReader(agentcore.LaunchTarget{
-		Command:       "ssh",
-		RemoteCommand: "agent",
-		SSHHost:       "worker",
-		WorkspacePath: "/w",
-	})
-	if remote != nil {
-		t.Error("selectUsageReader(remote) reader is non-nil, want none: nothing reads a far host's filesystem")
-	}
-	if remoteEnv != nil {
-		t.Errorf("selectUsageReader(remote) env = %v, want nil", remoteEnv)
-	}
-}
-
 func TestUsageDrainReportsTurnEndFigure(t *testing.T) {
 	t.Parallel()
 
@@ -199,10 +166,9 @@ func TestUsageDrainReportsTurnEndFigure(t *testing.T) {
 		}},
 	}
 
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-		discardLogger(), withUsageReader(reader))
+	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
 	out := newOutboundReader(outPr)
-	publishHandshake(state, "0.59.0")
+	publishHandshake(state, reader)
 	markSessionKnown(state)
 
 	events, outcome := measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))
@@ -243,10 +209,9 @@ func TestUsageMeasurementExistenceIsNotItsCompleteness(t *testing.T) {
 				usage:        agentcore.RecoveredUsage{Run: short, Model: "model-of-record"},
 			}},
 		}
-		state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-			discardLogger(), withUsageReader(reader))
+		state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
 		out := newOutboundReader(outPr)
-		publishHandshake(state, "0.59.0")
+		publishHandshake(state, reader)
 		markSessionKnown(state)
 
 		events, outcome := measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))
@@ -270,10 +235,9 @@ func TestUsageMeasurementExistenceIsNotItsCompleteness(t *testing.T) {
 		t.Parallel()
 
 		reader := &fakeUsageReader{recognizes: true, drains: []fakeDrain{{found: false}}}
-		state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-			discardLogger(), withUsageReader(reader))
+		state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
 		out := newOutboundReader(outPr)
-		publishHandshake(state, "0.59.0")
+		publishHandshake(state, reader)
 		markSessionKnown(state)
 
 		events, outcome := measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))
@@ -287,62 +251,6 @@ func TestUsageMeasurementExistenceIsNotItsCompleteness(t *testing.T) {
 				state.caps.tokenCounts, capabilityGap)
 		}
 	})
-}
-
-func TestUsageReaderDroppedOnUnrecognizedRuntimeName(t *testing.T) {
-	t.Parallel()
-
-	reader := &fakeUsageReader{
-		recognizes: false,
-		drains:     []fakeDrain{{found: true, usage: agentcore.RecoveredUsage{Run: domain.TokenUsage{InputTokens: 99}}}},
-	}
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-		discardLogger(), withUsageReader(reader))
-	out := newOutboundReader(outPr)
-	publishHandshake(state, "0.58.0")
-	markSessionKnown(state)
-
-	events, outcome := measuredTurn(t, state, inPw, out, quotaMeta(1250, 40))
-
-	agenttest.AssertMeasurementAbsent(t, events, outcome.result)
-	if state.caps.tokenCounts != capabilityGap {
-		t.Errorf("tokenCounts = %q, want %q for a runtime name the source does not recognize",
-			state.caps.tokenCounts, capabilityGap)
-	}
-	if reader.observedLowerBounds() != nil {
-		t.Error("the dropped source was still drained, want no drain at all")
-	}
-	if !hasNoticeContaining(events, capabilityLabelTokenCounts) {
-		t.Errorf("no gap notice named %q; the session must say what it cannot report", capabilityLabelTokenCounts)
-	}
-}
-
-func TestUsageReaderRecognizeReceivesTheHandshakeNameNotItsTitle(t *testing.T) {
-	t.Parallel()
-
-	reader := &fakeUsageReader{
-		recognizes: true,
-		drains: []fakeDrain{{
-			found: true,
-			usage: agentcore.RecoveredUsage{Run: domain.TokenUsage{InputTokens: 100, OutputTokens: 5, TotalTokens: 105}},
-		}},
-	}
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-		discardLogger(), withUsageReader(reader))
-	out := newOutboundReader(outPr)
-
-	title := "Other Runtime"
-	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{
-		agentInfo:        implementation{Name: "other-cli", Title: &title, Version: "1.0.0"},
-		agentInfoPresent: true,
-	}}})
-	markSessionKnown(state)
-
-	measuredTurn(t, state, inPw, out, quotaMeta(100, 5))
-
-	if got := reader.recognizedName(); got != "other-cli" {
-		t.Errorf("Recognize() name = %q, want %q", got, "other-cli")
-	}
 }
 
 func TestCancelledTurnRecordsSpendOccurred(t *testing.T) {
@@ -436,9 +344,8 @@ func durableReader(run domain.TokenUsage) *fakeUsageReader {
 func readerSession(t *testing.T, reader usageReader) (*sessionState, *outboundReader, *io.PipeWriter) {
 	t.Helper()
 
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes,
-		discardLogger(), withUsageReader(reader))
-	publishHandshake(state, "0.59.0")
+	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
+	publishHandshake(state, reader)
 	markSessionKnown(state)
 	return state, newOutboundReader(outPr), inPw
 }
@@ -785,10 +692,11 @@ func awaitPumpObserved(t *testing.T, state *sessionState) {
 	}
 }
 
-func publishHandshake(state *sessionState, version string) {
+func publishHandshake(state *sessionState, reader usageReader) {
 	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{
-		agentInfo:        implementation{Name: "other-cli", Version: version},
+		agentInfo:        implementation{Name: "other-cli", Version: "0.59.0"},
 		agentInfoPresent: true,
+		reader:           reader,
 	}}})
 }
 
@@ -800,15 +708,6 @@ func countTokenUsageEvents(events []domain.AgentEvent) int {
 		}
 	}
 	return count
-}
-
-func hasNoticeContaining(events []domain.AgentEvent, fragment string) bool {
-	for _, event := range events {
-		if event.Type == domain.EventNotification && strings.Contains(event.Message, fragment) {
-			return true
-		}
-	}
-	return false
 }
 
 func TestSpendUnaccountedIsGradedPerTurn(t *testing.T) {
@@ -882,6 +781,36 @@ func TestSpendUnaccountedIsGradedPerTurn(t *testing.T) {
 			}
 			if bounds := reader.observedLowerBounds(); len(bounds) != 2 || bounds[0] != 1000 || bounds[1] != 200 {
 				t.Errorf("reader.Drain() lower bounds = %v, want [1000 200]: each turn is drained against its own", bounds)
+			}
+		})
+	}
+}
+
+func TestSettleOffersNoRecognizerForARemoteLaunch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		remote         bool
+		wantRecognizer bool
+	}{
+		{name: "local launch", remote: false, wantRecognizer: true},
+		{name: "remote launch", remote: true, wantRecognizer: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A source that recognizes the name regardless of the launch, so
+			// only the settlement itself can keep a remote launch from a
+			// relaunch offer.
+			source := &fakeUsageReader{recognizes: true}
+			claims := usageClaims{unclaimed: []usageReader{source}}
+
+			verdict := settleUsageSources(claims, &implementation{Name: "runtime"}, tt.remote)
+
+			if got := verdict.recognizer != nil; got != tt.wantRecognizer {
+				t.Errorf("settleUsageSources(remote=%v).recognizer set = %v, want %v", tt.remote, got, tt.wantRecognizer)
 			}
 		})
 	}
