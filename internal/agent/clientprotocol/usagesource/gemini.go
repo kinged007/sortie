@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,16 @@ import (
 )
 
 const geminiAgentName = "gemini-cli"
+
+// geminiExecutableName is the name the runtime's own executable is published
+// under, distinct from geminiAgentName, the name it reports at handshake time.
+const geminiExecutableName = "gemini"
+
+const geminiPackageName = "@google/gemini-cli"
+
+// geminiExecutableSuffixes are the platform-specific extensions a launcher may
+// append to the executable name; namesGeminiCLI strips at most one.
+var geminiExecutableSuffixes = []string{".cmd", ".ps1", ".exe", ".js"}
 
 const (
 	geminiSourceTelemetry = "telemetry"
@@ -132,18 +143,94 @@ type geminiReader struct {
 	// runtime's own home.
 	now  func() time.Time
 	home string
+
+	// remove is the removal Close performs; nil means os.RemoveAll. Substituted
+	// by tests, as now and home are.
+	remove func(string) error
 }
 
 func newGeminiReader() *geminiReader {
 	return &geminiReader{}
 }
 
+func init() {
+	Sources.Register(geminiAgentName, func() Reader { return newGeminiReader() })
+}
+
+// namesGeminiCLI reports whether target's command line identifies Gemini
+// CLI, checked by an empty-runtime Claim before it arms anything. The tokens
+// are target.Command and every element of target.Args: a token naming the
+// gemini executable (bare, or the last path element after one platform
+// launcher suffix is stripped) claims the launch unless it is the value of a
+// preceding option flag with nothing to identify it as a path; a token naming
+// the @google/gemini-cli npm package, standalone, versioned, or inside a
+// node_modules path, always claims it.
+func namesGeminiCLI(target agentcore.LaunchTarget) bool {
+	tokens := append([]string{target.Command}, target.Args...)
+	for i, token := range tokens {
+		var optionValue bool
+		if i > 0 {
+			prev := tokens[i-1]
+			optionValue = strings.HasPrefix(prev, "-") && prev != "--"
+		}
+		if geminiToken(token, optionValue) {
+			return true
+		}
+	}
+	return false
+}
+
+// geminiToken reports whether one command-line token, given whether it is the
+// value of a preceding option flag, identifies Gemini CLI.
+func geminiToken(token string, optionValue bool) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(token, `\`, "/"))
+	if geminiExecutableToken(normalized, optionValue) {
+		return true
+	}
+	if normalized == geminiPackageName || strings.HasPrefix(normalized, geminiPackageName+"@") {
+		return true
+	}
+	return strings.Contains(normalized, "/"+geminiPackageName+"/") || strings.HasSuffix(normalized, "/"+geminiPackageName)
+}
+
+// geminiExecutableToken reports whether a normalized token names the gemini
+// executable itself, bare or as a path. A bare option value with no path
+// separator is ambiguous with an unrelated flag argument and is not matched.
+func geminiExecutableToken(normalized string, optionValue bool) bool {
+	hasPathSeparator := strings.Contains(normalized, "/")
+	if !hasPathSeparator && optionValue {
+		return false
+	}
+
+	base := normalized
+	if idx := strings.LastIndex(normalized, "/"); idx >= 0 {
+		base = normalized[idx+1:]
+	}
+	for _, suffix := range geminiExecutableSuffixes {
+		if trimmed, ok := strings.CutSuffix(base, suffix); ok {
+			base = trimmed
+			break
+		}
+	}
+	return base == geminiExecutableName
+}
+
 // Claim arms the source for a local launch, taking a session-private directory
 // for the outfile and returning the assignments that make the runtime write
 // there. A remote launch is refused: this source reads a local filesystem, and
-// a worker reached over SSH writes its outfile on the far host.
-func (r *geminiReader) Claim(target agentcore.LaunchTarget) ([]string, bool) {
+// a worker reached over SSH writes its outfile on the far host. With runtime
+// empty, the launch is armed only when its command line identifies Gemini
+// CLI; with runtime non-empty, the relaunch offer, it is armed exactly when
+// Recognize(runtime) is true, regardless of the command line.
+func (r *geminiReader) Claim(target agentcore.LaunchTarget, runtime string) ([]string, bool) {
 	if target.RemoteCommand != "" {
+		return nil, false
+	}
+	if runtime != "" {
+		if !r.Recognize(runtime) {
+			return nil, false
+		}
+	} else if !namesGeminiCLI(target) {
 		return nil, false
 	}
 
@@ -194,7 +281,10 @@ func (r *geminiReader) Open(sessionID string) {
 	r.inherited = r.journalMessageIDs()
 }
 
-// Close removes the session-private directory Claim took.
+// Close removes the session-private directory Claim took. It is safe to call
+// on a source that never claimed and safe to call more than once: a call
+// after a complete release does nothing, and a call after a removal that
+// failed retries it, keeping dir and outfile set until a retry succeeds.
 func (r *geminiReader) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -202,7 +292,13 @@ func (r *geminiReader) Close() {
 	if r.dir == "" {
 		return
 	}
-	os.RemoveAll(r.dir) //nolint:errcheck,gosec // best-effort cleanup of a directory this source created
+	remove := r.remove
+	if remove == nil {
+		remove = os.RemoveAll
+	}
+	if err := remove(r.dir); err != nil {
+		return
+	}
 	r.dir = ""
 	r.outfile = ""
 }
