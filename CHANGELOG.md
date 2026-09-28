@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Workflows that run Gemini CLI through the `agent-client-protocol` agent kind now report token usage on current Gemini CLI releases, not only on 0.59.0, so `agent.max_tokens` applies to them and their spend counts in the token and cost totals. Token usage for these workflows needs Gemini CLI 0.59.0 or later. ([#1189](https://github.com/sortie-ai/sortie/issues/1189))
+
 ## [1.25.0] - 2026-09-27
 
 ### Added
