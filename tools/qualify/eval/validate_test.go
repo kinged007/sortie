@@ -41,8 +41,8 @@ func TestValidateObservations(t *testing.T) {
 		fixture.Finalize()
 		tokenCount := evidencetest.TokenRecordCount(fixture.Records)
 		sessionCount := evidencetest.ProtocolSessionCount(fixture.Records)
-		if got := len(fixture.Records); got != 51+tokenCount+sessionCount {
-			t.Errorf("qualified fixture Record count = %d, want 51+tokenCount+sessionCount = %d (T=%d, N=%d)", got, 51+tokenCount+sessionCount, tokenCount, sessionCount)
+		if got := len(fixture.Records); got != 52+tokenCount+sessionCount {
+			t.Errorf("qualified fixture Record count = %d, want 52+tokenCount+sessionCount = %d (T=%d, N=%d)", got, 52+tokenCount+sessionCount, tokenCount, sessionCount)
 		}
 		path := evidencetest.WriteEvidenceFile(t, fixture.Records)
 		RequireObservationVerdict(t, path, evidence.VerdictQualified)
@@ -55,8 +55,8 @@ func TestValidateObservations(t *testing.T) {
 		fixture.Finalize()
 		tokenCount := evidencetest.TokenRecordCount(fixture.Records)
 		sessionCount := evidencetest.ProtocolSessionCount(fixture.Records)
-		if got := len(fixture.Records); got != 51+tokenCount+sessionCount {
-			t.Errorf("not_qualified fixture Record count = %d, want 51+tokenCount+sessionCount = %d (T=%d, N=%d)", got, 51+tokenCount+sessionCount, tokenCount, sessionCount)
+		if got := len(fixture.Records); got != 52+tokenCount+sessionCount {
+			t.Errorf("not_qualified fixture Record count = %d, want 52+tokenCount+sessionCount = %d (T=%d, N=%d)", got, 52+tokenCount+sessionCount, tokenCount, sessionCount)
 		}
 		path := evidencetest.WriteEvidenceFile(t, fixture.Records)
 		RequireObservationVerdict(t, path, evidence.VerdictNotQualified)

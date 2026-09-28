@@ -88,18 +88,6 @@ func TestNativeTokenInventoryNamesTheUnverifiedCeilingStop(t *testing.T) {
 	}
 }
 
-func TestProtocolTokenInventoryNamesTheUnverifiedCeilingStop(t *testing.T) {
-	t.Parallel()
-
-	_, paths, inventory, _ := protocolTokenInventory(&sharedFixture{usage: &usageTracker{}, wireTraceDir: completeExtensionTrace(t)})
-	if len(paths) == 0 {
-		t.Fatalf("protocolTokenInventory(...) paths = %+v, want the counters the capture carried", paths)
-	}
-	if !strings.Contains(inventory.obs.Detail, "max_tokens") {
-		t.Errorf("protocolTokenInventory(...) inventory detail = %q, want it to name the max_tokens stop this measurer never induced", inventory.obs.Detail)
-	}
-}
-
 func TestNativeTokenInventoryDoesNotInventASessionID(t *testing.T) {
 	t.Parallel()
 

@@ -277,7 +277,7 @@ func TestConclusionsFromRecordsExclusionAndBlockingBranches(t *testing.T) {
 			t.Fatalf("conclusionsFromRecords(...) = _, %v, want nil", err)
 		}
 
-		wantExcluded := "retry_classification unknown_outcome: no deterministic inducer, so neither the condition nor the surface's account of it was established"
+		wantExcluded := "retry_classification unknown_outcome: no deterministic inducer on any runtime, so the case carries no obligation"
 		if !slices.Contains(conclusions.Excluded, wantExcluded) {
 			t.Errorf("Excluded = %v, want it to contain %q", conclusions.Excluded, wantExcluded)
 		}

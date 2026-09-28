@@ -180,7 +180,7 @@ func geminiCliInventoryAgreementJournalLines(t *testing.T) []string {
 		Case:       "token_inventory",
 		Grade:      "gap",
 		Outcome:    "pass",
-		Detail:     "read 4 recognized observation(s) and resolved 5 token-bearing path(s); no max_tokens stop was induced, so ceiling enforcement stays unverified",
+		Detail:     "read 4 recognized observation(s) and resolved 5 token-bearing path(s); no max_tokens stop was induced on this surface",
 		RecordedAt: "2026-01-01T00:00:04Z",
 		Derivation: evidence.DerivationInventory,
 	}

@@ -63,6 +63,9 @@ func TestValidatorMissingAndDuplicateControls(T *testing.T) {
 		{"end to end", func(f *evidencetest.Fixture) *evidence.Record {
 			return f.FindFirst(matchRowClass(evidence.RowEndToEnd))
 		}},
+		{"token ceiling stop", func(f *evidencetest.Fixture) *evidence.Record {
+			return f.FindFirst(matchRowClass(evidence.RowCeilingStop))
+		}},
 		{"disposition semantic", func(f *evidencetest.Fixture) *evidence.Record {
 			return f.FindFirst(evidencetest.MatchSemantic(evidence.SurfaceProtocol, evidence.CapabilityTurnDisposition, evidence.CaseSuccess))
 		}},
@@ -124,6 +127,51 @@ func TestValidatorMissingAndDuplicateControls(T *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidatorCeilingStopRecordShape(T *testing.T) {
+	T.Parallel()
+
+	T.Run("an observed grade with a null session is rejected", func(T *testing.T) {
+		T.Parallel()
+
+		fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
+		fixture.Finalize()
+		rec := fixture.FindFirst(matchRowClass(evidence.RowCeilingStop))
+		if rec == nil {
+			T.Fatal("fixture carries no ceiling stop record")
+		}
+		rec.SessionID = nil
+		path := evidencetest.WriteEvidenceFile(T, fixture.Records)
+		_, err := ValidateObservations(path, profile.RuntimeProfile{})
+		if err == nil {
+			T.Fatal("ValidateObservations() = nil error, want rejection of an observed ceiling stop record with no session_id")
+		}
+		if !strings.Contains(err.Error(), "record reporting an observed run must reference the session it ran in") {
+			T.Errorf("ValidateObservations() error = %v, want the missing-session cause", err)
+		}
+	})
+
+	T.Run("a grade outside usable, gap, or not_observed is rejected", func(T *testing.T) {
+		T.Parallel()
+
+		fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
+		fixture.Finalize()
+		rec := fixture.FindFirst(matchRowClass(evidence.RowCeilingStop))
+		if rec == nil {
+			T.Fatal("fixture carries no ceiling stop record")
+		}
+		rec.Grade = evidence.GradeNotApplicable
+		rec.Outcome = evidence.OutcomeNotApplicable
+		path := evidencetest.WriteEvidenceFile(T, fixture.Records)
+		_, err := ValidateObservations(path, profile.RuntimeProfile{})
+		if err == nil {
+			T.Fatal("ValidateObservations() = nil error, want rejection of a ceiling stop grade outside usable, gap, or not_observed")
+		}
+		if !strings.Contains(err.Error(), "ceiling stop record grade must be usable, gap, or not_observed") {
+			T.Errorf("ValidateObservations() error = %v, want the closed-grade cause", err)
+		}
+	})
 }
 
 func TestValidatorSemanticControls(T *testing.T) {

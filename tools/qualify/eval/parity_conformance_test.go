@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -146,7 +147,7 @@ func TestDeclaredGapCarriesNoConformanceObligation(T *testing.T) {
 	}
 }
 
-func TestCompensationReachesTheProductAnswerWithoutFlatteringTheTransport(T *testing.T) {
+func TestCompensationLiftsBothVerdictsWhileTheWireGradeStaysGap(T *testing.T) {
 	T.Parallel()
 
 	// A corroboration-only reading is the shape a compensated baseline would
@@ -162,26 +163,33 @@ func TestCompensationReachesTheProductAnswerWithoutFlatteringTheTransport(T *tes
 	if before.Conformance != evidence.VerdictNotQualified {
 		T.Fatalf("product conformance before compensation = %s, want not_qualified", before.Conformance)
 	}
+	beforeRow := rowFor(before, evidence.CapabilityTokenCeiling)
+	if beforeRow.Standing != StandingBelow || beforeRow.Conformance != StandingBelow {
+		T.Fatalf("token_ceiling row before compensation = parity %s / conformance %s, want both below: with no figure reaching Sortie, both questions follow the wire", beforeRow.Standing, beforeRow.Conformance)
+	}
 
 	fixture.SetTokenCompensated("sortie/session/turn/usage")
 
 	after := publishedReport(T, fixture.Records, fixture.Declarations())
-	if after.Conformance != evidence.VerdictUnmeasured {
-		T.Errorf("product conformance = %s, want unmeasured: Sortie's own code supplies the spend, and no run crossed a ceiling", after.Conformance)
+	if after.Verdict != evidence.VerdictQualified {
+		T.Errorf("transport parity = %s, want qualified: a usable compensating record lifts the comparison", after.Verdict)
+	}
+	if after.Conformance != evidence.VerdictQualified {
+		T.Errorf("product conformance = %s, want qualified: the figure reaches Sortie and the default ceiling-stop record grades usable", after.Conformance)
 	}
 	row := rowFor(after, evidence.CapabilityTokenCeiling)
-	if row.Conformance != StandingUnmeasured {
-		T.Errorf("token_ceiling conformance standing = %s (cause %q), want unmeasured", row.Conformance, row.ConformanceCause)
+	if row.Standing != StandingSatisfied {
+		T.Errorf("token_ceiling parity standing = %s (cause %q), want satisfied", row.Standing, row.Cause)
 	}
-	if after.Verdict != evidence.VerdictNotQualified {
-		T.Errorf("transport parity = %s, want not_qualified: the wire still carries nothing, and compensating for it must not read as the protocol carrying it", after.Verdict)
+	if row.Conformance != StandingSatisfied {
+		T.Errorf("token_ceiling conformance standing = %s (cause %q), want satisfied", row.Conformance, row.ConformanceCause)
 	}
 	if grade := publishedBaseline(T, fixture.Records, evidence.SurfaceProtocol, evidence.CapabilityTokenCeiling); grade != evidence.GradeGap {
-		T.Errorf("published protocol token_ceiling baseline = %s, want gap: the baseline states what the surface reported", grade)
+		T.Errorf("published protocol token_ceiling baseline = %s, want gap: the baseline states what the surface itself reported", grade)
 	}
 }
 
-func TestCorroboratingCompensationDoesNotMeetConformance(T *testing.T) {
+func TestCorroboratingCompensationDoesNotMeetConformanceOrParity(T *testing.T) {
 	T.Parallel()
 
 	fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
@@ -199,6 +207,134 @@ func TestCorroboratingCompensationDoesNotMeetConformance(T *testing.T) {
 	report := publishedReport(T, fixture.Records, fixture.Declarations())
 	if report.Conformance != evidence.VerdictNotQualified {
 		T.Errorf("product conformance = %s, want not_qualified: a corroborating reading is not a working ceiling", report.Conformance)
+	}
+	if report.Verdict != evidence.VerdictNotQualified {
+		T.Errorf("transport parity = %s, want not_qualified: a corroborating reading must not lift the comparison either", report.Verdict)
+	}
+	row := rowFor(report, evidence.CapabilityTokenCeiling)
+	if row.Standing != StandingBelow {
+		T.Errorf("token_ceiling parity standing = %s (cause %q), want below", row.Standing, row.Cause)
+	}
+}
+
+func TestCatalogUninducibleCaseCarriesNoConformanceObligation(T *testing.T) {
+	T.Parallel()
+
+	fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
+	// Set before Finalize so no identity record is written for a session the
+	// not-inducible shape removes.
+	for _, surface := range []evidence.Surface{evidence.SurfaceProtocol, evidence.SurfaceNativeJSON, evidence.SurfaceNativeStreamJSON} {
+		fixture.SetSemanticNotInducible(surface, evidence.CapabilityRetryClassification, evidence.CaseUnknownOutcome, evidence.NotInducibleDetail)
+	}
+	fixture.Finalize()
+
+	p := summaryProfile(fixture)
+	report := publishedReport(T, fixture.Records, p)
+	if report.Conformance != evidence.VerdictQualified {
+		T.Errorf("product conformance = %s, want qualified: a catalog-uninducible case carries no obligation", report.Conformance)
+	}
+	row := rowFor(report, evidence.CapabilityRetryClassification)
+	if row.Conformance != StandingSatisfied {
+		T.Errorf("retry_classification conformance standing = %s (cause %q), want satisfied", row.Conformance, row.ConformanceCause)
+	}
+
+	conclusions, err := conclusionsFromRecords(fixture.Records, report.Conformance, p)
+	if err != nil {
+		T.Fatalf("conclusionsFromRecords(...) = _, %v, want nil", err)
+	}
+	wantExcluded := "retry_classification unknown_outcome: no deterministic inducer on any runtime, so the case carries no obligation"
+	if !slices.Contains(conclusions.Excluded, wantExcluded) {
+		T.Errorf("Excluded = %v, want it to contain %q", conclusions.Excluded, wantExcluded)
+	}
+}
+
+func TestTokenCeilingConformanceFollowsTheCeilingStopRecordOnlyWhenAFigureReachesSortie(T *testing.T) {
+	T.Parallel()
+
+	tests := []struct {
+		name              string
+		wireGap           bool
+		removeCeilingStop bool
+		stop              *evidence.Observation
+		wantStanding      Standing
+		wantCauseContains []string
+	}{
+		{
+			name:              "no figure reaches Sortie, the ceiling stop record is ignored",
+			wireGap:           true,
+			wantStanding:      StandingBelow,
+			wantCauseContains: []string{"protocol gap"},
+		},
+		{
+			name:              "a figure reaches Sortie, the ceiling stop record is missing",
+			removeCeilingStop: true,
+			wantStanding:      StandingUnmeasured,
+			wantCauseContains: []string{"ceiling stop record missing"},
+		},
+		{
+			name: "a figure reaches Sortie, the ceiling stop record is usable",
+			stop: &evidence.Observation{
+				Grade: evidence.GradeUsable, Outcome: evidence.OutcomePass,
+				SessionID: evidencetest.FixtureSession(evidence.SurfaceProtocol, "ceiling"),
+				Detail:    "stopped at 1 token(s)",
+			},
+			wantStanding: StandingSatisfied,
+		},
+		{
+			name: "a figure reaches Sortie, the ceiling stop record is gap",
+			stop: &evidence.Observation{
+				Grade: evidence.GradeGap, Outcome: evidence.OutcomePass,
+				SessionID: evidencetest.FixtureSession(evidence.SurfaceProtocol, "ceiling"),
+				Detail:    "the run crossed the ceiling without a stop",
+			},
+			wantStanding:      StandingBelow,
+			wantCauseContains: []string{"ceiling stop gap: the run crossed the ceiling without a stop"},
+		},
+		{
+			name: "a figure reaches Sortie, the ceiling stop record is not_observed",
+			stop: &evidence.Observation{
+				Grade: evidence.GradeNotObserved, Outcome: evidence.OutcomeRuntimeFailed,
+				Detail: "no run under the one-token ceiling ended within the observation bound",
+			},
+			wantStanding:      StandingUnmeasured,
+			wantCauseContains: []string{"ceiling stop runtime_failed: no run under the one-token ceiling ended within the observation bound"},
+		},
+	}
+
+	for _, tt := range tests {
+		T.Run(tt.name, func(T *testing.T) {
+			T.Parallel()
+
+			fixture := evidencetest.NewFixture(evidencetest.FixtureQualified)
+			if tt.wireGap {
+				fixture.SetTokenSentinel(evidence.SurfaceProtocol, false)
+			}
+			fixture.Finalize()
+
+			switch {
+			case tt.removeCeilingStop:
+				rec := fixture.FindFirst(matchRowClass(evidence.RowCeilingStop))
+				if rec == nil {
+					T.Fatal("fixture carries no ceiling stop record to remove")
+				}
+				fixture.Remove(rec)
+			case tt.stop != nil:
+				if err := fixture.SetCeilingStop(*tt.stop); err != nil {
+					T.Fatalf("SetCeilingStop(...) error = %v, want nil", err)
+				}
+			}
+
+			report := ExplainEligibility(fixture.Records, fixture.Declarations())
+			row := rowFor(report, evidence.CapabilityTokenCeiling)
+			if row.Conformance != tt.wantStanding {
+				T.Errorf("token_ceiling conformance standing = %s (cause %q), want %s", row.Conformance, row.ConformanceCause, tt.wantStanding)
+			}
+			for _, want := range tt.wantCauseContains {
+				if !strings.Contains(row.ConformanceCause, want) {
+					T.Errorf("token_ceiling conformance cause = %q, want it to contain %q", row.ConformanceCause, want)
+				}
+			}
+		})
 	}
 }
 
