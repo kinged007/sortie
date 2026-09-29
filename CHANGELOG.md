@@ -6,8 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.26.0] - 2026-09-29
+
+### Added
+
+- A new `pi` agent kind runs work through the Pi CLI, pi 0.85.1. The adapter launches one `pi -p --mode json` subprocess per Sortie turn, normalizes the JSON event stream into domain events, and settles the session's cumulative token usage from the usage figure each turn's `turn_end` event carries, so `agent.max_tokens` applies and the spend joins the token and cost totals. pi has no MCP transport, so the kind declares `MCPInjectionUnsupported` and Sortie's tools are neither advertised to nor callable by a pi session. pi authenticates from its own configuration file, `~/.pi/agent/models.json`, so the kind declares no credential environment variable and the preflight credential check reads that file instead of an injected variable. A run on the kind works locally and on `worker.ssh_hosts`.
+
+- A new `github-pr` tracker kind surfaces GitHub pull requests as Sortie issues. Candidate reads go to the Pulls REST API, which returns pull requests the issues route leaves out, and label writes go to the Issues routes, which accept a pull request number as an issue number. The kind is tracker-only and declares `BlockersUnsupported`, because a pull request carries no dependency relation and so has nothing to report as a blocker. `query_filter` is passed to GitHub for evaluation, so the operator's qualifiers narrow the candidate set server-side rather than being applied after the fact. `examples/WORKFLOW.github-pr.md` walks through a workflow on the kind, and the tracker integration contract describes it in section 11.6.5.
+
 ### Fixed
 
+- The `github-pr` tracker kind honors the `label:`, `-label:`, and `assignee:` clauses of `query_filter` on the open-pull-request path, as it already did on the search path. These qualifiers were dropped before the request left Sortie, so a filter naming them returned every open pull request in the repository instead of the ones the operator asked for. Qualifiers GitHub evaluates that Sortie does not interpret are still passed through untouched.
+- The `github-pr` tracker kind now bounds each GitHub request and declares `BlockersUnsupported` in place of a blocker reader that returned nothing. Without a deadline, one request could hold the poll tick that the orchestrator runs on its event loop, and with it worker-exit handling and the retry timers. Reading every request the shared timeout leaves open, and answering a truncated result set with a warning while keeping the pages that did arrive, are now covered by tests.
+- The `pi` agent kind now meets the credential and early-exit contract the other agent kinds meet. A run reports an agent that exits before its first turn instead of waiting for output that will not come, a failure to reach a host named in `worker.ssh_hosts` is reported as a launch failure rather than a turn failure, the workspace is bound to the launch target, and the preflight credential check reads pi's configuration file. A credential pi cannot use stops the run before any work, on the local machine and on a remote host alike.
 - Workflows that run Gemini CLI through the `agent-client-protocol` agent kind now report token usage on current Gemini CLI releases, not only on 0.59.0, so `agent.max_tokens` applies to them and their spend counts in the token and cost totals. Token usage for these workflows needs Gemini CLI 0.59.0 or later. ([#1189](https://github.com/sortie-ai/sortie/issues/1189))
 - Workflows that run an agent other than Gemini CLI through the `agent-client-protocol` agent kind no longer start with Gemini CLI's telemetry settings in their environment or an unused temporary directory left behind. An agent whose command line does not show which runtime it starts, or names Gemini CLI while starting a different runtime, is now started a second time before its session begins, so a Gemini CLI started through a wrapper script still reports token usage. ([#1198](https://github.com/sortie-ai/sortie/issues/1198))
 
@@ -1065,6 +1076,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Architecture Decision Records (ADR-0001 through ADR-0005).
 
 [Unreleased]: https://github.com/sortie-ai/sortie/compare/v1.25.0...HEAD
+[1.26.0]: https://github.com/sortie-ai/sortie/compare/v1.25.0...v1.26.0
 [1.25.0]: https://github.com/sortie-ai/sortie/compare/v1.24.1...v1.25.0
 [1.24.1]: https://github.com/sortie-ai/sortie/compare/v1.24.0...v1.24.1
 [1.24.0]: https://github.com/sortie-ai/sortie/compare/v1.23.0...v1.24.0
