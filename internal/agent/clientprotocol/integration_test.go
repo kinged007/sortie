@@ -374,7 +374,7 @@ func TestIntegration_RunTurnWithPermissionContinuation(t *testing.T) {
 	events := collected()
 	t.Logf("received %d events, exit reason: %q", len(events), result.ExitReason)
 
-	assertCapabilityGapLabelsMatchProfile(t, events)
+	assertCapabilityGapLabelsMatchProfile(t, events, result)
 
 	if result.SessionID != session.ID {
 		t.Errorf("TurnResult.SessionID = %q, want %q", result.SessionID, session.ID)

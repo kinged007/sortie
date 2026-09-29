@@ -14,6 +14,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/registry"
+
+	"github.com/sortie-ai/sortie/tools/qualify/evidence"
 )
 
 // ceilingAgentKind declares incremental usage arrival so the run is graded by
@@ -184,5 +186,34 @@ func TestTokenCeilingStopsTheRunAndDispatchesNoOther(t *testing.T) {
 	}
 	if len(after) != 1 {
 		t.Errorf("run history holds %d rows after the stop, want 1: nothing may be dispatched after the ceiling stop", len(after))
+	}
+}
+
+func TestObserveCeilingStopReportsAUsableStopUnderTheCeilingHarness(t *testing.T) {
+	agent := newSpendingAgent()
+	harness := NewCeilingHarness(t, agent, "sortie-qualification-spending-agent --session-fixture", ceilingAgentKind, fixturePrompt, Budgets{Observation: 30 * time.Second})
+
+	StartWorkflow(t, harness)
+
+	condition := ObserveCeilingStop(t, harness)
+	if condition.Status != "budget_stopped" {
+		t.Fatalf("ObserveCeilingStop() status = %q, want %q", condition.Status, "budget_stopped")
+	}
+	if !condition.TokensMeasured || condition.TotalTokens < 1 {
+		t.Errorf("ObserveCeilingStop() total tokens = %d measured=%t, want a measured total of at least one token", condition.TotalTokens, condition.TokensMeasured)
+	}
+	if !condition.HoldObserved {
+		t.Error("ObserveCeilingStop() HoldObserved = false, want true: a poll tick must catch the issue in the token budget hold")
+	}
+	if condition.Runs != 1 {
+		t.Errorf("ObserveCeilingStop() Runs = %d, want 1: nothing may be dispatched after the ceiling stop", condition.Runs)
+	}
+	if condition.Running {
+		t.Error("ObserveCeilingStop() Running = true, want false: nothing may be dispatched after the ceiling stop")
+	}
+
+	obs := CeilingStopObservation(condition, "sess-ceiling")
+	if obs.Grade != evidence.GradeUsable || obs.Outcome != evidence.OutcomePass {
+		t.Errorf("CeilingStopObservation(%+v) = %s/%s, want %s/%s", condition, obs.Grade, obs.Outcome, evidence.GradeUsable, evidence.OutcomePass)
 	}
 }

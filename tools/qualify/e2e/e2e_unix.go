@@ -51,6 +51,20 @@ const (
 	issueIdentifier = "SORTIE-E2E-1"
 )
 
+// The live ceiling step's fixed bounds: a one-token ceiling low enough that
+// the first measured turn crosses it, two turns so work is still pending
+// after the crossing, and room for one further dispatch so a defective
+// redispatch is observable rather than withheld by the session budget.
+const (
+	ceilingRunTokens   = 1
+	ceilingRunTurns    = 2
+	ceilingRunSessions = 2
+
+	// ceilingQuietPolls is one second of the observer's 20ms polls: how long a
+	// dispatch has to appear after the hold before the observation ends.
+	ceilingQuietPolls = 50
+)
+
 // fixturePrompt is the isolated harness's only agent prompt; omitting the
 // "no-change-needed" signal left a live model hunting for a nonexistent task
 // instead of exercising the orchestrator's handoff plumbing.
@@ -264,6 +278,8 @@ type AdapterObserver struct {
 	pgids      []int
 	sessionIDs []string
 	stops      int
+	turnCalls  int
+	figureTurn int
 }
 
 // StartSession delegates and captures the session's process-group leader PID
@@ -288,7 +304,27 @@ func (o *AdapterObserver) StartSession(ctx context.Context, params domain.StartS
 	return session, nil
 }
 
+// RunTurn delegates, counting this call and noting the first relayed event
+// carrying a positive token figure against the call's own index.
 func (o *AdapterObserver) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+	o.mu.Lock()
+	o.turnCalls++
+	call := o.turnCalls
+	o.mu.Unlock()
+
+	if params.OnEvent != nil {
+		onEvent := params.OnEvent
+		params.OnEvent = func(event domain.AgentEvent) {
+			if event.Usage.TotalTokens > 0 {
+				o.mu.Lock()
+				if o.figureTurn == 0 {
+					o.figureTurn = call
+				}
+				o.mu.Unlock()
+			}
+			onEvent(event)
+		}
+	}
 	return o.inner.RunTurn(ctx, session, params)
 }
 
@@ -321,6 +357,21 @@ func (o *AdapterObserver) SessionIDs() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.sessionIDs...)
+}
+
+// TurnsStarted returns the number of RunTurn calls observed so far.
+func (o *AdapterObserver) TurnsStarted() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.turnCalls
+}
+
+// FigureTurn returns the 1-based RunTurn call during which the first event
+// carrying a positive token figure was relayed, or 0 when none has been.
+func (o *AdapterObserver) FigureTurn() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.figureTurn
 }
 
 // toolServerBinary builds the sortie binary once per test process and returns
@@ -369,6 +420,10 @@ type Budgets struct {
 	// raises it, so this one cannot stand in for the budget under measurement.
 	MaxSessions int
 
+	// MaxTurns is the per-run turn bound, defaulting to the single turn a
+	// deterministic run needs.
+	MaxTurns int
+
 	// Observation bounds the wait for a terminal condition. It is not a shutdown
 	// bound: procgroup.ShutdownDeadline governs that, and spending one on
 	// the other gives a live run a shutdown's worth of time to do a turn's work.
@@ -393,6 +448,9 @@ func (b Budgets) withDefaults() Budgets {
 	if b.MaxSessions == 0 {
 		b.MaxSessions = 1
 	}
+	if b.MaxTurns == 0 {
+		b.MaxTurns = 1
+	}
 	return b
 }
 
@@ -408,6 +466,29 @@ func NewHarness(t *testing.T) *Harness {
 // agent, command, and kind. agentKind must be registered in the calling test
 // binary; a real adapter's own kind reads production MCP metadata, unlike fixtureAgentKind.
 func NewHarnessWithAgent(t *testing.T, agent domain.AgentAdapter, agentCommand, agentKind string, budgets Budgets) *Harness {
+	return newHarness(t, agent, agentCommand, agentKind, budgets, fixturePrompt)
+}
+
+// NewCeilingHarness assembles the harness for the live token-ceiling step: a
+// one-token ceiling, two turns, and room for one further dispatch so a
+// defective redispatch after the stop is observable rather than withheld by
+// the session budget. Every other bound comes from bounds.
+func NewCeilingHarness(t *testing.T, agent domain.AgentAdapter, agentCommand, agentKind, prompt string, bounds Budgets) *Harness {
+	budgets := Budgets{
+		ReadTimeoutMS:  bounds.ReadTimeoutMS,
+		TurnTimeoutMS:  bounds.TurnTimeoutMS,
+		StallTimeoutMS: bounds.StallTimeoutMS,
+		Observation:    bounds.Observation,
+		MaxTokens:      ceilingRunTokens,
+		MaxTurns:       ceilingRunTurns,
+		MaxSessions:    ceilingRunSessions,
+	}
+	return newHarness(t, agent, agentCommand, agentKind, budgets, prompt)
+}
+
+// newHarness assembles the harness under t.TempDir() with the given agent,
+// command, kind, budgets, and workflow prompt template.
+func newHarness(t *testing.T, agent domain.AgentAdapter, agentCommand, agentKind string, budgets Budgets, workflowPrompt string) *Harness {
 	budgets = budgets.withDefaults()
 	t.Helper()
 
@@ -449,12 +530,12 @@ func NewHarnessWithAgent(t *testing.T, agent domain.AgentAdapter, agentCommand, 
 		ReadTimeoutMS:  budgets.ReadTimeoutMS,
 		TurnTimeoutMS:  budgets.TurnTimeoutMS,
 		StallTimeoutMS: budgets.StallTimeoutMS,
-		MaxTurns:       1,
+		MaxTurns:       budgets.MaxTurns,
 		MaxSessions:    budgets.MaxSessions,
 		MaxTokens:      budgets.MaxTokens,
 	}
 	cfg := serviceConfig(workspaceRoot, sample)
-	tmpl, err := prompt.Parse(fixturePrompt, "fixture", 0)
+	tmpl, err := prompt.Parse(workflowPrompt, "fixture", 0)
 	if err != nil {
 		t.Fatalf("parse fixture prompt template: %v", err)
 	}
@@ -577,6 +658,212 @@ func ObserveTerminalCondition(t *testing.T, harness *Harness) TerminalCondition 
 
 	condition.StopSessionDone = harness.agent.StopObserved()
 	return condition
+}
+
+// CeilingCondition is the observed state of one live run through the
+// one-token ceiling harness, evaluated through the run-history store, the
+// adapter observer's turn counters, and, for a budget-stopped run, the
+// dispatch watch.
+type CeilingCondition struct {
+	RunEnded         bool
+	Status           string
+	TokensMeasured   bool
+	TotalTokens      int64
+	UnaccountedTurns int
+	TurnsStarted     int
+	FigureTurn       int
+	HoldObserved     bool
+	Runs             int
+	Running          bool
+}
+
+// ceilingSample is one poll tick's reading of the fixture issue's dispatch
+// state: its run_history row count, whether a token-budget hold covers it,
+// and whether a session is in flight.
+type ceilingSample struct {
+	runs    int
+	held    bool
+	running bool
+}
+
+// dispatchWatch folds a sequence of post-stop ceilingSample readings into
+// whether a redispatch happened and, once the issue entered the hold,
+// whether it stayed there through the quiet window.
+type dispatchWatch struct {
+	held       bool
+	runs       int
+	running    bool
+	quietPolls int
+}
+
+// add folds one sample into the watch and reports whether the observation
+// should end: true on the first sign of a dispatch, or once quietPolls
+// post-hold samples arrived with no such sign.
+func (w *dispatchWatch) add(sample ceilingSample) bool {
+	w.runs, w.running = sample.runs, sample.running
+	if sample.runs > 1 || sample.running {
+		return true
+	}
+	if w.held {
+		w.quietPolls++
+	}
+	if sample.held {
+		w.held = true
+	}
+	return w.quietPolls >= ceilingQuietPolls
+}
+
+// readCeilingSample reads one ceilingSample for the fixture issue from the
+// harness's store and runtime snapshot.
+func readCeilingSample(harness *Harness) (ceilingSample, error) {
+	rows, err := harness.store.QueryRunHistoryByIssue(context.Background(), issueID)
+	if err != nil {
+		return ceilingSample{}, fmt.Errorf("query run history: %w", err)
+	}
+	snapshot, err := harness.orchestrator.SnapshotFunc()()
+	if err != nil {
+		return ceilingSample{}, fmt.Errorf("runtime snapshot: %w", err)
+	}
+	held := false
+	for _, entry := range snapshot.BudgetExhausted {
+		if entry.IssueID == issueID && entry.Reason == "token_budget" {
+			held = true
+			break
+		}
+	}
+	return ceilingSample{
+		runs:    len(rows),
+		held:    held,
+		running: len(snapshot.Running) > 0,
+	}, nil
+}
+
+// ObserveCeilingStop waits for the fixture issue's first run_history row,
+// then, only for a run that ended budget_stopped, watches for a redispatch
+// through the quiet window. It never cancels the workflow; it fails the test
+// only on a store or snapshot read error.
+func ObserveCeilingStop(t *testing.T, harness *Harness) CeilingCondition {
+	t.Helper()
+
+	deadline := time.Now().Add(harness.Observation())
+	var rows []persistence.RunHistory
+	for {
+		var err error
+		rows, err = harness.store.QueryRunHistoryByIssue(context.Background(), issueID)
+		if err != nil {
+			t.Fatalf("query run history: %v", err)
+		}
+		if len(rows) > 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return CeilingCondition{}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	row := rows[0]
+	for _, candidate := range rows[1:] {
+		if candidate.ID < row.ID {
+			row = candidate
+		}
+	}
+
+	condition := CeilingCondition{
+		RunEnded:         true,
+		Status:           row.Status,
+		TokensMeasured:   row.TokensMeasured,
+		TotalTokens:      row.TotalTokens,
+		UnaccountedTurns: row.UnaccountedTurns,
+		TurnsStarted:     harness.agent.TurnsStarted(),
+		FigureTurn:       harness.agent.FigureTurn(),
+	}
+	if row.Status != "budget_stopped" {
+		return condition
+	}
+
+	watch := &dispatchWatch{}
+	deadline = time.Now().Add(harness.Observation())
+	for {
+		sample, err := readCeilingSample(harness)
+		if err != nil {
+			t.Fatalf("read ceiling sample: %v", err)
+		}
+		if watch.add(sample) {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	condition.HoldObserved, condition.Runs, condition.Running = watch.held, watch.runs, watch.running
+	return condition
+}
+
+// CeilingStopObservation maps one CeilingCondition onto the observation the
+// live ceiling step records for the protocol surface's token-ceiling row. It
+// is pure and total: the result always passes
+// [evidence.CheckObservationAdmitted]. An empty sessionID writes a null
+// session_id.
+func CeilingStopObservation(condition CeilingCondition, sessionID string) evidence.Observation {
+	grade, outcome, detail := ceilingStopGrading(condition)
+	return evidence.Observation{
+		Grade:     grade,
+		Outcome:   outcome,
+		Detail:    evidence.BoundDetail(detail),
+		SessionID: sessionID,
+	}
+}
+
+// ceilingStopGrading grades one CeilingCondition against the closed nine-row
+// table: whether the run ended, whether it stopped at the ceiling with no
+// later dispatch, and, for a run that ended on its own, whether it crossed
+// the ceiling unmeasured, unbounded, or without stopping in time.
+func ceilingStopGrading(condition CeilingCondition) (evidence.Grade, evidence.Outcome, string) {
+	switch {
+	case !condition.RunEnded:
+		return evidence.GradeNotObserved, evidence.OutcomeRuntimeFailed,
+			"no run under the one-token ceiling ended within the observation bound"
+
+	case condition.Status == "budget_stopped" && (condition.Runs > 1 || condition.Running):
+		return evidence.GradeGap, evidence.OutcomePass,
+			fmt.Sprintf("the ceiling stopped the run (status %s) and a dispatch followed: %d recorded run(s), running=%t",
+				condition.Status, condition.Runs, condition.Running)
+
+	case condition.Status == "budget_stopped" && !condition.HoldObserved:
+		return evidence.GradeNotObserved, evidence.OutcomeRuntimeFailed,
+			fmt.Sprintf("the ceiling stopped the run (status %s), but no poll tick held the issue within the bound, so the absence of a later dispatch is unproven", condition.Status)
+
+	case condition.Status == "budget_stopped":
+		return evidence.GradeUsable, evidence.OutcomePass,
+			fmt.Sprintf("stopped at %d token(s), the issue entered the token budget hold, no dispatch within the quiet window", condition.TotalTokens)
+
+	case !condition.TokensMeasured && condition.UnaccountedTurns > 0:
+		return evidence.GradeGap, evidence.OutcomePass,
+			fmt.Sprintf("the run spent tokens and recorded no figure, so the ceiling could not bound it: %d unaccounted turn(s), status %s",
+				condition.UnaccountedTurns, condition.Status)
+
+	case !condition.TokensMeasured:
+		return evidence.GradeNotObserved, evidence.OutcomePrerequisiteFailed,
+			fmt.Sprintf("the run recorded no token figure and no turn reported unaccounted spend, so the ceiling could not be crossed: status %s", condition.Status)
+
+	case condition.TotalTokens < ceilingRunTokens:
+		return evidence.GradeNotObserved, evidence.OutcomeFixtureInductionFailed,
+			fmt.Sprintf("measured total %d token(s) is below the ceiling %d: status %s", condition.TotalTokens, ceilingRunTokens, condition.Status)
+
+	case condition.FigureTurn == 0:
+		return evidence.GradeGap, evidence.OutcomePass,
+			fmt.Sprintf("the run recorded its tokens but none reached the orchestrator while it ran, so the ceiling could not stop it: status %s", condition.Status)
+
+	case condition.TurnsStarted > condition.FigureTurn:
+		return evidence.GradeGap, evidence.OutcomePass,
+			fmt.Sprintf("a turn began after the run crossed the ceiling, and the run ended with its status %s rather than budget_stopped", condition.Status)
+
+	default:
+		return evidence.GradeNotObserved, evidence.OutcomeFixtureInductionFailed,
+			fmt.Sprintf("the run crossed the ceiling on its last turn and ended with its status %s on its own before a stop could end it", condition.Status)
+	}
 }
 
 // TerminalRecord builds the single end-to-end record from the observed

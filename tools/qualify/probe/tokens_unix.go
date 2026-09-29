@@ -38,7 +38,7 @@ func protocolTokenInventory(fixture *sharedFixture) (sessionID string, paths []e
 			return reading.sessionID, reading.sources(), transportGraded(evidence.Observation{
 				Grade:   evidence.GradeGap,
 				Outcome: evidence.OutcomePass,
-				Detail:  reading.account() + "; " + ceilingStopUnverified,
+				Detail:  reading.account(),
 			}), extension
 		}
 	}
@@ -48,11 +48,6 @@ func protocolTokenInventory(fixture *sharedFixture) (sessionID string, paths []e
 		Detail:  reading.account(),
 	}), extension
 }
-
-// ceilingStopUnverified names the assertion no inventory makes: the
-// per-issue ceiling runs in the orchestrator's own lane, which nothing
-// this measurer launches exercises.
-const ceilingStopUnverified = "no max_tokens stop was induced, so ceiling enforcement stays unverified"
 
 // protocolExtensionMember is the protocol's extension point on a
 // result. Whatever a runtime reports beyond the protocol's vocabulary
@@ -312,9 +307,8 @@ func nativeTokenInventory(p profile.RuntimeProfile, surface evidence.Surface, ou
 const compensatedTokenPath = "sortie/session/turn/usage"
 
 // compensatedTokenDetail accounts for that reading: a returned figure
-// is the reading a budget is kept in, not the budget itself, and
-// carries the same unverified-stop caveat as the inventory rows.
-const compensatedTokenDetail = "the effective adapter returned a measured figure for this session from a source outside the protocol; " + ceilingStopUnverified
+// is the reading a budget is kept in, not the budget itself.
+const compensatedTokenDetail = "the effective adapter returned a measured figure for this session from a source outside the protocol"
 
 // tokenCompensation is what this collection observed about spend
 // reaching Sortie outside the protocol: the session a figure was

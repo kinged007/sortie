@@ -354,6 +354,7 @@ func TestBudgetsWithDefaults(t *testing.T) {
 			StallTimeoutMS: 10000,
 			Observation:    procgroup.ShutdownDeadline,
 			MaxSessions:    1,
+			MaxTurns:       1,
 		}
 		if got != want {
 			t.Errorf("Budgets{}.withDefaults() = %+v, want %+v", got, want)
@@ -368,6 +369,7 @@ func TestBudgetsWithDefaults(t *testing.T) {
 			StallTimeoutMS: 60000,
 			Observation:    10 * time.Minute,
 			MaxSessions:    4,
+			MaxTurns:       3,
 		}
 		if got := live.withDefaults(); got != live {
 			t.Errorf("withDefaults() = %+v, want the caller's own bounds %+v", got, live)
@@ -392,6 +394,190 @@ func TestBudgetsWithDefaults(t *testing.T) {
 		t.Parallel()
 		if got := NewHarness(t).Observation(); got != procgroup.ShutdownDeadline {
 			t.Errorf("NewHarness().Observation() = %v, want %v", got, procgroup.ShutdownDeadline)
+		}
+	})
+}
+
+func TestCeilingStopObservationGradesEachConditionRow(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "sess-ceiling-observed"
+
+	tests := []struct {
+		name        string
+		condition   CeilingCondition
+		wantGrade   evidence.Grade
+		wantOutcome evidence.Outcome
+		wantDetail  string
+	}{
+		{
+			name:        "no run ended within the observation bound",
+			condition:   CeilingCondition{RunEnded: false},
+			wantGrade:   evidence.GradeNotObserved,
+			wantOutcome: evidence.OutcomeRuntimeFailed,
+			wantDetail:  "no run under the one-token ceiling ended within the observation bound",
+		},
+		{
+			name:        "the ceiling stopped the run and a dispatch followed",
+			condition:   CeilingCondition{RunEnded: true, Status: "budget_stopped", Runs: 2},
+			wantGrade:   evidence.GradeGap,
+			wantOutcome: evidence.OutcomePass,
+		},
+		{
+			name:        "the ceiling stopped the run and no poll tick held the issue",
+			condition:   CeilingCondition{RunEnded: true, Status: "budget_stopped", HoldObserved: false, Runs: 1},
+			wantGrade:   evidence.GradeNotObserved,
+			wantOutcome: evidence.OutcomeRuntimeFailed,
+		},
+		{
+			name:        "the ceiling stopped the run and no dispatch followed",
+			condition:   CeilingCondition{RunEnded: true, Status: "budget_stopped", HoldObserved: true, Runs: 1, TotalTokens: 5},
+			wantGrade:   evidence.GradeUsable,
+			wantOutcome: evidence.OutcomePass,
+		},
+		{
+			name:        "the run spent tokens and recorded no figure",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: false, UnaccountedTurns: 1},
+			wantGrade:   evidence.GradeGap,
+			wantOutcome: evidence.OutcomePass,
+		},
+		{
+			name:        "the run recorded no token figure and no turn reported unaccounted spend",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: false, UnaccountedTurns: 0},
+			wantGrade:   evidence.GradeNotObserved,
+			wantOutcome: evidence.OutcomePrerequisiteFailed,
+		},
+		{
+			name:        "the measured total is below the ceiling",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: true, TotalTokens: 0},
+			wantGrade:   evidence.GradeNotObserved,
+			wantOutcome: evidence.OutcomeFixtureInductionFailed,
+		},
+		{
+			name:        "no figure reached the orchestrator while the run was live",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: true, TotalTokens: 1, FigureTurn: 0},
+			wantGrade:   evidence.GradeGap,
+			wantOutcome: evidence.OutcomePass,
+		},
+		{
+			name:        "a turn began after the run crossed the ceiling",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: true, TotalTokens: 1, FigureTurn: 1, TurnsStarted: 2},
+			wantGrade:   evidence.GradeGap,
+			wantOutcome: evidence.OutcomePass,
+		},
+		{
+			name:        "the run crossed the ceiling on its last turn and ended on its own",
+			condition:   CeilingCondition{RunEnded: true, Status: "succeeded", TokensMeasured: true, TotalTokens: 1, FigureTurn: 2, TurnsStarted: 2},
+			wantGrade:   evidence.GradeNotObserved,
+			wantOutcome: evidence.OutcomeFixtureInductionFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			obs := CeilingStopObservation(tt.condition, sessionID)
+			if obs.Grade != tt.wantGrade {
+				t.Errorf("CeilingStopObservation(%+v) grade = %s, want %s", tt.condition, obs.Grade, tt.wantGrade)
+			}
+			if obs.Outcome != tt.wantOutcome {
+				t.Errorf("CeilingStopObservation(%+v) outcome = %s, want %s", tt.condition, obs.Outcome, tt.wantOutcome)
+			}
+			if tt.wantDetail != "" && obs.Detail != tt.wantDetail {
+				t.Errorf("CeilingStopObservation(%+v) detail = %q, want %q", tt.condition, obs.Detail, tt.wantDetail)
+			}
+			if obs.Detail == "" {
+				t.Errorf("CeilingStopObservation(%+v) detail is empty, want a bounded explanation", tt.condition)
+			}
+			if obs.SessionID != sessionID {
+				t.Errorf("CeilingStopObservation(%+v) session = %q, want %q", tt.condition, obs.SessionID, sessionID)
+			}
+			if err := evidence.CheckObservationAdmitted(obs); err != nil {
+				t.Errorf("CheckObservationAdmitted(CeilingStopObservation(%+v)) error = %v, want nil", tt.condition, err)
+			}
+		})
+	}
+}
+
+func TestDispatchWatchAdd(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ends after the ceilingQuietPolls-th further sample following the hold, with no dispatch", func(t *testing.T) {
+		t.Parallel()
+
+		w := &dispatchWatch{}
+		if w.add(ceilingSample{runs: 1, held: true}) {
+			t.Fatal("add(hold sample) = true, want false: the observation must keep waiting through the quiet window")
+		}
+		for i := range ceilingQuietPolls - 1 {
+			if w.add(ceilingSample{runs: 1}) {
+				t.Fatalf("add(quiet sample %d) = true, want false before the %d-th further sample", i+1, ceilingQuietPolls)
+			}
+		}
+		if !w.add(ceilingSample{runs: 1}) {
+			t.Fatalf("add(the %d-th further sample) = false, want true", ceilingQuietPolls)
+		}
+		if !w.held || w.runs != 1 || w.running {
+			t.Errorf("watch state = %+v, want held with one run and nothing running", w)
+		}
+	})
+
+	t.Run("ends on the first sample showing more than one row, before the hold", func(t *testing.T) {
+		t.Parallel()
+
+		w := &dispatchWatch{}
+		if !w.add(ceilingSample{runs: 2}) {
+			t.Fatal("add(runs=2) = false, want true: more than one recorded run is a dispatch")
+		}
+	})
+
+	t.Run("ends on the first sample showing a running session, inside the quiet window", func(t *testing.T) {
+		t.Parallel()
+
+		w := &dispatchWatch{}
+		if w.add(ceilingSample{runs: 1, held: true}) {
+			t.Fatal("add(hold sample) = true, want false")
+		}
+		if w.add(ceilingSample{runs: 1}) {
+			t.Fatal("add(quiet sample) = true, want false")
+		}
+		if !w.add(ceilingSample{runs: 1, running: true}) {
+			t.Fatal("add(running=true) = false, want true: a session in flight is a dispatch")
+		}
+	})
+
+	t.Run("ends on the window's last sample when it shows a dispatch", func(t *testing.T) {
+		t.Parallel()
+
+		w := &dispatchWatch{}
+		if w.add(ceilingSample{runs: 1, held: true}) {
+			t.Fatal("add(hold sample) = true, want false")
+		}
+		for i := range ceilingQuietPolls - 1 {
+			if w.add(ceilingSample{runs: 1}) {
+				t.Fatalf("add(quiet sample %d) = true, want false", i+1)
+			}
+		}
+		if !w.add(ceilingSample{runs: 2}) {
+			t.Fatal("add(the window's last sample, runs=2) = false, want true: a dispatch on the final tick must still register")
+		}
+		// The dispatch evidence must end the observation before the quiet
+		// window's own bookkeeping runs, so the final sample's dispatch does
+		// not also get counted as a quiet tick.
+		if w.quietPolls != ceilingQuietPolls-1 {
+			t.Errorf("quietPolls after the dispatching final sample = %d, want %d: dispatch evidence must be checked before the quiet window's bookkeeping", w.quietPolls, ceilingQuietPolls-1)
+		}
+	})
+
+	t.Run("never ends while no sample shows the hold or a dispatch", func(t *testing.T) {
+		t.Parallel()
+
+		w := &dispatchWatch{}
+		for i := range ceilingQuietPolls * 3 {
+			if w.add(ceilingSample{runs: 1}) {
+				t.Fatalf("add(sample %d) = true, want false: nothing here shows the hold or a dispatch", i)
+			}
 		}
 	})
 }

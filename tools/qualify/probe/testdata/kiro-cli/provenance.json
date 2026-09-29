@@ -1,46 +1,62 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-09-23T22:27:39Z",
+  "observed_at": "2026-09-28T15:54:02Z",
   "profile_digest": "7841fa2bb9bd5c6af0209bf51b91be42a2c81e8aa851af6b8ca385e310413856",
-  "collector_digest": "e16553df8abc7ce440466d25e4cdb0c97f1fb4c39d008bb05180ce0fd98773f0",
+  "collector_digest": "7f72ccbffbe716f2f3d7db3ce9a7a7a1ea953bced59f1b59e60b191914ea64d7",
   "evidence_file": "evidence.jsonl",
-  "evidence_digest": "08020c1027f8d5940a2f29adb850d0d28eb66db682729181491edb60410887de",
+  "evidence_digest": "6fad20680396ae9490dbcc5eca79df0e5639a7b270094607abcc3be09cab3fef",
   "requested_model": "claude-haiku-4.5",
   "protocol_version": 1,
   "session_agents": {
-    "01269725-9dbb-4919-9a16-db01fabdfed4": {
+    "0490ab10-75aa-46db-9ee9-1013ea9fe05c": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "16efe5dc-e1a0-450c-955b-c732a408dbb8": {
+    "04e76219-2584-438a-b03f-b6727b3f64c2": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "49fa19cf-f85b-4c45-8346-43bf6438edae": {
+    "0bdebd71-ad5a-4564-988e-456d12b38806": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "6a7b0d13-3084-4c64-ba69-3a29d267ce96": {
+    "0e02097a-7876-4bd7-bd9d-e0ddd79fa338": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "88d70798-0721-4bd5-b268-d504fccc0a0c": {
+    "117f7a4c-d387-44bc-ba30-2c606e811f57": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "94d137da-f699-4f8b-87d6-03fd76008c74": {
+    "21100fd0-d077-4b18-bda0-72b55c1cee29": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "b2893638-738b-4b28-9d4f-e2467e6bf699": {
+    "259dcd4e-980a-4b98-95c6-42f2a1522494": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "d59b1937-0ba8-4aa1-a3b9-d139bf85eca1": {
+    "5c74ff22-c769-4330-bc78-4bb4b495b133": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     },
-    "e1228d12-acee-4572-afea-024ab058f320": {
+    "7f052316-c5ca-4f3c-b164-2b526f1e92fd": {
+      "name": "Kiro CLI Agent",
+      "version": "2.21.2"
+    },
+    "a236f99e-1773-4fd5-89aa-a4be198c898e": {
+      "name": "Kiro CLI Agent",
+      "version": "2.21.2"
+    },
+    "b9fd3443-9b7f-402b-9eb2-5ead077cd2dd": {
+      "name": "Kiro CLI Agent",
+      "version": "2.21.2"
+    },
+    "c9bb9b88-0f13-462e-b229-1be028731fa6": {
+      "name": "Kiro CLI Agent",
+      "version": "2.21.2"
+    },
+    "cf3578ac-305b-40b3-b632-ef78dd298e57": {
       "name": "Kiro CLI Agent",
       "version": "2.21.2"
     }

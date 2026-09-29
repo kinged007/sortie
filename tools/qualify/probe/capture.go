@@ -37,6 +37,7 @@ type collectedObservations struct {
 	workspaceSecurity evidence.Observation
 	processCleanup    evidence.Observation
 	endToEnd          evidence.Record
+	ceilingStop       evidence.Observation
 
 	identityObs             evidence.Observation
 	identities              map[string]evidence.SessionIdentity
@@ -299,6 +300,16 @@ func composeLive(p profile.RuntimeProfile, collected collectedObservations, star
 	endToEndRec.EvidencePath = new("/run_history/status")
 	evidence.ApplyObservation(&endToEndRec, endToEndObservation(collected.endToEnd))
 	records = append(records, endToEndRec)
+
+	ceilingStopRec := baseRecord(observedAt)
+	ceilingStopRec.Scenario = evidence.ScenarioCeilingStop
+	ceilingStopRec.Surface = evidence.SurfaceProtocol
+	ceilingStopRec.Capability = evidence.CapabilityTokenCeiling
+	ceilingStopRec.Source = evidence.SourceProcessObservation
+	ceilingStopRec.InputID = evidence.InputCeilingStop
+	ceilingStopRec.EvidencePath = new("/run_history/status")
+	evidence.ApplyObservation(&ceilingStopRec, collected.ceilingStop)
+	records = append(records, ceilingStopRec)
 
 	for _, surface := range measured {
 		records = append(records, composeContinuationRecords(observedAt, surface, collected)...)

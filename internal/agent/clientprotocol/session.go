@@ -39,6 +39,15 @@ const defaultReadTimeout = 30 * time.Second
 // code, returned when the runtime refuses its credential.
 const errorCodeAuthRequired = -32000
 
+// maxSessionStarts bounds how many times startSession may launch the runtime
+// while settling which measurement source, if any, the handshake confirms.
+const maxSessionStarts = 3
+
+const (
+	agentRelaunchedForMeasurementMessage      = "agent relaunched so its token usage can be measured: agent.command does not name the runtime it starts"
+	agentRelaunchedWithoutForeignUsageMessage = "agent relaunched without usage settings meant for another runtime"
+)
+
 // sessionState is this adapter's session state, reached through
 // domain.Session.Internal. Fields set once during StartSession before the pump
 // starts are read-only afterward; fields the pump owns are documented as such.
@@ -101,10 +110,10 @@ type sessionState struct {
 	// concurrent use; the pump goroutine is its only user afterward.
 	usage *agentcore.TurnEndUsage
 
-	// reader is the measurement source that claimed this session's launch, or
-	// nil when none did. Set once before the pump starts; the pump is its only
-	// user afterward, apart from teardown's release of it.
-	reader usageReader
+	// claimed is every source any start of this StartSession claimed, in the
+	// order they claimed. Set on each start's state before its go runPump(state);
+	// read-only afterward. Teardown closes each.
+	claimed []usageReader
 
 	// earlyExit is translateCallError's observation of whether the runtime
 	// exited on its own before this start's connection loss, recorded on the
@@ -184,6 +193,11 @@ type handshakeFacts struct {
 	// toolServersDelivered reports whether the session-creation request carried
 	// at least one tool server.
 	toolServersDelivered bool
+
+	// reader is the confirmed measurement source of this, the final, start, or
+	// nil when none was confirmed. It is the only path by which the pump
+	// receives a source.
+	reader usageReader
 }
 
 // turnStart is what RunTurn publishes to start one turn.
@@ -223,6 +237,13 @@ func readTimeout(state *sessionState) time.Duration {
 // continuation that is not confirmed, creates the session with session/new.
 // The capability record is built before the pump starts, and the pump applies
 // handshake- and continuation-based lowering to it.
+//
+// The runtime may be started more than once: every registered usage source is
+// offered the launch before the first start, and a start whose handshake does
+// not confirm the source it carried, or that lacked the source recognizing
+// the runtime, is torn down and the runtime relaunched carrying only what the
+// handshake supports, up to maxSessionStarts starts in all. Only the final
+// start reaches session/new.
 func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.StartSessionParams, usage *agentcore.TurnEndUsage) (domain.Session, error) {
 	target, agentErr := agentcore.ResolveLaunchTarget(params, "")
 	if agentErr != nil {
@@ -236,133 +257,206 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		return domain.Session{}, agentErr
 	}
 
-	state := &sessionState{
-		target:                 target,
-		agentConfig:            params.AgentConfig,
-		stopCh:                 make(chan struct{}),
-		pumpDone:               make(chan struct{}),
-		logger:                 slog.Default().With(slog.String("component", "clientprotocol-adapter")),
-		origins:                &a.origins,
-		credentialVerification: params.CredentialVerification,
+	sources := a.sources
+	if sources == nil {
+		sources = usagesource.Sources
 	}
-	state.drainGrace = a.drainGrace
-	if state.drainGrace <= 0 {
-		state.drainGrace = procutil.DefaultDrainGrace
-	}
-	state.inbox = jsonrpc.NewInbox[pumpItem]()
 
-	// The reader is chosen before launch because a source needs the launch to
-	// carry its assignments.
-	reader, readerEnv := selectUsageReader(target)
-	state.reader = reader
+	claims := claimUsageSources(sources, target)
+	var claimed []usageReader
+	for _, claim := range claims.claimed {
+		claimed = append(claimed, claim.source)
+	}
 
 	// Every failure below returns without a session, so nothing else releases
-	// what the claim armed.
+	// what a claim armed across every start.
+	var state *sessionState
 	started := false
 	defer func() {
-		if !started {
-			releaseUsageReader(state)
+		if !started && state != nil {
+			releaseUsageSources(state)
 		}
 	}()
 
-	var cmd *exec.Cmd
-	var launch sshutil.SSHLaunch
-	if remote {
-		launch = sshutil.BuildSSHLaunch(target.SSHHost, target.WorkspacePath, target.RemoteCommand, nil, target.SSHOptions())
-		cmd = exec.CommandContext(ctx, target.Command, launch.Args...) //nolint:gosec // args are constructed programmatically with shell quoting
-	} else {
-		cmd = exec.CommandContext(ctx, target.Command, target.Args...) //nolint:gosec // args are constructed programmatically
-	}
-	cmd.Env = append(os.Environ(), readerEnv...)
-	if !remote {
-		if bindErr := target.BindWorkspace(cmd); bindErr != nil {
-			return domain.Session{}, bindErr
+	for start := 1; start <= maxSessionStarts; start++ {
+		var readerEnv []string
+		for _, claim := range claims.claimed {
+			readerEnv = append(readerEnv, claim.assignments...)
 		}
+
+		state = &sessionState{
+			target:                 target,
+			agentConfig:            params.AgentConfig,
+			stopCh:                 make(chan struct{}),
+			pumpDone:               make(chan struct{}),
+			logger:                 slog.Default().With(slog.String("component", "clientprotocol-adapter")),
+			origins:                &a.origins,
+			credentialVerification: params.CredentialVerification,
+			claimed:                claimed,
+		}
+		state.drainGrace = a.drainGrace
+		if state.drainGrace <= 0 {
+			state.drainGrace = procutil.DefaultDrainGrace
+		}
+		state.inbox = jsonrpc.NewInbox[pumpItem]()
+
+		var cmd *exec.Cmd
+		var launch sshutil.SSHLaunch
+		if remote {
+			launch = sshutil.BuildSSHLaunch(target.SSHHost, target.WorkspacePath, target.RemoteCommand, nil, target.SSHOptions())
+			cmd = exec.CommandContext(ctx, target.Command, launch.Args...) //nolint:gosec // args are constructed programmatically with shell quoting
+		} else {
+			cmd = exec.CommandContext(ctx, target.Command, target.Args...) //nolint:gosec // args are constructed programmatically
+		}
+		cmd.Env = append(os.Environ(), readerEnv...)
+		if !remote {
+			if bindErr := target.BindWorkspace(cmd); bindErr != nil {
+				return domain.Session{}, bindErr
+			}
+		}
+		grace := procutil.StopGrace(state.agentConfig.StopGraceMS)
+		procutil.SetGroupCancel(cmd, grace)
+
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stdin pipe", Err: err}
+		}
+		prefixedStdin := launch.PrefixStdin(stdinPipe)
+
+		pipes, err := procutil.StartWithOwnedPipes(cmd, state.logger)
+		if err != nil {
+			var startErr *procutil.StartError
+			if !errors.As(err, &startErr) {
+				return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: err}
+			}
+			// Both pipe stages fail before cmd.Start, whose deferred cleanup would
+			// otherwise close the parent's stdin end, so this closes it instead.
+			switch startErr.Stage {
+			case procutil.StageStdoutPipe:
+				stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
+				return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stdout pipe", Err: startErr.Err}
+			case procutil.StageStderrPipe:
+				stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
+				return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stderr pipe", Err: startErr.Err}
+			default: // procutil.StageProcessStart, procutil.StageProcessResume
+				return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: startErr.Err}
+			}
+		}
+
+		state.pid = cmd.Process.Pid
+		state.stdinCloser = prefixedStdin
+		state.pipes = pipes
+		state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
+
+		state.conn = jsonrpc.NewConn(prefixedStdin, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
+			jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
+
+		// The reap runs independently of the connection's reader: the pipes are
+		// caller-owned, so exec.Cmd.Wait closes neither read end and cannot cut a
+		// reader still consuming buffered output short. Teardown's close_stdout and
+		// close_pipes steps end that reader.
+		reaper := procutil.StartReaper(cmd, state.logger)
+		state.waitCh = reaper.Done()
+		state.reaper = reaper
+
+		// The release ends a handshake call or a turn that would otherwise wait
+		// forever on a reaped runtime whose reader did not end inside the drain
+		// bound. Stderr stays nil: drain_stderr_and_reap and close_pipes already
+		// bound that stream, and moving the bound earlier would change the pinned
+		// teardown ceiling.
+		state.release = procutil.StartOutputRelease(procutil.OutputReleaseParams{
+			Pipes:      pipes,
+			Reaped:     reaper.Done(),
+			ReaderDone: state.conn.Done(),
+			OnAbandon:  state.conn.Close,
+			Grace:      state.drainGrace,
+			Logger:     state.logger,
+		})
+
+		// The capability record is built here, before the pump starts, so the pump
+		// is its sole mutator afterward: StartSession must not touch state.caps past
+		// this point.
+		state.caps = newCapabilityRecord(remote, len(claims.claimed) > 0)
+		state.usage = usage
+
+		// Start the pump before the handshake, so it is the sole mutator of session
+		// protocol state from here on; StartSession publishes what it learns as
+		// control messages rather than writing that state itself.
+		go runPump(state)
+
+		teardownOnFailure := func() {
+			graceCtx, cancel := context.WithTimeout(ctx, grace)
+			defer cancel()
+			runTeardown(state, defaultTeardownOrder(ctx, graceCtx, grace))
+		}
+
+		initResp, agentErr := doInitialize(ctx, state)
+		if agentErr != nil {
+			teardownOnFailure()
+			procutil.EmitWarnLines(state.stderrCollector.Lines(), state.logger)
+			if report := state.earlyExit.Report(state.stderrCollector); report != nil {
+				return domain.Session{}, report
+			}
+			return domain.Session{}, agentErr
+		}
+
+		handshakeName := ""
+		if initResp.AgentInfo != nil {
+			handshakeName = initResp.AgentInfo.Name
+		}
+
+		verdict := settleUsageSources(claims, initResp.AgentInfo, remote)
+
+		var next usageClaims
+		if verdict.confirmed != nil {
+			next.claimed = []usageClaim{*verdict.confirmed}
+		}
+
+		relaunchArmed := false
+		if start == 1 && verdict.recognizer != nil {
+			if assignments, ok := verdict.recognizer.Claim(target, handshakeName); ok {
+				next.claimed = []usageClaim{{source: verdict.recognizer, assignments: assignments}}
+				claimed = append(claimed, verdict.recognizer)
+				relaunchArmed = true
+			}
+		}
+
+		if len(verdict.released) == 0 && !relaunchArmed {
+			session, err := finishSession(ctx, state, params, target, parsedServers, initResp, verdict)
+			started = err == nil
+			return session, err
+		}
+
+		relaunchGraceCtx, cancel := context.WithTimeout(ctx, grace)
+		runTeardown(state, defaultTeardownOrder(ctx, relaunchGraceCtx, grace))
+		cancel()
+		for _, source := range verdict.released {
+			source.Close()
+		}
+		if relaunchArmed {
+			state.logger.Info(agentRelaunchedForMeasurementMessage, slog.String("name", handshakeName))
+		} else {
+			state.logger.Info(agentRelaunchedWithoutForeignUsageMessage, slog.String("name", handshakeName))
+		}
+		claims = next
 	}
+
+	return domain.Session{}, &domain.AgentError{
+		Kind:    domain.ErrPortExit,
+		Message: "agent could not be started with a settled usage source",
+	}
+}
+
+// finishSession completes a final start: negotiating tool servers, creating
+// or continuing the session, and publishing the handshake and session
+// identifier to the pump. verdict.confirmed's source, or nil, becomes the
+// only source the pump ever receives.
+func finishSession(ctx context.Context, state *sessionState, params domain.StartSessionParams, target agentcore.LaunchTarget, parsedServers parsedMCPServers, initResp *initializeResponse, verdict usageVerdict) (domain.Session, error) {
 	grace := procutil.StopGrace(state.agentConfig.StopGraceMS)
-	procutil.SetGroupCancel(cmd, grace)
-
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stdin pipe", Err: err}
-	}
-	prefixedStdin := launch.PrefixStdin(stdinPipe)
-
-	pipes, err := procutil.StartWithOwnedPipes(cmd, state.logger)
-	if err != nil {
-		var startErr *procutil.StartError
-		if !errors.As(err, &startErr) {
-			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: err}
-		}
-		// Both pipe stages fail before cmd.Start, whose deferred cleanup would
-		// otherwise close the parent's stdin end, so this closes it instead.
-		switch startErr.Stage {
-		case procutil.StageStdoutPipe:
-			stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
-			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stdout pipe", Err: startErr.Err}
-		case procutil.StageStderrPipe:
-			stdinPipe.Close() //nolint:errcheck,gosec // best-effort; the pipe error is what the caller needs
-			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to create stderr pipe", Err: startErr.Err}
-		default: // procutil.StageProcessStart, procutil.StageProcessResume
-			return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: startErr.Err}
-		}
-	}
-
-	state.pid = cmd.Process.Pid
-	state.stdinCloser = prefixedStdin
-	state.pipes = pipes
-	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
-
-	state.conn = jsonrpc.NewConn(prefixedStdin, pipes.Stdout, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
-		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(clientProtocolMaxLineBytes))
-
-	// The reap runs independently of the connection's reader: the pipes are
-	// caller-owned, so exec.Cmd.Wait closes neither read end and cannot cut a
-	// reader still consuming buffered output short. Teardown's close_stdout and
-	// close_pipes steps end that reader.
-	reaper := procutil.StartReaper(cmd, state.logger)
-	state.waitCh = reaper.Done()
-	state.reaper = reaper
-
-	// The release ends a handshake call or a turn that would otherwise wait
-	// forever on a reaped runtime whose reader did not end inside the drain
-	// bound. Stderr stays nil: drain_stderr_and_reap and close_pipes already
-	// bound that stream, and moving the bound earlier would change the pinned
-	// teardown ceiling.
-	state.release = procutil.StartOutputRelease(procutil.OutputReleaseParams{
-		Pipes:      pipes,
-		Reaped:     reaper.Done(),
-		ReaderDone: state.conn.Done(),
-		OnAbandon:  state.conn.Close,
-		Grace:      state.drainGrace,
-		Logger:     state.logger,
-	})
-
-	// The capability record is built here, before the pump starts, so the pump
-	// is its sole mutator afterward: StartSession must not touch state.caps past
-	// this point.
-	state.caps = newCapabilityRecord(remote, reader != nil)
-	state.usage = usage
-
-	// Start the pump before the handshake, so it is the sole mutator of session
-	// protocol state from here on; StartSession publishes what it learns as
-	// control messages rather than writing that state itself.
-	go runPump(state)
-
 	teardownOnFailure := func() {
 		graceCtx, cancel := context.WithTimeout(ctx, grace)
 		defer cancel()
 		runTeardown(state, defaultTeardownOrder(ctx, graceCtx, grace))
-	}
-
-	initResp, agentErr := doInitialize(ctx, state)
-	if agentErr != nil {
-		teardownOnFailure()
-		procutil.EmitWarnLines(state.stderrCollector.Lines(), state.logger)
-		if report := state.earlyExit.Report(state.stderrCollector); report != nil {
-			return domain.Session{}, report
-		}
-		return domain.Session{}, agentErr
 	}
 
 	allowHTTP := initResp.AgentCapabilities != nil &&
@@ -406,11 +500,13 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		facts.agentInfo = *initResp.AgentInfo
 		facts.agentInfoPresent = true
 	}
+	if verdict.confirmed != nil {
+		facts.reader = verdict.confirmed.source
+	}
 
 	state.inbox.Put(pumpItem{control: &pumpControl{handshake: facts}})
 	state.inbox.Put(pumpItem{control: &pumpControl{sessionID: sessionID}})
 
-	started = true
 	return domain.Session{
 		ID:       sessionID,
 		AgentPID: strconv.Itoa(state.pid),
@@ -710,7 +806,7 @@ func stopSession(ctx context.Context, session domain.Session) error {
 	graceCtx, cancel := context.WithTimeout(ctx, grace)
 	defer cancel()
 	runTeardown(state, defaultTeardownOrder(ctx, graceCtx, grace))
-	releaseUsageReader(state)
+	releaseUsageSources(state)
 	return nil
 }
 
@@ -749,16 +845,6 @@ func defaultTeardownOrder(callerCtx, graceCtx context.Context, grace time.Durati
 		{name: "drain_stderr_and_reap", run: drainStderrAndReap(callerCtx)},
 		{name: "close_pipes", run: closePipes},
 	}
-}
-
-// releaseUsageReader releases whatever the measurement source armed. It runs
-// after teardown, once the pump has stopped and no drain is still reading what
-// it removes.
-func releaseUsageReader(state *sessionState) {
-	if state.reader == nil {
-		return
-	}
-	state.reader.Close()
 }
 
 func runTeardown(state *sessionState, steps []teardownStep) {

@@ -455,9 +455,10 @@ func decodeLaunchRecords(output string) []map[string]any {
 	}
 }
 
-// ceilingStopUnverified states that no run here can observe a ceiling stop:
-// that enforcement lane belongs to the orchestrator, not this measurer.
-const ceilingStopUnverified = "no max_tokens stop was induced, so ceiling enforcement stays unverified"
+// ceilingStopUnverified qualifies a native-surface token inventory: the
+// ceiling itself is exercised only through the protocol surface's live
+// ceiling step, never on a native surface.
+const ceilingStopUnverified = "no max_tokens stop was induced on this surface"
 
 // tokenWildcard is the TokenPath.Path segment naming a level's dynamic key. A
 // runtime reporting usage per model carries several keys there, all real

@@ -12,7 +12,7 @@ import (
 // evaluatorVersion is the evaluator build that derived a Result. It MUST
 // increment in the same change as any edit that changes what re-deriving a
 // tracked capture yields; Reemit is what fails when it does not.
-const evaluatorVersion = 1
+const evaluatorVersion = 2
 
 // summaryGrade is one surface-capability grade with the exact status label
 // the adapter notes must use for it.
@@ -60,10 +60,9 @@ func notInducibleAccount(reason string) string {
 		return fmt.Sprintf("not induced (%s), so the case stays unmeasured on this surface", reason)
 	case evidence.ExclusionSurfaceSilent:
 		return fmt.Sprintf("induced, and the surface reported no outcome (%s), so the case keeps its obligation", reason)
+	case evidence.ExclusionUninducible:
+		return "no deterministic inducer on any runtime, so the case carries no obligation"
 	case evidence.ExclusionNone:
-	}
-	if reason == evidence.NotInducibleDetail {
-		return "no deterministic inducer, so neither the condition nor the surface's account of it was established"
 	}
 	return fmt.Sprintf("not inducible (%s), a reason no rule covers, so the case keeps its obligation", reason)
 }

@@ -3,6 +3,7 @@ package usagesource
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -269,28 +270,25 @@ func TestGeminiJournalIgnoresAForeignSessionAndAResumedHistory(t *testing.T) {
 	}
 }
 
-func TestGeminiRecognizesOnlyTheMeasuredBuilds(t *testing.T) {
+func TestGeminiRecognizesOnlyTheRuntimeName(t *testing.T) {
 	t.Parallel()
 
 	reader := newGeminiReader()
 	tests := []struct {
-		name    string
-		agent   string
-		version string
-		want    bool
+		name  string
+		agent string
+		want  bool
 	}{
-		{name: "the measured build", agent: "gemini-cli", version: "0.59.0", want: true},
-		{name: "an older build of the same runtime", agent: "gemini-cli", version: "0.58.0"},
-		{name: "a newer build of the same runtime", agent: "gemini-cli", version: "0.60.0"},
-		{name: "another runtime reporting a measured version", agent: "other-cli", version: "0.59.0"},
-		{name: "a handshake that named nothing", agent: "", version: ""},
+		{name: "the runtime's own name", agent: "gemini-cli", want: true},
+		{name: "another runtime's name", agent: "other-cli"},
+		{name: "a handshake that named nothing", agent: ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := reader.Recognize(tt.agent, tt.version); got != tt.want {
-				t.Errorf("Recognize(%q, %q) = %v, want %v", tt.agent, tt.version, got, tt.want)
+			if got := reader.Recognize(tt.agent); got != tt.want {
+				t.Errorf("Recognize(%q) = %v, want %v", tt.agent, got, tt.want)
 			}
 		})
 	}
@@ -302,16 +300,27 @@ func TestGeminiClaimRefusesARemoteLaunch(t *testing.T) {
 	reader := newGeminiReader()
 	t.Cleanup(reader.Close)
 
-	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}); claimed {
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}, ""); claimed {
 		t.Error("Claim(remote) = true, want false")
 	}
 
-	env, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"})
+	env, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, "")
 	if !claimed {
 		t.Fatal("Claim(local) = false, want true")
 	}
-	if len(env) != 3 {
-		t.Errorf("Claim(local) env = %v, want the three assignments the source's own output needs", env)
+	if len(env) != 4 {
+		t.Errorf("Claim(local) env = %v, want the four assignments the source's own output and prompt-logging posture need", env)
+	}
+}
+
+func TestGeminiClaimRefusesARemoteLaunchOnTheRelaunchOffer(t *testing.T) {
+	t.Parallel()
+
+	reader := newGeminiReader()
+	t.Cleanup(reader.Close)
+
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "gemini", SSHHost: "worker"}, geminiAgentName); claimed {
+		t.Error("Claim(remote, gemini-cli) = true, want false: the remote refusal runs before the runtime check")
 	}
 }
 
@@ -319,7 +328,7 @@ func TestGeminiCloseRemovesWhatClaimArmed(t *testing.T) {
 	t.Parallel()
 
 	reader := newGeminiReader()
-	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}); !claimed {
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, ""); !claimed {
 		t.Fatal("Claim(local) = false, want true")
 	}
 	dir := reader.dir
@@ -438,6 +447,26 @@ func apiResponseWithoutCounters(sessionID, model string) string {
 	return string(encoded) + "\n"
 }
 
+// apiResponseMissingCounter builds an authoritative-shape record for sess-a
+// whose attribute block omits missingField.
+func apiResponseMissingCounter(missingField string) string {
+	attrs := map[string]any{
+		"session.id":                 "sess-a",
+		"event.name":                 "gemini_cli.api_response",
+		"model":                      "model-x",
+		"input_token_count":          int64(100),
+		"output_token_count":         int64(10),
+		"cached_content_token_count": int64(5),
+		"thoughts_token_count":       int64(3),
+	}
+	delete(attrs, missingField)
+	encoded, err := json.MarshalIndent(map[string]any{"attributes": attrs}, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded) + "\n"
+}
+
 func journalMessage(id, stamp string, input, output, cached, thoughts int64) string {
 	line := map[string]any{
 		"id":     id,
@@ -445,6 +474,25 @@ func journalMessage(id, stamp string, input, output, cached, thoughts int64) str
 		"model":  "model-x",
 		"tokens": map[string]any{"input": input, "output": output, "cached": cached, "thoughts": thoughts, "tool": 0, "total": input + output + thoughts},
 	}
+	if stamp != "" {
+		line["timestamp"] = stamp
+	}
+	encoded, err := json.Marshal(line)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+// journalMessageMissingCounter builds a journal line for message m1 whose
+// tokens block omits missingField.
+func journalMessageMissingCounter(stamp, missingField string, input, output, cached, thoughts int64) string {
+	tokens := map[string]any{
+		"input": input, "output": output, "cached": cached, "thoughts": thoughts,
+		"tool": int64(0), "total": input + output + thoughts,
+	}
+	delete(tokens, missingField)
+	line := map[string]any{"id": "m1", "type": "gemini", "model": "model-x", "tokens": tokens}
 	if stamp != "" {
 		line["timestamp"] = stamp
 	}
@@ -657,14 +705,166 @@ func TestGeminiWaitsForTheTailOfAMultiRequestTurn(t *testing.T) {
 	}
 }
 
+func TestGeminiARecordSplitAcrossPollsIsCountedOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	reader := newGeminiReader()
+	reader.dir = dir
+	reader.home = filepath.Join(dir, "home")
+	reader.outfile = filepath.Join(dir, "telemetry.json")
+	reader.now = slowClock()
+	reader.Open("sess-a")
+
+	full := apiResponse("sess-a", "model-x", 400, 5, 0, 0, 0, 405)
+	split := len(full) / 2
+	writeOutfile(t, reader, full[:split])
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(250 * time.Millisecond)
+		file, err := os.OpenFile(reader.outfile, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		defer file.Close()             //nolint:errcheck // test handle
+		file.WriteString(full[split:]) //nolint:errcheck,gosec // best effort
+	}()
+	t.Cleanup(func() { <-done })
+
+	recovered, source, found := drain(t, reader, 405)
+	if !found {
+		t.Fatal("Drain() found = false, want the completed record")
+	}
+	if source != geminiSourceTelemetry {
+		t.Errorf("Drain() source = %q, want %q", source, geminiSourceTelemetry)
+	}
+	want := domain.TokenUsage{InputTokens: 400, OutputTokens: 5, TotalTokens: 405}
+	if recovered.Run != want {
+		t.Errorf("Drain() run-cumulative = %+v, want %+v: the record split across polls counts once, not twice or partially",
+			recovered.Run, want)
+	}
+}
+
+func TestGeminiAnUnmappableValueIsSkippedButASyntaxErrorEndsThePass(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		telemetry        []string
+		now              func() time.Time
+		bound            int64
+		wantFound        bool
+		wantSource       string
+		want             domain.TokenUsage
+		wantCompleteness Completeness
+	}{
+		{
+			name: "a complete value of the wrong shape is skipped, and the record after it still counts",
+			telemetry: []string{
+				"[1,2,3]\n",
+				apiResponse("sess-a", "model-x", 100, 10, 0, 0, 0, 110),
+			},
+			now:              steppingClock(),
+			bound:            110,
+			wantFound:        true,
+			wantSource:       geminiSourceTelemetry,
+			want:             domain.TokenUsage{InputTokens: 100, OutputTokens: 10, TotalTokens: 110},
+			wantCompleteness: CompletenessAccounted,
+		},
+		{
+			name: "a syntax error ends the pass, so the record on the other side of it does not count",
+			telemetry: []string{
+				apiResponse("sess-a", "model-x", 50, 5, 0, 0, 0, 55),
+				"@@@ not json @@@\n",
+				apiResponse("sess-a", "model-x", 900, 90, 0, 0, 0, 990),
+			},
+			now:              steppingClock(),
+			bound:            10000,
+			wantFound:        true,
+			wantSource:       geminiSourceTelemetry,
+			want:             domain.TokenUsage{InputTokens: 50, OutputTokens: 5, TotalTokens: 55},
+			wantCompleteness: CompletenessPartial,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			reader := newArmedReader(t, "sess-a")
+			if tt.now != nil {
+				reader.now = tt.now
+			}
+			writeOutfile(t, reader, tt.telemetry...)
+
+			recovered, source, found := drain(t, reader, tt.bound)
+			if found != tt.wantFound {
+				t.Fatalf("Drain() found = %v, want %v", found, tt.wantFound)
+			}
+			if source != tt.wantSource {
+				t.Errorf("Drain() source = %q, want %q", source, tt.wantSource)
+			}
+			if recovered.Run != tt.want {
+				t.Errorf("Drain() run-cumulative = %+v, want %+v", recovered.Run, tt.want)
+			}
+			if got := reader.Completeness(); got != tt.wantCompleteness {
+				t.Errorf("Completeness() = %v, want %v", got, tt.wantCompleteness)
+			}
+		})
+	}
+}
+
+func TestGeminiDrainsARecordAppendedPastAnOversizedOutfile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	reader := newGeminiReader()
+	reader.dir = dir
+	reader.home = filepath.Join(dir, "home")
+	reader.outfile = filepath.Join(dir, "telemetry.json")
+
+	file, err := os.OpenFile(reader.outfile, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("create outfile: %v", err)
+	}
+	const beyondTheJournalBound = geminiMaxJournalBytes + 4096
+	if _, err := file.WriteAt([]byte{0}, beyondTheJournalBound); err != nil {
+		t.Fatalf("sparse-write the outfile past %d bytes: %v", beyondTheJournalBound, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close outfile: %v", err)
+	}
+
+	reader.Open("sess-a")
+	writeOutfile(t, reader, apiResponse("sess-a", "model-x", 100, 10, 0, 0, 0, 110))
+
+	recovered, source, found := drain(t, reader, 1)
+	if !found {
+		t.Fatal("Drain() found = false, want the record appended past the oversized outfile")
+	}
+	if source != geminiSourceTelemetry {
+		t.Errorf("Drain() source = %q, want %q", source, geminiSourceTelemetry)
+	}
+	want := domain.TokenUsage{InputTokens: 100, OutputTokens: 10, TotalTokens: 110}
+	if recovered.Run != want {
+		t.Errorf("Drain() run-cumulative = %+v, want %+v", recovered.Run, want)
+	}
+}
+
 // A zero counter is a measurement only where the turn's own bound reports no
-// spend to contradict it.
+// spend to contradict it. Each of the four mapped counters gates the record
+// independently, so a record missing just one, with the other three present,
+// is what proves that counter's own check rather than the all-absent case
+// every other check would also catch.
 func TestGeminiCountersAbsentOrDefaultedAreNotAMeasurement(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name             string
 		telemetry        []string
+		journal          []string
 		bound            int64
 		wantFound        bool
 		want             domain.TokenUsage
@@ -699,6 +899,46 @@ func TestGeminiCountersAbsentOrDefaultedAreNotAMeasurement(t *testing.T) {
 			want:             domain.TokenUsage{InputTokens: 100, OutputTokens: 10, TotalTokens: 110},
 			wantCompleteness: CompletenessAccounted,
 		},
+		{
+			name:      "telemetry record missing input_token_count alone",
+			telemetry: []string{apiResponseMissingCounter("input_token_count")},
+			bound:     100,
+		},
+		{
+			name:      "telemetry record missing output_token_count alone",
+			telemetry: []string{apiResponseMissingCounter("output_token_count")},
+			bound:     100,
+		},
+		{
+			name:      "telemetry record missing cached_content_token_count alone",
+			telemetry: []string{apiResponseMissingCounter("cached_content_token_count")},
+			bound:     100,
+		},
+		{
+			name:      "telemetry record missing thoughts_token_count alone",
+			telemetry: []string{apiResponseMissingCounter("thoughts_token_count")},
+			bound:     100,
+		},
+		{
+			name:    "journal line missing input alone",
+			journal: []string{journalMessageMissingCounter("2026-01-01T00:00:01Z", "input", 100, 10, 5, 3)},
+			bound:   100,
+		},
+		{
+			name:    "journal line missing output alone",
+			journal: []string{journalMessageMissingCounter("2026-01-01T00:00:01Z", "output", 100, 10, 5, 3)},
+			bound:   100,
+		},
+		{
+			name:    "journal line missing cached alone",
+			journal: []string{journalMessageMissingCounter("2026-01-01T00:00:01Z", "cached", 100, 10, 5, 3)},
+			bound:   100,
+		},
+		{
+			name:    "journal line missing thoughts alone",
+			journal: []string{journalMessageMissingCounter("2026-01-01T00:00:01Z", "thoughts", 100, 10, 5, 3)},
+			bound:   100,
+		},
 	}
 
 	for _, tt := range tests {
@@ -706,6 +946,9 @@ func TestGeminiCountersAbsentOrDefaultedAreNotAMeasurement(t *testing.T) {
 			t.Parallel()
 
 			reader := newSeededReader(t, nil)
+			if len(tt.journal) > 0 {
+				writeJournal(t, reader.home, seededJournalName, append([]string{journalHeader("sess-a")}, tt.journal...))
+			}
 			writeOutfile(t, reader, tt.telemetry...)
 
 			recovered, _, found := drain(t, reader, tt.bound)
@@ -760,6 +1003,15 @@ func TestGeminiJournalBaselineIsTheHistoryPresentAtOpen(t *testing.T) {
 				journalMessage("m1", "2026-01-01T00:00:02Z", 120, 12, 0, 0),
 			},
 			want: domain.TokenUsage{InputTokens: 120, OutputTokens: 12, TotalTokens: 132},
+		},
+		{
+			name:  "a later revision missing a counter does not replace the earlier mapped occurrence",
+			prior: []string{journalMessage("old", "2025-12-31T23:00:00Z", 999, 0, 0, 0)},
+			after: []string{
+				journalMessage("m1", "2026-01-01T00:00:01Z", 100, 10, 0, 0),
+				journalMessageMissingCounter("2026-01-01T00:00:02Z", "cached", 500, 50, 0, 0),
+			},
+			want: domain.TokenUsage{InputTokens: 100, OutputTokens: 10, TotalTokens: 110},
 		},
 	}
 
@@ -913,5 +1165,105 @@ func TestGeminiATurnNothingMeasuredIsStillOwed(t *testing.T) {
 	}
 	if got := reader.Completeness(); got != CompletenessPartial {
 		t.Errorf("second Completeness() = %v, want %v: the first turn's whole bound is still uncovered", got, CompletenessPartial)
+	}
+}
+
+func TestGeminiClaimMatchesTheCommandLineTable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		command string
+		args    string
+		claimed bool
+	}{
+		{"bare executable", "/usr/local/bin/gemini", "--acp", true},
+		{"windows launcher suffix, forward slashes", "C:/Users/u/AppData/Roaming/npm/gemini.cmd", "--acp", true},
+		{"windows launcher suffix, backslashes", `C:\Users\u\AppData\Roaming\npm\gemini.cmd`, "--acp", true},
+		{"versioned npx package", "/usr/bin/npx", "-y @google/gemini-cli@0.61.0 --acp", true},
+		{"node_modules path", "/usr/bin/node", "/usr/lib/node_modules/@google/gemini-cli/dist/index.js --acp", true},
+		{"bundle path as an option value", "/usr/bin/node", "--no-warnings /opt/gemini-cli/bundle/gemini.js --acp", true},
+		{"wrapper script naming it bare", "/tmp/t/capture.sh", "gemini --acp", true},
+		{"preceded by an inline assignment", "/usr/bin/env", "GEMINI_CLI_HOME=/h gemini --acp", true},
+		{"after a double-dash separator", "/usr/bin/mise", "exec -- gemini --acp", true},
+		{"a path option value naming another flag", "/usr/local/bin/copilot", "--acp --add-dir /home/u/src/gemini", true},
+		{"a bare option value with no path separator", "/usr/local/bin/wrapper", "--verbose gemini --acp", false},
+		{"a short-flag option value", "/usr/local/bin/kiro-cli", "acp -a gemini", false},
+		{"a model flag's bare option value", "/usr/local/bin/opencode", "acp --model gemini", false},
+		{"a model flag naming a path-like model id", "/usr/local/bin/opencode", "acp --model google/gemini-2.5-pro", false},
+		{"a model flag naming a version-like model id", "/usr/local/bin/copilot", "--acp --model gemini-3-pro-preview", false},
+		{"a short flag with no value at all", "/usr/local/bin/kiro-cli", "acp -a", false},
+		{"an unrelated scoped package", "/usr/bin/npx", "@zed-industries/claude-code-acp", false},
+		{"a differently named scoped package", "/usr/bin/npx", "@google/gemini-cli-core", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := agentcore.LaunchTarget{Command: tt.command, Args: strings.Fields(tt.args)}
+
+			for _, runtime := range []string{"", geminiAgentName, "other-runtime"} {
+				want := tt.claimed
+				switch runtime {
+				case geminiAgentName:
+					want = true
+				case "other-runtime":
+					want = false
+				}
+
+				reader := newGeminiReader()
+				t.Cleanup(reader.Close)
+
+				env, claimed := reader.Claim(target, runtime)
+
+				if claimed != want {
+					t.Errorf("Claim(%+v, %q) claimed = %v, want %v", target, runtime, claimed, want)
+				}
+				if !claimed {
+					if env != nil {
+						t.Errorf("Claim(%+v, %q) env = %v, want nil on refusal", target, runtime, env)
+					}
+					if reader.dir != "" {
+						t.Errorf("Claim(%+v, %q) created directory %q, want none on refusal", target, runtime, reader.dir)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGeminiCloseRetriesAFailedRemoval(t *testing.T) {
+	t.Parallel()
+
+	reader := newGeminiReader()
+	failedOnce := false
+	reader.remove = func(path string) error {
+		if !failedOnce {
+			failedOnce = true
+			return errors.New("boom")
+		}
+		return os.RemoveAll(path)
+	}
+
+	if _, claimed := reader.Claim(agentcore.LaunchTarget{Command: "gemini", WorkspacePath: "/w"}, ""); !claimed {
+		t.Fatal("Claim(local) = false, want true")
+	}
+	dir := reader.dir
+
+	reader.Close()
+	if reader.dir != dir {
+		t.Errorf("dir after a failed removal = %q, want it kept at %q so a later Close retries it", reader.dir, dir)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("stat directory after a failed removal = %v, want it still present", err)
+	}
+
+	reader.Close()
+	if reader.dir != "" || reader.outfile != "" {
+		t.Errorf("dir=%q outfile=%q after the retried removal succeeds, want both empty", reader.dir, reader.outfile)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("stat directory after the retried removal succeeds = %v, want it removed", err)
 	}
 }

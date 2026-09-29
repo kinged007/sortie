@@ -178,7 +178,6 @@ func runPump(state *sessionState) {
 	p := &pumpState{
 		state:        state,
 		tracker:      agentcore.NewToolTracker(),
-		reader:       state.reader,
 		openRequests: make(map[jsonrpc.ID]string),
 	}
 
@@ -274,6 +273,7 @@ func (p *pumpState) handleControl(ctrl pumpControl) {
 		p.agentInfoPresent = ctrl.handshake.agentInfoPresent
 		p.caps = ctrl.handshake.caps
 		p.toolServersDelivered = ctrl.handshake.toolServersDelivered
+		p.reader = ctrl.handshake.reader
 		p.applyHandshakeCapabilityLowering(ctrl.handshake)
 
 	case ctrl.sessionID != "":
@@ -399,9 +399,6 @@ func (p *pumpState) applyHandshakeCapabilityLowering(facts *handshakeFacts) {
 	}
 	if facts.toolServersWithheld {
 		p.lowerCapability(&p.state.caps.toolServers, capabilityLabelToolServers)
-	}
-	if p.reader != nil && !p.reader.Recognize(facts.agentInfo.Name, facts.agentInfo.Version) {
-		p.dropReader()
 	}
 }
 

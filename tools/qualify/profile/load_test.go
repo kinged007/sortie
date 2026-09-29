@@ -105,6 +105,17 @@ func TestDecodeRuntimeProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("capability_gap_labels empty is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		doc := cloneProfileDoc(t, validProfileDoc())
+		doc["capability_gap_labels"] = []string{}
+		data := marshalProfileDoc(t, doc)
+		if _, err := Decode(data); err != nil {
+			t.Fatalf("Decode(%s) = %v, want nil", data, err)
+		}
+	})
+
 	tests := []struct {
 		name   string
 		mutate func(doc map[string]any)
@@ -152,10 +163,6 @@ func TestDecodeRuntimeProfile(t *testing.T) {
 		{
 			name:   "model_args carrying the model placeholder twice is rejected",
 			mutate: func(doc map[string]any) { doc["model_args"] = []string{"--model", "{model}", "--again", "{model}"} },
-		},
-		{
-			name:   "capability_gap_labels omitting token counts is rejected",
-			mutate: func(doc map[string]any) { doc["capability_gap_labels"] = []string{"agent version"} },
 		},
 		{
 			name: "capability_gap_labels outside the closed set is rejected",

@@ -1,10 +1,10 @@
 {
   "schema_version": 5,
-  "profile_digest": "c953570dbf620f1c35c9af8342f5b93b82187bdebb47cf0eeba539ac15793fdb",
-  "measured_at": "2026-09-23",
+  "profile_digest": "7f0b29afccb02851f9cd373210ac0e7316082d4114524afbb531bee6c7919039",
+  "measured_at": "2026-09-28",
   "expectation": {
-    "Verdict": "not_qualified",
-    "Conformance": "not_qualified",
+    "Verdict": "qualified",
+    "Conformance": "qualified",
     "Grades": [
       {
         "Surface": "protocol",
@@ -95,7 +95,7 @@
       "retry_classification human_input: induced, and the surface reported no outcome (terminal_vocabulary_closed), so the case keeps its obligation",
       "retry_classification human_input: not applicable on protocol: the request offered a refusing option and was answered inside the protocol, so the turn went on and no human-input outcome arose",
       "retry_classification non_retryable_refusal: declared outcome_never_produced",
-      "retry_classification unknown_outcome: no deterministic inducer, so neither the condition nor the surface's account of it was established",
+      "retry_classification unknown_outcome: no deterministic inducer on any runtime, so the case carries no obligation",
       "turn_disposition cancellation: induced, and the surface reported no outcome (terminal_written_at_exit_only), so the case keeps its obligation",
       "turn_disposition limit_reached: not induced (prompt_channel_too_small), so the case stays unmeasured on this surface",
       "turn_disposition runtime_failure: induced, and the surface reported no outcome (output_channel_silent_on_failure), so the case keeps its obligation",
@@ -105,6 +105,6 @@
   },
   "requested_model": "gemini-3.5-flash",
   "observed_model": null,
-  "provenance_digest": "0794cc4a0828ca25588f44d259377d4ab6434b53a71b7ca4d03415d58a0c87ae",
-  "evaluator_version": 1
+  "provenance_digest": "0fb548656cc18cfeed3c9bca1756ffc2086e1840da219798a11fbbb879369aa7",
+  "evaluator_version": 2
 }

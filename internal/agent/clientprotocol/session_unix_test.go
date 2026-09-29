@@ -5,6 +5,7 @@ package clientprotocol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -638,11 +640,11 @@ func TestStartSessionSSH_CarriesEnvironmentVariable(t *testing.T) {
 	const carriedValue = "carried-value-clientprotocol"
 	t.Setenv(carriedName, carriedValue)
 
-	capturePath := filepath.Join(dir, "captured.txt")
+	capturePath := filepath.Join(dir, "captured.jsonl")
 	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
-		Handshake:      true,
-		EnvCaptureName: carriedName,
-		EnvCapturePath: capturePath,
+		Handshake:       true,
+		EnvCaptureNames: []string{carriedName},
+		EnvCapturePath:  capturePath,
 	})
 
 	session, err := startTestSession(context.Background(), &ClientProtocolAdapter{}, domain.StartSessionParams{
@@ -660,12 +662,12 @@ func TestStartSessionSSH_CarriesEnvironmentVariable(t *testing.T) {
 		}
 	})
 
-	got, err := os.ReadFile(capturePath)
-	if err != nil {
-		t.Fatalf("ReadFile(captured.txt): %v", err)
+	captures := readEnvCaptures(t, capturePath)
+	if len(captures) != 1 {
+		t.Fatalf("env captures = %d, want 1", len(captures))
 	}
-	if string(got) != carriedValue {
-		t.Errorf("remote agent observed %q, want %q", string(got), carriedValue)
+	if got := captures[0][carriedName]; got != carriedValue {
+		t.Errorf("remote agent observed %q = %q, want %q", carriedName, got, carriedValue)
 	}
 }
 
@@ -807,5 +809,627 @@ func TestStartSessionLocalLaunchIgnoresSSHEnvNames(t *testing.T) {
 		if gotCwd != wantCwd {
 			t.Errorf("%s: runtime cwd = %q, want the configured workspace %q", tc.name, gotCwd, wantCwd)
 		}
+	}
+}
+
+// readEnvCaptures decodes the JSON-object-per-line file a
+// protocolAgentParams.EnvCaptureNames fixture appends to, one element per
+// process start, in start order.
+func readEnvCaptures(t *testing.T, path string) []map[string]string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+
+	var captures []map[string]string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var capture map[string]string
+		if err := json.Unmarshal([]byte(line), &capture); err != nil {
+			t.Fatalf("decode env capture line %q: %v", line, err)
+		}
+		captures = append(captures, capture)
+	}
+	return captures
+}
+
+// readSequenceCount reports how many times a protocolAgentParams.SequencePath
+// fixture has started, 0 when the file was never created.
+func readSequenceCount(t *testing.T, path string) int {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return len(data)
+}
+
+func assertDirGone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stat %q = %v, want it removed", path, err)
+	}
+}
+
+func hasNoticeContaining(events []domain.AgentEvent, fragment string) bool {
+	for _, event := range events {
+		if event.Type == domain.EventNotification && strings.Contains(event.Message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// awaitSourceOpened polls source.openedSession() until it equals sessionID,
+// failing t if awaitTimeout elapses first: the pump adopts the confirmed
+// source and opens it asynchronously, after startSession has already
+// returned.
+func awaitSourceOpened(t *testing.T, source *scriptedUsageSource, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(awaitTimeout)
+	for time.Now().Before(deadline) {
+		if got := source.openedSession(); got == sessionID {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("source.openedSession() = %q, want %q within %v", source.openedSession(), sessionID, awaitTimeout)
+}
+
+// scriptedUsageSource is a usagesource.Reader test double whose claim and
+// recognition decisions a test scripts directly, so the launch/settle/
+// release cycle can be driven without a real vendor-specific source.
+type scriptedUsageSource struct {
+	mu sync.Mutex
+
+	kind        string
+	root        string
+	claimsFirst bool
+
+	dir        string
+	opened     string
+	closeCalls int
+	recognized []string
+}
+
+func newScriptedUsageSource(kind, root string, claimsFirst bool) *scriptedUsageSource {
+	return &scriptedUsageSource{kind: kind, root: root, claimsFirst: claimsFirst}
+}
+
+func (s *scriptedUsageSource) envName() string {
+	return "SCRIPTED_" + strings.ToUpper(s.kind)
+}
+
+func (s *scriptedUsageSource) dirPath() string {
+	return filepath.Join(s.root, s.kind)
+}
+
+func (s *scriptedUsageSource) Claim(target agentcore.LaunchTarget, offeredRuntime string) ([]string, bool) {
+	if target.RemoteCommand != "" {
+		return nil, false
+	}
+	ok := s.claimsFirst
+	if offeredRuntime != "" {
+		ok = offeredRuntime == s.kind
+	}
+	if !ok {
+		return nil, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := s.dirPath()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, false
+	}
+	s.dir = dir
+	return []string{s.envName() + "=1"}, true
+}
+
+func (s *scriptedUsageSource) Recognize(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recognized = append(s.recognized, name)
+	return name == s.kind
+}
+
+func (s *scriptedUsageSource) Open(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opened = sessionID
+}
+
+func (s *scriptedUsageSource) Drain(context.Context, int64) (agentcore.RecoveredUsage, string, bool) {
+	return agentcore.RecoveredUsage{}, "", false
+}
+
+func (s *scriptedUsageSource) Completeness() usagesource.Completeness {
+	return usagesource.CompletenessUnknown
+}
+
+func (s *scriptedUsageSource) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeCalls++
+	if s.dir == "" {
+		return
+	}
+	if err := os.RemoveAll(s.dir); err != nil {
+		return
+	}
+	s.dir = ""
+}
+
+func (s *scriptedUsageSource) openedSession() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opened
+}
+
+func (s *scriptedUsageSource) recognizedNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.recognized...)
+}
+
+func (s *scriptedUsageSource) closeCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls
+}
+
+// newPrivateUsageRegistry builds a registry fit for ClientProtocolAdapter.sources,
+// holding the given sources under their own kind. It never touches
+// usagesource.Sources, the shared registry every production launch reads.
+func newPrivateUsageRegistry(sources ...*scriptedUsageSource) *registry.Registry[usagesource.Constructor, struct{}] {
+	reg := registry.NewRegistry[usagesource.Constructor, struct{}]("usage source")
+	for _, source := range sources {
+		reg.Register(source.kind, func() usagesource.Reader { return source })
+	}
+	return reg
+}
+
+func TestStartSessionOffersASourceRegisteredOnlyInAPrivateRegistry(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("private_source", root, true)
+	sources := newPrivateUsageRegistry(source)
+
+	dir := t.TempDir()
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:      true,
+		AgentInfoNames: []string{source.kind},
+	})
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	awaitSourceOpened(t, source, session.ID)
+}
+
+func TestStartSessionSettlesToTheSourceTheHandshakeRecognizes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		bClaimsFirst bool
+		wantStarts   int
+	}{
+		{name: "both sources claim the first offer", bClaimsFirst: true, wantStarts: 2},
+		{name: "the second source refuses the first offer", bClaimsFirst: false, wantStarts: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			sourceA := newScriptedUsageSource("source_a", root, true)
+			sourceB := newScriptedUsageSource("source_b", root, tt.bClaimsFirst)
+			sources := newPrivateUsageRegistry(sourceA, sourceB)
+
+			dir := t.TempDir()
+			sequencePath := filepath.Join(dir, "sequence")
+			capturePath := filepath.Join(dir, "env.jsonl")
+			const title = "Source A, Renamed"
+			agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+				Handshake:       true,
+				AgentInfoNames:  []string{sourceA.kind},
+				AgentInfoTitle:  title,
+				SequencePath:    sequencePath,
+				EnvCaptureNames: []string{sourceA.envName(), sourceB.envName()},
+				EnvCapturePath:  capturePath,
+			})
+
+			adapter := &ClientProtocolAdapter{sources: sources}
+			session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+				WorkspacePath: t.TempDir(),
+				AgentConfig:   domain.AgentConfig{Command: agentPath},
+			})
+			if err != nil {
+				t.Fatalf("startSession() error = %v", err)
+			}
+
+			if got := readSequenceCount(t, sequencePath); got != tt.wantStarts {
+				t.Errorf("runtime starts = %d, want %d", got, tt.wantStarts)
+			}
+			for _, name := range sourceA.recognizedNames() {
+				if name != sourceA.kind {
+					t.Errorf("source-a.Recognize() saw %q, want only %q: recognition reads the handshake name, never its title",
+						name, sourceA.kind)
+				}
+			}
+			assertDirGone(t, sourceB.dirPath())
+
+			captures := readEnvCaptures(t, capturePath)
+			if len(captures) != tt.wantStarts {
+				t.Fatalf("env captures = %d, want %d", len(captures), tt.wantStarts)
+			}
+			final := captures[len(captures)-1]
+			if final[sourceA.envName()] == "" {
+				t.Errorf("final start env %q missing, want the confirmed source's assignment", sourceA.envName())
+			}
+			if final[sourceB.envName()] != "" {
+				t.Errorf("final start env %q = %q, want empty: a released source's assignment must not reach the final start",
+					sourceB.envName(), final[sourceB.envName()])
+			}
+			if tt.wantStarts == 2 {
+				first := captures[0]
+				if first[sourceA.envName()] == "" || first[sourceB.envName()] == "" {
+					t.Errorf("first start env = %+v, want both sources' assignments: both claimed that offer", first)
+				}
+			}
+
+			awaitSourceOpened(t, sourceA, session.ID)
+			if got := sourceB.openedSession(); got != "" {
+				t.Errorf("source-b.Open() session = %q, want empty: a released source must never be opened", got)
+			}
+
+			if err := stopSession(context.Background(), session); err != nil {
+				t.Fatalf("stopSession() error = %v", err)
+			}
+			assertDirGone(t, sourceA.dirPath())
+		})
+	}
+}
+
+func TestStartSessionReleasesAClaimedSourceTheHandshakeDoesNotRecognize(t *testing.T) {
+	// Not parallel: installs a process-wide slog default.
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("source_a", root, true)
+	sources := newPrivateUsageRegistry(source)
+
+	dir := t.TempDir()
+	sequencePath := filepath.Join(dir, "sequence")
+	capturePath := filepath.Join(dir, "env.jsonl")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:       true,
+		RespondPrompts:  true,
+		AgentInfoNames:  []string{"unrelated-runtime"},
+		SequencePath:    sequencePath,
+		EnvCaptureNames: []string{source.envName()},
+		EnvCapturePath:  capturePath,
+	})
+
+	var buf syncBuffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	assertDirGone(t, source.dirPath())
+
+	if got := readSequenceCount(t, sequencePath); got != 2 {
+		t.Errorf("runtime starts = %d, want 2", got)
+	}
+	captures := readEnvCaptures(t, capturePath)
+	if len(captures) != 2 {
+		t.Fatalf("env captures = %d, want 2", len(captures))
+	}
+	if got := captures[1][source.envName()]; got != "" {
+		t.Errorf("second start env %q = %q, want empty: the unconfirmed source's assignment must not carry over", source.envName(), got)
+	}
+
+	output := buf.String()
+	if got := strings.Count(output, agentRelaunchedWithoutForeignUsageMessage); got != 1 {
+		t.Errorf("relaunched-without-foreign-usage records = %d, want 1: %s", got, output)
+	}
+	if strings.Count(output, agentRelaunchedForMeasurementMessage) != 0 {
+		t.Errorf("relaunched-for-measurement records present, want none: %s", output)
+	}
+
+	var events []domain.AgentEvent
+	result, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt:  "go",
+		OnEvent: collectEvents(&events),
+	})
+	if runErr != nil {
+		t.Fatalf("RunTurn() error = %v, want nil", runErr)
+	}
+	if result.UsageMeasured {
+		t.Error("result.UsageMeasured = true, want false: no source was confirmed")
+	}
+	if !hasNoticeContaining(events, capabilityLabelTokenCounts) {
+		t.Errorf("no gap notice naming %q; events = %+v", capabilityLabelTokenCounts, events)
+	}
+}
+
+func TestStartSessionReleasesAClaimedSourceWhenTheHandshakeReportsNoAgentInfo(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("source_a", root, true)
+	sources := newPrivateUsageRegistry(source)
+
+	dir := t.TempDir()
+	sequencePath := filepath.Join(dir, "sequence")
+	capturePath := filepath.Join(dir, "env.jsonl")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:       true,
+		SequencePath:    sequencePath,
+		EnvCaptureNames: []string{source.envName()},
+		EnvCapturePath:  capturePath,
+	})
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	if names := source.recognizedNames(); len(names) != 0 {
+		t.Errorf("Recognize() calls = %v, want none: a handshake without agentInfo asks no Recognize", names)
+	}
+	if got := readSequenceCount(t, sequencePath); got != 2 {
+		t.Errorf("runtime starts = %d, want 2", got)
+	}
+	captures := readEnvCaptures(t, capturePath)
+	if len(captures) != 2 {
+		t.Fatalf("env captures = %d, want 2", len(captures))
+	}
+	if got := captures[1][source.envName()]; got != "" {
+		t.Errorf("second start env %q = %q, want empty", source.envName(), got)
+	}
+}
+
+func TestStartSessionRelaunchesForASourceThatOnlyRecognizesTheHandshakeName(t *testing.T) {
+	// Not parallel: installs a process-wide slog default.
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("source_a", root, false)
+	sources := newPrivateUsageRegistry(source)
+
+	dir := t.TempDir()
+	sequencePath := filepath.Join(dir, "sequence")
+	capturePath := filepath.Join(dir, "env.jsonl")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:       true,
+		AgentInfoNames:  []string{source.kind},
+		SequencePath:    sequencePath,
+		EnvCaptureNames: []string{source.envName()},
+		EnvCapturePath:  capturePath,
+	})
+
+	var buf syncBuffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	if got := readSequenceCount(t, sequencePath); got != 2 {
+		t.Errorf("runtime starts = %d, want 2", got)
+	}
+	captures := readEnvCaptures(t, capturePath)
+	if len(captures) != 2 {
+		t.Fatalf("env captures = %d, want 2", len(captures))
+	}
+	if got := captures[0][source.envName()]; got != "" {
+		t.Errorf("first start env %q = %q, want empty: the source refused the first offer", source.envName(), got)
+	}
+	if got := captures[1][source.envName()]; got == "" {
+		t.Errorf("second start env %q missing, want the relaunch's own assignment", source.envName())
+	}
+
+	output := buf.String()
+	if got := strings.Count(output, agentRelaunchedForMeasurementMessage); got != 1 {
+		t.Errorf("relaunched-for-measurement records = %d, want 1: %s", got, output)
+	}
+	if strings.Count(output, agentRelaunchedWithoutForeignUsageMessage) != 0 {
+		t.Errorf("relaunched-without-foreign-usage records present, want none: %s", output)
+	}
+	awaitSourceOpened(t, source, session.ID)
+}
+
+func TestStartSessionStopsAfterASecondUnconfirmedRelaunch(t *testing.T) {
+	// Not parallel: installs a process-wide slog default.
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("source_a", root, false)
+	sources := newPrivateUsageRegistry(source)
+
+	dir := t.TempDir()
+	sequencePath := filepath.Join(dir, "sequence")
+	capturePath := filepath.Join(dir, "env.jsonl")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:       true,
+		AgentInfoNames:  []string{source.kind, "a-different-runtime"},
+		SequencePath:    sequencePath,
+		EnvCaptureNames: []string{source.envName()},
+		EnvCapturePath:  capturePath,
+	})
+
+	var buf syncBuffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	if got := readSequenceCount(t, sequencePath); got != 3 {
+		t.Errorf("runtime starts = %d, want 3 (no fourth start)", got)
+	}
+	captures := readEnvCaptures(t, capturePath)
+	if len(captures) != 3 {
+		t.Fatalf("env captures = %d, want 3", len(captures))
+	}
+	if got := captures[2][source.envName()]; got != "" {
+		t.Errorf("third start env %q = %q, want empty: the source was released after the second start", source.envName(), got)
+	}
+	assertDirGone(t, source.dirPath())
+
+	output := buf.String()
+	if got := strings.Count(output, agentRelaunchedForMeasurementMessage); got != 1 {
+		t.Errorf("relaunched-for-measurement records = %d, want 1: %s", got, output)
+	}
+	if got := strings.Count(output, agentRelaunchedWithoutForeignUsageMessage); got != 1 {
+		t.Errorf("relaunched-without-foreign-usage records = %d, want 1: %s", got, output)
+	}
+}
+
+func TestStartSessionRemoteLaunchNeverOffersARelaunch(t *testing.T) {
+	// Not parallel: sets PATH via t.Setenv.
+
+	root := t.TempDir()
+	source := newScriptedUsageSource("source_a", root, true)
+	sources := newPrivateUsageRegistry(source)
+
+	sshDir := t.TempDir()
+	agenttest.FakeRuntime(t, sshDir, "ssh", scenarioSSHStandIn, sshStandInParams{PATH: sshStandInEnvPath(t, false)})
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dir := t.TempDir()
+	sequencePath := filepath.Join(dir, "sequence")
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:      true,
+		AgentInfoNames: []string{source.kind},
+		SequencePath:   sequencePath,
+	})
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+		SSHHost:       "user@stand-in-host",
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stopSession(context.Background(), session); err != nil {
+			t.Errorf("stopSession() error = %v", err)
+		}
+	})
+
+	if got := readSequenceCount(t, sequencePath); got != 1 {
+		t.Errorf("runtime starts = %d, want 1: a remote launch never relaunches for measurement", got)
+	}
+	if got := source.openedSession(); got != "" {
+		t.Errorf("source.Open() session = %q, want empty: nothing reads a remote runtime's filesystem", got)
+	}
+}
+
+func TestStopSessionClosesEveryClaimedSourceIncludingAReleasedOne(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	sourceA := newScriptedUsageSource("source_a", root, true)
+	sourceB := newScriptedUsageSource("source_b", root, true)
+	sources := newPrivateUsageRegistry(sourceA, sourceB)
+
+	dir := t.TempDir()
+	agentPath := agenttest.FakeRuntime(t, dir, "agent", scenarioProtocolAgent, protocolAgentParams{
+		Handshake:      true,
+		AgentInfoNames: []string{sourceA.kind},
+	})
+
+	adapter := &ClientProtocolAdapter{sources: sources}
+	session, err := startTestSession(context.Background(), adapter, domain.StartSessionParams{
+		WorkspacePath: t.TempDir(),
+		AgentConfig:   domain.AgentConfig{Command: agentPath},
+	})
+	if err != nil {
+		t.Fatalf("startSession() error = %v", err)
+	}
+
+	if got := sourceB.closeCallCount(); got == 0 {
+		t.Error("source-b.Close() calls = 0, want at least 1: a released source must be closed before StartSession returns")
+	}
+	if got := sourceA.closeCallCount(); got != 0 {
+		t.Errorf("source-a.Close() calls = %d, want 0 before StopSession: the confirmed source is only closed at teardown", got)
+	}
+
+	if err := stopSession(context.Background(), session); err != nil {
+		t.Fatalf("stopSession() error = %v", err)
+	}
+
+	if got := sourceA.closeCallCount(); got == 0 {
+		t.Error("source-a.Close() calls = 0, want at least 1 after StopSession")
 	}
 }
