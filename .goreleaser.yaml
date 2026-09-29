@@ -62,32 +62,6 @@ checksum:
 sboms:
   - artifacts: archive
 
-homebrew_casks:
-  - name: sortie
-    binaries:
-      - sortie
-    repository:
-      owner: sortie-ai
-      name: homebrew-tap
-      branch: main
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    directory: Casks
-    commit_author:
-      name: goreleaserbot
-      email: goreleaserbot@users.noreply.github.com
-    commit_msg_template: "chore(cask): update {{ .ProjectName }} to {{ .Tag }}"
-    homepage: "https://github.com/sortie-ai/sortie"
-    description: "Spec-first orchestration service for coding agents"
-    skip_upload: "auto"
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr",
-              args: ["-dr", "com.apple.quarantine", "#{staged_path}/sortie"],
-              must_succeed: false
-          end
-
 changelog:
   sort: asc
   use: git
@@ -116,7 +90,7 @@ changelog:
 
 release:
   github:
-    owner: sortie-ai
+    owner: kinged007
     name: sortie
   name_template: "{{ .ProjectName }} {{ .Version }}"
   footer: |
@@ -124,9 +98,9 @@ release:
 
     ---
 
-    **Full changelog**: https://github.com/sortie-ai/sortie/blob/{{ .Tag }}/CHANGELOG.md
+    **Full changelog**: https://github.com/kinged007/sortie/blob/{{ .Tag }}/CHANGELOG.md
 
-    **Diff**: https://github.com/sortie-ai/sortie/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Diff**: https://github.com/kinged007/sortie/compare/{{ .PreviousTag }}...{{ .Tag }}
   draft: false
   prerelease: auto
   make_latest: true
