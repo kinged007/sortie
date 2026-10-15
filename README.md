@@ -4,15 +4,16 @@
 
 <div align="center">
 
-
 **Your next sprint isn't capped by headcount.**
 
 The open-source coding agent orchestrator.<br/>
 Run the coding agents you already use on tasks from your issue tracker - in parallel, on your own machine or server.
 
-[![CI](https://github.com/sortie-ai/sortie/actions/workflows/ci.yml/badge.svg)](https://github.com/sortie-ai/sortie/actions/workflows/ci.yml)
+[![CI](https://github.com/kinged007/sortie/actions/workflows/ci.yml/badge.svg)](https://github.com/kinged007/sortie/actions/workflows/ci.yml)
+[![CI upstream](https://github.com/sortie-ai/sortie/actions/workflows/ci.yml/badge.svg)](https://github.com/sortie-ai/sortie/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/sortie-ai/sortie/graph/badge.svg?token=K2TPXBCbvb)](https://codecov.io/gh/sortie-ai/sortie)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sortie-ai/sortie.svg)](https://pkg.go.dev/github.com/sortie-ai/sortie)
+[![Release](https://img.shields.io/github/v/release/kinged007/sortie?label=release)](https://github.com/kinged007/sortie/releases)
 
 [Website](https://sortie-ai.com) · [Documentation](https://docs.sortie-ai.com) · [Discord](https://discord.gg/MCNrc8Wf9M) · [Contributing](CONTRIBUTING.md)
 
@@ -20,13 +21,24 @@ Run the coding agents you already use on tasks from your issue tracker - in para
 
 </div>
 
-## The Problem
+## What this fork adds
 
-Coding agents can fix bugs, update dependencies, add tests, and build features. But running agents you trust across a backlog takes more than launching sessions: isolated workspaces, retries, tracker integration, and cost tracking all need to work together.
+> **Fork:** `kinged007/sortie` — 18 commits ahead of [`sortie-ai/sortie`](https://github.com/sortie-ai/sortie). Upstream PRs: **pi adapter** and **github-pr tracker** (see below).
 
-Building and maintaining that infrastructure becomes another engineering project.
+This fork adds two adapters missing upstream so you can run Sortie against a wider set of tools:
 
-Sortie is that infrastructure.
+| Feature | Kind | What it does | Docs / Example |
+|---|---|---|---|
+| **Pi agent** | `agent.kind: pi` | Drives the Pi CLI (`pi -p --mode json`) — one subprocess per turn, JSON event stream normalized to domain events, token usage from `turn_end`, session resume via `--session`, `~/.pi/agent/models.json` credential check. Declares `MCPInjectionUnsupported` (no MCP transport). | [`docs/pi-adapter-notes.md`](docs/pi-adapter-notes.md) · [`examples/WORKFLOW.pi.md`](examples/WORKFLOW.pi.md) |
+| **GitHub PR tracker** | `tracker.kind: github-pr` | Surfaces GitHub pull requests as Sortie issues. Reads from `GET /repos/{owner}/{repo}/pulls` (PRs the issues route omits); writes labels via the Issues routes. `query_filter` is a raw GitHub search-qualifier fragment evaluated server-side. Declares `BlockersUnsupported`. | [`examples/WORKFLOW.github-pr.md`](examples/WORKFLOW.github-pr.md) · Architecture §11.6.5 |
+
+Both adapters are covered by unit tests and conformance tests and ship with Docker examples (`examples/docker/pi.Dockerfile`).
+
+**Upstream PRs:** to be opened against `sortie-ai/sortie` — one per feature, each with tests and docs — so the fork stays rebase-friendly while contributing back.
+
+## What it is
+
+Sortie turns tracker tickets into autonomous agent sessions. You declare which issues to work on, which coding agent to run, and what instructions to give it in one `WORKFLOW.md`; Sortie picks up matching issues, runs agents in parallel in isolated workspaces, retries failures, and tracks cost and history — as a single Go binary with SQLite, no database or queue to deploy.
 
 ## Works With
 
@@ -38,11 +50,65 @@ Sortie is that infrastructure.
 
 ```bash
 curl -sSL https://get.sortie-ai.com/install.sh | sh
+# or build from source
+go install github.com/sortie-ai/sortie/cmd/sortie@latest
+# or
+make build   # produces ./sortie
 ```
 
-Or via Homebrew: `brew install --cask sortie-ai/tap/sortie`
+Homebrew (upstream tap): `brew install --cask sortie-ai/tap/sortie`
 
-Try the [local demo](https://docs.sortie-ai.com/getting-started/quick-start/) with a simulated agent and no external services, or [connect your tracker and coding agent](https://docs.sortie-ai.com/getting-started/).
+Try the [local demo](https://docs.sortie-ai.com/getting-started/quick-start/) with a simulated agent and no external services, or [connect your tracker and agent](https://docs.sortie-ai.com/getting-started/).
+
+## Usage
+
+```bash
+sortie init                  # scaffold WORKFLOW.md
+sortie validate              # check WORKFLOW.md and adapter config
+sortie run                   # start the orchestrator (polls tracker, launches agents)
+sortie stats                 # token and cost totals
+```
+
+Minimal `WORKFLOW.md` with this fork's adapters:
+
+```yaml
+# pi agent + github-pr tracker
+tracker:
+  kind: github-pr
+  api_key: $SORTIE_GITHUB_TOKEN
+  project: myorg/myrepo
+  active_states: [ready-for-agent]
+  terminal_states: [agent-done]
+
+agent:
+  kind: pi
+  # pi reads ~/.pi/agent/models.json; no env credential needed
+```
+
+```yaml
+# pi agent with model/thinking controls
+agent:
+  kind: pi
+  model: claude-opus-4
+  thinking: medium
+  allowed_tools: [read, write, bash]
+```
+
+More examples: [`examples/WORKFLOW.pi.md`](examples/WORKFLOW.pi.md), [`examples/WORKFLOW.github-pr.md`](examples/WORKFLOW.github-pr.md), [`examples/WORKFLOW.md`](examples/WORKFLOW.md). Full reference: [docs.sortie-ai.com](https://docs.sortie-ai.com) and [`docs/workflow-reference.md`](docs/workflow-reference.md).
+
+## How it is tested
+
+```bash
+make check   # lint (golangci-lint x linux/darwin/windows) + go vet + tests + shellcheck
+make test    # go test -race -count=1 ./...
+make test-coverage  # -covermode=atomic, report per package
+```
+
+- **Go:** `go test -race -count=1 ./...` and `go vet ./...` (via `golangci-lint`). CI runs the matrix on `linux`, `darwin`, `windows` plus a `tools/qualify` sub-module check and `shellcheck` for `*.sh`.
+- **Coverage:** uploaded to Codecov on `ubuntu-latest` runs (`coverage.out`, `-covermode=atomic`).
+- **Adapters:** adapter conformance tests in `internal/agent/pi/*_test.go` and `internal/scm/githubpr/*_test.go` drive fake runtimes/APIs; nightly integration tests are env-gated (`SORTIE_<ADAPTER>_TEST=1`).
+
+CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on push to `main` and on pull requests. See also `make help` for all targets.
 
 ## How It Works
 
