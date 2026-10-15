@@ -17,6 +17,7 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/copilot"
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
+	_ "github.com/sortie-ai/sortie/internal/agent/pi"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitea"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitlab"
@@ -248,6 +249,17 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
 				wantEffortForwarding:   registry.EffortForwarded,
+				wantUsageLimit:         registry.UsageLimitRecognized,
+			},
+			{
+				name:                   "pi requires command, declares MCP dialect none, derives turn_end/per_model usage, declares no resume blocker, and declares no credential names",
+				kind:                   "pi",
+				wantCommand:            true,
+				wantMCPDialect:         registry.MCPDialectNone,
+				wantUsageArrival:       registry.UsageArrivalTurnEnd,
+				wantUsageAttribution:   registry.UsageAttributionPerModel,
+				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortNotForwarded,
 				wantUsageLimit:         registry.UsageLimitRecognized,
 			},
 			{
