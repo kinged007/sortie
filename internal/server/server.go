@@ -149,6 +149,9 @@ type IssueGroupQuery struct {
 	// IssueKey keeps the issues with a run whose identifier or display
 	// identifier equals it.
 	IssueKey, Status, StageTarget string
+	// Search keeps the issues with a run whose identifier, display
+	// identifier, or title contains it, ignoring ASCII case.
+	Search string
 	// RuleName nil matches every run; a pointer to "" selects the runs that
 	// record no rule name.
 	RuleName *string

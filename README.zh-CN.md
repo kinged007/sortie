@@ -46,38 +46,40 @@ curl -sSL https://get.sortie-ai.com/install.sh | sh
 
 ## 运行原理
 
-1. 在一个 `WORKFLOW.md` 文件中指定要处理的工单、要运行的智能体，以及给它的指令：
+要做的事情写在一个 `WORKFLOW.md` 文件里就行：处理哪些工单，用哪个智能体，给它什么指令。
 
-  ```markdown
-  ---
-  tracker:
-    kind: github
-    api_key: $GITHUB_TOKEN
-    project: acme/billing-api
-    query_filter: "label:agent-ready"
-    active_states: [todo, in-progress]
-    handoff_state: review
-    terminal_states: [done]
-  
-  agent:
-    kind: claude-code
-    max_concurrent_agents: 4
-  ---
-  
-  You are a senior engineer.
-  
-  ## {{ .issue.identifier }}: {{ .issue.title }}
-  
-  {{ .issue.description }}
-  ```
+```markdown
+---
+tracker:
+  kind: github
+  api_key: $GITHUB_TOKEN
+  project: acme/billing-api
+  query_filter: "label:agent-ready"
+  active_states: [todo, in-progress]
+  handoff_state: review
+  terminal_states: [done]
 
+agent:
+  kind: claude-code
+  max_concurrent_agents: 4
+---
 
-2. Sortie 获取符合条件的工单，并行运行智能体，每个智能体都在独立的工作区中工作。
-3. 运行失败时自动重试。启用 CI 和评审反馈后，检查失败信息和评审意见会传回智能体。
+You are a senior engineer.
 
-运行历史在重启后仍然保留。你可以追踪进度和成本，修改工作流也无需重启 Sortie。
+## {{ .issue.identifier }}: {{ .issue.title }}
 
-Sortie 是一个独立的可执行文件，无需另行部署数据库或任务队列。Sortie 本身不发送遥测数据。
+{{ .issue.description }}
+```
+
+Sortie 会定期查询工单系统，找到符合条件的工单后，为每个工单分配独立的工作区并启动智能体，多个工单同时处理。运行失败会自动重试。如果开启了 CI 和评审反馈，没通过的检查和评审意见会交回给智能体继续修改。
+
+Sortie 运行时可以直接修改 `WORKFLOW.md`，改动会自动生效，不用重启。运行历史在重启后也会保留，进度和成本记录都还在。
+
+进度可以在内置的仪表盘里查看，也可以接入你自己的工具。JSON API（含实时变更推送）、健康探针和 Prometheus 指标都通过同一个端口提供。
+
+不管是笔记本、虚拟机还是 Kubernetes 集群，Sortie 的用法都一样。它提供容器镜像 `ghcr.io/sortie-ai/sortie`，健康探针可以直接用于存活和就绪检查，Pod 停止时也会正常退出。完整的部署步骤见 [Kubernetes 部署指南](https://docs.sortie-ai.com/guides/deploy-sortie-to-kubernetes/)。
+
+Sortie 只有一个可执行文件，不需要另外部署数据库或任务队列，它本身也不发送任何遥测数据。
 
 ## 文档
 

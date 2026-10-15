@@ -57,11 +57,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The JSON API (`/api/v1/state`) now describes the tracker poll in a plain English sentence, `health.poll.summary_text`, for example how many polls in a row failed and how long ago one last succeeded. ([#1300](https://github.com/sortie-ai/sortie/issues/1300))
 
+- The dashboard has an issue page: where the issue stands on its way from the tracker through the agent to its handoff state and pull request reactions, its place in its stage chain, its runs grouped by stage, each reaction its pull request waits on, its spend against its token and session budgets, its route, and what happens next, with Retry now, Check now, and Acknowledge beside the state they act on. It opens from Overview, History, and the command palette, which now finds active and finished issues by any part of the key or the title, and `/api/v1/{identifier}` names the stage chain a finished issue last stood on. ([#1297](https://github.com/sortie-ai/sortie/issues/1297))
+
+- The dashboard has a Pipeline screen that draws every active issue, and every issue that ended today, as a lane across the same stations, from the tracker through the agent and the handoff state to each pull request reaction and the end: how many issues stand at each station, how long each has stood at its own, which reactions wait or escalated, and how far a chained issue has come through its stages. Issues that need a person stand out, a busy day folds the lanes into one line per station, `L` switches between Overview and Pipeline, and each run on `/api/v1/runs` now names the stage chain its rule stands on. ([#1298](https://github.com/sortie-ai/sortie/issues/1298))
+
 ### Changed
 
 - The JSON API now reports a budget-held issue's unset token and session limits as `null` instead of `0`, and its token count as `null` when its sessions reported no token usage, as it does for running issues; the budget-hold comment and its Slack and webhook messages show that count as "not measured" instead of `0`, and put "at least" before a count that leaves out unreported spend. ([#1315](https://github.com/sortie-ai/sortie/issues/1315))
 
 - The built-in dashboard is now a live application at `/ui/` that opens on a headline saying whether anything needs a person, then lists each item with why, what clears it, and a button to acknowledge it, then every active issue in the order Sortie picked it up (the same order in every tab and after a reload) and the issues that ended today; `/` redirects there. ([#1296](https://github.com/sortie-ai/sortie/issues/1296), [#1348](https://github.com/sortie-ai/sortie/issues/1348))
+
+- The `tick completed` poll summary now logs at INFO level only on the first poll after startup and when it differs from the previous poll's, so an idle Sortie no longer repeats the same line every poll interval; `--log-level debug` still shows it on every poll. ([#1350](https://github.com/sortie-ai/sortie/issues/1350))
+
+- `sortie stats` and the dashboard's Analytics screen now break runs down by the model the agent reported running, falling back to the configured model only when the agent reported none, so runs left to the agent's default model are counted under that model's name instead of one shared "no model" row.
 
 ### Fixed
 
@@ -94,6 +102,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The last message shown for a running `agent-client-protocol` agent is now its whole latest message instead of the last fragment it streamed. ([#1353](https://github.com/sortie-ai/sortie/issues/1353))
 
 - The username in a tracker or tool server URL is now masked in logs and in the JSON API (`/api/v1/state`). A tracker request error used to print it beside the hidden password. ([#1300](https://github.com/sortie-ai/sortie/issues/1300))
+
+- After a fix command session pushes to a pull request, Sortie again watches that pull request's CI and bot reviews. A CI failure or a new bot review on the pushed commit used to go unnoticed. ([#1368](https://github.com/sortie-ai/sortie/issues/1368))
+
+- A Claude Code run that ends on a message Claude Code writes itself, such as an API error notice, now keeps the model that did the work as its reported model. It used to be recorded as `<synthetic>`, so `sortie stats` and the Analytics screen counted that run under `<synthetic>` instead of its model. Runs recorded before the fix keep `<synthetic>`.
 
 ### Migrations
 

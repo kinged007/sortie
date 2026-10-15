@@ -252,6 +252,7 @@ export interface IssueHistoryResponse {
   next_cursor: string | null;
   totals: HistoryTotalsResponse;
   hops: HopDecisionResponse[] | null;
+  last_stage: LastStageResponse | null;
   issue_outcome: IssueOutcomeResponse | null;
 }
 
@@ -271,6 +272,11 @@ export interface IssueResponse {
   issue_type?: string;
   labels?: string[];
   state?: string;
+}
+
+export interface LastStageResponse {
+  chain: string[] | null;
+  rule: string;
 }
 
 export interface NextOutcomeResponse {
@@ -472,6 +478,7 @@ export interface RunResponse {
   reaction_config_key: string | null;
   session_id: string | null;
   ssh_host: string | null;
+  stage_chain: string[] | null;
   issue_outcome: IssueOutcomeResponse | null;
 }
 

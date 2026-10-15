@@ -42,7 +42,8 @@ export function linkActionOf(item: AttentionItemResponse): LinkAction | null {
   return null;
 }
 
-function failureMessage(error: unknown): string {
+/** Gives the toast text for a failed call: the served message, or the no-answer text. */
+export function failureMessage(error: unknown): string {
   if (!(error instanceof ApiError) || error.status === 0) {
     return NO_ANSWER;
   }

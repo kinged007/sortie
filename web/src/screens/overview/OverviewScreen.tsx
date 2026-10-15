@@ -1,15 +1,17 @@
 import { useIsFetching } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router";
+import { useLocation, useNavigate, useSearchParams } from "react-router";
 
 import { ApiError } from "@/api/client";
 import { useEndedQuery, useFirstRunQuery, useStateQuery, useTallyQuery } from "@/api/queries";
 import { useHold, useLive, useNow } from "@/app/live";
 import { useShortcuts } from "@/app/keys";
+import { useAttentionActions } from "@/components/use-attention-actions";
 import { usePeek } from "@/components/use-peek";
 import { activeRows, filterRows } from "@/lib/active-rows";
 import { condition } from "@/lib/condition";
 import { buildEnded } from "@/lib/ended";
+import { issueLinkOf } from "@/lib/issue-link";
 import { localMidnight } from "@/lib/server-clock";
 import { tallyLine } from "@/lib/tally";
 import { attentionKey, endedKey, pruneRead, useReadSet } from "@/lib/unread";
@@ -21,7 +23,6 @@ import { EndedToday } from "./EndedToday";
 import { Headline } from "./Headline";
 import { buildHeadline } from "./headline";
 import { activeNavKey, attentionNavKey, endedNavKey } from "./rows";
-import { useAttentionActions } from "./use-attention-actions";
 
 import type { AttentionItemResponse, Report, RunsResponse, StateResponse } from "@/api/types.gen";
 import type { Binding } from "@/app/keys";
@@ -71,6 +72,7 @@ interface OverviewBodyProps {
 
 function OverviewBody({ state }: OverviewBodyProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const [params] = useSearchParams();
   const { identifier: peekIdentifier, open, follow, close } = usePeek();
   const { paused } = useLive();
@@ -222,7 +224,8 @@ function OverviewBody({ state }: OverviewBodyProps) {
   function handleOpenPage() {
     const identifier = peekIdentifier ?? selected?.identifier;
     if (identifier) {
-      void navigate(`/issues/${encodeURIComponent(identifier)}`);
+      const link = issueLinkOf(identifier, location);
+      void navigate(link.to, { state: link.state });
     }
   }
 
@@ -292,10 +295,11 @@ function OverviewBody({ state }: OverviewBodyProps) {
         />
       ) : view.isFirstRun === false && condition(view.state) !== "degraded" ? (
         <CalmState
-          running={view.state.counts.running}
-          endedCount={endedAll.length}
-          lastEndedAt={endedAll[0]?.outcome.observed_at ?? null}
-          runsFinished={view.tally?.summary.runs}
+          runningSince={(view.state.running ?? []).map((entry) => entry.started_at)}
+          maxAgents={config?.agent.max_concurrent_agents}
+          ended={endedAll}
+          runs={view.tally?.summary}
+          now={view.now}
         />
       ) : undefined}
       <ActiveList

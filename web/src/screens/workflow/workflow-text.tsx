@@ -1,6 +1,6 @@
 import { Fragment } from "react";
 
-import { Badge } from "@/components/ui/badge";
+import { TrackerLabel } from "@/components/TrackerLabel";
 import { fmtDuration } from "@/lib/format";
 
 import type { ShapeMatch, ShapePriority, ShapeRule } from "@/api/types.gen";
@@ -20,10 +20,10 @@ export function Code({ children }: CodeProps) {
   );
 }
 
-/** Renders each tracker label as a {@link Badge}, joined by a separator text. */
-export function joinBadges(labels: readonly string[], separator: string): ReactNode {
+/** Renders each tracker label as a {@link TrackerLabel}, joined by a separator text. */
+export function joinLabels(labels: readonly string[], separator: string): ReactNode {
   return joinNodes(
-    labels.map((label) => <Badge key={label}>{label}</Badge>),
+    labels.map((label) => <TrackerLabel key={label}>{label}</TrackerLabel>),
     separator,
   );
 }
@@ -70,7 +70,7 @@ function priorityClause({ op, value, values }: ShapePriority): ReactNode {
 function matchClauses(match: ShapeMatch): ReactNode[] {
   const clauses: ReactNode[] = [];
   if (match.labels !== undefined && match.labels.length > 0) {
-    clauses.push(joinBadges(match.labels, " or "));
+    clauses.push(joinLabels(match.labels, " or "));
   }
   if (match.issue_type !== undefined && match.issue_type.length > 0) {
     clauses.push(`issue type ${match.issue_type.join(" or ")}`);
@@ -94,7 +94,11 @@ function matchClauses(match: ShapeMatch): ReactNode[] {
 export function selectionText(rule: Pick<ShapeRule, "selected_by" | "stage" | "match">): ReactNode {
   switch (rule.selected_by) {
     case "stage":
-      return rule.stage === undefined ? rule.selected_by : <Badge>{rule.stage}</Badge>;
+      return rule.stage === undefined ? (
+        rule.selected_by
+      ) : (
+        <TrackerLabel>{rule.stage}</TrackerLabel>
+      );
     case "catch_all":
       return "as the catch-all";
     case "match": {
@@ -128,7 +132,7 @@ export function msText(ms: number): string {
 export function escalationText(escalation: string, label: string | undefined): ReactNode {
   switch (escalation) {
     case "label":
-      return label === undefined ? "label" : <Badge>{label}</Badge>;
+      return label === undefined ? "label" : <TrackerLabel>{label}</TrackerLabel>;
     case "none":
       return "—";
     default:

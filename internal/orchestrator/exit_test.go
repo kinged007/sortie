@@ -8216,6 +8216,43 @@ func TestHandleWorkerExit_LabelFixExit_NoHandoff(t *testing.T) {
 	}
 }
 
+func TestHandleWorkerExit_LabelFixExit_RearmsHeadWatches(t *testing.T) {
+	t.Parallel()
+
+	wsPath := t.TempDir()
+	writePRSCMMetadata(t, wsPath, 5, "corp", "api", "feature/LF-RA-1", "c0ffee")
+
+	store := &mockExitStore{}
+	state := exitStateWithIssue(t, "LF-RA-1", "Human Review")
+	state.Running["LF-RA-1"].ReactionKind = ReactionKindLabelFix
+
+	params := defaultExitParams(t, store)
+	params.TrackerAdapter = &mockTrackerAdapter{}
+	params.HandoffState = "Human Review"
+	params.ActiveStates = []string{"In Progress"}
+	params.CIProvider = &ciProviderStubExit{}
+	params.SCMAdapter = &scmAdapterStubExit{}
+	params.BotReviewReactionConfigured = true
+	params.LabelFixReactionConfigured = true
+
+	HandleWorkerExit(state, WorkerResult{
+		IssueID:       "LF-RA-1",
+		Identifier:    "LF-RA-1-ident",
+		ExitKind:      WorkerExitNormal,
+		AgentAdapter:  "mock",
+		WorkspacePath: wsPath,
+	}, params)
+
+	for _, kind := range []string{ReactionKindCI, ReactionKindBotReview} {
+		if _, ok := state.PendingReactions[ReactionKey("LF-RA-1", kind)]; !ok {
+			t.Errorf("no %s watch after a fix exit; a failure on the pushed head would go unnoticed", kind)
+		}
+	}
+	if _, ok := state.PendingReactions[ReactionKey("LF-RA-1", ReactionKindLabelFix)]; ok {
+		t.Error("label-fix entry re-seeded by its own exit; want none (repeatability comes from the reconcile re-enqueue)")
+	}
+}
+
 func TestHandleWorkerExit_LabelFixExit_ErrorStillRetries(t *testing.T) {
 	t.Parallel()
 

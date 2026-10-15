@@ -3,6 +3,7 @@ import { Fragment } from "react";
 import { ArrowRightIcon } from "@/components/icons";
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
+import { StateBadge } from "@/components/StateBadge";
 
 import { CELL, Code, Note, selectionText, Table } from "./workflow-text";
 
@@ -150,7 +151,7 @@ function ChainList({ plan, rules, handoff, hasReactions }: ChainListProps) {
         key="handoff"
         marker={<ArrowRightIcon />}
         hasNext={false}
-        title={handoff}
+        title={<StateBadge state={handoff} />}
         detail={`Handoff state, then ${hasReactions ? "the reactions take over" : "a person takes it from there"}`}
       />
     ) : (

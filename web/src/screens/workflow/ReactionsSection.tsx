@@ -1,7 +1,7 @@
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
 
-import { CELL, escalationText, joinBadges, Table } from "./workflow-text";
+import { CELL, escalationText, joinLabels, Table } from "./workflow-text";
 
 import type { ShapeReactions } from "@/api/types.gen";
 import type { ReactNode } from "react";
@@ -81,7 +81,7 @@ function reactionRows(reactions: ShapeReactions): Row[] {
     );
     rows.push({
       kind: "label_commands",
-      limit: labels.length === 0 ? "—" : joinBadges(labels, " "),
+      limit: labels.length === 0 ? "—" : joinLabels(labels, " "),
       escalation: "—",
     });
   }

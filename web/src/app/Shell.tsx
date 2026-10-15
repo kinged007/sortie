@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Outlet, useMatch, useNavigate } from "react-router";
+import { Outlet, useLocation, useMatch, useNavigate, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { ApiError, postRefresh } from "@/api/client";
@@ -13,11 +13,14 @@ import { NarrowBar } from "@/app/NarrowBar";
 import { Rail } from "@/app/Rail";
 import { ShortcutsDialog } from "@/app/ShortcutsDialog";
 import { TopBar } from "@/app/TopBar";
+import { activeViewPath } from "@/components/ActiveHead";
 import { IssuePeek } from "@/components/IssuePeek";
 import { toast, Toaster } from "@/components/toaster";
 import { usePeek } from "@/components/use-peek";
+import { cn } from "@/lib/cn";
 import { condition } from "@/lib/condition";
 import { buildEnded } from "@/lib/ended";
+import { backOf } from "@/lib/issue-link";
 import { localMidnight, now } from "@/lib/server-clock";
 import { cycleTheme } from "@/lib/theme";
 import { attentionKey, endedKey, markRead } from "@/lib/unread";
@@ -43,9 +46,12 @@ function ShellFrame({ screens }: ShellFrameProps) {
   const { data, status } = useStateQuery();
   const { togglePause, versionNotice, dismissVersionNotice } = useLive();
   const navigate = useNavigate();
+  const { state: routeState } = useLocation();
   const client = useQueryClient();
   const peek = usePeek();
+  const [search] = useSearchParams();
   const isOverview = useMatch("/") !== null;
+  const isPipeline = useMatch("/pipeline") !== null;
   const isIssueRoute = useMatch("/issues/:identifier") !== null;
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
@@ -104,7 +110,7 @@ function ShellFrame({ screens }: ShellFrameProps) {
     if (peek.identifier !== null) {
       peek.close();
     } else if (isIssueRoute) {
-      void navigate("/");
+      void navigate(backOf(routeState));
     }
   };
 
@@ -114,10 +120,19 @@ function ShellFrame({ screens }: ShellFrameProps) {
     }
   };
 
+  const handleSwitchView = () => {
+    if (isOverview) {
+      void navigate(activeViewPath("pipeline", search));
+    } else if (isPipeline) {
+      void navigate(activeViewPath("list", search));
+    }
+  };
+
   const bindings: Binding[] = [
     { keys: ["r"], run: whenIdle(() => void handleRefresh()) },
     { keys: ["p"], run: whenIdle(handleTogglePause) },
     { keys: ["t"], run: whenIdle(() => void cycleTheme()) },
+    { keys: ["l"], run: whenIdle(handleSwitchView) },
     { keys: ["u"], shift: true, run: whenIdle(handleMarkAllRead) },
     {
       keys: ["?"],
@@ -154,9 +169,15 @@ function ShellFrame({ screens }: ShellFrameProps) {
       />
       <div className="min-w-0">
         <NarrowBar onOpenPalette={handleOpenPalette} />
-        <div className="mx-auto w-full max-w-[calc(var(--container-wide)+2*var(--spacing-xxxl))] px-xxxl pt-xl pb-xxxl max-xl:px-lg max-md:px-md max-md:pt-md">
+        <div
+          className={cn(
+            "mx-auto w-full px-xxxl pt-xl pb-xxxl max-xl:px-lg max-md:px-md max-md:pt-md",
+            !isPipeline && "max-w-[calc(var(--container-wide)+2*var(--spacing-xxxl))]",
+          )}
+        >
           <TopBar
-            isHolding={isOverview && peek.identifier !== null}
+            screens={screens}
+            isHolding={(isOverview || isPipeline) && peek.identifier !== null}
             onTogglePause={handleTogglePause}
             onOpenPalette={handleOpenPalette}
           />

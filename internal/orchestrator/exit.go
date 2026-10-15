@@ -989,13 +989,18 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// A made hop leaves the issue active on its next stage, which owns any
 		// reaction from here on, so the run that hopped seeds none.
 		reactionEnqueueAllowed := claimedAtExit && (handoffPath || stillClaimed) && !terminalSuppressed && !hopMade
+		// A fix session leaves the issue in the handoff state and releases
+		// its claim, but its push gives the pull request a new head, so the
+		// watches keyed on that head must start over.
+		fixExit := claimedAtExit && dispatchPostureForReactionKind(entry.ReactionKind) == PostureFix && !blockedSoftStop && !terminalSuppressed
+		headWatchesAllowed := reactionEnqueueAllowed || fixExit
 
 		// Seed a pending CI check when CI provider and SCM adapter are both
 		// configured and the workspace carries PR identity: the reaction
 		// cannot resolve a head for a branch with no PR. Handoff paths stay
 		// eligible even after the claim is released.
 		if params.CIProvider != nil && params.SCMAdapter != nil && workerResult.WorkspacePath != "" {
-			if reactionEnqueueAllowed {
+			if headWatchesAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Owner != "" && scm.Repo != "" && scm.Branch != "" {
 					nowCI := time.Now().UTC()
@@ -1045,7 +1050,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// flag any other SCM-backed reaction would also seed a review entry,
 		// whose zero-valued config escalates the first actionable comment.
 		if params.SCMAdapter != nil && params.ReviewReactionConfigured && workerResult.WorkspacePath != "" {
-			if reactionEnqueueAllowed {
+			if headWatchesAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Branch != "" && scm.Owner != "" && scm.Repo != "" {
 					nowReview := time.Now().UTC()
@@ -1088,7 +1093,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// bot-review is enabled, and the workspace has PR metadata.
 		// Independent of the review-kind enqueue: both fire from the same exit.
 		if params.SCMAdapter != nil && params.BotReviewReactionConfigured && workerResult.WorkspacePath != "" {
-			if reactionEnqueueAllowed {
+			if headWatchesAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Branch != "" && scm.Owner != "" && scm.Repo != "" {
 					nowBotReview := time.Now().UTC()
@@ -1129,7 +1134,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// Seed a pending auto-merge entry when the SCM adapter is configured,
 		// auto-merge is enabled, and the workspace has PR metadata.
 		if params.SCMAdapter != nil && params.AutoMergeReactionConfigured && workerResult.WorkspacePath != "" {
-			if reactionEnqueueAllowed {
+			if headWatchesAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Branch != "" && scm.Owner != "" && scm.Repo != "" {
 					nowMerge := time.Now().UTC()
@@ -1171,7 +1176,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// configured, merge-conflict is enabled, and the workspace has PR
 		// metadata.
 		if params.SCMAdapter != nil && params.MergeConflictReactionConfigured && workerResult.WorkspacePath != "" {
-			if reactionEnqueueAllowed {
+			if headWatchesAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Branch != "" && scm.Owner != "" && scm.Repo != "" {
 					nowMergeConflict := time.Now().UTC()
@@ -1255,8 +1260,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// Seed a pending label-fix entry when the SCM adapter is configured,
 		// label-fix is enabled, and the workspace has PR metadata with a head
 		// branch (the fix session checks it out). A fix session's own exit
-		// never seeds (reactionEnqueueAllowed is false); repeatability comes
-		// from the reconcile re-enqueue on dispatch.
+		// never seeds it; repeatability comes from the reconcile re-enqueue
+		// on dispatch.
 		if params.SCMAdapter != nil && params.LabelFixReactionConfigured && workerResult.WorkspacePath != "" {
 			if reactionEnqueueAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)

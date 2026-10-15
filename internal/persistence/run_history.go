@@ -499,6 +499,10 @@ type IssueGroupFilter struct {
 	// display_identifier equals it.
 	IssueKey string
 
+	// Search keeps the issues with a run whose identifier,
+	// display_identifier, or issue_title contains it, ignoring ASCII case.
+	Search string
+
 	// RuleName nil matches every run; a pointer to "" selects the runs whose
 	// rule_name is empty.
 	RuleName    *string
@@ -535,13 +539,15 @@ func (s *Store) QueryIssueGroups(ctx context.Context, f IssueGroupFilter) ([]Iss
 		if err != nil {
 			return nil, err
 		}
-		if len(ids) == 0 {
-			return []IssueGroup{}, nil
-		}
 		keyed = ids
+	}
+	if f.IssueKey != "" && len(keyed) == 0 {
+		return []IssueGroup{}, nil
 	}
 	return s.streamIssueGroups(ctx, f, keyed)
 }
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // issueIDsByKey returns the issues with a run whose identifier or
 // display_identifier equals key, and closes its statement before it returns.
@@ -570,7 +576,7 @@ func (s *Store) issueIDsByKey(ctx context.Context, key string) ([]string, error)
 }
 
 // issueGroupRunPredicates returns the fixed predicates of f's rule, status,
-// and stage on the run_history table aliased as alias, with their bound
+// stage, and search on the run_history table aliased as alias, with their bound
 // values.
 func issueGroupRunPredicates(alias string, f IssueGroupFilter) ([]string, []any) {
 	var conds []string
@@ -586,6 +592,14 @@ func issueGroupRunPredicates(alias string, f IssueGroupFilter) ([]string, []any)
 	if f.StageTarget != "" {
 		conds = append(conds, alias+".stage_target = ?")
 		args = append(args, f.StageTarget)
+	}
+	if f.Search != "" {
+		pattern := "%" + likeEscaper.Replace(f.Search) + "%"
+		conds = append(conds, alias+`.issue_id IN (SELECT issue_id FROM run_history
+			WHERE identifier LIKE ? ESCAPE '\'
+				OR display_identifier LIKE ? ESCAPE '\'
+				OR issue_title LIKE ? ESCAPE '\')`)
+		args = append(args, pattern, pattern, pattern)
 	}
 	return conds, args
 }

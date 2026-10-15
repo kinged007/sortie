@@ -799,7 +799,7 @@ func TestQueryRunHistory_Paging(t *testing.T) {
 }
 
 type issueGroupSeed struct {
-	issue, identifier, display, status string
+	issue, identifier, display, status, title string
 }
 
 func TestQueryIssueGroups(t *testing.T) {
@@ -851,6 +851,18 @@ func TestQueryIssueGroups(t *testing.T) {
 			filter:    IssueGroupFilter{IssueKey: "OLD-1", Limit: 10},
 			wantPages: [][]string{{"A:3"}},
 		},
+		{
+			name:      "search text matches part of a key or a title in any case",
+			seeds:     []issueGroupSeed{{issue: "A", identifier: "BP-701"}, {issue: "B", identifier: "BP-810", title: "Fix the Retry banner"}, {issue: "C", identifier: "BP-702"}},
+			filter:    IssueGroupFilter{Search: "retry", Limit: 10},
+			wantPages: [][]string{{"B:2"}},
+		},
+		{
+			name:      "search text treats a percent sign as a literal",
+			seeds:     []issueGroupSeed{{issue: "A", identifier: "BP-1", title: "Cut cost 50%"}, {issue: "B", identifier: "BP-2", title: "Cut cost 50 times"}},
+			filter:    IssueGroupFilter{Search: "50%", Limit: 10},
+			wantPages: [][]string{{"A:1"}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -867,6 +879,7 @@ func TestQueryIssueGroups(t *testing.T) {
 				run.IssueID = seed.issue
 				run.Identifier = cmp.Or(seed.identifier, "PROJ-"+seed.issue)
 				run.DisplayID = seed.display
+				run.IssueTitle = seed.title
 				run.Status = cmp.Or(seed.status, "succeeded")
 				ids = append(ids, appendOrFatal(t, s, run).ID)
 			}

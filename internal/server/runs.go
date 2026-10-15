@@ -76,6 +76,10 @@ type runResponse struct {
 	SessionID            *string             `json:"session_id"`
 	SSHHost              *string             `json:"ssh_host"`
 
+	// StageChain is the chain the run's rule stood on; null when the run has
+	// no rule, its rule is on no chain, or no workflow shape is held.
+	StageChain []string `json:"stage_chain"`
+
 	// IssueOutcome is the issue's, the same on every run of the issue.
 	IssueOutcome *issueOutcomeResponse `json:"issue_outcome"`
 }
@@ -102,15 +106,22 @@ type selfReviewResponse struct {
 }
 
 // issueHistoryResponse is the history member of GET /api/v1/{identifier}: an
-// issue's newest runs, its totals over all runs, and the hop decisions of
-// the runs served.
+// issue's newest runs, its totals over all runs, the hop decisions of the
+// runs served, and the stage chain its last stage run stood on.
 type issueHistoryResponse struct {
 	Runs       []runResponse         `json:"runs"`
 	NextCursor *string               `json:"next_cursor"`
 	Totals     historyTotalsResponse `json:"totals"`
 	Hops       []hopDecisionResponse `json:"hops"`
+	LastStage  *lastStageResponse    `json:"last_stage"`
 
 	IssueOutcome *issueOutcomeResponse `json:"issue_outcome"`
+}
+
+// lastStageResponse is a stage chain and the rule on it where a run stood.
+type lastStageResponse struct {
+	Chain []string `json:"chain"`
+	Rule  string   `json:"rule"`
 }
 
 // historyTotalsResponse is an issue's spend over all of its runs.
@@ -220,8 +231,8 @@ func parseRunsQuery(values url.Values) (RunHistoryQuery, error) {
 
 // toRunResponse converts a run to its wire format, masking the free-text
 // members at serve time so a value registered as a secret after the run is
-// masked too.
-func toRunResponse(e RunHistoryEntry, rates TokenRates) runResponse {
+// masked too. chains are the dispatch chains of the configuration in effect.
+func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runResponse {
 	resp := runResponse{
 		RunID:                e.ID,
 		IssueID:              e.IssueID,
@@ -249,6 +260,7 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates) runResponse {
 		StageResult:          e.StageResult,
 		SelfReview:           toSelfReviewResponse(e.ReviewMetadata),
 		OriginRecorded:       e.OriginRecorded,
+		StageChain:           orchestrator.StageChainOf(chains, e.RuleName, e.StagePrevious),
 	}
 	if e.Error != nil {
 		resp.Error = new(redact.Mask(*e.Error))
@@ -306,10 +318,10 @@ func toSelfReviewResponse(metadata *string) *selfReviewResponse {
 	}
 }
 
-func toRunResponses(rows []RunHistoryEntry, rates TokenRates) []runResponse {
+func toRunResponses(rows []RunHistoryEntry, rates TokenRates, chains [][]string) []runResponse {
 	runs := make([]runResponse, len(rows))
 	for i, row := range rows {
-		runs[i] = toRunResponse(row, rates)
+		runs[i] = toRunResponse(row, rates, chains)
 	}
 	return runs
 }
@@ -478,7 +490,11 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		s.historyReadFailed(w, r, err)
 		return
 	}
-	runs := toRunResponses(rows, s.tokenRates)
+	var chains [][]string
+	if s.workflowShapeFn != nil {
+		chains = s.workflowShapeFn().Dispatch.Chains
+	}
+	runs := toRunResponses(rows, s.tokenRates, chains)
 	attachIssueOutcomes(runs, outcomes)
 	writeJSON(w, s.logger, http.StatusOK, runsResponse{Runs: runs, NextCursor: next})
 

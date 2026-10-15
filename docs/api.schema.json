@@ -1216,6 +1216,16 @@
             }
           ]
         },
+        "last_stage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastStageResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "next_cursor": {
           "anyOf": [
             {
@@ -1248,6 +1258,7 @@
         "next_cursor",
         "totals",
         "hops",
+        "last_stage",
         "issue_outcome"
       ],
       "type": "object"
@@ -1306,6 +1317,31 @@
         }
       },
       "required": [],
+      "type": "object"
+    },
+    "LastStageResponse": {
+      "properties": {
+        "chain": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "chain",
+        "rule"
+      ],
       "type": "object"
     },
     "NextOutcomeResponse": {
@@ -2268,6 +2304,19 @@
             }
           ]
         },
+        "stage_chain": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "stage_previous": {
           "type": "string"
         },
@@ -2335,6 +2384,7 @@
         "reaction_config_key",
         "session_id",
         "ssh_host",
+        "stage_chain",
         "issue_outcome"
       ],
       "type": "object"

@@ -3,8 +3,9 @@ import { StatusMark } from "@/components/StatusMark";
 import { cn } from "@/lib/cn";
 import { fmtClock, parseInstant } from "@/lib/format";
 import { timeCell } from "@/lib/active-rows";
+import { rowStyles, secondLineColor } from "@/lib/rows";
 
-import { activeNavKey, rowStyles, secondLineColor } from "./rows";
+import { activeNavKey } from "./rows";
 
 import type { ActiveRow as ActiveRowModel } from "@/lib/active-rows";
 

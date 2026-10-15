@@ -2,6 +2,7 @@ import {
   ArrowRightIcon,
   CheckIcon,
   CircleAlertFilledIcon,
+  CircleDotIcon,
   CirclePauseIcon,
   CircleXIcon,
   ClockIcon,
@@ -25,6 +26,7 @@ interface StatusEntry {
 
 const STATUS: Record<Mark, StatusEntry> = {
   running: { Glyph: LoaderCircleIcon, word: "Running", tone: "neutral" },
+  current: { Glyph: CircleDotIcon, word: "Current", tone: "neutral" },
   waiting: { Glyph: ClockIcon, word: "Waiting", tone: "neutral" },
   retry: { Glyph: RotateCwIcon, word: "Retry scheduled", tone: "neutral" },
   held: { Glyph: CirclePauseIcon, word: "Held, acknowledged", tone: "neutral" },
@@ -51,6 +53,11 @@ const LABEL_TONE: Record<Tone, string> = {
   success: "text-ink-body",
   error: "text-error",
 };
+
+/** Returns the word a status mark stands for. */
+export function markWord(mark: Mark): string {
+  return STATUS[mark].word;
+}
 
 /** Props of {@link StatusMark}. */
 export interface StatusMarkProps {

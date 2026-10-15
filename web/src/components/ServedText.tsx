@@ -18,7 +18,10 @@ export function ServedText({ text }: ServedTextProps) {
         const isPaired = index % 2 === 1 && index < last;
         if (isPaired) {
           return segment === "" ? undefined : (
-            <code key={index} className="rounded bg-surface-raised px-xxs font-mono text-[0.9em]">
+            <code
+              key={index}
+              className="rounded bg-surface-raised px-xxs font-mono text-[0.9em] whitespace-nowrap"
+            >
               {segment}
             </code>
           );

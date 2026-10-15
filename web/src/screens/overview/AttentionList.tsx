@@ -34,7 +34,10 @@ export function AttentionList({
 }: AttentionListProps) {
   return (
     <section className="flex flex-col gap-sm">
-      <h2 className="font-heading text-h7 font-semibold text-ink">Needs attention</h2>
+      <div className="flex flex-wrap items-baseline gap-x-sm">
+        <h2 className="font-heading text-h7 font-semibold text-ink">Needs attention</h2>
+        <span className="text-body-md text-ink-muted">critical first, then oldest</span>
+      </div>
       <ul className="divide-y divide-line overflow-hidden rounded-lg border border-line bg-canvas">
         {items.map((item) => {
           const navKey = attentionNavKey(item.id);

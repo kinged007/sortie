@@ -1095,7 +1095,7 @@ func TestStatsByModel_WithoutTheBreakdown(t *testing.T) {
 	}
 	text := renderText(report)
 	emptyLists := []string{`"by_model":[]`, `"by_chain":[]`, `"by_trigger":[]`}
-	absentTables := []string{"by configured model", "by retry trigger"}
+	absentTables := []string{"by model", "by retry trigger"}
 	for _, want := range emptyLists {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("JSON = %s, want %s, never null", data, want)
@@ -1136,7 +1136,7 @@ func TestStatsByChain_TextListsTheBusiestChainsOnly(t *testing.T) {
 func TestRunStatsByModelAgainstDatabases(t *testing.T) {
 	t.Parallel()
 
-	const warning = "this database was written before sortie recorded the model each run was configured with, so the report leaves out the breakdown by configured model. Run sortie once with this workflow to add it."
+	const warning = "this database was written before sortie recorded the model of each run, so the report leaves out the breakdown by model. Run sortie once with this workflow to add it."
 	runOf := func(adapter, model, status string) persistence.RunHistory {
 		return persistence.RunHistory{IssueID: "I-" + status, Identifier: "P-" + status, Attempt: 1, AgentAdapter: adapter, Workspace: "/tmp/ws", StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: status, ConfiguredModel: model}
 	}
@@ -1146,7 +1146,7 @@ func TestRunStatsByModelAgainstDatabases(t *testing.T) {
 		wantRuns    map[string]int
 		wantWarning bool
 	}{
-		{"migrated database groups runs by configured model", func(t *testing.T, dbPath string) {
+		{"migrated database groups runs by model", func(t *testing.T, dbPath string) {
 			createStatsDB(t, dbPath, runOf("mock", "model-a", "succeeded"), runOf("mock", "", "failed"))
 		}, map[string]int{"model-a": 1, "<none>": 1}, false},
 		{"full tier database without the column warns and leaves the list empty", func(t *testing.T, dbPath string) {

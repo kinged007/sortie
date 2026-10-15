@@ -6,6 +6,7 @@ import { Shell } from "@/app/Shell";
 import {
   ActivityIcon,
   ChartColumnIcon,
+  ChartGanttIcon,
   HistoryIcon,
   InboxIcon,
   SlidersHorizontalIcon,
@@ -16,6 +17,7 @@ import type { ScreenEntry } from "@/app/Rail";
 /** The screens the rail lists and the palette and `G` chords reach; each screen registers itself here. */
 export const screens: ScreenEntry[] = [
   { key: "o", label: "Overview", path: "/", group: 0, icon: InboxIcon },
+  { key: "p", label: "Pipeline", path: "/pipeline", group: 0, icon: ChartGanttIcon },
   { key: "h", label: "History", path: "/history", group: 0, icon: HistoryIcon },
   { key: "a", label: "Analytics", path: "/analytics", group: 0, icon: ChartColumnIcon },
   { key: "e", label: "Health", path: "/health", group: 1, icon: ActivityIcon },
@@ -37,6 +39,13 @@ export const router = createBrowserRouter(
               lazy: {
                 Component: async () =>
                   (await import("@/screens/overview/OverviewScreen")).OverviewScreen,
+              },
+            },
+            {
+              path: "pipeline",
+              lazy: {
+                Component: async () =>
+                  (await import("@/screens/pipeline/PipelineScreen")).PipelineScreen,
               },
             },
             {

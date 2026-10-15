@@ -2197,19 +2197,15 @@ func snapshotContinuation(target ContinuationTarget) *SnapshotContinuation {
 }
 
 // stagePosition returns where rule stands on the stage chains in force, or
-// nil when no chain holds it. When previous is set, a chain that lists it
-// immediately before rule wins over the first chain that merely holds rule.
-// The chain is copied, so the result shares nothing with state.
+// nil when no chain holds it. The chain is copied, so the result shares
+// nothing with state.
 func stagePosition(state *State, issueID, rule, previous string) *SnapshotStagePosition {
-	chain := chainHolding(state.StageChains, rule, previous)
-	if chain == nil && previous != "" {
-		chain = chainHolding(state.StageChains, rule, "")
-	}
+	chain := StageChainOf(state.StageChains, rule, previous)
 	if chain == nil {
 		return nil
 	}
 	position := &SnapshotStagePosition{
-		Chain:      slices.Clone(chain),
+		Chain:      chain,
 		Current:    rule,
 		HopCeiling: state.HopCeiling,
 	}
@@ -2217,6 +2213,18 @@ func stagePosition(state *State, issueID, rule, previous string) *SnapshotStageP
 		position.HopCount = hop.Count
 	}
 	return position
+}
+
+// StageChainOf returns a copy of the chain in chains that holds rule,
+// preferring one that lists previous immediately before rule when previous
+// is non-empty; nil when no chain holds rule. The copy keeps callers from
+// aliasing configuration.
+func StageChainOf(chains [][]string, rule, previous string) []string {
+	chain := chainHolding(chains, rule, previous)
+	if chain == nil && previous != "" {
+		chain = chainHolding(chains, rule, "")
+	}
+	return slices.Clone(chain)
 }
 
 // chainHolding returns the first chain that holds rule and, when previous is

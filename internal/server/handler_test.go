@@ -3871,3 +3871,36 @@ func historyServer(t *testing.T, snap orchestrator.RuntimeSnapshotResult, histor
 	t.Cleanup(ts.Close)
 	return ts
 }
+
+func TestLastStageOf(t *testing.T) {
+	t.Parallel()
+
+	chains := [][]string{{"plan", "build", "review"}, {"fix", "review"}}
+
+	tests := []struct {
+		name   string
+		runs   []RunHistoryEntry
+		chains [][]string
+		want   *lastStageResponse
+	}{
+		{"newest run decides", []RunHistoryEntry{{RuleName: "build"}, {RuleName: "plan"}}, chains, &lastStageResponse{Chain: chains[0], Rule: "build"}},
+		{"reaction run skipped", []RunHistoryEntry{{RuleName: "fix", ReactionKind: "ci"}, {RuleName: "build"}}, chains, &lastStageResponse{Chain: chains[0], Rule: "build"}},
+		{"ci result row never decides", []RunHistoryEntry{{Status: "ci_failed"}, {RuleName: "plan"}}, chains, &lastStageResponse{Chain: chains[0], Rule: "plan"}},
+		{"previous picks the chain", []RunHistoryEntry{{RuleName: "review", StagePrevious: "fix"}}, chains, &lastStageResponse{Chain: chains[1], Rule: "review"}},
+		{"no deciding run", []RunHistoryEntry{{Status: "ci_failed"}, {RuleName: "fix", ReactionKind: "ci"}}, chains, nil},
+		{"empty chains", []RunHistoryEntry{{RuleName: "build"}}, nil, nil},
+		{"rule on no chain", []RunHistoryEntry{{RuleName: "deploy"}}, chains, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := lastStageOf(tt.runs, tt.chains)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("lastStageOf(%+v, %v) = %+v, want %+v", tt.runs, tt.chains, got, tt.want)
+			}
+		})
+	}
+}

@@ -1,6 +1,7 @@
 /** The status marks a row, an outcome, or a run line can carry. */
 export type Mark =
   | "running"
+  | "current"
   | "waiting"
   | "retry"
   | "held"
@@ -33,4 +34,19 @@ export const RUN_STATUS_NAMES: readonly string[] = Object.keys(RUN_STATUSES);
  */
 export function runStatus(status: string): { word: string; mark: Mark | null } {
   return Object.hasOwn(RUN_STATUSES, status) ? RUN_STATUSES[status] : { word: status, mark: null };
+}
+
+/**
+ * Gives the mark of an issue outcome the dashboard marks: a handoff or a
+ * merge. Any other kind, and an absent one, carries no mark.
+ */
+export function outcomeMark(kind: string | undefined): Mark | null {
+  switch (kind) {
+    case "handed_off":
+      return "handed";
+    case "merged":
+      return "succeeded";
+    default:
+      return null;
+  }
 }

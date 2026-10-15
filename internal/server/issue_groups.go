@@ -45,7 +45,7 @@ type issueGroupResponse struct {
 	Totals            historyTotalsResponse `json:"totals"`
 }
 
-var issueGroupsParams = []string{"issue", "rule", "status", "stage", "cursor", "limit"}
+var issueGroupsParams = []string{"issue", "q", "rule", "status", "stage", "cursor", "limit"}
 
 // parseIssueGroupsQuery validates every parameter of GET /api/v1/runs/issues
 // before any read. An empty value reads as absent, and Limit is the page size
@@ -57,6 +57,7 @@ func parseIssueGroupsQuery(values url.Values) (IssueGroupQuery, error) {
 
 	q := IssueGroupQuery{
 		IssueKey:    values.Get("issue"),
+		Search:      values.Get("q"),
 		Status:      values.Get("status"),
 		StageTarget: values.Get("stage"),
 		Limit:       defaultIssueGroupsLimit,
@@ -206,6 +207,10 @@ func (s *Server) buildIssueGroup(ctx context.Context, key IssueGroupKey, q Issue
 		return issueGroupResponse{}, false, err
 	}
 
+	var chains [][]string
+	if words.Shape != nil {
+		chains = words.Shape.Dispatch.Chains
+	}
 	outcome, hasOutcome := outcomes[key.IssueID]
 	group := issueGroupResponse{
 		IssueID:           key.IssueID,
@@ -213,7 +218,7 @@ func (s *Server) buildIssueGroup(ctx context.Context, key IssueGroupKey, q Issue
 		DisplayIdentifier: newest.DisplayID,
 		IssueTitle:        redact.Mask(newest.IssueTitle),
 		IssueURL:          redact.Mask(newest.IssueURL),
-		Runs:              toRunResponses(page, s.tokenRates),
+		Runs:              toRunResponses(page, s.tokenRates, chains),
 		NextCursor:        runsNext,
 		Totals:            historyTotalsOf(totals, s.tokenRates),
 	}

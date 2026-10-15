@@ -5,13 +5,22 @@ import { cn } from "@/lib/cn";
 
 import type { ReactNode } from "react";
 
+/** The filter a query is matched with: substring, ignoring case and accents. */
+export const useAutocompleteFilter = BaseAutocomplete.useFilter;
+
+/** A captioned run of items; `value` is the caption. */
+export interface AutocompleteGroupData<ItemValue> {
+  value: string;
+  items: readonly ItemValue[];
+}
+
 /** Props of {@link Autocomplete}. */
 export type AutocompleteProps<ItemValue> = Omit<
   BaseAutocomplete.Root.Props<ItemValue>,
   "open" | "inline" | "autoHighlight" | "keepHighlight" | "items"
 > & {
-  /** A flat list; the palette has no groups. */
-  items: readonly ItemValue[];
+  /** The items in groups; render each group with {@link AutocompleteGroup}. */
+  items: readonly AutocompleteGroupData<ItemValue>[];
 };
 
 /**
@@ -50,6 +59,43 @@ export function AutocompleteList(props: AutocompleteListProps) {
       {...props}
     />
   );
+}
+
+/** Props of {@link AutocompleteGroup}. */
+export interface AutocompleteGroupProps<ItemValue> {
+  items: readonly ItemValue[];
+  children: ReactNode;
+}
+
+/** Holds one group of items, with an optional {@link AutocompleteGroupLabel} before its {@link AutocompleteCollection}. */
+export function AutocompleteGroup<ItemValue>(props: AutocompleteGroupProps<ItemValue>) {
+  return <BaseAutocomplete.Group {...props} />;
+}
+
+/** Props of {@link AutocompleteGroupLabel}. */
+export interface AutocompleteGroupLabelProps {
+  children: ReactNode;
+}
+
+/** Renders the caption of a group of items. */
+export function AutocompleteGroupLabel({ children }: AutocompleteGroupLabelProps) {
+  return (
+    <BaseAutocomplete.GroupLabel className="px-md pt-xs pb-xxs text-label-caps font-medium text-ink-muted">
+      {children}
+    </BaseAutocomplete.GroupLabel>
+  );
+}
+
+/** Props of {@link AutocompleteCollection}. */
+export interface AutocompleteCollectionProps<ItemValue> {
+  children: (item: ItemValue, index: number) => ReactNode;
+}
+
+/** Renders the items of the enclosing group that match the query. */
+export function AutocompleteCollection<ItemValue>({
+  children,
+}: AutocompleteCollectionProps<ItemValue>) {
+  return <BaseAutocomplete.Collection>{children}</BaseAutocomplete.Collection>;
 }
 
 /** Props of {@link AutocompleteItem}. */

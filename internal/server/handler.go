@@ -1214,7 +1214,11 @@ func (s *Server) withIssueHistory(w http.ResponseWriter, r *http.Request, identi
 		detail.StatusText, detail.StatusTextFull = sentencesOf(sentence.Entry{Finished: finishedOf(newest, outcome, hasOutcome)}, words)
 	}
 	detail.situation.Spend = &sentence.Spend{Sessions: totals.Usage.Sessions, Tokens: totals.Usage.TotalTokens}
-	detail.History = issueHistoryOf(page, totals, s.tokenRates)
+	var chains [][]string
+	if words.Shape != nil {
+		chains = words.Shape.Dispatch.Chains
+	}
+	detail.History = issueHistoryOf(page, totals, s.tokenRates, chains)
 	attachIssueOutcomes(detail.History.Runs, outcomes)
 	if hasOutcome {
 		detail.History.IssueOutcome = toIssueOutcomeResponse(outcome, newest.Identifier, newest.DisplayID)
@@ -1240,14 +1244,33 @@ func historyOnlyDetail(issueID string, newest RunHistoryEntry) *issueDetailRespo
 
 // issueHistoryOf builds the history member from an issue's newest runs, read
 // one past issueHistoryPageSize so a longer history names its continuation.
-func issueHistoryOf(page []RunHistoryEntry, totals IssueRunTotals, rates TokenRates) *issueHistoryResponse {
+func issueHistoryOf(page []RunHistoryEntry, totals IssueRunTotals, rates TokenRates, chains [][]string) *issueHistoryResponse {
 	rows, next := cutPage(page, issueHistoryPageSize)
 	return &issueHistoryResponse{
-		Runs:       toRunResponses(rows, rates),
+		Runs:       toRunResponses(rows, rates, chains),
 		NextCursor: next,
 		Totals:     historyTotalsOf(totals, rates),
 		Hops:       hopRowsOf(rows),
+		LastStage:  lastStageOf(rows, chains),
 	}
+}
+
+// lastStageOf names the chain the newest deciding run stood on. A reaction
+// run follows a pull request rather than a stage, and a CI result row
+// carries no rule, so neither decides. Only the served page is read: a page
+// holding no deciding run yields nil instead of costing a further read.
+func lastStageOf(runs []RunHistoryEntry, chains [][]string) *lastStageResponse {
+	for _, run := range runs {
+		if run.ReactionKind != "" || run.RuleName == "" {
+			continue
+		}
+		chain := orchestrator.StageChainOf(chains, run.RuleName, run.StagePrevious)
+		if chain == nil {
+			return nil
+		}
+		return &lastStageResponse{Chain: chain, Rule: run.RuleName}
+	}
+	return nil
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {

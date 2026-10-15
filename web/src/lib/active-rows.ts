@@ -25,7 +25,13 @@ export type RowKind =
   | "between_stages";
 
 /** The lifecycle phase a row belongs to; the Active chips filter on it. */
-export type Phase = "running" | "pull_request" | "between_stages" | "retry" | "needs_attention";
+export type Phase =
+  | "running"
+  | "pull_request"
+  | "between_stages"
+  | "retry"
+  | "needs_attention"
+  | "ended_today";
 
 /** Lists every phase in the order the chips appear. */
 export const PHASES: readonly Phase[] = [
@@ -34,7 +40,14 @@ export const PHASES: readonly Phase[] = [
   "between_stages",
   "retry",
   "needs_attention",
+  "ended_today",
 ];
+
+/** What the lifecycle chips and the Rule menu read of a row, whichever screen draws it. */
+export interface Filterable {
+  phase: Phase;
+  rule: string | null;
+}
 
 /** One issue in Active, built from a served `active` entry. */
 export interface ActiveRow {
@@ -63,7 +76,8 @@ export interface RuleOption {
   group: string | null;
 }
 
-type Deciding =
+/** The state row that decided an issue, tagged with the list it came from. */
+export type Deciding =
   | { kind: "running"; entry: RunningEntryResponse }
   | { kind: "retrying"; entry: RetryEntryResponse }
   | { kind: "budget_exhausted"; entry: BudgetExhaustedResponse }
@@ -116,7 +130,10 @@ export function rowMark(
   if (kind === "running") {
     return { mark: "running", acknowledgedAt: null };
   }
-  return { mark: kind === "retrying" ? "retry" : "waiting", acknowledgedAt: null };
+  return {
+    mark: kind === "retrying" ? "retry" : "waiting",
+    acknowledgedAt: null,
+  };
 }
 
 /** Words a row's place in a chain or its rule, or `null` when neither is worth showing. */
@@ -142,7 +159,8 @@ export function ruleOf(entry: RuleSource): string | null {
   return isNamedRule(entry.rule_name) ? entry.rule_name : null;
 }
 
-function timeBaseOf(deciding: Deciding): string | null {
+/** Gives the instant a deciding entry's time is counted from or to. */
+export function timeBaseOf(deciding: Deciding): string | null {
   switch (deciding.kind) {
     case "running":
       return deciding.entry.started_at;
@@ -209,6 +227,18 @@ function namedRow(
   }
 }
 
+/**
+ * Finds the state row that decided an active entry, from the list its status
+ * names. It returns `undefined` for a status that names no list and for a row
+ * the list no longer holds.
+ */
+export function decidingRowOf(
+  state: StateResponse,
+  entry: ActiveIssueResponse,
+): Deciding | undefined {
+  return isRowKind(entry.status) ? namedRow(state, entry.status, entry) : undefined;
+}
+
 function toRow(entry: ActiveIssueResponse, kind: RowKind, state: StateResponse): ActiveRow {
   const named = namedRow(state, kind, entry);
   const escalatedAt = named?.kind === "pending_reactions" ? named.entry.escalated_at : null;
@@ -231,23 +261,37 @@ function toRow(entry: ActiveIssueResponse, kind: RowKind, state: StateResponse):
   };
 }
 
+/** Builds the Active row of one served `active` entry, or `undefined` for a status that names no list. */
+export function activeRowOf(
+  state: StateResponse,
+  entry: ActiveIssueResponse,
+): ActiveRow | undefined {
+  return isRowKind(entry.status) ? toRow(entry, entry.status, state) : undefined;
+}
+
 /** Builds the Active rows from the served `active` entries, in the served order. */
 export function activeRows(state: StateResponse): ActiveRow[] {
-  return (state.active ?? []).flatMap((entry) =>
-    isRowKind(entry.status) ? [toRow(entry, entry.status, state)] : [],
-  );
+  return (state.active ?? []).flatMap((entry) => {
+    const row = activeRowOf(state, entry);
+    return row === undefined ? [] : [row];
+  });
+}
+
+/** Words the time of a deciding entry on the server clock: time left for a retry, time elapsed otherwise. */
+export function timeText(kind: RowKind, timeBase: string | null, now: number): string {
+  const base = parseInstant(timeBase);
+  if (base === null) {
+    return "unknown";
+  }
+  return kind === "retrying" ? fmtDue((base - now) / 1000) : fmtDuration((now - base) / 1000);
 }
 
 /** Words the time cell of a row on the server clock. */
 export function timeCell(row: ActiveRow, now: number): string {
-  const base = parseInstant(row.timeBase);
-  if (base === null) {
-    return "unknown";
-  }
-  return row.kind === "retrying" ? fmtDue((base - now) / 1000) : fmtDuration((now - base) / 1000);
+  return timeText(row.kind, row.timeBase, now);
 }
 
-function countRows(rows: readonly ActiveRow[], matches: (rule: string | null) => boolean): number {
+function countRows(rows: readonly Filterable[], matches: (rule: string | null) => boolean): number {
   return rows.filter((row) => matches(row.rule)).length;
 }
 
@@ -290,7 +334,7 @@ function filterOptions(options: RuleOption[], query: string): RuleOption[] {
  */
 export function ruleOptions(
   config: ConfigResponse | undefined,
-  rows: readonly ActiveRow[],
+  rows: readonly Filterable[],
   query: string,
 ): RuleOption[] {
   const rules = config?.dispatch.rules ?? [];
@@ -298,7 +342,13 @@ export function ruleOptions(
     return [];
   }
   const options: RuleOption[] = [
-    { kind: "any", value: "", label: "Any rule", count: rows.length, group: null },
+    {
+      kind: "any",
+      value: "",
+      label: "Any rule",
+      count: rows.length,
+      group: null,
+    },
   ];
   const chains = chainsOf(config);
   const chained = new Set(chains.flat());
@@ -367,7 +417,7 @@ export function isPhase(value: string | null): value is Phase {
   return PHASES.some((phase) => phase === value);
 }
 
-function matchesRule(row: ActiveRow, rule: string, config: ConfigResponse | undefined): boolean {
+function matchesRule(row: Filterable, rule: string, config: ConfigResponse | undefined): boolean {
   if (rule === "none") {
     return row.rule === null;
   }
@@ -386,12 +436,12 @@ function matchesRule(row: ActiveRow, rule: string, config: ConfigResponse | unde
  * Keeps the rows a phase and a rule select. An unknown phase is ignored; a
  * rule no option carries matches nothing, so the list shows its empty state.
  */
-export function filterRows(
-  rows: readonly ActiveRow[],
+export function filterRows<T extends Filterable>(
+  rows: readonly T[],
   phase: string | null,
   rule: string | null,
   config: ConfigResponse | undefined,
-): ActiveRow[] {
+): T[] {
   return rows.filter(
     (row) =>
       (!isPhase(phase) || row.phase === phase) &&
@@ -400,13 +450,14 @@ export function filterRows(
 }
 
 /** Counts rows per phase; pass rows already narrowed by the rule. */
-export function chipCounts(rows: readonly ActiveRow[]): Record<Phase, number> {
+export function chipCounts(rows: readonly Filterable[]): Record<Phase, number> {
   const counts: Record<Phase, number> = {
     running: 0,
     pull_request: 0,
     between_stages: 0,
     retry: 0,
     needs_attention: 0,
+    ended_today: 0,
   };
   for (const row of rows) {
     counts[row.phase] += 1;

@@ -47,8 +47,8 @@ func (c RunHistoryCapabilities) Full() bool {
 	return c.HasTurnsCompleted && c.HasReviewMetadata && c.HasRuleRouting && c.HasTokens && c.HasTokenMeasurement
 }
 
-// ModelBreakdown reports whether a read can group runs by configured
-// model: Full plus the configured-settings columns.
+// ModelBreakdown reports whether a read can group runs by model: Full plus
+// the configured-settings columns.
 func (c RunHistoryCapabilities) ModelBreakdown() bool {
 	return c.Full() && c.HasConfiguredSettings
 }
@@ -92,9 +92,10 @@ type RunStatsRow struct {
 	CacheWriteTokens int64 // 0 when the database lacks the column
 	TokensMeasured   bool
 
-	// ConfiguredModel is empty when the run named none or
-	// [RunHistoryCapabilities.ModelBreakdown] reports false.
+	// ConfiguredModel and ReportedModel are empty when the run named or
+	// reported none, or [RunHistoryCapabilities.ModelBreakdown] reports false.
 	ConfiguredModel string
+	ReportedModel   string
 
 	// Each is empty unless [RunHistoryCapabilities.ChainBreakdown] reports
 	// true.
@@ -215,7 +216,7 @@ func (s *Store) ScanRunHistoryRange(
 		query = runStatsColumnsFull
 	}
 	if breakdown {
-		query += ", configured_model"
+		query += ", configured_model, reported_model"
 	}
 	if chains {
 		query += ", identifier, display_identifier, chain_id, stage_previous, stage_result"
@@ -272,7 +273,7 @@ func (s *Store) ScanRunHistoryRange(
 			dest = []any{&row.IssueID, &row.Status, &row.AgentAdapter, &row.StartedAt, &row.CompletedAt}
 		}
 		if breakdown {
-			dest = append(dest, &row.ConfiguredModel)
+			dest = append(dest, &row.ConfiguredModel, &row.ReportedModel)
 		}
 		if chains {
 			dest = append(dest, &row.Identifier, &displayID, &row.ChainID, &row.StagePrevious, &row.StageResult)

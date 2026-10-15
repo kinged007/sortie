@@ -1,9 +1,11 @@
 import type {
   AcknowledgeResponse,
+  CheckNowResponse,
   IssueDetailResponse,
   IssueGroupsResponse,
   RefreshResponse,
   Report,
+  RetryNowResponse,
   RunsResponse,
   StateResponse,
 } from "@/api/types.gen";
@@ -117,7 +119,7 @@ export function getRuns(
 
 /** Fetches a page of issues with their newest finished runs, newest first. */
 export function getIssueGroups(
-  q: HistoryFilter & { cursor?: string; limit?: number },
+  q: HistoryFilter & { q?: string; cursor?: string; limit?: number },
   signal?: AbortSignal,
 ): Promise<IssueGroupsResponse> {
   return getJson<IssueGroupsResponse>(withQuery("runs/issues", { ...q }), signal);
@@ -140,5 +142,26 @@ export function postAcknowledge(
   return postJson<AcknowledgeResponse, 200 | 409>(
     `attention/${encodeURIComponent(id)}/acknowledge`,
     [200, 409],
+  );
+}
+
+/** Starts a scheduled retry now; `409` is the server's refusal, with its own wording. */
+export function postRetryNow(
+  identifier: string,
+): Promise<{ status: 202 | 409; body: RetryNowResponse }> {
+  return postJson<RetryNowResponse, 202 | 409>(
+    `retries/${encodeURIComponent(identifier)}/run`,
+    [202, 409],
+  );
+}
+
+/** Checks a pending pull request reaction now; `409` is the server's refusal, with its own wording. */
+export function postCheckNow(
+  identifier: string,
+  kind: string,
+): Promise<{ status: 202 | 409; body: CheckNowResponse }> {
+  return postJson<CheckNowResponse, 202 | 409>(
+    `reactions/${encodeURIComponent(identifier)}/${encodeURIComponent(kind)}/check`,
+    [202, 409],
   );
 }

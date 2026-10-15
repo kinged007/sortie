@@ -102,12 +102,7 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
         <GroupTable title="By rule" nameColumns={[RULE_COLUMN]} rows={byRule} {...common} />
       ) : undefined}
       {byModel.length > 0 ? (
-        <GroupTable
-          title="By configured model"
-          nameColumns={[MODEL_COLUMN]}
-          rows={byModel}
-          {...common}
-        />
+        <GroupTable title="By model" nameColumns={[MODEL_COLUMN]} rows={byModel} {...common} />
       ) : undefined}
       {byAdapter.length > 0 ? (
         <GroupTable title="By agent" nameColumns={[AGENT_COLUMN]} rows={byAdapter} {...common} />

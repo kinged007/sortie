@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useLocation, useNavigate } from "react-router";
 
 import { useHistoryRunsQuery } from "@/api/queries";
 import { ServedText } from "@/components/ServedText";
@@ -15,8 +15,9 @@ import {
   totalsTokensText,
 } from "@/lib/figures";
 import { fmtCount, fmtDuration, fmtStamp, parseInstant, plural } from "@/lib/format";
+import { issueLinkOf } from "@/lib/issue-link";
 import { ruleLabel } from "@/lib/labels";
-import { runStatus } from "@/lib/run-status";
+import { outcomeMark, runStatus } from "@/lib/run-status";
 
 import type { HistoryFilter } from "@/api/client";
 import type { ConfigResponse, IssueGroupResponse, RunResponse } from "@/api/types.gen";
@@ -96,10 +97,7 @@ function groupMark(group: IssueGroupResponse): Mark | null {
       return "waiting";
     case "history":
       // Green marks only a success, and "terminal" covers a person's close too.
-      if (group.issue_outcome?.kind === "handed_off") {
-        return "handed";
-      }
-      return group.issue_outcome?.kind === "merged" ? "succeeded" : null;
+      return outcomeMark(group.issue_outcome?.kind);
     default:
       return null;
   }
@@ -128,10 +126,6 @@ function costPart(text: string): string {
   return text === NOT_MEASURED ? "cost not measured" : `${text} estimated`;
 }
 
-function issuePath(identifier: string): string {
-  return `/issues/${encodeURIComponent(identifier)}`;
-}
-
 interface RunRowProps {
   run: RunResponse;
   columns: Columns;
@@ -139,6 +133,8 @@ interface RunRowProps {
 
 function RunRow({ run, columns }: RunRowProps) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const link = issueLinkOf(run.issue_identifier, location);
   const status = runStatus(run.status);
   const model = run.model_name || run.configured_model;
   const agent = [run.agent_kind, model].filter((part) => part !== undefined && part !== "");
@@ -149,12 +145,13 @@ function RunRow({ run, columns }: RunRowProps) {
 
   return (
     <tr
-      onClick={() => void navigate(issuePath(run.issue_identifier))}
+      onClick={() => void navigate(link.to, { state: link.state })}
       className="cursor-pointer border-t border-line hover:bg-state-hover"
     >
       <td className={CELL}>
         <Link
-          to={issuePath(run.issue_identifier)}
+          to={link.to}
+          state={link.state}
           onClick={(event) => event.stopPropagation()}
           className="rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
         >
@@ -205,6 +202,8 @@ export interface IssueGroupRowsProps {
  */
 export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const link = issueLinkOf(group.issue_identifier, location);
   const columns = columnsOf(config);
   const [isExpanded, setIsExpanded] = useState(false);
   const expansion = useHistoryRunsQuery(group.issue_id, filter, isExpanded);
@@ -242,7 +241,7 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
   return (
     <tbody className="border-b border-line last:border-b-0">
       <tr
-        onClick={() => void navigate(issuePath(group.issue_identifier))}
+        onClick={() => void navigate(link.to, { state: link.state })}
         className="cursor-pointer bg-surface hover:bg-state-hover"
       >
         <td colSpan={columns.span} className="px-md py-sm">
@@ -253,7 +252,8 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
             <div className="min-w-0 flex-1">
               <p className="text-body-md font-medium text-ink [overflow-wrap:anywhere]">
                 <Link
-                  to={issuePath(group.issue_identifier)}
+                  to={link.to}
+                  state={link.state}
                   onClick={(event) => event.stopPropagation()}
                   className="rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring"
                 >

@@ -902,6 +902,42 @@ func TestRunTurn_APIDurationMS_ZeroWhenAbsent(t *testing.T) {
 	t.Error("no turn_completed event found")
 }
 
+func TestRunTurn_SyntheticMessageKeepsModel(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"system","subtype":"init","session_id":"syn-sess","cwd":"/tmp"}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"text","text":"Working."}],"usage":{"input_tokens":100,"output_tokens":10}},"session_id":"syn-sess"}
+{"type":"assistant","message":{"id":"msg_2","model":"<synthetic>","content":[{"type":"text","text":"API Error"}],"usage":{"input_tokens":0,"output_tokens":0}},"session_id":"syn-sess"}
+{"type":"result","subtype":"success","result":"All done.","is_error":false,"usage":{"input_tokens":100,"output_tokens":10},"session_id":"syn-sess"}
+`})
+
+	adapter, _ := NewClaudeCodeAdapter()
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: tmpDir,
+		AgentConfig:   domain.AgentConfig{Command: script},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+
+	var models []string
+	_, err = adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		Prompt: "test",
+		OnEvent: func(e domain.AgentEvent) {
+			if e.Type == domain.EventTokenUsage {
+				models = append(models, e.Model)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+	if len(models) != 2 || models[0] != "claude-opus-5-5" || models[1] != "claude-opus-5-5" {
+		t.Errorf("token_usage models = %q, want the real model on both", models)
+	}
+}
+
 // TestRunTurn_ResultOnlyFallback verifies that when no assistant message
 // carries usage, the result event's usage still settles into
 // TurnResult.Usage without emitting its own token_usage event: the

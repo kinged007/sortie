@@ -2662,7 +2662,7 @@ type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
-func TestTickLogging_ZeroCandidates(t *testing.T) {
+func TestTickLogging_TickCompletedLevelFollowsSummaryChange(t *testing.T) {
 	t.Parallel()
 
 	cfg := config.ServiceConfig{
@@ -2676,8 +2676,9 @@ func TestTickLogging_ZeroCandidates(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
+	var fetched []domain.Issue
 	pf := passingPreflightRegistries()
 	pf.ReloadWorkflow = func() error { return nil }
 	pf.ConfigFunc = func() config.ServiceConfig { return cfg }
@@ -2687,7 +2688,7 @@ func TestTickLogging_ZeroCandidates(t *testing.T) {
 		Logger: logger,
 		TrackerAdapter: &candidateTrackerAdapter{
 			mockTrackerAdapter: &mockTrackerAdapter{},
-			fetchCandidatesFn:  func(_ context.Context) ([]domain.Issue, error) { return nil, nil },
+			fetchCandidatesFn:  func(_ context.Context) ([]domain.Issue, error) { return fetched, nil },
 		},
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: &stubWorkflowManager{config: cfg},
@@ -2695,17 +2696,15 @@ func TestTickLogging_ZeroCandidates(t *testing.T) {
 		PreflightParams: pf,
 	})
 
-	o.handleTick(context.Background())
-
-	got := buf.String()
-	if !strings.Contains(got, "tick completed") {
-		t.Fatalf("log missing 'tick completed': %s", got)
-	}
-	if !strings.Contains(got, "candidates=0") {
-		t.Errorf("log missing candidates=0: %s", got)
-	}
-	if !strings.Contains(got, "dispatched=0") {
-		t.Errorf("log missing dispatched=0: %s", got)
+	for i, want := range []string{"INFO", "DEBUG", "INFO"} {
+		if i == 2 {
+			fetched = []domain.Issue{{ID: "1", Identifier: "T-1", State: "Backlog"}}
+		}
+		buf.Reset()
+		o.handleTick(context.Background())
+		if got := buf.String(); !strings.Contains(got, "level="+want+` msg="tick completed"`) {
+			t.Errorf("tick %d: log lacks tick completed at %s: %s", i+1, want, got)
+		}
 	}
 }
 

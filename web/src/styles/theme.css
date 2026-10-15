@@ -23,6 +23,12 @@
   --color-line-active: #1f2937;
   --color-success: #0d6a30;
   --color-success-fill: #189646;
+  --color-success-container: #d7f7dc;
+  --color-success-border: #5adf7e;
+  --color-info: #2454a3;
+  --color-info-container: #e4eefd;
+  --color-info-border: #9bbffa;
+  --color-info-fill: #3b82f6;
   --color-warning: #7c5010;
   --color-warning-container: #ffeec9;
   --color-warning-fill: #eab308;
@@ -92,6 +98,9 @@
   --text-label-caps: 12px;
   --text-label-caps--line-height: 16px;
   --text-label-caps--letter-spacing: 1.2px;
+  --text-badge: 11px;
+  --text-badge--line-height: 16px;
+  --text-badge--letter-spacing: 0.4px;
 
   --spacing-xxs: 4px;
   --spacing-xs: 8px;
@@ -169,6 +178,12 @@
     --color-line-active: #ced6e2;
     --color-success: #5adf7e;
     --color-success-fill: #34d46a;
+    --color-success-container: #032e11;
+    --color-success-border: #1dad52;
+    --color-info: #9bbffa;
+    --color-info-container: #0e2a56;
+    --color-info-border: #639bf8;
+    --color-info-fill: #508ff7;
     --color-warning: #ffd67b;
     --color-warning-container: #382204;
     --color-warning-fill: #eab308;
@@ -225,6 +240,12 @@
   --color-line-active: #ced6e2;
   --color-success: #5adf7e;
   --color-success-fill: #34d46a;
+  --color-success-container: #032e11;
+  --color-success-border: #1dad52;
+  --color-info: #9bbffa;
+  --color-info-container: #0e2a56;
+  --color-info-border: #639bf8;
+  --color-info-fill: #508ff7;
   --color-warning: #ffd67b;
   --color-warning-container: #382204;
   --color-warning-fill: #eab308;

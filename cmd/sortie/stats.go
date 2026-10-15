@@ -350,7 +350,7 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 		renderStatsGroupTable(stdout, "by prompt template", "template", report.ByTemplate, full, false)
 		if len(report.ByModel) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
-			renderStatsGroupTable(stdout, "by configured model", "model", report.ByModel, full, false)
+			renderStatsGroupTable(stdout, "by model", "model", report.ByModel, full, false)
 		}
 		if len(report.ByChain) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable

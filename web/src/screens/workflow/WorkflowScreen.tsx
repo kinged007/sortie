@@ -1,6 +1,7 @@
 import { useStateQuery } from "@/api/queries";
 import { fmtCount, fmtRate, fmtStamp, fmtTokens } from "@/lib/format";
 import { Pair, Pairs, Panel } from "@/components/Panel";
+import { StateBadge } from "@/components/StateBadge";
 
 import { DispatchSection } from "./DispatchSection";
 import { ReactionsSection } from "./ReactionsSection";
@@ -32,8 +33,21 @@ function Standfirst({ workflow }: StandfirstProps) {
   return <p className={STANDFIRST}>{loaded}.</p>;
 }
 
-function listText(values: readonly string[] | null): string {
-  return values === null || values.length === 0 ? NONE : values.join(", ");
+interface StateListProps {
+  states: readonly string[] | null;
+}
+
+function StateList({ states }: StateListProps) {
+  if (states === null || states.length === 0) {
+    return NONE;
+  }
+  return (
+    <span className="flex flex-wrap gap-xxs">
+      {states.map((state) => (
+        <StateBadge key={state} state={state} />
+      ))}
+    </span>
+  );
 }
 
 interface ConfigProps {
@@ -46,15 +60,27 @@ function TrackerPanel({ config }: ConfigProps) {
     <Panel title="Tracker">
       <Pairs>
         <Pair label="Kind">{tracker.kind}</Pair>
-        <Pair label="Active">{listText(tracker.active_states)}</Pair>
+        <Pair label="Active">
+          <StateList states={tracker.active_states} />
+        </Pair>
         {tracker.in_progress_state ? (
-          <Pair label="In progress">{tracker.in_progress_state}</Pair>
+          <Pair label="In progress">
+            <StateBadge state={tracker.in_progress_state} />
+          </Pair>
         ) : undefined}
-        {tracker.handoff_state ? <Pair label="Handoff">{tracker.handoff_state}</Pair> : undefined}
+        {tracker.handoff_state ? (
+          <Pair label="Handoff">
+            <StateBadge state={tracker.handoff_state} />
+          </Pair>
+        ) : undefined}
         {tracker.no_change_state ? (
-          <Pair label="No change">{tracker.no_change_state}</Pair>
+          <Pair label="No change">
+            <StateBadge state={tracker.no_change_state} />
+          </Pair>
         ) : undefined}
-        <Pair label="Terminal">{listText(tracker.terminal_states)}</Pair>
+        <Pair label="Terminal">
+          <StateList states={tracker.terminal_states} />
+        </Pair>
         <Pair label="Poll">every {msText(polling.interval_ms)}</Pair>
       </Pairs>
     </Panel>

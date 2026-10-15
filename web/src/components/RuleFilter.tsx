@@ -12,7 +12,7 @@ import {
 import { Popover, PopoverPopup, PopoverTrigger } from "@/components/ui/popover";
 import { ruleOptions } from "@/lib/active-rows";
 
-import type { ActiveRow, RuleOption } from "@/lib/active-rows";
+import type { Filterable, RuleOption } from "@/lib/active-rows";
 import type { ConfigResponse } from "@/api/types.gen";
 
 const RULE_PARAM = "rule";
@@ -40,7 +40,7 @@ function describe(value: string, options: readonly RuleOption[]): string {
 export interface RuleFilterProps {
   config: ConfigResponse | undefined;
   /** Every row before any filter; the option counts read them. */
-  rows: readonly ActiveRow[];
+  rows: readonly Filterable[];
 }
 
 /**

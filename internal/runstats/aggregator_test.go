@@ -90,6 +90,12 @@ func triggerRow(issueID string, trigger *string) persistence.RunStatsRow {
 	return row
 }
 
+func reportedModelRow(configured, reported string) persistence.RunStatsRow {
+	row := modelRow("claude-code", configured, "succeeded", 0)
+	row.ReportedModel = reported
+	return row
+}
+
 func modelRow(adapter, model, status string, input int64) persistence.RunStatsRow {
 	return persistence.RunStatsRow{
 		Status: status, AgentAdapter: adapter, ConfiguredModel: model,
@@ -511,6 +517,8 @@ func TestStatsByModel(t *testing.T) {
 		modelRow("claude-code", "model-a", "failed", 0),
 		modelRow("codex", "model-b", "succeeded", 1_000_000),
 		modelRow("claude-code", "", "succeeded", 1_000_000),
+		reportedModelRow("", "model-a"),
+		reportedModelRow("model-b", "model-a"),
 	)
 
 	report := agg.Report(fixedNow, "/wf", "/db", nil, nil, nil)
@@ -519,8 +527,9 @@ func TestStatsByModel(t *testing.T) {
 		t.Errorf("by_model run counts sum to %d, want the report's runs: %d", got, report.Summary.Runs)
 	}
 	modelA, modelB, none := findGroup(t, report.ByModel, "model-a"), findGroup(t, report.ByModel, "model-b"), findGroup(t, report.ByModel, "<none>")
-	if modelA.Runs != 2 || modelA.Succeeded != 1 || none.Runs != 1 {
-		t.Errorf("model-a runs, succeeded and <none> runs = %d, %d, %d, want 2, 1, 1", modelA.Runs, modelA.Succeeded, none.Runs)
+	if modelA.Runs != 4 || modelA.Succeeded != 3 || modelB.Runs != 1 || none.Runs != 1 {
+		t.Errorf("model-a runs, succeeded, model-b runs and <none> runs = %d, %d, %d, %d, want 4, 3, 1, 1 (a reported model wins over the configured one)",
+			modelA.Runs, modelA.Succeeded, modelB.Runs, none.Runs)
 	}
 	if modelA.CostUSD == nil || *modelA.CostUSD != 10 || modelB.CostUSD != nil {
 		t.Errorf("model-a, model-b CostUSD = %v, %v, want 10 (priced by its kind's rate) and nil (its kind has no rate)", modelA.CostUSD, modelB.CostUSD)

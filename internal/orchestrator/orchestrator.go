@@ -356,6 +356,11 @@ type Orchestrator struct {
 	// most recent tick, empty at construction. Read and written only by
 	// handleTick.
 	reportedAdvisories []config.Advisory
+
+	// lastTickSummary holds the attributes of the most recent "tick
+	// completed" record, nil before the first. Read and written only by
+	// handleTick.
+	lastTickSummary []slog.Attr
 }
 
 // NewOrchestrator creates an [Orchestrator] with all dependencies wired.
@@ -1182,7 +1187,7 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		)
 	}
 
-	o.logger.Info("tick completed",
+	summary := []slog.Attr{
 		slog.Int("candidates", len(sorted)),
 		slog.Int("dispatched", dispatched),
 		slog.Int("dispatched_by_rule", dispatchedByRule),
@@ -1195,7 +1200,13 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		slog.Int("blockers_not_read", blockersNotReadHeld),
 		slog.Int("blockers_incomplete", blockersIncompleteHeld),
 		slog.Int("budget_exhausted", len(o.state.BudgetExhausted)),
-	)
+	}
+	level := slog.LevelInfo
+	if slices.EqualFunc(o.lastTickSummary, summary, slog.Attr.Equal) {
+		level = slog.LevelDebug
+	}
+	o.lastTickSummary = summary
+	o.logger.LogAttrs(ctx, level, "tick completed", summary...)
 
 	o.pruneAttentionAcknowledgements(ctx)
 	o.notifyObservers()

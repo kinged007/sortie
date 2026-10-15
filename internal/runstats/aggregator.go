@@ -307,9 +307,16 @@ func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
 		strings.Join(unrecorded, ", "), strings.Join(dropped, ", "))
 }
 
+// modelOf names the model a run is grouped under: the one the runtime
+// reported, else the configured one, because a run left to the runtime's
+// default configures none.
+func modelOf(row persistence.RunStatsRow) string {
+	return cmp.Or(row.ReportedModel, row.ConfiguredModel)
+}
+
 // modelBreakdownWarning explains the missing by_model breakdown.
-const modelBreakdownWarning = "this database was written before sortie recorded the model each run was configured with, " +
-	"so the report leaves out the breakdown by configured model. " +
+const modelBreakdownWarning = "this database was written before sortie recorded the model of each run, " +
+	"so the report leaves out the breakdown by model. " +
 	"Run sortie once with this workflow to add it."
 
 // chainBreakdownWarning explains the missing by_chain breakdown.
@@ -408,7 +415,7 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 			bumpGroup(a.byTemplate, label(row.TemplateID), isSucceeded),
 		)
 		if a.caps.ModelBreakdown() {
-			bumped = append(bumped, bumpGroup(a.byModel, label(row.ConfiguredModel), isSucceeded))
+			bumped = append(bumped, bumpGroup(a.byModel, label(modelOf(row)), isSucceeded))
 		}
 		if a.caps.ChainBreakdown() && row.ChainID != "" {
 			bumped = append(bumped, bumpGroup(a.byChain, row.ChainID, isSucceeded))

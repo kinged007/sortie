@@ -62,6 +62,12 @@ var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 // Code CLI subprocesses. One adapter instance serves all concurrent
 // sessions; per-session state is held in [sessionState] via the
 // [domain.Session] Internal field.
+
+// syntheticModel is the model Claude Code stamps on a message it writes
+// itself, such as an API error or an interruption notice. It names no model,
+// so it must not replace the model that did the work.
+const syntheticModel = "<synthetic>"
+
 type ClaudeCodeAdapter struct{}
 
 // sessionState is adapter-internal state stored in [domain.Session]
@@ -268,7 +274,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 				if len(event.Message) > 0 {
 					var meta rawAssistantMessageMeta
 					if err := json.Unmarshal(event.Message, &meta); err == nil {
-						if meta.Model != "" {
+						if meta.Model != "" && meta.Model != syntheticModel {
 							state.lastModel = meta.Model
 						}
 						if meta.Usage != nil {

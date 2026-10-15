@@ -1,22 +1,50 @@
-import { Link } from "react-router";
+import { Link, useLocation } from "react-router";
 
 import { ApiError } from "@/api/client";
-import { useIssueQuery } from "@/api/queries";
+import { useHistoryRunsQuery, useIssueQuery, useStateQuery } from "@/api/queries";
 import { keyTip } from "@/app/key-tips";
+import { useNow } from "@/app/live";
 import { ExternalLinkIcon } from "@/components/icons";
+import { IssueMargin, NextOutcomes } from "@/components/IssueMargin";
+import { IssueStory, storyRunsOf } from "@/components/IssueStory";
+import { Lane } from "@/components/Lane";
 import { ServedText } from "@/components/ServedText";
-import { StatusMark } from "@/components/StatusMark";
-import { buttonStyles } from "@/components/ui/button";
+import { StateBadge } from "@/components/StateBadge";
+import { Button, buttonStyles } from "@/components/ui/button";
 import { DrawerClose, DrawerTitle } from "@/components/ui/drawer";
-import { fmtClock, fmtDate, fmtDuration, parseInstant, pluralVerb } from "@/lib/format";
+import { useAttentionActions } from "@/components/use-attention-actions";
+import { budgetOf } from "@/lib/budget";
+import { cn } from "@/lib/cn";
+import { costText, NOT_MEASURED, runningTokensText } from "@/lib/figures";
+import { fmtClock, fmtTokens, plural } from "@/lib/format";
+import { issueLinkOf } from "@/lib/issue-link";
+import { agentLabel, modelLabel, ruleLabel } from "@/lib/labels";
+import {
+  decidingOf,
+  laneOf,
+  lastStageRunOf,
+  positionOf,
+  stageProgressOf,
+  standingOf,
+  stationsOf,
+} from "@/lib/lane";
 import { safeHttpUrl } from "@/lib/links";
+import { numberedRunsOf } from "@/lib/run-number";
 import { runStatus } from "@/lib/run-status";
-import { localMidnight, now } from "@/lib/server-clock";
 
-import type { IssueHistoryResponse, NextOutcomeResponse, RunResponse } from "@/api/types.gen";
+import type { ReactNode } from "react";
 
-const WRAP = "[overflow-wrap:anywhere]";
-const SECTION_HEADING = "text-label-caps font-medium text-ink-muted";
+import type {
+  AttentionItemResponse,
+  IssueDetailResponse,
+  PullRequestResponse,
+  RunsResponse,
+  StateResponse,
+} from "@/api/types.gen";
+import type { LaneStation, StagePosition, StageProgress } from "@/lib/lane";
+
+const SEP = " · ";
+const PEEK_RUNS = 4;
 
 /** What a list already knows of an issue; shown until the issue's own response arrives. */
 export interface IssueDetailRow {
@@ -30,191 +58,436 @@ export interface IssueDetailProps {
   /** The `issue_identifier` that addresses the issue. */
   identifier: string;
   row?: IssueDetailRow;
-  /** Renders the drawer header with "Open page" and "Close" instead of a page heading. */
+  /** Renders the drawer layout with "Open page" and "Close" instead of the page. */
   peek?: boolean;
 }
 
-/**
- * Renders one issue: its sentence, tracker link, what happens next, and its
- * runs. The peek and the issue route share it.
- */
-export function IssueDetail({ identifier, row, peek = false }: IssueDetailProps) {
-  const { data, error } = useIssueQuery(identifier);
-  const key = row?.displayKey ?? identifier;
-  const failure = error instanceof ApiError ? error : undefined;
-  const isGone = failure?.status === 404;
-  const isHistoryDown = failure?.status === 503 && failure.code === "history_unavailable";
-  const trackerUrl = safeHttpUrl(data?.issue.url);
-  const title = data?.issue.title || row?.title;
-  const sentence = data?.status_text_full || row?.statusTextFull;
-  const nextOutcomes = data?.next_outcomes ?? [];
+interface IssueView {
+  lane: LaneStation[] | undefined;
+  position: StagePosition | null;
+  progress: StageProgress | null;
+  isLive: boolean;
+}
 
+function viewOf(
+  detail: IssueDetailResponse,
+  state: StateResponse | undefined,
+  now: number,
+  olderPages: readonly RunsResponse[],
+): IssueView {
+  const active = (state?.active ?? []).find((entry) => entry.issue_id === detail.issue_id);
+  const deciding = decidingOf(detail, active);
+  const position = positionOf(detail, deciding);
+  const stations = state?.config === undefined ? undefined : stationsOf(state.config);
+  const standing =
+    stations === undefined
+      ? null
+      : standingOf(
+          {
+            deciding,
+            outcome: detail.history?.issue_outcome ?? null,
+            issueId: detail.issue_id,
+            attention: state?.attention ?? [],
+            now,
+          },
+          stations,
+        );
+  const station = stations?.find((candidate) => candidate.key === standing?.station)?.kind ?? null;
+  return {
+    lane:
+      stations === undefined
+        ? undefined
+        : laneOf(stations, standing, detail.pending_reactions ?? []),
+    position,
+    progress:
+      position === null
+        ? null
+        : stageProgressOf(
+            position,
+            deciding !== null,
+            station,
+            lastStageRunOf(storyRunsOf(detail.history?.runs ?? [], olderPages), position.current),
+          ),
+    isLive: deciding !== null,
+  };
+}
+
+function pullRequestOf(detail: IssueDetailResponse): PullRequestResponse | undefined {
+  return detail.pending_reactions?.[0]?.pull_request ?? detail.history?.issue_outcome?.pull_request;
+}
+
+interface ExternalButtonProps {
+  href: string;
+  title?: string;
+  children: ReactNode;
+}
+
+function ExternalButton({ href, title, children }: ExternalButtonProps) {
   return (
-    <div className="flex flex-col gap-md p-lg max-md:p-md">
-      <DetailHeader identifier={identifier} issueKey={key} state={data?.issue.state} peek={peek} />
-      {isGone ? (
-        <p className={`text-body-md text-ink-body ${WRAP}`}>Sortie no longer knows {key}.</p>
-      ) : (
-        <>
-          {title ? <p className={`font-heading text-h6 text-ink ${WRAP}`}>{title}</p> : undefined}
-          {sentence ? (
-            <p className={`text-body-md text-ink-body ${WRAP}`}>
-              <ServedText text={sentence} />
-            </p>
-          ) : undefined}
-          {isHistoryDown ? (
-            <p className="text-body-md text-ink-body">Run history could not be read.</p>
-          ) : undefined}
-          {trackerUrl === null ? undefined : (
-            <a
-              href={trackerUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className={buttonStyles("secondary", "self-start")}
-            >
-              Open in tracker
-              <ExternalLinkIcon />
-            </a>
-          )}
-          {nextOutcomes.length > 0 ? <NextOutcomes outcomes={nextOutcomes} /> : undefined}
-          {data === undefined ? undefined : <Runs history={data.history} />}
-        </>
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={title}
+      className={buttonStyles("secondary")}
+    >
+      <ExternalLinkIcon />
+      {children}
+    </a>
+  );
+}
+
+interface ActionsProps {
+  detail: IssueDetailResponse;
+  /** The open attention items the peek acknowledges from its action row; the page acknowledges them in its margin. */
+  attention?: readonly AttentionItemResponse[];
+}
+
+function Actions({ detail, attention = [] }: ActionsProps) {
+  const actions = useAttentionActions();
+  const trackerUrl = safeHttpUrl(detail.issue.url);
+  const pullRequest = pullRequestOf(detail);
+  const pullRequestUrl = safeHttpUrl(pullRequest?.url);
+  if (trackerUrl === null && pullRequestUrl === null && attention.length === 0) {
+    return undefined;
+  }
+  return (
+    <div className="flex flex-wrap gap-xs">
+      {attention.map((item) => (
+        <Button
+          key={item.id}
+          variant="primary"
+          disabled={actions.pending.has(item.id)}
+          title={keyTip("Acknowledge", "E")}
+          onClick={() => void actions.acknowledge(item)}
+        >
+          {actions.pending.has(item.id) ? "Acknowledging" : "Acknowledge"}
+        </Button>
+      ))}
+      {trackerUrl === null ? undefined : (
+        <ExternalButton href={trackerUrl}>Open issue</ExternalButton>
+      )}
+      {pullRequest === undefined || pullRequestUrl === null ? undefined : (
+        <ExternalButton href={pullRequestUrl}>{`PR #${pullRequest.number}`}</ExternalButton>
       )}
     </div>
   );
 }
 
-interface DetailHeaderProps {
-  identifier: string;
+interface KickerProps {
   issueKey: string;
-  state: string | undefined;
-  peek: boolean;
+  detail: IssueDetailResponse | undefined;
 }
 
-function DetailHeader({ identifier, issueKey, state, peek }: DetailHeaderProps) {
-  const keyClass = "min-w-0 font-semibold text-ink tabular-nums text-h7 [overflow-wrap:anywhere]";
+function Kicker({ issueKey, detail }: KickerProps) {
+  const state = detail?.issue.state;
+  const type = detail?.issue.issue_type;
   return (
-    <header className="flex flex-wrap items-center gap-xs">
-      {peek ? (
-        <DrawerTitle className={keyClass}>{issueKey}</DrawerTitle>
+    <p className="flex flex-wrap items-center gap-x-sm gap-y-xxs text-body-sm text-ink-muted">
+      <span className="text-ink-body tabular-nums">{issueKey}</span>
+      {state ? <StateBadge state={state} /> : undefined}
+      {type ? <span>{type}</span> : undefined}
+    </p>
+  );
+}
+
+function agentText(detail: IssueDetailResponse): string | undefined {
+  const { running } = detail;
+  const last = detail.history?.runs?.[0];
+  const kind = running?.agent_kind ?? last?.agent_kind;
+  const model =
+    running?.model_name || running?.configured_model || last?.model_name || last?.configured_model;
+  if (!kind) {
+    return undefined;
+  }
+  return model ? `${agentLabel(kind)}${SEP}${modelLabel(model)}` : agentLabel(kind);
+}
+
+interface PeekFactsProps {
+  detail: IssueDetailResponse;
+  state: StateResponse | undefined;
+  position: StagePosition | null;
+}
+
+function PeekFacts({ detail, state, position }: PeekFactsProps) {
+  const config = state?.config;
+  const { sessions, tokens, cost } = budgetOf(detail, config);
+  const { running } = detail;
+  const pullRequest = pullRequestOf(detail);
+  const agent = agentText(detail);
+  const facts: [string, ReactNode][] = [];
+  if (position !== null) {
+    const k = position.chain.indexOf(position.current) + 1;
+    facts.push(["Route", `${ruleLabel(position.current)}${SEP}${k} of ${position.chain.length}`]);
+  }
+  if (agent !== undefined) {
+    facts.push(["Agent", agent]);
+  }
+  if (running !== null) {
+    const tokensText = runningTokensText(running);
+    const sessionCost = costText(running.cost_status, running.estimated_cost_usd);
+    const parts = [
+      config === undefined
+        ? `turn ${running.turn_count}`
+        : `turn ${running.turn_count} of ${config.agent.max_turns}`,
+      tokensText === NOT_MEASURED ? "tokens not measured" : `${tokensText} tokens`,
+      cost === null || sessionCost === NOT_MEASURED ? undefined : `${sessionCost} est.`,
+    ].filter((part) => part !== undefined);
+    facts.push(["This session", parts.join(SEP)]);
+  }
+  facts.push([
+    "Sessions",
+    sessions.limit === null
+      ? String(sessions.used ?? 0)
+      : `${sessions.used ?? 0} of ${sessions.limit}`,
+  ]);
+  if (tokens.used === null) {
+    facts.push([
+      "Tokens",
+      <span key="tokens" className="text-ink-muted italic">
+        {NOT_MEASURED}
+      </span>,
+    ]);
+  } else if (cost !== null) {
+    facts.push([
+      "Spent",
+      `${costText(cost.status, cost.usd)} estimated, ${fmtTokens(tokens.used)} tokens`,
+    ]);
+  } else {
+    facts.push(["Tokens", fmtTokens(tokens.used)]);
+  }
+  if (pullRequest !== undefined) {
+    facts.push([
+      "Pull request",
+      pullRequest.branch ? (
+        <>
+          #{pullRequest.number}
+          {SEP}
+          <span className="font-mono">{pullRequest.branch}</span>
+        </>
       ) : (
-        <h1 className={keyClass}>{issueKey}</h1>
-      )}
-      {state ? (
-        <span className="rounded border border-line-medium px-xs text-body-sm text-ink-body">
-          {state}
-        </span>
+        `#${pullRequest.number}`
+      ),
+    ]);
+  }
+  return (
+    <dl className="grid grid-cols-[120px_minmax(0,1fr)] gap-x-md gap-y-xs text-body-md">
+      {facts.map(([label, value]) => (
+        <div key={label} className="contents">
+          <dt className="text-ink-muted">{label}</dt>
+          <dd className="text-ink">{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+interface PeekRunsProps {
+  detail: IssueDetailResponse;
+  now: number;
+}
+
+function PeekRuns({ detail, now }: PeekRunsProps) {
+  const served = detail.history?.runs ?? [];
+  const total = detail.history?.totals.run_count ?? served.length;
+  const shown = numberedRunsOf(served, total).slice(-PEEK_RUNS);
+  const earlier = total - shown.length;
+  const node = "relative z-(--z-raised) mt-xs ml-xxs size-[9px] rounded-full border-[1.5px]";
+  return (
+    <ul className="relative before:absolute before:top-xs before:bottom-xs before:left-[60px] before:w-px before:bg-line">
+      {earlier > 0 ? (
+        <li className="grid grid-cols-[48px_20px_minmax(0,1fr)] gap-x-sm py-xs text-body-md">
+          <span />
+          <span aria-hidden="true" className={cn(node, "border-ink-muted bg-canvas")} />
+          <span className="text-ink-muted">{plural(earlier, "earlier run", "earlier runs")}</span>
+        </li>
       ) : undefined}
-      {peek ? (
-        <span className="ml-auto flex items-center gap-xs">
+      {shown.map(({ run, number }) => (
+        <li
+          key={run.run_id}
+          className="grid grid-cols-[48px_20px_minmax(0,1fr)] gap-x-sm py-xs text-body-md"
+        >
+          <span className="pt-xxs text-right text-body-sm text-ink-muted tabular-nums">
+            {fmtClock(run.started_at)}
+          </span>
+          <span aria-hidden="true" className={cn(node, "border-ink-body bg-ink-body")} />
+          <span className="text-ink-body">
+            {`Run ${number}${run.rule_name ? `${SEP}${ruleLabel(run.rule_name)}` : ""}${SEP}${runStatus(run.status).word.toLowerCase()} at ${fmtClock(run.completed_at)}`}
+            {run.stage_result ? (
+              <span className="block text-body-sm text-ink-muted">
+                stage result: {run.stage_result}
+              </span>
+            ) : undefined}
+          </span>
+        </li>
+      ))}
+      <li className="grid grid-cols-[48px_20px_minmax(0,1fr)] gap-x-sm py-xs text-body-md">
+        <span className="pt-xxs text-right text-body-sm text-ink-muted tabular-nums">
+          {fmtClock(new Date(now))}
+        </span>
+        <span
+          aria-hidden="true"
+          className={cn(
+            node,
+            "border-primary bg-primary shadow-[0_0_0_3px_var(--color-surface-sunken)]",
+          )}
+        />
+        <span className="text-ink">
+          <ServedText text={detail.status_text_full} />
+        </span>
+      </li>
+    </ul>
+  );
+}
+
+function SubHeading({ children }: { children: ReactNode }) {
+  return <h3 className="mt-lg mb-sm text-body-sm font-medium text-ink-muted">{children}</h3>;
+}
+
+/**
+ * Renders one issue. The page shows the key, state and type over the title,
+ * the served sentence, the external links, the lane, then the story beside a
+ * margin from 1280 px. The peek shows the same head over the facts, what
+ * happens next, and the last runs.
+ */
+export function IssueDetail({ identifier, row, peek = false }: IssueDetailProps) {
+  const { data, error } = useIssueQuery(identifier);
+  const { data: state } = useStateQuery();
+  const now = useNow();
+  const location = useLocation();
+  // Disabled here: IssueStory enables the same cached query, and this reads the pages it loaded.
+  const { data: older } = useHistoryRunsQuery(data?.issue_id ?? "", {}, false);
+  const key = row?.displayKey ?? identifier;
+  const failure = error instanceof ApiError ? error : undefined;
+  const isGone = failure?.status === 404;
+  const isHistoryDown = failure?.status === 503 && failure.code === "history_unavailable";
+  const title = data?.issue.title || row?.title;
+  const sentence = data?.status_text_full || row?.statusTextFull;
+  const view = data === undefined ? undefined : viewOf(data, state, now, older?.pages ?? []);
+  const needsAttention = (state?.attention ?? []).some(
+    (item) => item.issue_id === data?.issue_id && item.acknowledged_at === null,
+  );
+  const link = issueLinkOf(identifier, location);
+
+  if (peek) {
+    return (
+      <div className="flex flex-col p-lg max-md:p-md">
+        <div className="mb-md flex items-center gap-sm text-body-sm text-ink-muted">
+          <DrawerTitle className="text-body-sm font-normal text-ink-body tabular-nums">
+            {key}
+          </DrawerTitle>
+          {data?.issue.state ? <StateBadge state={data.issue.state} /> : undefined}
+          <span className="flex-1" />
           <Link
-            to={`/issues/${encodeURIComponent(identifier)}`}
+            to={link.to}
+            state={link.state}
             className={buttonStyles("secondary")}
             title={keyTip("Open page", "Enter")}
           >
             Open page
           </Link>
           <DrawerClose title={keyTip("Close", "Esc")}>Close</DrawerClose>
-        </span>
-      ) : undefined}
-    </header>
-  );
-}
-
-interface NextOutcomesProps {
-  outcomes: NextOutcomeResponse[];
-}
-
-function NextOutcomes({ outcomes }: NextOutcomesProps) {
-  return (
-    <section className="flex flex-col gap-xs">
-      <h3 className={SECTION_HEADING}>What happens next</h3>
-      <ul className="flex flex-col gap-xs">
-        {outcomes.map((outcome) => (
-          <li key={outcome.condition} className={`text-body-md text-ink-body ${WRAP}`}>
-            <strong className="font-bold text-ink">
-              <ServedText text={outcome.condition} />
-            </strong>{" "}
-            <ServedText text={outcome.text} />
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-interface RunsProps {
-  history: IssueHistoryResponse | null;
-}
-
-function Runs({ history }: RunsProps) {
-  if (history === null) {
-    return (
-      <section className="flex flex-col gap-xs">
-        <h3 className={SECTION_HEADING}>Runs</h3>
-        <p className="text-body-md text-ink-body">No run is recorded yet.</p>
-      </section>
+        </div>
+        {isGone ? (
+          <p className="text-body-md text-ink-body">Sortie no longer knows {key}.</p>
+        ) : (
+          <>
+            {title ? (
+              <p className="mb-xs font-heading text-h6 font-semibold text-ink">{title}</p>
+            ) : undefined}
+            {sentence ? (
+              <p className="mb-md text-body-md text-ink-body">
+                <ServedText text={sentence} />
+              </p>
+            ) : undefined}
+            {view?.lane === undefined ? undefined : (
+              <div className="mb-md">
+                <Lane
+                  stations={view.lane}
+                  position={view.position}
+                  progress={view.progress}
+                  live={view.isLive}
+                  variant="peek"
+                />
+              </div>
+            )}
+            {data === undefined ? undefined : (
+              <>
+                <div className="mb-lg">
+                  <Actions
+                    detail={data}
+                    attention={(state?.attention ?? []).filter(
+                      (item) => item.issue_id === data.issue_id && item.acknowledged_at === null,
+                    )}
+                  />
+                </div>
+                <PeekFacts detail={data} state={state} position={view?.position ?? null} />
+                {(data.next_outcomes ?? []).length === 0 ? undefined : (
+                  <>
+                    <SubHeading>What happens next</SubHeading>
+                    <NextOutcomes outcomes={data.next_outcomes ?? []} />
+                  </>
+                )}
+                <SubHeading>So far</SubHeading>
+                <PeekRuns detail={data} now={now} />
+              </>
+            )}
+          </>
+        )}
+      </div>
     );
   }
-  const listed = history.runs ?? [];
-  const olderRuns = pluralVerb(
-    history.totals.run_count - listed.length,
-    ["older run", "older runs"],
-    ["is", "are"],
-  );
-  const startOfToday = localMidnight(now()).getTime();
+
   return (
-    <section className="flex flex-col gap-xs">
-      <h3 className={SECTION_HEADING}>Runs</h3>
-      <ul className="flex flex-col gap-sm">
-        {[...listed].reverse().map((run) => (
-          <RunLine key={run.run_id} run={run} startOfToday={startOfToday} />
-        ))}
-      </ul>
-      {history.next_cursor === null ? undefined : (
-        <p className="text-body-md text-ink-body">
-          {olderRuns.subject} {olderRuns.verb} not listed
-        </p>
+    <div className="flex flex-col">
+      <Kicker issueKey={key} detail={data} />
+      {isGone ? (
+        <p className="mt-xs text-body-md text-ink-body">Sortie no longer knows {key}.</p>
+      ) : (
+        <>
+          <h1 className="mt-xs mb-xs font-heading text-h5 font-semibold text-ink">
+            {title ?? key}
+          </h1>
+          {sentence ? (
+            <p className="mb-lg text-body-lg text-ink-body">
+              <ServedText text={sentence} />
+            </p>
+          ) : undefined}
+          {isHistoryDown ? (
+            <p className="mb-lg text-body-md text-ink-body">Run history could not be read.</p>
+          ) : undefined}
+          {data === undefined ? undefined : (
+            <div className="mb-lg">
+              <Actions detail={data} />
+            </div>
+          )}
+          {view?.lane === undefined ? undefined : (
+            <div className="mb-xl">
+              <Lane
+                stations={view.lane}
+                position={view.position}
+                progress={view.progress}
+                live={view.isLive}
+              />
+            </div>
+          )}
+          {data === undefined || view === undefined ? undefined : (
+            <div className="flex flex-col gap-xl xl:grid xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start xl:gap-xxxl">
+              <div className="min-w-0">
+                <IssueStory
+                  detail={data}
+                  position={view.position}
+                  progress={view.progress}
+                  needsAttention={needsAttention}
+                />
+              </div>
+              <div className="flex min-w-0 flex-col gap-xl">
+                <IssueMargin detail={data} state={state} position={view.position} />
+              </div>
+            </div>
+          )}
+        </>
       )}
-    </section>
-  );
-}
-
-interface RunLineProps {
-  run: RunResponse;
-  startOfToday: number;
-}
-
-function RunLine({ run, startOfToday }: RunLineProps) {
-  const started = parseInstant(run.started_at);
-  const completed = parseInstant(run.completed_at);
-  const isToday = started !== null && started >= startOfToday;
-  const when = isToday
-    ? fmtClock(run.started_at)
-    : `${fmtDate(run.started_at)} ${fmtClock(run.started_at)}`;
-  const { word, mark } = runStatus(run.status);
-  const span = started !== null && completed !== null ? (completed - started) / 1000 : null;
-  const hasHop = Boolean(run.stage_target) && Boolean(run.stage_result);
-
-  return (
-    <li className="flex flex-col gap-xxs">
-      <div className="flex flex-wrap items-center gap-x-sm gap-y-xxs text-body-md">
-        <span className="text-ink tabular-nums">{when}</span>
-        {run.rule_name && run.rule_name !== "default" ? (
-          <span className={`font-mono text-body-sm text-ink-body ${WRAP}`}>{run.rule_name}</span>
-        ) : undefined}
-        {mark === null ? (
-          <span className="text-ink-body">{word}</span>
-        ) : (
-          <StatusMark mark={mark} label={word} />
-        )}
-        <span className="ml-auto text-ink-body tabular-nums">{fmtDuration(span)}</span>
-      </div>
-      {hasHop ? (
-        <p className={`text-body-sm text-ink-body ${WRAP}`}>
-          Hop to {run.stage_target}: {run.stage_result}
-        </p>
-      ) : undefined}
-    </li>
+    </div>
   );
 }

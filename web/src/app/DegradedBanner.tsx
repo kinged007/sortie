@@ -1,3 +1,5 @@
+import { Link, useMatch } from "react-router";
+
 import { useStateQuery } from "@/api/queries";
 import { TriangleAlertIcon } from "@/components/icons";
 import { fmtClock } from "@/lib/format";
@@ -55,6 +57,7 @@ function failingChecks(state: StateResponse): CheckLine[] {
 /** Renders one line per failing health check under the top bar, or nothing while every check passes. */
 export function DegradedBanner() {
   const { data } = useStateQuery();
+  const isOnHealth = useMatch("/health") !== null;
   const lines = data === undefined ? [] : failingChecks(data);
   if (lines.length === 0) {
     return undefined;
@@ -75,6 +78,14 @@ export function DegradedBanner() {
           </div>
         ))}
       </div>
+      {isOnHealth ? undefined : (
+        <Link
+          to="/health"
+          className="ml-auto whitespace-nowrap text-ink underline underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus-ring"
+        >
+          Open Health
+        </Link>
+      )}
     </div>
   );
 }

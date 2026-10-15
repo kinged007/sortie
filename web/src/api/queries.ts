@@ -6,6 +6,7 @@ import { setServerOffset } from "@/lib/server-clock";
 import type { HistoryFilter } from "@/api/client";
 import type {
   IssueDetailResponse,
+  IssueGroupResponse,
   IssueGroupsResponse,
   Report,
   RunsResponse,
@@ -34,6 +35,7 @@ export const queryKeys = {
   history: (filter: HistoryFilter) => ["history", filter] as const,
   historyRuns: (issueId: string, filter: HistoryFilter) =>
     ["history-runs", issueId, filter] as const,
+  issueLookup: (query: string) => ["issue-lookup", query] as const,
   stats: (range: AnalyticsRange) => ["stats", range] as const,
 };
 
@@ -78,6 +80,15 @@ async function fetchHasRun(signal: AbortSignal): Promise<boolean> {
     }
     throw error;
   }
+}
+
+const ISSUE_LOOKUP_LIMIT = 5;
+
+// The server matches an issue key exactly, case included, so a key typed in
+// lowercase is also asked for in uppercase.
+async function fetchIssueLookup(query: string, signal: AbortSignal): Promise<IssueGroupResponse[]> {
+  const answer = await getIssueGroups({ q: query, limit: ISSUE_LOOKUP_LIMIT }, signal);
+  return answer.groups ?? [];
 }
 
 async function fetchState(signal: AbortSignal): Promise<StateResponse> {
@@ -169,6 +180,16 @@ export function useHistoryRunsQuery(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled,
+    meta: { refetchFloorMs: HISTORY_REFETCH_FLOOR_MS },
+  });
+}
+
+/** Reads the finished issues whose key or title contains the query, ignoring case; it stays idle while the query is empty. */
+export function useIssueLookupQuery(query: string): UseQueryResult<IssueGroupResponse[]> {
+  return useQuery({
+    queryKey: queryKeys.issueLookup(query),
+    queryFn: ({ signal }) => fetchIssueLookup(query, signal),
+    enabled: query !== "",
     meta: { refetchFloorMs: HISTORY_REFETCH_FLOOR_MS },
   });
 }

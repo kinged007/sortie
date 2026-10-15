@@ -1,0 +1,117 @@
+import { stationX } from "@/components/Lane";
+import { cn } from "@/lib/cn";
+
+import type { Station } from "@/lib/lane";
+
+const FULL_NAME_BOX_PX = 88;
+const NAME_BOX_SHARE = 0.9;
+const SPACING_XS_PX = 8;
+const LOOP_MARGIN = 3;
+
+// Their full labels do not fit a name box at any width.
+const ALWAYS_SHORT = new Set(["merge_completion", "label_commands"]);
+
+/** Props of {@link StationHeader}. */
+export interface StationHeaderProps {
+  stations: readonly Station[];
+  /** The lanes per station key; a station without an entry holds none. */
+  tally: ReadonlyMap<string, { count: number; hot: boolean }>;
+}
+
+interface StationNameProps {
+  station: Station;
+}
+
+function StationName({ station }: StationNameProps) {
+  if (station.short === undefined) {
+    return station.label;
+  }
+  if (ALWAYS_SHORT.has(station.key)) {
+    return station.short;
+  }
+  return (
+    <>
+      <span data-station-full="">{station.label}</span>
+      <span data-station-short="" hidden>
+        {station.short}
+      </span>
+    </>
+  );
+}
+
+/**
+ * Renders the stations above the Pipeline lanes, each with the count of lanes
+ * standing at it. It places each station with {@link stationX}, as the lane
+ * tracks do, so the names stand over the dots. A name box never grows past its
+ * share of the width; a reaction station shows its short form once the share
+ * drops below the room the full name needs.
+ */
+export function StationHeader({ stations, tally }: StationHeaderProps) {
+  const count = stations.length;
+  const reactions = stations.flatMap((station, index) =>
+    station.kind === "reaction" ? [index] : [],
+  );
+  const first = reactions[0];
+  const last = reactions.at(-1);
+  const shareExpression = `calc(${NAME_BOX_SHARE * 100}cqw / ${Math.max(1, count - 1)} - var(--spacing-xs))`;
+  const narrowBelowPx = Math.ceil(
+    ((FULL_NAME_BOX_PX + SPACING_XS_PX) * Math.max(1, count - 1)) / NAME_BOX_SHARE,
+  );
+  const label = `Stations: ${stations
+    .map((station) => {
+      const total = tally.get(station.key)?.count ?? 0;
+      return total > 0 ? `${station.label} ${total}` : station.label;
+    })
+    .join(", ")}`;
+
+  return (
+    <div className="sticky top-0 z-(--z-sticky) border-b border-line bg-canvas px-md pt-sm pb-xs max-md:hidden">
+      {/* The query threshold depends on the station count, which a static class cannot carry. */}
+      <style>{`@container (max-width: ${narrowBelowPx}px) { [data-station-full] { display: none } [data-station-short] { display: inline } }`}</style>
+      <div role="img" aria-label={label} className="@container relative h-16">
+        {first === undefined || last === undefined ? undefined : (
+          <div
+            className="absolute top-0 h-3 border-x border-t border-line-strong text-center text-label-caps font-medium text-ink-muted uppercase"
+            style={{
+              left: `${stationX(first, count) - LOOP_MARGIN}%`,
+              width: `${stationX(last, count) - stationX(first, count) + 2 * LOOP_MARGIN}%`,
+            }}
+          >
+            <span className="relative -top-xs bg-canvas px-xs">PR loop</span>
+          </div>
+        )}
+        {stations.map((station, index) => {
+          const entry = tally.get(station.key);
+          const total = entry?.count ?? 0;
+          return (
+            <div
+              key={station.key}
+              title={station.label}
+              className="absolute bottom-0 -translate-x-1/2 text-center whitespace-nowrap"
+              style={{ left: `${stationX(index, count)}%` }}
+            >
+              <div
+                className={cn(
+                  "mx-auto mb-xxs grid size-5 place-items-center rounded-full border-[1.5px] text-body-sm font-bold tabular-nums",
+                  total === 0 && "border-track-todo bg-canvas",
+                  total > 0 && entry?.hot !== true && "border-track-done bg-canvas",
+                  total > 0 &&
+                    entry?.hot === true &&
+                    "border-warning-fill bg-warning-fill text-on-warning-fill",
+                )}
+              >
+                {total === 0 ? undefined : total}
+              </div>
+              <div
+                className="mx-auto truncate text-body-sm font-medium text-ink-body"
+                style={{ maxWidth: `min(${FULL_NAME_BOX_PX}px, ${shareExpression})` }}
+              >
+                <StationName station={station} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

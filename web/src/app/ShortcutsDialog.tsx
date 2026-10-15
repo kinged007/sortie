@@ -17,6 +17,16 @@ const OVERVIEW_SHORTCUTS: Shortcut[] = [
   { label: "Open the issue page", keys: ["Enter"] },
   { label: "Run the item's action", keys: ["A"] },
   { label: "Acknowledge the item", keys: ["E"] },
+  { label: "Switch to Pipeline", keys: ["L"] },
+];
+
+const PIPELINE_SHORTCUTS: Shortcut[] = [
+  { label: "Select the next, previous lane", keys: ["J", "K"] },
+  { label: "Peek the selected issue", keys: ["Space"] },
+  { label: "Open the issue page", keys: ["Enter"] },
+  { label: "Run the peeked issue's action", keys: ["A"] },
+  { label: "Acknowledge the peeked issue's item", keys: ["E"] },
+  { label: "Switch to Overview", keys: ["L"] },
 ];
 
 function everywhereShortcuts(screens: ScreenEntry[]): Shortcut[] {
@@ -45,7 +55,12 @@ export interface ShortcutsDialogProps {
 /** Renders the dialog that lists the keys acting on the current route. */
 export function ShortcutsDialog({ screens, open, onOpenChange }: ShortcutsDialogProps) {
   const isOverview = useMatch("/") !== null;
-  const shortcuts = [...(isOverview ? OVERVIEW_SHORTCUTS : []), ...everywhereShortcuts(screens)];
+  const isPipeline = useMatch("/pipeline") !== null;
+  const shortcuts = [
+    ...(isOverview ? OVERVIEW_SHORTCUTS : []),
+    ...(isPipeline ? PIPELINE_SHORTCUTS : []),
+    ...everywhereShortcuts(screens),
+  ];
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

@@ -1,13 +1,11 @@
 import { keyTip } from "@/app/key-tips";
 import { ExternalLinkIcon } from "@/components/icons";
 import { ServedText } from "@/components/ServedText";
-import { StatusMark } from "@/components/StatusMark";
 import { Button, buttonStyles } from "@/components/ui/button";
+import { linkActionOf } from "@/components/use-attention-actions";
 import { cn } from "@/lib/cn";
 import { fmtAgo } from "@/lib/format";
-
-import { rowStyles, secondLineColor } from "./rows";
-import { linkActionOf } from "./use-attention-actions";
+import { rowStyles, secondLineColor } from "@/lib/rows";
 
 import type { MouseEvent } from "react";
 
@@ -34,7 +32,8 @@ export interface AttentionItemProps {
 }
 
 /**
- * Renders one attention item: why it exists, what clears it, and its actions.
+ * Renders one attention item: its reason, title and key on one line, why it
+ * exists, what clears it, and its age above its actions at the right.
  * A click outside its buttons opens the peek of its issue.
  */
 export function AttentionItem({
@@ -77,32 +76,55 @@ export function AttentionItem({
     <li
       data-nav-key={navKey}
       onClick={handleClick}
-      className={cn("flex gap-sm px-md py-md", rowStyles(isLook, isOpenable))}
+      className={cn(
+        "grid grid-cols-[var(--size-icon)_minmax(0,1fr)_auto] gap-x-md gap-y-xxs p-md max-md:grid-cols-[var(--size-icon)_minmax(0,1fr)]",
+        rowStyles(isLook, isOpenable),
+      )}
     >
-      <span className="flex h-5 shrink-0 items-center">
+      <span className="row-span-3 flex justify-center pt-xs">
         <span aria-hidden="true" className={cn("size-xs rounded-full", isUnread && "bg-primary")} />
       </span>
-      <StatusMark mark={isCritical ? "degraded" : "needs"} className="h-5 shrink-0" />
-      <div className="flex min-w-0 flex-1 flex-col gap-xxs [overflow-wrap:anywhere]">
-        <p className="text-body-md text-ink">
-          <strong className={cn("font-bold", isCritical ? "text-error" : "text-warning")}>
-            <ServedText text={item.reason_text} />
-          </strong>
-          {item.issue_title ? <> {item.issue_title}</> : undefined}
-          {key ? <span className="tabular-nums text-ink-body"> {key}</span> : undefined}
-        </p>
-        <p className="text-body-md text-ink-body">
-          <ServedText text={item.why_text} />
-        </p>
-        <p className="text-body-md text-ink-body">
-          <ServedText text={item.clears_text} />
-        </p>
-        {item.since === null ? undefined : (
-          <p className={cn("text-body-sm tabular-nums", secondLineColor(isLook))}>
-            {fmtAgo(item.since, now)}
-          </p>
-        )}
-        <div className="flex flex-wrap gap-xs pt-xs">
+      <p className="flex min-w-0 flex-wrap items-baseline gap-x-sm gap-y-xxs">
+        <strong
+          className={cn(
+            "text-body-md font-bold whitespace-nowrap",
+            isCritical ? "text-error" : "text-warning",
+          )}
+        >
+          <ServedText text={item.reason_text} />
+        </strong>
+        {item.issue_title ? (
+          <span className="text-body-md font-medium text-ink">{item.issue_title}</span>
+        ) : undefined}
+        {key ? (
+          <span
+            className={cn("text-body-sm whitespace-nowrap tabular-nums", secondLineColor(isLook))}
+          >
+            {key}
+          </span>
+        ) : undefined}
+      </p>
+      <p className="col-start-2 text-body-md text-ink-body">
+        <ServedText text={item.why_text} />
+      </p>
+      <p className={cn("col-start-2 text-body-sm", secondLineColor(isLook))}>
+        <ServedText text={item.clears_text} />
+      </p>
+      <div className="col-start-3 row-span-3 row-start-1 flex flex-col items-end justify-between gap-xs max-md:col-start-2 max-md:row-span-1 max-md:row-start-auto max-md:flex-row-reverse max-md:items-center max-md:justify-end">
+        <span
+          className={cn("text-body-sm whitespace-nowrap tabular-nums", secondLineColor(isLook))}
+        >
+          {item.since === null ? undefined : fmtAgo(item.since, now)}
+        </span>
+        <span className="flex flex-wrap gap-xs">
+          <Button
+            variant={isSelected && link === null ? "primary" : "secondary"}
+            disabled={isPending}
+            title={keyTip("Acknowledge", "E")}
+            onClick={() => onAcknowledge(item)}
+          >
+            {isPending ? "Acknowledging" : "Acknowledge"}
+          </Button>
           {link === null ? undefined : (
             <a
               href={link.url}
@@ -114,19 +136,11 @@ export function AttentionItem({
               onClick={handleLinkClick}
               className={buttonStyles(isSelected ? "primary" : "secondary")}
             >
-              {link.label}
               <ExternalLinkIcon />
+              {link.label}
             </a>
           )}
-          <Button
-            variant={isSelected && link === null ? "primary" : "secondary"}
-            disabled={isPending}
-            title={keyTip("Acknowledge", "E")}
-            onClick={() => onAcknowledge(item)}
-          >
-            {isPending ? "Acknowledging" : "Acknowledge"}
-          </Button>
-        </div>
+        </span>
       </div>
     </li>
   );

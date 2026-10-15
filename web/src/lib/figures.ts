@@ -1,6 +1,11 @@
 import { fmtMoney, fmtTokens, plural } from "@/lib/format";
 
-import type { Group, HistoryTotalsResponse, RunResponse } from "@/api/types.gen";
+import type {
+  Group,
+  HistoryTotalsResponse,
+  RunningEntryResponse,
+  RunResponse,
+} from "@/api/types.gen";
 
 /** The report fields a token or cost text reads; a `Summary` satisfies it too. */
 export type StatsFigures = Pick<
@@ -19,7 +24,8 @@ function atLeast(text: string): string {
   return `at least ${text}`;
 }
 
-function costText(status: string, usd: number | null): string {
+/** Words an estimated cost by its served status; a status the client does not know reads "unknown". */
+export function costText(status: string, usd: number | null): string {
   switch (status) {
     case "estimated":
       return usd === null ? "unknown" : fmtMoney(usd);
@@ -41,6 +47,15 @@ export function runTokensText(run: RunResponse): string {
   }
   const total = fmtTokens(run.tokens.total_tokens);
   return run.unaccounted_turns > 0 ? atLeast(total) : total;
+}
+
+/** Words the token figure of the session in flight; a count still arriving reads "at least". */
+export function runningTokensText(running: RunningEntryResponse): string {
+  const total = running.tokens.total_tokens;
+  if (!running.tokens_measured || total === null) {
+    return NOT_MEASURED;
+  }
+  return running.tokens_pending ? atLeast(fmtTokens(total)) : fmtTokens(total);
 }
 
 /** Words the estimated cost of one run. */

@@ -47,6 +47,7 @@ func (r runHistoryReader) QueryRuns(ctx context.Context, q server.RunHistoryQuer
 func (r runHistoryReader) QueryIssueGroups(ctx context.Context, q server.IssueGroupQuery) ([]server.IssueGroupKey, error) {
 	groups, err := r.store.QueryIssueGroups(ctx, persistence.IssueGroupFilter{
 		IssueKey:    q.IssueKey,
+		Search:      q.Search,
 		RuleName:    q.RuleName,
 		Status:      q.Status,
 		StageTarget: q.StageTarget,

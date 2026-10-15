@@ -4,7 +4,7 @@ import { ChipGroup } from "@/components/ui/chip-group";
 import { PHASES, chipCounts, isPhase } from "@/lib/active-rows";
 
 import type { ChipGroupItem } from "@/components/ui/chip-group";
-import type { ActiveRow, Phase } from "@/lib/active-rows";
+import type { Filterable, Phase } from "@/lib/active-rows";
 
 const PHASE_PARAM = "phase";
 
@@ -14,12 +14,13 @@ const LABELS: Record<Phase, string> = {
   between_stages: "Between stages",
   retry: "Retry scheduled",
   needs_attention: "Needs attention",
+  ended_today: "Ended today",
 };
 
 /** Props of {@link PhaseFilter}. */
 export interface PhaseFilterProps {
   /** The rows the rule menu already narrowed; the counts and the "All" chip read them. */
-  rows: readonly ActiveRow[];
+  rows: readonly Filterable[];
 }
 
 /**
@@ -40,7 +41,10 @@ export function PhaseFilter({ rows }: PhaseFilterProps) {
 
   const items: ChipGroupItem[] = PHASES.filter(
     (phase) => counts[phase] > 0 || phase === chosen,
-  ).map((phase) => ({ value: phase, label: `${LABELS[phase]} ${counts[phase]}` }));
+  ).map((phase) => ({
+    value: phase,
+    label: `${LABELS[phase]} ${counts[phase]}`,
+  }));
 
   function handleValueChange(value: string) {
     setParams(

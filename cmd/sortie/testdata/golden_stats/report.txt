@@ -33,7 +33,7 @@ by prompt template
   tpl-a     2     1          50.0%         5m 0s   10m 0s  7m 30s  2.5    1,550,000     $7.52
   tpl-b     1     1          100.0%        30m 0s  30m 0s  30m 0s  5.0    2,400,000     $12.00
 
-by configured model
+by model
   MODEL          RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN    TURNS  TOTAL TOKENS  COST
   <none>         2     0          0.0%          0s      0s      0s      0.5    110,000       -
   claude-sonnet  2     1          50.0%         5m 0s   10m 0s  7m 30s  2.5    1,550,000     $7.52
