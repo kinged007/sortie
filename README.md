@@ -40,9 +40,6 @@ Both adapters are covered by unit tests and conformance tests and ship with Dock
 
 Sortie turns tracker tickets into autonomous agent sessions. You declare which issues to work on, which coding agent to run, and what instructions to give it in one `WORKFLOW.md`; Sortie picks up matching issues, runs agents in parallel in isolated workspaces, retries failures, and tracks cost and history — as a single Go binary with SQLite, no database or queue to deploy.
 
-![Demo](docs/assets/banner.jpg)
-*Dashboard and run history: screenshot to be replaced with a short GIF of the local demo — see `docs/assets/`.*
-
 ## Works With
 
 **Issue trackers:** GitHub Issues and GitHub Pull Requests, GitLab Issues, Gitea Issues, Linear and Jira.
