@@ -490,6 +490,17 @@ func CancelRetry(state *State, issueID string) {
 	delete(state.RetryAttempts, issueID)
 }
 
+// releaseClaimUnlessRunning deletes the issue's claim unless a worker runs
+// for it. A running worker's exit decides its own claim and re-seeds the
+// watches its dispatch consumed, so releasing the claim under it would make
+// that exit seed nothing.
+func releaseClaimUnlessRunning(state *State, issueID string) {
+	if state.Running[issueID] != nil {
+		return
+	}
+	delete(state.Claimed, issueID)
+}
+
 // retrySlotIncumbent returns the retry entry occupying the issue's retry
 // slot, or nil when the slot is free. The retry slot holds at most one
 // entry per issue; a non-nil result means another unit of work already
@@ -524,14 +535,15 @@ func logRetrySlotDeferral(log *slog.Logger, challenger string, incumbent *RetryE
 
 // ScheduleRetryParams holds the inputs for [ScheduleRetry].
 type ScheduleRetryParams struct {
-	IssueID     string
-	Identifier  string
-	DisplayID   string
-	Attempt     int   // 1-based retry attempt number.
-	DelayMS     int64 // Delay before timer fires, in milliseconds.
-	Error       string
-	LastSSHHost string // Runtime-only: SSH host from previous attempt for retry affinity.
-	SessionID   string // Session identifier from previous attempt for cross-retry resume.
+	IssueID       string
+	Identifier    string
+	DisplayID     string
+	IssueIdentity IssueIdentity
+	Attempt       int   // 1-based retry attempt number.
+	DelayMS       int64 // Delay before timer fires, in milliseconds.
+	Error         string
+	LastSSHHost   string // Runtime-only: SSH host from previous attempt for retry affinity.
+	SessionID     string // Session identifier from previous attempt for cross-retry resume.
 
 	// Logger receives the displacement warning when ScheduleRetry finds
 	// the retry slot occupied. Nil selects slog.Default().
@@ -547,19 +559,43 @@ type ScheduleRetryParams struct {
 	// retries.
 	ReactionKind string
 
-	// AgentKind is the dispatch-frozen adapter kind. Propagated
-	// verbatim into the new [RetryEntry] so retries reuse the
-	// original adapter without re-running rule resolution.
+	// Trigger is the sortie_retries_total trigger label of this schedule.
+	// Propagated to [RetryEntry.Trigger]. Empty when the schedule records
+	// none.
+	Trigger string
+
+	// OriginTrigger is what started the retry. Only a caller that re-queues
+	// an existing retry passes it; [ScheduleRetry] ignores it on every
+	// schedule whose Trigger is not the timer label.
+	OriginTrigger string
+
+	// AgentKind is the adapter kind of the dispatch. Propagated verbatim
+	// into the new [RetryEntry].
 	AgentKind string
 
-	// RuleName is the dispatch-frozen rule name. Propagated verbatim
-	// into the new [RetryEntry] so logs and metrics report the
-	// original matched rule across every retry attempt.
+	// ConfiguredModel is the model the dispatch was configured with.
+	// Propagated verbatim into the new [RetryEntry].
+	ConfiguredModel string
+
+	// Continuation names the pull request and try of a reaction
+	// continuation. Propagated verbatim into the new [RetryEntry]; the zero
+	// value for a non-reaction retry.
+	Continuation ContinuationTarget
+
+	// RuleName is the rule name of the dispatch. Propagated verbatim
+	// into the new [RetryEntry].
 	RuleName string
 
-	// TemplateID is the dispatch-frozen template registry key.
-	// Propagated verbatim into the new [RetryEntry] so retries
-	// render the same template as the initial dispatch.
+	// StageLineage is the frozen stage lineage of the dispatch.
+	// Propagated verbatim into the new [RetryEntry].
+	StageLineage StageLineage
+
+	// RuleSettingsApplied reports that the dispatch ran with its rule's
+	// settings block. Propagated into the new [RetryEntry].
+	RuleSettingsApplied bool
+
+	// TemplateID is the template registry key of the dispatch.
+	// Propagated verbatim into the new [RetryEntry].
 	TemplateID string
 }
 
@@ -606,16 +642,24 @@ func ScheduleRetry(state *State, params ScheduleRetryParams, onFire func(issueID
 
 	delayMS := max(params.DelayMS, 0)
 
-	dueAtMS := time.Now().UnixMilli() + delayMS
+	// A timer that has fired must not look premature after a scheduling pause.
+	scheduledAt := time.Now()
+	dueAtMS := scheduledAt.UnixMilli() + delayMS
 
 	timer := time.AfterFunc(time.Duration(delayMS)*time.Millisecond, func() {
 		onFire(params.IssueID)
 	})
 
+	originTrigger := params.Trigger
+	if params.Trigger == triggerTimer {
+		originTrigger = params.OriginTrigger
+	}
+
 	state.RetryAttempts[params.IssueID] = &RetryEntry{
 		IssueID:             params.IssueID,
 		Identifier:          params.Identifier,
 		DisplayID:           params.DisplayID,
+		IssueIdentity:       params.IssueIdentity,
 		SessionID:           params.SessionID,
 		Attempt:             params.Attempt,
 		DueAtMS:             dueAtMS,
@@ -624,10 +668,16 @@ func ScheduleRetry(state *State, params ScheduleRetryParams, onFire func(issueID
 		LastSSHHost:         params.LastSSHHost,
 		ContinuationContext: params.ContinuationContext,
 		ReactionKind:        params.ReactionKind,
+		Trigger:             params.Trigger,
+		OriginTrigger:       originTrigger,
 		RuleName:            params.RuleName,
+		StageLineage:        params.StageLineage,
+		RuleSettingsApplied: params.RuleSettingsApplied,
 		TemplateID:          params.TemplateID,
 		AgentKind:           params.AgentKind,
-		scheduledAt:         time.Now(),
+		ConfiguredModel:     params.ConfiguredModel,
+		Continuation:        params.Continuation,
+		scheduledAt:         scheduledAt,
 		scheduledDelayMS:    delayMS,
 	}
 }

@@ -5,18 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
 	"github.com/sortie-ai/sortie/internal/agent/opencode"
+	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
@@ -27,7 +28,6 @@ func skipIfNotEnabled(t *testing.T) {
 	}
 }
 
-// integrationCommand returns the opencode binary path, defaulting to "opencode".
 func integrationCommand() string {
 	if cmd := os.Getenv("SORTIE_OPENCODE_COMMAND"); cmd != "" {
 		return cmd
@@ -35,7 +35,6 @@ func integrationCommand() string {
 	return "opencode"
 }
 
-// integrationConfig returns base config for integration tests.
 func integrationConfig() map[string]any {
 	model := os.Getenv("SORTIE_OPENCODE_MODEL")
 	if model == "" {
@@ -50,44 +49,35 @@ func integrationConfig() map[string]any {
 	return cfg
 }
 
-// mustNewAdapter creates an adapter or fatals.
 func mustNewAdapter(t *testing.T) domain.AgentAdapter {
 	t.Helper()
 	factory, err := registry.Agents.Get("opencode")
 	if err != nil {
 		t.Fatalf("registry.Agents.Get(opencode): %v", err)
 	}
-	a, err := factory(integrationConfig())
+	a, err := factory()
 	if err != nil {
 		t.Fatalf("factory(): %v", err)
 	}
 	return a
 }
 
-// mustStartIntegrationSession starts a session against the real opencode binary
-// in a fresh workspace.
-func mustStartIntegrationSession(t *testing.T, a domain.AgentAdapter) domain.Session {
-	t.Helper()
-	return mustStartIntegrationSessionIn(t, a, "", t.TempDir())
-}
+// coldStartReadTimeoutMS absorbs the SQLite migration a first launch runs,
+// which can take over 30 seconds.
+const coldStartReadTimeoutMS = 3 * 60 * 1000
 
-// mustStartIntegrationSessionIn starts a session in the given workspace.
-// ReadTimeoutMS is set to 3 minutes to absorb one-time cold-start SQLite
-// migrations that can run for over 30 seconds on first launch. Resuming a
-// session requires the workspace the session was created in: opencode replays
-// a --session only when the run executes in that same project directory.
-func mustStartIntegrationSessionIn(t *testing.T, a domain.AgentAdapter, resumeID, workspacePath string) domain.Session {
+func mustStartIntegrationSessionWith(t *testing.T, a domain.AgentAdapter, settings map[string]any) domain.Session {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	session, err := a.StartSession(ctx, domain.StartSessionParams{
-		WorkspacePath: workspacePath,
+		WorkspacePath: t.TempDir(),
 		AgentConfig: domain.AgentConfig{
 			Command:       integrationCommand(),
-			ReadTimeoutMS: 3 * 60 * 1000, // 3 minutes: absorbs cold-start SQLite migration
+			ReadTimeoutMS: coldStartReadTimeoutMS,
 		},
-		ResumeSessionID: resumeID,
+		Settings: settings,
 	})
 	if err != nil {
 		t.Fatalf("StartSession(): %v", err)
@@ -95,12 +85,9 @@ func mustStartIntegrationSessionIn(t *testing.T, a domain.AgentAdapter, resumeID
 	return session
 }
 
-// collectAllEvents runs a turn and returns all events and the result.
-// The per-turn context allows up to 5 minutes so that tests are not tripped
-// by slow first-turn processing on a cold-start instance.
 func collectAllEvents(t *testing.T, a domain.AgentAdapter, session domain.Session, prompt string) ([]domain.AgentEvent, domain.TurnResult) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), agenttest.LiveTurnBound)
 	defer cancel()
 
 	var events []domain.AgentEvent
@@ -116,73 +103,54 @@ func collectAllEvents(t *testing.T, a domain.AgentAdapter, session domain.Sessio
 	return events, result
 }
 
-// TestIntegration_HappyPathFreshTurn drives one real turn against the
-// live opencode binary and asserts turn_completed, satisfying the
-// shared disposition decision's live-runtime obligation for this
-// adapter. A live opencode turn reports no terminal outcome of its own,
-// so turn_completed is reachable only when the work predicate resolves
-// to present; this test therefore also exercises that predicate against
-// the real wire format, which is the only check that can catch it being
-// internally consistent but wrong.
-func TestIntegration_HappyPathFreshTurn(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	a := mustNewAdapter(t)
-	session := mustStartIntegrationSession(t, a)
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	events, result := collectAllEvents(t, a, session, "Reply with exactly: hello")
-
-	if result.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-	}
-
-	var sessionStarted bool
-	for _, e := range events {
-		if e.Type == domain.EventSessionStarted {
-			sessionStarted = true
-			if e.SessionID == "" {
-				t.Error("EventSessionStarted has empty SessionID")
-			}
-		}
-	}
-	if !sessionStarted {
-		t.Error("no session_started event emitted")
-	}
+// The key is an {env:} reference because opencode 2.x does not read the
+// provider's key variable on its own.
+func scriptedProviderDocument(url string) string {
+	return fmt.Sprintf(`{"$schema":"https://opencode.ai/config.json","provider":{"scripted":{"npm":"@ai-sdk/google","name":"scripted","options":{"baseURL":"%s/v1beta","apiKey":"{env:GOOGLE_GENERATIVE_AI_API_KEY}"},"models":{"scripted-model":{"name":"scripted-model"}}}}}`, url)
 }
 
-func TestIntegration_SessionResume(t *testing.T) {
+func TestIntegration_ScriptedModel(t *testing.T) {
 	skipIfNotEnabled(t)
 
-	// opencode replays a --session only when the run executes in the same
-	// project directory the session was created in; resuming under a different
-	// --dir exits cleanly with no events. The orchestrator reuses an issue's
-	// workspace across turns, so the resumed turn must share turn one's
-	// workspace.
-	workspace := t.TempDir()
-
-	a := mustNewAdapter(t)
-	session := mustStartIntegrationSessionIn(t, a, "", workspace)
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	_, result1 := collectAllEvents(t, a, session, "Say: turn one")
-	if result1.ExitReason != domain.EventTurnCompleted {
-		t.Fatalf("turn 1 ExitReason = %q, want completed", result1.ExitReason)
-	}
-	sessionID := result1.SessionID
-	if sessionID == "" {
-		t.Fatal("turn 1 SessionID is empty")
+	scriptedSettings := func(skipPermissions bool) map[string]any {
+		return map[string]any{
+			"model":                        "scripted/scripted-model",
+			"dangerously_skip_permissions": skipPermissions,
+			"disable_autocompact":          true,
+		}
 	}
 
-	// Resume from a fresh adapter (a new process) but the same workspace.
-	a2 := mustNewAdapter(t)
-	session2 := mustStartIntegrationSessionIn(t, a2, sessionID, workspace)
-	t.Cleanup(func() { _ = a2.StopSession(context.Background(), session2) })
-
-	_, result2 := collectAllEvents(t, a2, session2, "What did I say in the previous message?")
-	if result2.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("resumed turn ExitReason = %q, want completed", result2.ExitReason)
-	}
+	fakemodel.AssertConformance(t, fakemodel.Binding{
+		Kind:          "opencode",
+		Passthrough:   scriptedSettings(true),
+		CredentialEnv: []string{"GOOGLE_GENERATIVE_AI_API_KEY"},
+		Read:          fakemodel.ReadFile,
+		PermissionRefusal: &fakemodel.PermissionRefusal{
+			Passthrough: scriptedSettings(false),
+			Guarded:     fakemodel.ReadFile,
+			Notice:      agentcore.DecideHumanRequest(agentcore.ClassPermission, false, agentcore.AnswerRuntimeRefused).Notice,
+		},
+		// 2.x offers MCP tools to the model only inside its Code Mode
+		// runtime, which the execute tool scripts.
+		SortieStatus: fakemodel.Named("execute", json.RawMessage(fmt.Sprintf(
+			`{"code":"return await tools[\"%s\"].%s()"}`, agenttest.SortieToolsServer, agenttest.SortieStatusTool))),
+		Launch: func(t *testing.T, env fakemodel.Environment) fakemodel.Launch {
+			// The adapter drops an inherited OPENCODE_CONFIG_CONTENT and writes
+			// its own, so the provider rides in a file OPENCODE_CONFIG names.
+			document := filepath.Join(env.Home, "scripted-provider.json")
+			if err := os.WriteFile(document, []byte(scriptedProviderDocument(env.URL)), 0o600); err != nil {
+				t.Fatalf("write %s: %v", document, err)
+			}
+			return fakemodel.Launch{
+				Config: domain.AgentConfig{
+					Command:       integrationCommand(),
+					TurnTimeoutMS: 300000,
+					ReadTimeoutMS: coldStartReadTimeoutMS,
+				},
+				Env: map[string]string{"OPENCODE_CONFIG": document},
+			}
+		},
+	})
 }
 
 func TestIntegration_InvalidModelFailure(t *testing.T) {
@@ -191,16 +159,9 @@ func TestIntegration_InvalidModelFailure(t *testing.T) {
 	cfg := integrationConfig()
 	cfg["model"] = "nonexistent/nonexistent"
 
-	factory, err := registry.Agents.Get("opencode")
-	if err != nil {
-		t.Fatalf("registry.Agents.Get: %v", err)
-	}
-	a, err := factory(cfg)
-	if err != nil {
-		t.Fatalf("factory(): %v", err)
-	}
+	a := mustNewAdapter(t)
 
-	session := mustStartIntegrationSession(t, a)
+	session := mustStartIntegrationSessionWith(t, a, cfg)
 	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
 
 	events, result := collectAllEvents(t, a, session, "Reply with exactly: hello")
@@ -214,7 +175,7 @@ func TestIntegration_InvalidModelFailure(t *testing.T) {
 			continue
 		}
 		sawTurnFailed = true
-		if strings.Contains(event.Message, "Model not found") || strings.Contains(event.Message, "Model unavailable: nonexistent/nonexistent") {
+		if strings.Contains(event.Message, "Model unavailable: nonexistent/nonexistent") {
 			sawModelNotFound = true
 		}
 	}
@@ -226,104 +187,6 @@ func TestIntegration_InvalidModelFailure(t *testing.T) {
 	}
 }
 
-func TestIntegration_PermissionDeny(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	cfg := integrationConfig()
-	cfg["dangerously_skip_permissions"] = false
-
-	factory, err := registry.Agents.Get("opencode")
-	if err != nil {
-		t.Fatalf("registry.Agents.Get: %v", err)
-	}
-	a, err := factory(cfg)
-	if err != nil {
-		t.Fatalf("factory(): %v", err)
-	}
-
-	session := mustStartIntegrationSession(t, a)
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	// The prompt explicitly names the tool so the model is compelled to invoke
-	// it rather than narrating intent or answering from memory.
-	events, _ := collectAllEvents(t, a, session,
-		"Use your file-read tool to read /etc/hostname and return the exact contents verbatim. You must call the tool — do not answer from memory and do not describe what you would do.")
-
-	// Strong signal: OpenCode auto-rejects external_directory access in
-	// headless mode without --dangerously-skip-permissions, emitting a
-	// tool_use error envelope.
-	var sawToolError bool
-	for _, e := range events {
-		if e.Type == domain.EventToolResult && e.ToolError {
-			sawToolError = true
-			break
-		}
-	}
-	if sawToolError {
-		return
-	}
-
-	// Weak signal: the model acknowledged the denial in assistant text without
-	// emitting a tool result (e.g. OpenCode reported the block as a
-	// notification before the tool completed).
-	denialKeywords := []string{"denied", "permission", "not allowed", "cannot", "can't", "unable"}
-	for _, e := range events {
-		if e.Type != domain.EventNotification && e.Type != domain.EventOtherMessage && e.Type != domain.EventTurnFailed {
-			continue
-		}
-		msg := strings.ToLower(e.Message)
-		for _, kw := range denialKeywords {
-			if strings.Contains(msg, kw) {
-				return
-			}
-		}
-	}
-
-	// Neither signal was present: the model did not attempt the tool and did
-	// not report a denial. This is a non-deterministic model choice, not an
-	// adapter defect. Skip rather than block the release pipeline.
-	t.Skip("model neither invoked the file-read tool nor reported a denial; skipping to avoid blocking release on non-deterministic model behavior")
-}
-
-func TestIntegration_TurnCancellation(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	a := mustNewAdapter(t)
-	session := mustStartIntegrationSession(t, a)
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	turnCtx, turnCancel := context.WithCancel(ctx)
-	resultCh := make(chan domain.TurnResult, 1)
-	go func() {
-		result, _ := a.RunTurn(turnCtx, session, domain.RunTurnParams{
-			Prompt:  "Count to 1000 slowly, outputting each number on its own line",
-			OnEvent: func(_ domain.AgentEvent) {},
-		})
-		resultCh <- result
-	}()
-
-	// Cancel after a brief moment.
-	time.Sleep(500 * time.Millisecond)
-	turnCancel()
-
-	select {
-	case result := <-resultCh:
-		if result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
-		}
-	case <-ctx.Done():
-		t.Fatal("RunTurn did not return after context cancel")
-	}
-}
-
-// TestIntegration_PermissionDeepMerge reads the resolved tool-
-// permission document a session's own turns carry, on both majors,
-// with no model request: the operator's own opencode.json must survive
-// the adapter's merge, and the adapter's own entries must win a
-// conflict.
 func TestIntegration_PermissionDeepMerge(t *testing.T) {
 	skipIfNotEnabled(t)
 
@@ -346,14 +209,7 @@ func TestIntegration_PermissionDeepMerge(t *testing.T) {
 	cfg := integrationConfig()
 	cfg["allowed_tools"] = []any{"read", "glob"}
 
-	factory, err := registry.Agents.Get("opencode")
-	if err != nil {
-		t.Fatalf("registry.Agents.Get: %v", err)
-	}
-	a, err := factory(cfg)
-	if err != nil {
-		t.Fatalf("factory(): %v", err)
-	}
+	a := mustNewAdapter(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -361,23 +217,15 @@ func TestIntegration_PermissionDeepMerge(t *testing.T) {
 		WorkspacePath: workspace,
 		AgentConfig: domain.AgentConfig{
 			Command:       integrationCommand(),
-			ReadTimeoutMS: 3 * 60 * 1000,
+			ReadTimeoutMS: coldStartReadTimeoutMS,
 		},
 		MCPConfigPath: mcpConfigPath,
+		Settings:      cfg,
 	})
 	if err != nil {
 		t.Fatalf("StartSession(): %v", err)
 	}
 	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	major, err := opencode.RuntimeMajorForTest(session)
-	if err != nil {
-		t.Fatalf("RuntimeMajorForTest(): %v", err)
-	}
-	shellKey := "bash"
-	if major == 2 {
-		shellKey = "shell"
-	}
 
 	permCtx, permCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer permCancel()
@@ -399,181 +247,11 @@ func TestIntegration_PermissionDeepMerge(t *testing.T) {
 	if effective["glob"] != "allow" {
 		t.Errorf("effective[%q] = %q, want %q", "glob", effective["glob"], "allow")
 	}
-	if effective[shellKey] != "deny" {
-		t.Errorf("effective[%q] = %q, want %q", shellKey, effective[shellKey], "deny")
+	if effective["shell"] != "deny" {
+		t.Errorf("effective[%q] = %q, want %q", "shell", effective["shell"], "deny")
 	}
 }
 
-// TestIntegration_RuntimeMajor asserts the detected runtime major
-// matches the operator's own expectation for the binary under test,
-// catching a shard or leg that silently installs the wrong major.
-func TestIntegration_RuntimeMajor(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	wantStr := os.Getenv("SORTIE_OPENCODE_MAJOR")
-	if wantStr == "" {
-		t.Skip("set SORTIE_OPENCODE_MAJOR=1 or 2 to assert the detected runtime major")
-	}
-	want, convErr := strconv.Atoi(wantStr)
-	if convErr != nil || (want != 1 && want != 2) {
-		t.Fatalf("SORTIE_OPENCODE_MAJOR = %q, want \"1\" or \"2\"", wantStr)
-	}
-
-	a := mustNewAdapter(t)
-	session := mustStartIntegrationSession(t, a)
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	got, err := opencode.RuntimeMajorForTest(session)
-	if err != nil {
-		t.Fatalf("RuntimeMajorForTest(): %v", err)
-	}
-	if got != want {
-		t.Errorf("RuntimeMajorForTest() = %d, want %d (SORTIE_OPENCODE_MAJOR)", got, want)
-	}
-}
-
-// TestIntegration_ToolServerIdentity proves tool-server delivery on
-// both majors without a model call invoking the tool, mirroring
-// internal/agent/claude's TestIntegration_ToolServerIdentity.
-//
-// It does not call agenttest.AssertToolServerIdentity: that helper
-// writes the generated MCP config at <dir>/mcp.json, a path
-// mcpconfig.Parse refuses for a translated-injection adapter, which
-// requires the config to sit under a workspace's own ".sortie"
-// directory. codex and agent-client-protocol, this adapter's fellow
-// translated-injection kinds, do not use the helper for the same
-// reason.
-func TestIntegration_ToolServerIdentity(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	dir := t.TempDir()
-	workspace := filepath.Join(dir, "workspace")
-	if err := os.MkdirAll(workspace, 0o750); err != nil {
-		t.Fatalf("MkdirAll(workspace): %v", err)
-	}
-
-	const wantDispatchID = "opencode-tool-server-identity"
-	recordingPath := filepath.Join(dir, "recorded.json")
-	runtimePath := agenttest.FakeRuntime(t, dir, "tool-server-recorder", agenttest.RecordedEnvScenario, agenttest.RecordedEnv{
-		Path:  recordingPath,
-		Names: []string{"SORTIE_DISPATCH_ID", "SORTIE_WORKSPACE"},
-	})
-
-	mcpConfigPath := filepath.Join(workspace, ".sortie", "mcp.json")
-	if err := os.MkdirAll(filepath.Dir(mcpConfigPath), 0o750); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	mcpDoc := fmt.Sprintf(`{"mcpServers":{"sortie-tools":{"type":"stdio","command":%s,"env":{"SORTIE_DISPATCH_ID":%s,"SORTIE_WORKSPACE":%s}}}}`,
-		mustJSONString(t, runtimePath), mustJSONString(t, wantDispatchID), mustJSONString(t, workspace))
-	if err := os.WriteFile(mcpConfigPath, []byte(mcpDoc), 0o600); err != nil {
-		t.Fatalf("WriteFile(mcp.json): %v", err)
-	}
-
-	factory, err := registry.Agents.Get("opencode")
-	if err != nil {
-		t.Fatalf("registry.Agents.Get: %v", err)
-	}
-	a, err := factory(integrationConfig())
-	if err != nil {
-		t.Fatalf("factory(): %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sessionDone := make(chan error, 1)
-	go func() {
-		session, startErr := a.StartSession(ctx, domain.StartSessionParams{
-			WorkspacePath: workspace,
-			AgentConfig: domain.AgentConfig{
-				Command:       integrationCommand(),
-				ReadTimeoutMS: 3 * 60 * 1000,
-			},
-			MCPConfigPath: mcpConfigPath,
-		})
-		if startErr != nil {
-			sessionDone <- startErr
-			return
-		}
-		defer func() { _ = a.StopSession(context.Background(), session) }()
-
-		_, runErr := a.RunTurn(ctx, session, domain.RunTurnParams{
-			Prompt:  "Say exactly: hello",
-			OnEvent: func(domain.AgentEvent) {},
-		})
-		sessionDone <- runErr
-	}()
-
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		if raw, readErr := os.ReadFile(recordingPath); readErr == nil {
-			cancel()
-			<-sessionDone
-			assertRecordedToolServerIdentity(t, raw, wantDispatchID, workspace)
-			return
-		}
-		if !time.Now().Before(deadline) {
-			cancel()
-			runErr := <-sessionDone
-			t.Fatalf("no recording observed within 60s (session error = %v)", runErr)
-		}
-		select {
-		case runErr := <-sessionDone:
-			t.Fatalf("no recording observed before the session returned (error = %v)", runErr)
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
-func assertRecordedToolServerIdentity(t *testing.T, raw []byte, wantDispatchID, wantWorkspace string) {
-	t.Helper()
-
-	var recorded map[string]string
-	if err := json.Unmarshal(raw, &recorded); err != nil {
-		t.Fatalf("decode recorded tool-server environment %q: %v", raw, err)
-	}
-	if recorded["SORTIE_DISPATCH_ID"] != wantDispatchID {
-		t.Errorf("recorded SORTIE_DISPATCH_ID = %q, want %q", recorded["SORTIE_DISPATCH_ID"], wantDispatchID)
-	}
-	if recorded["SORTIE_WORKSPACE"] != wantWorkspace {
-		t.Errorf("recorded SORTIE_WORKSPACE = %q, want %q", recorded["SORTIE_WORKSPACE"], wantWorkspace)
-	}
-}
-
-// repoRoot returns the absolute path to the repository root, derived
-// from this test file's known location at internal/agent/opencode/.
-func repoRoot(t *testing.T) string {
-	t.Helper()
-	abs, err := filepath.Abs("../../../")
-	if err != nil {
-		t.Fatalf("resolving repo root: %v", err)
-	}
-	return abs
-}
-
-// buildSortieBinary builds the sortie binary from the repository
-// root into a fresh temp directory and returns its absolute path.
-// The generated MCP config's "command" must name a real, runnable
-// binary, matching what internal/orchestrator/mcpconfig.go's
-// GenerateMCPConfig writes in production.
-func buildSortieBinary(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	binPath := filepath.Join(dir, "sortie")
-	cmd := exec.CommandContext(context.Background(), "go", "build", "-o", binPath, "./cmd/sortie")
-	cmd.Dir = repoRoot(t)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build ./cmd/sortie: %v\n%s", err, out)
-	}
-	return binPath
-}
-
-// minimalMCPServerWorkflow is a WORKFLOW.md body with no tracker
-// section: just enough for workflow.Load and config.NewServiceConfig
-// to succeed.
-const minimalMCPServerWorkflow = "---\npolling:\n  interval_ms: 30000\nagent:\n  kind: mock\n---\nDo something.\n"
-
-// mustJSONString renders s as a JSON string literal.
 func mustJSONString(t *testing.T, s string) string {
 	t.Helper()
 	encoded, err := json.Marshal(s)
@@ -583,104 +261,20 @@ func mustJSONString(t *testing.T, s string) string {
 	return string(encoded)
 }
 
-// writeIntegrationMCPConfig writes a real generated-shape MCP config
-// naming one server, "sortie-tools", whose command launches
-// "sortie mcp-server --workflow <wfPath>" with SORTIE_WORKSPACE set,
-// so the sortie_status tool (gated only on a non-empty workspace
-// path) is the one tool this session's sidecar serves. Returns the
-// config's path.
-func writeIntegrationMCPConfig(t *testing.T, workspace, sortieBin, wfPath string) string {
-	t.Helper()
-
-	mcpConfigPath := filepath.Join(workspace, ".sortie", "mcp.json")
-	if err := os.MkdirAll(filepath.Dir(mcpConfigPath), 0o750); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-
-	doc := fmt.Sprintf(
-		`{"mcpServers":{"sortie-tools":{"command":%s,"args":["mcp-server","--workflow",%s],"env":{"SORTIE_WORKSPACE":%s}}}}`,
-		mustJSONString(t, sortieBin), mustJSONString(t, wfPath), mustJSONString(t, workspace),
-	)
-	if err := os.WriteFile(mcpConfigPath, []byte(doc), 0o600); err != nil {
-		t.Fatalf("WriteFile mcp.json: %v", err)
-	}
-	return mcpConfigPath
-}
-
-// TestIntegration_ToolRoundTrip drives one real turn with a generated
-// MCP config translated into the runtime's own inline configuration
-// document, and asserts the model calls a Sortie tool through the
-// resulting sidecar and receives its result. Earlier runtime probes
-// left this round trip unverified: the sidecar is spawned with its
-// session environment, but whether the model's call reaches it and a
-// result comes back was never observed until this test runs with a
-// real credential.
-func TestIntegration_ToolRoundTrip(t *testing.T) {
-	skipIfNotEnabled(t)
-
-	sortieBin := buildSortieBinary(t)
-	workspace := t.TempDir()
-
-	wfPath := filepath.Join(workspace, "WORKFLOW.md")
-	if err := os.WriteFile(wfPath, []byte(minimalMCPServerWorkflow), 0o644); err != nil {
-		t.Fatalf("WriteFile WORKFLOW.md: %v", err)
-	}
-	mcpConfigPath := writeIntegrationMCPConfig(t, workspace, sortieBin, wfPath)
-
-	a := mustNewAdapter(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	session, err := a.StartSession(ctx, domain.StartSessionParams{
-		WorkspacePath: workspace,
-		AgentConfig: domain.AgentConfig{
-			Command:       integrationCommand(),
-			ReadTimeoutMS: 3 * 60 * 1000,
-		},
-		MCPConfigPath: mcpConfigPath,
-	})
-	if err != nil {
-		t.Fatalf("StartSession(): %v", err)
-	}
-	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
-
-	events, result := collectAllEvents(t, a, session,
-		"Call the sortie_status tool now, with no arguments, and report exactly what it returns. Do not explain first; call the tool immediately.")
-
-	for _, e := range events {
-		if e.Type == domain.EventToolResult {
-			t.Logf("EventToolResult: ToolName=%q ToolDurationMS=%d", e.ToolName, e.ToolDurationMS)
-		}
-	}
-
-	if result.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-	}
-
-	var toolCalled bool
-	for _, e := range events {
-		if e.Type == domain.EventToolResult {
-			toolCalled = true
-			break
-		}
-	}
-	if !toolCalled {
-		t.Error("no EventToolResult observed: the agent turn never called a Sortie tool through the translated MCP channel")
-	}
-}
-
 func TestIntegration_CredentialVerification(t *testing.T) {
 	skipIfNotEnabled(t)
 
+	defaults, err := config.NewServiceConfig(map[string]any{})
+	if err != nil {
+		t.Fatalf("config.NewServiceConfig(defaults) error = %v", err)
+	}
 	adapter := mustNewAdapter(t)
 	params := domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
-		AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: 30000},
+		AgentConfig:   domain.AgentConfig{Command: integrationCommand(), ReadTimeoutMS: defaults.Agent.ReadTimeoutMS},
+		Settings:      integrationConfig(),
 	}
-	if _, err := credentialtest.VerifyLive(adapter, params); err != nil {
-		t.Fatalf("VerifyCredential() error = %v, want nil", err)
-	}
+	credentialtest.VerifyLiveUsage(t, "opencode", adapter, params, integrationConfig())
 
 	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
 		credentialtest.SetRefusedCredential(t, "SORTIE_OPENCODE_CREDENTIAL_ENV")

@@ -98,6 +98,39 @@ func TestRunDryRunExitZero(t *testing.T) {
 	assertNoDatabaseFile(t, dir)
 }
 
+func TestRunDryRunRetiredKindLogsOneWarning(t *testing.T) {
+	// No t.Parallel: uses t.Chdir.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeIssuesFixture(t, dir)
+	wfPath := writeCustomWorkflowFile(t, dir, agentKindWorkflow("  kind: "+retiredValidateKind, ""))
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"--dry-run", wfPath}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run(--dry-run) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var warnings []string
+	for line := range strings.SplitSeq(stderr.String(), "\n") {
+		if strings.Contains(line, "level=WARN") {
+			warnings = append(warnings, line)
+		}
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("WARN records = %d, want 1\nstderr:\n%s", len(warnings), stderr.String())
+	}
+	for _, attr := range []string{"agent_kind=" + retiredValidateKind, "replacement_kind=mock"} {
+		if !strings.Contains(warnings[0], attr) {
+			t.Errorf("WARN record = %q, want to contain %q", warnings[0], attr)
+		}
+	}
+	if strings.Contains(stderr.String(), "deprecated") {
+		t.Errorf("stderr contains %q, want no record naming a deprecation\nstderr:\n%s", "deprecated", stderr.String())
+	}
+	assertNoDatabaseFile(t, dir)
+}
+
 func TestRunDryRunNoCandidates(t *testing.T) {
 	// No t.Parallel: uses t.Chdir.
 	dir := t.TempDir()
@@ -328,6 +361,8 @@ var _ domain.TrackerAdapter = (*dryRunFakeTracker)(nil)
 func (f *dryRunFakeTracker) FetchCandidateIssues(context.Context) ([]domain.Issue, error) {
 	return f.issues, nil
 }
+
+func (f *dryRunFakeTracker) SetTrackerStates(func() domain.TrackerStates) {}
 func (f *dryRunFakeTracker) FetchIssueByID(context.Context, string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -345,7 +380,12 @@ func (f *dryRunFakeTracker) FetchIssueComments(context.Context, string) ([]domai
 }
 func (f *dryRunFakeTracker) TransitionIssue(context.Context, string, string) error { return nil }
 func (f *dryRunFakeTracker) CommentIssue(context.Context, string, string) error    { return nil }
-func (f *dryRunFakeTracker) AddLabel(context.Context, string, string) error        { return nil }
+func (f *dryRunFakeTracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (f *dryRunFakeTracker) AddLabel(context.Context, string, string) error { return nil }
+
+func (f *dryRunFakeTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // dryRunFakeResolver is a configurable orchestrator.BlockerResolver
 // double, recording every Resolve call in the order runDryRun makes

@@ -87,14 +87,17 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		entryLog := logging.WithIssue(log, pending.IssueID, pending.Identifier)
 
-		if state.AutoMergePreflightFailed {
+		// A standing escalation outlives the preflight failure: it reads
+		// the pull request to learn that it merged or closed, and
+		// dispatches nothing.
+		if state.AutoMergePreflightFailed && !pending.escalationStands() {
 			entryLog.Warn("auto_merge skipped: preflight failed",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
 			continue
 		}
 
-		if ttl > 0 && now.Sub(pending.CreatedAt) > ttl {
+		if ttl > 0 && !pending.escalationStands() && now.Sub(pending.CreatedAt) > ttl {
 			delete(state.ReactionAttempts, ReactionKey(pending.IssueID, ReactionKindAutoMerge))
 			entryLog.Warn("auto_merge watch window elapsed, dropping",
 				slog.Int64("window_ms", int64(ttl/time.Millisecond)),
@@ -103,19 +106,30 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 			continue
 		}
 
-		if now.Before(pending.PendingRetryAt) {
+		if reactionWaits(pending, now) {
 			state.PendingReactions[key] = pending
 			continue
 		}
+		retryEscalationSave(ctx, state, params.Store, pending, entryLog)
 
 		rkey := ReactionKey(pending.IssueID, ReactionKindAutoMerge)
 		turnCount := state.ReactionAttempts[rkey]
-		if params.AutoMergeConfig.MaxRetries > 0 && turnCount >= params.AutoMergeConfig.MaxRetries {
-			escalateAutoMergeFailure(state, params, pending, turnCount, autoMergeData, entryLog, ctx, metrics)
+		// A ceiling of 0 means no bound, so it never counts the tries as spent.
+		spent := params.AutoMergeConfig.MaxRetries > 0 && turnCount >= params.AutoMergeConfig.MaxRetries
+		endLiftedBudgetEscalation(ctx, params.Store, pending, spent, entryLog)
+		if spent && !pending.escalationStands() {
+			escalateAutoMergeFailure(state, params, pending, turnCount, EscalationTriggerBudget, "", autoMergeData, now, pollInterval, entryLog, ctx, metrics)
 			continue
 		}
 
 		mergeStatus, err := params.SCMAdapter.GetMergeability(ctx, autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo)
+		if pending.escalationStands() && isPullRequestNotFound(err) {
+			endEscalationAndCounter(ctx, state, params.Store, pending, entryLog)
+			entryLog.Warn("auto_merge pull request not found, dropping escalated entry",
+				slog.Int("pr_number", autoMergeData.PRNumber),
+			)
+			continue
+		}
 		if err != nil {
 			delay := applyAutoMergeBackoff(state, key, pending, now, pollInterval)
 			entryLog.Warn("auto_merge mergeability fetch failed",
@@ -127,9 +141,39 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 			continue
 		}
 
+		notePullRequestURL(pending, mergeStatus)
+
+		if mergeStatus.Merged {
+			recordIssueOutcome(ctx, params.Store, mergedOutcome(pending.IssueID, ReactionKindAutoMerge, autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo, now), entryLog)
+			endEscalation(ctx, params.Store, pending, entryLog)
+			delete(state.ReactionAttempts, rkey)
+			if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge); err != nil {
+				entryLog.Warn("auto_merge fingerprint delete failed",
+					slog.Any("error", err),
+				)
+			}
+			entryLog.Info("auto_merge pr found merged, dropping",
+				slog.Int("pr_number", autoMergeData.PRNumber),
+			)
+			continue
+		}
+
+		if pending.escalationStands() {
+			if mergeStatus.Closed {
+				endEscalationAndCounter(ctx, state, params.Store, pending, entryLog)
+				entryLog.Info("auto_merge pr found closed, dropping escalated entry",
+					slog.Int("pr_number", autoMergeData.PRNumber),
+				)
+				continue
+			}
+			pending.PendingRetryAt = now.Add(pollInterval)
+			requeueReaction(state, key, pending, waitPollInterval)
+			continue
+		}
+
 		if mergeStatus.Draft {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("auto_merge skipped: PR is draft",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
@@ -138,7 +182,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		if mergeStatus.Mergeability == domain.MergeabilityUnknown {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("auto_merge deferred: mergeability unknown",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
@@ -147,7 +191,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		if mergeStatus.Mergeability != domain.MergeabilityClean && mergeStatus.Mergeability != domain.MergeabilityUnstable {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("auto_merge deferred: PR not mergeable",
 				slog.String("state", string(mergeStatus.Mergeability)),
 				slog.Int("pr_number", autoMergeData.PRNumber),
@@ -169,7 +213,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		if reviewDecision != domain.ReviewDecisionApproved && reviewDecision != domain.ReviewDecisionNotRequired {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("auto_merge deferred: review decision not approved",
 				slog.String("decision", string(reviewDecision)),
 				slog.Int("pr_number", autoMergeData.PRNumber),
@@ -191,7 +235,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 			}
 			if ciConclusion == "pending" {
 				pending.PendingRetryAt = now.Add(pollInterval)
-				state.PendingReactions[key] = pending
+				requeueReaction(state, key, pending, waitPollInterval)
 				entryLog.Debug("auto_merge deferred: CI pending",
 					slog.Int("pr_number", autoMergeData.PRNumber),
 				)
@@ -199,7 +243,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 			}
 			if ciConclusion != "success" && ciConclusion != "" {
 				pending.PendingRetryAt = now.Add(pollInterval)
-				state.PendingReactions[key] = pending
+				requeueReaction(state, key, pending, waitPollInterval)
 				entryLog.Debug("auto_merge deferred: CI not green",
 					slog.String("conclusion", ciConclusion),
 					slog.Int("pr_number", autoMergeData.PRNumber),
@@ -210,7 +254,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		if mergeStatus.HeadSHA == "" {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitBackoff)
 			entryLog.Debug("auto_merge deferred: missing head sha",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
@@ -227,7 +271,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 		storedFP, dispatched, fpErr := params.Store.GetReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge)
 		if fpErr == nil && storedFP == fingerprint && dispatched {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("auto_merge already attempted for this fingerprint",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
@@ -248,7 +292,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 		state.ReactionAttempts[rkey]++
 
 		if err != nil {
-			handleMergeError(state, params, key, pending, autoMergeData, err, now, pollInterval, entryLog, ctx, metrics)
+			handleMergeError(state, params, key, pending, autoMergeData, fingerprint, err, now, pollInterval, entryLog, ctx, metrics)
 			continue
 		}
 
@@ -270,19 +314,20 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 		)
 		metrics.IncAutoMergeReactions("merged")
 
+		recordIssueOutcome(ctx, params.Store, mergedOutcome(pending.IssueID, ReactionKindAutoMerge, autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo, now), entryLog)
 		postAutoMergeSuccess(state, params, pending, autoMergeData, mergeResult, entryLog, ctx)
 	}
 }
 
-// applyAutoMergeBackoff applies exponential-backoff delay and rewrites
-// the pending entry to state.PendingReactions on a transient failure.
+// applyAutoMergeBackoff applies exponential-backoff delay and requeues the
+// pending entry with the backoff reason on a transient failure.
 // Returns the chosen delay so the caller can populate the structured
 // log it emits at its own (stable, literal) message.
 func applyAutoMergeBackoff(state *State, key string, pending *PendingReaction, now time.Time, pollInterval time.Duration) time.Duration {
 	pending.PendingAttempts++
 	delay := max(computeAutoMergePendingDelay(pending.PendingAttempts), pollInterval)
 	pending.PendingRetryAt = now.Add(delay)
-	state.PendingReactions[key] = pending
+	requeueReaction(state, key, pending, waitBackoff)
 	return delay
 }
 
@@ -354,24 +399,16 @@ func postAutoMergeSuccess(state *State, params ReconcileParams, pending *Pending
 		})
 	}
 
-	if params.TrackerAdapter != nil {
-		commentText := buildAutoMergeComment(autoMergeData, mergeResult, params.AutoMergeConfig.Strategy)
-		issueID := pending.IssueID
-		tracker := params.TrackerAdapter
-		commentLog := log
-
-		state.TrackerOpsWg.Go(func() {
-			dctx, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-
-			if err := tracker.CommentIssue(dctx, issueID, commentText); err != nil {
-				commentLog.Warn("auto_merge tracker comment failed",
-					slog.Any("error", err),
-				)
-			}
-		})
-	}
+	commentText := buildAutoMergeComment(autoMergeData, mergeResult, params.AutoMergeConfig.Strategy)
+	delivery := params.Router.Route(reactionNotification(domain.EventAutoMergeMerged, pending, commentText))
+	commentLog := log
+	deliverDetached(ctx, &state.TrackerOpsWg, delivery, log, func(received bool, err error) {
+		if received && err != nil {
+			commentLog.Warn("auto_merge tracker comment failed",
+				slog.Any("error", err),
+			)
+		}
+	})
 
 	if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge); err != nil {
 		log.Warn("auto_merge fingerprint delete failed",
@@ -395,7 +432,7 @@ func buildAutoMergeComment(autoMergeData *AutoMergeReactionData, mergeResult dom
 // merge as success, transport and API errors back off, auth and
 // payload errors escalate immediately, conflict otherwise re-enqueues
 // at poll interval.
-func handleMergeError(state *State, params ReconcileParams, key string, pending *PendingReaction, autoMergeData *AutoMergeReactionData, err error, now time.Time, pollInterval time.Duration, log *slog.Logger, ctx context.Context, metrics domain.Metrics) {
+func handleMergeError(state *State, params ReconcileParams, key string, pending *PendingReaction, autoMergeData *AutoMergeReactionData, fingerprint string, err error, now time.Time, pollInterval time.Duration, log *slog.Logger, ctx context.Context, metrics domain.Metrics) {
 	var scmErr *domain.SCMError
 	if !errors.As(err, &scmErr) {
 		delay := applyAutoMergeBackoff(state, key, pending, now, pollInterval)
@@ -412,6 +449,7 @@ func handleMergeError(state *State, params ReconcileParams, key string, pending 
 	case domain.ErrSCMConflict:
 		lower := strings.ToLower(scmErr.Message)
 		if strings.Contains(lower, "already merged") {
+			recordIssueOutcome(ctx, params.Store, mergedOutcome(pending.IssueID, ReactionKindAutoMerge, autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo, now), log)
 			log.Info("auto_merge pr already merged, treating as success",
 				slog.Int("pr_number", autoMergeData.PRNumber),
 			)
@@ -430,7 +468,7 @@ func handleMergeError(state *State, params ReconcileParams, key string, pending 
 			return
 		}
 		pending.PendingRetryAt = now.Add(pollInterval)
-		state.PendingReactions[key] = pending
+		requeueReaction(state, key, pending, waitPollInterval)
 		log.Warn("auto_merge conflict, retrying after poll interval",
 			slog.Any("error", scmErr),
 			slog.Int("pr_number", autoMergeData.PRNumber),
@@ -446,14 +484,14 @@ func handleMergeError(state *State, params ReconcileParams, key string, pending 
 			)
 			state.AutoMergeAuthLogged[pending.IssueID] = struct{}{}
 		}
-		escalateAutoMergeFailure(state, params, pending, state.ReactionAttempts[ReactionKey(pending.IssueID, ReactionKindAutoMerge)], autoMergeData, log, ctx, metrics)
+		escalateAutoMergeFailure(state, params, pending, state.ReactionAttempts[ReactionKey(pending.IssueID, ReactionKindAutoMerge)], EscalationTriggerRefused, fingerprint, autoMergeData, now, pollInterval, log, ctx, metrics)
 
 	case domain.ErrSCMPayload:
 		log.Error("auto_merge payload error, escalating",
 			slog.Any("error", scmErr),
 			slog.Int("pr_number", autoMergeData.PRNumber),
 		)
-		escalateAutoMergeFailure(state, params, pending, state.ReactionAttempts[ReactionKey(pending.IssueID, ReactionKindAutoMerge)], autoMergeData, log, ctx, metrics)
+		escalateAutoMergeFailure(state, params, pending, state.ReactionAttempts[ReactionKey(pending.IssueID, ReactionKindAutoMerge)], EscalationTriggerRefused, fingerprint, autoMergeData, now, pollInterval, log, ctx, metrics)
 
 	case domain.ErrSCMTransport, domain.ErrSCMAPI:
 		delay := applyAutoMergeBackoff(state, key, pending, now, pollInterval)
@@ -476,19 +514,63 @@ func handleMergeError(state *State, params ReconcileParams, key string, pending 
 	}
 }
 
-// escalateAutoMergeFailure applies the configured escalation action
-// (label or comment) after MaxRetries exhaustion or on a hard failure,
-// then removes the merge-kind pending entry and clears the fingerprint.
-// MUST NOT touch state.Claimed or any other reaction kind's entries.
-func escalateAutoMergeFailure(state *State, params ReconcileParams, pending *PendingReaction, turnCount int, autoMergeData *AutoMergeReactionData, log *slog.Logger, ctx context.Context, metrics domain.Metrics) {
+// escalateAutoMergeFailure begins the escalation on the subject (the merge
+// fingerprint of the call the forge refused, empty for the count check) and
+// applies the configured escalation action (label, comment, or none) unless
+// that subject was escalated before. It clears the fingerprint. The entry
+// and its counter stay, and the entry re-enqueues at the poll interval,
+// until the escalation ends. MUST NOT touch state.Claimed or any other
+// reaction kind's entries.
+func escalateAutoMergeFailure(
+	state *State,
+	params ReconcileParams,
+	pending *PendingReaction,
+	turnCount int,
+	trigger ReactionEscalationTrigger,
+	subject string,
+	autoMergeData *AutoMergeReactionData,
+	now time.Time,
+	pollInterval time.Duration,
+	log *slog.Logger,
+	ctx context.Context,
+	metrics domain.Metrics,
+) {
+	if beginEscalation(ctx, state, params.Store, pending, trigger, subject, now, log) {
+		applyAutoMergeEscalation(state, params, pending, turnCount, autoMergeData, log, ctx, metrics)
+	}
+
+	if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge); err != nil {
+		log.Warn("auto_merge fingerprint delete failed during escalation",
+			slog.Any("error", err),
+		)
+	}
+
+	pending.PendingRetryAt = now.Add(pollInterval)
+	requeueReaction(state, ReactionKey(pending.IssueID, ReactionKindAutoMerge), pending, waitPollInterval)
+}
+
+// applyAutoMergeEscalation applies the configured escalation action of the
+// auto-merge reaction: the event, and the label when so configured.
+func applyAutoMergeEscalation(
+	state *State,
+	params ReconcileParams,
+	pending *PendingReaction,
+	turnCount int,
+	autoMergeData *AutoMergeReactionData,
+	log *slog.Logger,
+	ctx context.Context,
+	metrics domain.Metrics,
+) {
 	log.Warn("auto_merge attempts exhausted, escalating",
 		slog.Int("turn_count", turnCount),
 		slog.Int("max_retries", params.AutoMergeConfig.MaxRetries),
 		slog.Int("pr_number", autoMergeData.PRNumber),
 	)
 
-	switch params.AutoMergeConfig.Escalation {
-	case "label":
+	commentText := buildAutoMergeEscalationComment(autoMergeData, turnCount)
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationAutoMerge, pending, commentText))
+
+	if params.AutoMergeConfig.Escalation == "label" {
 		label := params.AutoMergeConfig.EscalationLabel
 		if label == "" {
 			label = "needs-human"
@@ -510,36 +592,12 @@ func escalateAutoMergeFailure(state *State, params ReconcileParams, pending *Pen
 				}
 			})
 		}
-
-	case "comment", "":
-		commentText := buildAutoMergeEscalationComment(autoMergeData, turnCount)
-		if params.TrackerAdapter != nil {
-			issueID := pending.IssueID
-			tracker := params.TrackerAdapter
-			escalLog := log
-
-			state.TrackerOpsWg.Go(func() {
-				dctx, cancel := context.WithTimeout(
-					context.WithoutCancel(ctx), 30*time.Second)
-				defer cancel()
-
-				if err := tracker.CommentIssue(dctx, issueID, commentText); err != nil {
-					escalLog.Warn("auto_merge escalation comment failed",
-						slog.Any("error", err),
-					)
-				}
-			})
-		}
 	}
+	publishEscalation(ctx, &state.TrackerOpsWg, delivery, log, nil, func(err error) {
+		log.Warn("auto_merge escalation comment failed", slog.Any("error", err))
+	})
 
 	metrics.IncAutoMergeReactions("escalated")
-
-	delete(state.PendingReactions, ReactionKey(pending.IssueID, ReactionKindAutoMerge))
-	if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge); err != nil {
-		log.Warn("auto_merge fingerprint delete failed during escalation",
-			slog.Any("error", err),
-		)
-	}
 }
 
 // buildAutoMergeEscalationComment returns the escalation comment used

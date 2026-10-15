@@ -2,7 +2,7 @@
 
 Notes for a developer changing Sortie's Linear tracker adapter: what GraphQL costs us that REST does not, where Linear's model and ours disagree, and the traps that are invisible until they bite.
 
-Last updated: 2026-08-23
+Last updated: 2026-10-10
 
 ## GraphQL through a REST-shaped toolkit
 
@@ -34,7 +34,7 @@ That is fatal for exactly the operations that need batching, since state reconci
 
 ## Team key, not project
 
-`tracker.project` holds a Linear team key, not a Linear project. Three reasons, and they all still hold: workflow states are team-scoped, so the state model this adapter is built around is only well defined relative to one team; the team key is the visible prefix of every issue identifier, which makes it the least surprising thing for an operator to configure; and Linear projects are cross-team containers that own neither states nor identifiers, so filtering by one would still need a team for state resolution.
+`tracker.project` holds a Linear team key, not a Linear project, for these reasons: workflow states are team-scoped, so the state model this adapter is built around is only well defined relative to one team; the team key is the visible prefix of every issue identifier, which makes it the least surprising thing for an operator to configure; and Linear projects are cross-team containers that own neither states nor identifiers, so filtering by one would still need a team for state resolution.
 
 Reads filter by team key directly, so no team UUID lookup is needed. Only the label-create path needs the UUID, and it resolves one per call.
 
@@ -56,7 +56,7 @@ The issue filter has no identifier field. Identifier batches therefore split the
 
 The issue-update input exposes both a replace-style collection field and an append/remove pair for the same collection. Writing through the replace field means reading the current set first, and because that set is itself a paginated connection, the obvious implementation reads one page, writes back what it read plus the addition, and silently deletes every member beyond the first page.
 
-The adapter never uses the replace form. Labels are attached through the append field, which needs no read, has no pagination, and leaves no race window. Any future write to a collection-valued field must audit the schema for an `added*`/`removed*` pair before reaching for the replace-style name, and any code that genuinely must replace a set has to paginate that connection to exhaustion first, missing-cursor guard included.
+The adapter never uses the replace form. Labels are attached through the append field and detached through the remove field, which need no read of the issue's label set, have no pagination, and leave no race window. Any future write to a collection-valued field must audit the schema for an `added*`/`removed*` pair before reaching for the replace-style name, and any code that genuinely must replace a set has to paginate that connection to exhaustion first, missing-cursor guard included.
 
 Mutations carry one shared result policy: a non-empty errors array is a failure whatever the payload's success flag says, and a success flag of false with no errors maps to an API error. The adapter never consumes partial data; a populated `data` alongside errors still fails the call.
 
@@ -70,6 +70,16 @@ Label creation always passes a team id, so the label is team-scoped: workspace-l
 
 Label creation is also gated by a team-level permission setting that decides whether all members or only owners may create labels, so a correctly scoped key can still be refused. That is the one operation a well-configured key can fail. The remedies are to flip that team setting or to pre-create the escalation label once, after which resolution finds it and the create path never runs. Label failures are non-fatal to the orchestrator either way. Linear's own permissions documentation is the place to check what the setting is currently called.
 
+Removal takes label ids from the issue's own labels and never from a name lookup. Linear can hold a team label and a workspace label of one name, a name lookup returns one of them, and the issue may carry the other, so the issue's labels are read first and every one that names the requested label is removed in a single `removedLabelIds` mutation. Both label mutations select the issue's labels in their payload, capped at 50 with a next-page flag; a payload that reports another page cannot confirm anything, so the adapter reads the issue's labels instead.
+
+Linear does not document what happens when an add targets a label that shares a single-select group with a label already on the issue. It may replace the sibling, reject the mutation as invalid input, report `success: false`, or accept it and change nothing. The error classifier cannot tell a group conflict from any other rejection.
+
+A label is in a single-select group when its parent group's `groupType` is not `multiSelect`; a group without a type behaves as single-select. A label the adapter created has no parent.
+
+The plain add runs first. For a grouped label, any outcome other than the label being on the issue leads to a read of the issue's labels, removal of the labels that share the target's parent, and a second add. If Linear replaces the sibling itself, that costs one mutation. The gap between the removal and the second add is accepted: a request that fails there leaves the issue with neither the old group labels nor the new one.
+
+No input combines `addedLabelIds` with `removedLabelIds`, and removing an id the issue lacks is unverified, so the removal is settled by the confirming read.
+
 ## Pagination
 
 Every connection is a Relay cursor connection, and one loop walks all of them: send `first`, read `pageInfo`, stop when there is no next page.
@@ -80,7 +90,7 @@ A page that claims another page while omitting the end cursor raises a missing-c
 
 A caller may seed the cursor to resume a connection past a page it already holds; the loop preserves that seed instead of restarting from the beginning. That is what keeps the inline comment page from being fetched twice and duplicated, so a refactor that resets the cursor breaks comment collection in a way no single-page test notices.
 
-Nested connections inside an issue node are capped at their first page and are not paginated. Truncation is logged with the issue and the connection named, which keeps a dropped label or blocker observable instead of imaginary. The cap is cheap insurance against a pathological issue, not a complexity-budget necessity.
+The nested labels connection of an issue node is the exception to nested-first-page reads. It selects the first 25 labels with an end cursor, and an issue whose connection reports another page gets the rest from the issue labels query, seeded with that cursor, before normalization. A label list that omitted a label would hide a stage label from dispatch, so a failed completing request fails the read, and a next page without an end cursor raises the missing-cursor error without sending a request. The other nested connection, the inverse relations that carry blockers, stays capped at its first page; its truncation is logged with the issue and the connection named, which keeps a dropped blocker observable instead of imaginary.
 
 Never depend on server-side ordering. Connection order and the priority sort argument are both treated as hints: dispatch order comes from a client-side sort by normalized priority then creation time, and comments are re-sorted into chronological order after collection because agents read them as a narrative.
 
@@ -94,9 +104,11 @@ The assignee is strictly a human user. Agents and applications surface through s
 
 Blockers come from the issue's inverse relations. The relation record lives on the blocked issue, and the blocker is the relation's source issue, so reading a blocked issue gives you the blockers directly. The relation type is compared case-insensitively after trimming, and the blocker slice is always non-nil.
 
-Descriptions and comment bodies are markdown and pass through untouched. There is nothing to flatten and no wrapper to build on the write side either.
+Descriptions and comment bodies are markdown and pass through untouched. There is nothing to flatten and, apart from the literal fence described below, no wrapper to build on the write side either.
 
 What the adapter writes is stored verbatim, and that includes text it might be tempting to treat as rich. An interactive mention is something Linear's editor produces while a human is typing or pasting, not something the stored body encodes, so an issue or user URL an agent puts in a comment reaches human readers as a plain link. Never compose comment text whose meaning depends on a mention rendering.
+
+A comment that carries agent text ends in a Markdown fence: the text, a blank line, the fence, the literal, and the same fence. The fence is at least three backticks and one longer than the longest backtick run in the literal, with no info string, and it comes from the shared issue helper rather than from this adapter. Nothing else in the block is escaped, so what keeps a mention, link, or markup inert is Linear's own handling of a fenced block. Whether Linear renders a fence longer than three backticks as one code block is unchecked.
 
 ## Rate limits
 
@@ -116,7 +128,7 @@ The endpoint defaults to Linear's single hosted GraphQL URL; there is no self-ho
 
 `tracker.query_filter` is a JSON object merged into the fetch filter as extra sibling fields, which Linear ANDs with the adapter's own constraints. The top-level team and state keys are rejected so an operator cannot widen the team or state scope out from under the state model, the fragment travels in the variables object rather than the query text, and the filter map is rebuilt per call so concurrent fetches never share it.
 
-Configured state names are validated online, by the preflight, not offline. The offline validator only checks shapes it can decide without a network call: endpoint form, a team key that looks like a team key rather than an owner/repo path, and state list elements. Empty or padded state names are errors here rather than warnings, because construction rejects them.
+Configured state names are validated online, by the preflight, not offline. The offline validator only checks shapes it can decide without a network call: endpoint form, a team key that looks like a team key rather than an owner/repo path, and state list elements. Padded state names are errors here rather than warnings, because construction rejects them. An empty state name fails the workflow load on every tracker, so it never reaches this validator.
 
 Writes are ordinary data changes, so they emit whatever webhooks and automations the operator has configured in their workspace. Sortie polls and consumes no webhooks itself, so this is an operator-awareness note rather than a dependency.
 

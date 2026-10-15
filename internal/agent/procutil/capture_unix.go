@@ -3,24 +3,34 @@
 package procutil
 
 import (
+	"context"
 	"log/slog"
 	"os/exec"
 	"time"
 )
 
-// startAndAssign places cmd in its own process group and starts it.
-// Job Object assignment has no Unix analogue: process-group membership
-// is established at fork time via Setpgid, so keepJobHandle is unused
-// and the returned handle is always zero. The returned time is the
-// moment cmd.Start returned, the zero value when it failed.
-func startAndAssign(cmd *exec.Cmd, _ *slog.Logger, _ bool) (uintptr, time.Time, error) {
+// startAndAssign places cmd in its own process group, registers its
+// launch record, and starts it. Job Object assignment has no Unix
+// analogue: process-group membership is established at fork time via
+// Setpgid, so keepJobHandle is unused and the returned handle is always
+// zero. The returned record is nil on error. The returned time is the
+// moment cmd.Start returned, the zero value when it failed. A failed
+// start is a [StartError] at [StageProcessStart]. A Unix launch is never
+// suspended, so there is no resume to decide and ctx is unused.
+func startAndAssign(_ context.Context, cmd *exec.Cmd, _ *slog.Logger, _ bool) (*Group, uintptr, time.Time, *StartError) {
 	SetProcessGroup(cmd)
+
+	// os/exec may run Cancel as soon as Start returns, and a cancellation
+	// that found no record would skip the group.
+	g := newGroup(cmd)
+	groups.Store(cmd, g)
+	recordCancelStop(cmd, g)
+
 	if err := cmd.Start(); err != nil {
-		return 0, time.Time{}, err
+		groups.Delete(cmd)
+		return nil, 0, time.Time{}, processStartError(err)
 	}
-	startedAt := time.Now()
-	_ = assignProcess(cmd.Process.Pid, cmd.Process)
-	return 0, startedAt, nil
+	return g, 0, time.Now(), nil
 }
 
 // drainCaptureJob is a no-op on Unix: there is no Job Object to drain.

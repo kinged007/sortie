@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 // Compile-time operator-facing messages. None interpolates a request body, a
@@ -122,6 +124,15 @@ type pumpState struct {
 	caps             agentCapabilities
 
 	queued []domain.AgentEvent
+
+	agentMessageText      strings.Builder
+	agentMessageID        *messageId
+	agentMessageRunes     int
+	agentMessageTruncated bool
+	// agentMessageAt is when the message's last text chunk was observed. The
+	// completed message carries it, so history a load replays before a turn
+	// is not dated into that turn.
+	agentMessageAt time.Time
 
 	activeTurn *activeTurn
 
@@ -334,7 +345,7 @@ func (p *pumpState) handleReplayQuery(q *replayQuery) {
 		return
 	}
 	p.pendingReplayQuery = q
-	p.replayDeadlineC = time.After(readTimeout(p.state))
+	p.replayDeadlineC = time.After(agentcore.ReadTimeout(p.state.agentConfig))
 }
 
 // finalizeReplayQueryOnDeadline ends a pending replay query once its bounded
@@ -439,6 +450,7 @@ func (p *pumpState) drainReadyItems() {
 func (p *pumpState) handleStreamEnd() {
 	p.drainReadyItems()
 	p.streamEnded = true
+	p.flushAgentMessage()
 	if p.activeTurn == nil {
 		return
 	}
@@ -472,6 +484,7 @@ func streamEndedEvidence(state *sessionState, message string, cause error) agent
 func (p *pumpState) handleAbandonment() {
 	p.drainReadyItems()
 	p.streamEnded = true
+	p.flushAgentMessage()
 	if p.activeTurn == nil {
 		return
 	}
@@ -497,7 +510,7 @@ func (p *pumpState) armWriteFailedDeadline() <-chan time.Time {
 	if p.activeTurn == nil {
 		return nil
 	}
-	return time.After(readTimeout(p.state))
+	return time.After(agentcore.ReadTimeout(p.state.agentConfig))
 }
 
 // handleWriteFailed ends the active turn with the send-failure outcome. It runs
@@ -560,6 +573,7 @@ func (p *pumpState) handleMessage(msg *jsonrpc.Message) {
 // condition from the loss of the subprocess and is not retried.
 func (p *pumpState) handleStreamEndMessage(msg *jsonrpc.Message) {
 	p.streamEnded = true
+	p.flushAgentMessage()
 	if p.activeTurn == nil {
 		return
 	}
@@ -626,7 +640,7 @@ func (p *pumpState) armDrain(turn *activeTurn, evidence agentcore.TurnEvidence, 
 	turn.drainEvidence = evidence
 	turn.draining = true
 	if turn.deadlineC == nil {
-		turn.deadlineC = time.After(readTimeout(p.state))
+		turn.deadlineC = time.After(agentcore.ReadTimeout(p.state.agentConfig))
 	}
 
 	reader := p.reader
@@ -698,16 +712,79 @@ func (p *pumpState) handleSessionUpdateMessage(msg *jsonrpc.Message) {
 		p.emitOrQueue(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: time.Now().UTC(), Message: unrecognizedSessionUpdateMessage})
 		return
 	}
-
 	if sue.kind == updateUserMessageChunk || sue.kind == updateAgentMessageChunk {
 		p.observeReplay()
 	}
 	p.observeModelReached(sue.kind)
 
 	result := applySessionUpdate(p.tracker, sue)
+	switch {
+	case result.messageChunk:
+		p.handleAgentMessageChunk(result.messageID, result.messageText, result.event.Timestamp)
+		// emitOrQueue would complete the message this chunk belongs to.
+		if result.hasEvent {
+			p.publishOrQueue(result.event)
+		}
+		return
+	case sue.kind == updateUserMessageChunk:
+		// Ends the agent message before it without publishing an event.
+		p.flushAgentMessage()
+	}
 	if result.hasEvent {
 		p.emitOrQueue(result.event)
 	}
+}
+
+func sameMessageID(a, b *messageId) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func (p *pumpState) handleAgentMessageChunk(id *messageId, text string, at time.Time) {
+	if p.agentMessageRunes > 0 && !sameMessageID(p.agentMessageID, id) {
+		p.flushAgentMessage()
+	}
+	if text == "" {
+		return
+	}
+	if p.agentMessageRunes == 0 {
+		p.agentMessageID = id
+	}
+	p.agentMessageAt = at
+	for _, r := range text {
+		if p.agentMessageRunes == messageTruncateLimit {
+			p.agentMessageTruncated = true
+			break
+		}
+		p.agentMessageText.WriteRune(r)
+		p.agentMessageRunes++
+	}
+}
+
+func (p *pumpState) flushAgentMessage() {
+	if p.agentMessageRunes == 0 {
+		return
+	}
+
+	text := p.agentMessageText.String()
+	if p.agentMessageTruncated {
+		text = redact.MaskTruncated(text)
+		text = redact.Truncate(text, messageTruncateLimit)
+		if !strings.HasSuffix(text, "…") {
+			text += "…"
+		}
+	} else {
+		text = redact.Truncate(text, messageTruncateLimit)
+	}
+	p.publishOrQueue(domain.AgentEvent{Type: domain.EventNotification, Timestamp: p.agentMessageAt, Message: text})
+
+	p.agentMessageText.Reset()
+	p.agentMessageID = nil
+	p.agentMessageAt = time.Time{}
+	p.agentMessageRunes = 0
+	p.agentMessageTruncated = false
 }
 
 // observeModelReached records that the active turn reached the model, for the
@@ -724,9 +801,16 @@ func (p *pumpState) observeModelReached(kind sessionUpdateKind) {
 	}
 }
 
-// emitOrQueue publishes ev into the active turn's sink, or queues it when no
-// turn is in flight, to be flushed after the next turn's session_started event.
+// emitOrQueue completes any agent message still being accumulated, then
+// publishes or queues ev, so events keep the order the agent produced them in.
 func (p *pumpState) emitOrQueue(ev domain.AgentEvent) {
+	p.flushAgentMessage()
+	p.publishOrQueue(ev)
+}
+
+// publishOrQueue publishes ev into the active turn's sink, or queues it when no
+// turn is in flight, to be flushed after the next turn's session_started event.
+func (p *pumpState) publishOrQueue(ev domain.AgentEvent) {
 	if p.activeTurn != nil {
 		p.publish(p.activeTurn)(ev)
 		return
@@ -783,6 +867,7 @@ func (p *pumpState) handleStartTurn(ts *turnStart) {
 		return
 	}
 
+	p.flushAgentMessage()
 	turn := &activeTurn{sink: ts.sink, resultCh: ts.resultCh, done: ts.done, cancelCh: ts.cancelCh, capsSnapshot: *p.state.caps}
 	p.activeTurn = turn
 	ts.reply <- turnVerdict{accepted: true}
@@ -845,6 +930,7 @@ func (p *pumpState) finalizeTurnWithUsage(ev agentcore.TurnEvidence, observed *u
 	if turn == nil {
 		return
 	}
+	p.flushAgentMessage()
 	p.activeTurn = nil
 	ev = turn.disposition(ev)
 
@@ -907,7 +993,7 @@ func (p *pumpState) beginEndAttempt(kind turnEndKind, detail string) {
 		p.state.conn.Notify(methodSessionCancel, cancelNotification{SessionID: sessionId(p.sessionID)}) //nolint:errcheck,gosec // best-effort
 	}
 	if turn.deadlineC == nil {
-		turn.deadlineC = time.After(readTimeout(p.state))
+		turn.deadlineC = time.After(agentcore.ReadTimeout(p.state.agentConfig))
 	}
 }
 

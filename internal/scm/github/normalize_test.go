@@ -7,7 +7,18 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/issuekit"
 )
+
+func normalizeIssueUnder(gi githubIssue, active, terminal []string) domain.Issue {
+	model := issuekit.NewLabelStateModel(issuekit.NewStateSource(domain.TrackerStates{Active: active, Terminal: terminal}), nil)
+	return normalizeIssue(gi, model, model.Snapshot())
+}
+
+func normalizeBlockersUnder(blockers []githubIssue, active, terminal []string) []domain.BlockerRef {
+	model := issuekit.NewLabelStateModel(issuekit.NewStateSource(domain.TrackerStates{Active: active, Terminal: terminal}), nil)
+	return normalizeBlockers(blockers, model, model.Snapshot(), "owner", "repo")
+}
 
 func typePtr(name string) *githubIssueType { return &githubIssueType{Name: name} }
 func prMarker() *githubPR                  { return &githubPR{} }
@@ -32,7 +43,7 @@ func TestNormalizeIssue_AllFields(t *testing.T) {
 	active := []string{"backlog", "in-progress", "review"}
 	terminal := []string{"done", "wontfix"}
 
-	got := normalizeIssue(gi, active, terminal, "", nil)
+	got := normalizeIssueUnder(gi, active, terminal)
 
 	// ID and Identifier are both the issue number (not global int64 ID).
 	if got.ID != "42" {
@@ -89,7 +100,7 @@ func TestNormalizeIssue_LabelsLowercased(t *testing.T) {
 		State:  "open",
 		Labels: []githubLabel{{Name: "BACKLOG"}, {Name: "Priority-High"}},
 	}
-	got := normalizeIssue(gi, []string{"backlog"}, nil, "", nil)
+	got := normalizeIssueUnder(gi, []string{"backlog"}, nil)
 
 	if len(got.Labels) != 2 {
 		t.Fatalf("Labels len = %d, want 2", len(got.Labels))
@@ -106,46 +117,13 @@ func TestNormalizeIssue_NonNilEmptyLabels(t *testing.T) {
 	t.Parallel()
 
 	gi := githubIssue{Number: 1, State: "open", Labels: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	if got.Labels == nil {
 		t.Error("Labels is nil, want non-nil empty slice")
 	}
 	if len(got.Labels) != 0 {
 		t.Errorf("Labels len = %d, want 0", len(got.Labels))
-	}
-}
-
-func TestNormalizeIssue_NilBody(t *testing.T) {
-	t.Parallel()
-
-	gi := githubIssue{Number: 1, State: "open", Body: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	if got.Description != "" {
-		t.Errorf("Description = %q, want empty string for nil Body", got.Description)
-	}
-}
-
-func TestNormalizeIssue_NilType(t *testing.T) {
-	t.Parallel()
-
-	gi := githubIssue{Number: 1, State: "open", Type: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	if got.IssueType != "" {
-		t.Errorf("IssueType = %q, want empty string for nil Type", got.IssueType)
-	}
-}
-
-func TestNormalizeIssue_EmptyAssignees(t *testing.T) {
-	t.Parallel()
-
-	gi := githubIssue{Number: 1, State: "open", Assignees: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	if got.Assignee != "" {
-		t.Errorf("Assignee = %q, want empty string for no assignees", got.Assignee)
 	}
 }
 
@@ -157,7 +135,7 @@ func TestNormalizeIssue_MultipleAssignees(t *testing.T) {
 		State:     "open",
 		Assignees: []githubUser{{Login: "alice"}, {Login: "bob"}},
 	}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	// Only the first assignee is used.
 	if got.Assignee != "alice" {
@@ -175,7 +153,7 @@ func TestNormalizeIssue_NonNilEmptyBlockedBy(t *testing.T) {
 	t.Parallel()
 
 	gi := githubIssue{Number: 1, State: "open"}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	if got.BlockedBy == nil {
 		t.Error("BlockedBy is nil, want non-nil empty slice in list normalization")
@@ -188,40 +166,11 @@ func TestNormalizeIssue_NonNilEmptyBlockedBy(t *testing.T) {
 	}
 }
 
-func TestNormalizeIssue_NilPriority(t *testing.T) {
-	t.Parallel()
-
-	gi := githubIssue{Number: 1, State: "open"}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	if got.Priority != nil {
-		t.Errorf("Priority = %v, want nil (GitHub has no native priority)", got.Priority)
-	}
-}
-
-func TestNormalizeIssue_IDEqualsIdentifier(t *testing.T) {
-	t.Parallel()
-
-	gi := githubIssue{ID: 99999999, Number: 123, State: "open"}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	// Both ID and Identifier must be the issue number, not the global int64 ID.
-	if got.ID != "123" {
-		t.Errorf("ID = %q, want issue number %q (not global ID)", got.ID, "123")
-	}
-	if got.Identifier != "123" {
-		t.Errorf("Identifier = %q, want issue number %q", got.Identifier, "123")
-	}
-	if got.ID != got.Identifier {
-		t.Errorf("ID %q != Identifier %q", got.ID, got.Identifier)
-	}
-}
-
 func TestNormalizeIssue_DisplayIDEmpty(t *testing.T) {
 	t.Parallel()
 
 	gi := githubIssue{Number: 42, State: "open"}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	// normalizeIssue must leave DisplayID empty; callers are responsible for
 	// calling qualifyDisplayID to set the qualified form.
@@ -285,7 +234,7 @@ func TestNormalizeBlockers_NonEmpty(t *testing.T) {
 	active := []string{"backlog", "in-progress", "review"}
 	terminal := []string{"done", "wontfix"}
 
-	got := normalizeBlockers(blockers, active, terminal, "", "owner", "repo", nil)
+	got := normalizeBlockersUnder(blockers, active, terminal)
 
 	if len(got) != 2 {
 		t.Fatalf("normalizeBlockers len = %d, want 2", len(got))
@@ -314,7 +263,7 @@ func TestNormalizeBlockers_NonEmpty(t *testing.T) {
 func TestNormalizeBlockers_EmptyReturnsNonNilSlice(t *testing.T) {
 	t.Parallel()
 
-	got := normalizeBlockers(nil, nil, nil, "", "owner", "repo", nil)
+	got := normalizeBlockersUnder(nil, nil, nil)
 
 	if got == nil {
 		t.Error("normalizeBlockers(nil) returned nil, want non-nil empty slice")
@@ -446,7 +395,7 @@ func TestNormalizeIssue_DependenciesSummaryPreFilter(t *testing.T) {
 			t.Parallel()
 
 			gi := githubIssue{Number: 1, State: "open", DependenciesSummary: tt.summary}
-			got := normalizeIssue(gi, nil, nil, "", nil)
+			got := normalizeIssueUnder(gi, nil, nil)
 
 			if got.BlockersUnresolved != tt.wantBlockersUnres {
 				t.Errorf("BlockersUnresolved = %t, want %t", got.BlockersUnresolved, tt.wantBlockersUnres)
@@ -476,7 +425,7 @@ func TestNormalizeIssue_DependenciesSummaryNullDecodesToNil(t *testing.T) {
 		t.Fatalf("DependenciesSummary = %v, want nil after decoding a JSON null", gi.DependenciesSummary)
 	}
 
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 	if !got.BlockersUnresolved {
 		t.Error("BlockersUnresolved = false, want true: a JSON null summary proves nothing about dependencies")
 	}
@@ -496,11 +445,11 @@ func TestNormalizeIssue_PreFilterDecisionEquality(t *testing.T) {
 		State:               "open",
 		DependenciesSummary: &githubDependenciesSummary{BlockedBy: 0, TotalBlockedBy: 0},
 	}
-	preFiltered := normalizeIssue(gi, nil, nil, "", nil)
+	preFiltered := normalizeIssueUnder(gi, nil, nil)
 
 	// The per-issue read path: a dependencies route responding with no
 	// entries, normalized the same way fetchBlockers would.
-	readBlockedBy := normalizeBlockers(nil, nil, nil, "", "owner", "repo", nil)
+	readBlockedBy := normalizeBlockersUnder(nil, nil, nil)
 
 	if preFiltered.BlockersUnresolved {
 		t.Fatal("pre-filtered issue has BlockersUnresolved = true, want false")

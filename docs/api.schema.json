@@ -1,0 +1,4144 @@
+{
+  "$defs": {
+    "AcknowledgeResponse": {
+      "properties": {
+        "acknowledged": {
+          "type": "boolean"
+        },
+        "acknowledged_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "already_acknowledged": {
+          "type": "boolean"
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "outcome_text": {
+          "type": "string"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "acknowledged",
+        "already_acknowledged",
+        "requested_at",
+        "outcome_text"
+      ],
+      "type": "object"
+    },
+    "ActiveIssueResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "reaction_kind": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "status",
+        "stage_position",
+        "dispatched_at",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "AttemptsInfo": {
+      "properties": {
+        "current_retry_attempt": {
+          "type": "integer"
+        },
+        "restart_count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "restart_count",
+        "current_retry_attempt"
+      ],
+      "type": "object"
+    },
+    "AttentionActionResponse": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "AttentionEvidenceResponse": {
+      "properties": {
+        "budget_sessions": {
+          "type": "integer"
+        },
+        "budget_tokens": {
+          "type": "integer"
+        },
+        "config_key": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "escalation_trigger": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "last_check": {
+          "$ref": "#/$defs/ReactionCheckResponse"
+        },
+        "max_attempts": {
+          "type": "integer"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/PullRequestResponse"
+        },
+        "reaction_kind": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "used_attempts": {
+          "type": "integer"
+        },
+        "used_sessions": {
+          "type": "integer"
+        },
+        "used_tokens": {
+          "type": "integer"
+        },
+        "used_tokens_complete": {
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "AttentionItemResponse": {
+      "properties": {
+        "acknowledged_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "action": {
+          "$ref": "#/$defs/AttentionActionResponse"
+        },
+        "clears_text": {
+          "type": "string"
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "evidence": {
+          "$ref": "#/$defs/AttentionEvidenceResponse"
+        },
+        "id": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "reason_text": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "why_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "severity",
+        "since",
+        "acknowledged_at",
+        "reason_text",
+        "why_text",
+        "clears_text",
+        "action",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "BudgetExhaustedResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "budget_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "exhausted_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "stage_lineage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageLineageResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "stopped_in_flight": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_sessions": {
+          "type": "integer"
+        },
+        "used_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "dispatched_at",
+        "reason",
+        "used_sessions",
+        "budget_sessions",
+        "used_tokens",
+        "budget_tokens",
+        "unmeasured_sessions",
+        "stopped_in_flight",
+        "exhausted_at",
+        "stage_lineage",
+        "stage_position",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "ChainGroup": {
+      "properties": {
+        "cost_per_succeeded_run_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_unpriced_runs": {
+          "type": "integer"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_seconds": {
+          "$ref": "#/$defs/Duration"
+        },
+        "issue": {
+          "type": "string"
+        },
+        "last_hop": {
+          "type": "string"
+        },
+        "mean_turns": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "share": {
+          "type": "number"
+        },
+        "stages": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "succeeded": {
+          "type": "integer"
+        },
+        "success_rate": {
+          "type": "number"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_unmeasured_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "runs",
+        "succeeded",
+        "success_rate",
+        "share",
+        "duration_seconds",
+        "mean_turns",
+        "tokens",
+        "cost_usd",
+        "cost_per_succeeded_run_usd",
+        "tokens_unmeasured_runs",
+        "cost_unpriced_runs",
+        "issue",
+        "stages",
+        "last_hop"
+      ],
+      "type": "object"
+    },
+    "CheckNowResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "outcome_text": {
+          "type": "string"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/PullRequestResponse"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "queued",
+        "requested_at",
+        "outcome_text"
+      ],
+      "type": "object"
+    },
+    "ConfigResponse": {
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/ShapeAgent"
+        },
+        "dispatch": {
+          "$ref": "#/$defs/ShapeDispatch"
+        },
+        "polling": {
+          "$ref": "#/$defs/ShapePolling"
+        },
+        "reactions": {
+          "$ref": "#/$defs/ShapeReactions"
+        },
+        "token_rates": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/TokenRateResponse"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tracker": {
+          "$ref": "#/$defs/ShapeTracker"
+        },
+        "worker": {
+          "$ref": "#/$defs/ShapeWorker"
+        }
+      },
+      "required": [
+        "tracker",
+        "polling",
+        "agent",
+        "worker",
+        "dispatch",
+        "reactions",
+        "token_rates"
+      ],
+      "type": "object"
+    },
+    "Duration": {
+      "properties": {
+        "mean": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "p50": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "p95": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "samples": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "p50",
+        "p95",
+        "mean",
+        "samples"
+      ],
+      "type": "object"
+    },
+    "ErrorDetail": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ErrorResponse": {
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ErrorDetail"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "type": "object"
+    },
+    "Group": {
+      "properties": {
+        "cost_per_succeeded_run_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_unpriced_runs": {
+          "type": "integer"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_seconds": {
+          "$ref": "#/$defs/Duration"
+        },
+        "mean_turns": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "share": {
+          "type": "number"
+        },
+        "succeeded": {
+          "type": "integer"
+        },
+        "success_rate": {
+          "type": "number"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_unmeasured_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "runs",
+        "succeeded",
+        "success_rate",
+        "share",
+        "duration_seconds",
+        "mean_turns",
+        "tokens",
+        "cost_usd",
+        "cost_per_succeeded_run_usd",
+        "tokens_unmeasured_runs",
+        "cost_unpriced_runs"
+      ],
+      "type": "object"
+    },
+    "HealthCheckResponse": {
+      "properties": {
+        "checked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consecutive_failures": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failing_since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_success_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "checked_at",
+        "last_success_at",
+        "consecutive_failures",
+        "failing_since"
+      ],
+      "type": "object"
+    },
+    "HealthResponse": {
+      "properties": {
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "HistoryTotalsResponse": {
+      "properties": {
+        "cost_status": {
+          "type": "string"
+        },
+        "estimated_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_count": {
+          "type": "integer"
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenInfo"
+        },
+        "tokens_complete": {
+          "type": "boolean"
+        },
+        "unmeasured_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_count",
+        "unmeasured_runs",
+        "tokens",
+        "tokens_complete",
+        "estimated_cost_usd",
+        "cost_status"
+      ],
+      "type": "object"
+    },
+    "HopDecisionResponse": {
+      "properties": {
+        "chain_id": {
+          "type": "string"
+        },
+        "completed_at": {
+          "type": "string"
+        },
+        "result": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "integer"
+        },
+        "source_rule": {
+          "type": "string"
+        },
+        "target_rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "source_rule",
+        "target_rule",
+        "result",
+        "completed_at"
+      ],
+      "type": "object"
+    },
+    "IssueDetailResponse": {
+      "properties": {
+        "attempts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttemptsInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "between_stages": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageHopResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_exhausted": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BudgetExhaustedResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueHistoryResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue": {
+          "$ref": "#/$defs/IssueResponse"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_outcomes": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/NextOutcomeResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParkedEntryResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_reactions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PendingReactionResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recent_events": {
+          "anyOf": [
+            {
+              "items": {},
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetryEntryResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "running": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunningEntryResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "tracked": {
+          "anyOf": [
+            {
+              "additionalProperties": {},
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "issue_identifier",
+        "issue_id",
+        "status",
+        "issue",
+        "workspace",
+        "attempts",
+        "running",
+        "retry",
+        "budget_exhausted",
+        "parked",
+        "pending_reactions",
+        "between_stages",
+        "recent_events",
+        "last_error",
+        "tracked",
+        "history",
+        "status_text",
+        "status_text_full",
+        "next_outcomes"
+      ],
+      "type": "object"
+    },
+    "IssueGroupResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueOutcomeResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/$defs/HistoryTotalsResponse"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "status",
+        "status_text",
+        "status_text_full",
+        "issue_outcome",
+        "runs",
+        "next_cursor",
+        "totals"
+      ],
+      "type": "object"
+    },
+    "IssueGroupsResponse": {
+      "properties": {
+        "groups": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/IssueGroupResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "groups",
+        "next_cursor"
+      ],
+      "type": "object"
+    },
+    "IssueHistoryResponse": {
+      "properties": {
+        "hops": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/HopDecisionResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueOutcomeResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "totals": {
+          "$ref": "#/$defs/HistoryTotalsResponse"
+        }
+      },
+      "required": [
+        "runs",
+        "next_cursor",
+        "totals",
+        "hops",
+        "issue_outcome"
+      ],
+      "type": "object"
+    },
+    "IssueOutcomeResponse": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "merge_path": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/PullRequestResponse"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "observed_at",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "IssueResponse": {
+      "properties": {
+        "issue_type": {
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "state": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "NextOutcomeResponse": {
+      "properties": {
+        "condition": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "condition",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ParkedEntryResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "label_applied": {
+          "type": "boolean"
+        },
+        "parked_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "parked_state": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "dispatched_at",
+        "reason",
+        "label",
+        "label_applied",
+        "parked_at",
+        "stage_position",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "PendingReactionResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "config_key": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "escalated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "escalation_trigger": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "last_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReactionCheckResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_attempts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_poll_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/PullRequestResponse"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "used_attempts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait": {
+          "type": "string"
+        },
+        "watch_ends_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "kind",
+        "config_key",
+        "pull_request",
+        "created_at",
+        "dispatched_at",
+        "next_poll_at",
+        "used_attempts",
+        "max_attempts",
+        "escalated_at",
+        "watch_ends_at",
+        "last_check",
+        "stage_position",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "PollHealthResponse": {
+      "properties": {
+        "checked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consecutive_failures": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failing_since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_success_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_poll_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "summary_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "checked_at",
+        "last_success_at",
+        "consecutive_failures",
+        "failing_since",
+        "next_poll_at",
+        "summary_text"
+      ],
+      "type": "object"
+    },
+    "PullRequestResponse": {
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "number": {
+          "type": "integer"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "repository"
+      ],
+      "type": "object"
+    },
+    "ReactionCheckResponse": {
+      "properties": {
+        "actionable_comments": {
+          "type": "integer"
+        },
+        "failing": {
+          "type": "integer"
+        },
+        "failing_checks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "mergeable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_comments": {
+          "type": "integer"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "passing": {
+          "type": "integer"
+        },
+        "pending": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "ReadyResponse": {
+      "properties": {
+        "checks": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "uptime_seconds": {
+          "type": "number"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "version",
+        "uptime_seconds",
+        "checks"
+      ],
+      "type": "object"
+    },
+    "RefreshResponse": {
+      "properties": {
+        "coalesced": {
+          "type": "boolean"
+        },
+        "operations": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome_text": {
+          "type": "string"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "queued",
+        "coalesced",
+        "requested_at",
+        "operations",
+        "outcome_text"
+      ],
+      "type": "object"
+    },
+    "Report": {
+      "properties": {
+        "by_adapter": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_chain": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ChainGroup"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_model": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_origin": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_rule": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_status": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_template": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by_trigger": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "generated_at": {
+          "type": "string"
+        },
+        "schema_tier": {
+          "type": "string"
+        },
+        "self_review": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfReview"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/Summary"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "warnings": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generated_at",
+        "workflow_path",
+        "db_path",
+        "since",
+        "until",
+        "schema_tier",
+        "warnings",
+        "summary",
+        "by_status",
+        "by_adapter",
+        "by_rule",
+        "by_template",
+        "by_model",
+        "by_chain",
+        "by_trigger",
+        "by_origin",
+        "self_review"
+      ],
+      "type": "object"
+    },
+    "RetryEntryResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "due_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "reaction_config_key": {
+          "type": "string"
+        },
+        "reaction_kind": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "stage_lineage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageLineageResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "dispatched_at",
+        "attempt",
+        "due_at",
+        "error",
+        "stage_lineage",
+        "stage_position",
+        "paused",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "RetryNowResponse": {
+      "properties": {
+        "attempt": {
+          "type": "integer"
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "outcome_text": {
+          "type": "string"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "queued",
+        "requested_at",
+        "outcome_text"
+      ],
+      "type": "object"
+    },
+    "RunResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "chain_id": {
+          "type": "string"
+        },
+        "completed_at": {
+          "type": "string"
+        },
+        "configured_effort": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "cost_status": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "estimated_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueOutcomeResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "origin_recorded": {
+          "type": "boolean"
+        },
+        "reaction_config_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reaction_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "integer"
+        },
+        "self_review": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfReviewResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ssh_host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage_previous": {
+          "type": "string"
+        },
+        "stage_previous_outcome": {
+          "type": "string"
+        },
+        "stage_result": {
+          "type": "string"
+        },
+        "stage_target": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenInfo"
+        },
+        "tokens_measured": {
+          "type": "boolean"
+        },
+        "trigger": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turns_completed": {
+          "type": "integer"
+        },
+        "unaccounted_turns": {
+          "type": "integer"
+        },
+        "workflow_file": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "issue_id",
+        "issue_identifier",
+        "attempt",
+        "status",
+        "error",
+        "started_at",
+        "completed_at",
+        "dispatched_at",
+        "turns_completed",
+        "tokens",
+        "tokens_measured",
+        "unaccounted_turns",
+        "estimated_cost_usd",
+        "cost_status",
+        "self_review",
+        "origin_recorded",
+        "trigger",
+        "reaction_kind",
+        "reaction_config_key",
+        "session_id",
+        "ssh_host",
+        "issue_outcome"
+      ],
+      "type": "object"
+    },
+    "RunningEntryResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "api_request_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "api_requests_measured": {
+          "type": "boolean"
+        },
+        "api_time_percent": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configured_effort": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "cost_status": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "estimated_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_cost_status": {
+          "type": "string"
+        },
+        "issue_estimated_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_tokens_completed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "last_event": {
+          "type": "string"
+        },
+        "last_event_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "last_message": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/PullRequestResponse"
+        },
+        "reaction_attempt": {
+          "type": "integer"
+        },
+        "reaction_config_key": {
+          "type": "string"
+        },
+        "reaction_kind": {
+          "type": "string"
+        },
+        "requests_by_model": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "self_review_active": {
+          "type": "boolean"
+        },
+        "self_review_iteration": {
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "ssh_host": {
+          "type": "string"
+        },
+        "stage_lineage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageLineageResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenInfo"
+        },
+        "tokens_awaited": {
+          "type": "boolean"
+        },
+        "tokens_measured": {
+          "type": "boolean"
+        },
+        "tokens_pending": {
+          "type": "boolean"
+        },
+        "tool_time_percent": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turn_count": {
+          "type": "integer"
+        },
+        "unmeasured_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_arrival": {
+          "type": "string"
+        },
+        "usage_attribution": {
+          "type": "string"
+        },
+        "used_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_tokens_complete": {
+          "type": "boolean"
+        },
+        "workflow_file": {
+          "type": "string"
+        },
+        "workspace_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "issue_labels",
+        "state",
+        "session_id",
+        "turn_count",
+        "self_review_active",
+        "self_review_iteration",
+        "last_event",
+        "last_message",
+        "started_at",
+        "dispatched_at",
+        "last_event_at",
+        "workspace_path",
+        "tokens",
+        "stage_lineage",
+        "stage_position",
+        "api_request_count",
+        "tool_time_percent",
+        "api_time_percent",
+        "tokens_measured",
+        "usage_arrival",
+        "usage_attribution",
+        "tokens_pending",
+        "tokens_awaited",
+        "api_requests_measured",
+        "used_sessions",
+        "budget_sessions",
+        "issue_tokens_completed",
+        "unmeasured_sessions",
+        "used_tokens",
+        "used_tokens_complete",
+        "budget_tokens",
+        "estimated_cost_usd",
+        "cost_status",
+        "issue_estimated_cost_usd",
+        "issue_cost_status",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "RunsResponse": {
+      "properties": {
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "runs",
+        "next_cursor"
+      ],
+      "type": "object"
+    },
+    "ScmHealthResponse": {
+      "properties": {
+        "checked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consecutive_failures": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failing_since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_success_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "status",
+        "checked_at",
+        "last_success_at",
+        "consecutive_failures",
+        "failing_since"
+      ],
+      "type": "object"
+    },
+    "SelfReview": {
+      "properties": {
+        "by_final_verdict": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/VerdictCount"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cap_reached_runs": {
+          "type": "integer"
+        },
+        "mean_iterations": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs_with_metadata": {
+          "type": "integer"
+        },
+        "unparsed_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "runs_with_metadata",
+        "by_final_verdict",
+        "cap_reached_runs",
+        "mean_iterations",
+        "unparsed_runs"
+      ],
+      "type": "object"
+    },
+    "SelfReviewResponse": {
+      "properties": {
+        "cap_reached": {
+          "type": "boolean"
+        },
+        "final_verdict": {
+          "type": "string"
+        },
+        "total_iterations": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "final_verdict",
+        "total_iterations",
+        "cap_reached"
+      ],
+      "type": "object"
+    },
+    "ShapeAgent": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "max_concurrent_agents": {
+          "type": "integer"
+        },
+        "max_concurrent_agents_by_state": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_retry_backoff_ms": {
+          "type": "integer"
+        },
+        "max_sessions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_turns": {
+          "type": "integer"
+        },
+        "stall_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_arrival": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "usage_arrival",
+        "max_turns",
+        "stall_timeout_ms",
+        "max_retry_backoff_ms",
+        "max_sessions",
+        "max_tokens",
+        "max_concurrent_agents",
+        "max_concurrent_agents_by_state"
+      ],
+      "type": "object"
+    },
+    "ShapeAutoMerge": {
+      "properties": {
+        "delete_branch": {
+          "type": "boolean"
+        },
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_retries": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "require_ci": {
+          "type": "boolean"
+        },
+        "strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "strategy",
+        "require_ci",
+        "delete_branch",
+        "poll_interval_ms",
+        "max_retries",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapeBotReview": {
+      "properties": {
+        "bot_usernames": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_continuation_turns": {
+          "type": "integer"
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "triage": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_continuation_turns",
+        "poll_interval_ms",
+        "bot_usernames",
+        "triage",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapeCIFailure": {
+      "properties": {
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_retries": {
+          "type": "integer"
+        },
+        "triage": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_retries",
+        "triage",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapeDispatch": {
+      "properties": {
+        "chains": {
+          "anyOf": [
+            {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShapeSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hop_ceiling": {
+          "type": "integer"
+        },
+        "max_consecutive_hops": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rules": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ShapeRule"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "rules",
+        "default",
+        "chains",
+        "max_consecutive_hops",
+        "hop_ceiling"
+      ],
+      "type": "object"
+    },
+    "ShapeLabelCommands": {
+      "properties": {
+        "fix_label": {
+          "type": "string"
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "review_label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "poll_interval_ms"
+      ],
+      "type": "object"
+    },
+    "ShapeMatch": {
+      "properties": {
+        "assignee": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "identifier": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_type": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "priority": {
+          "$ref": "#/$defs/ShapePriority"
+        },
+        "title": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "ShapeMergeCompletion": {
+      "properties": {
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_retries": {
+          "type": "integer"
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "target_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_state",
+        "max_retries",
+        "poll_interval_ms",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapeMergeConflicts": {
+      "properties": {
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_retries": {
+          "type": "integer"
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "triage": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_retries",
+        "poll_interval_ms",
+        "triage",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapePolling": {
+      "properties": {
+        "interval_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "interval_ms"
+      ],
+      "type": "object"
+    },
+    "ShapePriority": {
+      "properties": {
+        "op": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer"
+        },
+        "values": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "ShapeReactions": {
+      "properties": {
+        "auto_merge": {
+          "$ref": "#/$defs/ShapeAutoMerge"
+        },
+        "bot_review": {
+          "$ref": "#/$defs/ShapeBotReview"
+        },
+        "ci_failure": {
+          "$ref": "#/$defs/ShapeCIFailure"
+        },
+        "label_commands": {
+          "$ref": "#/$defs/ShapeLabelCommands"
+        },
+        "merge_completion": {
+          "$ref": "#/$defs/ShapeMergeCompletion"
+        },
+        "merge_conflicts": {
+          "$ref": "#/$defs/ShapeMergeConflicts"
+        },
+        "review_comments": {
+          "$ref": "#/$defs/ShapeReviewComments"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "ShapeReviewComments": {
+      "properties": {
+        "debounce_ms": {
+          "type": "integer"
+        },
+        "escalation": {
+          "type": "string"
+        },
+        "escalation_label": {
+          "type": "string"
+        },
+        "max_continuation_turns": {
+          "type": "integer"
+        },
+        "poll_interval_ms": {
+          "type": "integer"
+        },
+        "triage": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_continuation_turns",
+        "debounce_ms",
+        "poll_interval_ms",
+        "triage",
+        "escalation"
+      ],
+      "type": "object"
+    },
+    "ShapeRule": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "match": {
+          "$ref": "#/$defs/ShapeMatch"
+        },
+        "name": {
+          "type": "string"
+        },
+        "next": {
+          "type": "string"
+        },
+        "selected_by": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "usage_arrival": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "selected_by",
+        "agent_kind",
+        "usage_arrival"
+      ],
+      "type": "object"
+    },
+    "ShapeSelection": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "usage_arrival": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_kind",
+        "usage_arrival"
+      ],
+      "type": "object"
+    },
+    "ShapeTracker": {
+      "properties": {
+        "active_states": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handoff_state": {
+          "type": "string"
+        },
+        "in_progress_state": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "no_change_state": {
+          "type": "string"
+        },
+        "terminal_states": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "active_states",
+        "terminal_states"
+      ],
+      "type": "object"
+    },
+    "ShapeWorker": {
+      "properties": {
+        "max_concurrent_agents_per_host": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ssh_hosts": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "ssh_hosts",
+        "max_concurrent_agents_per_host"
+      ],
+      "type": "object"
+    },
+    "SnapshotAgentTotals": {
+      "properties": {
+        "cache_read_tokens": {
+          "type": "integer"
+        },
+        "cache_write_tokens": {
+          "type": "integer"
+        },
+        "input_tokens": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "running_non_reporting": {
+          "type": "integer"
+        },
+        "running_unreported": {
+          "type": "integer"
+        },
+        "seconds_running": {
+          "type": "number"
+        },
+        "total_tokens": {
+          "type": "integer"
+        },
+        "unmeasured_sessions": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "seconds_running",
+        "unmeasured_sessions",
+        "running_unreported",
+        "running_non_reporting"
+      ],
+      "type": "object"
+    },
+    "StageHopResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "configured_model": {
+          "type": "string"
+        },
+        "dispatched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "hopped_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "source_rule": {
+          "type": "string"
+        },
+        "stage_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StagePositionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "target_rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "source_rule",
+        "target_rule",
+        "target_label",
+        "hopped_at",
+        "dispatched_at",
+        "stage_position",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
+    "StageLineageResponse": {
+      "properties": {
+        "chain_id": {
+          "type": "string"
+        },
+        "previous": {
+          "type": "string"
+        },
+        "previous_outcome": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "StagePositionResponse": {
+      "properties": {
+        "chain": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current": {
+          "type": "string"
+        },
+        "hop_ceiling": {
+          "type": "integer"
+        },
+        "hop_count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "chain",
+        "current",
+        "hop_count",
+        "hop_ceiling"
+      ],
+      "type": "object"
+    },
+    "StateCounts": {
+      "properties": {
+        "attention": {
+          "type": "integer"
+        },
+        "between_stages": {
+          "type": "integer"
+        },
+        "budget_exhausted": {
+          "type": "integer"
+        },
+        "parked": {
+          "type": "integer"
+        },
+        "pending_reactions": {
+          "type": "integer"
+        },
+        "retrying": {
+          "type": "integer"
+        },
+        "running": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "running",
+        "retrying",
+        "budget_exhausted",
+        "parked",
+        "pending_reactions",
+        "between_stages",
+        "attention"
+      ],
+      "type": "object"
+    },
+    "StateHealthResponse": {
+      "properties": {
+        "database": {
+          "$ref": "#/$defs/HealthCheckResponse"
+        },
+        "poll": {
+          "$ref": "#/$defs/PollHealthResponse"
+        },
+        "preflight": {
+          "$ref": "#/$defs/HealthCheckResponse"
+        },
+        "scm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScmHealthResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow": {
+          "$ref": "#/$defs/WorkflowHealthResponse"
+        }
+      },
+      "required": [
+        "database",
+        "preflight",
+        "workflow",
+        "poll",
+        "scm"
+      ],
+      "type": "object"
+    },
+    "StateResponse": {
+      "properties": {
+        "active": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ActiveIssueResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "active_estimated_cost_usd": {
+          "type": "number"
+        },
+        "agent_totals": {
+          "$ref": "#/$defs/SnapshotAgentTotals"
+        },
+        "attention": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/AttentionItemResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "between_stages": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/StageHopResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_exhausted": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/BudgetExhaustedResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigResponse"
+        },
+        "cost_unpriced_running": {
+          "type": "integer"
+        },
+        "counts": {
+          "$ref": "#/$defs/StateCounts"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/StateHealthResponse"
+        },
+        "parked": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ParkedEntryResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_reactions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PendingReactionResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limits": {
+          "anyOf": [
+            {
+              "additionalProperties": {},
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retrying": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RetryEntryResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "running": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunningEntryResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generated_at",
+        "version",
+        "started_at",
+        "counts",
+        "running",
+        "retrying",
+        "budget_exhausted",
+        "parked",
+        "pending_reactions",
+        "between_stages",
+        "active",
+        "attention",
+        "agent_totals",
+        "rate_limits"
+      ],
+      "type": "object"
+    },
+    "Summary": {
+      "properties": {
+        "cancelled": {
+          "type": "integer"
+        },
+        "cost_per_succeeded_run_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_unpriced_runs": {
+          "type": "integer"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_excluded_runs": {
+          "type": "integer"
+        },
+        "duration_seconds": {
+          "$ref": "#/$defs/Duration"
+        },
+        "failed": {
+          "type": "integer"
+        },
+        "issues": {
+          "type": "integer"
+        },
+        "mean_turns_succeeded": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "stopped": {
+          "type": "integer"
+        },
+        "succeeded": {
+          "type": "integer"
+        },
+        "success_rate": {
+          "type": "number"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_unmeasured_runs": {
+          "type": "integer"
+        },
+        "zero_duration_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "runs",
+        "issues",
+        "succeeded",
+        "failed",
+        "stopped",
+        "cancelled",
+        "success_rate",
+        "duration_seconds",
+        "mean_turns_succeeded",
+        "tokens",
+        "cost_usd",
+        "cost_per_succeeded_run_usd",
+        "zero_duration_runs",
+        "duration_excluded_runs",
+        "cost_unpriced_runs",
+        "tokens_unmeasured_runs"
+      ],
+      "type": "object"
+    },
+    "TokenInfo": {
+      "properties": {
+        "cache_read_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_write_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens"
+      ],
+      "type": "object"
+    },
+    "TokenRateResponse": {
+      "properties": {
+        "cache_read_per_mtok": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_write_per_mtok": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "input_per_mtok": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_per_mtok": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "input_per_mtok",
+        "output_per_mtok",
+        "cache_read_per_mtok",
+        "cache_write_per_mtok",
+        "complete"
+      ],
+      "type": "object"
+    },
+    "Tokens": {
+      "properties": {
+        "cache_read": {
+          "type": "integer"
+        },
+        "cache_write": {
+          "type": "integer"
+        },
+        "input": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "integer"
+        },
+        "total": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "total",
+        "cache_read",
+        "cache_write"
+      ],
+      "type": "object"
+    },
+    "VerdictCount": {
+      "properties": {
+        "runs": {
+          "type": "integer"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "runs"
+      ],
+      "type": "object"
+    },
+    "WorkflowHealthResponse": {
+      "properties": {
+        "checked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consecutive_failures": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failing_since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "file": {
+          "type": "string"
+        },
+        "last_success_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "checked_at",
+        "last_success_at",
+        "consecutive_failures",
+        "failing_since"
+      ],
+      "type": "object"
+    },
+    "WorkspaceInfo": {
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sortie JSON API responses"
+}

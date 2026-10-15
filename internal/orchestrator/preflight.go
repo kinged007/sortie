@@ -1,15 +1,24 @@
 package orchestrator
 
 import (
-	"errors"
+	"cmp"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/config"
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/maputil"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+// PreflightFailedPrefix leads the text of a failed [PreflightResult].
+const PreflightFailedPrefix = "dispatch preflight failed: "
+
+// preflightCheckWorkflowLoad is the [PreflightError.Check] of a workflow file
+// that cannot be loaded.
+const preflightCheckWorkflowLoad = "workflow_load"
 
 // PreflightError represents a single preflight validation failure.
 type PreflightError struct {
@@ -18,7 +27,8 @@ type PreflightError struct {
 	// "tracker.project", "tracker_adapter", "tracker.handoff_state",
 	// "tracker.in_progress_state", "agent.kind", "agent.command",
 	// "agent_adapter", "workspace.root_writable",
-	// "agent.kind.session_resume", "dispatch.agent.missing_block".
+	// "agent.kind.session_resume", "dispatch.agent.missing_block",
+	// "dispatch.stage.collision".
 	Check string
 
 	// Message is an operator-friendly description of the failure.
@@ -61,7 +71,7 @@ func (r PreflightResult) Error() string {
 	for i, e := range r.Errors {
 		msgs[i] = e.Message
 	}
-	return "dispatch preflight failed: " + strings.Join(msgs, "; ")
+	return PreflightFailedPrefix + strings.Join(msgs, "; ")
 }
 
 // PreflightParams holds the dependencies for preflight validation.
@@ -106,7 +116,7 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 	// misleading. The operator must fix the workflow file first.
 	if err := params.ReloadWorkflow(); err != nil {
 		errs = append(errs, PreflightError{
-			Check:   "workflow_load",
+			Check:   preflightCheckWorkflowLoad,
 			Message: "workflow file cannot be loaded: " + err.Error(),
 		})
 		return PreflightResult{Errors: errs}
@@ -124,8 +134,9 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 
 	// Tracker-specific validations share a single Meta() lookup.
 	var warns []PreflightWarning
+	var trackerMeta registry.TrackerMeta
 	if cfg.Tracker.Kind != "" {
-		trackerMeta, _ := params.TrackerRegistry.Meta(cfg.Tracker.Kind)
+		trackerMeta, _ = params.TrackerRegistry.Meta(cfg.Tracker.Kind)
 
 		// API key is mandatory for adapters that declare it required.
 		if trackerMeta.RequiresAPIKey && cfg.Tracker.APIKey == "" {
@@ -175,11 +186,13 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 				}
 			}
 		}
+	}
 
-		// The config loader rules on the state lists as written. A list the
-		// tracker adapter fills from its own fallback needs the same rules
-		// run against the lists the run actually uses.
-		errs = append(errs, validateDefaultedTrackerStates(cfg.Tracker, trackerMeta)...)
+	if len(cfg.Tracker.ActiveStates) == 0 {
+		warns = append(warns, PreflightWarning{
+			Check:   "tracker.active_states.empty",
+			Message: "tracker.active_states is empty, so no issue is dispatched",
+		})
 	}
 
 	// Agent kind must be set for any subsequent agent validation.
@@ -188,17 +201,6 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 			Check:   "agent.kind",
 			Message: "agent.kind is required",
 		})
-	}
-
-	// Command is mandatory for adapters that declare it required.
-	if cfg.Agent.Kind != "" {
-		agentMeta, _ := params.AgentRegistry.Meta(cfg.Agent.Kind)
-		if agentMeta.RequiresCommand && cfg.Agent.Command == "" {
-			errs = append(errs, PreflightError{
-				Check:   "agent.command",
-				Message: "agent.command is required for agent kind " + strconv.Quote(cfg.Agent.Kind),
-			})
-		}
 	}
 
 	// Agent adapter must be registered in the registry.
@@ -217,27 +219,21 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 	// mode for every session this configuration can produce.
 	remote := len(ParseWorkerConfig(cfg.ExtensionSection("worker"), cfg.ExtensionEnvRefPaths("worker")).SSHHosts) > 0
 
-	// tokenRatePricedKinds is the set of kind strings token_rates
-	// prices, read once per validation call. Only the key set is
-	// needed here; the rate values themselves belong to internal/server,
-	// which internal/orchestrator must not import.
-	var tokenRatePricedKinds map[string]struct{}
-	if raw, present := cfg.ExtensionValue("token_rates"); present {
-		if topMap, ok := raw.(map[string]any); ok {
-			tokenRatePricedKinds = make(map[string]struct{}, len(topMap))
-			for kind := range topMap {
-				tokenRatePricedKinds[kind] = struct{}{}
-			}
-		}
-	}
-
 	// Adapter-specific agent config validation, for every distinct kind
 	// this configuration can reach. A registered kind the configuration
 	// never references is skipped, because that would report a fault in
 	// a block no run reads.
+	selectors := agentKindSelectors(cfg)
 	for _, ref := range orderedUniqueAgentKinds(cfg) {
 		agentMeta, registered := params.AgentRegistry.Meta(ref.Kind)
-		settings := config.ResolveAgentSettings(cfg, ref.Kind, "")
+		settings := config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: ref.Kind}, "")
+
+		if registered && agentMeta.RequiresCommand && !launchesExecutable(cfg, agentMeta, ref.Kind, remote) {
+			errs = append(errs, PreflightError{
+				Check:   "agent.command",
+				Message: missingCommandMessage(ref, cmp.Or(cfg.Dispatch.Default.AgentKind, cfg.Agent.Kind)),
+			})
+		}
 
 		// A kind the dispatch block introduces, rather than the
 		// workflow-wide default, must carry its own settings block.
@@ -245,32 +241,27 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 		// already resolves the "differs from cfg.Agent.Kind"
 		// comparison into the origin, so no second kind comparison
 		// belongs here.
+		//
+		// A kind selected only by rules that carry its block needs no
+		// top-level block: no attempt reads it alone.
+		blockOnly := false
 		if registered && ref.Origin != agentKindOriginDefault {
+			uncovered, hasUncovered := firstSelectorWithoutBlock(selectors, ref.Kind)
+			blockOnly = !hasUncovered
 			switch settings.BlockPresence {
 			case config.ExtensionBlockAbsent:
-				errs = append(errs, PreflightError{
-					Check:   "dispatch.agent.missing_block",
-					Message: missingBlockAbsentMessage(ref),
-				})
+				if hasUncovered {
+					errs = append(errs, PreflightError{
+						Check:   "dispatch.agent.missing_block",
+						Message: missingBlockAbsentMessage(uncovered),
+					})
+				}
 			case config.ExtensionBlockNotAMapping:
 				errs = append(errs, PreflightError{
 					Check:   "dispatch.agent.missing_block",
 					Message: missingBlockNotAMappingMessage(ref, settings.BlockDescription),
 				})
 			}
-		}
-
-		// A kind whose adapter never hands the generated MCP config
-		// path to the agent process cannot make use of an mcp_config
-		// value in its own block. This is evaluated for every kind,
-		// including one with no config validator (for example
-		// "mock"), so it is not folded behind the early continue
-		// below.
-		if registered && agentMeta.MCPInjection == registry.MCPInjectionUnsupported && settings.MCPConfigPath != "" {
-			warns = append(warns, PreflightWarning{
-				Check:   "agent.mcp_config",
-				Message: "mcp_config in the " + strconv.Quote(ref.Kind) + " block cannot reach the agent: this agent kind receives no MCP configuration",
-			})
 		}
 
 		// A kind whose declared disposition delivers no channel on a
@@ -283,61 +274,32 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 			})
 		}
 
-		// A kind whose disposition reports no usage figure for the
-		// sessions this configuration produces makes a configured
-		// token ceiling inert and a priced rate un-billable. Each
-		// setting has its own remedy, so each earns its own check key.
-		if registered {
-			arrival, _ := agentMeta.UsageDisposition(settings.Passthrough, remote)
-			if !arrival.ReportsAnyFigure() {
-				if cfg.Agent.MaxTokens != 0 {
-					warns = append(warns, PreflightWarning{
-						Check: "agent.kind.no_usage_reporting",
-						Message: "agent.max_tokens is set but agent kind " + strconv.Quote(ref.Kind) +
-							" reports no token usage for the sessions this configuration produces: the per-issue token ceiling can never be reached for it",
-					})
-				}
-				if _, priced := tokenRatePricedKinds[ref.Kind]; priced {
-					warns = append(warns, PreflightWarning{
-						Check: "agent.kind.no_cost_estimate",
-						Message: "token_rates prices agent kind " + strconv.Quote(ref.Kind) +
-							", which reports no token usage for the sessions this configuration produces: no cost can be estimated for it",
-					})
-				}
-			}
-		}
-
-		// A kind whose declaration reports a blocking key under this
-		// configuration's passthrough cannot resume a session, but
-		// Sortie re-dispatches an issue with its earlier session on
-		// every retry, continuation, stall, or restart.
-		if registered && agentMeta.SessionResumeBlockedBy != nil {
-			if key := agentMeta.SessionResumeBlockedBy(settings.Passthrough); key != "" {
-				errs = append(errs, PreflightError{
-					Check: "agent.kind.session_resume",
-					Message: ref.Kind + "." + key + " stops this agent kind from resuming a session across separate agent launches, " +
-						"but Sortie re-dispatches an issue with its earlier session after a retry, a continuation, a stall, or a restart, " +
-						"and every such turn fails. Change " + ref.Kind + "." + key + ", or use an agent kind that can resume a session.",
-				})
-			}
-		}
-
-		if !registered || agentMeta.ValidateAgentConfig == nil {
+		if blockOnly {
 			continue
 		}
-		fields := registry.AgentConfigFields{
-			Kind:        ref.Kind,
-			Passthrough: settings.Passthrough,
+		settingsErrs, settingsWarns := settingsDiagnostics(cfg, agentMeta, registered, settings, remote)
+		errs = append(errs, settingsErrs...)
+		warns = append(warns, settingsWarns...)
+	}
+
+	for i, rule := range cfg.Dispatch.Rules {
+		if rule.SettingsKind == "" {
+			continue
 		}
-		for _, d := range agentMeta.ValidateAgentConfig(fields) {
-			switch d.Severity {
-			case "warning":
-				warns = append(warns, PreflightWarning{Check: d.Check, Message: d.Message})
-			default:
-				errs = append(errs, PreflightError{Check: d.Check, Message: d.Message})
-			}
+		agentMeta, registered := params.AgentRegistry.Meta(rule.SettingsKind)
+		settings := config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: rule.SettingsKind, RuleName: rule.Name}, "")
+		prefix := ruleSettingsPrefix(i, rule)
+
+		ruleErrs, ruleWarns := settingsDiagnostics(cfg, agentMeta, registered, settings, remote)
+		for _, e := range ruleErrs {
+			errs = append(errs, PreflightError{Check: e.Check, Message: prefix + e.Message})
+		}
+		for _, w := range ruleWarns {
+			warns = append(warns, PreflightWarning{Check: w.Check, Message: prefix + w.Message})
 		}
 	}
+
+	errs = append(errs, stageCollisions(cfg)...)
 
 	// Workspace root must exist and be writable.
 	if cfg.Workspace.Root != "" {
@@ -402,12 +364,134 @@ func orderedUniqueAgentKinds(cfg config.ServiceConfig) []agentKindRef {
 	return refs
 }
 
+// ruleSettingsPrefix opens every message about the settings block of
+// rules[index].
+func ruleSettingsPrefix(index int, rule config.DispatchRule) string {
+	return "dispatch rule " + strconv.Quote(rule.Name) + " (dispatch.rules[" + strconv.Itoa(index) + "]." + rule.SettingsKind + "): "
+}
+
+// stageCollisionSource is one value a stage label must not equal, with
+// the words that name it in a diagnostic.
+type stageCollisionSource struct {
+	value     string
+	rendering string
+}
+
+// stageCollisions returns one error per staged rule and per source value
+// that equals its stage label, rules in list order and sources in the
+// order stageCollisionSources lists them. It reads configuration and
+// registry metadata only, so it runs without a tracker call.
+func stageCollisions(cfg config.ServiceConfig) []PreflightError {
+	var sources []stageCollisionSource
+	var errs []PreflightError
+	for i, rule := range cfg.Dispatch.Rules {
+		if rule.Stage == "" {
+			continue
+		}
+		if sources == nil {
+			sources = stageCollisionSources(cfg)
+		}
+		for _, source := range sources {
+			if !config.StageLabelsEqual(rule.Stage, source.value) {
+				continue
+			}
+			errs = append(errs, PreflightError{
+				Check: "dispatch.stage.collision",
+				Message: "dispatch rule " + strconv.Quote(rule.Name) + " (dispatch.rules[" + strconv.Itoa(i) + "].stage): stage label " +
+					strconv.Quote(rule.Stage) + " collides with " + source.rendering +
+					"; a stage label must not equal a tracker state or a label Sortie applies to issues",
+			})
+		}
+	}
+	return errs
+}
+
+// stageCollisionSources lists every value a stage label must not equal:
+// the tracker states as written, then the labels Sortie applies to issues.
+func stageCollisionSources(cfg config.ServiceConfig) []stageCollisionSource {
+	tc := cfg.Tracker
+	var sources []stageCollisionSource
+	sources = append(sources, stateListSources("active", tc.ActiveStates)...)
+	sources = append(sources, stateListSources("terminal", tc.TerminalStates)...)
+	for _, named := range []struct{ key, value string }{
+		{"tracker.handoff_state", tc.HandoffState},
+		{"tracker.in_progress_state", tc.InProgressState},
+		{"tracker.no_change_state", tc.NoChangeState},
+	} {
+		if named.value != "" {
+			sources = append(sources, stageCollisionSource{value: named.value, rendering: named.key + " " + strconv.Quote(named.value)})
+		}
+	}
+
+	escalationLabels := make(map[string]string, len(cfg.Reactions)+1)
+	for key, reaction := range cfg.Reactions {
+		escalationLabels[key] = reaction.EscalationLabel
+	}
+	if cfg.CIFeedback.EscalationLabel != "" {
+		escalationLabels["ci_failure"] = cfg.CIFeedback.EscalationLabel
+	}
+	for _, key := range maputil.SortedKeys(escalationLabels) {
+		if label := escalationLabels[key]; label != "" {
+			sources = append(sources, stageCollisionSource{value: label, rendering: "reactions." + key + ".escalation_label " + strconv.Quote(label)})
+		}
+	}
+
+	parking := resolveHandoffParkingLabel(cfg.Reactions)
+	return append(sources, stageCollisionSource{value: parking, rendering: "the parking label " + strconv.Quote(parking)})
+}
+
+// stateListSources names each state of a written list. noun is "active"
+// or "terminal".
+func stateListSources(noun string, states []string) []stageCollisionSource {
+	sources := make([]stageCollisionSource, len(states))
+	for i, state := range states {
+		sources[i] = stageCollisionSource{value: state, rendering: noun + " state " + strconv.Quote(state)}
+	}
+	return sources
+}
+
+// agentKindSelector is a dispatch.default.agent or rule agent selection;
+// carriesBlock marks a rule holding a settings block for its kind.
+type agentKindSelector struct {
+	ref          agentKindRef
+	carriesBlock bool
+}
+
+// agentKindSelectors lists every non-empty selector, default first and
+// then rules in order, without [orderedUniqueAgentKinds]'s deduplication.
+func agentKindSelectors(cfg config.ServiceConfig) []agentKindSelector {
+	var selectors []agentKindSelector
+	if kind := cfg.Dispatch.Default.AgentKind; kind != "" {
+		selectors = append(selectors, agentKindSelector{ref: agentKindRef{Kind: kind, Origin: agentKindOriginDispatchDefault}})
+	}
+	for i, rule := range cfg.Dispatch.Rules {
+		kind := rule.Selection.AgentKind
+		if kind == "" {
+			continue
+		}
+		selectors = append(selectors, agentKindSelector{
+			ref:          agentKindRef{Kind: kind, Origin: agentKindOriginRule, RuleIndex: i, RuleName: rule.Name},
+			carriesBlock: rule.SettingsKind == kind,
+		})
+	}
+	return selectors
+}
+
+// firstSelectorWithoutBlock returns the first selector of kind that is not
+// a rule carrying its block.
+func firstSelectorWithoutBlock(selectors []agentKindSelector, kind string) (agentKindRef, bool) {
+	for _, selector := range selectors {
+		if selector.ref.Kind == kind && !selector.carriesBlock {
+			return selector.ref, true
+		}
+	}
+	return agentKindRef{}, false
+}
+
 // agentKindOriginPrefix names the front-matter field that introduced
-// ref.Kind, in the wording the dispatch.agent.missing_block messages
-// use to point the operator at the exact selector. Returns "" for
-// agentKindOriginDefault, which never reaches a message: that origin
-// is excluded from the covered set before either message function is
-// called.
+// ref.Kind, in the wording the dispatch.agent.missing_block and
+// agent.command messages use to point the operator at the exact
+// selector.
 func agentKindOriginPrefix(ref agentKindRef) string {
 	switch ref.Origin {
 	case agentKindOriginRule:
@@ -419,8 +503,27 @@ func agentKindOriginPrefix(ref agentKindRef) string {
 	case agentKindOriginDispatchDefault:
 		return "dispatch.default.agent"
 	default:
-		return ""
+		return "agent.kind"
 	}
+}
+
+// launchesExecutable reports whether a session of kind, in the given
+// launch mode, would launch a process: its own command names an
+// executable, or the kind has a default command.
+func launchesExecutable(cfg config.ServiceConfig, meta registry.AgentMeta, kind string, remote bool) bool {
+	return cfg.AgentCommand(kind, remote).NamesExecutable() || domain.AgentCommand{Line: meta.DefaultCommand}.NamesExecutable()
+}
+
+// missingCommandMessage renders the agent.command message for a kind
+// that would launch no executable. Only the default agent kind reads
+// agent.command, so any other kind is pointed at its selector.
+func missingCommandMessage(ref agentKindRef, defaultKind string) string {
+	kind := strconv.Quote(ref.Kind)
+	if ref.Kind == defaultKind {
+		return "agent.command is required for agent kind " + kind
+	}
+	return agentKindOriginPrefix(ref) + " selects agent kind " + kind +
+		", which has no default command and launches agent.command only as the default agent kind (dispatch.default.agent, else agent.kind)"
 }
 
 // missingBlockAbsentMessage renders the dispatch.agent.missing_block
@@ -443,91 +546,6 @@ func missingBlockNotAMappingMessage(ref agentKindRef, found string) string {
 		", but the " + kind + " key in the workflow front matter holds " + found +
 		" where a block of settings was expected; write the kind's settings as keys under " + strconv.Quote(ref.Kind+":") +
 		", or write " + strconv.Quote(ref.Kind+": {}")
-}
-
-// validateDefaultedTrackerStates reports the state collisions that
-// become visible only after the tracker adapter's default state lists
-// fill an empty tracker.active_states or tracker.terminal_states.
-//
-// Both arguments are read-only. The result is nil when no list was
-// defaulted, when the defaulted list produces no collision, or when the
-// written lists already violate a rule, in which case the config loader
-// reports the fault under its own field key.
-func validateDefaultedTrackerStates(tc config.TrackerConfig, meta registry.TrackerMeta) []PreflightError {
-	activeDefaulted := len(tc.ActiveStates) == 0 && len(meta.DefaultActiveStates) > 0
-	terminalDefaulted := len(tc.TerminalStates) == 0 && len(meta.DefaultTerminalStates) > 0
-	if !activeDefaulted && !terminalDefaulted {
-		return nil
-	}
-
-	// A collision the written lists already carry has its own diagnostic from
-	// the config loader. Returning here keeps every diagnostic below
-	// attributable to one empty front-matter key.
-	if config.ValidateHandoffState(tc.HandoffState, tc.ActiveStates, tc.TerminalStates) != nil {
-		return nil
-	}
-	if config.ValidateInProgressState(tc.InProgressState, tc.ActiveStates, tc.TerminalStates, tc.HandoffState) != nil {
-		return nil
-	}
-
-	effectiveActive := tc.ActiveStates
-	if activeDefaulted {
-		effectiveActive = meta.DefaultActiveStates
-	}
-	effectiveTerminal := tc.TerminalStates
-	if terminalDefaulted {
-		effectiveTerminal = meta.DefaultTerminalStates
-	}
-
-	var errs []PreflightError
-
-	// The handoff rule runs once per list, each call passing the other list as
-	// nil, so a violation names the one list whose emptiness the fallback
-	// filled instead of leaving the operator to guess.
-	if activeDefaulted {
-		if err := config.ValidateHandoffState(tc.HandoffState, effectiveActive, nil); err != nil {
-			errs = append(errs, defaultedStateError("tracker.handoff_state", err, "tracker.active_states", tc.Kind))
-		}
-	}
-	if terminalDefaulted {
-		if err := config.ValidateHandoffState(tc.HandoffState, nil, effectiveTerminal); err != nil {
-			errs = append(errs, defaultedStateError("tracker.handoff_state", err, "tracker.terminal_states", tc.Kind))
-		}
-		// The guards above returned on any membership or handoff-equality
-		// violation, so the only rule left for this call is the terminal
-		// collision.
-		if err := config.ValidateInProgressState(tc.InProgressState, effectiveActive, effectiveTerminal, tc.HandoffState); err != nil {
-			errs = append(errs, defaultedStateError("tracker.in_progress_state", err, "tracker.terminal_states", tc.Kind))
-		}
-	}
-
-	return errs
-}
-
-// defaultedStateError builds the diagnostic for a collision that a
-// tracker adapter's fallback state list exposed, naming the empty
-// front-matter key and the tracker kind whose fallback filled it.
-//
-// The sentence before the semicolon is the config loader's own, so both
-// paths report the same collision in the same words. ConfigError.Error
-// is not used: its field prefix belongs to a config-load failure, not to
-// a preflight message.
-func defaultedStateError(check string, err error, emptyKey, kind string) PreflightError {
-	message := err.Error()
-	if cfgErr, ok := errors.AsType[*config.ConfigError](err); ok {
-		message = cfgErr.Message
-	}
-
-	stateNoun := "terminal"
-	if emptyKey == "tracker.active_states" {
-		stateNoun = "active"
-	}
-
-	return PreflightError{
-		Check: check,
-		Message: message + "; " + emptyKey + " is empty, so the " + strconv.Quote(kind) +
-			" adapter falls back to its own " + stateNoun + " states",
-	}
 }
 
 // checkWorkspaceRootWritable verifies that root exists (creating it

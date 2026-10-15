@@ -73,6 +73,26 @@ func readWorkerTestMCPServers(t *testing.T, path string) map[string]any {
 	return servers
 }
 
+type startParamsRecorder struct {
+	mockAgentAdapter
+
+	mu     sync.Mutex
+	params []domain.StartSessionParams
+}
+
+func (r *startParamsRecorder) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
+	r.mu.Lock()
+	r.params = append(r.params, params)
+	r.mu.Unlock()
+	return r.mockAgentAdapter.StartSession(ctx, params)
+}
+
+func (r *startParamsRecorder) recorded() []domain.StartSessionParams {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.params)
+}
+
 func workerTestIssue() domain.Issue {
 	return domain.Issue{
 		ID:         "issue-1",
@@ -216,11 +236,15 @@ type mockTrackerAdapter struct {
 	transitionIssueFn func(ctx context.Context, issueID, targetState string) error
 	transitionCalls   []transitionIssueCall
 	commentIssueFn    func(ctx context.Context, issueID, text string) error
+	fetchIssueByIDFn  func(ctx context.Context, id string) (domain.Issue, error)
 
 	// commentMu guards commentCalls: several detached budget-hold-notice
 	// goroutines can write it concurrently within a single tick.
 	commentMu    sync.Mutex
 	commentCalls []commentIssueCall
+
+	fetchIssueByIDMu    sync.Mutex
+	fetchIssueByIDCalls []string
 
 	// fetchStatesCalls is atomic because the double is shared across the
 	// worker goroutine and the test goroutine under -race.
@@ -233,7 +257,15 @@ func (m *mockTrackerAdapter) FetchCandidateIssues(_ context.Context) ([]domain.I
 	return nil, nil
 }
 
-func (m *mockTrackerAdapter) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
+func (m *mockTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
+
+func (m *mockTrackerAdapter) FetchIssueByID(ctx context.Context, id string) (domain.Issue, error) {
+	m.fetchIssueByIDMu.Lock()
+	m.fetchIssueByIDCalls = append(m.fetchIssueByIDCalls, id)
+	m.fetchIssueByIDMu.Unlock()
+	if m.fetchIssueByIDFn != nil {
+		return m.fetchIssueByIDFn(ctx, id)
+	}
 	return domain.Issue{}, nil
 }
 
@@ -272,6 +304,7 @@ func (m *mockTrackerAdapter) TransitionIssue(ctx context.Context, issueID string
 type commentIssueCall struct {
 	IssueID string
 	Text    string
+	Literal string
 }
 
 func (m *mockTrackerAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
@@ -284,9 +317,21 @@ func (m *mockTrackerAdapter) CommentIssue(ctx context.Context, issueID string, t
 	return nil
 }
 
+func (m *mockTrackerAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	m.commentMu.Lock()
+	m.commentCalls = append(m.commentCalls, commentIssueCall{IssueID: issueID, Text: text, Literal: literal})
+	m.commentMu.Unlock()
+	if m.commentIssueFn != nil {
+		return m.commentIssueFn(ctx, issueID, text)
+	}
+	return nil
+}
+
 func (m *mockTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error {
 	return nil
 }
+
+func (m *mockTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 type stubAgentTool struct {
 	toolName string
@@ -471,50 +516,59 @@ func TestIsTurnSuccess(t *testing.T) {
 func TestToDomainAgentConfig(t *testing.T) {
 	t.Parallel()
 
-	src := config.AgentConfig{
-		Kind:           "claude-code",
-		Command:        "claude --json",
-		TurnTimeoutMS:  30000,
-		ReadTimeoutMS:  10000,
-		StallTimeoutMS: 60000,
+	timeouts := config.AgentConfig{TurnTimeoutMS: 30000, ReadTimeoutMS: 10000, StallTimeoutMS: 60000, StopGraceMS: 2000}
+	withCommand := func(kind, command string, argv []string) config.ServiceConfig {
+		agent := timeouts
+		agent.Kind, agent.Command, agent.CommandArgv = kind, command, argv
+		return config.ServiceConfig{Agent: agent}
+	}
+	converted := convertedConfig(t, map[string]any{
+		"agent":    map[string]any{"kind": "kind-a", "command": "kind-a-cmd"},
+		"dispatch": map[string]any{"rules": []any{backendRuleRaw("legacy")}},
+	})
+
+	tests := []struct {
+		name        string
+		cfg         config.ServiceConfig
+		kind        string
+		remote      bool
+		wantCommand string
+		wantArgv    []string
+	}{
+		{name: "default kind, string command", cfg: withCommand("kind-a", "kind-a --json", nil), kind: "kind-a", wantCommand: "kind-a --json"},
+		{name: "default kind, string command, remote", cfg: withCommand("kind-a", "kind-a --json", nil), kind: "kind-a", remote: true, wantCommand: "kind-a --json"},
+		{name: "default kind, list command", cfg: withCommand("kind-a", "", []string{"kind a", "--json"}), kind: "kind-a", wantArgv: []string{"kind a", "--json"}},
+		{name: "default kind, list command, remote", cfg: withCommand("kind-a", "", []string{"kind a", "--json"}), kind: "kind-a", remote: true, wantArgv: []string{"kind a", "--json"}},
+		{name: "routed kind has no command of its own", cfg: withCommand("kind-a", "kind-a --json", nil), kind: "codex"},
+		{name: "routed kind has no command of its own, remote", cfg: withCommand("kind-a", "", []string{"kind-a"}), kind: "codex", remote: true},
+		{name: "converted kind launches the converted command locally", cfg: converted, kind: "modern", wantCommand: "legacy-cli serve"},
+		{name: "converted kind launches the converted command remotely", cfg: converted, kind: "modern", remote: true, wantCommand: "legacy-cli serve --remote"},
+		{name: "default kind beside a converted kind keeps agent.command", cfg: converted, kind: "kind-a", wantCommand: "kind-a-cmd"},
 	}
 
-	t.Run("passed kind matches the configuration's default kind", func(t *testing.T) {
-		t.Parallel()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		got := toDomainAgentConfig(src, src.Kind)
+			got := toDomainAgentConfig(tt.cfg, tt.kind, tt.remote)
 
-		if got.Kind != src.Kind {
-			t.Errorf("Kind = %q, want %q", got.Kind, src.Kind)
-		}
-		if got.Command != src.Command {
-			t.Errorf("Command = %q, want %q", got.Command, src.Command)
-		}
-		if got.TurnTimeoutMS != src.TurnTimeoutMS {
-			t.Errorf("TurnTimeoutMS = %d, want %d", got.TurnTimeoutMS, src.TurnTimeoutMS)
-		}
-		if got.ReadTimeoutMS != src.ReadTimeoutMS {
-			t.Errorf("ReadTimeoutMS = %d, want %d", got.ReadTimeoutMS, src.ReadTimeoutMS)
-		}
-		if got.StallTimeoutMS != src.StallTimeoutMS {
-			t.Errorf("StallTimeoutMS = %d, want %d", got.StallTimeoutMS, src.StallTimeoutMS)
-		}
-	})
-
-	t.Run("passed kind differs from the configuration's default kind", func(t *testing.T) {
-		t.Parallel()
-
-		const routedKind = "codex"
-
-		got := toDomainAgentConfig(src, routedKind)
-
-		if got.Kind != routedKind {
-			t.Errorf("Kind = %q, want %q (the passed kind, not cfg.Agent.Kind %q)", got.Kind, routedKind, src.Kind)
-		}
-		if got.Command != src.Command {
-			t.Errorf("Command = %q, want %q", got.Command, src.Command)
-		}
-	})
+			if got.Kind != tt.kind {
+				t.Errorf("Kind = %q, want the passed kind %q", got.Kind, tt.kind)
+			}
+			if got.Command != tt.wantCommand {
+				t.Errorf("toDomainAgentConfig(kind %q, remote %v).Command = %q, want %q", tt.kind, tt.remote, got.Command, tt.wantCommand)
+			}
+			if !slices.Equal(got.CommandArgv, tt.wantArgv) {
+				t.Errorf("toDomainAgentConfig(kind %q, remote %v).CommandArgv = %q, want %q", tt.kind, tt.remote, got.CommandArgv, tt.wantArgv)
+			}
+			cfgAgent := tt.cfg.Agent
+			if got.TurnTimeoutMS != cfgAgent.TurnTimeoutMS || got.ReadTimeoutMS != cfgAgent.ReadTimeoutMS ||
+				got.StallTimeoutMS != cfgAgent.StallTimeoutMS || got.StopGraceMS != cfgAgent.StopGraceMS {
+				t.Errorf("timeouts = %d/%d/%d/%d, want %d/%d/%d/%d", got.TurnTimeoutMS, got.ReadTimeoutMS, got.StallTimeoutMS, got.StopGraceMS,
+					cfgAgent.TurnTimeoutMS, cfgAgent.ReadTimeoutMS, cfgAgent.StallTimeoutMS, cfgAgent.StopGraceMS)
+			}
+		})
+	}
 }
 
 func TestRunWorkerAttempt_SSHEnvNamesFunc(t *testing.T) {
@@ -914,7 +968,7 @@ func TestRunWorkerAttempt(t *testing.T) {
 		cfg.Agent.MaxTurns = 2
 		ec := newExitCapture()
 
-		var turns atomic.Int64
+		var turns, relayed atomic.Int64
 		deps := WorkerDeps{
 			TrackerAdapter: &mockTrackerAdapter{},
 			AgentAdapter: &mockAgentAdapter{
@@ -939,6 +993,7 @@ func TestRunWorkerAttempt(t *testing.T) {
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "do work on {{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
+			OnUnaccountedTurns:     func(_ string, count int) { relayed.Store(int64(count)) },
 			OnExit:                 ec.onExit,
 			Logger:                 discardLogger(),
 		}
@@ -949,6 +1004,10 @@ func TestRunWorkerAttempt(t *testing.T) {
 		if result.UnaccountedTurns != 1 {
 			t.Errorf("WorkerResult.UnaccountedTurns = %d, want 1: one turn reported spend of an unknown amount",
 				result.UnaccountedTurns)
+		}
+		if got := relayed.Load(); got != int64(result.UnaccountedTurns) {
+			t.Errorf("last count relayed through OnUnaccountedTurns = %d, want %d (WorkerResult.UnaccountedTurns)",
+				got, result.UnaccountedTurns)
 		}
 		if !result.UsageMeasured {
 			t.Error("WorkerResult.UsageMeasured = false, want true: an unaccounted turn does not deny a measurement " +
@@ -1631,68 +1690,31 @@ func TestRunWorkerAttempt(t *testing.T) {
 		}
 	})
 
-	t.Run("max_turns_clamped", func(t *testing.T) {
-		t.Parallel()
+	for _, maxTurns := range []int{0, -5} {
+		t.Run(fmt.Sprintf("max_turns_clamped_from_%d", maxTurns), func(t *testing.T) {
+			t.Parallel()
 
-		tmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(tmpDir)
-		cfg.Agent.MaxTurns = 0
+			cfg := defaultWorkerConfig(t.TempDir())
+			cfg.Agent.MaxTurns = maxTurns
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter:         &mockTrackerAdapter{},
+				AgentAdapter:           &mockAgentAdapter{},
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				Logger:                 discardLogger(),
+			}
 
-		ec := newExitCapture()
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
 
-		deps := WorkerDeps{
-			TrackerAdapter:         &mockTrackerAdapter{},
-			AgentAdapter:           &mockAgentAdapter{},
-			ConfigFunc:             func() config.ServiceConfig { return cfg },
-			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
-			OnEvent:                func(_ string, _ domain.AgentEvent) {},
-			OnExit:                 ec.onExit,
-			Logger:                 discardLogger(),
-		}
-
-		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-
-		result := ec.waitResult(t)
-		if result.ExitKind != WorkerExitNormal {
-			t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-		}
-		if result.TurnsCompleted != 1 {
-			t.Errorf("TurnsCompleted = %d, want 1 (max_turns clamped from 0)", result.TurnsCompleted)
-		}
-		if result.Error != nil {
-			t.Errorf("Error = %v, want nil", result.Error)
-		}
-	})
-
-	t.Run("max_turns_clamped_negative", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(tmpDir)
-		cfg.Agent.MaxTurns = -5
-
-		ec := newExitCapture()
-
-		deps := WorkerDeps{
-			TrackerAdapter:         &mockTrackerAdapter{},
-			AgentAdapter:           &mockAgentAdapter{},
-			ConfigFunc:             func() config.ServiceConfig { return cfg },
-			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
-			OnEvent:                func(_ string, _ domain.AgentEvent) {},
-			OnExit:                 ec.onExit,
-			Logger:                 discardLogger(),
-		}
-
-		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-
-		result := ec.waitResult(t)
-		if result.ExitKind != WorkerExitNormal {
-			t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-		}
-		if result.TurnsCompleted != 1 {
-			t.Errorf("TurnsCompleted = %d, want 1 (max_turns clamped from -5)", result.TurnsCompleted)
-		}
-	})
+			result := ec.waitResult(t)
+			if result.ExitKind != WorkerExitNormal || result.TurnsCompleted != 1 || result.Error != nil {
+				t.Errorf("RunWorkerAttempt(max_turns %d) = exit %q, turns %d, error %v, want normal exit after 1 turn", maxTurns, result.ExitKind, result.TurnsCompleted, result.Error)
+			}
+		})
+	}
 
 	t.Run("panic_with_turns_completed", func(t *testing.T) {
 		t.Parallel()
@@ -2542,52 +2564,65 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 func TestRunWorkerAttempt_ObservedIssueStatePropagated(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	cfg := defaultWorkerConfig(tmpDir)
-	cfg.Agent.MaxTurns = 5
+	tests := []struct {
+		name       string
+		refresh    func(call int64) string
+		wantTurns  int
+		wantStated string
+	}{
+		{name: "a stated refresh is observed", refresh: func(int64) string { return "Done" }, wantTurns: 1, wantStated: "Done"},
+		{
+			name:       "an empty refresh keeps the last stated state and the turn loop running",
+			refresh:    func(call int64) string { return map[int64]string{1: "To Do"}[call] },
+			wantTurns:  3,
+			wantStated: "To Do",
+		},
+	}
 
-	var turnCount atomic.Int64
-	tracker := &mockTrackerAdapter{
-		fetchStatesFn: func(_ context.Context, ids []string) (map[string]string, error) {
-			turn := turnCount.Load()
-			result := make(map[string]string, len(ids))
-			for _, id := range ids {
-				if turn >= 1 {
-					result[id] = "Done"
-				} else {
-					result[id] = "To Do"
-				}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := defaultWorkerConfig(t.TempDir())
+			cfg.Agent.MaxTurns = 3
+
+			var refreshes atomic.Int64
+			tracker := &mockTrackerAdapter{
+				fetchStatesFn: func(_ context.Context, ids []string) (map[string]string, error) {
+					return map[string]string{ids[0]: tt.refresh(refreshes.Add(1))}, nil
+				},
 			}
-			return result, nil
-		},
-	}
-	ec := newExitCapture()
-	deps := WorkerDeps{
-		TrackerAdapter: tracker,
-		AgentAdapter: &mockAgentAdapter{
-			runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-				turnCount.Add(1)
-				if params.OnEvent != nil {
-					params.OnEvent(domain.AgentEvent{Type: domain.EventNotification, Timestamp: time.Now().UTC()})
-				}
-				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
-			},
-		},
-		ConfigFunc:             func() config.ServiceConfig { return cfg },
-		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
-		OnEvent:                func(_ string, _ domain.AgentEvent) {},
-		OnExit:                 ec.onExit,
-		Logger:                 discardLogger(),
-	}
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter: tracker,
+				AgentAdapter: &mockAgentAdapter{
+					runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+						if params.OnEvent != nil {
+							params.OnEvent(domain.AgentEvent{Type: domain.EventNotification, Timestamp: time.Now().UTC()})
+						}
+						return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+					},
+				},
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				Logger:                 discardLogger(),
+			}
 
-	RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-	result := ec.waitResult(t)
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+			result := ec.waitResult(t)
 
-	if result.ExitKind != WorkerExitNormal {
-		t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-	}
-	if result.ObservedIssueState != "Done" {
-		t.Errorf("ObservedIssueState = %q, want %q", result.ObservedIssueState, "Done")
+			if result.ExitKind != WorkerExitNormal {
+				t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+			}
+			if result.TurnsCompleted != tt.wantTurns {
+				t.Errorf("TurnsCompleted = %d, want %d", result.TurnsCompleted, tt.wantTurns)
+			}
+			if result.ObservedIssueState != tt.wantStated {
+				t.Errorf("ObservedIssueState = %q, want %q", result.ObservedIssueState, tt.wantStated)
+			}
+		})
 	}
 }
 
@@ -3823,6 +3858,7 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 				},
 			},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			AgentSettings:          config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: "mock"}, ""),
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
 			OnExit:                 ec.onExit,
@@ -3882,6 +3918,7 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 				},
 			},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			AgentSettings:          config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: "mock"}, ""),
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
 			OnExit:                 ec.onExit,
@@ -3971,6 +4008,7 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 				},
 			},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
+			AgentSettings:          config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: "codex"}, workflowDir),
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
 			OnExit:                 ec.onExit,
@@ -4025,38 +4063,34 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("relative_operator_path_resolved_from_workflow_dir", func(t *testing.T) {
+	t.Run("agent_settings_reach_both_sessions_and_the_mcp_config", func(t *testing.T) {
 		t.Parallel()
 
 		workflowDir := t.TempDir()
-		workspaceTmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(workspaceTmpDir)
+		cfg := defaultWorkerConfig(t.TempDir())
 		cfg.Agent.MaxTurns = 1
 
-		relName := "op.json"
-		opData, _ := json.Marshal(map[string]any{
-			"mcpServers": map[string]any{
-				"relative-tool": map[string]any{"type": "stdio", "command": "/bin/rel"},
-			},
-		})
-		if err := os.WriteFile(filepath.Join(workflowDir, relName), opData, 0o600); err != nil {
-			t.Fatalf("WriteFile: %v", err)
+		suppliedPath := filepath.Join(workflowDir, "supplied-mcp.json")
+		configPath := filepath.Join(workflowDir, "config-mcp.json")
+		for path, marker := range map[string]string{suppliedPath: "supplied-marker", configPath: "config-marker"} {
+			body := `{"mcpServers": {"` + marker + `": {"type": "stdio", "command": "/bin/x"}}}`
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("WriteFile %s: %v", path, err)
+			}
 		}
+		cfg.SetExtensionSection("mock", map[string]any{"model": "from-config-func", "mcp_config": configPath})
 
-		// Relative path, worker must resolve it via filepath.Dir(WorkflowPath).
-		cfg.SetExtensionSection("mock", map[string]any{"mcp_config": relName})
-
-		var capturedMCPConfigPath atomic.Value
+		settings := config.AgentSettings{
+			Kind:          "mock",
+			Passthrough:   map[string]any{"model": "from-attempt-settings"},
+			MCPConfigPath: suppliedPath,
+		}
+		adapter := &startParamsRecorder{}
 		ec := newExitCapture()
-
 		deps := WorkerDeps{
-			TrackerAdapter: &mockTrackerAdapter{},
-			AgentAdapter: &mockAgentAdapter{
-				startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-					capturedMCPConfigPath.Store(params.MCPConfigPath)
-					return domain.Session{ID: "sess-1"}, nil
-				},
-			},
+			TrackerAdapter:         &mockTrackerAdapter{},
+			AgentAdapter:           adapter,
+			AgentSettings:          settings,
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
@@ -4071,139 +4105,25 @@ func TestRunWorkerAttempt_MCPConfig(t *testing.T) {
 		if result.ExitKind != WorkerExitNormal {
 			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
 		}
-
-		mcpPath, _ := capturedMCPConfigPath.Load().(string)
-		rawData, err := os.ReadFile(mcpPath)
-		if err != nil {
-			t.Fatalf("ReadFile(%q): %v", mcpPath, err)
-		}
-		var merged map[string]any
-		if err := json.Unmarshal(rawData, &merged); err != nil {
-			t.Fatalf("Unmarshal mcp.json: %v", err)
-		}
-		servers, _ := merged["mcpServers"].(map[string]any)
-		if _, ok := servers["relative-tool"]; !ok {
-			t.Errorf("relative-tool missing from merged config: relative operator path was not resolved from workflow dir")
-		}
-	})
-
-	// Hot-reload seam: the kind freezes at dispatch, but the settings it
-	// selects MUST be re-resolved through deps.ConfigFunc() on every
-	// attempt, never cached across attempts. A ConfigFunc that returns a
-	// different mcp_config on its second call simulates a workflow
-	// reloaded between two attempts of the same claim.
-	t.Run("settings_reresolve_per_attempt_through_config_func", func(t *testing.T) {
-		t.Parallel()
-
-		workflowDir := t.TempDir()
-		workspaceTmpDir := t.TempDir()
-
-		firstOperatorPath := filepath.Join(workflowDir, "first-mcp.json")
-		firstData, err := json.Marshal(map[string]any{
-			"mcpServers": map[string]any{
-				"first-attempt-marker": map[string]any{"type": "stdio", "command": "/bin/first"},
-			},
-		})
-		if err != nil {
-			t.Fatalf("Marshal first operator config: %v", err)
-		}
-		if err := os.WriteFile(firstOperatorPath, firstData, 0o600); err != nil {
-			t.Fatalf("WriteFile first operator config: %v", err)
-		}
-
-		secondOperatorPath := filepath.Join(workflowDir, "second-mcp.json")
-		secondData, err := json.Marshal(map[string]any{
-			"mcpServers": map[string]any{
-				"second-attempt-marker": map[string]any{"type": "stdio", "command": "/bin/second"},
-			},
-		})
-		if err != nil {
-			t.Fatalf("Marshal second operator config: %v", err)
-		}
-		if err := os.WriteFile(secondOperatorPath, secondData, 0o600); err != nil {
-			t.Fatalf("WriteFile second operator config: %v", err)
-		}
-
-		var configCalls atomic.Int32
-		configFunc := func() config.ServiceConfig {
-			cfg := defaultWorkerConfig(workspaceTmpDir)
-			cfg.Agent.MaxTurns = 1
-			operatorPath := firstOperatorPath
-			if configCalls.Add(1) > 1 {
-				operatorPath = secondOperatorPath
+		var verification, working int
+		for _, params := range adapter.recorded() {
+			if got := params.Settings["model"]; got != "from-attempt-settings" {
+				t.Errorf("StartSession(CredentialVerification=%v).Settings[model] = %v, want %q", params.CredentialVerification, got, "from-attempt-settings")
 			}
-			cfg.SetExtensionSection("mock", map[string]any{"mcp_config": operatorPath})
-			return cfg
+			if params.CredentialVerification {
+				verification++
+				continue
+			}
+			working++
+			servers := readWorkerTestMCPServers(t, params.MCPConfigPath)
+			_, hasSupplied := servers["supplied-marker"]
+			_, hasConfig := servers["config-marker"]
+			if !hasSupplied || hasConfig {
+				t.Errorf("generated config has supplied-marker, config-marker = %v, %v, want true, false: the operator path of AgentSettings.MCPConfigPath, never re-resolved from ConfigFunc", hasSupplied, hasConfig)
+			}
 		}
-
-		deps := WorkerDeps{
-			TrackerAdapter:         &mockTrackerAdapter{},
-			ConfigFunc:             configFunc,
-			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
-			OnEvent:                func(_ string, _ domain.AgentEvent) {},
-			Logger:                 discardLogger(),
-			WorkflowPath:           filepath.Join(workflowDir, "WORKFLOW.md"),
-		}
-
-		var firstCapturedPath atomic.Value
-		firstEC := newExitCapture()
-		deps.AgentAdapter = &mockAgentAdapter{
-			startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-				firstCapturedPath.Store(params.MCPConfigPath)
-				return domain.Session{ID: "sess-1"}, nil
-			},
-		}
-		deps.OnExit = firstEC.onExit
-
-		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-		firstResult := firstEC.waitResult(t)
-		if firstResult.ExitKind != WorkerExitNormal {
-			t.Fatalf("first attempt ExitKind = %q, want %q", firstResult.ExitKind, WorkerExitNormal)
-		}
-
-		firstPath, _ := firstCapturedPath.Load().(string)
-		if firstPath == "" {
-			t.Fatal("first attempt: MCPConfigPath is empty")
-		}
-		firstServers := readWorkerTestMCPServers(t, firstPath)
-		if _, ok := firstServers["first-attempt-marker"]; !ok {
-			t.Error("first attempt: first-attempt-marker missing, want present (ConfigFunc's first-call value)")
-		}
-		if _, ok := firstServers["second-attempt-marker"]; ok {
-			t.Error("first attempt: second-attempt-marker present, want absent")
-		}
-
-		attempt := 2
-		var secondCapturedPath atomic.Value
-		secondEC := newExitCapture()
-		deps.AgentAdapter = &mockAgentAdapter{
-			startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-				secondCapturedPath.Store(params.MCPConfigPath)
-				return domain.Session{ID: "sess-2"}, nil
-			},
-		}
-		deps.OnExit = secondEC.onExit
-
-		RunWorkerAttempt(context.Background(), workerTestIssue(), &attempt, deps)
-		secondResult := secondEC.waitResult(t)
-		if secondResult.ExitKind != WorkerExitNormal {
-			t.Fatalf("second attempt ExitKind = %q, want %q", secondResult.ExitKind, WorkerExitNormal)
-		}
-
-		secondPath, _ := secondCapturedPath.Load().(string)
-		if secondPath == "" {
-			t.Fatal("second attempt: MCPConfigPath is empty")
-		}
-		secondServers := readWorkerTestMCPServers(t, secondPath)
-		if _, ok := secondServers["second-attempt-marker"]; !ok {
-			t.Error("second attempt: second-attempt-marker missing, want present (ConfigFunc's second-call value, proving settings re-resolve per attempt)")
-		}
-		if _, ok := secondServers["first-attempt-marker"]; ok {
-			t.Error("second attempt: first-attempt-marker present, want absent (stale value from the first attempt must not survive)")
-		}
-
-		if got := configCalls.Load(); got < 2 {
-			t.Errorf("ConfigFunc call count = %d, want at least 2", got)
+		if verification != 1 || working != 1 {
+			t.Errorf("StartSession calls = %d verification, %d working, want 1 of each", verification, working)
 		}
 	})
 
@@ -5386,6 +5306,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5443,6 +5364,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 				deps := WorkerDeps{
 					TrackerAdapter:         tracker,
+					Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 					AgentAdapter:           &mockAgentAdapter{},
 					AgentKind:              kind,
 					ConfigFunc:             func() config.ServiceConfig { return cfg },
@@ -5479,6 +5401,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5523,6 +5446,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5572,6 +5496,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5604,6 +5529,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5636,6 +5562,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 		deps := WorkerDeps{
 			TrackerAdapter:         tracker,
+			Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 			AgentAdapter:           &mockAgentAdapter{},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -5673,6 +5600,7 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 
 				deps := WorkerDeps{
 					TrackerAdapter:         tracker,
+					Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 					AgentAdapter:           &mockAgentAdapter{},
 					ConfigFunc:             func() config.ServiceConfig { return cfg },
 					PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
@@ -6626,6 +6554,7 @@ func TestRunWorkerAttempt_ReadOnly_SuppressesDispatchComment(t *testing.T) {
 	ec := newExitCapture()
 	deps := WorkerDeps{
 		TrackerAdapter:         tracker,
+		Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 		AgentAdapter:           &mockAgentAdapter{},
 		ConfigFunc:             func() config.ServiceConfig { return cfg },
 		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
@@ -6803,6 +6732,7 @@ func TestRunWorkerAttempt_NormalDispatchUnaffected(t *testing.T) {
 	ec := newExitCapture()
 	deps := WorkerDeps{
 		TrackerAdapter:         tracker,
+		Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 		AgentAdapter:           &mockAgentAdapter{},
 		ConfigFunc:             func() config.ServiceConfig { return cfg },
 		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
@@ -6970,6 +6900,7 @@ func TestRunWorkerAttempt_Fix_SuppressesDispatchComment(t *testing.T) {
 	ec := newExitCapture()
 	deps := WorkerDeps{
 		TrackerAdapter:         tracker,
+		Router:                 routerWithComments(tracker, cfg.Tracker.Comments),
 		AgentAdapter:           &mockAgentAdapter{},
 		ConfigFunc:             func() config.ServiceConfig { return cfg },
 		PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
@@ -8610,7 +8541,7 @@ func TestRunWorkerAttempt_SelfReviewTurnTimeoutFailsAttempt(t *testing.T) {
 	tracker := &mockTrackerAdapter{}
 	state := exitStateWithIssue(t, result.IssueID, "To Do")
 	params := handoffEvidenceExitParams(t, store, tracker, &domain.NoopMetrics{})
-	params.CommentsConfig.OnFailure = true
+	params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 
 	HandleWorkerExit(state, result, params)
 	state.TrackerOpsWg.Wait()
@@ -8747,34 +8678,69 @@ func TestRunWorkerAttempt_TurnTimeoutBoundIsAttemptStartSnapshot(t *testing.T) {
 	}
 }
 
-func TestRunBoundedTurn_ExpiryWithNilAdapterError(t *testing.T) {
+func TestRunBoundedTurn_ExpiryOutcomes(t *testing.T) {
 	t.Parallel()
 
-	adapter := &mockAgentAdapter{
-		runTurnFn: func(ctx context.Context, _ domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
-			<-ctx.Done()
-			return domain.TurnResult{}, nil
+	tests := []struct {
+		name           string
+		result         domain.TurnResult
+		wantTimeout    bool
+		wantExitReason domain.AgentEventType
+	}{
+		{
+			name:           "a cancellation reported with a nil error is turn_timeout",
+			result:         domain.TurnResult{ExitReason: domain.EventTurnCancelled},
+			wantTimeout:    true,
+			wantExitReason: domain.EventTurnCancelled,
+		},
+		{
+			name:           "a completed turn delivered after the deadline stands",
+			result:         domain.TurnResult{ExitReason: domain.EventTurnCompleted},
+			wantTimeout:    false,
+			wantExitReason: domain.EventTurnCompleted,
 		},
 	}
 
-	_, err := runBoundedTurn(
-		context.Background(),
-		adapter,
-		domain.Session{ID: "sess"},
-		domain.RunTurnParams{},
-		50,
-		discardLogger(),
-	)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) {
-		t.Fatalf("err = %v (%T), want *domain.AgentError", err, err)
-	}
-	if agentErr.Kind != domain.ErrTurnTimeout {
-		t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnTimeout)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want the deadline substituted as the wrapped cause", err)
+			adapter := &mockAgentAdapter{
+				runTurnFn: func(ctx context.Context, _ domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
+					<-ctx.Done()
+					return tt.result, nil
+				},
+			}
+
+			result, err := runBoundedTurn(
+				context.Background(),
+				adapter,
+				domain.Session{ID: "sess"},
+				domain.RunTurnParams{},
+				50,
+				discardLogger(),
+			)
+
+			if !tt.wantTimeout {
+				if err != nil {
+					t.Fatalf("runBoundedTurn() error = %v, want nil", err)
+				}
+				if result.ExitReason != tt.wantExitReason {
+					t.Errorf("TurnResult.ExitReason = %q, want %q", result.ExitReason, tt.wantExitReason)
+				}
+				return
+			}
+			var agentErr *domain.AgentError
+			if !errors.As(err, &agentErr) {
+				t.Fatalf("err = %v (%T), want *domain.AgentError", err, err)
+			}
+			if agentErr.Kind != domain.ErrTurnTimeout {
+				t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnTimeout)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want the deadline substituted as the wrapped cause", err)
+			}
+		})
 	}
 }
 
@@ -9571,7 +9537,7 @@ func TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone(t *testing.T) 
 			},
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 		ctx := t.Context()
 
 		workerDone := make(chan struct{})
@@ -9626,7 +9592,7 @@ func TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone(t *testing.T) 
 			},
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 		ctx, cancel := context.WithCancel(context.Background())
 
 		workerDone := make(chan struct{})
@@ -9840,4 +9806,167 @@ func TestRunWorkerAttempt_SelfReviewTurnResultsCountUnaccountedSpend(t *testing.
 			t.Errorf("WorkerResult.Usage = %+v, want %+v", result.Usage, figureF)
 		}
 	})
+}
+
+func TestRenderFirstTurnPrompt(t *testing.T) {
+	t.Parallel()
+
+	reviewSeed := map[string]any{reviewCommentsKey: buildReviewTemplateMap([]domain.ReviewComment{summaryComment("a"), inlineComment("b")})}
+	botSeed := map[string]any{botReviewCommentsKey: buildReviewTemplateMap([]domain.ReviewComment{summaryComment("x")})}
+	bothSeed := map[string]any{
+		reviewCommentsKey:    reviewSeed[reviewCommentsKey],
+		botReviewCommentsKey: botSeed[botReviewCommentsKey],
+	}
+	const (
+		elseIfTemplate    = "task\n{{ if .review_comments }}R\n{{ else if .bot_review_comments }}B\n{{ end }}"
+		modeSwitch        = "{{ if .review_comments }}Fix the comments{{ else }}Do the task{{ end }}\n"
+		failsWhenSeeded   = "task\n{{ if .review_comments }}{{ index .review_comments 99 }}{{ end }}\n"
+		attemptOnlyBlock  = "task\n{{ if .attempt }}{{ range .review_comments }}{{ .id }}{{ end }}{{ end }}\n"
+		unreferenced      = "Resolve {{ .issue.identifier }}.\n"
+		failsAlways       = "{{ .issue.no_such_field }}\n"
+		referenceTemplate = commentsPromptTemplate
+	)
+
+	tests := []struct {
+		name          string
+		body          string
+		attempt       int
+		continuation  map[string]any
+		freshRun      bool
+		wantPresented map[string][]string
+		wantRender    string
+		wantContains  string
+		wantErr       bool
+	}{
+		{
+			name:          "the added block presents review IDs on a continuation",
+			body:          referenceTemplate,
+			continuation:  reviewSeed,
+			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
+			wantContains:  "- a",
+		},
+		{
+			name:          "the added block presents bot-review IDs on a continuation",
+			body:          referenceTemplate,
+			continuation:  botSeed,
+			wantPresented: map[string][]string{ReactionKindBotReview: {"x"}},
+			wantContains:  "- x",
+		},
+		{
+			name:          "the added block presents both kinds on a fresh run",
+			body:          referenceTemplate,
+			continuation:  bothSeed,
+			freshRun:      true,
+			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}, ReactionKindBotReview: {"x"}},
+			wantContains:  "- x",
+		},
+		{
+			name:         "a template that never references the key presents nothing on a continuation",
+			body:         unreferenced,
+			continuation: reviewSeed,
+			wantRender:   "Resolve ISS-1.\n",
+		},
+		{
+			name:         "a template that never references the key presents nothing on a fresh run",
+			body:         unreferenced,
+			continuation: reviewSeed,
+			freshRun:     true,
+			wantRender:   "Resolve ISS-1.\n",
+		},
+		{
+			name:         "a reference only inside an attempt block presents nothing on a first attempt",
+			body:         attemptOnlyBlock,
+			continuation: reviewSeed,
+			freshRun:     true,
+			wantRender:   "task\n\n",
+		},
+		{
+			name:          "a reference behind the other kind's else-if presents only the shadowing kind",
+			body:          elseIfTemplate,
+			continuation:  bothSeed,
+			freshRun:      true,
+			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
+			wantRender:    "task\nR\n",
+		},
+		{
+			name:         "a fresh run whose seeded render drops a line gets the unseeded render",
+			body:         modeSwitch,
+			continuation: reviewSeed,
+			freshRun:     true,
+			wantRender:   "Do the task\n",
+		},
+		{
+			name:         "a fresh run whose seeded render fails gets the unseeded render",
+			body:         failsWhenSeeded,
+			continuation: reviewSeed,
+			freshRun:     true,
+			wantRender:   "task\n\n",
+		},
+		{
+			name:          "a continuation keeps a render that drops a line",
+			body:          modeSwitch,
+			continuation:  reviewSeed,
+			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
+			wantRender:    "Fix the comments\n",
+		},
+		{
+			name:         "a continuation whose render fails returns the error",
+			body:         failsWhenSeeded,
+			continuation: reviewSeed,
+			wantErr:      true,
+		},
+		{
+			name:         "a fresh run whose unseeded render fails returns the error",
+			body:         failsAlways,
+			continuation: reviewSeed,
+			freshRun:     true,
+			wantErr:      true,
+		},
+		{
+			name:         "no continuation renders the template alone",
+			body:         referenceTemplate,
+			freshRun:     true,
+			wantContains: "Resolve ISS-1.",
+		},
+		{
+			name:     "no continuation returns the render error",
+			body:     failsAlways,
+			freshRun: true,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpl := mustParseTemplate(t, tt.body)
+			issue := domain.Issue{ID: "1", Identifier: "ISS-1"}
+
+			rendered, presented, err := renderFirstTurnPrompt(tmpl, issue.ToTemplateMap(), tt.attempt, 3, tt.continuation, tt.freshRun)
+
+			if tt.wantErr {
+				var templateErr *prompt.TemplateError
+				if !errors.As(err, &templateErr) || templateErr.Kind != prompt.ErrTemplateRender {
+					t.Fatalf("renderFirstTurnPrompt() error = %v, want a render *prompt.TemplateError", err)
+				}
+				if rendered != "" || presented != nil {
+					t.Errorf("renderFirstTurnPrompt() = %q, %v on error, want empty", rendered, presented)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("renderFirstTurnPrompt() error = %v, want nil", err)
+			}
+			if !maps.EqualFunc(presented, tt.wantPresented, slices.Equal) {
+				t.Errorf("renderFirstTurnPrompt() presented = %v, want %v", presented, tt.wantPresented)
+			}
+			if tt.wantRender != "" && rendered != tt.wantRender {
+				t.Errorf("renderFirstTurnPrompt() rendered = %q, want %q", rendered, tt.wantRender)
+			}
+			if tt.wantContains != "" && !strings.Contains(rendered, tt.wantContains) {
+				t.Errorf("renderFirstTurnPrompt() rendered = %q, want it to contain %q", rendered, tt.wantContains)
+			}
+		})
+	}
 }

@@ -37,7 +37,9 @@ cat >"$tmp/bin/gh" <<'EOF'
 } >>"$GH_ARGV_LOG"
 case "$*" in
 *'/actions/runs/42 --jq .workflow_id') printf '%s\n' 7 ;;
-*'/actions/workflows/7/runs?'*) printf '%s\n' '{"workflow_runs":[]}' ;;
+*'/actions/workflows/7/runs?'*) printf '%s\n' "$GH_RUNS_JSON" ;;
+*'/actions/runs/101/jobs?'*) printf '%s\n' '{"name":"Integration: Example","conclusion":"skipped"}' ;;
+*'/actions/runs/102/jobs?'*) printf '%s\n' '{"name":"Integration: Example","conclusion":"failure"}' ;;
 *'/issues?state=all&labels=ci-nightly'*) printf '%s\n' "$GH_ISSUES_JSON" ;;
 'label create'*) exit 0 ;;
 *' --jq .node_id')
@@ -49,7 +51,7 @@ case "$*" in
 	;;
 *'createIssue'*) printf '%s\n' 555 ;;
 *'updateIssue'*) exit 0 ;;
-'issue comment'* | 'issue close'* | 'issue reopen'* | 'issue edit'*) exit 0 ;;
+'issue comment'* | 'issue close'* | 'issue reopen'* | 'issue edit'*) exit "${GH_FAIL_MUTATION:-0}" ;;
 *)
 	printf 'unexpected gh call: %s\n' "$*" >&2
 	exit 1
@@ -60,7 +62,8 @@ chmod +x "$tmp/bin/gh"
 
 cat >"$tmp/bin/nite" <<'EOF'
 #!/bin/sh
-cat >/dev/null
+cat >"${NITE_INPUT_LOG:-/dev/null}"
+[ "${NITE_FAIL:-0}" -eq 0 ] || exit 1
 printf '{"action":"%s","body":"%s","summary":"summary","annotation":""}\n' "$NITE_FORCE_ACTION" "$NITE_FORCE_BODY"
 EOF
 chmod +x "$tmp/bin/nite"
@@ -72,19 +75,31 @@ run_revision() {
 	: >"$_gh_log"
 	: >"$_bodies_log"
 	: >"$tmp/summary"
+	rm -f "$tmp/report/summary.md" "$tmp/report/decision.json"
 	PATH="$tmp/bin:$PATH" \
 		GH_TOKEN=test RUN_HISTORY_TOKEN=test GH_REPO=sortie-ai/sortie \
 		NITE_BIN="$tmp/bin/nite" \
+		NITE_REPORT_DIR="$tmp/report" \
 		ADAPTER=example ADAPTER_NAME=Example KIND=agent SOURCE=test ADAPTER_VERSION=1.0 \
 		TEST_ISSUE_TYPE_ID=IT_test JOB_NAME='Integration: Example' OUTCOME=success DEFAULT_BRANCH=main \
 		GITHUB_REPOSITORY=sortie-ai/sortie GITHUB_RUN_ID=42 GITHUB_SERVER_URL=https://github.com \
 		GITHUB_SHA=deadbeef GITHUB_STEP_SUMMARY="$tmp/summary" \
 		GH_ARGV_LOG="$_gh_log" GH_BODIES_LOG="$_bodies_log" \
 		GH_ISSUES_JSON="$ISSUES_JSON" \
+		GH_RUNS_JSON="${RUNS_JSON:-$no_runs}" \
+		NITE_INPUT_LOG="$tmp/nite.in" \
+		FORMER_ADAPTER_NAME="${FORMER_ADAPTER_NAME:-}" \
+		GH_FAIL_MUTATION="${GH_FAIL_MUTATION:-0}" \
+		NITE_FAIL="${NITE_FAIL:-0}" \
 		NITE_FORCE_ACTION="$NITE_FORCE_ACTION" NITE_FORCE_BODY="canned incident body" \
-		"$_script" decide
+		"$_script" decide >"$tmp/stdout"
 
-	[ "$(cat "$tmp/summary")" = summary ] || fail "${_script} decide (action ${NITE_FORCE_ACTION}) did not carry out the NITE decision: $(cat "$tmp/summary")"
+	if [ "${NITE_FAIL:-0}" -eq 0 ]; then
+		grep -qx summary "$tmp/summary" || fail "job summary was not saved"
+		grep -qx summary "$tmp/stdout" || fail "summary was not printed to the job log"
+		grep -qx summary "$tmp/report/summary.md" || fail "report summary was not saved"
+		[ "$(jq -r .action "$tmp/report/decision.json")" = "$NITE_FORCE_ACTION" ] || fail "report decision was not saved"
+	fi
 }
 
 check_action() {
@@ -103,6 +118,7 @@ check_action() {
 title_row='Nightly integration failure: Example'
 open_row=$(printf '[{"number":99,"state":"open","title":"%s","pull_request":null}]' "$title_row")
 closed_row=$(printf '[{"number":99,"state":"closed","title":"%s","pull_request":null}]' "$title_row")
+no_runs='{"workflow_runs":[]}'
 
 check_action open '[]' open
 check_action comment "$open_row" comment
@@ -111,3 +127,54 @@ check_action reopen "$closed_row" reopen
 check_action none '[]' none
 
 grep -q '=== call ===' "$tmp/gh.log" || fail "no gh calls were recorded for the none action"
+
+former_name='Example Renamed'
+former_row=$(printf '[{"number":99,"state":"open","title":"Nightly integration failure: %s","pull_request":null}]' "$former_name")
+both_rows=$(printf '[{"number":99,"state":"open","title":"Nightly integration failure: %s","pull_request":null},{"number":120,"state":"open","title":"%s","pull_request":null}]' "$former_name" "$title_row")
+
+incident_sent_to_nite() {
+	jq -r '"\(.incident_state) \(.incident_number)"' "$tmp/nite.in"
+}
+
+FORMER_ADAPTER_NAME=$former_name
+check_action close "$former_row" close
+
+ISSUES_JSON=$both_rows
+NITE_FORCE_ACTION=none
+run_revision "$SCRIPT" "$tmp/gh.log" "$tmp/bodies.log"
+[ "$(incident_sent_to_nite)" = 'open 120' ] || fail "highest-numbered incident did not win across the current and former titles: $(incident_sent_to_nite)"
+
+FORMER_ADAPTER_NAME=
+ISSUES_JSON=$former_row
+run_revision "$SCRIPT" "$tmp/gh.log" "$tmp/bodies.log"
+[ "$(incident_sent_to_nite)" = 'absent 0' ] || fail "former-title incident matched without FORMER_ADAPTER_NAME: $(incident_sent_to_nite)"
+
+RUNS_JSON='{"workflow_runs":[{"id":101,"html_url":"u101"},{"id":102,"html_url":"u102"}]}'
+run_revision "$SCRIPT" "$tmp/gh.log" "$tmp/bodies.log"
+[ "$(jq -c '[.history_read, .history]' "$tmp/nite.in")" = '[true,[{"run_id":102,"run_url":"u102","conclusion":"failure"}]]' ] ||
+	fail "a prior job without a verdict was not passed over in history"
+RUNS_JSON=
+
+GH_FAIL_MUTATION=1
+ISSUES_JSON=$open_row
+NITE_FORCE_ACTION=comment
+run_revision "$SCRIPT" "$tmp/gh.log" "$tmp/bodies.log"
+grep -q 'Incident action did not complete' "$tmp/report/summary.md" || fail "incident failure was not recorded in the artifact"
+grep -q '^::error::' "$tmp/stdout" || fail "incident failure was not annotated"
+for output in "$tmp/stdout" "$tmp/summary" "$tmp/report/summary.md"; do
+	grep -q 'Incident action did not complete; the NITE decision was persisted' "$output" || fail "mutation failure was misreported in $output"
+	if grep -q 'no NITE decision' "$output"; then
+		fail "persisted decision was reported as missing in $output"
+	fi
+done
+
+NITE_FAIL=1
+run_revision "$SCRIPT" "$tmp/gh.log" "$tmp/bodies.log"
+for output in "$tmp/stdout" "$tmp/summary"; do
+	grep -q 'No NITE decision was persisted' "$output" || fail "missing decision was misreported in $output"
+done
+[ ! -f "$tmp/report/decision.json" ] || fail "failed monitor left a decision artifact"
+[ ! -f "$tmp/report/summary.md" ] || fail "failed monitor left a summary artifact"
+if grep -qx issue "$tmp/gh.log"; then
+	fail "failed monitor attempted an incident mutation"
+fi

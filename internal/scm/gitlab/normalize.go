@@ -2,7 +2,6 @@ package gitlab
 
 import (
 	"encoding/json"
-	"log/slog"
 	"strconv"
 
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -24,6 +23,12 @@ type gitlabIssue struct {
 	References  gitlabReferences `json:"references"`
 	CreatedAt   string           `json:"created_at"`
 	UpdatedAt   string           `json:"updated_at"`
+}
+
+// isClosed reports whether the issue's native status is closed. GitLab spells
+// open as "opened"; every status other than "closed" reads as open.
+func (gi gitlabIssue) isClosed() bool {
+	return gi.State == "closed"
 }
 
 // gitlabReferences carries the qualified display forms GitLab computes for
@@ -106,11 +111,12 @@ type gitlabErrorBody struct {
 // are both the decimal iid; the instance-global id is never read.
 // DisplayID falls back to "<project>#<iid>" when the server-provided
 // reference is empty. Priority, Parent, and BranchName are always nil,
-// nil, and empty; BlockedBy is a non-nil empty slice.
+// nil, and empty; BlockedBy is a non-nil empty slice. State is the model's
+// reading of the labels and the closed status under s.
 //
 // Comments is left nil; callers that fetch comments assign them
 // afterwards.
-func normalizeIssue(gi gitlabIssue, project string, activeStates, terminalStates []string, handoffState string, log *slog.Logger) domain.Issue {
+func normalizeIssue(gi gitlabIssue, project string, model *issuekit.LabelStateModel, s issuekit.LabelStates) domain.Issue {
 	iid := strconv.Itoa(gi.IID)
 
 	displayID := gi.References.Full
@@ -129,15 +135,14 @@ func normalizeIssue(gi gitlabIssue, project string, activeStates, terminalStates
 		DisplayID:   displayID,
 		Title:       gi.Title,
 		Description: gi.Description,
-		State: issuekit.DeriveLabelState(gi.Labels, gi.State, "opened", "closed",
-			issuekit.LabelStates{Active: activeStates, Terminal: terminalStates, Handoff: handoffState}, iid, log),
-		URL:       gi.WebURL,
-		Labels:    issuekit.NormalizeLabels(gi.Labels),
-		Assignee:  assignee,
-		IssueType: gi.IssueType,
-		BlockedBy: []domain.BlockerRef{},
-		CreatedAt: gi.CreatedAt,
-		UpdatedAt: gi.UpdatedAt,
+		State:       model.Derive(s, iid, gi.Labels, gi.isClosed()),
+		URL:         gi.WebURL,
+		Labels:      issuekit.NormalizeLabels(gi.Labels),
+		Assignee:    assignee,
+		IssueType:   gi.IssueType,
+		BlockedBy:   []domain.BlockerRef{},
+		CreatedAt:   gi.CreatedAt,
+		UpdatedAt:   gi.UpdatedAt,
 	}
 }
 

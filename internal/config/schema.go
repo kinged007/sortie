@@ -15,13 +15,14 @@ import (
 type FieldType int
 
 const (
-	FieldString      FieldType = iota + 1 // string scalar
-	FieldInt                              // integer (or string-encoded integer)
-	FieldBool                             // boolean
-	FieldStringList                       // []string (YAML sequence)
-	FieldMap                              // map[string]any (YAML mapping)
-	FieldShellScript                      // multiline string (shell script)
-	FieldSequence                         // []any (YAML sequence of maps or scalars)
+	FieldString       FieldType = iota + 1 // string scalar
+	FieldInt                               // integer (or string-encoded integer)
+	FieldBool                              // boolean
+	FieldStringList                        // []string (YAML sequence)
+	FieldMap                               // map[string]any (YAML mapping)
+	FieldShellScript                       // multiline string (shell script)
+	FieldSequence                          // []any (YAML sequence of maps or scalars)
+	FieldStringOrList                      // string scalar or []any (YAML sequence)
 )
 
 // FieldDef describes a single known configuration field within a section.
@@ -86,7 +87,7 @@ var knownFieldsRegistry = map[string]SectionSchema{
 	"agent": {
 		Fields: []FieldDef{
 			{Name: "kind", Type: FieldString},
-			{Name: "command", Type: FieldString},
+			{Name: "command", Type: FieldStringOrList},
 			{Name: "turn_timeout_ms", Type: FieldInt},
 			{Name: "read_timeout_ms", Type: FieldInt},
 			{Name: "stall_timeout_ms", Type: FieldInt},
@@ -101,15 +102,6 @@ var knownFieldsRegistry = map[string]SectionSchema{
 			{Name: "stop_grace_ms", Type: FieldInt},
 		},
 		AllowAdapterPassthrough: true,
-	},
-	"ci_feedback": {
-		Fields: []FieldDef{
-			{Name: "kind", Type: FieldString},
-			{Name: "max_retries", Type: FieldInt},
-			{Name: "max_log_lines", Type: FieldInt},
-			{Name: "escalation", Type: FieldString},
-			{Name: "escalation_label", Type: FieldString},
-		},
 	},
 	"self_review": {
 		Fields: []FieldDef{
@@ -128,33 +120,14 @@ var knownFieldsRegistry = map[string]SectionSchema{
 	"dispatch": {
 		Fields: []FieldDef{
 			{Name: "rules", Type: FieldSequence},
+			{Name: "max_consecutive_hops", Type: FieldInt},
+			{Name: "partials", Type: FieldStringList},
 			{Name: "default", Type: FieldMap, Nested: []FieldDef{
 				{Name: "agent", Type: FieldString},
 				{Name: "template", Type: FieldString},
 			}},
 		},
 	},
-}
-
-// dispatchRuleAllowedKeys lists the recognized per-rule keys for
-// front-matter static analysis. Mirrors [ruleKeyAllowed] in
-// dispatch.go; kept here so schema descent does not import dispatch
-// helpers directly.
-var dispatchRuleAllowedKeys = map[string]bool{
-	"name":     true,
-	"match":    true,
-	"agent":    true,
-	"template": true,
-}
-
-// dispatchMatchAllowedKeys lists the recognized match keys for
-// front-matter static analysis.
-var dispatchMatchAllowedKeys = map[string]bool{
-	"labels":     true,
-	"issue_type": true,
-	"priority":   true,
-	"identifier": true,
-	"assignee":   true,
 }
 
 // staticKnownExtensionKeys lists extension top-level keys defined by
@@ -330,7 +303,7 @@ func ValidateFrontMatter(raw map[string]any, cfg ServiceConfig) []FrontMatterWar
 			// Sequence descent for sections that carry a YAML sequence
 			// of maps (e.g. dispatch.rules).
 			if field.Type == FieldSequence && sectionName == "dispatch" && field.Name == "rules" {
-				warnings = descendDispatchRules(warnings, v)
+				warnings = descendDispatchRules(warnings, v, rawDefaultAgentKind(raw))
 			}
 			// Nested map type checking (e.g. tracker.comments sub-fields).
 			if field.Nested != nil {
@@ -372,7 +345,7 @@ func ValidateFrontMatter(raw map[string]any, cfg ServiceConfig) []FrontMatterWar
 	// snapshot captured during NewServiceConfig. A non-empty resolved
 	// leaf indicates the variable was set; a resolved empty leaf is the
 	// warning trigger.
-	warnings = checkUnresolvedExtensionVars(warnings, cfg)
+	warnings = checkUnresolvedExtensionVars(warnings, cfg, raw)
 	warnings = checkIneffectiveTokenWarningSetting(warnings, cfg)
 
 	return warnings
@@ -401,15 +374,22 @@ func checkIneffectiveTokenWarningSetting(warnings []FrontMatterWarning, cfg Serv
 // "https://$HOST:$PORT/path" still warns about PORT when only HOST is
 // set. Entries whose extracted variable name is empty (e.g. the $$
 // literal) are excluded.
-func checkUnresolvedExtensionVars(warnings []FrontMatterWarning, cfg ServiceConfig) []FrontMatterWarning {
+//
+// A path under dispatch is looked up in raw, where a rule's block lives,
+// because a caller that only validates the front matter has not set
+// cfg.Dispatch.
+func checkUnresolvedExtensionVars(warnings []FrontMatterWarning, cfg ServiceConfig, raw map[string]any) []FrontMatterWarning {
 	if len(cfg.extensionsPreResolution) == 0 {
 		return warnings
 	}
 	paths := maputil.SortedKeys(cfg.extensionsPreResolution)
 	for _, path := range paths {
 		before := cfg.extensionsPreResolution[path]
-		_, ok := lookupExtensionValue(cfg.extensions, path)
-		if !ok {
+		source := cfg.extensions
+		if strings.HasPrefix(path, "dispatch.") {
+			source = raw
+		}
+		if _, ok := lookupExtensionValue(source, path); !ok {
 			continue
 		}
 		unsetNames := extractUnsetExtensionVars(before)
@@ -706,6 +686,12 @@ func typeMatches(v any, ft FieldType) bool {
 	case FieldSequence:
 		_, ok := v.([]any)
 		return ok
+	case FieldStringOrList:
+		switch v.(type) {
+		case string, []any:
+			return true
+		}
+		return false
 	case FieldInt:
 		_, err := coerceInt(v)
 		return err == nil || errors.Is(err, ErrIntegerOutOfRange)
@@ -729,6 +715,8 @@ func typeName(ft FieldType) string {
 		return "map"
 	case FieldSequence:
 		return "sequence"
+	case FieldStringOrList:
+		return "string or list"
 	default:
 		return "unknown"
 	}
@@ -736,8 +724,10 @@ func typeName(ft FieldType) string {
 
 // descendDispatchRules walks the dispatch.rules sequence and emits
 // unknown_sub_key warnings for unrecognized per-rule keys and per-match
-// keys. The sequence shape itself is already type-checked.
-func descendDispatchRules(warnings []FrontMatterWarning, rulesVal any) []FrontMatterWarning {
+// keys. A key naming the rule's agent kind (its agent, else defaultKind)
+// is its settings block and draws none. The sequence shape is already
+// type-checked.
+func descendDispatchRules(warnings []FrontMatterWarning, rulesVal any, defaultKind string) []FrontMatterWarning {
 	seq, ok := rulesVal.([]any)
 	if !ok {
 		return warnings
@@ -748,9 +738,13 @@ func descendDispatchRules(warnings []FrontMatterWarning, rulesVal any) []FrontMa
 			continue
 		}
 		rulePath := fmt.Sprintf("dispatch.rules[%d]", i)
+		ruleKind := defaultKind
+		if own, ok := ruleMap["agent"].(string); ok && own != "" {
+			ruleKind = own
+		}
 		keys := maputil.SortedKeys(ruleMap)
 		for _, key := range keys {
-			if !dispatchRuleAllowedKeys[key] {
+			if !ruleKeyAllowed[key] && key != ruleKind {
 				warnings = append(warnings, FrontMatterWarning{
 					Check:   "unknown_sub_key",
 					Field:   rulePath + "." + key,
@@ -768,7 +762,7 @@ func descendDispatchRules(warnings []FrontMatterWarning, rulesVal any) []FrontMa
 		}
 		matchKeys := maputil.SortedKeys(matchMap)
 		for _, key := range matchKeys {
-			if !dispatchMatchAllowedKeys[key] {
+			if !matchKeyAllowed[key] {
 				warnings = append(warnings, FrontMatterWarning{
 					Check:   "unknown_sub_key",
 					Field:   rulePath + ".match." + key,

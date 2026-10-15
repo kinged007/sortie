@@ -1,6 +1,6 @@
 ## 11C. Auto-merge Reaction Contract
 
-The auto-merge reaction is default-off; enablement requires `reactions.auto_merge.provider` to be non-empty in `WORKFLOW.md`. The merge operation is irreversible: the orchestrator does NOT roll back on partial-failure tail operations (branch delete, tracker comment). The reaction runs after the CI, review-comment, bot-review-comment, and merge-conflict reconcile passes in the tick, so the precondition reads observe the most current per-kind state; it runs before the label-review and label-fix passes, whose relative ordering does not affect correctness because each of those two is fully cross-kind isolated.
+The auto-merge reaction is default-off; enablement requires `reactions.auto_merge.provider` to be non-empty in `WORKFLOW.md`. The merge operation is irreversible: the orchestrator does NOT roll back on partial-failure tail operations (branch delete, success-event delivery). The reaction runs after the CI, review-comment, bot-review-comment, and merge-conflict reconcile passes in the tick, so the precondition reads observe the most current per-kind state; it runs before the label-review and label-fix passes, whose relative ordering does not affect correctness because each of those two is fully cross-kind isolated.
 
 ### 11C.1 SCMAdapter write surface
 
@@ -27,7 +27,7 @@ The auto-merge reaction introduces the following domain types:
 - `MergeStrategy`: merge strategy for `MergePR`. One of `merge`, `squash`, `rebase`.
 - `ReviewDecision`: normalized review status. One of `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NOT_REQUIRED`.
 - `MergeabilityState`: PR mergeability classification. One of `clean`, `unstable`, `blocked`, `dirty`, `unknown` (lowercase string values).
-- `PRMergeStatus`: struct carrying the merge precondition state. Fields: `ReviewDecision`, `CIConclusion`, `Draft` (bool, separate from `Mergeability`), `Mergeability` (`MergeabilityState`), `HeadSHA`, `BranchName`, `BaseBranch` (the PR's target branch, added for merge-conflict detection, §11E.1), `Merged` (bool reporting whether the pull request has merged, added for the post-merge closure reaction, ADR-0017), `MergeCommitSHA` (the merge commit identifier, set only when `Merged` is true, added by the same reaction), and `Closed` (bool reporting whether the provider considers the pull request no longer open, primarily read by the CI reaction, §11A.9). `ReviewDecision` and `CIConclusion` are unset by `GetMergeability`; callers obtain those from dedicated reads.
+- `PRMergeStatus`: struct carrying the merge precondition state. Fields: `ReviewDecision`, `CIConclusion`, `Draft` (bool, separate from `Mergeability`), `Mergeability` (`MergeabilityState`), `HeadSHA`, `BranchName`, `BaseBranch` (the PR's target branch, added for merge-conflict detection, §11E.1), `Merged` (bool reporting whether the pull request has merged, added for the post-merge closure reaction, ADR-0017), `MergeCommitSHA` (the merge commit identifier, set only when `Merged` is true, added by the same reaction), and `Closed` (bool reporting whether the provider considers the pull request no longer open, primarily read by the CI reaction, §11A.9), and `URL` (the pull request's web page as the provider reports it, empty when it reports none; each adapter normalizes its own wire field at its boundary, and the reactions keep the link to show a pending reaction's pull request). `ReviewDecision` and `CIConclusion` are unset by `GetMergeability`; callers obtain those from dedicated reads.
 - `MergeResult`: struct carrying `SHA` (merge commit SHA), `Merged` (bool reporting whether the merge completed), and `Message` (provider-supplied status text). The already-merged case is NOT signaled on this struct; it is signaled via `*SCMError` with kind `ErrSCMConflict` and the substring `already merged` (case-insensitive) in the error message. Callers disambiguate that subcase as documented in §11C.3.
 
 **GitLab caveat.** On GitLab the effective merge strategy is the project's own `merge_method` setting rather than a per-call choice. The adapter always calls the one merge route and never the asynchronous standalone rebase route, so a configured `rebase` performs the operator's intent on a project set to fast-forward or semi-linear history and produces a merge commit on a project set to merge commits. The adapter logs one WARN per merge naming that governance.
@@ -42,7 +42,11 @@ The auto-merge reconcile loop imposes merge-specific dispositions on this kind. 
 
 The auto-merge reconcile loop runs as Part G of active run reconciliation (see §8.5 Part G for the algorithm). The loop processes entries from `pending_reactions` whose kind discriminator is `"merge"`.
 
-The loop drops an entry whose age, measured from the entry's creation, exceeds the configured `reactions.auto_merge.watch_window_ms` (default `1800000`, thirty minutes; `0` removes the bound), and deletes the `merge`-kind attempt counter with it. The drop logs at WARN and performs no escalation, so an entry that never satisfies its preconditions produces no tracker-visible signal.
+The loop drops an entry whose age, measured from the entry's creation, exceeds the configured `reactions.auto_merge.watch_window_ms` (default `1800000`, thirty minutes; `0` removes the bound), and deletes the `merge`-kind attempt counter with it. The drop logs at WARN and performs no escalation, so an entry that never satisfies its preconditions produces no tracker-visible signal. The window never drops an entry whose escalation stands (§11C.6).
+
+The loop also drops an entry whose `GetMergeability` read reports the pull request already merged, whatever its mergeability: a pull request a person or a forge merged first reads `unknown` on some forges, and without this drop the merge call would never run and the entry would live until its watch window ends, or without end under `0`. The drop records the merged outcome with the `merge` path (Section 4.1.8), deletes the `merge`-kind attempt counter and fingerprint, and logs at INFO. It performs no escalation, emits no `auto_merge.merged` event, and deletes no branch.
+
+An entry whose escalation stands is spared by both the window and the token-scope preflight drop (§11C.9). Each due pass still reads the pull request for it, also after the preflight failed: a merged read ends the escalation and drops the entry as the drop above does, and a closed or missing pull request ends the escalation and drops the entry and its attempt counter. No other read changes the entry, and the pass makes no merge call.
 
 There is an intentional asymmetry between the YAML configuration key and the runtime kind value. The YAML key the operator sets in `WORKFLOW.md` is `reactions.auto_merge`. The runtime and persisted kind value used in `pending_reactions` map keys and in the `reaction_fingerprints` table's `kind` column is `"merge"`, not `"auto_merge"`. A reader who only sees the YAML key would expect the runtime kind to be `auto_merge`; it is `merge`.
 
@@ -52,6 +56,7 @@ The auto-merge reconcile loop evaluates the merge preconditions reported by `Get
 
 | From state | Observation | To state | Action |
 |------------|-------------|----------|--------|
+| Pending | `Merged == true` | Done | Record the merged outcome (Section 4.1.8); remove the pending entry; clear the attempt counter and the fingerprint. Emit no event, delete no branch, and increment no metric. |
 | Pending | `Draft == true` | Pending | Re-enqueue with poll interval. |
 | Pending | `Mergeability == dirty` | Pending | Re-enqueue with poll interval. |
 | Pending | `Mergeability == blocked` | Pending | Re-enqueue with poll interval. |
@@ -60,12 +65,16 @@ The auto-merge reconcile loop evaluates the merge preconditions reported by `Get
 | Pending | `ReviewDecision != APPROVED` and `!= NOT_REQUIRED` | Pending | Re-enqueue with poll interval. |
 | Pending | `require_ci == true` and `CI` is neither `success` nor the empty no-checks value | Pending | Re-enqueue with poll interval. |
 | Pending | All preconditions satisfied (`Mergeability` in (`clean`, `unstable`); `!Draft`; review and CI satisfied) | Merging | Call `SCMAdapter.MergePR`. |
-| Merging | Merge succeeded | Done | Post tracker comment; delete branch when `delete_branch == true`; clear fingerprint; increment `sortie_reactions_auto_merge_total{result="merged"}`. |
+| Merging | Merge succeeded | Done | Record the merged outcome (Section 4.1.8); emit the `auto_merge.merged` event, whose body is the merge-success comment, to its subscribers (§11C.6); delete branch when `delete_branch == true`; clear fingerprint; increment `sortie_reactions_auto_merge_total{result="merged"}`. |
 | Merging | `ErrSCMConflict` ("already merged") | Done | Treat as idempotent success; same actions as merge succeeded. |
 | Merging | `ErrSCMConflict` (head SHA mismatch) | Pending | Re-enqueue with poll interval; next tick refreshes fingerprint. |
-| Merging | `ErrSCMAuth` | Escalated | Escalate immediately; do not re-enqueue. |
-| Merging | `ErrSCMPayload` | Escalated | Escalate immediately; do not re-enqueue. |
-| Merging | Other transient error | Pending | Re-enqueue with backoff; escalate on a later tick when `MaxRetries > 0` and the attempt count reaches it (§11C.6). |
+| Merging | `ErrSCMAuth` | Escalated | Escalate immediately with trigger `refused`; the entry stays pending. |
+| Merging | `ErrSCMPayload` | Escalated | Escalate immediately with trigger `refused`; the entry stays pending. |
+| Merging | Other transient error | Pending | Re-enqueue with backoff; escalate with trigger `budget_exhausted` on a later tick when `MaxRetries > 0` and the attempt count reaches it (§11C.6). |
+| Escalated | `Merged == true` | Done | End the escalation; record the merged outcome (Section 4.1.8); remove the pending entry; clear the attempt counter. Emit no event, delete no branch, and increment no metric. |
+| Escalated | Pull request closed or missing | Done | End the escalation; remove the pending entry; clear the attempt counter. |
+| Escalated | Issue leaves `tracker.handoff_state` while Sortie does not drive it | Done | End the escalation; remove the pending entry; clear the attempt counter. |
+| Escalated | Any other observation | Escalated | Re-enqueue with poll interval. Make no merge call and apply no action. For a count-based escalation, a ceiling that no longer counts the stored tries as spent ends the escalation and the pass goes on as for a pending entry. |
 
 **Gitea auto-merge reads.** The Gitea adapter has no aggregate review-decision field and no `mergeable_state` string, so it composes both preconditions itself. `GetReviewDecision` folds the per-review list, taking each reviewer's latest approving or changes-requested review, normalizing Gitea's native `REQUEST_CHANGES` review state to this contract's `CHANGES_REQUESTED`, and combining the result with the PR's requested-reviewers signal into one decision. `GetMergeability` maps Gitea's single `mergeable` boolean to `clean` (mergeable and not a draft), `blocked` (draft), or `unknown` (anything else), and never yields `dirty` or `unstable`. Gitea cannot distinguish a merge conflict from an in-progress recheck, so both present as `unknown`, which this table re-enqueues on the poll interval as a transient state. The fold orders decision-bearing reviews by submission time, so that timestamp is load-bearing; a review that can change the verdict and carries a submission timestamp that is not a valid RFC 3339 value fails the read with a `scm_payload_error` rather than sorting to the epoch, because a substituted timestamp can let a superseded approval outrank the changes-requested review that supersedes it. A review that cannot change the verdict, a dismissed review or one whose state is not a decision, is not parsed and cannot fail the read. The precondition read defers with backoff and never merges on this failure, and the pending entry is dropped once its age passes the configured watch window (§11C.4), which escalates nothing and leaves the pull request unmerged for the operator to merge manually.
 
@@ -77,12 +86,24 @@ The count-based escalation check guards the comparison with `MaxRetries > 0`: th
 
 A configured `MaxRetries` of `0` disables count-based escalation rather than triggering it on the first attempt: the `> 0` guard keeps the comparison false no matter how large `reaction_attempts[issue_id:merge]` grows, so a `merge`-kind entry with no retry budget keeps retrying transient failures instead of escalating on them. This is the opposite of the sibling merge-conflict reaction, whose comparison (`attempts > MaxRetries`, §11E.5) carries no such guard, so a merge-conflict `MaxRetries` of `0` escalates on the first conflict detection (§11E.8). The same `0` literal therefore carries two incompatible meanings across these two adjacent `WORKFLOW.md` configuration blocks. An `ErrSCMAuth` or `ErrSCMPayload` failure still escalates immediately regardless of the configured `MaxRetries`, including when it is `0`.
 
-Two escalation postures are available, set by the operator in `WORKFLOW.md`:
+Every escalation emits the `escalation.auto_merge` event (Section 10.4.7) under every posture, in a detached goroutine with a 30-second timeout. The event body is a plain-text message identifying the PR number, the retry count, and that manual merge is required. Three escalation postures are available, set by the operator in `WORKFLOW.md`:
 
-- `label`: applies the `needs-human` label to the tracker issue via `TrackerAdapter.AddLabel`. This is the default posture.
-- `comment`: posts a plain-text message to the tracker issue identifying the PR number, the retry count, and that manual merge is required.
+- `label`: applies the `needs-human` label to the tracker issue via `TrackerAdapter.AddLabel`. This is the default posture, and it is the posture an omitted `escalation` resolves to. The event reaches only destinations that subscribe to `escalation.auto_merge`, so the issue receives no comment unless a `tracker_comment` entry lists it.
+- `comment` (deprecated): applies no label; the `tracker_comment` destination receives the event through a subscription Sortie synthesizes from this value. The comment keeps posting and a deprecation advisory names the replacement: `escalation: none` plus `escalation.auto_merge` in the events of a `tracker_comment` entry (Section 5.3.10).
+- `none`: applies no label; the event reaches only destinations subscribed to it.
 
-Neither posture writes to the reaction attempt state. What makes escalation terminal is the cleanup that follows the action: the `merge`-kind pending entry is deleted from `pending_reactions` and its `reaction_fingerprints` row is removed, and because the reconcile loop iterates only over pending entries, that issue's merge kind is polled no further. The `reaction_attempts[issue_id:merge]` counter is left in place, unlike the merge-conflict episode-exit cleanup (§11E.5) and unlike this kind's own watch-window drop (§11C.4), so a `merge` entry re-created for the same issue later in the same process escalates on its first tick whenever `MaxRetries > 0`.
+The merge-success comment is the `auto_merge.merged` event (§11C.5): a `tracker_comment` entry that lists it posts the comment, and a configuration with no `tracker_comment` entry keeps posting it through an implicit subscription that draws a deprecation advisory. A `tracker_comment` entry that omits `auto_merge.merged` posts no merge-success comment.
+
+Neither posture writes to the reaction attempt state. The escalation records on the `merge`-kind pending entry its time, its trigger, and its subject, and stores that record. The trigger is `budget_exhausted` for the count check and `refused` for `ErrSCMAuth` or `ErrSCMPayload`. The subject is the merge fingerprint (§11C.7) of the call that escalated, and empty for the count check. The configured action applies when the stored subject differs from this one or this one is empty, so one fingerprint gets one action however often its escalation ends and begins again. The `reaction_fingerprints` row is removed, the entry stays pending, and the `reaction_attempts[issue_id:merge]` counter stays in place.
+
+What makes escalation terminal is a fact that ends it, and the escalation stands until one holds. The orchestrator stores the escalation, so it survives a restart with its time, trigger, subject, and counter (Section 14.3). While it stands, the entry makes no merge call, applies no action, and is never dropped by the watch window (§11C.4) or the token-scope preflight drop (§11C.9). The escalation ends on any of these facts, and on no other:
+
+- The pull request merges, which the pass records as the merged outcome the drop in §11C.4 records, or the pull request closes, or the pull request is missing (`ErrSCMNotFound`).
+- The tracker issue reaches a terminal state.
+- A person moves the issue out of `tracker.handoff_state`, or releases its park so Sortie runs the issue again, while Sortie does not drive it (Section 8.5 Part B).
+- For a `budget_exhausted` escalation, the ceiling as the pass applies it no longer counts the stored tries as spent. This kind counts a counter as spent only under a ceiling above `0`, so a ceiling of `0`, or a ceiling above the count, ends the escalation.
+
+The counter leaves with the entry on every one of these exits. Leaving the handoff state deletes it, so an entry re-created after a person's answer no longer starts at the ceiling and escalates on its first tick.
 
 Cross-kind isolation: escalation cleanup MUST scope deletions to the `merge` kind only. The escalation path MUST NOT mutate `ci` or `review` reaction state. The full normative invariant is in §11C.10.
 
@@ -92,7 +113,7 @@ Before calling `MergePR`, the reconcile loop computes a merge fingerprint as SHA
 
 The fingerprint's purpose is to let a changed pull request re-arm the merge, not to suppress a retry of an unchanged one. The upsert carries that behavior: a computed value differing from the stored one resets the row's `dispatched` flag, and an unchanged value preserves whatever flag the row already holds, so a new push or a changed review decision produces a new fingerprint and a fresh attempt. The flag is set only after a merge the loop treats as complete, which is a successful `MergePR` return or the already-merged rejection of §11C.3. A failed attempt deliberately leaves the flag clear, so a transient or transport-class failure retries on the next due tick instead of being skipped as a duplicate.
 
-Three exits delete the row, and each one ends this kind's work on the issue: a successful merge, the already-merged idempotent success, and escalation. Each of them also removes the `merge`-kind pending entry in the same tick, so on the ordinary path no later tick holds both a dispatched row and an entry to observe it, and the guard before `MergePR` (stored fingerprint equal to the computed one and `dispatched` set) does not fire. It is reachable only when the row outlives its deletion, because `reaction_fingerprints` is persisted while pending entries are held in memory and re-created after a restart from recovered run metadata: a surviving dispatched row then meets a re-created entry and skips a merge that already completed.
+These exits delete the row: a successful merge, the already-merged idempotent success, the drop of an entry whose pull request reads merged, and escalation. A merge, an already-merged success, and a merged read end this kind's work on the issue and remove the `merge`-kind pending entry in the same tick. An escalation deletes the row and no longer removes the entry, which makes no merge call while the escalation stands. So on the ordinary path no later tick holds both a dispatched row and an entry to observe it, and the guard before `MergePR` (stored fingerprint equal to the computed one and `dispatched` set) does not fire. It is reachable only when the row outlives its deletion, because `reaction_fingerprints` is persisted while pending entries are held in memory and re-created after a restart from recovered run metadata: a surviving dispatched row then meets a re-created entry and skips a merge that already completed.
 
 ### 11C.8 Adapter registration
 
@@ -111,7 +132,7 @@ Scope verification is best-effort: the preflight relies on `X-OAuth-Scopes` retu
 
 Three failure postures apply:
 
-- **Auth-class sticky**: a missing-scope failure (the verifier returns one or more missing scope names) sets `state.AutoMergePreflightFailed = true` permanently for the process lifetime. Every subsequent `reconcileAutoMerge` tick drops `merge`-kind pending entries with a WARN log.
+- **Auth-class sticky**: a missing-scope failure (the verifier returns one or more missing scope names) sets `state.AutoMergePreflightFailed = true` permanently for the process lifetime. Every subsequent `reconcileAutoMerge` tick drops `merge`-kind pending entries that hold no standing escalation, with a WARN log.
 - **Transport-class bounded retry**: a transport failure on the preflight call schedules one retry via `state.AutoMergePreflightRetryDueAt`. After one retry attempt, any further transport failure leaves the sticky flag set.
 - **Fail-open (no scope information)**: the verifier returned no scopes and no missing entries (fine-grained PAT or GitHub App token), or the adapter does not implement scope verification. The orchestrator proceeds with auto-merge enabled and surfaces any real scope gap at the first `MergePR` call.
 
@@ -123,7 +144,7 @@ For the full preflight algorithm, see §6.3.
 
 ### 11C.10 Cross-kind isolation
 
-`postAutoMergeSuccess` and `escalateAutoMergeFailure` MUST NOT call any function that modifies state owned by a different reaction kind. Specifically, these paths MUST NOT call:
+`postAutoMergeSuccess`, `escalateAutoMergeFailure`, and the drop of an entry whose pull request reads merged MUST NOT call any function that modifies state owned by a different reaction kind. Specifically, these paths MUST NOT call:
 
 - `CancelRetry`
 - `DeleteRetryEntry`

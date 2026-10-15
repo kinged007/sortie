@@ -437,6 +437,9 @@ func TestGetMergeability_FieldPopulation(t *testing.T) {
 	if got.Draft {
 		t.Errorf("GetMergeability().Draft = %v, want false", got.Draft)
 	}
+	if want := "https://gitlab.example.com/acme/widgets/-/merge_requests/6"; got.URL != want {
+		t.Errorf("GetMergeability().URL = %q, want %q", got.URL, want)
+	}
 	if got.ReviewDecision != "" {
 		t.Errorf("GetMergeability().ReviewDecision = %q, want empty (left unset)", got.ReviewDecision)
 	}

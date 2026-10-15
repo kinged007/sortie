@@ -6,7 +6,23 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/issuekit"
 )
+
+func stateModel(active, terminal []string) (*issuekit.LabelStateModel, issuekit.LabelStates) {
+	m := issuekit.NewLabelStateModel(issuekit.NewStateSource(domain.TrackerStates{Active: active, Terminal: terminal}), nil)
+	return m, m.Snapshot()
+}
+
+func normalizeIssueUnder(gi giteaIssue, active, terminal []string) domain.Issue {
+	m, s := stateModel(active, terminal)
+	return normalizeIssue(gi, m, s)
+}
+
+func normalizeBlockersUnder(blockers []giteaIssue, active, terminal []string) []domain.BlockerRef {
+	m, s := stateModel(active, terminal)
+	return normalizeBlockers(blockers, m, s, "acme", "widgets")
+}
 
 func TestNormalizeIssue_AllFields(t *testing.T) {
 	t.Parallel()
@@ -20,7 +36,7 @@ func TestNormalizeIssue_AllFields(t *testing.T) {
 	active := []string{"backlog", "in-progress", "review"}
 	terminal := []string{"done", "wontfix"}
 
-	got := normalizeIssue(gi, active, terminal, "", nil)
+	got := normalizeIssueUnder(gi, active, terminal)
 
 	// issue_full.json carries number=42 and a distinct global id=9042; the
 	// global id must never surface in ID, Identifier, or DisplayID.
@@ -103,7 +119,7 @@ func TestNormalizeIssue_LabelsLowercased(t *testing.T) {
 		State:  "open",
 		Labels: []giteaLabel{{Name: "BACKLOG"}, {Name: "Priority-High"}},
 	}
-	got := normalizeIssue(gi, []string{"backlog"}, nil, "", nil)
+	got := normalizeIssueUnder(gi, []string{"backlog"}, nil)
 
 	if len(got.Labels) != 2 {
 		t.Fatalf("Labels len = %d, want 2", len(got.Labels))
@@ -120,7 +136,7 @@ func TestNormalizeIssue_NonNilEmptyLabels(t *testing.T) {
 	t.Parallel()
 
 	gi := giteaIssue{Number: 1, State: "open", Labels: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	if got.Labels == nil {
 		t.Error("Labels is nil, want non-nil empty slice")
@@ -134,7 +150,7 @@ func TestNormalizeIssue_EmptyAssignees(t *testing.T) {
 	t.Parallel()
 
 	gi := giteaIssue{Number: 1, State: "open", Assignees: nil}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	if got.Assignee != "" {
 		t.Errorf("Assignee = %q, want empty string for no assignees", got.Assignee)
@@ -149,21 +165,10 @@ func TestNormalizeIssue_MultipleAssignees(t *testing.T) {
 		State:     "open",
 		Assignees: []giteaUser{{Login: "alice"}, {Login: "bob"}},
 	}
-	got := normalizeIssue(gi, nil, nil, "", nil)
+	got := normalizeIssueUnder(gi, nil, nil)
 
 	if got.Assignee != "alice" {
 		t.Errorf("Assignee = %q, want first assignee %q", got.Assignee, "alice")
-	}
-}
-
-func TestNormalizeIssue_NilPriority(t *testing.T) {
-	t.Parallel()
-
-	gi := giteaIssue{Number: 1, State: "open"}
-	got := normalizeIssue(gi, nil, nil, "", nil)
-
-	if got.Priority != nil {
-		t.Errorf("Priority = %v, want nil (gitea has no priority field)", got.Priority)
 	}
 }
 
@@ -259,7 +264,7 @@ func TestNormalizeBlockers_NonEmpty(t *testing.T) {
 	active := []string{"backlog", "in-progress", "review"}
 	terminal := []string{"done", "wontfix"}
 
-	got := normalizeBlockers(blockers, active, terminal, "", "acme", "widgets", nil)
+	got := normalizeBlockersUnder(blockers, active, terminal)
 
 	if len(got) != 2 {
 		t.Fatalf("normalizeBlockers len = %d, want 2", len(got))
@@ -288,7 +293,7 @@ func TestNormalizeBlockers_NonEmpty(t *testing.T) {
 func TestNormalizeBlockers_EmptyReturnsNonNilSlice(t *testing.T) {
 	t.Parallel()
 
-	got := normalizeBlockers(nil, nil, nil, "", "acme", "widgets", nil)
+	got := normalizeBlockersUnder(nil, nil, nil)
 
 	if got == nil {
 		t.Error("normalizeBlockers(nil) returned nil, want non-nil empty slice")

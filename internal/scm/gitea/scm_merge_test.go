@@ -32,10 +32,12 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 		wantMerged         bool
 		wantMergeCommitSHA string
 		wantClosed         bool
+		wantURL            string
 	}{
 		{
 			name:           "mergeable true maps to clean",
 			fixture:        "pr_clean.json",
+			wantURL:        "https://git.example.com/acme/widgets/pulls/6",
 			wantMergeable:  domain.MergeabilityClean,
 			wantDraft:      false,
 			wantHeadSHA:    "sha-clean-001",
@@ -46,6 +48,7 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 		{
 			name:           "draft true maps to blocked even when mergeable is true",
 			fixture:        "pr_draft.json",
+			wantURL:        "https://git.example.com/acme/widgets/pulls/7",
 			wantMergeable:  domain.MergeabilityBlocked,
 			wantDraft:      true,
 			wantHeadSHA:    "sha-draft-002",
@@ -55,6 +58,7 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 		{
 			name:           "mergeable false maps to unknown",
 			fixture:        "pr_conflict_unknown.json",
+			wantURL:        "https://git.example.com/acme/widgets/pulls/8",
 			wantMergeable:  domain.MergeabilityUnknown,
 			wantDraft:      false,
 			wantHeadSHA:    "sha-conflict-003",
@@ -64,6 +68,7 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 		{
 			name:               "merged true populates Merged and MergeCommitSHA",
 			fixture:            "pr_merged.json",
+			wantURL:            "https://git.example.com/acme/widgets/pulls/6",
 			wantMergeable:      domain.MergeabilityUnknown,
 			wantDraft:          false,
 			wantHeadSHA:        "sha-clean-001",
@@ -76,6 +81,7 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 		{
 			name:           "closed without merge populates Closed but not Merged",
 			fixture:        "pr_closed_unmerged.json",
+			wantURL:        "https://git.example.com/acme/widgets/pulls/6",
 			wantMergeable:  domain.MergeabilityUnknown,
 			wantDraft:      false,
 			wantHeadSHA:    "sha-clean-001",
@@ -132,6 +138,9 @@ func TestGiteaSCMGetMergeability(t *testing.T) {
 			}
 			if got.Closed != tt.wantClosed {
 				t.Errorf("GetMergeability().Closed = %v, want %v", got.Closed, tt.wantClosed)
+			}
+			if got.URL != tt.wantURL {
+				t.Errorf("GetMergeability().URL = %q, want %q", got.URL, tt.wantURL)
 			}
 		})
 	}

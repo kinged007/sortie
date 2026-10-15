@@ -1,18 +1,12 @@
 // Package opencode implements [domain.AgentAdapter] for the OpenCode CLI.
 // It launches one `opencode run --format json` subprocess per turn,
 // normalizes stdout envelopes into domain events, and recovers final token
-// usage with `opencode export --sanitize`. When a turn fails and the run
-// stream carried nothing but opencode's masked generic server error, the
-// adapter consults `opencode models` to reconstruct the unknown-model
-// diagnostic.
+// usage with `opencode session export --standalone --sanitize`.
 //
 // The CLI accepts no MCP configuration path as an argument, so on a local
 // launch the adapter translates the file named by
 // [domain.StartSessionParams] MCPConfigPath into OpenCode's own
-// configuration form and delivers it in the turn's environment. A remote
-// launch receives none: the only delivery route there is the command line,
-// where the document's credentials would be readable by any user of the
-// host.
+// configuration form and delivers it in the turn's environment.
 package opencode
 
 import (
@@ -20,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -37,22 +30,25 @@ import (
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
+// defaultCommand is what a session launches when it is given no command.
+const defaultCommand = "opencode"
+
 func init() {
 	registry.Agents.RegisterWithMeta("opencode", NewOpenCodeAdapter, registry.AgentMeta{
 		RequiresCommand:     true,
+		DefaultCommand:      defaultCommand,
 		ValidateAgentConfig: validateConfig,
 		MCPInjection:        registry.MCPInjectionTranslated,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
+		EffortForwarding:    registry.EffortForwarded,
 	})
 }
 
 var _ domain.AgentAdapter = (*OpenCodeAdapter)(nil)
 
-type OpenCodeAdapter struct {
-	passthrough passthroughConfig
-}
+type OpenCodeAdapter struct{}
 
 type sessionState struct {
 	target         agentcore.LaunchTarget
@@ -75,14 +71,16 @@ type sessionState struct {
 	// reads it when it builds each turn's own turnRuntime.
 	drainGrace time.Duration
 
-	// major is the OpenCode major this session drives, detected once by
-	// StartSession and never re-detected or cached anywhere else.
-	major runtimeMajor
+	// firstEventTimeout bounds each turn's wait for its first JSON event.
+	// opencode prints nothing before the model starts answering, so the
+	// wait carries the provider's latency. Written once by StartSession,
+	// or by a test before a session's first turn.
+	firstEventTimeout time.Duration
 
-	// turnConfigContent is the configuration value every turn carries
-	// through OPENCODE_CONFIG_CONTENT: the 1.x MCP document on major1,
-	// the 2.x inline document on major2. Empty when there is nothing to
-	// carry. Set once in StartSession and never mutated after.
+	// turnConfigContent is the inline configuration document every turn
+	// carries through OPENCODE_CONFIG_CONTENT. Never empty, because the
+	// document always carries the title-agent switch. Set once in
+	// StartSession and never mutated after.
 	turnConfigContent string
 
 	credentialVerification bool
@@ -90,7 +88,7 @@ type sessionState struct {
 
 type turnRuntime struct {
 	pid             string
-	proc            *os.Process
+	group           *procutil.Group
 	waitCh          chan waitResult
 	reapedCh        chan struct{}
 	reader          *procutil.StdoutReader
@@ -116,27 +114,31 @@ type turnRuntime struct {
 type waitResult struct {
 	exitCode int
 	err      error
+	// stopped is the launch record's verdict: a stop began while the
+	// subprocess was still running.
+	stopped bool
 }
 
-// NewOpenCodeAdapter creates an [OpenCodeAdapter] from the raw "opencode"
-// adapter configuration in WORKFLOW.md.
-func NewOpenCodeAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, fault := parsePassthroughConfig(config)
+// NewOpenCodeAdapter creates an [OpenCodeAdapter].
+func NewOpenCodeAdapter() (domain.AgentAdapter, error) {
+	return &OpenCodeAdapter{}, nil
+}
+
+// StartSession parses the session's settings, checks that the installed
+// OpenCode is a 2.x release, and initializes session state without
+// starting a turn subprocess. It refuses an unusable settings block, a
+// set pure, and a model-variant setting without a plain model before
+// launching anything, and a major other than 2 once the version is read.
+func (a *OpenCodeAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
+	pt, fault := parsePassthroughConfig(params.Settings)
 	if fault != nil {
-		return nil, fault
+		return domain.Session{}, agentcore.SettingsError(fault.Error(), fault)
 	}
 	if err := checkCrossField(pt); err != nil {
-		return nil, err
+		return domain.Session{}, agentcore.SettingsError(err.Error(), err)
 	}
-	return &OpenCodeAdapter{passthrough: pt}, nil
-}
 
-// StartSession resolves the launch target, detects the installed
-// OpenCode major, and initializes adapter-owned session state without
-// starting a turn subprocess. It refuses a major other than 1 or 2, and
-// a passthrough setting that major cannot carry.
-func (a *OpenCodeAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	target, agentErr := agentcore.ResolveLaunchTarget(params, "opencode")
+	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
 	}
@@ -153,28 +155,22 @@ func (a *OpenCodeAdapter) StartSession(ctx context.Context, params domain.StartS
 	state := &sessionState{
 		target:                 target,
 		agentConfig:            params.AgentConfig,
-		passthrough:            a.passthrough,
+		passthrough:            pt,
 		sessionID:              params.ResumeSessionID,
-		major:                  majorUnknown,
 		baseLogger:             slog.Default().With(slog.String("component", "opencode-adapter")),
 		createdSession:         params.ResumeSessionID == "",
 		runStartedAtMS:         time.Now().UnixMilli(),
 		usage:                  agentcore.NewTurnEndUsage(),
 		drainGrace:             procutil.DefaultDrainGrace,
+		firstEventTimeout:      agentcore.FirstResponseTimeout(params.AgentConfig),
 		credentialVerification: params.CredentialVerification,
 	}
 
-	major, majorErr := detectRuntimeMajor(ctx, state)
-	if majorErr != nil {
-		return domain.Session{}, majorErr
-	}
-	state.major = major
-
-	if settingsErr := checkMajorSettings(state.passthrough, state.major); settingsErr != nil {
-		return domain.Session{}, settingsErr
+	if versionErr := checkRuntimeVersion(ctx, state); versionErr != nil {
+		return domain.Session{}, versionErr
 	}
 
-	turnConfigContent, buildErr := buildTurnConfigContent(state.major, state.passthrough, servers)
+	turnConfigContent, buildErr := buildInlineConfig(state.passthrough, servers)
 	if buildErr != nil {
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
@@ -207,23 +203,8 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 		}
 	}
 
-	env, err := buildTurnEnv(state)
-	if err != nil {
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "build opencode environment",
-			Err:     err,
-		}
-	}
-
-	managedEnv, err := buildManagedEnv(a.passthrough, state.major)
-	if err != nil {
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "build opencode managed environment",
-			Err:     err,
-		}
-	}
+	env := buildTurnEnv(state)
+	managedEnv := buildManagedEnv()
 
 	state.mu.Lock()
 	if state.closed {
@@ -241,12 +222,13 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 		}
 	}
 	state.turnCount++
-	cmdArgs := buildRunArgs(state, params.Prompt, a.passthrough)
+	cmdArgs := buildRunArgs(state, state.passthrough)
 	logger := state.loggerLocked()
 
 	var cmd *exec.Cmd
 	var launch sshutil.SSHLaunch
 	if state.target.RemoteCommand != "" {
+		managedEnv["OPENCODE_CONFIG_CONTENT"] = state.turnConfigContent
 		launch = sshutil.BuildSSHLaunch(
 			state.target.SSHHost,
 			state.target.WorkspacePath,
@@ -265,9 +247,9 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 		state.mu.Unlock()
 		return domain.TurnResult{}, bindErr
 	}
-	cmd.Stdin = buildTurnStdin(state.major, params.Prompt, launch.StdinReader())
+	cmd.Stdin = buildTurnStdin(params.Prompt, launch.StdinReader())
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
+	pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
@@ -293,6 +275,10 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				Err:     startErr.Err,
 			}
 		default: // procutil.StageProcessStart, procutil.StageProcessResume
+			if startErr.Cancelled {
+				ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
+				return state.usage.Finalize(params.OnEvent, state.logger(), ev, state.currentSessionID(), 0, nil)
+			}
 			return domain.TurnResult{}, &domain.AgentError{
 				Kind:    domain.ErrResponseError,
 				Message: "start opencode subprocess",
@@ -306,7 +292,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 
 	runtime := &turnRuntime{
 		pid:             strconv.Itoa(cmd.Process.Pid),
-		proc:            cmd.Process,
+		group:           group,
 		waitCh:          make(chan waitResult, 1),
 		reapedCh:        make(chan struct{}),
 		drainGrace:      state.drainGrace,
@@ -327,8 +313,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 		params.OnEvent(event)
 	}
 
-	readTimeout := readTimeout(state)
-	readTimer := time.NewTimer(readTimeout)
+	readTimer := time.NewTimer(state.firstEventTimeout)
 	defer stopTimer(readTimer)
 
 	readTimeoutC := readTimer.C
@@ -339,6 +324,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 	var postExitAt time.Time
 	var exit waitResult
 	processExited := false
+	ctxDone := ctx.Done()
 
 	// handleLine applies one raw stdout line's per-event path: parsing,
 	// the first-JSON latch, and the event switch. It is shared between
@@ -356,7 +342,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 
 		if parsed.PlainText != "" {
 			if readTimeoutC != nil {
-				resetTimer(readTimer, readTimeout)
+				resetTimer(readTimer, state.firstEventTimeout)
 			}
 
 			plainText := redact.Truncate(parsed.PlainText, 500)
@@ -502,13 +488,14 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			if !ok {
 				lineCh = nil
 				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
+					stoppedBeforeKill := runtime.group.Stopped()
 					killTurnProcess(runtime)
 					_ = waitForProcess(runtime)
 					recovered := recoverUsage(ctx, state, runWindow(state))
 					clearActive(state, runtime)
 
 					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-					if ctx.Err() == nil && !state.isClosed() {
+					if !stoppedBeforeKill {
 						procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
 						ev = agentcore.TurnEvidence{
 							Terminal:          agentcore.TerminalFailure,
@@ -557,9 +544,15 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			}
 			return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
 
-		case <-ctx.Done():
+		case <-ctxDone:
 			killTurnProcess(runtime)
-			_ = waitForProcess(runtime)
+			if !waitForProcess(runtime).stopped {
+				// The subprocess had exited on its own before the stop
+				// reached it, so the turn finishes like one whose context
+				// is live: the closed wait channel takes the exit arm next.
+				ctxDone = nil
+				continue
+			}
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			recovered := recoverUsage(ctx, state, runWindow(state))
 			clearActive(state, runtime)
@@ -636,12 +629,12 @@ func deleteVerificationSession(ctx context.Context, state *sessionState, session
 	deleteCtx, cancel := context.WithTimeout(ctx, agentcore.AuxiliaryTimeout(state.agentConfig))
 	defer cancel()
 
-	cmd, buildErr := auxiliaryCommand(deleteCtx, state, deleteArgs(state.major, sessionID))
+	cmd, buildErr := auxiliaryCommand(deleteCtx, state, deleteArgs(sessionID))
 	if buildErr != nil {
 		state.logger().Warn("failed to delete credential verification session", slog.Any("error", buildErr))
 		return
 	}
-	result, startErr := procutil.RunCapture(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{})
+	result, startErr := procutil.RunCapture(deleteCtx, cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{})
 	if startErr != nil {
 		state.logger().Warn("failed to delete credential verification session", slog.Any("error", startErr))
 		return
@@ -675,11 +668,11 @@ func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *session
 	ev := agentcore.TurnEvidence{
 		ExitObserved: true,
 		ExitCode:     exit.exitCode,
-		Cause:        exit.err,
+		WaitErr:      exit.err,
 	}
 	ev.Work, ev.WorkDetail = runtime.work.Report()
 
-	if ctx.Err() == nil && !state.isClosed() {
+	if !exit.stopped {
 		ev.EarlyExit = runtime.output.ExitedBeforeOutput(state.target, exit.err).Report(runtime.stderrCollector)
 	}
 
@@ -697,21 +690,13 @@ func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *session
 	case runtime.terminalOutcome == domain.EventTurnFailed:
 		ev.Terminal = agentcore.TerminalFailure
 		ev.TerminalErrorKind = domain.ErrTurnFailed
-		ev.Cause = nil
 		ev.TerminalMessage = rawRunErrorMessage(runtime.terminalError)
-		if state.major == major1 && isMaskedServerError(ev.TerminalMessage) {
-			if detail, ok := queryModelNotFound(ctx, state); ok {
-				state.logger().Debug("recovered masked opencode failure detail", slog.String("detail", detail))
-				ev.TerminalMessage = detail
-			}
-		}
 		ev.TerminalMessage += freeTierRefusalClause(runtime.terminalError, state.passthrough)
 		procutil.EmitWarnLines(stderrLines, state.logger())
 
-	case ctx.Err() != nil || state.isClosed():
+	case exit.stopped:
 		ev.Terminal = agentcore.TerminalCancelled
 		ev.TerminalMessage = "turn cancelled"
-		ev.Cause = nil
 
 	case !runtime.firstJSONSeen:
 		procutil.EmitWarnLines(stderrLines, state.logger())
@@ -748,12 +733,6 @@ func (s *sessionState) currentSessionID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessionID
-}
-
-func (s *sessionState) isClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
 }
 
 func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
@@ -798,6 +777,7 @@ func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 		runtime.waitRes = waitResult{
 			exitCode: procutil.ExtractExitCode(reaper.Err()),
 			err:      reaper.Err(),
+			stopped:  reaper.Stopped(),
 		}
 		runtime.waitMu.Unlock()
 
@@ -850,11 +830,11 @@ func stopActiveTurn(ctx context.Context, runtime *turnRuntime, grace time.Durati
 		return nil
 	}
 
-	if runtime.proc == nil {
+	if runtime.group == nil {
 		return nil
 	}
 
-	_ = procutil.SignalGraceful(runtime.proc.Pid) //nolint:errcheck // best-effort signal; process may already be dead
+	_ = runtime.group.SignalGraceful() //nolint:errcheck // best-effort signal; process may already be dead
 
 	started := time.Now()
 	graceTimer := time.NewTimer(grace)
@@ -880,10 +860,10 @@ func stopActiveTurn(ctx context.Context, runtime *turnRuntime, grace time.Durati
 }
 
 func killTurnProcess(runtime *turnRuntime) {
-	if runtime == nil || runtime.proc == nil {
+	if runtime == nil || runtime.group == nil {
 		return
 	}
-	procutil.KillProcessGroup(runtime.proc.Pid) //nolint:errcheck,gosec // best-effort cleanup
+	runtime.group.Kill() //nolint:errcheck,gosec // best-effort cleanup
 }
 
 func stopTimer(timer *time.Timer) {
@@ -903,13 +883,6 @@ func resetTimer(timer *time.Timer, timeout time.Duration) {
 	timer.Reset(timeout)
 }
 
-func readTimeout(state *sessionState) time.Duration {
-	if state.agentConfig.ReadTimeoutMS > 0 {
-		return time.Duration(state.agentConfig.ReadTimeoutMS) * time.Millisecond
-	}
-	return 30 * time.Second
-}
-
 func isPermissionWarning(line string) bool {
 	return strings.HasPrefix(strings.TrimSpace(agentcore.SanitizeLine(line)), "! permission requested:")
 }
@@ -921,23 +894,14 @@ func toolDuration(partTime rawPartTime) int64 {
 	return partTime.End - partTime.Start
 }
 
-// rawRunErrorMessage returns the first non-empty of runErr's 1.x
-// nested message, its 2.x message, its name, or its 2.x type, falling
-// back to a generic message when none carry text.
+// rawRunErrorMessage returns the first non-empty of runErr's message or
+// type, falling back to a generic message when neither carries text.
 func rawRunErrorMessage(runErr *rawRunError) string {
 	if runErr == nil {
 		return "opencode reported an unknown error"
 	}
-	if runErr.Data != nil {
-		if message, ok := runErr.Data["message"].(string); ok && message != "" {
-			return message
-		}
-	}
 	if runErr.Message != "" {
 		return runErr.Message
-	}
-	if runErr.Name != "" {
-		return runErr.Name
 	}
 	if runErr.Type != "" {
 		return runErr.Type

@@ -1,0 +1,16 @@
+/** Draws the Sortie logomark in the ink color of the theme scope it sits in. */
+export function BrandMark() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="500 880.44 272.92 239.12"
+      fill="currentColor"
+      className="h-(--size-kbd) w-auto shrink-0 text-ink"
+    >
+      <path d="M772.92 1045.61 698.57 1119.11 624.55 1119.56 699.37 1045.61 624.55 971.65 698.57 972.11Z" />
+      <path d="M500 954.39 574.35 880.89 648.36 880.44 573.54 954.39 648.36 1028.35 574.35 1027.89Z" />
+      <path d="M638.73 1072.39 591 1119.56 500 1119.56 500 1091.95 547.17 1045.33 547.17 1072.39Z" />
+      <path d="M634.18 927.61 681.91 880.44 772.91 880.44 772.91 908.05 725.74 954.67 725.74 927.61Z" />
+    </svg>
+  );
+}

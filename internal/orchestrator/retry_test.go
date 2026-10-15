@@ -3,19 +3,24 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 type mockRetryStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	savedEntries   []persistence.RetryEntry
@@ -152,6 +157,7 @@ type mockRetryTracker struct {
 type mockRetryCommentCall struct {
 	IssueID string
 	Text    string
+	Literal string
 }
 
 var _ domain.TrackerAdapter = (*mockRetryTracker)(nil)
@@ -159,6 +165,8 @@ var _ domain.TrackerAdapter = (*mockRetryTracker)(nil)
 func (m *mockRetryTracker) FetchCandidateIssues(_ context.Context) ([]domain.Issue, error) {
 	panic("FetchCandidateIssues must not be called by HandleRetryTimer")
 }
+
+func (m *mockRetryTracker) SetTrackerStates(func() domain.TrackerStates) {}
 
 func (m *mockRetryTracker) FetchIssueByID(_ context.Context, issueID string) (domain.Issue, error) {
 	m.fetchCount++
@@ -193,10 +201,17 @@ func (m *mockRetryTracker) CommentIssue(_ context.Context, issueID, text string)
 	return m.commentIssueErr
 }
 
+func (m *mockRetryTracker) CommentIssueWithLiteral(_ context.Context, issueID, text, literal string) error {
+	m.commentCalls = append(m.commentCalls, mockRetryCommentCall{IssueID: issueID, Text: text, Literal: literal})
+	return m.commentIssueErr
+}
+
 func (m *mockRetryTracker) AddLabel(_ context.Context, _ string, label string) error {
 	m.addedLabels = append(m.addedLabels, label)
 	return m.addLabelErr
 }
+
+func (m *mockRetryTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 func retryState(t *testing.T, id, identifier string, attempt int) *State {
 	t.Helper()
@@ -224,15 +239,16 @@ func defaultRetryParams(t *testing.T, store *mockRetryStore, tracker *mockRetryT
 	return HandleRetryTimerParams{
 		Store:             store,
 		TrackerAdapter:    tracker,
+		Router:            route.NewRouter(tracker, nil),
 		ActiveStates:      []string{"To Do", "In Progress"},
 		TerminalStates:    []string{"Done"},
 		MaxRetryBackoffMS: 300_000,
-		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 			return func(_ context.Context, _ domain.Issue, _ *int) {}
 		},
 		AgentAdapterByKind: func(_ string) (domain.AgentAdapter, error) { return &mockAgentAdapter{}, nil },
-		ResolveUsageDisposition: func(_, _ string) (registry.UsageArrival, registry.UsageAttribution) {
-			return registry.UsageArrivalUndeclared, registry.UsageAttributionUndeclared
+		ResolveAttemptSettings: func(_ DispatchResolution, _ string) AttemptSettings {
+			return AttemptSettings{}
 		},
 		OnRetryFire: noopRetryFire,
 		Ctx:         context.Background(),
@@ -702,6 +718,67 @@ func TestHandleRetryTimer(t *testing.T) {
 			},
 		},
 		{
+			name:    "first no-state reading reschedules and keeps the session, the continuation, the reaction kind and the hop record",
+			issueID: "ISS-8",
+			state: func(t *testing.T, id string) *State {
+				t.Helper()
+				state := retryState(t, id, id, 2)
+				entry := state.RetryAttempts[id]
+				entry.SessionID, entry.ReactionKind = "sess-keep", ReactionKindCI
+				entry.Error = "worker exited: boom"
+				entry.ContinuationContext = map[string]any{"ci_failure": "failing"}
+				state.StageHops[id] = &StageHopEntry{Count: 2}
+				return state
+			},
+			store: func() *mockRetryStore { return &mockRetryStore{} },
+			tracker: func(id string) *mockRetryTracker {
+				return &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "")}
+			},
+			check: func(t *testing.T, id string, state *State, _ *mockRetryStore, _ *mockRetryTracker, _ bool) {
+				t.Helper()
+				entry, ok := state.RetryAttempts[id]
+				if !ok {
+					t.Fatalf("RetryAttempts[%s] missing after the first no-state reading, want rescheduled", id)
+				}
+				if entry.TimerHandle != nil {
+					entry.TimerHandle.Stop()
+				}
+				if entry.Attempt != 2 || entry.SessionID != "sess-keep" || entry.ReactionKind != ReactionKindCI || entry.ContinuationContext == nil || !entry.noStateObserved {
+					t.Errorf("RetryAttempts[%s] = %+v, want attempt 2, session, reaction kind and continuation kept, noStateObserved set", id, entry)
+				}
+				if entry.Error != "issue without a state label" || entry.Trigger != "timer" {
+					t.Errorf("RetryAttempts[%s] error, trigger = %q, %q, want %q, %q", id, entry.Error, entry.Trigger, "issue without a state label", "timer")
+				}
+				if _, claimed := state.Claimed[id]; !claimed || state.StageHops[id] == nil || len(state.Running) != 0 {
+					t.Errorf("after the first no-state reading claimed = %v, hop kept = %v, running = %d; want true, true, 0", claimed, state.StageHops[id] != nil, len(state.Running))
+				}
+			},
+		},
+		{
+			name:    "second consecutive no-state reading releases the claim and keeps the hop record",
+			issueID: "ISS-9",
+			state: func(t *testing.T, id string) *State {
+				t.Helper()
+				state := retryState(t, id, id, 2)
+				state.RetryAttempts[id].noStateObserved = true
+				state.StageHops[id] = &StageHopEntry{Count: 2}
+				return state
+			},
+			store: func() *mockRetryStore { return &mockRetryStore{} },
+			tracker: func(id string) *mockRetryTracker {
+				return &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "")}
+			},
+			check: func(t *testing.T, id string, state *State, store *mockRetryStore, _ *mockRetryTracker, _ bool) {
+				t.Helper()
+				_, claimed := state.Claimed[id]
+				_, queued := state.RetryAttempts[id]
+				if claimed || queued || !slices.Equal(store.deletedIssueID, []string{id}) || state.StageHops[id] == nil {
+					t.Errorf("after the second no-state reading claimed = %v, queued = %v, deleted = %v, hop kept = %v; want false, false, [%s], true",
+						claimed, queued, store.deletedIssueID, state.StageHops[id] != nil, id)
+				}
+			},
+		},
+		{
 			name:    "terminal state releases claim",
 			issueID: "ISS-6",
 			state: func(t *testing.T, id string) *State {
@@ -950,8 +1027,8 @@ func TestHandleRetryTimer(t *testing.T) {
 			},
 			check: func(t *testing.T, id string, state *State, store *mockRetryStore, tracker *mockRetryTracker, workerCalled bool) {
 				t.Helper()
-				if len(store.summedTokenIssueIDs) != 1 || store.summedTokenIssueIDs[0] != id {
-					t.Errorf("SumTotalTokensByIssue calls = %v, want [%s]", store.summedTokenIssueIDs, id)
+				if want := []string{id, id}; !slices.Equal(store.summedTokenIssueIDs, want) {
+					t.Errorf("TokenUsageByIssue calls = %v, want %v (gate read, then freeze read)", store.summedTokenIssueIDs, want)
 				}
 				if tracker.fetchCount != 1 {
 					t.Errorf("FetchIssueByID call count = %d, want 1", tracker.fetchCount)
@@ -989,8 +1066,8 @@ func TestHandleRetryTimer(t *testing.T) {
 			},
 			check: func(t *testing.T, id string, state *State, store *mockRetryStore, tracker *mockRetryTracker, workerCalled bool) {
 				t.Helper()
-				if len(store.summedTokenIssueIDs) != 0 {
-					t.Errorf("SumTotalTokensByIssue calls = %v, want empty (MaxTokens=0)", store.summedTokenIssueIDs)
+				if entry, ok := state.BudgetExhausted[id]; ok {
+					t.Errorf("BudgetExhausted[%s] = %+v, want absent: no ceiling is set, so the token gate must not run", id, entry)
 				}
 				if tracker.fetchCount != 1 {
 					t.Errorf("FetchIssueByID call count = %d, want 1", tracker.fetchCount)
@@ -1029,8 +1106,8 @@ func TestHandleRetryTimer(t *testing.T) {
 			},
 			check: func(t *testing.T, id string, state *State, store *mockRetryStore, tracker *mockRetryTracker, workerCalled bool) {
 				t.Helper()
-				if len(store.summedTokenIssueIDs) != 1 || store.summedTokenIssueIDs[0] != id {
-					t.Errorf("SumTotalTokensByIssue calls = %v, want [%s]", store.summedTokenIssueIDs, id)
+				if want := []string{id, id}; !slices.Equal(store.summedTokenIssueIDs, want) {
+					t.Errorf("TokenUsageByIssue calls = %v, want %v (gate read, then freeze read)", store.summedTokenIssueIDs, want)
 				}
 				if tracker.fetchCount != 1 {
 					t.Errorf("FetchIssueByID call count = %d, want 1 (fail-open)", tracker.fetchCount)
@@ -1347,7 +1424,7 @@ func TestHandleRetryTimer(t *testing.T) {
 			if tt.workerFn != nil {
 				ch := make(chan struct{}, 1)
 				wf := tt.workerFn(ch)
-				params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc { return wf }
+				params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc { return wf }
 				HandleRetryTimer(state, id, params)
 				select {
 				case <-ch:
@@ -1417,7 +1494,7 @@ func TestHandleRetryTimer_TokenBudgetIncomplete(t *testing.T) {
 	params := defaultRetryParams(t, store, tracker)
 	params.MaxTokens = 1000
 	params.Logger = logger
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			dispatched <- struct{}{}
 		}
@@ -1478,7 +1555,7 @@ func TestHandleRetryTimer_TokenBudgetUnaccountedTurns(t *testing.T) {
 	params := defaultRetryParams(t, store, tracker)
 	params.MaxTokens = 1000
 	params.Logger = logger
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			dispatched <- struct{}{}
 		}
@@ -1526,7 +1603,7 @@ func TestHandleRetryTimer_TokenBudgetFailOpenLogsWarning(t *testing.T) {
 	params := defaultRetryParams(t, store, tracker)
 	params.MaxTokens = 1000
 	params.Logger = logger
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			dispatched <- struct{}{}
 		}
@@ -1556,6 +1633,7 @@ func TestHandleRetryTimer_WorkerStillRunningReschedulesInsteadOfDispatching(t *t
 	tracker := &mockRetryTracker{}
 
 	state := retryState(t, "ISS-1", "ISS-1", 2)
+	state.RetryAttempts["ISS-1"].Error = "worker exited: boom"
 	state.Running["ISS-1"] = &RunningEntry{
 		Identifier: "ISS-1",
 		Issue:      candidateIssue("ISS-1", "ISS-1", "In Progress"),
@@ -1565,7 +1643,7 @@ func TestHandleRetryTimer_WorkerStillRunningReschedulesInsteadOfDispatching(t *t
 	params := defaultRetryParams(t, store, tracker)
 
 	workerCalled := false
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled = true
 		}
@@ -1587,6 +1665,9 @@ func TestHandleRetryTimer_WorkerStillRunningReschedulesInsteadOfDispatching(t *t
 	}
 	if entry.Attempt != 2 {
 		t.Errorf("rescheduled Attempt = %d, want 2 (same as original)", entry.Attempt)
+	}
+	if entry.Error != "worker still running" || entry.Trigger != "timer" {
+		t.Errorf("rescheduled error, trigger = %q, %q, want %q, %q", entry.Error, entry.Trigger, "worker still running", "timer")
 	}
 	if entry.TimerHandle == nil {
 		t.Error("rescheduled TimerHandle = nil, want non-nil")
@@ -1625,7 +1706,7 @@ func TestHandleRetryTimer_SSHHostAcquisition(t *testing.T) {
 		params.HostPool = hp
 
 		ch := make(chan struct{}, 1)
-		params.MakeWorkerFn = func(_, sshHost, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+		params.MakeWorkerFn = func(_, sshHost, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 			return func(_ context.Context, _ domain.Issue, _ *int) {
 				if sshHost != "host-b" {
 					t.Errorf("MakeWorkerFn sshHost = %q, want \"host-b\" (preferred)", sshHost)
@@ -1765,7 +1846,7 @@ func TestHandleRetryTimer_WorkflowFilePropagated(t *testing.T) {
 	params.WorkflowFile = "infra.WORKFLOW.md"
 
 	workerCalled := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled <- struct{}{}
 		}
@@ -1800,15 +1881,15 @@ func TestHandleRetryTimer_UsageDispositionFrozen(t *testing.T) {
 
 	params := defaultRetryParams(t, store, tracker)
 	var resolveCalls int
-	params.ResolveUsageDisposition = func(kind, sshHost string) (registry.UsageArrival, registry.UsageAttribution) {
+	params.ResolveAttemptSettings = func(DispatchResolution, string) AttemptSettings {
 		resolveCalls++
-		return registry.UsageArrivalNone, registry.UsageAttributionNone
+		return AttemptSettings{UsageArrival: registry.UsageArrivalNone, UsageAttribution: registry.UsageAttributionNone}
 	}
 
 	workerCalled := make(chan struct{}, 1)
 	var capturedArrival registry.UsageArrival
-	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, arrival registry.UsageArrival) WorkerFunc {
-		capturedArrival = arrival
+	params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, attempt AttemptSettings) WorkerFunc {
+		capturedArrival = attempt.UsageArrival
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			workerCalled <- struct{}{}
 		}
@@ -1834,7 +1915,7 @@ func TestHandleRetryTimer_UsageDispositionFrozen(t *testing.T) {
 		t.Errorf("MakeWorkerFn received arrival = %q, want %q (the same value frozen onto the entry)", capturedArrival, registry.UsageArrivalNone)
 	}
 	if resolveCalls != 1 {
-		t.Errorf("ResolveUsageDisposition called %d times, want 1 (resolved once and shared with the worker)", resolveCalls)
+		t.Errorf("ResolveAttemptSettings called %d times, want 1 (resolved once and shared with the worker)", resolveCalls)
 	}
 }
 
@@ -2329,7 +2410,7 @@ func TestHandleRetryTimer_SessionID_PassedToMakeWorkerFn(t *testing.T) {
 
 	var gotSessionID string
 	ch := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(resumeSessionID, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(resumeSessionID, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		gotSessionID = resumeSessionID
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			ch <- struct{}{}
@@ -2367,7 +2448,7 @@ func TestHandleRetryTimer_PassesReactionKindToMakeWorkerFn(t *testing.T) {
 
 	var gotReactionKind string
 	ch := make(chan struct{}, 1)
-	params.MakeWorkerFn = func(_, _, _, _, reactionKind string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, _, _, reactionKind string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		gotReactionKind = reactionKind
 		return func(_ context.Context, _ domain.Issue, _ *int) {
 			ch <- struct{}{}
@@ -2584,6 +2665,7 @@ func TestHandleRetryTimer_ReactionInUnrelatedStateReschedules(t *testing.T) {
 		Identifier:          id,
 		Attempt:             1,
 		ReactionKind:        ReactionKindReview,
+		Error:               "worker exited: boom",
 		ContinuationContext: contContext,
 		SessionID:           "sess-x",
 		LastSSHHost:         "host-a",
@@ -2611,6 +2693,9 @@ func TestHandleRetryTimer_ReactionInUnrelatedStateReschedules(t *testing.T) {
 	}
 	if entry.ReactionKind != ReactionKindReview {
 		t.Errorf("RetryAttempts[%s].ReactionKind = %q, want %q", id, entry.ReactionKind, ReactionKindReview)
+	}
+	if entry.Error != "reaction retry paused by issue state" || entry.Trigger != "timer" {
+		t.Errorf("RetryAttempts[%s] error, trigger = %q, %q, want %q, %q", id, entry.Error, entry.Trigger, "reaction retry paused by issue state", "timer")
 	}
 	if entry.ContinuationContext == nil {
 		t.Fatal("RetryAttempts.ContinuationContext is nil, want preserved")
@@ -2860,6 +2945,7 @@ func TestHandleRetryTimer_ReactionActiveStateBlockerReschedules(t *testing.T) {
 		Identifier:          id,
 		Attempt:             1,
 		ReactionKind:        ReactionKindReview,
+		Error:               "worker exited: boom",
 		ContinuationContext: contContext,
 		SessionID:           "sess-b",
 		LastSSHHost:         "host-b",
@@ -2888,6 +2974,9 @@ func TestHandleRetryTimer_ReactionActiveStateBlockerReschedules(t *testing.T) {
 	}
 	if entry.ReactionKind != ReactionKindReview {
 		t.Errorf("RetryAttempts[%s].ReactionKind = %q, want %q", id, entry.ReactionKind, ReactionKindReview)
+	}
+	if entry.Error != "reaction retry paused by an open blocking issue" || entry.Trigger != "timer" {
+		t.Errorf("RetryAttempts[%s] error, trigger = %q, %q, want %q, %q", id, entry.Error, entry.Trigger, "reaction retry paused by an open blocking issue", "timer")
 	}
 	if entry.ContinuationContext == nil {
 		t.Fatal("RetryAttempts.ContinuationContext nil after blocker reschedule, want preserved")
@@ -3052,7 +3141,7 @@ func TestHandleRetryTimer_FrozenFieldsPropagatedToRunningEntry(t *testing.T) {
 
 	var capturedAgentKind, capturedTemplateID string
 	params := defaultRetryParams(t, store, tracker)
-	params.MakeWorkerFn = func(_, _, agentKind, templateID, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+	params.MakeWorkerFn = func(_, _, agentKind, templateID, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 		capturedAgentKind = agentKind
 		capturedTemplateID = templateID
 		return func(_ context.Context, _ domain.Issue, _ *int) {}
@@ -3151,14 +3240,17 @@ func TestHandleRetryTimer_FrozenFieldsPersistedOnReschedule(t *testing.T) {
 		AgentKind:  wantAgentKind,
 		RuleName:   wantRuleName,
 		TemplateID: wantTemplateID,
+
+		StageLineage:  StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-1"},
+		IssueIdentity: IssueIdentity{Title: "held title", URL: "https://example.test/held"},
 	}
 	state.Claimed[id] = struct{}{}
 	state.Running["OTHER"] = &RunningEntry{Identifier: "OTHER"}
 
 	store := &mockRetryStore{}
-	tracker := &mockRetryTracker{
-		fetchedIssue: candidateIssue(id, id, "To Do"),
-	}
+	fired := candidateIssue(id, id, "To Do")
+	fired.URL, fired.IssueType, fired.Labels = "https://example.test/fired", "Bug", []string{"a", "b"}
+	tracker := &mockRetryTracker{fetchedIssue: fired}
 	params := defaultRetryParams(t, store, tracker)
 
 	HandleRetryTimer(state, id, params)
@@ -3176,32 +3268,151 @@ func TestHandleRetryTimer_FrozenFieldsPersistedOnReschedule(t *testing.T) {
 	if saved.TemplateID != wantTemplateID {
 		t.Errorf("saved RetryEntry.TemplateID = %q, want %q", saved.TemplateID, wantTemplateID)
 	}
+	if saved.StagePrevious != "specify" || saved.StagePreviousOutcome != "succeeded" || saved.ChainID != "chain-1" {
+		t.Errorf("saved RetryEntry previous, outcome, chain = %q, %q, %q, want %q, %q, %q", saved.StagePrevious, saved.StagePreviousOutcome, saved.ChainID, "specify", "succeeded", "chain-1")
+	}
+	if saved.IssueTitle != "held title" || saved.IssueURL != "https://example.test/held" {
+		t.Errorf("saved RetryEntry title, url = %q, %q, want the held %q, %q", saved.IssueTitle, saved.IssueURL, "held title", "https://example.test/held")
+	}
+	if saved.IssueType != "Bug" || !slices.Equal(saved.IssueLabels, []string{"a", "b"}) || saved.IssueState != "To Do" {
+		t.Errorf("saved RetryEntry type, labels, state = %q, %q, %q, want %q, %q, %q", saved.IssueType, saved.IssueLabels, saved.IssueState, "Bug", []string{"a", "b"}, "To Do")
+	}
 	if entry, ok := state.RetryAttempts[id]; ok && entry.TimerHandle != nil {
 		entry.TimerHandle.Stop()
 	}
 }
 
-func TestHandleRetryTimer_AgentAdapterLookupUsesAgentKind(t *testing.T) {
+func stopRetryTimer(state *State, id string) {
+	if entry, ok := state.RetryAttempts[id]; ok && entry.TimerHandle != nil {
+		entry.TimerHandle.Stop()
+	}
+}
+
+func logRecords(t *testing.T, buf *lockedBuf, message string) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for line := range strings.SplitSeq(buf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if record["msg"] == message {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+const selectionChangedMessage = "retry dispatching on the selection the configuration in force gives it"
+
+type dispatchedWorker struct {
+	resumeSessionID string
+	host            string
+	agentKind       string
+	templateID      string
+	reactionKind    string
+}
+
+func capturingRetryParams(t *testing.T, store *mockRetryStore, tracker *mockRetryTracker, dispatched *[]dispatchedWorker) HandleRetryTimerParams {
+	t.Helper()
+	params := defaultRetryParams(t, store, tracker)
+	params.MakeWorkerFn = func(resumeSessionID, host, agentKind, templateID, reactionKind string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
+		*dispatched = append(*dispatched, dispatchedWorker{resumeSessionID, host, agentKind, templateID, reactionKind})
+		return func(context.Context, domain.Issue, *int) {}
+	}
+	return params
+}
+
+func frozenRetryState(id string, entry RetryEntry) *State {
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+	entry.IssueID, entry.Identifier = id, id
+	state.RetryAttempts[id] = &entry
+	state.Claimed[id] = struct{}{}
+	return state
+}
+
+func TestHandleRetryTimer_StageLineage(t *testing.T) {
+	t.Parallel()
+
+	const fresh = "<fresh>"
+	passAt := time.Date(2026, 3, 19, 9, 0, 0, 0, time.UTC)
+	hopPassAt := passAt.Add(-time.Hour)
+	carried := StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-1", DispatchedAt: passAt}
+	hop := &StageHopEntry{SourceRule: "plan", TargetRule: "implement", PreviousOutcome: "no_change", ChainID: "chain-hop", DispatchedAt: hopPassAt}
+	tests := []struct {
+		name        string
+		lineage     StageLineage
+		hop         *StageHopEntry
+		resolveRule string
+		want        StageLineage
+	}{
+		{"a retry keeping its rule carries the chain and pass time it was frozen with", carried, nil, "", carried},
+		{"an empty carried chain is replaced and the pair is kept", StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded"}, nil, "",
+			StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: fresh}},
+		{"a retry routed afresh to a rule no hop targeted starts a chain", carried, nil, "implement", StageLineage{ChainID: fresh}},
+		{"a retry routed afresh to the rule a hop targeted inherits the hop's chain and pass time", carried, hop, "implement",
+			StageLineage{PreviousRule: "plan", PreviousOutcome: "no_change", ChainID: "chain-hop", DispatchedAt: hopPassAt}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const id = "ISS-LINEAGE"
+			state := frozenRetryState(id, RetryEntry{Attempt: 1, AgentKind: "kind-a", RuleName: "plan", StageLineage: tt.lineage})
+			if tt.hop != nil {
+				state.StageHops[id] = tt.hop
+			}
+			params := capturingRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}, new([]dispatchedWorker))
+			if tt.resolveRule != "" {
+				params.ResolveSelection = func(frozen DispatchResolution, _ domain.Issue) DispatchResolution {
+					frozen.RuleName = tt.resolveRule
+					return frozen
+				}
+			}
+
+			HandleRetryTimer(state, id, params)
+
+			running := state.Running[id]
+			if running == nil {
+				t.Fatal("Running[id] missing after dispatch")
+			}
+			want := tt.want
+			if want.DispatchedAt.IsZero() {
+				want.DispatchedAt = running.StartedAt
+			}
+			got := running.StageLineage
+			if want.ChainID == fresh && got.ChainID != "" && got.ChainID != tt.lineage.ChainID {
+				got.ChainID = fresh
+			}
+			if got != want {
+				t.Errorf("RunningEntry.StageLineage = %+v, want %+v (a fresh chain differs from %q, an unset pass time is the run's start %v)", got, want, tt.lineage.ChainID, running.StartedAt)
+			}
+		})
+	}
+}
+
+func TestHandleRetryTimer_AdapterLookupFailureReschedulesWithBackoff(t *testing.T) {
 	t.Parallel()
 
 	const id = "ISS-BADKIND"
 	const frozenKind = "unknown-agent"
+	continuation := map[string]any{"review": "thread-1"}
 
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	state.RetryAttempts[id] = &RetryEntry{
-		IssueID:    id,
-		Identifier: id,
-		Attempt:    1,
-		AgentKind:  frozenKind,
-		RuleName:   "some-rule",
-		TemplateID: "",
-	}
-	state.Claimed[id] = struct{}{}
-
+	state := frozenRetryState(id, RetryEntry{
+		Attempt:             2,
+		AgentKind:           frozenKind,
+		RuleName:            "some-rule",
+		TemplateID:          "/prompts/some.md",
+		SessionID:           "sess-keep",
+		LastSSHHost:         "host-a",
+		ContinuationContext: continuation,
+	})
 	store := &mockRetryStore{}
-	tracker := &mockRetryTracker{
-		fetchedIssue: candidateIssue(id, id, "To Do"),
-	}
+	tracker := &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}
 	params := defaultRetryParams(t, store, tracker)
 	params.AgentAdapterByKind = func(kind string) (domain.AgentAdapter, error) {
 		if kind != frozenKind {
@@ -3211,15 +3422,266 @@ func TestHandleRetryTimer_AgentAdapterLookupUsesAgentKind(t *testing.T) {
 	}
 
 	HandleRetryTimer(state, id, params)
+	defer stopRetryTimer(state, id)
 
-	if _, claimed := state.Claimed[id]; claimed {
-		t.Error("Claimed[id] still present after adapter lookup failure, want released")
+	if _, claimed := state.Claimed[id]; !claimed {
+		t.Error("Claimed[id] released after adapter lookup failure, want the claim kept")
 	}
-	if _, ok := state.Running[id]; ok {
+	if _, running := state.Running[id]; running {
 		t.Error("Running[id] present after adapter lookup failure, want not dispatched")
 	}
-	if len(store.deletedIssueID) == 0 {
-		t.Error("DeleteRetryEntry not called after adapter lookup failure")
+	entry, ok := state.RetryAttempts[id]
+	if !ok {
+		t.Fatal("RetryAttempts[id] missing after adapter lookup failure, want a rescheduled retry")
+	}
+	if entry.Attempt != 3 {
+		t.Errorf("rescheduled RetryEntry.Attempt = %d, want 3", entry.Attempt)
+	}
+	if want := computeBackoffDelay(3, params.MaxRetryBackoffMS); entry.scheduledDelayMS != want {
+		t.Errorf("rescheduled delay = %d ms, want the backoff of attempt 3, %d ms", entry.scheduledDelayMS, want)
+	}
+	if entry.AgentKind != frozenKind || entry.RuleName != "some-rule" || entry.TemplateID != "/prompts/some.md" ||
+		entry.SessionID != "sess-keep" || entry.LastSSHHost != "host-a" || entry.ContinuationContext["review"] != "thread-1" {
+		t.Errorf("rescheduled RetryEntry = %+v, want the frozen selection, session, host and continuation carried over", entry)
+	}
+	if len(store.savedEntries) != 1 || store.savedEntries[0].Attempt != 3 {
+		t.Errorf("SaveRetryEntry calls = %+v, want one row at attempt 3", store.savedEntries)
+	}
+	if len(store.deletedIssueID) != 0 {
+		t.Errorf("DeleteRetryEntry calls = %v, want none", store.deletedIssueID)
+	}
+}
+
+func TestHandleRetryTimer_AdapterLookupFailureReleasesTheHost(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISS-HOST"
+	state := frozenRetryState(id, RetryEntry{Attempt: 1, AgentKind: "unknown-agent"})
+	params := defaultRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")})
+	params.HostPool = NewHostPool([]string{"host-a"}, 1)
+	params.AgentAdapterByKind = func(string) (domain.AgentAdapter, error) { return nil, errors.New("adapter not registered") }
+
+	HandleRetryTimer(state, id, params)
+	defer stopRetryTimer(state, id)
+
+	if used := params.HostPool.Snapshot()["host-a"]; used != 0 {
+		t.Errorf("HostPool usage of host-a = %d after adapter lookup failure, want the host released", used)
+	}
+	if _, claimed := state.Claimed[id]; !claimed {
+		t.Error("Claimed[id] released after adapter lookup failure, want the claim kept")
+	}
+}
+
+func TestHandleRetryTimer_ReactionRetryKeepsItsClaimWhenTheAdapterIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISS-REACTION"
+	state := frozenRetryState(id, RetryEntry{Attempt: 1, AgentKind: "unknown-agent", ReactionKind: ReactionKindCI, SessionID: "sess-keep"})
+	params := defaultRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "Ready For Review")})
+	params.HandoffState = "Ready For Review"
+	params.AgentAdapterByKind = func(string) (domain.AgentAdapter, error) { return nil, errors.New("adapter not registered") }
+
+	HandleRetryTimer(state, id, params)
+	defer stopRetryTimer(state, id)
+
+	entry, ok := state.RetryAttempts[id]
+	if !ok {
+		t.Fatal("RetryAttempts[id] missing, want the reaction retry rescheduled instead of dropped")
+	}
+	if entry.ReactionKind != ReactionKindCI || entry.SessionID != "sess-keep" || entry.Attempt != 2 {
+		t.Errorf("rescheduled RetryEntry = %+v, want reaction %q, session %q, attempt 2", entry, ReactionKindCI, "sess-keep")
+	}
+	if _, claimed := state.Claimed[id]; !claimed {
+		t.Error("Claimed[id] released, want the claim kept")
+	}
+}
+
+func TestHandleRetryTimer_LaterFireDispatchesOnceTheAdapterExists(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISS-LATER"
+	state := frozenRetryState(id, RetryEntry{Attempt: 1, AgentKind: "late-agent", TemplateID: "/prompts/late.md", SessionID: "sess-keep"})
+	tracker := &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}
+	var dispatched []dispatchedWorker
+	params := capturingRetryParams(t, &mockRetryStore{}, tracker, &dispatched)
+	available := false
+	params.AgentAdapterByKind = func(string) (domain.AgentAdapter, error) {
+		if !available {
+			return nil, errors.New("adapter not registered")
+		}
+		return &mockAgentAdapter{}, nil
+	}
+
+	HandleRetryTimer(state, id, params)
+	entry := state.RetryAttempts[id]
+	if entry == nil {
+		t.Fatal("RetryAttempts[id] missing after the failed lookup")
+	}
+	stopRetryTimer(state, id)
+	entry.scheduledAt = time.Time{}
+	available = true
+	HandleRetryTimer(state, id, params)
+
+	if _, running := state.Running[id]; !running {
+		t.Fatal("Running[id] missing after the later fire, want the retry dispatched")
+	}
+	if _, pending := state.RetryAttempts[id]; pending {
+		t.Error("RetryAttempts[id] still present after the dispatch")
+	}
+	want := dispatchedWorker{resumeSessionID: "sess-keep", agentKind: "late-agent", templateID: "/prompts/late.md"}
+	if len(dispatched) != 1 || dispatched[0] != want {
+		t.Errorf("dispatched = %+v, want one worker %+v", dispatched, want)
+	}
+}
+
+func TestHandleRetryTimer_ResolveSelection(t *testing.T) {
+	t.Parallel()
+
+	frozenEntry := RetryEntry{Attempt: 1, AgentKind: "kind-a", TemplateID: "/prompts/a.md", RuleName: "rule-a", SessionID: "sess-1"}
+	frozen := DispatchResolution{AgentKind: "kind-a", TemplateID: "/prompts/a.md", RuleName: "rule-a"}
+
+	tests := []struct {
+		name         string
+		entry        RetryEntry
+		resolve      func(t *testing.T, gotFrozen DispatchResolution, issue domain.Issue) DispatchResolution
+		wantFrozen   DispatchResolution
+		want         dispatchedWorker
+		wantLogged   bool
+		wantSelected DispatchResolution
+	}{
+		{
+			name:         "nil keeps the frozen selection",
+			entry:        frozenEntry,
+			want:         dispatchedWorker{resumeSessionID: "sess-1", agentKind: "kind-a", templateID: "/prompts/a.md"},
+			wantSelected: frozen,
+		},
+		{
+			name:  "unchanged selection logs nothing",
+			entry: frozenEntry,
+			resolve: func(_ *testing.T, f DispatchResolution, _ domain.Issue) DispatchResolution {
+				return f
+			},
+			wantFrozen:   frozen,
+			want:         dispatchedWorker{resumeSessionID: "sess-1", agentKind: "kind-a", templateID: "/prompts/a.md"},
+			wantSelected: frozen,
+		},
+		{
+			name:  "kind change clears the resume identifier",
+			entry: frozenEntry,
+			resolve: func(_ *testing.T, f DispatchResolution, _ domain.Issue) DispatchResolution {
+				return DispatchResolution{AgentKind: "kind-b", TemplateID: f.TemplateID, RuleName: f.RuleName}
+			},
+			wantFrozen:   frozen,
+			want:         dispatchedWorker{resumeSessionID: "", agentKind: "kind-b", templateID: "/prompts/a.md"},
+			wantLogged:   true,
+			wantSelected: DispatchResolution{AgentKind: "kind-b", TemplateID: "/prompts/a.md", RuleName: "rule-a"},
+		},
+		{
+			name:  "template change clears the resume identifier",
+			entry: frozenEntry,
+			resolve: func(_ *testing.T, f DispatchResolution, _ domain.Issue) DispatchResolution {
+				return DispatchResolution{AgentKind: f.AgentKind, TemplateID: "/prompts/b.md", RuleName: f.RuleName}
+			},
+			wantFrozen:   frozen,
+			want:         dispatchedWorker{resumeSessionID: "", agentKind: "kind-a", templateID: "/prompts/b.md"},
+			wantLogged:   true,
+			wantSelected: DispatchResolution{AgentKind: "kind-a", TemplateID: "/prompts/b.md", RuleName: "rule-a"},
+		},
+		{
+			name:  "rule name change keeps the resume identifier",
+			entry: frozenEntry,
+			resolve: func(_ *testing.T, f DispatchResolution, _ domain.Issue) DispatchResolution {
+				return DispatchResolution{AgentKind: f.AgentKind, TemplateID: f.TemplateID, RuleName: "rule-b"}
+			},
+			wantFrozen:   frozen,
+			want:         dispatchedWorker{resumeSessionID: "sess-1", agentKind: "kind-a", templateID: "/prompts/a.md"},
+			wantLogged:   true,
+			wantSelected: DispatchResolution{AgentKind: "kind-a", TemplateID: "/prompts/a.md", RuleName: "rule-b"},
+		},
+		{
+			name:  "legacy row without a kind is resolved from the default kind",
+			entry: RetryEntry{Attempt: 1, TemplateID: "/prompts/a.md", RuleName: "rule-a", SessionID: "sess-1"},
+			resolve: func(_ *testing.T, f DispatchResolution, _ domain.Issue) DispatchResolution {
+				return f
+			},
+			wantFrozen:   DispatchResolution{AgentKind: "default-kind", TemplateID: "/prompts/a.md", RuleName: "rule-a"},
+			want:         dispatchedWorker{resumeSessionID: "sess-1", agentKind: "default-kind", templateID: "/prompts/a.md"},
+			wantSelected: DispatchResolution{AgentKind: "default-kind", TemplateID: "/prompts/a.md", RuleName: "rule-a"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const id = "ISS-SELECT"
+			state := frozenRetryState(id, tt.entry)
+			tracker := &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}
+			var dispatched []dispatchedWorker
+			var logs lockedBuf
+			params := capturingRetryParams(t, &mockRetryStore{}, tracker, &dispatched)
+			params.Logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			params.DefaultAgentKind = "default-kind"
+			var adapterKinds []string
+			params.AgentAdapterByKind = func(kind string) (domain.AgentAdapter, error) {
+				adapterKinds = append(adapterKinds, kind)
+				return &mockAgentAdapter{}, nil
+			}
+			if tt.resolve != nil {
+				params.ResolveSelection = func(gotFrozen DispatchResolution, issue domain.Issue) DispatchResolution {
+					if gotFrozen != tt.wantFrozen {
+						t.Errorf("ResolveSelection frozen = %+v, want %+v", gotFrozen, tt.wantFrozen)
+					}
+					if issue.ID != id {
+						t.Errorf("ResolveSelection issue.ID = %q, want the fetched issue %q", issue.ID, id)
+					}
+					return tt.resolve(t, gotFrozen, issue)
+				}
+			}
+
+			HandleRetryTimer(state, id, params)
+
+			if len(dispatched) != 1 || dispatched[0] != tt.want {
+				t.Fatalf("dispatched = %+v, want one worker %+v", dispatched, tt.want)
+			}
+			if len(adapterKinds) != 1 || adapterKinds[0] != tt.want.agentKind {
+				t.Errorf("AgentAdapterByKind kinds = %v, want [%q]", adapterKinds, tt.want.agentKind)
+			}
+			running := state.Running[id]
+			if running == nil {
+				t.Fatal("Running[id] missing after dispatch")
+			}
+			if running.AgentKind != tt.wantSelected.AgentKind || running.TemplateID != tt.wantSelected.TemplateID || running.RuleName != tt.wantSelected.RuleName {
+				t.Errorf("RunningEntry selection = {%q, %q, %q}, want {%q, %q, %q}", running.AgentKind, running.TemplateID, running.RuleName,
+					tt.wantSelected.AgentKind, tt.wantSelected.TemplateID, tt.wantSelected.RuleName)
+			}
+			records := logRecords(t, &logs, selectionChangedMessage)
+			if !tt.wantLogged {
+				if len(records) != 0 {
+					t.Errorf("selection records = %v, want none", records)
+				}
+				return
+			}
+			if len(records) != 1 {
+				t.Fatalf("selection records = %v, want exactly one", records)
+			}
+			wantAttrs := map[string]string{
+				"agent_kind":           tt.wantFrozen.AgentKind,
+				"template_id":          tt.wantFrozen.TemplateID,
+				"rule_name":            tt.wantFrozen.RuleName,
+				"dispatch_agent_kind":  tt.wantSelected.AgentKind,
+				"dispatch_template_id": tt.wantSelected.TemplateID,
+				"dispatch_rule_name":   tt.wantSelected.RuleName,
+			}
+			if records[0]["level"] != "INFO" {
+				t.Errorf("selection record level = %v, want INFO", records[0]["level"])
+			}
+			for key, want := range wantAttrs {
+				if records[0][key] != want {
+					t.Errorf("selection record %q = %v, want %q", key, records[0][key], want)
+				}
+			}
+		})
 	}
 }
 
@@ -3683,3 +4145,176 @@ func TestHandleRetryTimer_BudgetHoldNotice(t *testing.T) {
 		}
 	})
 }
+
+func jsonLogger(buf *lockedBuf) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
+func requireOneRecord(t *testing.T, buf *lockedBuf, message string, want map[string]any) {
+	t.Helper()
+	records := logRecords(t, buf, message)
+	if len(records) != 1 {
+		t.Fatalf("log records %q = %v, want exactly one", message, records)
+	}
+	for key, value := range want {
+		if records[0][key] != value {
+			t.Errorf("log record %q field %q = %v, want %v", message, key, records[0][key], value)
+		}
+	}
+}
+
+func TestHandleRetryTimer_RefusedSettingsRescheduleAndKeepTheClaim(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISS-REFUSED"
+	state := frozenRetryState(id, RetryEntry{
+		Attempt: 2, AgentKind: "kind-a", RuleName: "cheap", RuleSettingsApplied: true,
+		SessionID: "sess-keep", LastSSHHost: "host-a", ContinuationContext: map[string]any{"review": "thread-1"},
+	})
+	logs := &lockedBuf{}
+	var dispatched []dispatchedWorker
+	params := capturingRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}, &dispatched)
+	params.Logger = jsonLogger(logs)
+	params.HostPool = NewHostPool([]string{"host-a"}, 1)
+	params.ResolveAttemptSettings = func(DispatchResolution, string) AttemptSettings {
+		return AttemptSettings{Refusals: []PreflightError{{Check: "kind-a.permission_mode.interactive", Message: "permission mode asks"}}}
+	}
+
+	HandleRetryTimer(state, id, params)
+	defer stopRetryTimer(state, id)
+
+	if _, claimed := state.Claimed[id]; len(dispatched) != 0 || state.Running[id] != nil || !claimed {
+		t.Errorf("MakeWorkerFn calls, Running[id], claimed = %+v, %v, %v, want no session and the claim kept", dispatched, state.Running[id], claimed)
+	}
+	if used := params.HostPool.Snapshot()["host-a"]; used != 0 {
+		t.Errorf("HostPool usage of host-a = %d, want the host released", used)
+	}
+	entry, ok := state.RetryAttempts[id]
+	if !ok {
+		t.Fatal("RetryAttempts[id] missing, want a rescheduled retry")
+	}
+	if entry.Attempt != 3 || entry.Error != "retry agent settings refused" || entry.scheduledDelayMS != computeBackoffDelay(3, params.MaxRetryBackoffMS) {
+		t.Errorf("rescheduled RetryEntry attempt, error, delay = %d, %q, %d ms, want 3, %q, the backoff of attempt 3", entry.Attempt, entry.Error, entry.scheduledDelayMS, "retry agent settings refused")
+	}
+	if entry.SessionID != "sess-keep" || entry.ContinuationContext["review"] != "thread-1" || !entry.RuleSettingsApplied || entry.RuleName != "cheap" {
+		t.Errorf("rescheduled RetryEntry = %+v, want session, continuation, rule and the settings flag carried over", entry)
+	}
+	requireOneRecord(t, logs, "retry agent settings refused", map[string]any{
+		"level": "ERROR", "rule_name": "cheap", "agent_kind": "kind-a", "check": "kind-a.permission_mode.interactive",
+		"diagnostic": "permission mode asks", "attempt": float64(3),
+	})
+}
+
+func TestHandleRetryTimer_RecordsTheResolvedSettingsAndLogsAVanishedRuleBlockOnce(t *testing.T) {
+	t.Parallel()
+
+	const message = "rule settings no longer present, attempt runs on the kind's top-level settings"
+	applied := RetryEntry{Attempt: 1, AgentKind: "kind-a", RuleName: "cheap", RuleSettingsApplied: true}
+	unapplied := RetryEntry{Attempt: 1, AgentKind: "kind-a", RuleName: "cheap"}
+	bare := AttemptSettings{Settings: config.AgentSettings{Kind: "kind-a"}}
+	inForce := AttemptSettings{
+		Settings:         config.AgentSettings{Kind: "kind-a", RuleName: "cheap", Model: "model-a", Effort: "low"},
+		UsageArrival:     registry.UsageArrivalTurnEnd,
+		UsageAttribution: registry.UsageAttributionSessionTotal,
+	}
+	tests := []struct {
+		name       string
+		entry      RetryEntry
+		resolved   AttemptSettings
+		selection  *DispatchResolution
+		wantRecord bool
+	}{
+		{name: "block applied before and gone now", entry: applied, resolved: bare, wantRecord: true},
+		{name: "block never applied", entry: unapplied, resolved: bare},
+		{name: "block still applies", entry: applied, resolved: inForce},
+		{name: "claim moved to another rule", entry: applied, resolved: bare, selection: &DispatchResolution{AgentKind: "kind-a", RuleName: "other"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const id = "ISS-RECORD"
+			state := frozenRetryState(id, tt.entry)
+			logs := &lockedBuf{}
+			params := defaultRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")})
+			params.Logger = jsonLogger(logs)
+			params.ResolveAttemptSettings = func(DispatchResolution, string) AttemptSettings { return tt.resolved }
+			if tt.selection != nil {
+				params.ResolveSelection = func(DispatchResolution, domain.Issue) DispatchResolution { return *tt.selection }
+			}
+
+			HandleRetryTimer(state, id, params)
+
+			settings, rule := tt.resolved.Settings, tt.entry.RuleName
+			if tt.selection != nil {
+				rule = tt.selection.RuleName
+			}
+			entry := state.Running[id]
+			if entry == nil {
+				t.Fatal("Running[id] missing after dispatch")
+			}
+			if entry.ConfiguredModel != settings.Model || entry.ConfiguredEffort != settings.Effort || entry.RuleSettingsApplied != (settings.RuleName != "") ||
+				entry.UsageArrival != tt.resolved.UsageArrival || entry.UsageAttribution != tt.resolved.UsageAttribution {
+				t.Errorf("running entry = %+v, want the resolved model, effort, rule flag and usage pair of %+v", entry, tt.resolved)
+			}
+			requireOneRecord(t, logs, "retried issue dispatched", map[string]any{"agent_kind": "kind-a", "rule_name": rule, "model": settings.Model, "effort": settings.Effort})
+			if vanished := logRecords(t, logs, message); len(vanished) != map[bool]int{true: 1}[tt.wantRecord] || (tt.wantRecord && (vanished[0]["level"] != "INFO" || vanished[0]["rule_name"] != "cheap" || vanished[0]["agent_kind"] != "kind-a")) {
+				t.Errorf("vanished-block records = %v, want %d, an INFO with rule_name and agent_kind", vanished, map[bool]int{true: 1}[tt.wantRecord])
+			}
+		})
+	}
+}
+
+func (m *mockRetryStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (m *mockRetryStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func TestHandleRetryTimer_ReactionRetryRecordsNoHandedOffComments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		issueState  string
+		wantRunning bool
+	}{
+		{"a dispatched retry", "In Progress", true},
+		{"a retry that releases the claim for a terminal issue", "Done", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const id = "ISS-RETRY-REC"
+			state := frozenRetryState(id, RetryEntry{
+				Attempt:      1,
+				ReactionKind: ReactionKindReview,
+				ContinuationContext: map[string]any{
+					reviewCommentsKey: buildReviewTemplateMap([]domain.ReviewComment{summaryComment("a"), inlineComment("b")}),
+				},
+			})
+			store := newFingerprintModelStore()
+			tracker := &mockRetryTracker{fetchedIssue: candidateIssue(id, id, tt.issueState)}
+			params := defaultRetryParams(t, &mockRetryStore{}, tracker)
+			params.Store = store
+
+			HandleRetryTimer(state, id, params)
+			t.Cleanup(state.WorkerWg.Wait)
+
+			if _, running := state.Running[id]; running != tt.wantRunning {
+				t.Errorf("Running[%s] present = %v, want %v", id, running, tt.wantRunning)
+			}
+			assertStoredHandedOff(t, store, id, ReactionKindReview)
+			assertStoredHandedOff(t, store, id, ReactionKindBotReview)
+		})
+	}
+}
+
+func (m *mockRetryStore) DeleteStageHop(context.Context, string) error { return nil }
+
+func (m *mockRetryStore) MarkStageHopDispatched(context.Context, string) error { return nil }

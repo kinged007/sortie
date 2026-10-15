@@ -34,7 +34,7 @@ import (
 // reports nil when the group no longer exists, since expiry is expected
 // during best-effort cleanup.
 func signalProcessGroup(pid int, sig syscall.Signal) error {
-	return procutil.SignalProcessGroup(pid, sig)
+	return procgroup.Signal(pid, sig)
 }
 
 // assertSessionGroupAbsent confirms the process group session's launch
@@ -98,7 +98,7 @@ func startBoundedLaunch(commandPath string, argv []string, dir string, env []str
 
 	stdout := &lineBoundedWriter{limit: 1 << 20}
 	stderr := &lineBoundedWriter{limit: 1 << 20}
-	capture, err := procutil.StartCapture(cmd, procutil.CaptureParams{Stdout: stdout, Stderr: stderr, DrainGrace: nativeDrainBound})
+	capture, err := procutil.StartCapture(ctx, cmd, procutil.CaptureParams{Stdout: stdout, Stderr: stderr, DrainGrace: nativeDrainBound})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -275,7 +275,7 @@ func runPublishedPostureProbe(t *testing.T, coords Coordinates, envWrapper strin
 		t.Fatalf("build the published-posture probe argv: %v", err)
 	}
 
-	adapter, err := clientprotocol.NewClientProtocolAdapter(nil)
+	adapter, err := clientprotocol.NewClientProtocolAdapter()
 	if err != nil {
 		t.Fatalf("construct the published-posture probe adapter: %v", err)
 	}

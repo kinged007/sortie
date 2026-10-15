@@ -63,12 +63,11 @@ import (
 
 func init() {
 	registry.Trackers.RegisterWithMeta("gitlab", NewGitLabAdapter, registry.TrackerMeta{
-		RequiresProject:       true,
-		RequiresAPIKey:        true,
-		DefaultActiveStates:   defaultActiveStates,
-		DefaultTerminalStates: defaultTerminalStates,
-		ValidateTrackerConfig: validateConfig,
-		BlockerSource:         registry.BlockersUnsupported,
+		RequiresProject:        true,
+		RequiresAPIKey:         true,
+		RequiresTerminalStates: true,
+		ValidateTrackerConfig:  validateConfig,
+		BlockerSource:          registry.BlockersUnsupported,
 	})
 }
 
@@ -86,24 +85,19 @@ const maxPages = 200
 // one.
 const stateBatchSize = 50
 
-// defaultActiveStates is applied when the config omits active_states.
-var defaultActiveStates = issuekit.DefaultActiveLabelStates()
-
-// defaultTerminalStates is applied when the config omits terminal_states.
-var defaultTerminalStates = issuekit.DefaultTerminalLabelStates()
-
 // GitLabAdapter implements [domain.TrackerAdapter] against the GitLab REST
 // API v4. All fields except metrics are set once at construction and never
-// mutated, so the adapter is safe for concurrent use.
+// mutated, and the embedded state source is safe for concurrent use, so the
+// adapter is safe for concurrent use.
 type GitLabAdapter struct {
-	client         *httpkit.Client
-	project        string
-	projectPath    string
-	activeStates   []string
-	terminalStates []string
-	handoffState   string
-	log            *slog.Logger
-	metrics        domain.Metrics
+	*issuekit.StateSource
+
+	client      *httpkit.Client
+	project     string
+	projectPath string
+	model       *issuekit.LabelStateModel
+	log         *slog.Logger
+	metrics     domain.Metrics
 
 	// queryFilter holds the validated tracker.query_filter parameters, or
 	// nil when the key is unset. Never mutated after construction.
@@ -365,29 +359,10 @@ func NewGitLabAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		baseURL += "/api/v4"
 	}
 
-	activeRaw := typeutil.ExtractStringSlice(config["active_states"])
-	if len(activeRaw) == 0 {
-		activeRaw = defaultActiveStates
+	initialStates, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
-	activeStates := make([]string, len(activeRaw))
-	for i, s := range activeRaw {
-		activeStates[i] = strings.ToLower(s)
-	}
-
-	terminalRaw := typeutil.ExtractStringSlice(config["terminal_states"])
-	if len(terminalRaw) == 0 {
-		terminalRaw = defaultTerminalStates
-	}
-	terminalStates := make([]string, len(terminalRaw))
-	for i, s := range terminalRaw {
-		terminalStates[i] = strings.ToLower(s)
-	}
-
-	handoffRaw, fault := typeutil.StringField(config, "handoff_state")
-	if fault != nil {
-		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
-	}
-	handoffState := strings.ToLower(strings.TrimSpace(handoffRaw))
 
 	userAgent, fault := typeutil.StringField(config, "user_agent")
 	if fault != nil {
@@ -401,19 +376,21 @@ func NewGitLabAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	client := newGitLabClient(baseURL, apiKey, userAgent)
 	log := slog.Default()
 
-	configuredStates := configuredStateNames(activeStates, terminalStates, handoffState)
+	source := issuekit.NewStateSource(initialStates)
+	model := issuekit.NewLabelStateModel(source, log)
+	constructed := model.Snapshot()
+	configuredStates := configuredStateNames(constructed.Active, constructed.Terminal, constructed.Handoff)
 	stateLabelCasing, err := runPreflight(context.Background(), client, projectPath, configuredStates, log)
 	if err != nil {
 		return nil, err
 	}
 
 	adapter := &GitLabAdapter{
+		StateSource:      source,
 		client:           client,
 		project:          project,
 		projectPath:      projectPath,
-		activeStates:     activeStates,
-		terminalStates:   terminalStates,
-		handoffState:     handoffState,
+		model:            model,
 		log:              log,
 		queryFilter:      queryFilter,
 		stateLabelCasing: stateLabelCasing,
@@ -435,13 +412,26 @@ func configuredStateNames(activeStates, terminalStates []string, handoffState st
 	return names
 }
 
-// canonicalLabel returns the stored casing of lowered when
-// stateLabelCasing knows it, else lowered unchanged.
-func (a *GitLabAdapter) canonicalLabel(lowered string) string {
+// storedStateLabel returns the casing the project stores for the lowercased
+// state label. A label the construction-time casing map lacks, such as one a
+// reload added, is resolved against a fresh catalog read.
+func (a *GitLabAdapter) storedStateLabel(ctx context.Context, lowered string) string {
 	if casing, ok := a.stateLabelCasing[lowered]; ok {
 		return casing
 	}
-	return lowered
+	return catalogCasing(ctx, a.client, a.projectPath, a.log, lowered)
+}
+
+func (a *GitLabAdapter) readProjectLabelNames(ctx context.Context) ([]string, error) {
+	catalog, err := fetchProjectLabels(ctx, a.client, a.projectPath, a.log)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(catalog))
+	for i, label := range catalog {
+		names[i] = label.Name
+	}
+	return names, nil
 }
 
 // warnUnresolvedFilterLabels warns once for each distinct label name in
@@ -607,9 +597,9 @@ func parseIID(raw string) (int, bool) {
 	return n, true
 }
 
-// listAndFilter paginates the issue-list route for the given native state
-// and returns issues whose derived state is in keep. Comments is nil on
-// every returned issue.
+// listIssues paginates the issue-list route for the given native state and
+// returns every issue with its state derived under s, the states that read
+// no state included. Comments is nil on every returned issue.
 //
 // State filtering stays client-side: the configured state labels are
 // never pushed into the labels query parameter, whose AND semantics and
@@ -618,7 +608,7 @@ func parseIID(raw string) (int, bool) {
 // configured, its parameters replace the adapter's own value for any
 // matching key before the request is issued; when applyFilter is false
 // the request carries only the adapter-owned parameters.
-func (a *GitLabAdapter) listAndFilter(ctx context.Context, nativeState string, keep map[string]bool, applyFilter bool) ([]domain.Issue, error) {
+func (a *GitLabAdapter) listIssues(ctx context.Context, s issuekit.LabelStates, nativeState string, applyFilter bool) ([]domain.Issue, error) {
 	path := "/projects/" + a.projectPath + "/issues"
 	params := url.Values{
 		"state":      {nativeState},
@@ -644,32 +634,40 @@ func (a *GitLabAdapter) listAndFilter(ctx context.Context, nativeState string, k
 		if gi.IssueType != "" && gi.IssueType != "issue" {
 			continue
 		}
-		issue := normalizeIssue(gi, a.project, a.activeStates, a.terminalStates, a.handoffState, a.log)
-		if !keep[issue.State] {
-			continue
-		}
-		issue.Comments = nil
-		out = append(out, issue)
+		out = append(out, normalizeIssue(gi, a.project, a.model, s))
 	}
 	return out, nil
 }
 
+func keepStates(issues []domain.Issue, states map[string]bool) []domain.Issue {
+	kept := make([]domain.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue.State != "" && states[issue.State] {
+			kept = append(kept, issue)
+		}
+	}
+	return kept
+}
+
 // FetchCandidateIssues returns opened issues whose derived state is in the
 // configured active states, oldest-first as ordered by the server, with
-// Comments nil on every returned issue.
+// Comments nil on every returned issue. An opened issue carrying no state
+// label is not a candidate. It returns an empty slice with no request when
+// the active states are empty.
 func (a *GitLabAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
-		keep := make(map[string]bool, len(a.activeStates))
-		for _, s := range a.activeStates {
-			keep[s] = true
+		states := a.model.Snapshot()
+		if len(states.Active) == 0 {
+			return nil
 		}
+		a.model.CheckActiveLabels(ctx, states, a.readProjectLabelNames)
 
-		fetched, fetchErr := a.listAndFilter(ctx, "opened", keep, true)
+		open, fetchErr := a.listIssues(ctx, states, "opened", true)
 		if fetchErr != nil {
 			return fetchErr
 		}
-		issues = fetched
+		issues = a.model.Candidates(states, open)
 		return nil
 	})
 	return issues, err
@@ -695,8 +693,9 @@ func (a *GitLabAdapter) FetchIssuesByStates(ctx context.Context, states []string
 		requested[strings.ToLower(s)] = true
 	}
 
-	terminalSet := make(map[string]bool, len(a.terminalStates))
-	for _, s := range a.terminalStates {
+	snapshot := a.model.Snapshot()
+	terminalSet := make(map[string]bool, len(snapshot.Terminal))
+	for _, s := range snapshot.Terminal {
 		terminalSet[s] = true
 	}
 
@@ -715,19 +714,19 @@ func (a *GitLabAdapter) FetchIssuesByStates(ctx context.Context, states []string
 		result := make([]domain.Issue, 0)
 
 		if needOpened {
-			opened, fetchErr := a.listAndFilter(ctx, "opened", requested, true)
+			opened, fetchErr := a.listIssues(ctx, snapshot, "opened", true)
 			if fetchErr != nil {
 				return fetchErr
 			}
-			result = append(result, opened...)
+			result = append(result, keepStates(opened, requested)...)
 		}
 
 		if needClosed {
-			closed, fetchErr := a.listAndFilter(ctx, "closed", requested, false)
+			closed, fetchErr := a.listIssues(ctx, snapshot, "closed", false)
 			if fetchErr != nil {
 				return fetchErr
 			}
-			result = append(result, closed...)
+			result = append(result, keepStates(closed, requested)...)
 		}
 
 		issues = result
@@ -810,7 +809,7 @@ func (a *GitLabAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 			}
 		}
 
-		fetched := normalizeIssue(gi, a.project, a.activeStates, a.terminalStates, a.handoffState, a.log)
+		fetched := normalizeIssue(gi, a.project, a.model, a.model.Snapshot())
 
 		comments, commentsErr := a.fetchComments(ctx, decimal)
 		if commentsErr != nil {
@@ -871,6 +870,7 @@ func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []strin
 		return map[string]string{}, nil
 	}
 
+	snapshot := a.model.Snapshot()
 	states := make(map[string]string, len(requested))
 	for chunkStart := 0; chunkStart < len(order); chunkStart += stateBatchSize {
 		if ctx.Err() != nil {
@@ -901,8 +901,7 @@ func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []strin
 			if !ok {
 				continue
 			}
-			derived := issuekit.DeriveLabelState(gi.Labels, gi.State, "opened", "closed",
-				issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState}, strconv.Itoa(gi.IID), a.log)
+			derived := a.model.Derive(snapshot, strconv.Itoa(gi.IID), gi.Labels, gi.isClosed())
 			for _, key := range keys {
 				states[key] = derived
 			}
@@ -955,33 +954,24 @@ type gitlabIssueUpdate struct {
 	RemoveLabels []string `json:"remove_labels,omitempty"`
 }
 
-// TransitionIssue moves an issue to targetState by swapping its state
-// label and reconciling the native open/closed status in one PUT request.
-// targetState is compared case-insensitively against the configured
-// active, terminal, and handoff states; a value matching none of them, or
-// an empty string, returns [domain.ErrTrackerPayload] before any request.
-// issueID is guarded through [parseIID] before the GET; a rejected value,
-// a missing iid, or an entity whose issue_type is set and is not "issue"
-// returns [domain.ErrTrackerNotFound].
+// TransitionIssue moves an issue to targetState by planning the label and
+// open/closed writes with [issuekit.LabelStates.PlanTransition] and applying
+// them in order. targetState is compared case-insensitively against the
+// configured active, terminal, and handoff states; a value matching none of
+// them, an empty string, or a handoff target on a closed issue returns
+// [domain.ErrTrackerPayload]. issueID is guarded through [parseIID] before
+// the GET; a rejected value, a missing iid, or an entity whose issue_type is
+// set and is not "issue" returns [domain.ErrTrackerNotFound].
 //
-// Every case variant of the label being replaced, and any pre-existing
-// variant of the label being attached, is cleared in the same request, so
-// a project already holding a case-duplicate label does not accumulate
-// state labels on every transition. A transition that is already
-// converged issues no PUT and returns nil.
+// The state labels change in one update request that adds the target and
+// removes every case variant of each label being replaced, so a project
+// already holding a case-duplicate label does not accumulate state labels on
+// every transition; the response must carry the target and none of the stale
+// labels. A close or reopen is a request of its own, because GitLab applies
+// a state_event before the labels of the same request. A transition that is
+// already converged issues no PUT and returns nil.
 func (a *GitLabAdapter) TransitionIssue(ctx context.Context, issueID, targetState string) error {
 	return trackermetrics.Track(a.metrics, "transition", func() error {
-		targetLower := strings.ToLower(targetState)
-		isHandoffTarget := a.handoffState != "" && targetLower == a.handoffState
-		if !slices.Contains(a.activeStates, targetLower) &&
-			!slices.Contains(a.terminalStates, targetLower) &&
-			!isHandoffTarget {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: fmt.Sprintf("invalid target state: %q is not a configured active, terminal, or handoff state", targetState),
-			}
-		}
-
 		n, ok := parseIID(issueID)
 		if !ok {
 			return &domain.TrackerError{
@@ -1017,40 +1007,93 @@ func (a *GitLabAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 			}
 		}
 
-		currentLower := issuekit.CurrentLabelState(gi.Labels,
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState})
+		plan, err := a.model.Snapshot().PlanTransition(targetState, gi.Labels, gi.isClosed())
+		if err != nil {
+			return err
+		}
+		return issuekit.ApplyTransition(ctx, plan, issuekit.TransitionOps{
+			Swap:      a.swapStateLabels(path, gi.Labels, strings.ToLower(targetState)),
+			SetClosed: a.setClosed(path),
+		})
+	})
+}
 
-		var addLabels, removeLabels []string
-		if currentLower != targetLower {
-			target := a.canonicalLabel(targetLower)
-			addLabels = []string{target}
-			if currentLower != "" {
-				removeLabels = append(removeLabels, labelVariants(gi.Labels, currentLower)...)
-			}
-			for _, variant := range labelVariants(gi.Labels, targetLower) {
-				if variant != target {
-					removeLabels = append(removeLabels, variant)
+// swapStateLabels returns the one label request of a transition to target.
+// stored holds the labels the issue carried when it was read, which supply
+// every spelling that remove_labels must name because GitLab matches names
+// exactly.
+func (a *GitLabAdapter) swapStateLabels(path string, stored []string, target string) func(ctx context.Context, add string, remove []string) error {
+	return func(ctx context.Context, add string, remove []string) error {
+		canonical := a.storedStateLabel(ctx, target)
+		var update gitlabIssueUpdate
+		if add != "" {
+			update.AddLabels = []string{canonical}
+		}
+		for _, state := range remove {
+			update.RemoveLabels = append(update.RemoveLabels, issuekit.LabelVariants(stored, state)...)
+		}
+		if slices.Contains(stored, canonical) {
+			for _, variant := range issuekit.LabelVariants(stored, target) {
+				if variant != canonical {
+					update.RemoveLabels = append(update.RemoveLabels, variant)
 				}
 			}
 		}
 
-		stateEvent := ""
-		switch {
-		case slices.Contains(a.terminalStates, targetLower) && gi.State == "opened":
-			stateEvent = "close"
-		case slices.Contains(a.activeStates, targetLower) && gi.State == "closed":
-			stateEvent = "reopen"
+		write, err := putLabels(ctx, a.client, path, update)
+		if err != nil {
+			return err
 		}
-
-		if len(addLabels) == 0 && len(removeLabels) == 0 && stateEvent == "" {
-			return nil
+		after := write.After
+		if !write.Reported {
+			if after, err = a.readIssueLabels(ctx, path); err != nil {
+				return err
+			}
 		}
+		return confirmSwap(after, target, remove)
+	}
+}
 
-		payload, err := json.Marshal(gitlabIssueUpdate{
-			StateEvent:   stateEvent,
-			AddLabels:    addLabels,
-			RemoveLabels: removeLabels,
-		})
+func (a *GitLabAdapter) readIssueLabels(ctx context.Context, path string) ([]string, error) {
+	read, err := gitlabLabelOps(a.client, a.log, a.projectPath, path, true).Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(read))
+	for i, label := range read {
+		names[i] = label.Name
+	}
+	return names, nil
+}
+
+// confirmSwap returns [domain.ErrTrackerPayload] unless after carries target
+// and none of the stale states: GitLab answers a label edit the token may not
+// make with success.
+func confirmSwap(after []string, target string, stale []string) error {
+	if len(issuekit.LabelVariants(after, target)) == 0 {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: fmt.Sprintf("tracker accepted label %q and the issue does not carry it", target),
+		}
+	}
+	for _, state := range stale {
+		if len(issuekit.LabelVariants(after, state)) > 0 {
+			return &domain.TrackerError{
+				Kind:    domain.ErrTrackerPayload,
+				Message: fmt.Sprintf("tracker accepted removal of label %q and the issue still carries it", state),
+			}
+		}
+	}
+	return nil
+}
+
+func (a *GitLabAdapter) setClosed(path string) func(ctx context.Context, closed bool) error {
+	return func(ctx context.Context, closed bool) error {
+		event := "reopen"
+		if closed {
+			event = "close"
+		}
+		payload, err := json.Marshal(gitlabIssueUpdate{StateEvent: event})
 		if err != nil {
 			return &domain.TrackerError{
 				Kind:    domain.ErrTrackerPayload,
@@ -1058,10 +1101,9 @@ func (a *GitLabAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 				Err:     err,
 			}
 		}
-
 		_, err = a.client.Send(ctx, http.MethodPut, path, bytes.NewReader(payload))
 		return err
-	})
+	}
 }
 
 // CommentIssue posts text verbatim as a new issue note. No Markdown
@@ -1078,66 +1120,79 @@ func (a *GitLabAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 // WARN; the note text itself is never logged.
 func (a *GitLabAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		n, ok := parseIID(issueID)
-		if !ok {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerNotFound,
-				Message: fmt.Sprintf("issue not found: %s", issueID),
-			}
-		}
-		path := "/projects/" + a.projectPath + "/issues/" + strconv.Itoa(n) + "/notes"
-
-		payload, err := json.Marshal(map[string]string{"body": text})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal comment payload",
-				Err:     err,
-			}
-		}
-
-		respBody, err := a.client.Send(ctx, http.MethodPost, path, bytes.NewReader(payload))
-		if err != nil {
-			return err
-		}
-
-		var created gitlabNoteCreated
-		if err := json.Unmarshal(respBody, &created); err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to parse note-creation response",
-				Err:     err,
-			}
-		}
-
-		if len(created.CommandsChanges) > 0 {
-			keys := make([]string, 0, len(created.CommandsChanges))
-			for key := range created.CommandsChanges {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			a.log.Warn("gitlab executed quick actions in a comment body",
-				slog.String("iid", strconv.Itoa(n)),
-				slog.Any("commands", keys))
-		}
-
-		if created.ID == nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: fmt.Sprintf("gitlab created no note for issue %s: the comment body was consumed as quick actions", issueID),
-			}
-		}
-		return nil
+		return a.postComment(ctx, issueID, text)
 	})
 }
 
+// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
+// code block, so the tracker shows literal verbatim.
+func (a *GitLabAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) error {
+	n, ok := parseIID(issueID)
+	if !ok {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerNotFound,
+			Message: fmt.Sprintf("issue not found: %s", issueID),
+		}
+	}
+	path := "/projects/" + a.projectPath + "/issues/" + strconv.Itoa(n) + "/notes"
+
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal comment payload",
+			Err:     err,
+		}
+	}
+
+	respBody, err := a.client.Send(ctx, http.MethodPost, path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	var created gitlabNoteCreated
+	if err := json.Unmarshal(respBody, &created); err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to parse note-creation response",
+			Err:     err,
+		}
+	}
+
+	if len(created.CommandsChanges) > 0 {
+		keys := make([]string, 0, len(created.CommandsChanges))
+		for key := range created.CommandsChanges {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		a.log.Warn("gitlab executed quick actions in a comment body",
+			slog.String("iid", strconv.Itoa(n)),
+			slog.Any("commands", keys))
+	}
+
+	if created.ID == nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: fmt.Sprintf("gitlab created no note for issue %s: the comment body was consumed as quick actions", issueID),
+		}
+	}
+	return nil
+}
+
 // AddLabel attaches label to the issue, resolving its canonical stored
-// casing against the project label catalog first. issueID is guarded
-// through [parseIID] before any request; a rejected value or a missing
-// iid returns [domain.ErrTrackerNotFound]. An empty or whitespace-only
-// label attaches nothing, issues no request, returns nil, and logs a
-// WARN, so a caller reading nil as a successful escalation is not the
-// only record of the condition.
+// casing against the project label catalog first, and confirms it against the
+// issue's labels. issueID is guarded through [parseIID] before any request; a
+// rejected value or a missing iid returns [domain.ErrTrackerNotFound]. A
+// label with no character other than white space returns
+// [domain.ErrTrackerPayload] without a request. A label with surrounding
+// white space attaches its trimmed spelling and fails the confirmation, which
+// compares the label as given.
 //
 // The catalog is read fresh on every call, never from the
 // construction-time casing map, because an escalation label is not a
@@ -1148,46 +1203,41 @@ func (a *GitLabAdapter) CommentIssue(ctx context.Context, issueID, text string) 
 // mismatches through the catalog, and lowercasing here would itself
 // create the case-variant duplicate the catalog resolution exists to
 // prevent. The attach is additive and may create the label as a
-// server-side side effect when it does not already exist.
+// server-side side effect when it does not already exist. GitLab answers a
+// label edit the token may not make with success, so a label the issue does
+// not carry afterwards returns [domain.ErrTrackerPayload].
 func (a *GitLabAdapter) AddLabel(ctx context.Context, issueID, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		n, ok := parseIID(issueID)
-		if !ok {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerNotFound,
-				Message: fmt.Sprintf("issue not found: %s", issueID),
-			}
-		}
-
-		name := strings.TrimSpace(label)
-		if name == "" {
-			a.log.Warn("gitlab add_label received an empty label; nothing attached",
-				slog.String("iid", strconv.Itoa(n)))
-			return nil
-		}
-
-		catalog, err := fetchProjectLabels(ctx, a.client, a.projectPath, a.log)
-		if err != nil {
-			a.log.Warn("gitlab label catalog unavailable; attaching the configured spelling",
-				slog.Any("error", err))
-		} else {
-			casing := resolveCasing(catalog, []string{name})
-			if stored, ok := casing[strings.ToLower(name)]; ok {
-				name = stored
-			}
-		}
-
-		path := "/projects/" + a.projectPath + "/issues/" + strconv.Itoa(n)
-		payload, err := json.Marshal(gitlabIssueUpdate{AddLabels: []string{name}})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal add-label payload",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, http.MethodPut, path, bytes.NewReader(payload))
-		return err
+		return a.withLabelOps(issueID, func(ops issuekit.IssueLabelOps) error {
+			return issuekit.AddIssueLabel(ctx, label, ops)
+		})
 	})
+}
+
+// RemoveLabel removes every label of the issue that names label, ignoring
+// letter case, in one request, and confirms the removal against the issue's
+// labels. issueID is guarded through [parseIID] before any request; a
+// rejected value, a missing iid, or an entity whose issue_type is set and is
+// not "issue" returns [domain.ErrTrackerNotFound]. An issue that carries no
+// such label receives no write. A label with no character other than white
+// space returns [domain.ErrTrackerPayload] without a request, as does a label
+// the issue still carries after the write.
+func (a *GitLabAdapter) RemoveLabel(ctx context.Context, issueID, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return a.withLabelOps(issueID, func(ops issuekit.IssueLabelOps) error {
+			return issuekit.RemoveIssueLabel(ctx, label, ops)
+		})
+	})
+}
+
+func (a *GitLabAdapter) withLabelOps(issueID string, run func(issuekit.IssueLabelOps) error) error {
+	n, ok := parseIID(issueID)
+	if !ok {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerNotFound,
+			Message: fmt.Sprintf("issue not found: %s", issueID),
+		}
+	}
+	path := "/projects/" + a.projectPath + "/issues/" + strconv.Itoa(n)
+	return run(gitlabLabelOps(a.client, a.log, a.projectPath, path, true))
 }

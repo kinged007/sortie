@@ -82,6 +82,8 @@ func (m *mergeabilitySCM) RemoveLabel(_ context.Context, _ int, _, _, _ string) 
 // than canned values. Only the fingerprint methods carry behavior; the rest
 // satisfy the interface.
 type statefulFingerprintStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	fingerprints map[string]fingerprintRecord
@@ -291,6 +293,7 @@ func TestReconcileMergeConflicts_Dispatch(t *testing.T) {
 
 	state := stateWithMergeConflict(t, "MC-D1", 42)
 	rkey := ReactionKey("MC-D1", ReactionKindMergeConflict)
+	state.PendingReactions[rkey].RuleSettingsApplied = true
 	store := newStatefulFingerprintStore()
 	metrics := newMergeConflictMetricsSpy()
 	scm := &mergeabilitySCM{fn: func() (domain.PRMergeStatus, error) {
@@ -312,6 +315,9 @@ func TestReconcileMergeConflicts_Dispatch(t *testing.T) {
 	}
 	if retry.ReactionKind != ReactionKindMergeConflict {
 		t.Errorf("RetryEntry.ReactionKind = %q, want %q", retry.ReactionKind, ReactionKindMergeConflict)
+	}
+	if !retry.RuleSettingsApplied {
+		t.Error("RetryEntry.RuleSettingsApplied = false, want the pending reaction's flag carried")
 	}
 	if retry.ContinuationContext == nil {
 		t.Fatal("RetryEntry.ContinuationContext is nil; want merge_conflict map")
@@ -556,7 +562,6 @@ func TestReconcileMergeConflicts_Escalate(t *testing.T) {
 	}}
 	params := mergeConflictParams(store, scm, tracker)
 
-	// Tick 1: the first head is dirty -> dispatch, attempts == 1 (1 > 1 false).
 	head = "H1"
 	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
 	if state.ReactionAttempts[rkey] != 1 {
@@ -566,8 +571,6 @@ func TestReconcileMergeConflicts_Escalate(t *testing.T) {
 		t.Fatalf("after tick 1: dispatched = %d, want 1", metrics.checks["dispatched"])
 	}
 
-	// The agent rebased to a NEW head that is still dirty. A worker exit
-	// frees the tick-1 retry entry and re-seeds the slot; run tick 2.
 	head = "H2"
 	CancelRetry(state, issueID)
 	state.PendingReactions[rkey] = newMergeConflictPending(issueID, 77)
@@ -578,13 +581,12 @@ func TestReconcileMergeConflicts_Escalate(t *testing.T) {
 	if scm.calls != 2 {
 		t.Errorf("GetMergeability calls = %d, want 2 (read NOT skipped on tick 2)", scm.calls)
 	}
-	// Strict over-limit: attempts 2, 2 > 1 true -> escalate. The counter is
-	// deleted on the escalation exit (episodic reset), so it is ABSENT.
-	if _, ok := state.ReactionAttempts[rkey]; ok {
-		t.Errorf("ReactionAttempts[%s] present after escalation = %d, want absent (episodic reset)", rkey, state.ReactionAttempts[rkey])
+	firstSubject := assertEscalationBegan(t, state, rkey, EscalationTriggerBudget).EscalationSubject
+	if firstSubject == "" {
+		t.Error("EscalationSubject is empty, want the head fingerprint")
 	}
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("merge-conflict slot still present after escalation; want deleted")
+	if state.ReactionAttempts[rkey] != 1 {
+		t.Errorf("ReactionAttempts[%s] = %d, want 1 (the rebases dispatched, without the observation that tripped the cap)", rkey, state.ReactionAttempts[rkey])
 	}
 	if metrics.escalations["label"] != 1 {
 		t.Errorf(`IncMergeConflictEscalations("label") = %d, want 1 (exactly one escalation)`, metrics.escalations["label"])
@@ -592,80 +594,39 @@ func TestReconcileMergeConflicts_Escalate(t *testing.T) {
 	if tracker.addLabelCalled != 1 {
 		t.Errorf("AddLabel calls = %d, want 1", tracker.addLabelCalled)
 	}
-	// No second dispatch on the escalation tick.
 	if metrics.checks["dispatched"] != 1 {
 		t.Errorf(`IncMergeConflictChecks("dispatched") = %d, want 1 (no dispatch on escalation tick)`, metrics.checks["dispatched"])
 	}
 	if store.deleteCalls != 1 {
 		t.Errorf("DeleteReactionFingerprint calls = %d, want 1 during escalation", store.deleteCalls)
 	}
-	// Claim must NOT be released by escalation.
 	if _, ok := state.Claimed[issueID]; !ok {
 		t.Error("state.Claimed cleared by merge-conflict escalation; want preserved")
 	}
-}
 
-func TestReconcileMergeConflicts_EscalationResetsCounterReArm(t *testing.T) {
-	t.Parallel()
-
-	issueID := "MC-AC15"
-	state := stateWithMergeConflict(t, issueID, 88)
-	rkey := ReactionKey(issueID, ReactionKindMergeConflict)
-	store := newStatefulFingerprintStore()
-	metrics := newMergeConflictMetricsSpy()
-	tracker := &ciTrackerStub{}
-
-	var head string
-	scm := &mergeabilitySCM{fn: func() (domain.PRMergeStatus, error) {
-		return dirtyStatus(head, "main"), nil
-	}}
-	params := mergeConflictParams(store, scm, tracker)
-
-	// Tick 1: the first head is dirty -> dispatch, attempts 1.
-	head = "H1"
-	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
-	if state.ReactionAttempts[rkey] != 1 {
-		t.Fatalf("after tick 1: ReactionAttempts = %d, want 1", state.ReactionAttempts[rkey])
-	}
-
-	// Tick 2: a still-dirty new head -> attempts 2, 2 > 1 -> escalate, counter
-	// deleted. A worker exit frees the tick-1 retry entry before this tick.
-	head = "H2"
-	CancelRetry(state, issueID)
-	state.PendingReactions[rkey] = newMergeConflictPending(issueID, 88)
+	makeDue(t, state, rkey)
 	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
 	state.TrackerOpsWg.Wait()
-	if _, ok := state.ReactionAttempts[rkey]; ok {
-		t.Fatalf("after tick 2: ReactionAttempts present, want absent (escalation reset)")
-	}
-	if metrics.escalations["label"] != 1 {
-		t.Fatalf("after tick 2: escalations[label] = %d, want 1", metrics.escalations["label"])
-	}
 
-	// A normal worker exit re-seeds the merge-conflict slot. There is NO clean
-	// observation between the escalation and the next conflict.
-	state.PendingReactions[rkey] = newMergeConflictPending(issueID, 88)
+	if metrics.escalations["label"] != 1 || metrics.checks["dispatched"] != 1 || len(state.RetryAttempts) != 0 {
+		t.Errorf("standing pass: escalations = %d, dispatched = %d, retries = %d, want 1, 1, 0", metrics.escalations["label"], metrics.checks["dispatched"], len(state.RetryAttempts))
+	}
+	assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
 
-	// Tick 3: a NEW dirty third head -> because the escalation reset the
-	// counter, attempts goes to 1 (not 2), 1 > 1 is false, so the orchestrator
-	// DISPATCHES fresh rather than escalating. Without the escalation-time
-	// counter reset, the counter would still read 2 and the third head would
-	// escalate at attempts 3 with zero rebase dispatches.
 	head = "H3"
+	makeDue(t, state, rkey)
 	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
 	state.TrackerOpsWg.Wait()
 
-	if state.ReactionAttempts[rkey] != 1 {
-		t.Errorf("after tick 3: ReactionAttempts = %d, want 1 (fresh episode, no intervening clean tick)", state.ReactionAttempts[rkey])
+	next := assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
+	if next.EscalationSubject == firstSubject {
+		t.Errorf("EscalationSubject = %q after a new head, want a subject different from the first escalation", next.EscalationSubject)
 	}
-	if metrics.checks["dispatched"] != 2 {
-		t.Errorf("after tick 3: dispatched = %d, want 2 (fresh dispatch, not escalation)", metrics.checks["dispatched"])
+	if metrics.escalations["label"] != 2 {
+		t.Errorf("after the new head: escalations[label] = %d, want 2 (a new head is a new subject)", metrics.escalations["label"])
 	}
-	if metrics.escalations["label"] != 1 {
-		t.Errorf("after tick 3: escalations[label] = %d, want 1 (no second escalation)", metrics.escalations["label"])
-	}
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("after tick 3: slot still present, want consumed by fresh dispatch")
+	if metrics.checks["dispatched"] != 1 || state.ReactionAttempts[rkey] != 1 {
+		t.Errorf("after the new head: dispatched = %d, ReactionAttempts = %d, want 1, 1 (the budget is still spent)", metrics.checks["dispatched"], state.ReactionAttempts[rkey])
 	}
 }
 
@@ -1257,17 +1218,14 @@ func TestReconcileRunningIssues_MergeConflictOrdering(t *testing.T) {
 	})
 }
 
-// TestReconcileMergeConflicts_ForeignIncumbentDefers covers the deferral
-// half of the retry-slot arbitration check at the top of the dirty
-// branch: a foreign incumbent survives, MarkReactionDispatched is not
-// called for the merge-conflict kind, and the merge-conflict
-// ReactionAttempts counter does not move.
 func TestReconcileMergeConflicts_ForeignIncumbentDefers(t *testing.T) {
 	t.Parallel()
 
 	const issueID = "MC-DEFER"
 	state := stateWithMergeConflict(t, issueID, 10)
 	rkey := ReactionKey(issueID, ReactionKindMergeConflict)
+	seededAt := mcBaseTime.Add(-5 * time.Minute)
+	state.PendingReactions[rkey].CreatedAt = seededAt
 	state.RetryAttempts[issueID] = &RetryEntry{
 		IssueID:      issueID,
 		Attempt:      1,
@@ -1280,6 +1238,7 @@ func TestReconcileMergeConflicts_ForeignIncumbentDefers(t *testing.T) {
 		return dirtyStatus("head-defer", "main"), nil
 	}}
 	params := mergeConflictParams(store, scm, nil)
+	params.MergeConflictPendingTTL = 10 * time.Minute
 
 	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
 
@@ -1287,8 +1246,11 @@ func TestReconcileMergeConflicts_ForeignIncumbentDefers(t *testing.T) {
 	if !ok {
 		t.Fatal("PendingReactions entry dropped on a defer; want re-enqueued")
 	}
-	if !entry.CreatedAt.Equal(mcBaseTime) {
-		t.Errorf("CreatedAt = %v, want refreshed to %v", entry.CreatedAt, mcBaseTime)
+	if !entry.CreatedAt.Equal(seededAt) {
+		t.Errorf("CreatedAt = %v, want %v (a deferral leaves it unchanged)", entry.CreatedAt, seededAt)
+	}
+	if !entry.WatchRestartedAt.Equal(mcBaseTime) {
+		t.Errorf("WatchRestartedAt = %v, want %v (the deferral restarts the watch window)", entry.WatchRestartedAt, mcBaseTime)
 	}
 	incumbent := state.RetryAttempts[issueID]
 	if incumbent.ReactionKind != ReactionKindCI {
@@ -1303,12 +1265,18 @@ func TestReconcileMergeConflicts_ForeignIncumbentDefers(t *testing.T) {
 	if metrics.checks["dispatched"] != 0 {
 		t.Errorf(`IncMergeConflictChecks("dispatched") = %d, want 0`, metrics.checks["dispatched"])
 	}
+
+	// Past the window measured from creation (seededAt + 10m), inside the
+	// restarted one (mcBaseTime + 10m).
+	params.NowFunc = func() time.Time { return mcBaseTime.Add(8 * time.Minute) }
+
+	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
+
+	if _, ok := state.PendingReactions[rkey]; !ok {
+		t.Error("PendingReactions entry dropped past its creation-based window but inside the restarted one; want kept")
+	}
 }
 
-// TestReconcileMergeConflicts_FreeSlotControlDispatches is the free-slot
-// control paired with TestReconcileMergeConflicts_ForeignIncumbentDefers:
-// the same dirty setup, but with no incumbent occupying the slot, results
-// in a merge-conflict retry and exactly one MarkReactionDispatched call.
 func TestReconcileMergeConflicts_FreeSlotControlDispatches(t *testing.T) {
 	t.Parallel()
 
@@ -1644,9 +1612,7 @@ func TestReconcileMergeConflicts_Triage_Escalate(t *testing.T) {
 	if state.ReactionAttempts[rkey] != 0 {
 		t.Errorf("ReactionAttempts[%s] = %d, want 0 (a triage escalation must not spend a continuation)", rkey, state.ReactionAttempts[rkey])
 	}
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions entry survived a triage escalation, want dropped (matches a budget escalation)")
-	}
+	assertEscalationBegan(t, state, rkey, EscalationTriggerTriage)
 	if store.markDispatchedCalls != 1 {
 		t.Errorf("MarkReactionDispatched calls = %d, want 1", store.markDispatchedCalls)
 	}
@@ -1718,9 +1684,7 @@ func TestReconcileMergeConflicts_Triage_EpisodeCloseClearsHandledForNextEpisode(
 	runMergeConflictTriageToCompletion(t, state, params, rkey, metrics)
 	reconcileMergeConflicts(state, params, discardLogger(), context.Background(), metrics)
 
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions entry survived a triage escalation, want dropped (the replayed handled verdict from episode 1 must not suppress it)")
-	}
+	assertEscalationBegan(t, state, rkey, EscalationTriggerTriage)
 	if store.markDispatchedCalls != 2 {
 		t.Errorf("MarkReactionDispatched calls = %d, want 2 (one real verdict per episode: handled, then escalate)", store.markDispatchedCalls)
 	}
@@ -1813,3 +1777,13 @@ func TestReconcileMergeConflicts_Triage_CancelOnTTLDrop(t *testing.T) {
 		t.Error("PendingReactions entry survived past the watch window, want dropped")
 	}
 }
+
+func (s *statefulFingerprintStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *statefulFingerprintStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *statefulFingerprintStore) DeleteStageHop(context.Context, string) error { return nil }

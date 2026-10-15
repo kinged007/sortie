@@ -333,6 +333,16 @@ func TestNormalizeSearchIssue_EmptyLabelsSlice(t *testing.T) {
 	}
 }
 
+func TestNormalizeSearchIssue_URLOmitsEndpointUserinfo(t *testing.T) {
+	t.Parallel()
+
+	issue := normalizeSearchIssue("3", "https://bot:s3cret@x.atlassian.net", jiraIssue{ID: "1", Key: "PROJ-1"})
+
+	if want := "https://x.atlassian.net/browse/PROJ-1"; issue.URL != want {
+		t.Errorf("normalizeSearchIssue(userinfo endpoint).URL = %q, want %q", issue.URL, want)
+	}
+}
+
 func TestExtractBlockers_Empty(t *testing.T) {
 	t.Parallel()
 

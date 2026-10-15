@@ -27,6 +27,10 @@ const contractRegistryImportPath = "github.com/sortie-ai/sortie/internal/registr
 // caught regardless of the local import alias.
 const contractTrackermetricsImportPath = "github.com/sortie-ai/sortie/internal/trackermetrics"
 
+// contractDomainImportPath is resolved per file so the assertion naming the
+// tracker adapter type is found regardless of the local import alias.
+const contractDomainImportPath = "github.com/sortie-ai/sortie/internal/domain"
+
 // contractProcutilImportPath is resolved per file so an aliased import
 // cannot evade rule STOPGRACE.
 const contractProcutilImportPath = "github.com/sortie-ai/sortie/internal/agent/procutil"
@@ -58,9 +62,10 @@ var contractBanTable = map[string]string{
 	"asSCMError":             "scmcore.AsSCMError",
 	"toCIError":              "scmcore.ToCIError",
 	"giteaToCIError":         "scmcore.ToCIError",
-	"deriveState":            "issuekit.DeriveLabelState",
-	"extractState":           "issuekit.DeriveLabelState",
-	"findCurrentStateLabel":  "issuekit.CurrentLabelState",
+	"labelVariants":          "issuekit.LabelVariants",
+	"deriveState":            "issuekit.LabelStates.Derive",
+	"extractState":           "issuekit.LabelStates.Derive",
+	"findCurrentStateLabel":  "issuekit.LabelStates.PlanTransition",
 	"paginatePages":          "httpkit.NewPagePaginator",
 	"parseUTC":               "scmcore.ParseTimestamp or scmcore.ParseTimestampOrZero",
 	"stringFrom":             "typeutil.StringField",
@@ -81,6 +86,10 @@ var contractBanTable = map[string]string{
 	"subtractUsage":          "agentcore.SubtractUsage",
 	"maxUsage":               "agentcore.MaxUsage",
 	"componentwiseMaxUsage":  "agentcore.MaxUsage",
+	"truncateLog":            "cilog.Builder",
+	"traceExcerpt":           "cilog.Builder",
+	"truncateLines":          "cilog.TailLines",
+	"stripANSI":              "cilog.Builder.Line or cilog.TailLines",
 }
 
 // contractTrackerAdapterMethods are the tracker operation methods rule
@@ -97,7 +106,9 @@ var contractTrackerAdapterMethods = map[string]bool{
 	"FetchIssueBlockers":            true,
 	"TransitionIssue":               true,
 	"CommentIssue":                  true,
+	"CommentIssueWithLiteral":       true,
 	"AddLabel":                      true,
+	"RemoveLabel":                   true,
 }
 
 // contractRule names one of the syntactic rules the checker enforces.
@@ -167,6 +178,7 @@ type contractSharedPackage struct {
 var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/scmcore":                     {reason: "shared forge decision core; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/scm/githubapi":                   {reason: "shared GitHub transport and error classification; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/scm/cilog":                       {reason: "shared CI log excerpt assembly for the forge CI providers; registers no kind and holds no adapter", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig":                 {reason: "shared MCP configuration parsing; registers no kind and holds no adapter", coreImportable: true},
@@ -175,6 +187,8 @@ var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/agent/agenttest":                 {reason: "shared agent-adapter test support; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest": {reason: "shared turn-disposition conformance assertion, keyed separately because keys match exactly; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest":  {reason: "shared credential-verification conformance assertion, keyed separately because keys match exactly; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel":       {reason: "shared scripted model endpoint and scripted-model conformance driver; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/notify/route":                    {reason: "shared notification routing for orchestrator events; registers no kind and holds no adapter", coreImportable: true},
 }
 
 // contractPackageBannedImports maps one package's import path to the
@@ -200,6 +214,9 @@ var contractAllowlist = map[string]map[contractRule]string{
 	"agenttest": {
 		ruleCAPTURE: "test-support package that cmd/sortie does not link",
 	},
+	"fakemodel": {
+		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+	},
 	"probe": {
 		ruleCAPTURE: "test-support package that cmd/sortie does not link",
 		ruleWORKDIR: "test-support package that cmd/sortie does not link",
@@ -210,9 +227,6 @@ var contractAllowlist = map[string]map[contractRule]string{
 	},
 	"workspacekit": {
 		ruleANCHOR: "owns the workspace-anchoring mechanism",
-	},
-	"kiro": {
-		ruleIDENTITY: "declares its own registered deprecation, naming its replacement kind",
 	},
 }
 
@@ -1347,11 +1361,86 @@ func bodyCallsTrackermetricsTrack(file *ast.File, body *ast.BlockStmt) bool {
 	return found
 }
 
+// contractTrackerAdapterType returns the type a non-test file names in
+// "var _ domain.TrackerAdapter = (*T)(nil)", with the domain qualifier
+// resolved from the file's own imports, or "" when no file asserts one.
+// A package that also holds a source-control adapter declares its tracker
+// adapter this way, which is how rule METRICS tells the two apart.
+func contractTrackerAdapterType(files []*ast.File) string {
+	for _, file := range files {
+		domainIdent := resolveContractImportName(file, contractDomainImportPath)
+		if domainIdent == "" {
+			continue
+		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				if name := contractTrackerAssertionType(spec, domainIdent); name != "" {
+					return name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func contractTrackerAssertionType(spec ast.Spec, domainIdent string) string {
+	value, ok := spec.(*ast.ValueSpec)
+	if !ok || len(value.Names) != 1 || value.Names[0].Name != "_" || len(value.Values) != 1 {
+		return ""
+	}
+	typ, ok := value.Type.(*ast.SelectorExpr)
+	if !ok || typ.Sel.Name != "TrackerAdapter" {
+		return ""
+	}
+	if qualifier, ok := typ.X.(*ast.Ident); !ok || qualifier.Name != domainIdent {
+		return ""
+	}
+	conversion, ok := value.Values[0].(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	paren, ok := conversion.Fun.(*ast.ParenExpr)
+	if !ok {
+		return ""
+	}
+	star, ok := paren.X.(*ast.StarExpr)
+	if !ok {
+		return ""
+	}
+	if ident, ok := star.X.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
+// contractReceiverBaseType returns the receiver's type name with any
+// pointer stripped, or "" for a receiver that is not a plain named type.
+func contractReceiverBaseType(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return ""
+	}
+	expr := fn.Recv.List[0].Type
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
 // checkContractMetrics reports a violation for every domain.TrackerAdapter
 // method in file, declared in a tracker-registering package, whose body
 // carries no trackermetrics.Track call, and for every call expression
-// selecting IncTrackerRequests anywhere in file.
-func checkContractMetrics(fset *token.FileSet, file *ast.File, registersTracker bool) []contractViolation {
+// selecting IncTrackerRequests anywhere in file. A non-empty trackerType
+// limits the method check to that receiver type, so a source-control
+// adapter's method of the same name is not taken for a tracker operation;
+// an empty one checks every receiver.
+func checkContractMetrics(fset *token.FileSet, file *ast.File, registersTracker bool, trackerType string) []contractViolation {
 	var violations []contractViolation
 
 	if registersTracker {
@@ -1361,6 +1450,9 @@ func checkContractMetrics(fset *token.FileSet, file *ast.File, registersTracker 
 				continue
 			}
 			if !contractTrackerAdapterMethods[fn.Name.Name] {
+				continue
+			}
+			if trackerType != "" && contractReceiverBaseType(fn) != trackerType {
 				continue
 			}
 			if fn.Body == nil || !bodyCallsTrackermetricsTrack(file, fn.Body) {
@@ -1611,53 +1703,12 @@ func buildContractAgentIdentitySnapshot() contractAgentIdentitySnapshot {
 		}
 		importPath := contractPackageImportPath(dir, contractAgentFamilyPath, filepath.Dir(walkPath))
 
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, isCall := n.(*ast.CallExpr)
-			if !isCall {
-				return true
-			}
-			outer, isSel := call.Fun.(*ast.SelectorExpr)
-			if !isSel {
-				return true
-			}
-			inner, isSel := outer.X.(*ast.SelectorExpr)
-			if !isSel {
-				return true
-			}
-			ident, isIdent := inner.X.(*ast.Ident)
-			if !isIdent || ident.Name != registryIdent || inner.Sel.Name != "Agents" {
-				return true
-			}
-			if outer.Sel.Name != "Register" && outer.Sel.Name != "RegisterWithMeta" {
-				return true
-			}
-			if len(call.Args) == 0 {
-				extractionErrors = append(extractionErrors, contractViolation{
-					pos:  fset.Position(call.Pos()),
-					text: registryIdent + ".Agents." + outer.Sel.Name + " call has no kind argument",
-				})
-				return true
-			}
-			lit, isBasicLit := call.Args[0].(*ast.BasicLit)
-			if !isBasicLit || lit.Kind != token.STRING {
-				extractionErrors = append(extractionErrors, contractViolation{
-					pos:  fset.Position(call.Args[0].Pos()),
-					text: registryIdent + ".Agents." + outer.Sel.Name + " call's kind argument is not a string literal",
-				})
-				return true
-			}
-			kind, unquoteErr := strconv.Unquote(lit.Value)
-			if unquoteErr != nil {
-				extractionErrors = append(extractionErrors, contractViolation{
-					pos:  fset.Position(lit.Pos()),
-					text: "unquote " + registryIdent + ".Agents." + outer.Sel.Name + " kind argument: " + unquoteErr.Error(),
-				})
-				return true
-			}
+		kinds, kindErrors := contractAgentRegisteredKinds(fset, file, registryIdent)
+		extractionErrors = append(extractionErrors, kindErrors...)
+		for _, kind := range kinds {
 			tokenSet[strings.ToLower(kind)] = true
 			kindImportPaths[importPath] = append(kindImportPaths[importPath], kind)
-			return true
-		})
+		}
 		return nil
 	})
 	if walkErr != nil {
@@ -1679,6 +1730,52 @@ func buildContractAgentIdentitySnapshot() contractAgentIdentitySnapshot {
 		profileDeclaredTokens: profileDeclaredTokens,
 		extractionErrors:      extractionErrors,
 	}
+}
+
+// A retired registration counts as its package's kind registration, so a kind
+// registered only as retired stays anchored to its package.
+func contractAgentRegisteredKinds(fset *token.FileSet, file *ast.File, registryIdent string) ([]string, []contractViolation) {
+	var kinds []string
+	var errs []contractViolation
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		outer, isSel := call.Fun.(*ast.SelectorExpr)
+		if !isSel {
+			return true
+		}
+		inner, isSel := outer.X.(*ast.SelectorExpr)
+		if !isSel {
+			return true
+		}
+		ident, isIdent := inner.X.(*ast.Ident)
+		if !isIdent || ident.Name != registryIdent || (inner.Sel.Name != "Agents" && inner.Sel.Name != "RetiredAgents") {
+			return true
+		}
+		if outer.Sel.Name != "Register" && outer.Sel.Name != "RegisterWithMeta" {
+			return true
+		}
+		callName := registryIdent + "." + inner.Sel.Name + "." + outer.Sel.Name
+		if len(call.Args) == 0 {
+			errs = append(errs, contractViolation{pos: fset.Position(call.Pos()), text: callName + " call has no kind argument"})
+			return true
+		}
+		lit, isBasicLit := call.Args[0].(*ast.BasicLit)
+		if !isBasicLit || lit.Kind != token.STRING {
+			errs = append(errs, contractViolation{pos: fset.Position(call.Args[0].Pos()), text: callName + " call's kind argument is not a string literal"})
+			return true
+		}
+		kind, unquoteErr := strconv.Unquote(lit.Value)
+		if unquoteErr != nil {
+			errs = append(errs, contractViolation{pos: fset.Position(lit.Pos()), text: "unquote " + callName + " kind argument: " + unquoteErr.Error()})
+			return true
+		}
+		kinds = append(kinds, kind)
+		return true
+	})
+	return kinds, errs
 }
 
 // contractRuntimeProfilesGlob matches every runtime profile document. A
@@ -2259,19 +2356,19 @@ const cmd = "gemini --acp"
 
 	t.Run("a kind-anchored profile-declared token in a package outside internal/agent still passes", func(t *testing.T) {
 		anchoredKindImportPaths := map[string][]string{
-			"github.com/sortie-ai/sortie/internal/agent/kiro": {"kiro"},
+			"github.com/sortie-ai/sortie/internal/agent/fixtureruntime": {"fixtureruntime"},
 		}
-		if !contractTokenIsKindAnchored("kiro", anchoredKindImportPaths) {
-			t.Fatal("contractTokenIsKindAnchored(\"kiro\", ...) = false, want true: kiro's own kind package anchors it")
+		if !contractTokenIsKindAnchored("fixtureruntime", anchoredKindImportPaths) {
+			t.Fatal("contractTokenIsKindAnchored(\"fixtureruntime\", ...) = false, want true: fixtureruntime's own kind package anchors it")
 		}
 
 		anchoredSnapshot := contractAgentIdentitySnapshot{
-			tokens:                []string{"kiro"},
+			tokens:                []string{"fixtureruntime"},
 			kindImportPaths:       anchoredKindImportPaths,
-			profileDeclaredTokens: map[string]bool{"kiro": true},
+			profileDeclaredTokens: map[string]bool{"fixtureruntime": true},
 		}
 		if wide := contractWideScopedTokens(anchoredSnapshot); len(wide) != 0 {
-			t.Errorf("contractWideScopedTokens() = %v, want none: kiro is anchored by its own kind package", wide)
+			t.Errorf("contractWideScopedTokens() = %v, want none: fixtureruntime is anchored by its own kind package", wide)
 		}
 	})
 }
@@ -2279,9 +2376,8 @@ const cmd = "gemini --acp"
 // TestContractIdentityWideScope_StalenessGuardCatchesRealBreaks proves the
 // mechanisms TestContractIdentityWideScope relies on can fail, not just
 // pass against the current tree: a profile that fails to decode is
-// reported, and dropping either the anchoring clause or the
-// profile-source clause reddens against a real collision (kiro, cursor).
-// The last two subtests confirm today's snapshot keeps both green.
+// reported, and marking cursor profile-declared reddens against a real
+// collision.
 func TestContractIdentityWideScope_StalenessGuardCatchesRealBreaks(t *testing.T) {
 	snapshot := contractAgentIdentitySnapshotData()
 
@@ -2308,37 +2404,6 @@ func TestContractIdentityWideScope_StalenessGuardCatchesRealBreaks(t *testing.T)
 		}
 		if !declared["gemini"] {
 			t.Errorf("contractProfileDeclaredTokens(%q) = %v, want it to mark %q profile-declared from the tracked gemini-cli profile", contractRuntimeProfilesGlob, declared, "gemini")
-		}
-	})
-
-	t.Run("dropping the anchoring clause makes an unanchored kiro redden against the real preflight_test.go collision", func(t *testing.T) {
-		fset := token.NewFileSet()
-		unanchored := contractAgentIdentitySnapshot{
-			tokens:                []string{"kiro"},
-			kindImportPaths:       map[string][]string{},
-			profileDeclaredTokens: map[string]bool{"kiro": true},
-		}
-		wide := contractWideScopedTokens(unanchored)
-		if !slices.Contains(wide, "kiro") {
-			t.Fatalf("contractWideScopedTokens() = %v, want it to carry kiro once the anchoring clause is dropped, so this control can prove the clause is load-bearing", wide)
-		}
-
-		var violations []contractViolation
-		for _, root := range contractWideIdentityRoots {
-			v, _ := contractWideIdentityTestViolations(t, fset, root, wide)
-			violations = append(violations, v...)
-		}
-		if len(violations) == 0 {
-			t.Fatal("the wide test-file scan found no violation for an unanchored kiro token, want it to catch var kiroErrors in internal/orchestrator/preflight_test.go")
-		}
-	})
-
-	t.Run("kiro stays kind-anchored against the real snapshot, so today's wide check passes it", func(t *testing.T) {
-		if !contractTokenIsKindAnchored("kiro", snapshot.kindImportPaths) {
-			t.Fatal("contractTokenIsKindAnchored(\"kiro\", ...) = false against the real snapshot, want true: internal/agent/kiro registers kind kiro")
-		}
-		if wide := contractWideScopedTokens(snapshot); slices.Contains(wide, "kiro") {
-			t.Errorf("contractWideScopedTokens() = %v, want no kiro: it is kind-anchored", wide)
 		}
 	})
 
@@ -2406,8 +2471,9 @@ func checkAdapterContractPackage(fset *token.FileSet, pkg contractPackage) []con
 	registers, usedMeta, hasHook, hasBlockerSource, blockerSourceIsPerIssue, factsPos := contractRegistrationFacts(fset, pkg.files)
 
 	if !contractExempt(pkg.dirName, ruleMETRICS) {
+		trackerType := contractTrackerAdapterType(pkg.files)
 		for _, file := range pkg.files {
-			violations = append(violations, checkContractMetrics(fset, file, registers)...)
+			violations = append(violations, checkContractMetrics(fset, file, registers, trackerType)...)
 		}
 	}
 
@@ -2694,6 +2760,7 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/mcpconfig", name: "Parse", reason: "location check"},
 	{importPath: "github.com/sortie-ai/sortie/internal/orchestrator", name: "RunWorkerAttempt", reason: "exported summary path"},
 	{importPath: "github.com/sortie-ai/sortie/tools/qualify/probe", name: "writeToolServerMCPConfig", reason: "fixture path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "NewSortieTools", reason: "returned path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR
@@ -3437,6 +3504,48 @@ func (a *fixtureAdapter) FetchIssueByID(ctx int, id string) (int, error) {
 }
 `,
 			wantCount: 0,
+		},
+		{
+			name:       "only the tracker adapter type's RemoveLabel must be recorded by trackermetrics.Track",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture",
+			src: `package fixture
+
+import (
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/registry"
+)
+
+func init() {
+	registry.Trackers.RegisterWithMeta("fixture", newFixtureAdapter, registry.TrackerMeta{
+		ValidateTrackerConfig: validateConfig,
+		BlockerSource:         registry.BlockersFromCandidates,
+	})
+}
+
+var _ domain.TrackerAdapter = (*fixtureAdapter)(nil)
+
+type fixtureAdapter struct{}
+
+func (a *fixtureAdapter) RemoveLabel(ctx int, id, label string) error { return nil }
+
+type fixtureSCMAdapter struct{}
+
+func (a *fixtureSCMAdapter) RemoveLabel(ctx int, pr int, label string) error { return nil }
+`,
+			wantCount:  1,
+			wantSubstr: "RemoveLabel is not recorded by trackermetrics.Track",
+		},
+		{
+			name:       "a private labelVariants function is rejected in favor of issuekit.LabelVariants",
+			dirName:    "fixture",
+			importPath: "github.com/sortie-ai/sortie/internal/scm/fixture",
+			src: `package fixture
+
+func labelVariants(stored []string, label string) []string { return nil }
+`,
+			wantCount:  1,
+			wantSubstr: "issuekit.LabelVariants",
 		},
 		{
 			// Plain Register carries no meta literal, so BLOCKER also
@@ -6188,5 +6297,128 @@ func doWork() {}
 				t.Errorf("contractPackageRegistersKind() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestContractAgentRegisteredKinds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		src       string
+		wantKinds []string
+		wantErrs  int
+	}{
+		{
+			name: "live registration",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	registry.Agents.RegisterWithMeta("live-kind", newFixtureAgent, registry.AgentMeta{})
+}
+`,
+			wantKinds: []string{"live-kind"},
+		},
+		{
+			name: "retired registration alone",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	registry.RetiredAgents.Register("retired-only-kind", registry.RetiredAgent{})
+}
+`,
+			wantKinds: []string{"retired-only-kind"},
+		},
+		{
+			name: "live and retired registrations of one kind",
+			src: `package fixture
+
+import reg "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	reg.Agents.Register("both-kind", newFixtureAgent)
+	reg.RetiredAgents.Register("both-kind", reg.RetiredAgent{})
+}
+`,
+			wantKinds: []string{"both-kind", "both-kind"},
+		},
+		{
+			name: "another registry is not an agent kind",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	registry.Trackers.Register("tracker-kind", newFixtureTracker)
+}
+`,
+		},
+		{
+			name: "retired registration without a literal kind is reported",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	registry.RetiredAgents.Register(kindName, registry.RetiredAgent{})
+}
+`,
+			wantErrs: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parser.ParseFile: %v", err)
+			}
+			registryIdent := resolveContractImportName(file, contractRegistryImportPath)
+
+			kinds, errs := contractAgentRegisteredKinds(fset, file, registryIdent)
+
+			if !slices.Equal(kinds, tt.wantKinds) {
+				t.Errorf("contractAgentRegisteredKinds() kinds = %v, want %v", kinds, tt.wantKinds)
+			}
+			if len(errs) != tt.wantErrs {
+				t.Errorf("contractAgentRegisteredKinds() errors = %v, want %d", errs, tt.wantErrs)
+			}
+		})
+	}
+}
+
+func TestContractTokenIsKindAnchored_RetiredOnlyKind(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "retired.go", `package fixture
+
+import "github.com/sortie-ai/sortie/internal/registry"
+
+func init() {
+	registry.RetiredAgents.Register("retired-only-kind", registry.RetiredAgent{})
+}
+`, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile: %v", err)
+	}
+	kinds, errs := contractAgentRegisteredKinds(fset, file, resolveContractImportName(file, contractRegistryImportPath))
+	if len(errs) != 0 {
+		t.Fatalf("contractAgentRegisteredKinds() errors = %v", errs)
+	}
+	kindImportPaths := map[string][]string{"github.com/sortie-ai/sortie/internal/agent/fixturekind": kinds}
+
+	if !contractTokenIsKindAnchored("retired-only-kind", kindImportPaths) {
+		t.Error(`contractTokenIsKindAnchored("retired-only-kind", ...) = false, want true: a retired registration anchors its kind to its package`)
+	}
+	if !contractPackageRegistersKind([]*ast.File{file}) {
+		t.Error("contractPackageRegistersKind() = false for a package that registers only a retired kind, want true")
 	}
 }

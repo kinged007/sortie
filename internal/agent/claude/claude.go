@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,15 +24,29 @@ import (
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
+// defaultCommand is what a session launches when it is given no command.
+const defaultCommand = "claude"
+
+// effortEnvName is the variable Claude Code lets outrank --effort without
+// reporting it, so a session that sets the level launches without it.
+const effortEnvName = "CLAUDE_CODE_EFFORT_LEVEL"
+
+// unknownEffortPrefix starts the standard-error line Claude Code writes
+// when it does not recognize the --effort value and runs at the model's
+// default level instead.
+const unknownEffortPrefix = "Warning: Unknown --effort value"
+
 func init() {
 	registry.Agents.RegisterWithMeta("claude-code", NewClaudeCodeAdapter, registry.AgentMeta{
 		RequiresCommand:        true,
+		DefaultCommand:         defaultCommand,
 		ValidateAgentConfig:    validateConfig,
 		MCPInjection:           registry.MCPInjectionSupported,
 		SessionResumeBlockedBy: sessionResumeBlockedBy,
 		UsageArrival:           registry.UsageArrivalIncremental,
 		UsageAttribution:       registry.UsageAttributionPerModel,
 		CredentialEnv:          registry.DeclareCredentialEnv("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+		EffortForwarding:       registry.EffortForwarded,
 	})
 }
 
@@ -47,9 +62,7 @@ var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 // Code CLI subprocesses. One adapter instance serves all concurrent
 // sessions; per-session state is held in [sessionState] via the
 // [domain.Session] Internal field.
-type ClaudeCodeAdapter struct {
-	passthrough passthroughConfig
-}
+type ClaudeCodeAdapter struct{}
 
 // sessionState is adapter-internal state stored in [domain.Session]
 // Internal. It tracks the Claude Code session ID and per-turn scan
@@ -58,6 +71,7 @@ type sessionState struct {
 	target          agentcore.LaunchTarget
 	claudeSessionID string
 	isContinuation  bool
+	passthrough     passthroughConfig
 	agentConfig     domain.AgentConfig
 	baseLogger      *slog.Logger
 
@@ -97,6 +111,11 @@ type sessionState struct {
 	// [agentcore.FinalizeTurn].
 	humanInputEnds   bool
 	humanInputDetail string
+
+	// effortReported records that the session has already logged the
+	// runtime's report of an unrecognized effort value. Touched only from
+	// the OnFinalize hook.
+	effortReported bool
 }
 
 func (s *sessionState) logger() *slog.Logger {
@@ -106,22 +125,37 @@ func (s *sessionState) logger() *slog.Logger {
 	return logging.WithSession(s.baseLogger, s.claudeSessionID)
 }
 
+// relayEffortReport logs the first standard-error line that starts with
+// [unknownEffortPrefix] as a warning, once per session, so the operator
+// learns the configured level was not applied. It does nothing when no
+// effort is configured.
+func (s *sessionState) relayEffortReport(effort string, stderrLines []string) {
+	if s.effortReported || effort == "" {
+		return
+	}
+	idx := slices.IndexFunc(stderrLines, func(line string) bool {
+		return strings.HasPrefix(line, unknownEffortPrefix)
+	})
+	if idx < 0 {
+		return
+	}
+	s.logger().Warn("reasoning level not applied by the agent",
+		slog.String("agent_kind", "claude-code"),
+		slog.String(registry.EffortKey, effort),
+		slog.String("line", stderrLines[idx]))
+	s.effortReported = true
+}
+
 func (s *sessionState) refreshForkLogger() {
 	if s.forkSession != nil {
 		s.forkSession.SetLogger(s.logger())
 	}
 }
 
-// NewClaudeCodeAdapter creates a [ClaudeCodeAdapter] from adapter
-// configuration. The config parameter is the raw map from the
-// "claude-code" sub-object in WORKFLOW.md. Command resolution is
-// deferred to [ClaudeCodeAdapter.StartSession].
-func NewClaudeCodeAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, fault := parsePassthroughConfig(config)
-	if fault != nil {
-		return nil, fault
-	}
-	return &ClaudeCodeAdapter{passthrough: pt}, nil
+// NewClaudeCodeAdapter creates a [ClaudeCodeAdapter]. Settings and command
+// resolution are deferred to [ClaudeCodeAdapter.StartSession].
+func NewClaudeCodeAdapter() (domain.AgentAdapter, error) {
+	return &ClaudeCodeAdapter{}, nil
 }
 
 // askUserQuestionTool is the built-in Claude Code tool name that carries a
@@ -136,13 +170,20 @@ const askUserQuestionTool = "AskUserQuestion"
 // message.
 const detailAnswerToQuestion = "an answer to a question"
 
-// StartSession validates the workspace path, resolves the claude binary, and
-// initializes per-session state. No subprocess is spawned; that happens in
-// [ClaudeCodeAdapter.RunTurn].
+// StartSession parses the session's settings, validates the workspace path,
+// resolves the claude binary, and initializes per-session state. No
+// subprocess is spawned; that happens in [ClaudeCodeAdapter.RunTurn].
 func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	target, agentErr := agentcore.ResolveLaunchTarget(params, "claude")
+	pt, fault := parsePassthroughConfig(params.Settings)
+	if fault != nil {
+		return domain.Session{}, agentcore.SettingsError(fault.Error(), fault)
+	}
+	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
+	}
+	if pt.Effort != "" {
+		target.WithheldEnv = []string{effortEnvName}
 	}
 
 	isContinuation := false
@@ -166,6 +207,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 		target:                 target,
 		claudeSessionID:        sessionUUID,
 		isContinuation:         isContinuation,
+		passthrough:            pt,
 		agentConfig:            params.AgentConfig,
 		baseLogger:             slog.Default().With(slog.String("component", "claude-adapter")),
 		mcpConfigPath:          params.MCPConfigPath,
@@ -175,7 +217,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 
 	hooks := agentcore.ForkPerTurnHooks{
 		BuildArgs: func(turn int, prompt string) []string {
-			return buildArgs(state, turn, prompt, a.passthrough)
+			return buildArgs(state, turn, prompt, state.passthrough)
 		},
 		ParseLine: func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) {
 			now := time.Now().UTC()
@@ -309,8 +351,16 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 		},
 		GetUsage:     func() (domain.TokenUsage, bool) { return state.acc.Snapshot(), state.usageMeasured },
 		GetSessionID: func() string { return state.claudeSessionID },
-		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
+		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, waitErr error, stderrLines []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			usage := state.acc.Snapshot()
+
+			finalize := func(ev agentcore.TurnEvidence, meta agentcore.TurnMeta) (domain.TurnResult, *domain.AgentError) {
+				result, agentErr := agentcore.FinalizeTurn(emit, state.logger(), ev, meta)
+				if agentErr == nil {
+					state.relayEffortReport(state.passthrough.Effort, stderrLines)
+				}
+				return result, agentErr
+			}
 
 			// A recognized request that only a person could answer, observed
 			// in ParseLine, overrides the turn's normal success/failure
@@ -322,7 +372,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 					Usage:         usage,
 					UsageMeasured: state.usageMeasured,
 				}
-				return agentcore.FinalizeTurn(emit, state.logger(), evidence, meta)
+				return finalize(evidence, meta)
 			}
 
 			lastResult, _ := lastParsed.(*rawEvent)
@@ -330,6 +380,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 			ev := agentcore.TurnEvidence{
 				ExitObserved: true,
 				ExitCode:     exitCode,
+				WaitErr:      waitErr,
 				EarlyExit:    earlyExit,
 			}
 			ev.Work, ev.WorkDetail = state.work.Report()
@@ -361,7 +412,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 				APIDurationMS: turnAPIDuration,
 			}
 
-			return agentcore.FinalizeTurn(emit, state.logger(), ev, meta)
+			return finalize(ev, meta)
 		},
 		EmitSessionStartID: nil, // Claude emits EventSessionStarted from ParseLine on "system/init"
 	}

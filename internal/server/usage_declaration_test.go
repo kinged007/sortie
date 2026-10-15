@@ -1,40 +1,20 @@
 package server
 
 import (
-	"bytes"
 	"encoding/json"
-	"html/template"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/sentence"
 )
 
-// renderDashboard renders data through the template [New] serves.
-func renderDashboard(t *testing.T, data dashboardData) string {
-	t.Helper()
-
-	tmpl := template.Must(
-		template.New("dashboard").Funcs(template.FuncMap{
-			"fmtInt":  FormatInt,
-			"fmtCost": FormatCost,
-			"even":    func(i int) bool { return i%2 == 0 },
-		}).Parse(dashboardHTML),
-	)
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		t.Fatalf("dashboard template Execute: %v", err)
-	}
-	return buf.String()
-}
-
 // TestUsageDeclaration_NoneArrivalDiscardedEndToEnd drives a none and an
-// incremental session through HandleAgentEvent and RuntimeSnapshot into both
-// presenters, since a hand-built SnapshotRunningEntry would bypass the
+// incremental session through HandleAgentEvent and RuntimeSnapshot into the
+// state API, since a hand-built SnapshotRunningEntry would bypass the
 // accounting under test.
 func TestUsageDeclaration_NoneArrivalDiscardedEndToEnd(t *testing.T) {
 	t.Parallel()
@@ -74,61 +54,7 @@ func TestUsageDeclaration_NoneArrivalDiscardedEndToEnd(t *testing.T) {
 		"kind-none": {InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)},
 		"kind-inc":  {InputPerMtok: fptr(3.0), OutputPerMtok: fptr(15.0)},
 	}
-	const wantCost = "$21.00" // 2M input @ $3/Mtok + 1M output @ $15/Mtok
-
-	data := buildDashboardData(snap, "test", now.Add(-time.Hour), nil, now, rates)
-
-	var noneRow, incRow dashboardRunningEntry
-	var foundNone, foundInc bool
-	for _, r := range data.Running {
-		switch r.Identifier {
-		case "USG-NONE":
-			noneRow, foundNone = r, true
-		case "USG-INC":
-			incRow, foundInc = r, true
-		}
-	}
-	if !foundNone || !foundInc {
-		t.Fatalf("dashboard rows = %+v, want rows for both USG-NONE and USG-INC", data.Running)
-	}
-
-	if noneRow.ModelRow != dashPlaceholder {
-		t.Errorf("none session ModelRow = %q, want %q", noneRow.ModelRow, dashPlaceholder)
-	}
-	if noneRow.APIRequestsRow != dashPlaceholder {
-		t.Errorf("none session APIRequestsRow = %q, want %q", noneRow.APIRequestsRow, dashPlaceholder)
-	}
-	if noneRow.TokensRow != dashPlaceholder {
-		t.Errorf("none session TokensRow = %q, want %q", noneRow.TokensRow, dashPlaceholder)
-	}
-	if noneRow.EstCostRow != dashPlaceholder {
-		t.Errorf("none session EstCostRow = %q, want %q", noneRow.EstCostRow, dashPlaceholder)
-	}
-	if incRow.EstimatedCostUSD != wantCost {
-		t.Fatalf("incremental session EstimatedCostUSD = %q, want %q (setup invariant)", incRow.EstimatedCostUSD, wantCost)
-	}
-
-	if data.TotalTokens != usage.TotalTokens {
-		t.Errorf("Total Tokens card = %d, want %d (the incremental session's figure alone)", data.TotalTokens, usage.TotalTokens)
-	}
-	if data.InputTokens != usage.InputTokens || data.OutputTokens != usage.OutputTokens || data.CacheReadTokens != usage.CacheReadTokens {
-		t.Errorf("footer token totals = (%d, %d, %d), want (%d, %d, %d)",
-			data.InputTokens, data.OutputTokens, data.CacheReadTokens,
-			usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens)
-	}
-	if data.EstimatedCostUSD == nil || *data.EstimatedCostUSD != wantCost {
-		t.Errorf("Active Est. Cost card = %v, want %q", data.EstimatedCostUSD, wantCost)
-	}
-
-	html := renderDashboard(t, data)
-	if strings.Contains(html, "none-model") {
-		t.Error("rendered dashboard contains the none session's discarded model name")
-	}
-	if !strings.Contains(html, "inc-model") {
-		t.Error("rendered dashboard is missing the incremental session's model name")
-	}
-
-	resp := toStateResponse(snap, rates)
+	resp := toStateResponse(snap, rates, sentence.Context{}, nil)
 
 	var noneResp, incResp runningEntryResponse
 	var foundNoneResp, foundIncResp bool

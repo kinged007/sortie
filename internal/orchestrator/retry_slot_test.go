@@ -85,6 +85,8 @@ func (s *retrySlotSCM) RemoveLabel(_ context.Context, _ int, _, _, label string)
 // so "unchanged" and "advanced" assertions exercise real state rather than
 // a canned return value.
 type retrySlotStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	marks      map[string]string
@@ -344,6 +346,9 @@ func TestRetrySlot_ReviewDefersToLabelReview(t *testing.T) {
 	}
 	if _, ok := state.ReactionAttempts[rKey]; ok {
 		t.Errorf("ReactionAttempts[%s] present, want absent (a defer must not increment it)", rKey)
+	}
+	if got := pendingRow(t, state, issueID, ReactionKindReview).Wait; got != "retry_slot" {
+		t.Errorf("review row Wait = %q, want %q", got, "retry_slot")
 	}
 }
 
@@ -655,9 +660,6 @@ func TestRetrySlot_DeferralRecordReportsContinuationForEmptyKindIncumbent(t *tes
 	}
 }
 
-// TestRetrySlot_TTLRefreshOnArbitrationDeferral verifies that CreatedAt
-// advances on every arbitration deferral, for both a TTL-bearing kind and
-// a kind with no TTL.
 func TestRetrySlot_TTLRefreshOnArbitrationDeferral(t *testing.T) {
 	t.Parallel()
 
@@ -736,7 +738,8 @@ func TestRetrySlot_TTLRefreshOnArbitrationDeferral(t *testing.T) {
 		state.Claimed[issueID] = struct{}{}
 		state.RetryAttempts[issueID] = &RetryEntry{IssueID: issueID, Attempt: 1, ReactionKind: ReactionKindCI}
 		lrKey := ReactionKey(issueID, ReactionKindLabelReview)
-		state.PendingReactions[lrKey] = retrySlotLabelReviewPending(issueID, tick1.Add(-29*time.Minute))
+		seededAt := tick1.Add(-29 * time.Minute)
+		state.PendingReactions[lrKey] = retrySlotLabelReviewPending(issueID, seededAt)
 
 		store := newRetrySlotStore()
 		scm := &retrySlotSCM{
@@ -754,9 +757,19 @@ func TestRetrySlot_TTLRefreshOnArbitrationDeferral(t *testing.T) {
 			if !ok {
 				t.Fatalf("label-review pending entry dropped at tick %v; want re-enqueued", tickNow)
 			}
-			if !entry.CreatedAt.Equal(tickNow) {
-				t.Errorf("CreatedAt at tick %v = %v, want %v", tickNow, entry.CreatedAt, tickNow)
+			if !entry.CreatedAt.Equal(seededAt) {
+				t.Errorf("CreatedAt at tick %v = %v, want %v (a deferral leaves it unchanged)", tickNow, entry.CreatedAt, seededAt)
 			}
 		}
 	})
 }
+
+func (s *retrySlotStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *retrySlotStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *retrySlotStore) DeleteStageHop(context.Context, string) error { return nil }

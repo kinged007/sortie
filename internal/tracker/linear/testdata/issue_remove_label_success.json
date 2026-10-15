@@ -1,0 +1,15 @@
+{
+  "data": {
+    "issueUpdate": {
+      "success": true,
+      "issue": {
+        "labels": {
+          "nodes": [
+            { "id": "label-team-existing", "name": "existing" }
+          ],
+          "pageInfo": { "hasNextPage": false }
+        }
+      }
+    }
+  }
+}

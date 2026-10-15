@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,61 +96,49 @@ func requireAgentError(t *testing.T, err error, wantKind domain.AgentErrorKind) 
 func TestNewCopilotAdapter(t *testing.T) {
 	t.Parallel()
 
-	t.Run("zero config succeeds", func(t *testing.T) {
-		t.Parallel()
-		adapter, err := NewCopilotAdapter(map[string]any{})
-		if err != nil {
-			t.Fatalf("NewCopilotAdapter(empty) error = %v", err)
-		}
-		if adapter == nil {
-			t.Fatal("adapter is nil")
-		}
-	})
+	adapter, err := NewCopilotAdapter()
+	if err != nil {
+		t.Fatalf("NewCopilotAdapter() error = %v", err)
+	}
+	if adapter == nil {
+		t.Fatal("adapter is nil")
+	}
+}
 
-	t.Run("nil config succeeds", func(t *testing.T) {
-		t.Parallel()
-		adapter, err := NewCopilotAdapter(nil)
-		if err != nil {
-			t.Fatalf("NewCopilotAdapter(nil) error = %v", err)
-		}
-		if adapter == nil {
-			t.Fatal("adapter is nil")
-		}
-	})
+func startSettingsSession(t *testing.T, adapter domain.AgentAdapter, settings map[string]any, resumeID string) *sessionState {
+	t.Helper()
 
-	t.Run("passthrough fields are stored on adapter", func(t *testing.T) {
-		t.Parallel()
-		adapter, err := NewCopilotAdapter(map[string]any{
-			"model":                   "gpt-5",
-			"max_autopilot_continues": float64(15),
-			"agent":                   "custom",
-			"disable_builtin_mcps":    true,
-			"no_custom_instructions":  true,
-			"experimental":            true,
-		})
-		if err != nil {
-			t.Fatalf("NewCopilotAdapter() error = %v", err)
-		}
-		a := adapter.(*CopilotAdapter)
-		if a.passthrough.Model != "gpt-5" {
-			t.Errorf("passthrough.Model = %q, want %q", a.passthrough.Model, "gpt-5")
-		}
-		if a.passthrough.MaxAutopilotContinues != 15 {
-			t.Errorf("passthrough.MaxAutopilotContinues = %d, want 15", a.passthrough.MaxAutopilotContinues)
-		}
-		if a.passthrough.Agent != "custom" {
-			t.Errorf("passthrough.Agent = %q, want %q", a.passthrough.Agent, "custom")
-		}
-		if !a.passthrough.DisableBuiltinMCPs {
-			t.Error("passthrough.DisableBuiltinMCPs = false, want true")
-		}
-		if !a.passthrough.NoCustomInstructions {
-			t.Error("passthrough.NoCustomInstructions = false, want true")
-		}
-		if !a.passthrough.Experimental {
-			t.Error("passthrough.Experimental = false, want true")
-		}
+	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath:   t.TempDir(),
+		AgentConfig:     domain.AgentConfig{Command: fakeCopilotBinary(t)},
+		ResumeSessionID: resumeID,
+		Settings:        settings,
 	})
+	if err != nil {
+		t.Fatalf("StartSession(Settings=%v) error = %v", settings, err)
+	}
+	return session.Internal.(*sessionState)
+}
+
+func TestStartSession_SettingsArePerSession(t *testing.T) {
+	t.Parallel()
+
+	adapter, _ := NewCopilotAdapter()
+	first := startSettingsSession(t, adapter, map[string]any{
+		"model": "gpt-5", "effort": "high", "max_autopilot_continues": float64(15), "agent": "custom",
+		"disable_builtin_mcps": true, "no_custom_instructions": true, "experimental": true,
+	}, "")
+	resumed := startSettingsSession(t, adapter, map[string]any{"model": "model-b"}, "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f")
+
+	if pt := first.passthrough; pt.Model != "gpt-5" || pt.MaxAutopilotContinues != 15 || pt.Agent != "custom" || !pt.DisableBuiltinMCPs || !pt.NoCustomInstructions || !pt.Experimental {
+		t.Errorf("first session settings = %+v, want every key parsed", pt)
+	}
+	assertHasArgPair(t, buildArgs(first, 1, "p", first.passthrough), reasoningEffortFlag, "high")
+	for turn := 1; turn <= 2; turn++ {
+		args := buildArgs(resumed, turn, "p", resumed.passthrough)
+		assertHasArgPair(t, args, "--model", "model-b")
+		assertNoFlag(t, args, reasoningEffortFlag)
+	}
 }
 
 func TestRegistration(t *testing.T) {
@@ -159,9 +148,9 @@ func TestRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry.Agents.Get(\"copilot-cli\") error = %v", err)
 	}
-	adapter, err := factory(map[string]any{})
+	adapter, err := factory()
 	if err != nil {
-		t.Fatalf("factory(empty config) error = %v", err)
+		t.Fatalf("factory() error = %v", err)
 	}
 	if _, ok := adapter.(*CopilotAdapter); !ok {
 		t.Errorf("factory() type = %T, want *CopilotAdapter", adapter)
@@ -232,7 +221,7 @@ func TestStartSession(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			adapter, _ := NewCopilotAdapter(map[string]any{})
+			adapter, _ := NewCopilotAdapter()
 			params := tt.setup(t)
 			_, err := adapter.StartSession(context.Background(), params)
 			requireAgentError(t, err, tt.wantErr)
@@ -245,7 +234,7 @@ func TestStartSession_NewSession(t *testing.T) {
 
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	adapter, _ := NewCopilotAdapter(map[string]any{})
+	adapter, _ := NewCopilotAdapter()
 	fakeBin := fakeCopilotBinary(t)
 	workspace := t.TempDir()
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
@@ -287,7 +276,7 @@ func TestStartSession_ResumeSessionID(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	adapter, _ := NewCopilotAdapter(map[string]any{})
+	adapter, _ := NewCopilotAdapter()
 	fakeBin := fakeCopilotBinary(t)
 	const resumeID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
 
@@ -314,7 +303,7 @@ func TestStartSession_DefaultCommand(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	adapter, _ := NewCopilotAdapter(map[string]any{})
+	adapter, _ := NewCopilotAdapter()
 	// Empty command falls back to "copilot". In CI, copilot is likely
 	// absent, so ErrAgentNotFound is expected. If copilot is installed,
 	// the session may succeed; either outcome is acceptable.
@@ -337,7 +326,7 @@ func TestStartSession_SSHMode(t *testing.T) {
 		t.Skip("ssh not available on PATH")
 	}
 
-	adapter, _ := NewCopilotAdapter(map[string]any{})
+	adapter, _ := NewCopilotAdapter()
 	workspace := t.TempDir()
 	session, lookupErr := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: workspace,
@@ -367,7 +356,7 @@ func TestStartSession_SSHHostWhitespaceOnly(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	adapter, _ := NewCopilotAdapter(map[string]any{})
+	adapter, _ := NewCopilotAdapter()
 	fakeBin := fakeCopilotBinary(t)
 	workspace := t.TempDir()
 
@@ -403,7 +392,7 @@ func fakeCopilotBinaryWithOutput(t *testing.T, content string, exitCode int) str
 // The caller must set GH_TOKEN (or another auth env var) before calling.
 func newTestSession(t *testing.T, workspace string) (domain.AgentAdapter, domain.Session) {
 	t.Helper()
-	adapter, err := NewCopilotAdapter(map[string]any{})
+	adapter, err := NewCopilotAdapter()
 	if err != nil {
 		t.Fatalf("NewCopilotAdapter: %v", err)
 	}
@@ -964,6 +953,151 @@ func TestRunTurn_NonZeroResultExitCode(t *testing.T) {
 	}, result, err)
 }
 
+const (
+	providerFailureMessage = "400 scripted model: request 1 (POST /v1/messages) arrived after the script was exhausted"
+	failedResultLine       = `{"type":"result","timestamp":"2026-03-30T22:19:28.097Z","sessionId":"cc990fc2-1234-5678-9abc-def012345678","exitCode":1,"usage":{"premiumRequests":0,"totalApiDurationMs":0,"sessionDurationMs":0}}` + "\n"
+	noProviderMessage      = "non-zero exit in result event"
+)
+
+func sessionErrorLine(data string) string {
+	return `{"type":"session.error","timestamp":"2026-03-30T22:19:27.500Z","data":` + data + `}` + "\n"
+}
+
+func sessionErrorMessageLine(message string) string {
+	return sessionErrorLine(`{"message":` + strconv.Quote(message) + `}`)
+}
+
+func runFailedTurn(t *testing.T, adapter domain.AgentAdapter, session domain.Session) (*domain.AgentError, domain.AgentEvent, []domain.AgentEvent) {
+	t.Helper()
+
+	var events []domain.AgentEvent
+	_, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+		OnEvent: func(e domain.AgentEvent) { events = append(events, e) },
+	})
+
+	var agentErr *domain.AgentError
+	if !errors.As(err, &agentErr) {
+		t.Fatalf("RunTurn error = %v (%T), want *domain.AgentError", err, err)
+	}
+	if agentErr.Kind != domain.ErrTurnFailed {
+		t.Errorf("RunTurn AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnFailed)
+	}
+	failed, ok := findEventByType(events, domain.EventTurnFailed)
+	if !ok {
+		t.Fatalf("RunTurn events = %v, want an EventTurnFailed", events)
+	}
+	return agentErr, failed, events
+}
+
+func TestRunTurn_SessionErrorMessageIsFailureReason(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+
+	longMessage := strings.Repeat("provider detail ", 512)
+
+	tests := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{
+			name:   "session error then non-zero result",
+			stdout: sessionErrorMessageLine(providerFailureMessage) + failedResultLine,
+			want:   providerFailureMessage,
+		},
+		{
+			name:   "no session error keeps the old text",
+			stdout: failedResultLine,
+			want:   noProviderMessage,
+		},
+		{
+			name:   "two session errors keep the last",
+			stdout: sessionErrorMessageLine("first failure") + sessionErrorMessageLine(providerFailureMessage) + failedResultLine,
+			want:   providerFailureMessage,
+		},
+		{
+			name:   "message is trimmed",
+			stdout: sessionErrorMessageLine("  \t"+providerFailureMessage+"\n ") + failedResultLine,
+			want:   providerFailureMessage,
+		},
+		{
+			name:   "message is not truncated",
+			stdout: sessionErrorMessageLine(longMessage) + failedResultLine,
+			want:   strings.TrimSpace(longMessage),
+		},
+		{
+			name:   "empty message replaces an earlier one",
+			stdout: sessionErrorMessageLine(providerFailureMessage) + sessionErrorLine(`{}`) + failedResultLine,
+			want:   noProviderMessage,
+		},
+		{
+			name:   "undecodable payload keeps an earlier message",
+			stdout: sessionErrorMessageLine(providerFailureMessage) + sessionErrorLine(`"not an object"`) + failedResultLine,
+			want:   providerFailureMessage,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter, session := newTestSession(t, t.TempDir())
+			state := session.Internal.(*sessionState)
+			state.target.Command = fakeCopilotBinaryWithOutput(t, tt.stdout, 0)
+
+			agentErr, failed, _ := runFailedTurn(t, adapter, session)
+
+			if agentErr.Message != tt.want {
+				t.Errorf("RunTurn AgentError.Message = %q, want %q", agentErr.Message, tt.want)
+			}
+			if failed.Message != tt.want {
+				t.Errorf("EventTurnFailed.Message = %q, want %q", failed.Message, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunTurn_SessionErrorEventStillEmitted(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+
+	adapter, session := newTestSession(t, t.TempDir())
+	state := session.Internal.(*sessionState)
+	state.target.Command = fakeCopilotBinaryWithOutput(t, sessionErrorMessageLine(providerFailureMessage)+failedResultLine, 0)
+
+	_, _, events := runFailedTurn(t, adapter, session)
+
+	other, ok := findEventByType(events, domain.EventOtherMessage)
+	if !ok {
+		t.Fatalf("RunTurn events = %v, want an EventOtherMessage for session.error", events)
+	}
+	if other.Message != "session.error" {
+		t.Errorf("EventOtherMessage.Message = %q, want %q", other.Message, "session.error")
+	}
+}
+
+func TestRunTurn_SessionErrorMessageDoesNotLeakIntoNextTurn(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+
+	adapter, session := newTestSession(t, t.TempDir())
+	state := session.Internal.(*sessionState)
+
+	state.target.Command = fakeCopilotBinaryWithOutput(t, sessionErrorMessageLine(providerFailureMessage)+failedResultLine, 0)
+	first, _, _ := runFailedTurn(t, adapter, session)
+	if first.Message != providerFailureMessage {
+		t.Fatalf("RunTurn(first) AgentError.Message = %q, want %q", first.Message, providerFailureMessage)
+	}
+
+	state.target.Command = fakeCopilotBinaryWithOutput(t, failedResultLine, 0)
+	second, failed, _ := runFailedTurn(t, adapter, session)
+
+	if second.Message != noProviderMessage {
+		t.Errorf("RunTurn(second) AgentError.Message = %q, want %q", second.Message, noProviderMessage)
+	}
+	if failed.Message != noProviderMessage {
+		t.Errorf("RunTurn(second) EventTurnFailed.Message = %q, want %q", failed.Message, noProviderMessage)
+	}
+}
+
 // TestRunTurn_TurnFailed_APIDurationMS verifies that EventTurnFailed carries
 // APIDurationMS from the result event's totalApiDurationMs field, and that no
 // phantom EventTokenUsage follows it.
@@ -1055,7 +1189,7 @@ func TestRunTurn_ContextCancelledBeforeStart(t *testing.T) {
 func TestStopSession_NilProc(t *testing.T) {
 	t.Parallel()
 
-	adapter, err := NewCopilotAdapter(map[string]any{})
+	adapter, err := NewCopilotAdapter()
 	if err != nil {
 		t.Fatalf("NewCopilotAdapter: %v", err)
 	}

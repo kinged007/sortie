@@ -111,6 +111,10 @@ type PRMergeStatus struct {
 	// closed-without-merge condition tests Closed && !Merged rather
 	// than Closed alone.
 	Closed bool
+
+	// URL is the pull request's web page as the provider reports it; empty
+	// when the provider reports none.
+	URL string
 }
 
 // MergeResult carries the outcome of a successful merge call.

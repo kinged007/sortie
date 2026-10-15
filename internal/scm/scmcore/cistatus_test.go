@@ -15,9 +15,10 @@ func TestAggregateCIStatus(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		runs []domain.CheckRun
-		want domain.CIStatus
+		name      string
+		runs      []domain.CheckRun
+		want      domain.CIStatus
+		wantTally scmcore.CheckRunTally
 	}{
 		{
 			name: "nil slice returns Pending",
@@ -35,7 +36,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 			},
-			want: domain.CIStatusPassing,
+			want:      domain.CIStatusPassing,
+			wantTally: scmcore.CheckRunTally{Passing: 2},
 		},
 		{
 			name: "one failure returns Failing",
@@ -43,7 +45,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionFailure),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 			},
-			want: domain.CIStatusFailing,
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1, Passing: 1},
 		},
 		{
 			name: "any in_progress returns Pending",
@@ -51,7 +54,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 				run(domain.CheckRunStatusInProgress, domain.CheckConclusionPending),
 			},
-			want: domain.CIStatusPending,
+			want:      domain.CIStatusPending,
+			wantTally: scmcore.CheckRunTally{Pending: 1, Passing: 1},
 		},
 		{
 			name: "cancelled with success returns Pending",
@@ -59,14 +63,16 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 			},
-			want: domain.CIStatusPending,
+			want:      domain.CIStatusPending,
+			wantTally: scmcore.CheckRunTally{Pending: 1, Passing: 1},
 		},
 		{
 			name: "timed_out returns Failing",
 			runs: []domain.CheckRun{
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionTimedOut),
 			},
-			want: domain.CIStatusFailing,
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1},
 		},
 		{
 			name: "all cancelled returns Pending",
@@ -74,7 +80,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 			},
-			want: domain.CIStatusPending,
+			want:      domain.CIStatusPending,
+			wantTally: scmcore.CheckRunTally{Pending: 2},
 		},
 		{
 			name: "cancelled with failure returns Failing",
@@ -82,7 +89,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionFailure),
 			},
-			want: domain.CIStatusFailing,
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1, Pending: 1},
 		},
 		{
 			name: "cancelled with timed_out returns Failing",
@@ -90,7 +98,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionTimedOut),
 			},
-			want: domain.CIStatusFailing,
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1, Pending: 1},
 		},
 		{
 			name: "cancelled with in_progress returns Pending",
@@ -98,7 +107,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionCancelled),
 				run(domain.CheckRunStatusInProgress, domain.CheckConclusionPending),
 			},
-			want: domain.CIStatusPending,
+			want:      domain.CIStatusPending,
+			wantTally: scmcore.CheckRunTally{Pending: 2},
 		},
 		{
 			name: "all neutral and skipped completed returns Passing",
@@ -106,7 +116,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionNeutral),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSkipped),
 			},
-			want: domain.CIStatusPassing,
+			want:      domain.CIStatusPassing,
+			wantTally: scmcore.CheckRunTally{Passing: 2},
 		},
 		{
 			name: "failure and in_progress returns Failing",
@@ -114,7 +125,8 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionFailure),
 				run(domain.CheckRunStatusInProgress, domain.CheckConclusionPending),
 			},
-			want: domain.CIStatusFailing,
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1, Pending: 1},
 		},
 		{
 			name: "all completed with a neutral conclusion yields passing",
@@ -122,7 +134,16 @@ func TestAggregateCIStatus(t *testing.T) {
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionNeutral),
 				run(domain.CheckRunStatusCompleted, domain.CheckConclusionSuccess),
 			},
-			want: domain.CIStatusPassing,
+			want:      domain.CIStatusPassing,
+			wantTally: scmcore.CheckRunTally{Passing: 2},
+		},
+		{
+			name: "failing conclusion on an unfinished run counts as failing not pending",
+			runs: []domain.CheckRun{
+				run(domain.CheckRunStatusInProgress, domain.CheckConclusionFailure),
+			},
+			want:      domain.CIStatusFailing,
+			wantTally: scmcore.CheckRunTally{Failing: 1},
 		},
 	}
 
@@ -132,6 +153,10 @@ func TestAggregateCIStatus(t *testing.T) {
 			got := scmcore.AggregateCIStatus(tt.runs)
 			if got != tt.want {
 				t.Errorf("AggregateCIStatus: got %q, want %q", got, tt.want)
+			}
+
+			if gotTally := scmcore.TallyCheckRuns(tt.runs); gotTally != tt.wantTally {
+				t.Errorf("TallyCheckRuns(%v) = %+v, want %+v", tt.runs, gotTally, tt.wantTally)
 			}
 		})
 	}

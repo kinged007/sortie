@@ -72,10 +72,12 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 
 		// A human gesture stays actionable regardless of age, so this kind
 		// has no TTL and no drop-on-age branch.
-		if now.Before(pending.PendingRetryAt) {
+		if reactionWaits(pending, now) {
 			state.PendingReactions[key] = pending
 			continue
 		}
+
+		readPullRequestURL(ctx, params.SCMAdapter, pending, entryLog)
 
 		// The dispatched flag is not consulted for this kind. The read error
 		// is: at-most-once rests solely on the mark, and this kind has no
@@ -87,7 +89,7 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 			pending.PendingAttempts++
 			delay := max(computeReactionPendingDelay(pending.PendingAttempts), pollInterval)
 			pending.PendingRetryAt = now.Add(delay)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitBackoff)
 			entryLog.Warn("label-review fingerprint read failed, backing off without dispatch",
 				slog.Int("pr_number", data.PRNumber),
 				slog.Any("error", fpErr),
@@ -102,7 +104,7 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 			pending.PendingAttempts++
 			delay := max(computeReactionPendingDelay(pending.PendingAttempts), pollInterval)
 			pending.PendingRetryAt = now.Add(delay)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitBackoff)
 			entryLog.Warn("label-review journal fetch failed, retrying with backoff",
 				slog.Int("pr_number", data.PRNumber),
 				slog.Any("error", err),
@@ -122,7 +124,7 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 		}
 		if len(newEvents) == 0 {
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			continue
 		}
 
@@ -143,20 +145,24 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 		labelPresentNow := labelPresent(events, params.LabelReviewConfig.ReviewLabel)
 		commandConfirmed := len(matches) > 0 && labelPresentNow
 
-		running := state.Running[pending.IssueID] != nil
+		running := state.Running[pending.IssueID]
 		incumbent := retrySlotIncumbent(state, pending.IssueID)
 
-		// A foreign incumbent defers before the same-kind collapse check
-		// runs: evaluating the collapse arm first would advance the mark
-		// past the labeling event and swallow the gesture.
+		// A session or retry of another kind defers before the same-kind
+		// collapse check runs: evaluating the collapse arm first would
+		// advance the mark past the labeling event and swallow the gesture.
 		if commandConfirmed && incumbent != nil && incumbent.ReactionKind != ReactionKindLabelReview {
 			logRetrySlotDeferral(entryLog, ReactionKindLabelReview, incumbent)
-			pending.CreatedAt = now
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitRetrySlot)
+			continue
+		}
+		if commandConfirmed && running != nil && running.ReactionKind != ReactionKindLabelReview {
+			requeueReaction(state, key, pending, waitRetrySlot)
 			continue
 		}
 
-		sameKindQueuedOrRunning := running || (incumbent != nil && incumbent.ReactionKind == ReactionKindLabelReview)
+		sameKindQueuedOrRunning := (running != nil && running.ReactionKind == ReactionKindLabelReview) ||
+			(incumbent != nil && incumbent.ReactionKind == ReactionKindLabelReview)
 
 		if commandConfirmed && !sameKindQueuedOrRunning {
 			// Advance the mark BEFORE scheduling: at-most-once rests on the
@@ -184,11 +190,17 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 				ContinuationContext: map[string]any{
 					"label_review": buildLabelReviewMap(data, newestMatch.Actor, newestMatch.At),
 				},
-				ReactionKind: ReactionKindLabelReview,
-				AgentKind:    pending.AgentKind,
-				RuleName:     pending.RuleName,
-				TemplateID:   pending.TemplateID,
-				Logger:       entryLog,
+				ReactionKind:        ReactionKindLabelReview,
+				Continuation:        continuationTargetOf(pending, 0),
+				AgentKind:           pending.AgentKind,
+				ConfiguredModel:     pending.ConfiguredModel,
+				RuleName:            pending.RuleName,
+				StageLineage:        pending.StageLineage,
+				RuleSettingsApplied: pending.RuleSettingsApplied,
+				TemplateID:          pending.TemplateID,
+				Logger:              entryLog,
+
+				IssueIdentity: pending.IssueIdentity,
 			}, params.OnRetryFire)
 
 			// Best-effort acknowledgment: the label's disappearance tells the
@@ -210,7 +222,7 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 			// Re-enqueue so the detection loop survives the dispatch,
 			// decoupled from the scratch workspace the session runs in.
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitPollInterval)
 			continue
 		}
 
@@ -224,7 +236,7 @@ func reconcileLabelReviewCommands(state *State, params ReconcileParams, log *slo
 		}
 		data.HighWaterMark = newestMark
 		pending.PendingRetryAt = now.Add(pollInterval)
-		state.PendingReactions[key] = pending
+		requeueReaction(state, key, pending, waitPollInterval)
 	}
 }
 

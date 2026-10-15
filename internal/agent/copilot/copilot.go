@@ -38,14 +38,19 @@ var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // call and the session continues.
 const copilotToolDeniedCode = "denied"
 
+// defaultCommand is what a session launches when it is given no command.
+const defaultCommand = "copilot"
+
 func init() {
 	registry.Agents.RegisterWithMeta("copilot-cli", NewCopilotAdapter, registry.AgentMeta{
 		RequiresCommand:     true,
+		DefaultCommand:      defaultCommand,
 		ValidateAgentConfig: validateConfig,
 		MCPInjection:        registry.MCPInjectionSupported,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+		EffortForwarding:    registry.EffortForwarded,
 		UsageSessionRules: []registry.UsageSessionRule{
 			{
 				// Mirrors sessionState.recoverUsage's own remote
@@ -66,9 +71,7 @@ var _ domain.AgentAdapter = (*CopilotAdapter)(nil)
 // CLI subprocesses. One adapter instance serves all concurrent
 // sessions; per-session state is held in [sessionState] via the
 // [domain.Session] Internal field.
-type CopilotAdapter struct {
-	passthrough passthroughConfig
-}
+type CopilotAdapter struct{}
 
 // sessionState is adapter-internal state stored in [domain.Session]
 // Internal. It tracks the Copilot CLI session ID and per-turn scan
@@ -76,6 +79,7 @@ type CopilotAdapter struct {
 type sessionState struct {
 	target           agentcore.LaunchTarget
 	copilotSessionID string
+	passthrough      passthroughConfig
 	agentConfig      domain.AgentConfig
 	baseLogger       *slog.Logger
 
@@ -142,6 +146,12 @@ type sessionState struct {
 	// summary, empty when the report never arrived or its payload was
 	// unreadable.
 	turnCompletionSummary string
+
+	// turnErrorMessage is the trimmed message of the turn's last
+	// session.error event, empty when none arrived or its payload was
+	// unreadable. It is the failure reason when the result event reports a
+	// failed exit.
+	turnErrorMessage string
 
 	// turnContinuations counts the user.message events this turn whose
 	// payload marked them as autopilot continuations. Diagnostic only;
@@ -244,23 +254,22 @@ func (s *sessionState) recoverUsage(logger *slog.Logger) *agentcore.RecoveredUsa
 	return &agentcore.RecoveredUsage{Run: agentcore.SubtractUsage(current, s.baseline), Model: model}
 }
 
-// NewCopilotAdapter creates a [CopilotAdapter] from adapter
-// configuration. The config parameter is the raw map from the
-// "copilot-cli" sub-object in WORKFLOW.md. Command resolution is
-// deferred to [CopilotAdapter.StartSession].
-func NewCopilotAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, fault := parsePassthroughConfig(config)
-	if fault != nil {
-		return nil, fault
-	}
-	return &CopilotAdapter{passthrough: pt}, nil
+// NewCopilotAdapter creates a [CopilotAdapter]. Settings and command
+// resolution are deferred to [CopilotAdapter.StartSession].
+func NewCopilotAdapter() (domain.AgentAdapter, error) {
+	return &CopilotAdapter{}, nil
 }
 
-// StartSession validates the workspace path, resolves the copilot binary, and
-// initializes per-session state. No subprocess is spawned; that happens in
-// [CopilotAdapter.RunTurn].
+// StartSession parses the session's settings, validates the workspace path,
+// resolves the copilot binary, and initializes per-session state. A local
+// session runs a version canary of the binary; turns spawn their
+// subprocess in [CopilotAdapter.RunTurn].
 func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	target, agentErr := agentcore.ResolveLaunchTarget(params, "copilot")
+	pt, fault := parsePassthroughConfig(params.Settings)
+	if fault != nil {
+		return domain.Session{}, agentcore.SettingsError(fault.Error(), fault)
+	}
+	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
 	}
@@ -273,8 +282,11 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 		defer cancel()
 		cmd := exec.CommandContext(canaryCtx, target.Command, "--version") //nolint:gosec // target.Command from LookPath
 		var combined bytes.Buffer
-		result, startErr := procutil.RunCapture(cmd, stopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+		result, startErr := procutil.RunCapture(canaryCtx, cmd, stopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
 		if startErr != nil || result.WaitErr != nil {
+			if cancelled := agentcore.SessionStartCancelledError(ctx, startErr); cancelled != nil {
+				return domain.Session{}, cancelled
+			}
 			canaryErr := startErr
 			if canaryErr == nil {
 				canaryErr = result.WaitErr
@@ -304,6 +316,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 	state := &sessionState{
 		target:                 target,
 		copilotSessionID:       copilotSessionID,
+		passthrough:            pt,
 		agentConfig:            params.AgentConfig,
 		baseLogger:             slog.Default().With(slog.String("component", "copilot-adapter")),
 		mcpConfigPath:          params.MCPConfigPath,
@@ -315,7 +328,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 
 	hooks := agentcore.ForkPerTurnHooks{
 		BuildArgs: func(turn int, prompt string) []string {
-			return buildArgs(state, turn, prompt, a.passthrough)
+			return buildArgs(state, turn, prompt, state.passthrough)
 		},
 		ParseLine: func(line []byte, emit func(domain.AgentEvent), pid string) (any, error) {
 			now := time.Now().UTC()
@@ -438,6 +451,19 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				"session.tools_updated":
 				state.logger().Debug("copilot event logged only", slog.String("event_type", event.Type))
 
+			case "session.error":
+				if len(event.Data) > 0 {
+					errData, dataErr := parseSessionErrorData(event.Data)
+					if dataErr == nil {
+						state.turnErrorMessage = strings.TrimSpace(errData.Message)
+					}
+				}
+				emit(domain.AgentEvent{
+					Type:      domain.EventOtherMessage,
+					Timestamp: now,
+					Message:   event.Type,
+				})
+
 			case "user.message":
 				if len(event.Data) > 0 {
 					msgData, dataErr := parseUserMessageData(event.Data)
@@ -462,7 +488,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 		},
 		GetUsage:     func() (domain.TokenUsage, bool) { return state.usage.Snapshot(), state.usage.Measured() },
 		GetSessionID: func() string { return state.copilotSessionID },
-		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, stderrLines []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
+		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, waitErr error, stderrLines []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
 			lastResult, _ := lastParsed.(*rawEvent)
 
 			// Capture session ID from result event for subsequent turns.
@@ -476,6 +502,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 			ev := agentcore.TurnEvidence{
 				ExitObserved: true,
 				ExitCode:     exitCode,
+				WaitErr:      waitErr,
 				EarlyExit:    earlyExit,
 			}
 			ev.Work, ev.WorkDetail = state.work.Report()
@@ -492,12 +519,15 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				case lastResult.ExitCode == nil || *lastResult.ExitCode != 0:
 					ev.Terminal = agentcore.TerminalFailure
 					ev.TerminalMessage = "non-zero exit in result event"
+					if state.turnErrorMessage != "" {
+						ev.TerminalMessage = state.turnErrorMessage
+					}
 				case !state.turnCompletionSeen:
 					ev.Terminal = agentcore.TerminalIncomplete
 					ev.TerminalMessage = "raise copilot-cli.max_autopilot_continues if the turn needs more steps"
 					state.logger().Warn("copilot turn ended without a task-completion report",
 						slog.Int("autopilot_continuations_observed", state.turnContinuations),
-						slog.Int("max_autopilot_continues", effectiveMaxAutopilotContinues(a.passthrough)))
+						slog.Int("max_autopilot_continues", effectiveMaxAutopilotContinues(state.passthrough)))
 				case !state.turnCompletionSuccess:
 					ev.Terminal = agentcore.TerminalFailure
 					ev.TerminalErrorKind = domain.ErrTurnFailed
@@ -545,6 +575,7 @@ func (a *CopilotAdapter) RunTurn(ctx context.Context, session domain.Session, pa
 	state.turnCompletionSeen = false
 	state.turnCompletionSuccess = false
 	state.turnCompletionSummary = ""
+	state.turnErrorMessage = ""
 	state.turnContinuations = 0
 
 	return state.forkSession.RunTurn(ctx, params.Prompt, params.OnEvent)

@@ -30,6 +30,7 @@ func webhookBackend(t *testing.T) config.NotificationBackend {
 	t.Cleanup(srv.Close)
 	return config.NotificationBackend{
 		Kind:   "webhook",
+		Events: agentMessageEvents,
 		Config: map[string]any{"url": srv.URL},
 	}
 }
@@ -138,6 +139,8 @@ var _ domain.TrackerAdapter = (*stubTrackerAdapter)(nil)
 func (s *stubTrackerAdapter) FetchCandidateIssues(_ context.Context) ([]domain.Issue, error) {
 	return nil, nil
 }
+
+func (s *stubTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
 func (s *stubTrackerAdapter) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -155,7 +158,12 @@ func (s *stubTrackerAdapter) FetchIssueComments(_ context.Context, _ string) ([]
 }
 func (s *stubTrackerAdapter) TransitionIssue(_ context.Context, _ string, _ string) error { return nil }
 func (s *stubTrackerAdapter) CommentIssue(_ context.Context, _ string, _ string) error    { return nil }
-func (s *stubTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error        { return nil }
+func (s *stubTrackerAdapter) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (s *stubTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error { return nil }
+
+func (s *stubTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // TestBuildSessionToolRegistry_AllToolsPresent verifies served-side parity:
 // all five expected tools appear in the built registry and in the names served
@@ -387,6 +395,7 @@ func TestBuildSessionToolRegistry_MisconfiguredNotifier(t *testing.T) {
 			name: "unknown notifier kind",
 			backend: config.NotificationBackend{
 				Kind:   "no-such-backend-xyz",
+				Events: agentMessageEvents,
 				Config: map[string]any{"url": "https://example.com"},
 			},
 		},
@@ -394,6 +403,7 @@ func TestBuildSessionToolRegistry_MisconfiguredNotifier(t *testing.T) {
 			name: "webhook empty url",
 			backend: config.NotificationBackend{
 				Kind:   "webhook",
+				Events: agentMessageEvents,
 				Config: map[string]any{"url": ""},
 			},
 		},
@@ -401,6 +411,7 @@ func TestBuildSessionToolRegistry_MisconfiguredNotifier(t *testing.T) {
 			name: "slack empty webhook_url",
 			backend: config.NotificationBackend{
 				Kind:   "slack",
+				Events: agentMessageEvents,
 				Config: map[string]any{"webhook_url": ""},
 			},
 		},
@@ -549,6 +560,7 @@ func TestBuildSessionToolRegistry_StoreOpenedThenNotifierError(t *testing.T) {
 			name: "unknown notifier kind with open store",
 			backend: config.NotificationBackend{
 				Kind:   "no-such-backend-xyz",
+				Events: agentMessageEvents,
 				Config: map[string]any{"url": "https://example.com"},
 			},
 		},
@@ -556,6 +568,7 @@ func TestBuildSessionToolRegistry_StoreOpenedThenNotifierError(t *testing.T) {
 			name: "webhook empty url with open store",
 			backend: config.NotificationBackend{
 				Kind:   "webhook",
+				Events: agentMessageEvents,
 				Config: map[string]any{"url": ""},
 			},
 		},
@@ -623,7 +636,7 @@ func TestBuildSessionToolRegistry_NotifyOperatorWithoutIdentity(t *testing.T) {
 				WorkspacePath: tt.workspacePath,
 				DispatchID:    tt.dispatchID,
 				Notifications: []config.NotificationBackend{
-					{Kind: "webhook", Config: map[string]any{"url": srv.URL}},
+					{Kind: "webhook", Events: agentMessageEvents, Config: map[string]any{"url": srv.URL}},
 				},
 			}
 
@@ -687,7 +700,7 @@ func TestBuildSessionToolRegistry_CreatesNoFileBeforeExecute(t *testing.T) {
 		WorkspacePath: tmpDir,
 		DispatchID:    "dispatch-construction",
 		Notifications: []config.NotificationBackend{
-			{Kind: "webhook", Config: map[string]any{"url": srv.URL}},
+			{Kind: "webhook", Events: agentMessageEvents, Config: map[string]any{"url": srv.URL}},
 		},
 	}
 
@@ -702,5 +715,56 @@ func TestBuildSessionToolRegistry_CreatesNoFileBeforeExecute(t *testing.T) {
 		t.Errorf("notification_slots directory exists with entries %v before Execute, want absent", entries)
 	} else if !os.IsNotExist(readErr) {
 		t.Fatalf("ReadDir(notification_slots) unexpected error: %v", readErr)
+	}
+}
+
+func TestBuildSessionToolRegistry_NotifyOperatorOnlyForAgentMessageSubscribers(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".sortie"), 0o750); err != nil {
+		t.Fatalf("MkdirAll(.sortie): %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		entry func(t *testing.T) config.NotificationBackend
+		want  bool
+	}{
+		{
+			name: "an entry that lists agent message",
+			entry: func(t *testing.T) config.NotificationBackend {
+				return webhookBackend(t)
+			},
+			want: true,
+		},
+		{
+			name: "an entry that lists only orchestrator events",
+			entry: func(t *testing.T) config.NotificationBackend {
+				backend := webhookBackend(t)
+				backend.Events = []domain.EventType{domain.EventSessionFailed}
+				return backend
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result, err := BuildSessionToolRegistry(context.Background(), slog.New(slog.DiscardHandler), SessionToolParams{
+				WorkspacePath: tmpDir,
+				DispatchID:    "dispatch-subset",
+				Notifications: []config.NotificationBackend{tt.entry(t)},
+			})
+			if err != nil {
+				t.Fatalf("BuildSessionToolRegistry(%q) error = %v, want nil", tt.name, err)
+			}
+			t.Cleanup(func() { closeResult(t, result) })
+
+			if got := slices.Contains(toolNamesFromResult(result), "notify_operator"); got != tt.want {
+				t.Errorf("BuildSessionToolRegistry(%q) registers notify_operator = %v, want %v", tt.name, got, tt.want)
+			}
+		})
 	}
 }

@@ -3,11 +3,7 @@ name: CI
 
 on:
   push:
-    branches:
-      # This is to make sure that there is no broken CI on
-      # the main branch, and also for Sonarqube integration
-      - main
-  # We need it for better Sonarqube integration
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -15,13 +11,6 @@ permissions:
   contents: read
 
 concurrency:
-  # Cancel any currently running job or workflow in the same concurrency group.
-  # The group is a unique identifier for the workflow run.
-  #
-  # Explanation:
-  # - github.workflow: The name of the workflow (e.g. Workflow 1).
-  # - github.event.pull_request.number: The number of the pull request (when the trigger event is a PR).
-  # - github.ref_name: The short branch or tag name (when the trigger is not a PR but a push).
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
@@ -33,13 +22,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # golangci-lint applies build constraints exactly as the compiler
-        # does, so one run only ever analyses the files that survive for
-        # its GOOS - every _windows.go file is invisible to a Linux run.
-        # Each released platform therefore needs its own run. Cross-GOOS
-        # analysis is exact here because the module is pure Go; a cgo
-        # dependency would invalidate it. Keep in step with LINT_GOOS in
-        # default.mk, which is what "make lint" iterates locally.
         goos: [linux, darwin, windows]
 
     steps:
@@ -61,13 +43,8 @@ jobs:
         with:
           version: latest
           verify: false
-          # Skip the action's analysis cache: stale entries cause flaky
-          # false positives (golangci-lint#5979) that reproduce on no rerun.
-          # A cache shared across the matrix would also carry a result over
-          # from the wrong GOOS. setup-go's caches are unaffected.
           skip-cache: true
 
-      # Comment style does not depend on GOOS, so one matrix leg checks it.
       - name: Check comments
         if: matrix.goos == 'linux'
         run: scripts/comments.sh
@@ -82,6 +59,14 @@ jobs:
           verify: false
           working-directory: tools/qualify
           skip-cache: true
+
+      - name: Install gopls
+        if: matrix.goos == 'linux'
+        run: go install golang.org/x/tools/gopls@latest
+
+      - name: Lint (gopls)
+        if: matrix.goos == 'linux'
+        run: make lint-gopls GOPLS="$(go env GOPATH)/bin/gopls"
 
   lint-shell:
     name: Lint (shell)
@@ -117,8 +102,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Same per-GOOS reasoning as the Lint job above: production code
-        # reachable only from its own test is a per-platform property.
         goos: [linux, darwin, windows]
 
     steps:
@@ -126,8 +109,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # No step in this job runs an authenticated git command, so the
-          # token does not need to stay in the local git config.
           persist-credentials: false
 
       - name: Set up Go
@@ -135,9 +116,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The main Lint job counts a reference from a test as a use, so
-      # production code reachable only from its own test never turns up
-      # there. This job is the only one that can fail on that class.
       - name: Lint shipped code
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         env:
@@ -146,9 +124,6 @@ jobs:
           version: latest
           verify: false
           args: --config .golangci-no-tests.yml --tests=false ./...
-          # Skip the action's analysis cache: this job runs a different
-          # analyzer scope than the main Lint job, and a cache shared
-          # between the two could carry a result over from the wrong scope.
           skip-cache: true
 
       - name: Lint shipped tools
@@ -168,7 +143,6 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # secrets cannot be directly referenced in if: conditionals
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
@@ -226,6 +200,24 @@ jobs:
       - name: Test workspace verbosely
         run: go test -v -count=1 ./internal/workspace/...
 
+  test-darwin:
+    name: Test (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run darwin-only tests
+        run: make test-darwin
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -245,3 +237,32 @@ jobs:
 
       - name: Build binary
         run: make build
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: make ui-install
+
+      - name: Lint
+        run: make ui-lint
+
+      - name: Format
+        run: make ui-fmt-check
+
+      - name: Output drift
+        run: make ui-build-check

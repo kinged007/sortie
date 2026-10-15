@@ -1,0 +1,8 @@
+# Read by "make lint-docs" and by the Docs workflow, so a local run and CI
+# check the same things.
+
+include_fragments = "full"
+
+# A 502 or 503 is the remote host's outage, not a broken link, so the
+# weekly external check must not page anyone for it.
+accept = ["100..=103", "200..=299", "502", "503"]

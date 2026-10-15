@@ -2,7 +2,9 @@ version: 2
 
 updates:
   - package-ecosystem: gomod
-    directory: /
+    directories:
+      - /
+      - /tools/qualify
     schedule:
       interval: weekly
       day: monday
@@ -13,10 +15,35 @@ updates:
       - dependencies
       - go
     commit-message:
-      prefix: "chore"
-      include: "scope"
+      prefix: chore
+      include: scope
     groups:
       go-minor-patch:
+        update-types:
+          - minor
+          - patch
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    versioning-strategy: increase
+    target-branch: main
+    assignees: [cicdbot]
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - npm
+    commit-message:
+      prefix: chore
+      include: scope
+    cooldown:
+      default-days: 3
+    groups:
+      npm-minor-patch:
         update-types:
           - minor
           - patch
@@ -35,8 +62,8 @@ updates:
       - dependencies
       - github_actions
     commit-message:
-      prefix: "ci"
-      include: "scope"
+      prefix: ci
+      include: scope
     groups:
       actions:
         patterns:

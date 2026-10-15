@@ -3,7 +3,8 @@
 // no third-party Gitea client library, normalizing issue responses to domain
 // types: labels lowercased, priority always nil (Gitea exposes no priority
 // field), parent always nil (Gitea has no sub-issue concept), state derived
-// from labels against the configured active, terminal, and handoff lists, and
+// from labels against the configured active, terminal, and handoff lists (an
+// open issue carrying none reads no state and is never a candidate), and
 // blocker refs read from the issue dependencies route.
 //
 // The constructor runs a two-call preflight (GET /user and GET
@@ -21,7 +22,6 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -34,12 +34,11 @@ import (
 
 func init() {
 	registry.Trackers.RegisterWithMeta("gitea", NewGiteaAdapter, registry.TrackerMeta{
-		RequiresProject:       true,
-		RequiresAPIKey:        true,
-		ValidateTrackerConfig: validateConfig,
-		DefaultActiveStates:   defaultActiveStates,
-		DefaultTerminalStates: defaultTerminalStates,
-		BlockerSource:         registry.BlockersPerIssue,
+		RequiresProject:        true,
+		RequiresAPIKey:         true,
+		ValidateTrackerConfig:  validateConfig,
+		RequiresTerminalStates: true,
+		BlockerSource:          registry.BlockersPerIssue,
 	})
 }
 
@@ -50,25 +49,19 @@ var _ domain.TrackerAdapter = (*GiteaAdapter)(nil)
 // allows up to 10,000 results before the adapter stops and returns what it has.
 const maxPages = 200
 
-// defaultActiveStates is applied when the config omits active_states.
-var defaultActiveStates = issuekit.DefaultActiveLabelStates()
-
-// defaultTerminalStates is applied when the config omits terminal_states.
-var defaultTerminalStates = issuekit.DefaultTerminalLabelStates()
-
 // GiteaAdapter implements [domain.TrackerAdapter] against the Gitea REST API v1.
 // All fields except metrics are set once at construction and never mutated, so
-// the adapter is safe for concurrent use.
+// the adapter is safe for concurrent use. The embedded state source supplies the
+// workflow's state lists, which an operation reads once at its start.
 type GiteaAdapter struct {
-	client         *httpkit.Client
-	owner          string
-	repo           string
-	activeStates   []string
-	terminalStates []string
-	handoffState   string
-	queryFilter    url.Values // parsed tracker.query_filter; nil or empty when unset
-	log            *slog.Logger
-	metrics        domain.Metrics
+	*issuekit.StateSource
+	client      *httpkit.Client
+	owner       string
+	repo        string
+	model       *issuekit.LabelStateModel
+	queryFilter url.Values // parsed tracker.query_filter; nil or empty when unset
+	log         *slog.Logger
+	metrics     domain.Metrics
 }
 
 // NewGiteaAdapter creates a [GiteaAdapter] from adapter configuration and runs a
@@ -77,8 +70,8 @@ type GiteaAdapter struct {
 // Required config keys: "api_key" (access token), "project" (owner/repo), and
 // "endpoint" (instance base URL, which must parse as an absolute http(s) URL
 // with a host; there is no default host). Optional: "active_states",
-// "terminal_states", "handoff_state" (label names, lowercased), and
-// "user_agent". A missing or malformed key, or a preflight failure (invalid
+// "terminal_states", "handoff_state", "in_progress_state" (label names, with no
+// default list), and "user_agent". A missing or malformed key, or a preflight failure (invalid
 // token or unknown repository), returns a [*domain.TrackerError] and blocks
 // construction.
 func NewGiteaAdapter(config map[string]any) (domain.TrackerAdapter, error) {
@@ -134,29 +127,10 @@ func NewGiteaAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		baseURL += "/api/v1"
 	}
 
-	activeRaw := typeutil.ExtractStringSlice(config["active_states"])
-	if len(activeRaw) == 0 {
-		activeRaw = defaultActiveStates
+	trackerStates, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
-	activeStates := make([]string, len(activeRaw))
-	for i, s := range activeRaw {
-		activeStates[i] = strings.ToLower(s)
-	}
-
-	terminalRaw := typeutil.ExtractStringSlice(config["terminal_states"])
-	if len(terminalRaw) == 0 {
-		terminalRaw = defaultTerminalStates
-	}
-	terminalStates := make([]string, len(terminalRaw))
-	for i, s := range terminalRaw {
-		terminalStates[i] = strings.ToLower(s)
-	}
-
-	handoffRaw, fault := typeutil.StringField(config, "handoff_state")
-	if fault != nil {
-		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
-	}
-	handoffState := strings.ToLower(strings.TrimSpace(handoffRaw))
 
 	userAgent, fault := typeutil.StringField(config, "user_agent")
 	if fault != nil {
@@ -184,15 +158,15 @@ func NewGiteaAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		return nil, err
 	}
 
+	source := issuekit.NewStateSource(trackerStates)
 	adapter := &GiteaAdapter{
-		client:         client,
-		owner:          owner,
-		repo:           repo,
-		activeStates:   activeStates,
-		terminalStates: terminalStates,
-		handoffState:   handoffState,
-		queryFilter:    filter,
-		log:            slog.Default(),
+		StateSource: source,
+		client:      client,
+		owner:       owner,
+		repo:        repo,
+		model:       issuekit.NewLabelStateModel(source, slog.Default()),
+		queryFilter: filter,
+		log:         slog.Default(),
 	}
 
 	warnUnrecognizedFilterKeys(adapter.log, filter)
@@ -251,10 +225,40 @@ func parseGiteaQueryFilter(raw string) (url.Values, error) {
 // case-sensitive comparison the query_filter labels diagnostic requires. A page
 // decode failure returns [domain.ErrTrackerPayload].
 func (a *GiteaAdapter) fetchLabelNames(ctx context.Context) (map[string]struct{}, error) {
-	path := "/repos/" + a.owner + "/" + a.repo + "/labels"
-	params := url.Values{"limit": {"50"}}
+	labels, err := a.paginateLabels(ctx, "/repos/"+a.owner+"/"+a.repo+"/labels")
+	if err != nil {
+		return nil, err
+	}
 
-	paginator := httpkit.NewLinkPaginator(a.client, path, params, func(body []byte) ([]giteaLabel, error) {
+	names := make(map[string]struct{}, len(labels))
+	for _, l := range labels {
+		names[l.Name] = struct{}{}
+	}
+	return names, nil
+}
+
+// readCatalogLabelNames returns the names of the labels an issue of this
+// repository can carry: the repository's own and its owner's organization
+// labels. The organization read is a 404 when the owner is a user, which reads
+// as no organization labels.
+func (a *GiteaAdapter) readCatalogLabelNames(ctx context.Context) ([]string, error) {
+	repoLabels, err := a.paginateLabels(ctx, "/repos/"+a.owner+"/"+a.repo+"/labels")
+	if err != nil {
+		return nil, err
+	}
+
+	orgLabels, err := a.paginateLabels(ctx, "/orgs/"+url.PathEscape(a.owner)+"/labels")
+	if err != nil && !domain.IsNotFound(err) {
+		return nil, err
+	}
+
+	return giteaLabelNames(append(repoLabels, orgLabels...)), nil
+}
+
+// paginateLabels pages a label-array route to exhaustion through the Link
+// paginator. A page decode failure returns [domain.ErrTrackerPayload].
+func (a *GiteaAdapter) paginateLabels(ctx context.Context, path string) ([]giteaLabel, error) {
+	paginator := httpkit.NewLinkPaginator(a.client, path, url.Values{"limit": {"50"}}, func(body []byte) ([]giteaLabel, error) {
 		var raw []giteaLabel
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, &domain.TrackerError{
@@ -273,16 +277,7 @@ func (a *GiteaAdapter) fetchLabelNames(ctx context.Context) (map[string]struct{}
 		},
 	})
 
-	labels, err := paginator.All(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	names := make(map[string]struct{}, len(labels))
-	for _, l := range labels {
-		names[l.Name] = struct{}{}
-	}
-	return names, nil
+	return paginator.All(ctx)
 }
 
 // reportUnresolvedLabels warns once for each query_filter label absent from
@@ -367,24 +362,28 @@ func (a *GiteaAdapter) SetMetrics(m domain.Metrics) {
 
 // FetchCandidateIssues returns open issues whose derived state is in the
 // configured active states, sorted ascending by creation time. Pull requests
-// are skipped and Comments is nil on every returned issue.
+// are skipped and Comments is nil on every returned issue. An empty active list
+// returns no issue and sends no request.
 //
 // Gitea lists newest-first and offers no sort parameter, so the adapter
 // re-sorts client-side to hand the orchestrator the same ascending order the
 // other trackers produce.
 func (a *GiteaAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
+	states := a.model.Snapshot()
+	if len(states.Active) == 0 {
+		return []domain.Issue{}, nil
+	}
+
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
-		activeSet := make(map[string]struct{}, len(a.activeStates))
-		for _, s := range a.activeStates {
-			activeSet[s] = struct{}{}
-		}
+		a.model.CheckActiveLabels(ctx, states, a.readCatalogLabelNames)
 
-		candidates, fetchErr := a.listAndFilter(ctx, "open", activeSet, true)
+		open, fetchErr := a.listIssues(ctx, "open", states, true)
 		if fetchErr != nil {
 			return fetchErr
 		}
 
+		candidates := a.model.Candidates(states, open)
 		slices.SortFunc(candidates, func(x, y domain.Issue) int {
 			return cmp.Compare(x.CreatedAt, y.CreatedAt)
 		})
@@ -407,20 +406,17 @@ func (a *GiteaAdapter) FetchIssuesByStates(ctx context.Context, states []string)
 		return []domain.Issue{}, nil
 	}
 
+	snapshot := a.model.Snapshot()
+
 	requested := make(map[string]struct{}, len(states))
 	for _, s := range states {
 		requested[strings.ToLower(s)] = struct{}{}
 	}
 
-	terminalSet := make(map[string]struct{}, len(a.terminalStates))
-	for _, s := range a.terminalStates {
-		terminalSet[s] = struct{}{}
-	}
-
 	needOpen := false
 	needClosed := false
 	for s := range requested {
-		if _, ok := terminalSet[s]; ok {
+		if slices.Contains(snapshot.Terminal, s) {
 			needClosed = true
 		} else {
 			needOpen = true
@@ -432,19 +428,19 @@ func (a *GiteaAdapter) FetchIssuesByStates(ctx context.Context, states []string)
 		result := make([]domain.Issue, 0)
 
 		if needOpen {
-			open, err := a.listAndFilter(ctx, "open", requested, true)
+			open, err := a.listIssues(ctx, "open", snapshot, true)
 			if err != nil {
 				return err
 			}
-			result = append(result, open...)
+			result = append(result, inStates(open, requested)...)
 		}
 
 		if needClosed {
-			closed, err := a.listAndFilter(ctx, "closed", requested, false)
+			closed, err := a.listIssues(ctx, "closed", snapshot, false)
 			if err != nil {
 				return err
 			}
-			result = append(result, closed...)
+			result = append(result, inStates(closed, requested)...)
 		}
 
 		issues = result
@@ -474,18 +470,19 @@ func mergeQueryParams(base, filter url.Values) url.Values {
 	return merged
 }
 
-// listAndFilter paginates the issue-list route for the given native state and
-// returns issues whose derived state is in keep. Pull requests are skipped,
+// listIssues paginates the issue-list route for the given native state and
+// returns every issue, each derived under states. Pull requests are skipped,
 // DisplayID is qualified to owner/repo#N, and Comments is nil on every issue.
 //
-// State filtering is client-side; the configured labels are never pushed into
-// the Gitea labels query parameter, whose AND semantics and silent drop on an
-// unresolvable name make it unusable for correctness-critical filtering.
+// State filtering is the caller's, client-side; the configured labels are never
+// pushed into the Gitea labels query parameter, whose AND semantics and silent
+// drop on an unresolvable name make it unusable for correctness-critical
+// filtering.
 //
 // When applyFilter is true and an operator query_filter is configured, its
 // params are merged into the request; when false, the request carries only the
 // adapter-owned params.
-func (a *GiteaAdapter) listAndFilter(ctx context.Context, nativeState string, keep map[string]struct{}, applyFilter bool) ([]domain.Issue, error) {
+func (a *GiteaAdapter) listIssues(ctx context.Context, nativeState string, states issuekit.LabelStates, applyFilter bool) ([]domain.Issue, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues"
 	params := url.Values{
 		"state": {nativeState},
@@ -501,20 +498,29 @@ func (a *GiteaAdapter) listAndFilter(ctx context.Context, nativeState string, ke
 		return nil, err
 	}
 
-	filtered := make([]domain.Issue, 0, len(raw))
+	issues := make([]domain.Issue, 0, len(raw))
 	for _, gi := range raw {
 		if isPullRequest(gi) {
 			continue
 		}
-		issue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+		issue := normalizeIssue(gi, a.model, states)
 		setDisplayID(&issue, a.owner, a.repo)
-		if _, ok := keep[issue.State]; !ok {
-			continue
-		}
 		issue.Comments = nil
-		filtered = append(filtered, issue)
+		issues = append(issues, issue)
 	}
-	return filtered, nil
+	return issues, nil
+}
+
+// inStates returns the issues whose state is a key of keep, in order. An issue
+// that reads no state is never kept.
+func inStates(issues []domain.Issue, keep map[string]struct{}) []domain.Issue {
+	kept := make([]domain.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if _, ok := keep[issue.State]; ok && issue.State != "" {
+			kept = append(kept, issue)
+		}
+	}
+	return kept
 }
 
 // paginateIssues fetches every page of an issue-array route through the
@@ -557,6 +563,7 @@ func (a *GiteaAdapter) paginateIssues(ctx context.Context, path string, params u
 func (a *GiteaAdapter) FetchIssueByID(ctx context.Context, issueID string) (domain.Issue, error) {
 	var issue domain.Issue
 	err := trackermetrics.Track(a.metrics, "fetch_issue", func() error {
+		states := a.model.Snapshot()
 		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID)
 
 		body, _, err := a.client.Get(ctx, path, nil)
@@ -586,10 +593,10 @@ func (a *GiteaAdapter) FetchIssueByID(ctx context.Context, issueID string) (doma
 			}
 		}
 
-		fetched := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+		fetched := normalizeIssue(gi, a.model, states)
 		setDisplayID(&fetched, a.owner, a.repo)
 
-		blockers, err := a.fetchBlockers(ctx, issueID)
+		blockers, err := a.fetchBlockers(ctx, issueID, states)
 		if err != nil {
 			return err
 		}
@@ -614,15 +621,15 @@ func (a *GiteaAdapter) FetchIssueBlockers(ctx context.Context, index string) ([]
 	blockers := make([]domain.BlockerRef, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_blockers", func() error {
 		var fetchErr error
-		blockers, fetchErr = a.fetchBlockers(ctx, index)
+		blockers, fetchErr = a.fetchBlockers(ctx, index, a.model.Snapshot())
 		return fetchErr
 	})
 	return blockers, err
 }
 
 // fetchBlockers returns the issues blocking the given issue, read from the
-// dependencies route through the Link paginator.
-func (a *GiteaAdapter) fetchBlockers(ctx context.Context, index string) ([]domain.BlockerRef, error) {
+// dependencies route through the Link paginator, each derived under states.
+func (a *GiteaAdapter) fetchBlockers(ctx context.Context, index string, states issuekit.LabelStates) ([]domain.BlockerRef, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(index) + "/dependencies"
 	params := url.Values{"limit": {"50"}}
 
@@ -631,7 +638,7 @@ func (a *GiteaAdapter) fetchBlockers(ctx context.Context, index string) ([]domai
 		return nil, err
 	}
 
-	return normalizeBlockers(raw, a.activeStates, a.terminalStates, a.handoffState, a.owner, a.repo, a.log), nil
+	return normalizeBlockers(raw, a.model, states, a.owner, a.repo), nil
 }
 
 // FetchIssueComments returns all comments for the issue. It returns a non-nil
@@ -725,6 +732,7 @@ func (a *GiteaAdapter) fetchStatesByIndexes(ctx context.Context, indexes []strin
 		return map[string]string{}, nil
 	}
 
+	snapshot := a.model.Snapshot()
 	states := make(map[string]string, len(indexes))
 	for _, index := range indexes {
 		if ctx.Err() != nil {
@@ -752,8 +760,7 @@ func (a *GiteaAdapter) fetchStatesByIndexes(ctx context.Context, indexes []strin
 			continue
 		}
 
-		states[index] = issuekit.DeriveLabelState(giteaLabelNames(gi.Labels), gi.State, "open", "closed",
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState}, index, a.log)
+		states[index] = a.model.Derive(snapshot, index, giteaLabelNames(gi.Labels), gi.State == "closed")
 	}
 
 	return states, nil
@@ -767,29 +774,7 @@ func (a *GiteaAdapter) fetchStatesByIndexes(ctx context.Context, indexes []strin
 // spuriously create a duplicate. A page decode failure returns
 // [domain.ErrTrackerPayload].
 func (a *GiteaAdapter) resolveLabelIndex(ctx context.Context) (map[string]int64, error) {
-	path := "/repos/" + a.owner + "/" + a.repo + "/labels"
-	params := url.Values{"limit": {"50"}}
-
-	paginator := httpkit.NewLinkPaginator(a.client, path, params, func(body []byte) ([]giteaLabel, error) {
-		var raw []giteaLabel
-		if err := json.Unmarshal(body, &raw); err != nil {
-			return nil, &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to parse labels response",
-				Err:     err,
-			}
-		}
-		return raw, nil
-	}, httpkit.PaginatorOptions{
-		MaxPages: maxPages,
-		OnLimitReached: func(limit int) {
-			a.log.Warn("pagination limit reached",
-				slog.Int("max_pages", limit),
-				slog.String("endpoint", path))
-		},
-	})
-
-	labels, err := paginator.All(ctx)
+	labels, err := a.paginateLabels(ctx, "/repos/"+a.owner+"/"+a.repo+"/labels")
 	if err != nil {
 		return nil, err
 	}
@@ -843,29 +828,19 @@ func (a *GiteaAdapter) ensureLabelID(ctx context.Context, index map[string]int64
 
 // TransitionIssue moves an issue to targetState by swapping its state label and
 // reconciling the native open/closed status. A target that is not a configured
-// active, terminal, or handoff state returns [domain.ErrTrackerPayload] before
-// any request; an index resolving to a pull request returns
-// [domain.ErrTrackerNotFound].
+// active, terminal, or handoff state, and a handoff target on a closed issue,
+// return [domain.ErrTrackerPayload] before any write; an index resolving to a
+// pull request returns [domain.ErrTrackerNotFound].
 //
 // Gitea has no transition API, so the move is composed from label and state
-// edits: the current state label is removed by id, the target label is resolved
-// or created and attached by id, and a terminal or active target patches the
-// native state. Every step is idempotent, so a partial failure converges on
-// retry, and a no-op transition performs no label work.
+// edits. The target label is resolved or created and attached by id before any
+// other state label is removed by the id the issue reports, and a close follows
+// the label writes, so the issue always reads the state it started in or the
+// target. Every step is idempotent, so a partial failure converges on retry, and
+// a no-op transition performs no label work.
 func (a *GiteaAdapter) TransitionIssue(ctx context.Context, issueID, targetState string) error {
-	targetLower := strings.ToLower(targetState)
-
 	return trackermetrics.Track(a.metrics, "transition", func() error {
-		isHandoffTarget := a.handoffState != "" && targetLower == a.handoffState
-		if !slices.Contains(a.activeStates, targetLower) &&
-			!slices.Contains(a.terminalStates, targetLower) &&
-			!isHandoffTarget {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: fmt.Sprintf("invalid target state: %q is not a configured active, terminal, or handoff state", targetState),
-			}
-		}
-
+		states := a.model.Snapshot()
 		basePath := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID)
 
 		body, _, err := a.client.Get(ctx, basePath, nil)
@@ -894,126 +869,104 @@ func (a *GiteaAdapter) TransitionIssue(ctx context.Context, issueID, targetState
 			}
 		}
 
-		currentLabel := issuekit.CurrentLabelState(giteaLabelNames(gi.Labels),
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState})
-
-		if currentLabel != targetLower {
-			index, err := a.resolveLabelIndex(ctx)
-			if err != nil {
-				return err
-			}
-
-			if currentLabel != "" {
-				if currentID, ok := index[currentLabel]; ok {
-					labelPath := basePath + "/labels/" + strconv.FormatInt(currentID, 10)
-					if err := a.client.SendNoBody(ctx, "DELETE", labelPath); err != nil && !domain.IsNotFound(err) {
-						return err
-					}
-				}
-			}
-
-			targetID, err := a.ensureLabelID(ctx, index, targetLower)
-			if err != nil {
-				return err
-			}
-
-			payload, err := json.Marshal(map[string][]int64{"labels": {targetID}})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal label payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "POST", basePath+"/labels", bytes.NewReader(payload)); err != nil {
-				return err
-			}
+		plan, err := states.PlanTransition(targetState, giteaLabelNames(gi.Labels), gi.State == "closed")
+		if err != nil {
+			return err
 		}
-
-		if slices.Contains(a.terminalStates, targetLower) && gi.State == "open" {
-			payload, err := json.Marshal(map[string]string{"state": "closed"})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal state payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", basePath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		} else if slices.Contains(a.activeStates, targetLower) && gi.State == "closed" {
-			payload, err := json.Marshal(map[string]string{"state": "open"})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal state payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", basePath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		}
-
-		return nil
+		return issuekit.ApplyTransition(ctx, plan, issuekit.TransitionOps{
+			Labels: a.labelOps(issueID),
+			SetClosed: func(ctx context.Context, closed bool) error {
+				return a.setIssueClosed(ctx, basePath, closed)
+			},
+		})
 	})
+}
+
+// setIssueClosed patches the native open/closed status of the issue at
+// issuePath.
+func (a *GiteaAdapter) setIssueClosed(ctx context.Context, issuePath string, closed bool) error {
+	state := "open"
+	if closed {
+		state = "closed"
+	}
+	payload, err := json.Marshal(map[string]string{"state": state})
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal state payload",
+			Err:     err,
+		}
+	}
+	_, err = a.client.Send(ctx, "PATCH", issuePath, bytes.NewReader(payload))
+	return err
 }
 
 // CommentIssue posts text as a Markdown comment on the issue. The text is sent
 // verbatim with no conversion, and the created-comment response is ignored.
 func (a *GiteaAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
-
-		payload, err := json.Marshal(map[string]string{"body": text})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal comment payload",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return a.postComment(ctx, issueID, text)
 	})
 }
 
+// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
+// code block, so the tracker shows literal verbatim.
+func (a *GiteaAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *GiteaAdapter) postComment(ctx context.Context, issueID, body string) error {
+	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
+
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal comment payload",
+			Err:     err,
+		}
+	}
+
+	_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
+	return err
+}
+
 // AddLabel attaches label to the issue, resolving or creating the label id
-// first. The label name is lowercased to match the read path, and the attach is
-// additive, so existing labels are preserved and no read-modify-write occurs.
+// first, and confirms it against the issue's labels. The label name is
+// lowercased to match the read path, and the attach is additive, so existing
+// labels are preserved and no read-modify-write occurs. Returns
+// [domain.ErrTrackerPayload] when the label is blank or the issue does not
+// carry it afterwards.
 //
 // The label is attached by id, never by name: Gitea silently ignores an unknown
 // name on the attach route, so an unresolved label would otherwise be a silent
 // no-op instead of a created-then-attached label.
 func (a *GiteaAdapter) AddLabel(ctx context.Context, issueID, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		lowered := strings.ToLower(label)
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
 
+// RemoveLabel removes every label of the issue that names label, ignoring
+// letter case, by the ids the issue reports, so an organization label that the
+// repository catalog lacks is removed too. The removal is confirmed against the
+// issue's labels, and an issue that carries no such label receives no write.
+// Returns [domain.ErrTrackerPayload] when the label is blank or the issue still
+// carries it afterwards.
+func (a *GiteaAdapter) RemoveLabel(ctx context.Context, issueID, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+func (a *GiteaAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	return giteaIssueLabelOps(a.client, a.owner, a.repo, issueID, func(ctx context.Context, lowered string) (int64, error) {
 		index, err := a.resolveLabelIndex(ctx)
 		if err != nil {
-			return err
+			return 0, err
 		}
-
-		labelID, err := a.ensureLabelID(ctx, index, lowered)
-		if err != nil {
-			return err
-		}
-
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/labels"
-		payload, err := json.Marshal(map[string][]int64{"labels": {labelID}})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal label payload",
-				Err:     err,
-			}
-		}
-
-		if _, err := a.client.Send(ctx, "POST", path, bytes.NewReader(payload)); err != nil {
-			return err
-		}
-		return nil
+		return a.ensureLabelID(ctx, index, lowered)
 	})
 }

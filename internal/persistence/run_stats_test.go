@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// createLegacyRunHistoryTable creates a run_history table carrying only
-// the migration-001 columns, with no schema_migrations tracking and none
-// of the optional column groups.
 func createLegacyRunHistoryTable(t *testing.T, s *Store) {
 	t.Helper()
 	if _, err := s.db.ExecContext(context.Background(), `CREATE TABLE run_history (
@@ -30,10 +28,6 @@ func createLegacyRunHistoryTable(t *testing.T, s *Store) {
 	}
 }
 
-// createPartialRunHistoryTable creates a run_history table carrying
-// turns_completed and review_metadata but neither rule_name/template_id
-// nor the four token columns, matching this repository's own .sortie.db
-// shape (schema version 9).
 func createPartialRunHistoryTable(t *testing.T, s *Store) {
 	t.Helper()
 	createLegacyRunHistoryTable(t, s)
@@ -66,6 +60,24 @@ func TestRunHistoryCapabilities(t *testing.T) {
 		}
 		if !caps.Full() {
 			t.Errorf("Full() = false, want true for a fully migrated store")
+		}
+	})
+
+	t.Run("configured settings columns follow migration 021 and stay outside the schema tier", func(t *testing.T) {
+		t.Parallel()
+
+		current, before := openTestStore(t), openTestStore(t)
+		migrateOrFatal(t, current)
+		migrateToVersion(t, before, 20)
+
+		for s, want := range map[*Store]bool{current: true, before: false} {
+			caps, err := s.RunHistoryCapabilities(context.Background())
+			if err != nil {
+				t.Fatalf("RunHistoryCapabilities: %v", err)
+			}
+			if !caps.Full() || caps.HasConfiguredSettings != want || caps.ModelBreakdown() != want {
+				t.Errorf("RunHistoryCapabilities() = %+v, ModelBreakdown() = %v, want Full() and HasConfiguredSettings, ModelBreakdown() both %v", caps, caps.ModelBreakdown(), want)
+			}
 		}
 	})
 
@@ -150,9 +162,51 @@ func TestRunHistoryCapabilities(t *testing.T) {
 	})
 }
 
-// runAt returns a minimal RunHistory whose StartedAt and CompletedAt are
-// both completedAt, for tests that only care about the completed_at
-// range filter.
+func TestRunHistoryCapabilities_Breakdowns(t *testing.T) {
+	t.Parallel()
+
+	full := RunHistoryCapabilities{HasTurnsCompleted: true, HasReviewMetadata: true, HasRuleRouting: true, HasTokens: true, HasTokenMeasurement: true}
+	withSettings := full
+	withSettings.HasConfiguredSettings = true
+	withChains := withSettings
+	withChains.HasStageChains = true
+	withTrigger := withChains
+	withTrigger.HasTrigger = true
+	chainsWithoutSettings := full
+	chainsWithoutSettings.HasStageChains = true
+	tests := []struct {
+		name        string
+		caps        RunHistoryCapabilities
+		wantModel   bool
+		wantChain   bool
+		wantTrigger bool
+	}{
+		{"full tier with settings, stage chains and trigger", withTrigger, true, true, true},
+		{"full tier with configured settings and stage chains", withChains, true, true, false},
+		{"full tier with configured settings", withSettings, true, false, false},
+		{"full tier without configured settings", full, false, false, false},
+		{"stage chains without configured settings", chainsWithoutSettings, false, false, false},
+		{"trigger without stage chains", RunHistoryCapabilities{HasTrigger: true}, false, false, false},
+		{"configured settings without the full tier", RunHistoryCapabilities{HasConfiguredSettings: true, HasStageChains: true, HasTrigger: true}, false, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.caps.ModelBreakdown(); got != tt.wantModel {
+				t.Errorf("%+v.ModelBreakdown() = %v, want %v", tt.caps, got, tt.wantModel)
+			}
+			if got := tt.caps.ChainBreakdown(); got != tt.wantChain {
+				t.Errorf("%+v.ChainBreakdown() = %v, want %v", tt.caps, got, tt.wantChain)
+			}
+			if got := tt.caps.TriggerBreakdown(); got != tt.wantTrigger {
+				t.Errorf("%+v.TriggerBreakdown() = %v, want %v", tt.caps, got, tt.wantTrigger)
+			}
+		})
+	}
+}
+
 func runAt(id, completedAt string) RunHistory {
 	return RunHistory{
 		IssueID:      id,
@@ -446,4 +500,85 @@ func TestScanRunHistoryRange(t *testing.T) {
 			t.Errorf("RunStatsRow.CacheWriteTokens = %d, want 38948", got[0].CacheWriteTokens)
 		}
 	})
+}
+
+func TestScanRunHistoryRange_OptionalColumns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, s *Store)
+		want  []string
+	}{
+		{"filled when the model breakdown is available", func(t *testing.T, s *Store) {
+			migrateOrFatal(t, s)
+			row := runAt("with-model", "2026-01-01T00:00:00Z")
+			row.ConfiguredModel, row.DisplayID = "provider/cheap", "PROJ-1"
+			row.ChainID, row.StagePrevious, row.StageResult = "chain-1", "specify", "advanced"
+			row.Trigger, row.ReactionKind = new("ci_fix"), "review"
+			appendOrFatal(t, s, row)
+			appendOrFatal(t, s, runAt("no-model", "2026-01-02T00:00:00Z"))
+			empty := runAt("empty-trigger", "2026-01-03T00:00:00Z")
+			empty.Trigger = new("")
+			appendOrFatal(t, s, empty)
+			first := runAt("first-after-hop", "2026-01-04T00:00:00Z")
+			first.FirstAfterHop = true
+			appendOrFatal(t, s, first)
+		}, []string{
+			"with-model|provider/cheap|with-model|PROJ-1|chain-1|specify|advanced|\"ci_fix\"|review|false",
+			"no-model||no-model|||||<nil>||false",
+			"empty-trigger||empty-trigger|||||\"\"||false",
+			"first-after-hop||first-after-hop|||||<nil>||true",
+		}},
+		{"origin left empty without error on a database upgraded from before migration 028", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 27)
+			insertBareRun(t, s, "pre-028")
+			migrateOrFatal(t, s)
+		}, []string{"pre-028||MT-1|||||<nil>||false"}},
+		{"first_after_hop left false without error on a database before migration 032", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 31)
+			insertBareRun(t, s, "pre-032")
+		}, []string{"pre-032||MT-1|||||<nil>||false"}},
+		{"trigger left nil without error on a database before migration 028", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 27)
+			insertBareRun(t, s, "pre-028")
+		}, []string{"pre-028||MT-1|||||<nil>||false"}},
+		{"left empty without error on a database before migration 021", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 20)
+			insertBareRun(t, s, "old")
+		}, []string{"old|||||||<nil>||false"}},
+		{"chain columns left empty without error on a database before migration 024", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 23)
+			insertBareRun(t, s, "old")
+		}, []string{"old|||||||<nil>||false"}},
+		{"a legacy table with only the base columns still scans", createLegacyRunHistoryTable, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := openTestStore(t)
+			tt.setup(t, s)
+			ctx := context.Background()
+			caps, err := s.RunHistoryCapabilities(ctx)
+			if err != nil {
+				t.Fatalf("RunHistoryCapabilities: %v", err)
+			}
+
+			var got []string
+			err = s.ScanRunHistoryRange(ctx, caps, nil, nil, func(row RunStatsRow) error {
+				trigger := "<nil>"
+				if row.Trigger != nil {
+					trigger = strconv.Quote(*row.Trigger)
+				}
+				got = append(got, strings.Join([]string{row.IssueID, row.ConfiguredModel, row.Identifier, row.DisplayID, row.ChainID, row.StagePrevious, row.StageResult, trigger, row.ReactionKind, strconv.FormatBool(row.FirstAfterHop)}, "|"))
+				return nil
+			})
+
+			if err != nil || !slices.Equal(got, tt.want) {
+				t.Errorf("ScanRunHistoryRange optional column values, error = %q, %v, want %q, nil", got, err, tt.want)
+			}
+		})
+	}
 }

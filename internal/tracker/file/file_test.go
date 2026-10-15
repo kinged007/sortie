@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,10 +20,10 @@ func fixture(name string) string {
 
 func newAdapter(t *testing.T, path string, activeStates []any) *FileAdapter {
 	t.Helper()
-	config := map[string]any{"path": path}
-	if activeStates != nil {
-		config["active_states"] = activeStates
+	if activeStates == nil {
+		activeStates = []any{"to do", "in progress", "done", "open"}
 	}
+	config := map[string]any{"path": path, "active_states": activeStates}
 	a, err := NewFileAdapter(config)
 	if err != nil {
 		t.Fatalf("NewFileAdapter: %v", err)
@@ -135,28 +134,6 @@ func TestNewFileAdapter_TypeFaultVsAbsentKey(t *testing.T) {
 	})
 }
 
-func TestNewFileAdapter_YAMLAnySliceExtraction(t *testing.T) {
-	t.Parallel()
-
-	// YAML decoders produce []any, not []string. Verify the constructor
-	// handles this without panic and lowercases state values.
-	config := map[string]any{
-		"path":          fixture("basic.json"),
-		"active_states": []any{"To Do", "In Progress"},
-	}
-	a, err := NewFileAdapter(config)
-	if err != nil {
-		t.Fatalf("NewFileAdapter: %v", err)
-	}
-	fa := a.(*FileAdapter)
-	if !fa.activeStates["to do"] {
-		t.Error("active_states missing 'to do'")
-	}
-	if !fa.activeStates["in progress"] {
-		t.Error("active_states missing 'in progress'")
-	}
-}
-
 func TestFetchCandidateIssues(t *testing.T) {
 	t.Parallel()
 
@@ -193,16 +170,16 @@ func TestFetchCandidateIssues(t *testing.T) {
 		adaptertest.AssertCandidateBlockerSource(t, registry.BlockersFromCandidates, proj1, 1)
 	})
 
-	t.Run("no active states returns all", func(t *testing.T) {
+	t.Run("no active states returns none", func(t *testing.T) {
 		t.Parallel()
 
-		a := newAdapter(t, fixture("basic.json"), nil)
+		a := newAdapter(t, fixture("basic.json"), []any{})
 		issues, err := a.FetchCandidateIssues(ctx)
 		if err != nil {
 			t.Fatalf("FetchCandidateIssues: %v", err)
 		}
-		if len(issues) != 3 {
-			t.Fatalf("got %d issues, want 3", len(issues))
+		if len(issues) != 0 {
+			t.Fatalf("got %d issues, want 0", len(issues))
 		}
 	})
 
@@ -751,7 +728,7 @@ func TestRegistryIntegration(t *testing.T) {
 		t.Fatalf("registry.Trackers.Get(\"file\"): %v", err)
 	}
 
-	adapter, err := ctor(map[string]any{"path": fixture("basic.json")})
+	adapter, err := ctor(map[string]any{"path": fixture("basic.json"), "active_states": []any{"To Do"}})
 	if err != nil {
 		t.Fatalf("constructor: %v", err)
 	}
@@ -1130,6 +1107,16 @@ func TestFileAdapterMetrics(t *testing.T) {
 		requireSingleCall(t, spy, "add_label", "success")
 	})
 
+	t.Run("RemoveLabel/success", func(t *testing.T) {
+		t.Parallel()
+		a, spy := newAdapterWithMetrics(t, fixture("basic.json"))
+		err := a.RemoveLabel(ctx, "10001", "feature")
+		if err != nil {
+			t.Fatalf("RemoveLabel: %v", err)
+		}
+		requireSingleCall(t, spy, "remove_label", "success")
+	})
+
 	t.Run("nil_metrics", func(t *testing.T) {
 		t.Parallel()
 		a := newAdapter(t, fixture("basic.json"), nil)
@@ -1143,69 +1130,117 @@ func TestFileAdapterMetrics(t *testing.T) {
 		a.TransitionIssue(ctx, "10001", "Done")                  //nolint:errcheck // verifying no panic
 		a.CommentIssue(ctx, "10001", "ping")                     //nolint:errcheck // verifying no panic
 		a.AddLabel(ctx, "10001", "urgent")                       //nolint:errcheck // verifying no panic
+		a.RemoveLabel(ctx, "10001", "urgent")                    //nolint:errcheck // verifying no panic
 	})
 }
 
-// TestAddLabel_IsANoOp documents the file adapter's stated contract: its
-// AddLabel neither reads nor stores label state, so the additive-write
-// invariant [adaptertest.AssertLabelAddIsAdditive] pins for a tracker that
-// manages labels does not apply here. The only observable behavior is a
-// nil return and a recorded metric, both asserted by TestFileAdapterMetrics.
-func TestAddLabel_IsANoOp(t *testing.T) {
+func fetchIssueAndCandidates(t *testing.T, a *FileAdapter, id string) (domain.Issue, []domain.Issue) {
+	t.Helper()
+
+	issue, err := a.FetchIssueByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("FetchIssueByID(%q): %v", id, err)
+	}
+	candidates, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	return issue, candidates
+}
+
+func TestLabelWrites_OverlayKeepsEveryLabelAndHidesFixtureLabels(t *testing.T) {
 	t.Parallel()
 
 	a := newAdapter(t, fixture("basic.json"), nil)
-	if err := a.AddLabel(context.Background(), "10001", "urgent"); err != nil {
-		t.Fatalf("AddLabel: %v", err)
+	ctx := context.Background()
+
+	for _, label := range []string{"needs-human", "urgent"} {
+		if err := a.AddLabel(ctx, "10001", label); err != nil {
+			t.Fatalf("AddLabel(%q): %v", label, err)
+		}
+	}
+	if err := a.RemoveLabel(ctx, "10001", "feature"); err != nil {
+		t.Fatalf("RemoveLabel(%q): %v", "feature", err)
+	}
+	if err := a.RemoveLabel(ctx, "10001", "needs-human"); err != nil {
+		t.Fatalf("RemoveLabel(%q): %v", "needs-human", err)
+	}
+
+	issue, candidates := fetchIssueAndCandidates(t, a, "10001")
+	adaptertest.AssertLabelVisible(t, "urgent", true, issue, candidates)
+	adaptertest.AssertLabelVisible(t, "auth", true, issue, candidates)
+	adaptertest.AssertLabelVisible(t, "feature", false, issue, candidates)
+	adaptertest.AssertLabelVisible(t, "needs-human", false, issue, candidates)
+}
+
+func TestLabelWrites_UnknownIssueIsNotFound(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		write func(*FileAdapter) error
+	}{
+		{"AddLabel", func(a *FileAdapter) error { return a.AddLabel(context.Background(), "nonexistent", "urgent") }},
+		{"RemoveLabel", func(a *FileAdapter) error { return a.RemoveLabel(context.Background(), "nonexistent", "urgent") }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a := newAdapter(t, fixture("basic.json"), nil)
+
+			err := tt.write(a)
+
+			requireTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
+		})
 	}
 }
 
-// TestAddLabel_VisibleOnSubsequentReads verifies that a label recorded
-// through AddLabel is visible on a later FetchCandidateIssues call (the
-// load-bearing read, since it is the one the orchestrator's park release
-// rule evaluates) and on a later FetchIssueByID call.
-func TestAddLabel_VisibleOnSubsequentReads(t *testing.T) {
+func TestCommentIssueWithLiteral(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
+	tests := []struct {
+		name    string
+		literal string
+		want    string
+	}{
+		{
+			name:    "plain statement sits in a three backtick fence",
+			literal: "Which one should the API expose?",
+			want:    text + "\n\n```\nWhich one should the API expose?\n```",
+		},
+		{
+			name: "adversarial statement sits in a fence longer than its longest backtick run",
+			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
+				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
+			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
+				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
+		},
+	}
 
-	t.Run("visible via FetchCandidateIssues", func(t *testing.T) {
-		t.Parallel()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		a := newAdapter(t, fixture("basic.json"), nil)
-		if err := a.AddLabel(ctx, "10001", "needs-human"); err != nil {
-			t.Fatalf("AddLabel: %v", err)
-		}
+			a := newAdapter(t, fixture("basic.json"), nil)
+			if err := a.CommentIssueWithLiteral(context.Background(), "10002", text, tt.literal); err != nil {
+				t.Fatalf("CommentIssueWithLiteral: %v", err)
+			}
 
-		issues, err := a.FetchCandidateIssues(ctx)
-		if err != nil {
-			t.Fatalf("FetchCandidateIssues: %v", err)
-		}
-		idx := slices.IndexFunc(issues, func(issue domain.Issue) bool { return issue.ID == "10001" })
-		if idx == -1 {
-			t.Fatal("issue 10001 not found in FetchCandidateIssues result")
-		}
-		if !slices.ContainsFunc(issues[idx].Labels, func(l string) bool { return strings.EqualFold(l, "needs-human") }) {
-			t.Errorf("FetchCandidateIssues labels = %v, want to include %q", issues[idx].Labels, "needs-human")
-		}
-	})
-
-	t.Run("visible via FetchIssueByID", func(t *testing.T) {
-		t.Parallel()
-
-		a := newAdapter(t, fixture("basic.json"), nil)
-		if err := a.AddLabel(ctx, "10001", "needs-human"); err != nil {
-			t.Fatalf("AddLabel: %v", err)
-		}
-
-		issue, err := a.FetchIssueByID(ctx, "10001")
-		if err != nil {
-			t.Fatalf("FetchIssueByID: %v", err)
-		}
-		if !slices.ContainsFunc(issue.Labels, func(l string) bool { return strings.EqualFold(l, "needs-human") }) {
-			t.Errorf("FetchIssueByID labels = %v, want to include %q", issue.Labels, "needs-human")
-		}
-	})
+			comments, err := a.FetchIssueComments(context.Background(), "10002")
+			if err != nil {
+				t.Fatalf("FetchIssueComments: %v", err)
+			}
+			if len(comments) != 1 {
+				t.Fatalf("comment count = %d, want 1", len(comments))
+			}
+			if comments[0].Body != tt.want {
+				t.Errorf("comment body = %q, want %q", comments[0].Body, tt.want)
+			}
+		})
+	}
 }
 
 func TestCommentIssue(t *testing.T) {

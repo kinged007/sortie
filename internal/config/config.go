@@ -12,11 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/maputil"
 	"github.com/sortie-ai/sortie/internal/redact"
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
@@ -67,8 +70,8 @@ type ServiceConfig struct {
 	// construction. Unexported: every access goes through
 	// [ServiceConfig.ExtensionSection], [ServiceConfig.ExtensionValue],
 	// or [ServiceConfig.SetExtensionSection], and a kind-scoped read
-	// goes through [AgentAdapterConfig], [ResolveAgentSettings], or
-	// [MergeAdapterExtensions] instead.
+	// goes through [ResolveAgentSettings] or [MergeAdapterExtensions]
+	// instead.
 	extensions map[string]any
 
 	// extensionsPreResolution maps a dotted-and-indexed extension field
@@ -95,6 +98,12 @@ type ServiceConfig struct {
 	// was built or loaded. Read and written only through
 	// [ServiceConfig.Advisories] and [ServiceConfig.AddAdvisories].
 	advisories []Advisory
+
+	// conversions records each retired agent kind the load converted
+	// onto its replacement kind. Read through
+	// [ServiceConfig.AgentKindConversions] and
+	// [ServiceConfig.AgentCommand].
+	conversions []AgentKindConversion
 }
 
 // SetDispatch attaches a parsed [DispatchConfig] to the service
@@ -107,8 +116,8 @@ func (c *ServiceConfig) SetDispatch(d DispatchConfig) {
 // ExtensionSection returns the top-level extension section named
 // name, or nil when the section is absent or is not a
 // map[string]any. name is a section name known at compile time, never
-// a kind; a kind-scoped read goes through [AgentAdapterConfig],
-// [ResolveAgentSettings], or [MergeAdapterExtensions] instead. The
+// a kind; a kind-scoped read goes through [ResolveAgentSettings] or
+// [MergeAdapterExtensions] instead. The
 // returned map is the one stored inside c, not a copy; callers MUST
 // treat it as read-only.
 func (c ServiceConfig) ExtensionSection(name string) map[string]any {
@@ -202,6 +211,9 @@ func (p HandoffEvidencePolicy) Effective() HandoffEvidencePolicy {
 
 // TrackerCommentsConfig holds the boolean flags controlling whether
 // the orchestrator posts tracker comments at session lifecycle points.
+// The flags are deprecated: each one subscribes the tracker comment
+// destination to the matching session events, and a notifications entry
+// of kind tracker_comment replaces them.
 type TrackerCommentsConfig struct {
 	OnDispatch   bool
 	OnCompletion bool
@@ -240,8 +252,17 @@ type HooksConfig struct {
 // AgentConfig holds coding-agent adapter selection, timeouts, and
 // concurrency limits.
 type AgentConfig struct {
-	Kind                 string
-	Command              string
+	Kind string
+
+	// Command is agent.command in its string form. Empty when the key
+	// is absent or holds a list.
+	Command string
+
+	// CommandArgv is agent.command in its list form: element zero names
+	// the executable and each later element is one argument. Nil unless
+	// the key holds a list, and then Command is empty.
+	CommandArgv []string
+
 	TurnTimeoutMS        int
 	ReadTimeoutMS        int
 	StallTimeoutMS       int
@@ -282,6 +303,12 @@ type AgentConfig struct {
 	MaxConsecutiveAbsences int
 }
 
+// TurnLimit returns the most turns a session runs: MaxTurns, or 1 when
+// MaxTurns is below 1.
+func (a AgentConfig) TurnLimit() int {
+	return max(a.MaxTurns, 1)
+}
+
 // TokenWarningThreshold returns the token count at which the warning
 // threshold fires: the least integer not below MaxTokens times
 // TokenWarningPercent divided by 100. It returns 0, disabling the
@@ -317,40 +344,17 @@ const (
 	ExtensionBlockNotAMapping
 )
 
-// AgentAdapterConfig returns the effective pass-through config map for
-// the agent adapter kind, the single producer both the offline
-// preflight validator and the adapter constructor read, so the two can
-// never disagree about what an adapter of that kind would see.
-//
-// The map carries exactly six keys derived from cfg.Agent's typed
-// fields: kind (set to the kind parameter rather than cfg.Agent.Kind,
-// so a dispatch-rule-routed kind resolves correctly), command,
-// turn_timeout_ms, read_timeout_ms, stall_timeout_ms, and
-// stop_grace_ms. Every other
-// [AgentConfig] field is intentionally excluded: those fields are
-// orchestrator-only, consumed through the typed [AgentConfig] before
-// this map reaches a constructor, and including them would shadow an
-// adapter extension key of the same name during the merge below.
-//
-// The kind-named sub-object under cfg.extensions, if present, is
-// merged in without overwriting any of the six keys above. The
-// returned map is freshly allocated on every call.
-func AgentAdapterConfig(cfg ServiceConfig, kind string) map[string]any {
-	m, _, _ := agentAdapterConfig(cfg, kind)
-	return m
-}
-
-// agentAdapterConfig builds the pass-through config map [AgentAdapterConfig]
-// returns and reports what the front matter carried under kind, so
-// [ResolveAgentSettings] can expose that value without a second,
-// unsanctioned read of the extensions field. description is empty
-// unless presence is [ExtensionBlockNotAMapping], in which case it
-// names the found value's shape in fixed, operator-facing vocabulary
-// that never includes a Go type name.
+// agentAdapterConfig builds the pass-through map of kind, freshly
+// allocated: six keys derived from cfg.Agent (kind is the parameter, not
+// cfg.Agent.Kind, so a rule-routed kind resolves correctly), with the
+// kind-named sub-object merged in without overwriting them. Other
+// [AgentConfig] fields stay out so they cannot shadow an extension key.
+// description names a non-mapping block in operator vocabulary, and is
+// empty otherwise.
 func agentAdapterConfig(cfg ServiceConfig, kind string) (m map[string]any, presence ExtensionBlockPresence, description string) {
 	m = map[string]any{
 		"kind":             kind,
-		"command":          cfg.Agent.Command,
+		"command":          localCommandValue(cfg.Agent),
 		"turn_timeout_ms":  cfg.Agent.TurnTimeoutMS,
 		"read_timeout_ms":  cfg.Agent.ReadTimeoutMS,
 		"stall_timeout_ms": cfg.Agent.StallTimeoutMS,
@@ -360,15 +364,42 @@ func agentAdapterConfig(cfg ServiceConfig, kind string) (m map[string]any, prese
 	return m, presence, description
 }
 
+// localCommandValue returns agent.command in the form a local launch
+// reads: the string, or a copy of the list.
+func localCommandValue(a AgentConfig) any {
+	if len(a.CommandArgv) > 0 {
+		return slices.Clone(a.CommandArgv)
+	}
+	return a.Command
+}
+
+// SettingsSelection names the attempt whose settings
+// [ResolveAgentSettings] resolves: its dispatch-frozen agent kind and the
+// dispatch rule that routed it, empty when none did.
+type SettingsSelection struct {
+	Kind     string
+	RuleName string
+}
+
 // AgentSettings is the resolved answer to what one agent kind
-// resolves to for one session, returned by [ResolveAgentSettings].
+// resolves to for one attempt, returned by [ResolveAgentSettings].
 type AgentSettings struct {
 	Kind string
 
-	// Passthrough is the same map [AgentAdapterConfig] returns for
-	// Kind: freshly allocated on every call, and safe for the caller
-	// to keep.
+	// RuleName is the rule whose block was laid over the kind's
+	// top-level block, or empty when none was.
+	RuleName string
+
+	// Passthrough is the settings block the session starts with, freshly
+	// allocated; nested values are shared with the configuration and
+	// read-only.
 	Passthrough map[string]any
+
+	// Model and Effort are what Passthrough carries under
+	// [registry.ModelKey] and [registry.EffortKey], empty when absent,
+	// null, empty, or not a string.
+	Model  string
+	Effort string
 
 	// MCPConfigPath is the operator-declared MCP config path resolved
 	// from Passthrough["mcp_config"]. Empty when the kind has no
@@ -378,8 +409,7 @@ type AgentSettings struct {
 
 	// BlockPresence reports what the front matter carries under the
 	// top-level key named Kind. Passthrough is never empty and cannot
-	// answer this: AgentAdapterConfig seeds six keys before any
-	// merge.
+	// answer this: six derived keys are seeded before any merge.
 	BlockPresence ExtensionBlockPresence
 
 	// BlockDescription names, in fixed operator-facing vocabulary, the
@@ -389,12 +419,11 @@ type AgentSettings struct {
 	BlockDescription string
 }
 
-// ResolveAgentSettings resolves kind to the settings a session running
-// on that kind uses for one attempt. kind is the session's
-// dispatch-frozen agent kind, never the workflow default: a session
-// routed to a different kind than cfg.Agent.Kind resolves against the
-// routed kind's own block. Callers MUST call ResolveAgentSettings once
-// per attempt, never once per session, so a workflow reloaded between
+// ResolveAgentSettings resolves selection to the settings a session
+// running on selection.Kind uses for one attempt. A session routed to a
+// different kind than cfg.Agent.Kind resolves against the routed
+// kind's own block. Callers MUST call ResolveAgentSettings once per
+// attempt, never once per session, so a workflow reloaded between
 // attempts takes effect on the next one.
 //
 // A relative mcp_config value is resolved against workflowDir when
@@ -402,8 +431,9 @@ type AgentSettings struct {
 // are both returned unchanged. ResolveAgentSettings is pure: it reads
 // no environment variable and touches no file, and is safe for
 // concurrent use.
-func ResolveAgentSettings(cfg ServiceConfig, kind string, workflowDir string) AgentSettings {
-	passthrough, presence, description := agentAdapterConfig(cfg, kind)
+func ResolveAgentSettings(cfg ServiceConfig, selection SettingsSelection, workflowDir string) AgentSettings {
+	passthrough, presence, description := agentAdapterConfig(cfg, selection.Kind)
+	ruleName := overlayRuleSettings(passthrough, cfg.Dispatch.Rules, selection)
 
 	var mcpConfigPath string
 	if v, ok := passthrough["mcp_config"].(string); ok {
@@ -413,20 +443,57 @@ func ResolveAgentSettings(cfg ServiceConfig, kind string, workflowDir string) Ag
 		mcpConfigPath = filepath.Join(workflowDir, mcpConfigPath)
 	}
 
+	model, _ := registry.ModelSetting(passthrough)
+	effort, _ := registry.EffortSetting(passthrough)
+
 	return AgentSettings{
-		Kind:             kind,
+		Kind:             selection.Kind,
+		RuleName:         ruleName,
 		Passthrough:      passthrough,
+		Model:            model,
+		Effort:           effort,
 		MCPConfigPath:    mcpConfigPath,
 		BlockPresence:    presence,
 		BlockDescription: description,
 	}
 }
 
+// overlaySettings lays block over base in place: a written key replaces
+// the inherited value whole, a null key removes it.
+func overlaySettings(base, block map[string]any) {
+	for key, value := range block {
+		if value == nil {
+			delete(base, key)
+		} else {
+			base[key] = value
+		}
+	}
+}
+
+// overlayRuleSettings lays the block of the rule selection names over
+// passthrough: a written key replaces the inherited value whole, a null
+// key removes it. It returns the rule's name when a block applied, else "".
+func overlayRuleSettings(passthrough map[string]any, rules []DispatchRule, selection SettingsSelection) string {
+	if selection.RuleName == "" {
+		return ""
+	}
+	for _, rule := range rules {
+		if rule.Name != selection.RuleName {
+			continue
+		}
+		if rule.SettingsKind != selection.Kind {
+			return ""
+		}
+		overlaySettings(passthrough, rule.Settings)
+		return rule.Name
+	}
+	return ""
+}
+
 // MergeAdapterExtensions copies the kind-named sub-object from
 // cfg's extensions into dst without overwriting an existing key. It
 // serves the tracker, CI-provider, and SCM adapter families; the
-// agent family goes through [AgentAdapterConfig] and
-// [ResolveAgentSettings] instead.
+// agent family goes through [ResolveAgentSettings] instead.
 func MergeAdapterExtensions(dst map[string]any, cfg ServiceConfig, kind string) {
 	mergeExtensionSection(dst, cfg.extensions, kind)
 }
@@ -457,10 +524,12 @@ func mergeExtensionSection(dst map[string]any, extensions map[string]any, kind s
 	return ExtensionBlockPresent, ""
 }
 
-// describeExtensionValue maps a parsed front-matter value that failed
-// [mergeExtensionSection]'s mapping assertion to fixed, operator-facing
+// describeExtensionValue names the shape of a parsed front-matter value
+// that failed an expected-shape check, in fixed, operator-facing
 // vocabulary. It never names a Go type: that detail is internal and an
-// operator writing YAML cannot act on it.
+// operator writing YAML cannot act on it. Callers are the extension
+// block merge ([mergeExtensionSection]), the dispatch rule settings
+// block, and the dispatch match title phrases.
 func describeExtensionValue(v any) string {
 	switch v.(type) {
 	case string:
@@ -471,6 +540,8 @@ func describeExtensionValue(v any) string {
 		return "a number"
 	case []any:
 		return "a list"
+	case map[string]any:
+		return "a map"
 	default:
 		return "a value of an unexpected type"
 	}
@@ -485,7 +556,6 @@ var knownTopLevelKeys = map[string]bool{
 	"hooks":         true,
 	"agent":         true,
 	"db_path":       true,
-	"ci_feedback":   true,
 	"self_review":   true,
 	"reactions":     true,
 	"dispatch":      true,
@@ -498,9 +568,18 @@ var knownTopLevelKeys = map[string]bool{
 // fields, coerces string-encoded integers, and normalizes per-state
 // concurrency map keys to lowercase. Returns a [*ConfigError] when a
 // field value cannot be coerced to the expected type.
-func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
+//
+// Under [WithRetiredAgents] it then converts every reference to a
+// retired agent kind onto the replacement kind, rewriting raw in place
+// as it does for environment overrides. A conversion the retired kind
+// cannot carry returns a [*ConfigError].
+func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceConfig, error) {
 	if raw == nil {
 		raw = map[string]any{}
+	}
+	var options serviceConfigOptions
+	for _, opt := range opts {
+		opt(&options)
 	}
 
 	envKeys, envAdvisories, err := applyEnvOverrides(raw)
@@ -509,6 +588,26 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 	}
 	var advisories []Advisory
 	advisories = append(advisories, envAdvisories...)
+
+	extensions := make(map[string]any)
+	for k, v := range raw {
+		if !knownTopLevelKeys[k] {
+			extensions[k] = v
+		}
+	}
+
+	preResolution := resolveExtensionEnvRefs(extensions)
+	preResolution = resolveRuleBlockEnvRefs(raw, preResolution)
+
+	var conversions []AgentKindConversion
+	if options.retiredAgents != nil {
+		var conversionAdvisories []Advisory
+		conversions, conversionAdvisories, err = convertRetiredAgents(raw, extensions, options.retiredAgents)
+		if err != nil {
+			return ServiceConfig{}, err
+		}
+		advisories = append(advisories, conversionAdvisories...)
+	}
 
 	rawTracker := extractSubMap(raw, "tracker")
 	tracker, err := buildTrackerConfig(rawTracker, envKeys)
@@ -602,13 +701,6 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		return ServiceConfig{}, err
 	}
 
-	ciFeedback, err := buildCIFeedbackConfig(extractSubMap(raw, "ci_feedback"))
-	if err != nil {
-		return ServiceConfig{}, err
-	}
-
-	hasCIFeedbackSection := raw["ci_feedback"] != nil
-
 	selfReview, err := buildSelfReviewConfig(extractSubMap(raw, "self_review"))
 	if err != nil {
 		return ServiceConfig{}, err
@@ -619,18 +711,11 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		return ServiceConfig{}, err
 	}
 
+	var ciFeedback CIFeedbackConfig
 	if ciReaction, ok := reactions["ci_failure"]; ok {
 		ciFeedback, err = populateCIFeedbackFromReactions(ciReaction)
 		if err != nil {
 			return ServiceConfig{}, err
-		}
-		if hasCIFeedbackSection {
-			advisories = append(advisories, Advisory{
-				Check:   "ci_feedback.deprecated",
-				Text:    "ci_feedback is deprecated and ignored because reactions.ci_failure is set; remove the ci_feedback section",
-				Message: "ci_feedback section is deprecated; using reactions.ci_failure instead",
-				Attrs:   []slog.Attr{slog.String("hint", "remove the ci_feedback section from your WORKFLOW.md")},
-			})
 		}
 		delete(reactions, "ci_failure")
 	}
@@ -647,17 +732,11 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 	if err != nil {
 		return ServiceConfig{}, err
 	}
-
-	extensions := make(map[string]any)
-	for k, v := range raw {
-		if !knownTopLevelKeys[k] {
-			extensions[k] = v
-		}
+	if err := validateTrackerCommentEntries(notifications, tracker); err != nil {
+		return ServiceConfig{}, err
 	}
 
-	preResolution := resolveExtensionEnvRefs(extensions)
-
-	registerConfigSecrets(tracker, reactions, notifications, extensions)
+	registerConfigSecrets(tracker, reactions, notifications, extensions, raw)
 
 	cfg := ServiceConfig{
 		Tracker:                 tracker,
@@ -673,6 +752,7 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 		extensions:              extensions,
 		extensionsPreResolution: preResolution,
 		Notifications:           notifications,
+		conversions:             conversions,
 	}
 	cfg.AddAdvisories(advisories...)
 	return cfg, nil
@@ -682,7 +762,7 @@ func NewServiceConfig(raw map[string]any) (ServiceConfig, error) {
 // [ServiceConfig] load carries with [internal/redact], so a log record,
 // a stored row, or a runtime-derived text can mask it later. Call it
 // once every value has its final, environment-resolved form.
-func registerConfigSecrets(tracker TrackerConfig, reactions map[string]ReactionConfig, notifications NotificationsConfig, extensions map[string]any) {
+func registerConfigSecrets(tracker TrackerConfig, reactions map[string]ReactionConfig, notifications NotificationsConfig, extensions, raw map[string]any) {
 	redact.Add("tracker.api_key", tracker.APIKey)
 	redact.AddURLCredentials("tracker.endpoint", tracker.Endpoint)
 
@@ -701,6 +781,10 @@ func registerConfigSecrets(tracker TrackerConfig, reactions map[string]ReactionC
 	}
 
 	registerCredentialLeaves("", extensions, false)
+
+	for i, rule := range dispatchRuleMaps(raw) {
+		registerCredentialLeaves(fmt.Sprintf("dispatch.rules[%d]", i), ruleSettingsKeys(rule), false)
+	}
 }
 
 // registerCredentialLeaves walks m at any depth, registering each
@@ -970,18 +1054,65 @@ func buildDBPath(raw map[string]any, envKeys map[string]bool) (string, error) {
 	return expanded, nil
 }
 
+// builtinAgentKind is the agent kind a configuration without
+// agent.kind runs.
+const builtinAgentKind = "claude-code"
+
+// parseAgentCommand reads a raw agent.command value: absent or null
+// yields the zero command, a string yields its string form, and a list
+// of strings yields its list form. It returns a [*ConfigError] for any
+// other value, an empty list, a non-string or empty element, and a
+// whitespace-only element zero.
+func parseAgentCommand(v any) (domain.AgentCommand, error) {
+	switch typed := v.(type) {
+	case nil:
+		return domain.AgentCommand{}, nil
+	case string:
+		return domain.AgentCommand{Line: typed}, nil
+	case []any:
+		return parseAgentCommandList(typed)
+	default:
+		return domain.AgentCommand{}, &ConfigError{
+			Field:   "agent.command",
+			Message: "expected string or list, got " + typeutil.DescribeYAMLType(v),
+		}
+	}
+}
+
+func parseAgentCommandList(list []any) (domain.AgentCommand, error) {
+	if len(list) == 0 {
+		return domain.AgentCommand{}, &ConfigError{Field: "agent.command", Message: "must not be an empty list"}
+	}
+	argv := make([]string, len(list))
+	for i, elem := range list {
+		field := fmt.Sprintf("agent.command[%d]", i)
+		s, ok := elem.(string)
+		if !ok {
+			return domain.AgentCommand{}, &ConfigError{
+				Field:   field,
+				Message: "expected string, got " + typeutil.DescribeYAMLType(elem),
+			}
+		}
+		if s == "" || (i == 0 && strings.TrimSpace(s) == "") {
+			return domain.AgentCommand{}, &ConfigError{Field: field, Message: "must not be empty"}
+		}
+		argv[i] = s
+	}
+	return domain.AgentCommand{Argv: argv}, nil
+}
+
 func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 	kind, fault := typeutil.StringField(m, "kind")
 	if fault != nil {
 		return AgentConfig{}, &ConfigError{Field: "agent.kind", Message: fault.Reason()}
 	}
 	if kind == "" {
-		kind = "claude-code"
+		kind = builtinAgentKind
 	}
 
-	command, fault := typeutil.StringField(m, "command")
-	if fault != nil {
-		return AgentConfig{}, &ConfigError{Field: "agent.command", Message: fault.Reason()}
+	command, err := parseAgentCommand(m["command"])
+	if err != nil {
+		return AgentConfig{}, err
 	}
 
 	turnTimeoutMS := 3600000
@@ -1134,7 +1265,8 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 
 	return AgentConfig{
 		Kind:                   kind,
-		Command:                command,
+		Command:                command.Line,
+		CommandArgv:            command.Argv,
 		TurnTimeoutMS:          turnTimeoutMS,
 		ReadTimeoutMS:          readTimeoutMS,
 		StallTimeoutMS:         stallTimeoutMS,
@@ -1155,71 +1287,6 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 // covering a reviewer who returns the next working day and pushes a
 // fixup.
 const ciWatchWindowDefaultMS = 86400000
-
-func buildCIFeedbackConfig(m map[string]any) (CIFeedbackConfig, error) {
-	kind, fault := typeutil.StringField(m, "kind")
-	if fault != nil {
-		return CIFeedbackConfig{}, &ConfigError{Field: "ci_feedback.kind", Message: fault.Reason()}
-	}
-	if kind == "" {
-		return CIFeedbackConfig{}, nil
-	}
-
-	maxRetries, err := coerceIntField(m, "max_retries", "ci_feedback.max_retries")
-	if err != nil {
-		return CIFeedbackConfig{}, err
-	}
-	if _, exists := m["max_retries"]; !exists {
-		maxRetries = 2
-	}
-
-	maxLogLines, err := coerceIntField(m, "max_log_lines", "ci_feedback.max_log_lines")
-	if err != nil {
-		return CIFeedbackConfig{}, err
-	}
-	if _, exists := m["max_log_lines"]; !exists {
-		maxLogLines = 50
-	}
-	if maxRetries < 0 {
-		return CIFeedbackConfig{}, &ConfigError{
-			Field:   "ci_feedback.max_retries",
-			Message: "must be non-negative",
-		}
-	}
-	if maxLogLines < 0 {
-		return CIFeedbackConfig{}, &ConfigError{
-			Field:   "ci_feedback.max_log_lines",
-			Message: "must be non-negative",
-		}
-	}
-
-	escalation := extractString(m, "escalation")
-	if escalation == "" {
-		escalation = "label"
-	}
-	if escalation != "label" && escalation != "comment" {
-		return CIFeedbackConfig{}, &ConfigError{
-			Field:   "ci_feedback.escalation",
-			Message: fmt.Sprintf("must be \"label\" or \"comment\", got %q", escalation),
-		}
-	}
-
-	escalationLabel := extractString(m, "escalation_label")
-	if escalationLabel == "" {
-		escalationLabel = "needs-human"
-	}
-
-	// The deprecated ci_feedback section exposes no watch_window_ms key,
-	// so it always resolves to the default.
-	return CIFeedbackConfig{
-		Kind:            kind,
-		MaxRetries:      maxRetries,
-		MaxLogLines:     maxLogLines,
-		Escalation:      escalation,
-		EscalationLabel: escalationLabel,
-		WatchWindowMS:   ciWatchWindowDefaultMS,
-	}, nil
-}
 
 // populateCIFeedbackFromReactions converts a ReactionConfig for the
 // "ci_failure" reaction kind into a CIFeedbackConfig. Provider maps to
@@ -1512,6 +1579,46 @@ func resolveExtensionEnvRefs(extensions map[string]any) map[string]string {
 	return snapshot
 }
 
+// dispatchRuleMaps returns the dispatch.rules elements of raw, a nil map
+// for an element that is not a mapping.
+func dispatchRuleMaps(raw map[string]any) []map[string]any {
+	dispatch, _ := raw["dispatch"].(map[string]any)
+	sequence, _ := dispatch["rules"].([]any)
+	if len(sequence) == 0 {
+		return nil
+	}
+	rules := make([]map[string]any, len(sequence))
+	for i, element := range sequence {
+		rules[i], _ = element.(map[string]any)
+	}
+	return rules
+}
+
+// ruleSettingsKeys returns the entries of a rule map that are not the
+// rule's own keys.
+func ruleSettingsKeys(rule map[string]any) map[string]any {
+	blocks := make(map[string]any, len(rule))
+	for key, value := range rule {
+		if !ruleKeyAllowed[key] {
+			blocks[key] = value
+		}
+	}
+	return blocks
+}
+
+// resolveRuleBlockEnvRefs resolves $VAR references in every rule settings
+// block of raw in place, as [resolveExtensionEnvRefs] does for an
+// extension section, recording each pre-resolution literal in snapshot
+// under "dispatch.rules[<i>].<key>.<leaf path>".
+func resolveRuleBlockEnvRefs(raw map[string]any, snapshot map[string]string) map[string]string {
+	for i, rule := range dispatchRuleMaps(raw) {
+		for key, value := range ruleSettingsKeys(rule) {
+			rule[key] = resolveExtensionEnvValue(fmt.Sprintf("dispatch.rules[%d].%s", i, key), value, &snapshot)
+		}
+	}
+	return snapshot
+}
+
 // resolveExtensionEnvValue recursively resolves $VAR references on
 // string leaves under v. Maps and slices are mutated in place; non-
 // string leaves are returned unchanged. Recorded entries are written
@@ -1790,7 +1897,8 @@ type CIFeedbackConfig struct {
 
 	// Escalation controls what happens when max_retries is exceeded.
 	// Valid values: "label" (default) adds a label to the issue,
-	// "comment" posts a comment on the issue.
+	// "comment" (deprecated) posts a comment on the issue, and "none"
+	// does neither, leaving the escalation event to its subscribers.
 	Escalation string
 
 	// EscalationLabel is the label applied when escalation is "label".
@@ -1828,7 +1936,7 @@ type ReactionConfig struct {
 	MaxRetries int
 
 	// Escalation controls what happens when MaxRetries is exceeded.
-	// Valid values: "label" (default), "comment".
+	// Valid values: "label" (default), "comment" (deprecated), "none".
 	Escalation string
 
 	// EscalationLabel is the label applied when Escalation is "label".
@@ -1897,6 +2005,12 @@ var knownReactionFields = map[string]bool{
 	"triage":           true,
 }
 
+// validEscalation reports whether v is a value a reaction's escalation
+// key accepts.
+func validEscalation(v string) bool {
+	return v == "label" || v == "comment" || v == "none"
+}
+
 func buildReactionsConfig(m map[string]any) (map[string]ReactionConfig, error) {
 	result := make(map[string]ReactionConfig)
 	if len(m) == 0 {
@@ -1956,10 +2070,10 @@ func buildReactionsConfig(m map[string]any) (map[string]ReactionConfig, error) {
 		} else if found && s != "" {
 			escalation = s
 		}
-		if escalation != "label" && escalation != "comment" {
+		if !validEscalation(escalation) {
 			return nil, &ConfigError{
 				Field:   "reactions." + k + ".escalation",
-				Message: fmt.Sprintf("must be \"label\" or \"comment\", got %q", escalation),
+				Message: fmt.Sprintf("must be \"label\", \"comment\", or \"none\", got %q", escalation),
 			}
 		}
 

@@ -19,6 +19,7 @@ profile.cov
 docs/
 blog/
 website/
+web/
 kb/
 *.md
 

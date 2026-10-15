@@ -16,21 +16,18 @@ import (
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
-// fixtureBudgetAgentKind and fixtureBudgetTrackerKind name the agent and
-// tracker kinds this test's fixtures register. The orchestrator's
-// dispatch preflight requires cfg.Agent.Kind and cfg.Tracker.Kind to
-// resolve in their registries even though this harness supplies both
-// adapters directly, so the kinds are registered here rather than
-// depending on a real adapter package's own registration.
+// Preflight resolves configured kinds through the registries even when this
+// harness injects adapters directly.
 const (
 	fixtureBudgetAgentKind   = "mcpserver-budget-e2e-agent"
 	fixtureBudgetTrackerKind = "mcpserver-budget-e2e-tracker"
 )
 
 func init() {
-	registry.Agents.RegisterWithMeta(fixtureBudgetAgentKind, func(map[string]any) (domain.AgentAdapter, error) {
+	registry.Agents.RegisterWithMeta(fixtureBudgetAgentKind, func() (domain.AgentAdapter, error) {
 		return nil, fmt.Errorf("%s is resolved through AgentAdapterByKind, never constructed from the registry", fixtureBudgetAgentKind)
 	}, registry.AgentMeta{
 		UsageArrival:     registry.UsageArrivalIncremental,
@@ -42,9 +39,6 @@ func init() {
 	}, registry.TrackerMeta{})
 }
 
-// budgetE2ETracker is a minimal domain.TrackerAdapter fixture: it
-// always reports the one configured issue as a candidate in its active
-// state, and answers every other call as a no-op.
 type budgetE2ETracker struct {
 	issueID    string
 	identifier string
@@ -60,6 +54,8 @@ func (tr *budgetE2ETracker) FetchCandidateIssues(_ context.Context) ([]domain.Is
 		State:      "todo",
 	}}, nil
 }
+
+func (tr *budgetE2ETracker) SetTrackerStates(func() domain.TrackerStates) {}
 
 func (tr *budgetE2ETracker) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
@@ -89,12 +85,13 @@ func (tr *budgetE2ETracker) FetchIssueComments(_ context.Context, _ string) ([]d
 
 func (tr *budgetE2ETracker) TransitionIssue(_ context.Context, _ string, _ string) error { return nil }
 func (tr *budgetE2ETracker) CommentIssue(_ context.Context, _ string, _ string) error    { return nil }
-func (tr *budgetE2ETracker) AddLabel(_ context.Context, _ string, _ string) error        { return nil }
+func (tr *budgetE2ETracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (tr *budgetE2ETracker) AddLabel(_ context.Context, _ string, _ string) error { return nil }
 
-// budgetE2EAgent is a domain.AgentAdapter fixture whose single turn
-// holds open until the test tells it to emit a usage-bearing event and,
-// separately, to complete: the test reads the tool's response between
-// those two signals so its turn genuinely straddles the assertions.
+func (tr *budgetE2ETracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
+
 type budgetE2EAgent struct {
 	started     chan domain.StartSessionParams
 	emitUsage   chan int64
@@ -111,9 +108,6 @@ func newBudgetE2EAgent() *budgetE2EAgent {
 
 var _ domain.AgentAdapter = (*budgetE2EAgent)(nil)
 
-// budgetE2ESession lets RunTurn answer a credential verification
-// session immediately, never through the blocking usage/proceed
-// handshake the working turn exercises.
 type budgetE2ESession struct {
 	credentialVerification bool
 }
@@ -153,8 +147,6 @@ func (a *budgetE2EAgent) RunTurn(ctx context.Context, session domain.Session, pa
 
 func (a *budgetE2EAgent) StopSession(_ context.Context, _ domain.Session) error { return nil }
 
-// budgetE2EWorkflowManager implements orchestrator.WorkflowManager with
-// a frozen configuration and one prompt template.
 type budgetE2EWorkflowManager struct {
 	config   config.ServiceConfig
 	template *prompt.Template
@@ -176,9 +168,8 @@ func (m *budgetE2EWorkflowManager) PromptTemplateByID(id string) *prompt.Templat
 func (m *budgetE2EWorkflowManager) Reload() error           { return nil }
 func (m *budgetE2EWorkflowManager) WorkflowAbsPath() string { return m.absPath }
 
-// waitForSessionMetadataTotal polls store.LoadSessionMetadata under a
-// deadline until issueID's row reports want as TotalTokens, never
-// sleeping a fixed duration.
+func (m *budgetE2EWorkflowManager) LoadStatus() workflow.LoadStatus { return workflow.LoadStatus{} }
+
 func waitForSessionMetadataTotal(t *testing.T, store *persistence.Store, issueID string, want int64, deadline time.Duration) persistence.SessionMetadata {
 	t.Helper()
 	ctx := context.Background()
@@ -203,8 +194,6 @@ func waitForSessionMetadataTotal(t *testing.T, store *persistence.Store, issueID
 	}
 }
 
-// costBudgetResult decodes the fields of cost_budget's response this
-// test asserts on.
 type costBudgetResult struct {
 	UsedTokens         int64  `json:"used_tokens"`
 	UsedTokensComplete bool   `json:"used_tokens_complete"`
@@ -231,14 +220,6 @@ func executeBudgetTool(t *testing.T, tool domain.AgentTool) costBudgetResult {
 	return envelope.Data
 }
 
-// TestMCPServerBudget covers the dispatch-to-response path end to end,
-// with no dispatch ID or session ID supplied by hand at any seam.
-// It dispatches a real [orchestrator.Orchestrator] against a migrated
-// [persistence.Store], reads the dispatch ID and every other tool
-// parameter out of the [MCPConfigParams]-generated mcp.json the worker
-// actually wrote, and executes cost_budget through the same
-// [BuildSessionToolRegistry] the sidecar uses. It carries no build tag
-// and no SORTIE_*_TEST env gate, so it runs on every CI platform.
 func TestMCPServerBudget(t *testing.T) {
 	t.Parallel()
 
@@ -436,15 +417,6 @@ func TestMCPServerBudget(t *testing.T) {
 	close(agent.proceedTurn)
 }
 
-// TestMCPServerBudget_WarningThreshold covers the token-warning-percent
-// dispatch-to-response path end to end. It mirrors TestMCPServerBudget's
-// harness with a threshold configured below the ceiling: a live figure
-// that stays under the threshold reports warning_reached false, and a
-// second figure arriving quickly after the first (well inside
-// sessionMetadataWriteInterval of the incremental write it triggered)
-// still reaches session_metadata and reports warning_reached true on the
-// very next cost_budget call, proving the write reached the database
-// despite the throttle window.
 func TestMCPServerBudget_WarningThreshold(t *testing.T) {
 	t.Parallel()
 

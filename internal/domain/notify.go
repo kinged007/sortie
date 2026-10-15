@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"slices"
+)
 
 // Notifier sends a normalized [Notification] to a single backend.
 type Notifier interface {
@@ -16,6 +19,103 @@ type Notifier interface {
 type Notification struct {
 	Envelope NotificationEnvelope
 	Message  NotificationMessage
+}
+
+// EventType names one outbound event. The catalog is closed.
+type EventType string
+
+const (
+	// EventTypeSessionStarted carries the Type prefix because
+	// [EventSessionStarted] already names an agent event.
+	EventTypeSessionStarted        EventType = "session.started"
+	EventSessionCompleted          EventType = "session.completed"
+	EventSessionStopped            EventType = "session.stopped"
+	EventSessionFailed             EventType = "session.failed"
+	EventEscalationCIFailure       EventType = "escalation.ci_failure"
+	EventEscalationReviewComments  EventType = "escalation.review_comments"
+	EventEscalationBotReview       EventType = "escalation.bot_review"
+	EventEscalationMergeConflicts  EventType = "escalation.merge_conflicts"
+	EventEscalationAutoMerge       EventType = "escalation.auto_merge"
+	EventEscalationMergeCompletion EventType = "escalation.merge_completion"
+	EventAutoMergeMerged           EventType = "auto_merge.merged"
+	EventBudgetHeld                EventType = "budget.held"
+	EventStageAdvanced             EventType = "stage.advanced"
+	EventStageNotAdvanced          EventType = "stage.not_advanced"
+	EventAgentMessage              EventType = "agent.message"
+)
+
+// TrackerCommentKind is the reserved notifications kind of the built-in
+// tracker comment destination. No notifier registers under it.
+const TrackerCommentKind = "tracker_comment"
+
+var eventTypes = []EventType{
+	EventTypeSessionStarted,
+	EventSessionCompleted,
+	EventSessionStopped,
+	EventSessionFailed,
+	EventEscalationCIFailure,
+	EventEscalationReviewComments,
+	EventEscalationBotReview,
+	EventEscalationMergeConflicts,
+	EventEscalationAutoMerge,
+	EventEscalationMergeCompletion,
+	EventAutoMergeMerged,
+	EventBudgetHeld,
+	EventStageAdvanced,
+	EventStageNotAdvanced,
+	EventAgentMessage,
+}
+
+// EventTypes returns the catalog in declaration order. The caller may
+// modify the returned slice.
+func EventTypes() []EventType {
+	return slices.Clone(eventTypes)
+}
+
+// Valid reports whether t is a member of the catalog.
+func (t EventType) Valid() bool {
+	return slices.Contains(eventTypes, t)
+}
+
+// FromOrchestrator reports whether the orchestrator produces t: every
+// valid type except [EventAgentMessage].
+func (t EventType) FromOrchestrator() bool {
+	return t.Valid() && t != EventAgentMessage
+}
+
+// Severity returns the notification severity the orchestrator stamps on
+// t, or "" for [EventAgentMessage] and for a value outside the catalog.
+func (t EventType) Severity() string {
+	switch t {
+	case EventTypeSessionStarted, EventSessionCompleted, EventAutoMergeMerged, EventStageAdvanced:
+		return "info"
+	case EventSessionStopped,
+		EventSessionFailed,
+		EventEscalationCIFailure,
+		EventEscalationReviewComments,
+		EventEscalationBotReview,
+		EventEscalationMergeConflicts,
+		EventEscalationAutoMerge,
+		EventEscalationMergeCompletion,
+		EventBudgetHeld,
+		EventStageNotAdvanced:
+		return "warning"
+	default:
+		return ""
+	}
+}
+
+// StageTransition is the hop decision a stage event reports. The zero value
+// means the notification is not a stage event.
+type StageTransition struct {
+	SourceRule string
+	TargetRule string
+	ChainID    string
+	HopCount   int
+
+	// Reason is "failed" or "ceiling" on [EventStageNotAdvanced] and empty
+	// otherwise.
+	Reason string
 }
 
 // NotificationEnvelope carries system-owned session context.
@@ -50,10 +150,18 @@ type NotificationEnvelope struct {
 	// Agent is the dispatch-frozen agent kind, such as "claude-code".
 	// It may be empty when no agent kind is resolved.
 	Agent string
+
+	// EventType is the catalog entry the notification belongs to.
+	EventType EventType
+
+	// Stage is the hop decision of a stage event and the zero value on
+	// every other event.
+	Stage StageTransition
 }
 
-// NotificationMessage carries the agent-supplied content. Severity is
-// constrained to info, warning, or critical, and Category to
+// NotificationMessage carries the content of a notification: agent-supplied
+// for [EventAgentMessage], built by the orchestrator for every other event.
+// Severity is constrained to info, warning, or critical, and Category to
 // decision_needed, progress, blocked, completed, or other. The
 // constraints are documented here but enforced by the producing tool,
 // not by this type.
@@ -70,4 +178,9 @@ type NotificationMessage struct {
 	// Category is optional and, when set, is one of decision_needed,
 	// progress, blocked, completed, or other.
 	Category string
+
+	// AgentText is agent-authored text carried by an orchestrator event.
+	// Every destination renders it apart from Body; it is empty on
+	// agent.message.
+	AgentText string
 }

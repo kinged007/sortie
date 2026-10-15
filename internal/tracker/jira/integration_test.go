@@ -2,8 +2,11 @@ package jira
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -44,20 +47,7 @@ func integrationConfig(t *testing.T) map[string]any {
 		"project":  project,
 	}
 
-	if states := os.Getenv("SORTIE_JIRA_ACTIVE_STATES"); states != "" {
-		parts := strings.Split(states, ",")
-		trimmed := make([]any, 0, len(parts))
-		for _, s := range parts {
-			v := strings.TrimSpace(s)
-			if v == "" {
-				continue
-			}
-			trimmed = append(trimmed, v)
-		}
-		if len(trimmed) > 0 {
-			cfg["active_states"] = trimmed
-		}
-	}
+	cfg["active_states"] = integrationActiveStates(t)
 	if qf := os.Getenv("SORTIE_JIRA_QUERY_FILTER"); qf != "" {
 		cfg["query_filter"] = qf
 	}
@@ -71,7 +61,7 @@ func integrationEndpoint(t *testing.T) string {
 }
 
 // integrationActiveStates returns the active states from the environment
-// variable or falls back to the adapter's defaults.
+// variable or falls back to the stock Jira software workflow states.
 func integrationActiveStates(t *testing.T) []string {
 	t.Helper()
 	if states := os.Getenv("SORTIE_JIRA_ACTIVE_STATES"); states != "" {
@@ -88,7 +78,7 @@ func integrationActiveStates(t *testing.T) []string {
 			return result
 		}
 	}
-	return defaultActiveStates
+	return []string{"Backlog", "Selected for Development", "In Progress"}
 }
 
 // jiraTimestampFormats lists the formats tried when validating Jira timestamps.
@@ -423,5 +413,130 @@ func TestIntegration_FetchIssueComments(t *testing.T) {
 		if c.CreatedAt == "" {
 			t.Errorf("comments[%d].CreatedAt is empty", i)
 		}
+	}
+}
+
+const integrationStatement = "/close\n@sortie-literal-probe please look\n[~jdoe] see https://example.com/probe?x=1\n" +
+	"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat}\ntoken=[redacted]"
+
+func TestIntegration_CommentIssueWithLiteral_StoresOneCodeBlock(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	adapter, err := NewJiraAdapter(integrationConfig(t))
+	if err != nil {
+		t.Fatalf("NewJiraAdapter: %v", err)
+	}
+	jiraAdapter, ok := adapter.(*JiraAdapter)
+	if !ok {
+		t.Fatal("NewJiraAdapter did not return a *JiraAdapter")
+	}
+	if jiraAdapter.apiVersion != "3" {
+		t.Skipf("skipping: structured comment view needs API version 3, adapter uses %q", jiraAdapter.apiVersion)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	candidates, err := adapter.FetchCandidateIssues(ctx)
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(candidates) == 0 {
+		t.Skip("no candidate issues in project; cannot run write test")
+	}
+	key := candidates[0].Identifier
+
+	marker := "sortie literal round trip " + time.Now().UTC().Format(time.RFC3339Nano)
+	if err := adapter.CommentIssueWithLiteral(ctx, key, marker, integrationStatement); err != nil {
+		t.Fatalf("CommentIssueWithLiteral(%s): %v", key, err)
+	}
+
+	raw, _, err := jiraAdapter.client.Get(ctx, jiraAdapter.basePath+"/issue/"+key+"/comment", url.Values{"orderBy": {"-created"}, "maxResults": {"50"}})
+	if err != nil {
+		t.Fatalf("GET comments of %s: %v", key, err)
+	}
+	var listing struct {
+		Comments []struct {
+			Body json.RawMessage `json:"body"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(raw, &listing); err != nil {
+		t.Fatalf("decode comments of %s: %v", key, err)
+	}
+	for _, comment := range listing.Comments {
+		if !strings.Contains(string(comment.Body), marker) {
+			continue
+		}
+		var document struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(comment.Body, &document); err != nil {
+			t.Fatalf("decode stored comment body: %v", err)
+		}
+		codeBlocks := 0
+		for _, node := range document.Content {
+			if node.Type == "codeBlock" {
+				codeBlocks++
+			}
+		}
+		if codeBlocks != 1 {
+			t.Errorf("stored comment holds %d codeBlock nodes, want 1:\n%s", codeBlocks, comment.Body)
+		}
+		return
+	}
+	t.Fatalf("no stored comment contains %q among %d comments", marker, len(listing.Comments))
+}
+
+func TestIntegration_LabelRoundTrip(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	adapter, err := NewJiraAdapter(integrationConfig(t))
+	if err != nil {
+		t.Fatalf("NewJiraAdapter: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	candidates, err := adapter.FetchCandidateIssues(ctx)
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if len(candidates) == 0 {
+		t.Skip("no candidate issues in project; cannot run write test")
+	}
+	key := candidates[0].Identifier
+	probe := "sortie-label-probe"
+
+	if err := adapter.AddLabel(ctx, key, probe); err != nil {
+		t.Fatalf("AddLabel(%s, %q): %v", key, probe, err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := adapter.RemoveLabel(cleanupCtx, key, probe); err != nil {
+			t.Errorf("cleanup RemoveLabel(%s, %q): %v", key, probe, err)
+		}
+	})
+
+	issue, err := adapter.FetchIssueByID(ctx, key)
+	if err != nil {
+		t.Fatalf("FetchIssueByID(%s): %v", key, err)
+	}
+	if !slices.Contains(issue.Labels, probe) {
+		t.Fatalf("FetchIssueByID(%s) labels = %v, want %q after AddLabel", key, issue.Labels, probe)
+	}
+
+	if err := adapter.RemoveLabel(ctx, key, probe); err != nil {
+		t.Fatalf("RemoveLabel(%s, %q): %v", key, probe, err)
+	}
+	issue, err = adapter.FetchIssueByID(ctx, key)
+	if err != nil {
+		t.Fatalf("FetchIssueByID(%s) after removal: %v", key, err)
+	}
+	if slices.Contains(issue.Labels, probe) {
+		t.Errorf("FetchIssueByID(%s) labels = %v, want %q gone immediately after RemoveLabel", key, issue.Labels, probe)
 	}
 }

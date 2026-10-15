@@ -65,7 +65,7 @@ type Metrics interface {
 	// counter. operation is one of "fetch_candidates", "fetch_issue",
 	// "fetch_comments", "fetch_by_states", "fetch_states_by_ids",
 	// "fetch_states_by_identifiers", "fetch_blockers", "transition",
-	// "comment", or "add_label".
+	// "comment", "add_label", or "remove_label".
 	// result is "success" or "error"
 	// (sortie_tracker_requests_total{operation,result} counter).
 	IncTrackerRequests(operation string, result string)
@@ -118,7 +118,7 @@ type Metrics interface {
 	IncCIStatusChecks(result string)
 
 	// IncCIEscalations increments the CI escalation counter.
-	// action is "label", "comment", or "error"
+	// action is "label", "comment", "none", or "error"
 	// (sortie_ci_escalations_total{action} counter).
 	IncCIEscalations(action string)
 
@@ -148,7 +148,7 @@ type Metrics interface {
 	IncReviewChecks(result string)
 
 	// IncReviewEscalations increments the review escalation counter.
-	// action is "label", "comment", or "error"
+	// action is "label", "comment", "none", or "error"
 	// (sortie_review_escalations_total{action} counter).
 	IncReviewEscalations(action string)
 
@@ -158,7 +158,7 @@ type Metrics interface {
 	IncBotReviewChecks(result string)
 
 	// IncBotReviewEscalations increments the bot review escalation
-	// counter. action is "label", "comment", or "error"
+	// counter. action is "label", "comment", "none", or "error"
 	// (sortie_bot_review_escalations_total{action} counter).
 	IncBotReviewEscalations(action string)
 
@@ -173,7 +173,7 @@ type Metrics interface {
 	IncMergeConflictChecks(result string)
 
 	// IncMergeConflictEscalations increments the merge-conflict
-	// escalation counter. action is "label", "comment", or "error"
+	// escalation counter. action is "label", "comment", "none", or "error"
 	// (sortie_merge_conflict_escalations_total{action} counter).
 	IncMergeConflictEscalations(action string)
 

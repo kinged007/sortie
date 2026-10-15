@@ -13,7 +13,6 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/clientprotocol"
 	_ "github.com/sortie-ai/sortie/internal/agent/codex"
 	_ "github.com/sortie-ai/sortie/internal/agent/copilot"
-	_ "github.com/sortie-ai/sortie/internal/agent/kiro"
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
 	_ "github.com/sortie-ai/sortie/internal/agent/pi"
@@ -33,27 +32,24 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 		t.Parallel()
 
 		tests := []struct {
-			name         string
-			kind         string
-			wantAPIKey   bool
-			wantProject  bool
-			wantActive   []string
-			wantTerminal []string
+			name               string
+			kind               string
+			wantAPIKey         bool
+			wantProject        bool
+			wantTerminalStates bool
 		}{
 			{
-				name:        "jira requires api_key and project and declares active states only",
+				name:        "jira requires api_key and project",
 				kind:        "jira",
 				wantAPIKey:  true,
 				wantProject: true,
-				wantActive:  []string{"Backlog", "Selected for Development", "In Progress"},
 			},
 			{
-				name:         "github requires api_key and project and declares both state lists",
-				kind:         "github",
-				wantAPIKey:   true,
-				wantProject:  true,
-				wantActive:   []string{"backlog", "in-progress", "review"},
-				wantTerminal: []string{"done", "wontfix"},
+				name:               "github requires api_key, project and terminal states",
+				kind:               "github",
+				wantAPIKey:         true,
+				wantProject:        true,
+				wantTerminalStates: true,
 			},
 			{
 				name:         "github-pr requires api_key and project and declares both state lists",
@@ -64,31 +60,27 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantTerminal: []string{"done", "wontfix"},
 			},
 			{
-				name:         "gitea requires api_key and project and declares both state lists",
-				kind:         "gitea",
-				wantAPIKey:   true,
-				wantProject:  true,
-				wantActive:   []string{"backlog", "in-progress", "review"},
-				wantTerminal: []string{"done", "wontfix"},
+				name:               "gitea requires api_key, project and terminal states",
+				kind:               "gitea",
+				wantAPIKey:         true,
+				wantProject:        true,
+				wantTerminalStates: true,
 			},
 			{
-				name:         "gitlab requires api_key and project and declares both state lists",
-				kind:         "gitlab",
-				wantAPIKey:   true,
-				wantProject:  true,
-				wantActive:   []string{"backlog", "in-progress", "review"},
-				wantTerminal: []string{"done", "wontfix"},
+				name:               "gitlab requires api_key, project and terminal states",
+				kind:               "gitlab",
+				wantAPIKey:         true,
+				wantProject:        true,
+				wantTerminalStates: true,
 			},
 			{
-				name:         "linear requires api_key and project and declares both state lists",
-				kind:         "linear",
-				wantAPIKey:   true,
-				wantProject:  true,
-				wantActive:   []string{"Backlog", "Todo", "In Progress"},
-				wantTerminal: []string{"Done", "Canceled", "Duplicate"},
+				name:        "linear requires api_key and project",
+				kind:        "linear",
+				wantAPIKey:  true,
+				wantProject: true,
 			},
 			{
-				name: "file requires neither api_key nor project and declares no default states",
+				name: "file requires neither api_key nor project",
 				kind: "file",
 			},
 		}
@@ -108,11 +100,8 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				if meta.RequiresProject != tt.wantProject {
 					t.Errorf("Trackers.Meta(%q).RequiresProject = %v, want %v", tt.kind, meta.RequiresProject, tt.wantProject)
 				}
-				if !slices.Equal(meta.DefaultActiveStates, tt.wantActive) {
-					t.Errorf("Trackers.Meta(%q).DefaultActiveStates = %v, want %v", tt.kind, meta.DefaultActiveStates, tt.wantActive)
-				}
-				if !slices.Equal(meta.DefaultTerminalStates, tt.wantTerminal) {
-					t.Errorf("Trackers.Meta(%q).DefaultTerminalStates = %v, want %v", tt.kind, meta.DefaultTerminalStates, tt.wantTerminal)
+				if meta.RequiresTerminalStates != tt.wantTerminalStates {
+					t.Errorf("Trackers.Meta(%q).RequiresTerminalStates = %v, want %v", tt.kind, meta.RequiresTerminalStates, tt.wantTerminalStates)
 				}
 			})
 		}
@@ -122,17 +111,17 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 		t.Parallel()
 
 		tests := []struct {
-			name                       string
-			kind                       string
-			wantCommand                bool
-			wantMCPInjection           registry.MCPInjection
-			wantUsageArrival           registry.UsageArrival
-			wantUsageAttribution       registry.UsageAttribution
-			declaresResumeBlocker      bool
-			samplePassthrough          map[string]any
-			wantKey                    string
-			wantCredentialEnvNames     []string
-			wantDeprecationReplacement string
+			name                   string
+			kind                   string
+			wantCommand            bool
+			wantMCPInjection       registry.MCPInjection
+			wantUsageArrival       registry.UsageArrival
+			wantUsageAttribution   registry.UsageAttribution
+			declaresResumeBlocker  bool
+			samplePassthrough      map[string]any
+			wantKey                string
+			wantCredentialEnvNames []string
+			wantEffortForwarding   registry.EffortForwarding
 		}{
 			{
 				name:                   "agent-client-protocol requires command, declares MCP injection translated, declares turn_end/per_model usage, declares no resume blocker, and declares no credential names",
@@ -142,6 +131,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortNotForwarded,
 			},
 			{
 				name:                   "claude-code requires command, declares MCP injection supported, declares incremental/per_model usage, declares session_persistence as a resume blocker, and declares its Anthropic credential names",
@@ -154,6 +144,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				samplePassthrough:      map[string]any{"session_persistence": false},
 				wantKey:                "session_persistence",
 				wantCredentialEnvNames: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"},
+				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
 				name:                   "copilot-cli requires command, declares MCP injection supported, declares turn_end/per_model usage, declares no resume blocker, and declares its GitHub-token credential names",
@@ -163,6 +154,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"},
+				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
 				name:                   "codex requires command, declares MCP injection translated, declares incremental/per_model usage, declares no resume blocker, and declares no credential names",
@@ -172,16 +164,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalIncremental,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
-			},
-			{
-				name:                       "kiro requires command, declares MCP injection unsupported, declares none/none usage, declares no resume blocker, declares its API key credential name, and is deprecated in favor of agent-client-protocol",
-				kind:                       "kiro",
-				wantCommand:                true,
-				wantMCPInjection:           registry.MCPInjectionUnsupported,
-				wantUsageArrival:           registry.UsageArrivalNone,
-				wantUsageAttribution:       registry.UsageAttributionNone,
-				wantCredentialEnvNames:     []string{"KIRO_API_KEY"},
-				wantDeprecationReplacement: "agent-client-protocol",
+				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
 				name:                   "pi requires command, declares MCP injection unsupported, declares turn_end/per_model usage, and declares no resume blocker",
@@ -200,6 +183,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
 				name:                   "mock requires nothing, declares MCP injection unsupported, declares incremental/session_total usage, declares no resume blocker, and declares no credential names",
@@ -208,6 +192,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalIncremental,
 				wantUsageAttribution:   registry.UsageAttributionSessionTotal,
 				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortNotForwarded,
 			},
 		}
 
@@ -261,17 +246,12 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 					t.Errorf("Agents.Meta(%q).CredentialEnv.Names() = %v, want %v", tt.kind, got, tt.wantCredentialEnvNames)
 				}
 
-				if tt.wantDeprecationReplacement == "" {
-					if meta.Deprecation != nil {
-						t.Errorf("Agents.Meta(%q).Deprecation = %+v, want nil", tt.kind, meta.Deprecation)
-					}
-				} else {
-					if meta.Deprecation == nil {
-						t.Fatalf("Agents.Meta(%q).Deprecation = nil, want non-nil naming replacement %q", tt.kind, tt.wantDeprecationReplacement)
-					}
-					if meta.Deprecation.Replacement != tt.wantDeprecationReplacement {
-						t.Errorf("Agents.Meta(%q).Deprecation.Replacement = %q, want %q", tt.kind, meta.Deprecation.Replacement, tt.wantDeprecationReplacement)
-					}
+				if meta.EffortForwarding != tt.wantEffortForwarding {
+					t.Errorf("Agents.Meta(%q).EffortForwarding = %q, want %q", tt.kind, meta.EffortForwarding, tt.wantEffortForwarding)
+				}
+
+				if meta.Deprecation != nil {
+					t.Errorf("Agents.Meta(%q).Deprecation = %+v, want nil", tt.kind, meta.Deprecation)
 				}
 
 				if !tt.declaresResumeBlocker {

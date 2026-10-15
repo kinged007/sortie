@@ -55,7 +55,7 @@ func TestRunPreflight(t *testing.T) {
 		f.queueBody("query TeamStates", loadFixture(t, "team_states_empty.json"))
 
 		_, err := runPreflight(context.Background(), f, "NOPE",
-			defaultActiveStates, defaultTerminalStates, "", nil)
+			testActiveStates, testTerminalStates, "", nil)
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
 	})
@@ -67,7 +67,7 @@ func TestRunPreflight(t *testing.T) {
 		seedPreflight(f, t)
 
 		_, err := runPreflight(context.Background(), f, "SOR",
-			[]string{"Backlog", "Nonexistent"}, defaultTerminalStates, "", nil)
+			[]string{"Backlog", "Nonexistent"}, testTerminalStates, "", nil)
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
 	})
@@ -106,7 +106,7 @@ func TestRunPreflight(t *testing.T) {
 		f.queueBody("query Me", loadFixture(t, "auth_error.json"))
 
 		_, err := runPreflight(context.Background(), f, "SOR",
-			defaultActiveStates, defaultTerminalStates, "", nil)
+			testActiveStates, testTerminalStates, "", nil)
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerAuth)
 
@@ -121,7 +121,7 @@ func TestRunPreflight(t *testing.T) {
 		f := newFakeClient()
 		f.queueBody("query Me", loadFixture(t, "auth_error.json"))
 
-		_, err := newAdapter(f, "SOR", defaultActiveStates, defaultTerminalStates, "", nil, nil)
+		_, err := newAdapter(f, "SOR", testStates(testActiveStates, ""), nil, nil)
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerAuth)
 	})
@@ -142,7 +142,7 @@ func TestRunPreflightRetry(t *testing.T) {
 		}
 
 		_, err := runPreflight(context.Background(), f, "SOR",
-			defaultActiveStates, defaultTerminalStates, "", nil)
+			testActiveStates, testTerminalStates, "", nil)
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerTransport)
 
@@ -158,7 +158,7 @@ func TestRunPreflightRetry(t *testing.T) {
 		f.queueBody("query TeamStates", loadFixture(t, "team_states.json"))
 
 		_, err := runPreflight(context.Background(), f, "SOR",
-			defaultActiveStates, defaultTerminalStates, "", nil)
+			testActiveStates, testTerminalStates, "", nil)
 		if err != nil {
 			t.Fatalf("runPreflight should recover after a transient failure: %v", err)
 		}

@@ -25,6 +25,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/tracker/file"
+	"github.com/sortie-ai/sortie/internal/workflow"
 	"github.com/sortie-ai/sortie/internal/workspace"
 
 	"github.com/sortie-ai/sortie/tools/qualify/evidence"
@@ -37,7 +38,7 @@ import (
 const fixtureAgentKind = "qualification-e2e-fixture"
 
 func init() {
-	registry.Agents.RegisterWithMeta(fixtureAgentKind, func(map[string]any) (domain.AgentAdapter, error) {
+	registry.Agents.RegisterWithMeta(fixtureAgentKind, func() (domain.AgentAdapter, error) {
 		return nil, fmt.Errorf("%s is resolved through AgentAdapterByKind, never constructed from the registry", fixtureAgentKind)
 	}, registry.AgentMeta{RequiresCommand: true})
 }
@@ -152,6 +153,8 @@ func (m *workflowManager) Reload() error { return nil }
 // would resolve those against whatever working directory the test binary ran in.
 func (m *workflowManager) WorkflowAbsPath() string { return m.workflowPath }
 
+func (m *workflowManager) LoadStatus() workflow.LoadStatus { return workflow.LoadStatus{} }
+
 // fakeAgent is the fake protocol agent the deterministic oracle drives: a
 // real bounded child process in its own group gives the PGID postcondition
 // something to check, with no model traffic.
@@ -230,7 +233,7 @@ func (a *fakeAgent) StopSession(_ context.Context, session domain.Session) error
 	if !ok {
 		return fmt.Errorf("unexpected session internal type %T", session.Internal)
 	}
-	_ = procutil.SignalProcessGroup(fs.cmd.Process.Pid, syscall.SIGKILL)
+	_ = procgroup.Signal(fs.cmd.Process.Pid, syscall.SIGKILL)
 	_, _ = fs.cmd.Process.Wait()
 
 	a.mu.Lock()

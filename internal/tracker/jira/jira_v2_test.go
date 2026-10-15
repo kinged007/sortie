@@ -21,10 +21,11 @@ import (
 // colon-free PAT (Bearer) credential and a non-Cloud host.
 func v2Config(endpoint string) map[string]any {
 	return map[string]any{
-		"endpoint":    endpoint,
-		"api_key":     "pat_token_abc",
-		"project":     "SRV",
-		"api_version": "2",
+		"endpoint":      endpoint,
+		"api_key":       "pat_token_abc",
+		"project":       "SRV",
+		"api_version":   "2",
+		"active_states": []any{"To Do"},
 	}
 }
 
@@ -630,6 +631,38 @@ func TestCommentIssue_V2RawStringBody(t *testing.T) {
 	}
 	if bodyStr != text {
 		t.Errorf("body = %q, want verbatim %q", bodyStr, text)
+	}
+}
+
+func TestCommentIssueWithLiteral_V2SendsANoformatBlockTheStatementCannotClose(t *testing.T) {
+	t.Parallel()
+
+	const text = "Sortie session completed (agent signaled: blocked)."
+	raw := postedCommentBody(t, v2Config, func(a *JiraAdapter) error {
+		return a.CommentIssueWithLiteral(context.Background(), "SRV-9", text, adversarialStatement)
+	})
+
+	var payload struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal request body %s: %v", raw, err)
+	}
+
+	const zwsp = "\u200b"
+	broken := strings.NewReplacer("{NoFormat}", "{"+zwsp+"NoFormat}", "{noformat:", "{"+zwsp+"noformat:", "[~", "["+zwsp+"~").Replace(adversarialStatement)
+	want := text + "\n\n{noformat}\n" + broken + "\n{noformat}"
+	if payload.Body != want {
+		t.Errorf("comment body = %q, want %q", payload.Body, want)
+	}
+	if got := strings.Count(strings.ToLower(payload.Body), "{noformat"); got != 2 {
+		t.Errorf("comment body holds %d noformat markers, want only the opening and closing one", got)
+	}
+	if strings.Contains(payload.Body, "[~") {
+		t.Errorf("comment body = %q, want no [~user] mention Jira Server would parse inside the block", payload.Body)
+	}
+	if !strings.HasSuffix(payload.Body, "\n{noformat}") {
+		t.Errorf("comment body = %q, want it to end at the closing marker", payload.Body)
 	}
 }
 

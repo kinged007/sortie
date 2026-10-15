@@ -23,6 +23,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 func TestRefusalNoticesUseSharedNotificationEmitter(t *testing.T) {
@@ -82,7 +83,17 @@ func TestPumpStreamEndCleanExit(t *testing.T) {
 
 	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
 	out := newOutboundReader(outPr)
-	outcomeCh := startTurnAwaitingPrompt(t, state, out)
+	markSessionKnown(state)
+	var events []domain.AgentEvent
+	outcomeCh := runTurnAsync(state, domain.RunTurnParams{
+		Prompt: "do something",
+		OnEvent: func(e domain.AgentEvent) {
+			events = append(events, e)
+		},
+	})
+	out.awaitMethod(t, methodSessionPrompt)
+
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial assistant message"},"messageId":"message-1"}}}`)
 
 	if err := inPw.Close(); err != nil {
 		t.Fatalf("close the simulated agent stream: %v", err)
@@ -94,6 +105,26 @@ func TestPumpStreamEndCleanExit(t *testing.T) {
 		TerminalErrorKind: domain.ErrPortExit,
 		TerminalMessage:   streamEndedMessage,
 	}, outcome.result, outcome.err)
+
+	emptyNotifications := 0
+	completeMessages := 0
+	for _, event := range events {
+		if event.Type != domain.EventNotification {
+			continue
+		}
+		switch event.Message {
+		case "":
+			emptyNotifications++
+		case "partial assistant message":
+			completeMessages++
+		}
+	}
+	if emptyNotifications != 1 {
+		t.Errorf("empty liveness notifications = %d, want 1", emptyNotifications)
+	}
+	if completeMessages != 1 {
+		t.Errorf("completed message notifications = %d, want 1", completeMessages)
+	}
 }
 
 func TestPumpStreamEndReadFailure(t *testing.T) {
@@ -192,16 +223,22 @@ func TestSessionUpdateBeforeAnyPromptNotLost(t *testing.T) {
 		t.Fatalf("second event type = %q, want %q (the once-per-session capability notice)", second.Type, domain.EventNotification)
 	}
 	third := waitEvent(t, eventCh)
-	if third.Type != domain.EventNotification || third.Message != "queued before any turn" {
-		t.Fatalf("third event = %+v, want the queued notification flushed after session_started and the capability notice", third)
+	if third.Type != domain.EventNotification || third.Message != "" {
+		t.Fatalf("third event = %+v, want the queued chunk's liveness notification", third)
 	}
-
 	promptID := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
 
 	outcome := awaitOutcome(t, outcomeCh)
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
+	}
+	fourth := waitEvent(t, eventCh)
+	if fourth.Type != domain.EventNotification || fourth.Message != "queued before any turn" {
+		t.Fatalf("fourth event = %+v, want the queued message", fourth)
+	}
+	if !fourth.Timestamp.Equal(third.Timestamp) {
+		t.Errorf("queued message timestamp = %v, want %v, when its chunk arrived before the turn", fourth.Timestamp, third.Timestamp)
 	}
 }
 
@@ -406,18 +443,20 @@ func TestRunTurn_StalledConsumerDoesNotParkPump(t *testing.T) {
 			mu.Lock()
 			events = append(events, e)
 			mu.Unlock()
-			// Only a burst chunk's own event holds the gate; the turn's
+			// Only a burst chunk's liveness event holds the gate; the turn's
 			// session-started event and capability notice must reach the caller
 			// before the prompt request is even sent.
-			if _, err := strconv.Atoi(e.Message); err == nil {
+			if e.Type == domain.EventNotification && e.Message == "" {
 				<-gate
 			}
 		},
 	})
 	promptID := out.awaitMethod(t, methodSessionPrompt)
 
+	var wantText strings.Builder
 	for i := range stalledConsumerBurstCount {
 		line := fmt.Sprintf(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%d"}}}}`, i)
+		wantText.WriteString(strconv.Itoa(i))
 		errCh := make(chan error, 1)
 		go func() {
 			_, writeErr := fmt.Fprintln(inPw, line)
@@ -442,21 +481,123 @@ func TestRunTurn_StalledConsumerDoesNotParkPump(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	var texts []string
+	var emptyNotifications int
+	var partialChunks int
+	var completeMessages int
+	wantRunes := []rune(wantText.String())
+	wantMessage := string(wantRunes[:messageTruncateLimit]) + "…"
 	for _, e := range events {
-		if e.Type == domain.EventNotification {
+		if e.Type != domain.EventNotification {
+			continue
+		}
+		switch e.Message {
+		case "":
+			emptyNotifications++
+		case wantMessage:
+			completeMessages++
+		default:
 			if _, err := strconv.Atoi(e.Message); err == nil {
-				texts = append(texts, e.Message)
+				partialChunks++
 			}
 		}
 	}
-	if len(texts) != stalledConsumerBurstCount {
-		t.Fatalf("notification events = %d, want %d", len(texts), stalledConsumerBurstCount)
+	if emptyNotifications != stalledConsumerBurstCount {
+		t.Errorf("empty liveness notifications = %d, want %d", emptyNotifications, stalledConsumerBurstCount)
 	}
-	for i, text := range texts {
-		if want := fmt.Sprintf("%d", i); text != want {
-			t.Errorf("notification %d text = %q, want %q (chunks out of order)", i, text, want)
+	if completeMessages != 1 {
+		t.Errorf("completed message notifications = %d, want 1 carrying the truncated aggregate", completeMessages)
+	}
+	if partialChunks != 0 {
+		t.Errorf("partial chunk notifications = %d, want 0", partialChunks)
+	}
+}
+
+func TestPumpAgentMessageChunksAreCoalesced(t *testing.T) {
+	t.Parallel()
+
+	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
+	out := newOutboundReader(outPr)
+	markSessionKnown(state)
+
+	var events []domain.AgentEvent
+	outcomeCh := runTurnAsync(state, domain.RunTurnParams{
+		Prompt: "go",
+		OnEvent: func(e domain.AgentEvent) {
+			events = append(events, e)
+		},
+	})
+	promptID := out.awaitMethod(t, methodSessionPrompt)
+
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello "},"messageId":"message-1"}}}`)
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"usage_update","used":12000,"size":200000}}}`)
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"world"},"messageId":"message-1"}}}`)
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Next"},"messageId":"message-2"}}}`)
+	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"plan","entries":[]}}}`)
+	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
+
+	if outcome := awaitOutcome(t, outcomeCh); outcome.err != nil {
+		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
+	}
+
+	var chunkNotifications []string
+	for _, event := range events {
+		isChunk := event.Type == domain.EventNotification && (event.Message == "" || event.Message == "hello world" || event.Message == "Next")
+		if isChunk || event.Message == planUpdateMessage {
+			chunkNotifications = append(chunkNotifications, event.Message)
 		}
+	}
+	want := []string{"", "", "hello world", "", "Next", planUpdateMessage}
+	if len(chunkNotifications) != len(want) {
+		t.Fatalf("chunk notifications = %q, want %q", chunkNotifications, want)
+	}
+	for i := range want {
+		if chunkNotifications[i] != want[i] {
+			t.Errorf("chunk notification %d = %q, want %q", i, chunkNotifications[i], want[i])
+		}
+	}
+}
+
+func TestPumpAgentMessageBufferIsBounded(t *testing.T) {
+	pump := &pumpState{}
+	id := messageId("message-1")
+	pump.handleAgentMessageChunk(&id, strings.Repeat("界", messageTruncateLimit+100), time.Now().UTC())
+	if got := pump.agentMessageText.Len(); got != len([]byte(strings.Repeat("界", messageTruncateLimit))) {
+		t.Fatalf("buffer bytes = %d, want %d", got, len([]byte(strings.Repeat("界", messageTruncateLimit))))
+	}
+	if !pump.agentMessageTruncated {
+		t.Fatal("buffer truncated = false, want true after the message limit")
+	}
+
+	pump.flushAgentMessage()
+	if len(pump.queued) != 1 {
+		t.Fatalf("queued events = %d, want 1 completed message", len(pump.queued))
+	}
+	if got, want := len([]rune(pump.queued[0].Message)), messageTruncateLimit+1; got != want {
+		t.Errorf("completed message rune count = %d, want %d", got, want)
+	}
+	if !strings.HasSuffix(pump.queued[0].Message, "…") {
+		t.Errorf("completed message = %q, want truncation marker", pump.queued[0].Message)
+	}
+}
+
+func TestPumpAgentMessageTruncationDoesNotLeakSecretPrefix(t *testing.T) {
+	secret := fmt.Sprintf("message-secret-%d", time.Now().UnixNano())
+	redact.Add(t.Name(), secret)
+
+	pump := &pumpState{}
+	id := messageId("message-1")
+	pump.handleAgentMessageChunk(&id, strings.Repeat("x", messageTruncateLimit-2)+secret, time.Now().UTC())
+	pump.flushAgentMessage()
+
+	if len(pump.queued) != 1 {
+		t.Fatalf("queued events = %d, want 1 completed message", len(pump.queued))
+	}
+	message := pump.queued[0].Message
+	if strings.Contains(message, secret[:2]) {
+		t.Errorf("completed message = %q, leaks a truncated prefix of the registered secret", message)
+	}
+	if !strings.HasSuffix(message, "…") {
+		t.Errorf("completed message = %q, want truncation marker", message)
 	}
 }
 

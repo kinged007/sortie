@@ -26,7 +26,7 @@ func loadSessionUpdateFixture(t *testing.T, name string) json.RawMessage {
 func TestApplySessionUpdate(t *testing.T) {
 	t.Parallel()
 
-	t.Run("agent_message_chunk emits a notification", func(t *testing.T) {
+	t.Run("agent_message_chunk emits a liveness notification and exposes its text", func(t *testing.T) {
 		t.Parallel()
 		ev, ok := parseSessionUpdate(loadSessionUpdateFixture(t, "agent_message_chunk.json"))
 		if !ok {
@@ -36,8 +36,11 @@ func TestApplySessionUpdate(t *testing.T) {
 		if !got.hasEvent || got.event.Type != domain.EventNotification {
 			t.Fatalf("applySessionUpdate() = %+v, want a notification event", got)
 		}
-		if got.event.Message != "Reading the file to understand its structure." {
-			t.Errorf("applySessionUpdate() Message = %q, want the chunk's text", got.event.Message)
+		if got.event.Message != "" {
+			t.Errorf("applySessionUpdate() Message = %q, want an empty liveness notification", got.event.Message)
+		}
+		if !got.messageChunk || got.messageText != "Reading the file to understand its structure." {
+			t.Errorf("applySessionUpdate() message chunk = (%t, %q), want the chunk's raw text", got.messageChunk, got.messageText)
 		}
 	})
 
@@ -144,7 +147,7 @@ func TestApplySessionUpdate(t *testing.T) {
 			t.Fatal("parseSessionUpdate() found = false, want true: an unmodeled key must not fail decoding")
 		}
 		got := applySessionUpdate(agentcore.NewToolTracker(), ev)
-		if !got.hasEvent || got.event.Message != "Patching the retry loop." {
+		if !got.hasEvent || got.event.Message != "" || got.messageText != "Patching the retry loop." {
 			t.Fatalf("applySessionUpdate() = %+v, want the chunk's own text despite the extra key", got)
 		}
 	})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -44,16 +45,34 @@ func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog
 			sessionID = *e.SessionID
 		}
 
+		lineage := StageLineage{
+			PreviousRule:    e.StagePrevious,
+			PreviousOutcome: e.StagePreviousOutcome,
+			ChainID:         e.ChainID,
+			DispatchedAt:    parseDispatchedAt(e.DispatchedAt),
+		}
 		state.RetryAttempts[e.IssueID] = &RetryEntry{
-			IssueID:          e.IssueID,
-			Identifier:       e.Identifier,
+			IssueID:    e.IssueID,
+			Identifier: e.Identifier,
+			DisplayID:  e.DisplayID,
+			IssueIdentity: IssueIdentity{
+				Title:     e.IssueTitle,
+				URL:       e.IssueURL,
+				IssueType: e.IssueType,
+				Labels:    slices.Clone(e.IssueLabels),
+				State:     e.IssueState,
+			},
 			SessionID:        sessionID,
 			Attempt:          e.Attempt,
 			DueAtMS:          e.DueAtMs,
 			Error:            errStr,
 			RuleName:         e.RuleName,
+			StageLineage:     lineage,
 			TemplateID:       e.TemplateID,
 			AgentKind:        e.AgentKind,
+			ConfiguredModel:  e.ConfiguredModel,
+			Trigger:          e.Trigger,
+			OriginTrigger:    e.OriginTrigger,
 			scheduledDelayMS: pending.RemainingMs,
 		}
 		state.Claimed[e.IssueID] = struct{}{}
@@ -91,6 +110,7 @@ type PendingReactionRecoveryParams struct {
 	CIProvider                        domain.CIStatusProvider
 	SCMAdapter                        domain.SCMAdapter
 	AutoMergeReactionConfigured       bool
+	ReviewReactionConfigured          bool
 	BotReviewReactionConfigured       bool
 	MergeConflictReactionConfigured   bool
 	LabelReviewReactionConfigured     bool
@@ -284,6 +304,23 @@ func validReactionRecoveryRuns(runs []persistence.RunHistory, log *slog.Logger, 
 	return validRuns, issueIDs
 }
 
+// stageLineageOf returns the lineage frozen with the dispatch that wrote
+// run.
+func stageLineageOf(run persistence.RunHistory) StageLineage {
+	return StageLineage{
+		PreviousRule:    run.StagePrevious,
+		PreviousOutcome: run.StagePreviousOutcome,
+		ChainID:         run.ChainID,
+		DispatchedAt:    parseDispatchedAt(run.DispatchedAt),
+	}
+}
+
+// issueIdentityOfRun returns the identity run recorded at dispatch: a title
+// and link with nil Labels, because run history keeps no other fact.
+func issueIdentityOfRun(run persistence.RunHistory) IssueIdentity {
+	return IssueIdentity{Title: run.IssueTitle, URL: run.IssueURL}
+}
+
 func recoverPendingReactionKinds(
 	state *State,
 	run persistence.RunHistory,
@@ -292,226 +329,134 @@ func recoverPendingReactionKinds(
 	params PendingReactionRecoveryParams,
 	outcome *PendingReactionRecoveryResult,
 ) int {
+	pr := pullRequestRef{Number: meta.PRNumber, Owner: meta.Owner, Repo: meta.Repo, Branch: meta.Branch, HeadSHA: meta.SHA}
+	hasPullRequest := pr.Number > 0 && pr.Owner != "" && pr.Repo != ""
+	hasCheckout := hasPullRequest && pr.Branch != ""
 	added := 0
 
-	if params.SCMAdapter != nil && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindReview)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindReview,
-				CreatedAt:  now,
-				KindData: &ReviewReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-					SHA:      meta.SHA,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.ReviewRecovered++
-			added++
+	recoverKind := func(kind string, counter *int) {
+		key := ReactionKey(run.IssueID, kind)
+		if _, exists := state.PendingReactions[key]; exists {
+			return
 		}
+		state.PendingReactions[key] = recoveredPendingReaction(run, kind, pr, now)
+		*counter++
+		added++
 	}
 
-	if params.BotReviewReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindBotReview)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindBotReview,
-				CreatedAt:  now,
-				KindData: &BotReviewReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-					SHA:      meta.SHA,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.BotReviewRecovered++
-			added++
-		}
+	if reactionKindConfigured(params, ReactionKindReview) && hasCheckout {
+		recoverKind(ReactionKindReview, &outcome.ReviewRecovered)
 	}
-
-	if params.CIProvider != nil && params.SCMAdapter != nil && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindCI)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindCI,
-				CreatedAt:  now,
-				// HeadRecordedAt is left zero: a head recorded by a
-				// previous process cannot bound this process's
-				// attribution query, so the first pass after a restart
-				// records a baseline and classifies it unknown rather
-				// than resetting a counter against a boundary this
-				// process never observed.
-				KindData: &CIReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-					SHA:      meta.SHA,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.CIRecovered++
-			added++
-		}
+	if reactionKindConfigured(params, ReactionKindBotReview) && hasCheckout {
+		recoverKind(ReactionKindBotReview, &outcome.BotReviewRecovered)
 	}
-
-	if params.SCMAdapter != nil && params.AutoMergeReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindAutoMerge)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindAutoMerge,
-				CreatedAt:  now,
-				KindData: &AutoMergeReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-					SHA:      meta.SHA,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.AutoMergeRecovered++
-			added++
-		}
+	if reactionKindConfigured(params, ReactionKindCI) && hasCheckout {
+		recoverKind(ReactionKindCI, &outcome.CIRecovered)
 	}
-
-	if params.SCMAdapter != nil && params.MergeConflictReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindMergeConflict)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindMergeConflict,
-				CreatedAt:  now,
-				KindData: &MergeConflictReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-					SHA:      meta.SHA,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.MergeConflictRecovered++
-			added++
-		}
+	if reactionKindConfigured(params, ReactionKindAutoMerge) && hasCheckout {
+		recoverKind(ReactionKindAutoMerge, &outcome.AutoMergeRecovered)
+	}
+	if reactionKindConfigured(params, ReactionKindMergeConflict) && hasCheckout {
+		recoverKind(ReactionKindMergeConflict, &outcome.MergeConflictRecovered)
 	}
 
 	// The label-review reaction has no checkout and requires no branch, so
-	// unlike the sibling kinds its guard omits the meta.Branch != "" clause.
-	if params.SCMAdapter != nil && params.LabelReviewReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" {
-		key := ReactionKey(run.IssueID, ReactionKindLabelReview)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindLabelReview,
-				CreatedAt:  now,
-				KindData: &LabelReviewReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.LabelReviewRecovered++
-			added++
-		}
+	// unlike the sibling kinds its guard omits the branch clause.
+	if reactionKindConfigured(params, ReactionKindLabelReview) && hasPullRequest {
+		recoverKind(ReactionKindLabelReview, &outcome.LabelReviewRecovered)
 	}
 
 	// The label-fix reaction checks out the PR head branch, so unlike
-	// label-review its guard requires meta.Branch != "", matching every
-	// other checkout-bearing sibling kind.
-	if params.SCMAdapter != nil && params.LabelFixReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" && meta.Branch != "" {
-		key := ReactionKey(run.IssueID, ReactionKindLabelFix)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindLabelFix,
-				CreatedAt:  now,
-				KindData: &LabelFixReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-					Branch:   meta.Branch,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.LabelFixRecovered++
-			added++
-		}
+	// label-review its guard requires a branch, matching every other
+	// checkout-bearing sibling kind.
+	if reactionKindConfigured(params, ReactionKindLabelFix) && hasCheckout {
+		recoverKind(ReactionKindLabelFix, &outcome.LabelFixRecovered)
 	}
 
 	// The merge-completion reaction has no checkout and requires no
 	// branch, so unlike the checkout-bearing kinds its guard omits the
-	// meta.Branch != "" clause, matching label-review.
-	if params.SCMAdapter != nil && params.MergeCompletionReactionConfigured && meta.PRNumber > 0 && meta.Owner != "" && meta.Repo != "" {
-		key := ReactionKey(run.IssueID, ReactionKindMergeCompletion)
-		if _, exists := state.PendingReactions[key]; !exists {
-			state.PendingReactions[key] = &PendingReaction{
-				IssueID:    run.IssueID,
-				Identifier: run.Identifier,
-				DisplayID:  run.DisplayID,
-				Attempt:    run.Attempt,
-				Kind:       ReactionKindMergeCompletion,
-				CreatedAt:  now,
-				KindData: &MergeCompletionReactionData{
-					PRNumber: meta.PRNumber,
-					Owner:    meta.Owner,
-					Repo:     meta.Repo,
-				},
-				AgentKind:  run.AgentAdapter,
-				RuleName:   run.RuleName,
-				TemplateID: run.TemplateID,
-			}
-			outcome.MergeCompletionRecovered++
-			added++
-		}
+	// branch clause, matching label-review.
+	if reactionKindConfigured(params, ReactionKindMergeCompletion) && hasPullRequest {
+		recoverKind(ReactionKindMergeCompletion, &outcome.MergeCompletionRecovered)
 	}
 
 	return added
+}
+
+// reactionKindConfigured reports whether params carries what recovery needs
+// to watch a pull request under the kind.
+func reactionKindConfigured(params PendingReactionRecoveryParams, kind string) bool {
+	switch kind {
+	case ReactionKindCI:
+		return params.CIProvider != nil && params.SCMAdapter != nil
+	case ReactionKindReview:
+		return params.SCMAdapter != nil && params.ReviewReactionConfigured
+	case ReactionKindBotReview:
+		return params.BotReviewReactionConfigured
+	case ReactionKindAutoMerge:
+		return params.SCMAdapter != nil && params.AutoMergeReactionConfigured
+	case ReactionKindMergeConflict:
+		return params.SCMAdapter != nil && params.MergeConflictReactionConfigured
+	case ReactionKindLabelReview:
+		return params.SCMAdapter != nil && params.LabelReviewReactionConfigured
+	case ReactionKindLabelFix:
+		return params.SCMAdapter != nil && params.LabelFixReactionConfigured
+	case ReactionKindMergeCompletion:
+		return params.SCMAdapter != nil && params.MergeCompletionReactionConfigured
+	default:
+		return false
+	}
+}
+
+// recoveredPendingReaction builds the entry startup rebuilds for a pull
+// request the run's workspace carried. HeadRecordedAt stays zero: a head
+// recorded by a previous process cannot bound this process's attribution
+// query, so the first pass after a restart records a baseline and
+// classifies it unknown rather than resetting a counter against a boundary
+// this process never observed.
+func recoveredPendingReaction(run persistence.RunHistory, kind string, pr pullRequestRef, now time.Time) *PendingReaction {
+	return &PendingReaction{
+		IssueID:    run.IssueID,
+		Identifier: run.Identifier,
+		DisplayID:  run.DisplayID,
+		Attempt:    run.Attempt,
+		Kind:       kind,
+		CreatedAt:  now,
+		KindData:   recoveredKindData(kind, pr),
+
+		AgentKind:       run.AgentAdapter,
+		RuleName:        run.RuleName,
+		StageLineage:    stageLineageOf(run),
+		ConfiguredModel: run.ConfiguredModel,
+		TemplateID:      run.TemplateID,
+
+		IssueIdentity: issueIdentityOfRun(run),
+	}
+}
+
+// recoveredKindData returns the kind data of a rebuilt entry, or nil for a
+// kind that rebuilds none.
+func recoveredKindData(kind string, pr pullRequestRef) any {
+	switch kind {
+	case ReactionKindCI:
+		return &CIReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch, SHA: pr.HeadSHA}
+	case ReactionKindReview:
+		return &ReviewReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch, SHA: pr.HeadSHA}
+	case ReactionKindBotReview:
+		return &BotReviewReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch, SHA: pr.HeadSHA}
+	case ReactionKindAutoMerge:
+		return &AutoMergeReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch, SHA: pr.HeadSHA}
+	case ReactionKindMergeConflict:
+		return &MergeConflictReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch, SHA: pr.HeadSHA}
+	case ReactionKindLabelReview:
+		return &LabelReviewReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo}
+	case ReactionKindLabelFix:
+		return &LabelFixReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo, Branch: pr.Branch}
+	case ReactionKindMergeCompletion:
+		return &MergeCompletionReactionData{PRNumber: pr.Number, Owner: pr.Owner, Repo: pr.Repo}
+	default:
+		return nil
+	}
 }
 
 func freshReactionRecoveryActivity(run persistence.RunHistory, meta domain.SCMMetadata, cutoff time.Time) bool {

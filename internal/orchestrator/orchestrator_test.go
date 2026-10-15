@@ -17,9 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -77,6 +79,8 @@ func (s *stubWorkflowManager) WorkflowAbsPath() string {
 	return s.absPath
 }
 
+func (s *stubWorkflowManager) LoadStatus() workflow.LoadStatus { return workflow.LoadStatus{} }
+
 func (s *stubWorkflowManager) setConfig(cfg config.ServiceConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,6 +98,8 @@ type observerFunc func()
 func (f observerFunc) OnStateChange() { f() }
 
 type stubStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	mu              sync.Mutex
@@ -139,6 +145,14 @@ type stubStore struct {
 	listParkedIssues   []persistence.ParkedIssue
 	listParkedIssueErr error
 
+	latestRuns      map[string]persistence.RunHistory
+	latestRunsErr   error
+	latestRunsCalls [][]string
+
+	dispatchMarked    []string
+	clearedOutcomeIDs []string
+	markDispatchedErr error
+
 	budgetHoldNotices         []persistence.BudgetHoldNotice
 	upsertBudgetHoldNoticeErr error
 	deletedBudgetHoldIDs      []string
@@ -147,6 +161,16 @@ type stubStore struct {
 	deleteAllBudgetHoldErr    error
 	listBudgetHoldNotices     []persistence.BudgetHoldNotice
 	listBudgetHoldNoticesErr  error
+
+	storedAcknowledgements    map[string]persistence.AttentionAcknowledgement
+	savedAcknowledgements     []persistence.AttentionAcknowledgement
+	deletedAcknowledgementIDs []string
+	saveAcknowledgementErr    error
+	deleteAcknowledgementsErr error
+
+	// scopeBudgetToCandidates makes QueryBudgetExhaustedIssues answer only
+	// for the candidate IDs it receives, as persistence.Store does.
+	scopeBudgetToCandidates bool
 
 	// onAppendRunHistory and onUpsertSessionMetadata, when set, run
 	// synchronously after the write so a test can capture single-writer
@@ -203,12 +227,21 @@ func (s *stubStore) SaveRetryEntry(_ context.Context, entry persistence.RetryEnt
 	return nil
 }
 
+func (s *stubStore) DeleteIssueOutcome(_ context.Context, issueID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearedOutcomeIDs = append(s.clearedOutcomeIDs, issueID)
+	return nil
+}
+
 func (s *stubStore) DeleteRetryEntry(_ context.Context, issueID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deletedRetryIDs = append(s.deletedRetryIDs, issueID)
 	return nil
 }
+
+func (s *stubStore) Ping(_ context.Context) error { return nil }
 
 func (s *stubStore) CountRunHistoryByIssue(_ context.Context, _ string) (int, error) {
 	return 0, nil
@@ -225,7 +258,7 @@ func (s *stubStore) TokenUsageByIssue(_ context.Context, _ string) (persistence.
 	}, nil
 }
 
-func (s *stubStore) QueryBudgetExhaustedIssues(_ context.Context, _ []string, _ int) (map[string]int, error) {
+func (s *stubStore) QueryBudgetExhaustedIssues(_ context.Context, candidateIDs []string, _ int) (map[string]int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.budgetExhaustedErr != nil {
@@ -233,6 +266,9 @@ func (s *stubStore) QueryBudgetExhaustedIssues(_ context.Context, _ []string, _ 
 	}
 	result := make(map[string]int, len(s.budgetExhaustedIDs))
 	maps.Copy(result, s.budgetExhaustedIDs)
+	if s.scopeBudgetToCandidates {
+		maps.DeleteFunc(result, func(id string, _ int) bool { return !slices.Contains(candidateIDs, id) })
+	}
 	return result, nil
 }
 
@@ -370,6 +406,39 @@ func (s *stubStore) ListBudgetHoldNotices(_ context.Context) ([]persistence.Budg
 	out := make([]persistence.BudgetHoldNotice, len(s.listBudgetHoldNotices))
 	copy(out, s.listBudgetHoldNotices)
 	return out, nil
+}
+
+func (s *stubStore) SaveAttentionAcknowledgement(_ context.Context, ack persistence.AttentionAcknowledgement) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saveAcknowledgementErr != nil {
+		return s.saveAcknowledgementErr
+	}
+	if s.storedAcknowledgements == nil {
+		s.storedAcknowledgements = make(map[string]persistence.AttentionAcknowledgement)
+	}
+	s.storedAcknowledgements[ack.ItemID] = ack
+	s.savedAcknowledgements = append(s.savedAcknowledgements, ack)
+	return nil
+}
+
+func (s *stubStore) DeleteAttentionAcknowledgements(_ context.Context, itemIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteAcknowledgementsErr != nil {
+		return s.deleteAcknowledgementsErr
+	}
+	for _, id := range itemIDs {
+		delete(s.storedAcknowledgements, id)
+	}
+	s.deletedAcknowledgementIDs = append(s.deletedAcknowledgementIDs, itemIDs...)
+	return nil
+}
+
+func (s *stubStore) ListAttentionAcknowledgements(_ context.Context) ([]persistence.AttentionAcknowledgement, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Collect(maps.Values(s.storedAcknowledgements)), nil
 }
 
 type stubObserver struct {
@@ -893,7 +962,7 @@ func TestMakeWorkerFn_SSHEnvNamesJoinsRegistryAndOperatorLists(t *testing.T) {
 		Issue:      issue,
 	}
 
-	wfn := o.makeWorkerFn("", "user@stand-in-host", kind, "", "", nil, registry.UsageArrivalUndeclared)
+	wfn := o.makeWorkerFn("", "user@stand-in-host", kind, "", "", nil, AttemptSettings{})
 
 	exitDone := make(chan struct{})
 	go func() {
@@ -1618,9 +1687,6 @@ func TestApplyTurnStarted(t *testing.T) {
 	})
 }
 
-// TestOrchestrator_TurnStartedAppliesAheadOfExit pins that a turn-started
-// message queued before a worker's exit reaches that run's entry, never
-// a later run of the same issue.
 func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 	t.Parallel()
 
@@ -1637,6 +1703,7 @@ func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 		o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
 
 		o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 5}
+		o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: issueID, UnaccountedTurns: 2}
 
 		o.handleWorkerExit(context.Background(), WorkerResult{
 			IssueID:      issueID,
@@ -1651,19 +1718,25 @@ func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 		if entry.TurnCount != 5 {
 			t.Errorf("entry.TurnCount = %d, want 5 (applied before HandleWorkerExit removed the entry)", entry.TurnCount)
 		}
+		if entry.UnaccountedTurns != 2 {
+			t.Errorf("entry.UnaccountedTurns = %d, want 2 (applied before HandleWorkerExit removed the entry)", entry.UnaccountedTurns)
+		}
 
 		state.Running[issueID] = queuedOrderingIssueEntry(issueID)
 		o.applyQueuedAheadOfExit(context.Background(), map[string]struct{}{})
 		if got := state.Running[issueID].TurnCount; got != 0 {
 			t.Errorf("a later entry's TurnCount = %d, want 0 (no stray message left queued)", got)
 		}
+		if got := state.Running[issueID].UnaccountedTurns; got != 0 {
+			t.Errorf("a later entry's UnaccountedTurns = %d, want 0 (no stray message left queued)", got)
+		}
 	})
 
 	t.Run("workerExitCh case of drainRunningWorkers", func(t *testing.T) {
 		t.Parallel()
 
-		// The drain's own turnStartedCh case wins the random select about
-		// half the time, so a single trial cannot catch a missing drain.
+		// The drain's own channel cases win the random select about half
+		// the time, so a single trial cannot catch a missing drain.
 		const trials = 64
 
 		for trial := range trials {
@@ -1677,6 +1750,7 @@ func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 			o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
 
 			o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: 9}
+			o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: issueID, UnaccountedTurns: 4}
 			o.workerExitCh <- WorkerResult{
 				IssueID:      issueID,
 				Identifier:   entry.Identifier,
@@ -1699,8 +1773,95 @@ func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 			if entry.TurnCount != 9 {
 				t.Fatalf("trial %d: entry.TurnCount = %d, want 9 (applied before the drain's HandleWorkerExit removed the entry)", trial, entry.TurnCount)
 			}
+			if entry.UnaccountedTurns != 4 {
+				t.Fatalf("trial %d: entry.UnaccountedTurns = %d, want 4 (applied before the drain's HandleWorkerExit removed the entry)", trial, entry.UnaccountedTurns)
+			}
 		}
 	})
+}
+
+func TestOrchestrator_UnaccountedTurnsRelayWritesWithoutWorkerExit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a relayed count reaches the in-flight row inside the throttle interval", func(t *testing.T) {
+		t.Parallel()
+
+		issueID := "ISSUE-RELAY-WRITE"
+		state := NewState(60000, 4, 0, nil, AgentTotals{})
+		entry := queuedOrderingIssueEntry(issueID)
+		entry.LastMetadataWrite = time.Now().UTC()
+		state.Running[issueID] = entry
+		store := &stubStore{}
+		o := budgetOrchestrator(state, budgetTickConfig(0), store, &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}})
+		o.drainTimeout = 100 * time.Millisecond
+		written := make(chan persistence.SessionMetadata, 8)
+		store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) { written <- meta }
+		o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: issueID, UnaccountedTurns: 3}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			o.Run(ctx)
+			close(done)
+		}()
+
+		var got persistence.SessionMetadata
+		select {
+		case got = <-written:
+		case <-time.After(5 * time.Second):
+			t.Error("UpsertSessionMetadata not called within 5 seconds of the relay, want one")
+		}
+		cancel()
+		<-done
+
+		if got.UnaccountedTurns != 3 || got.DispatchID != entry.DispatchID {
+			t.Errorf("SessionMetadata (UnaccountedTurns, DispatchID) = (%d, %q), want (3, %q)", got.UnaccountedTurns, got.DispatchID, entry.DispatchID)
+		}
+	})
+}
+
+func TestOrchestrator_RunNotifiesObserversAfterAgentLaneMessage(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISSUE-LANE-NOTIFY"
+	tests := []struct {
+		name string
+		send func(o *Orchestrator)
+	}{
+		{"token usage event", func(o *Orchestrator) { o.agentEventCh <- agentEventMsg{id, tokenUsageEvent(1, 1, 2, 0)} }},
+		{"turn start", func(o *Orchestrator) { o.turnStartedCh <- turnStartedMsg{IssueID: id, TurnsStarted: 2} }},
+		{"self-review progress", func(o *Orchestrator) { o.selfReviewCh <- selfReviewProgressMsg{IssueID: id, Iteration: 1} }},
+		{"unaccounted turns", func(o *Orchestrator) { o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: id, UnaccountedTurns: 3} }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := NewState(60000, 4, 0, nil, AgentTotals{})
+			state.Running[id] = queuedOrderingIssueEntry(id)
+			o := budgetOrchestrator(state, budgetTickConfig(0), &stubStore{}, &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}})
+			o.drainTimeout = 100 * time.Millisecond
+			notified := make(chan struct{}, 16)
+			o.AddObserver(observerFunc(func() { notified <- struct{}{} }))
+			var running sync.WaitGroup
+			running.Go(func() { o.Run(t.Context()) })
+			t.Cleanup(running.Wait)
+
+			<-notified
+			_, _ = o.SnapshotFunc()()
+			for len(notified) > 0 {
+				<-notified
+			}
+			tt.send(o)
+
+			select {
+			case <-notified:
+			case <-time.After(5 * time.Second):
+				t.Errorf("observer not called within 5 seconds of the %s, want a call with no tick in between", tt.name)
+			}
+		})
+	}
 }
 
 // waitForTurnCount polls snapshots until issueID reports want, failing on
@@ -1792,7 +1953,7 @@ func TestOrchestrator_TurnCountTracksWorkerTally(t *testing.T) {
 
 			// Built before Run, whose first tick writes
 			// o.sshStrictHostKeyChecking concurrently.
-			wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+			wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			runDone := make(chan struct{})
@@ -1874,7 +2035,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1934,7 +2095,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -1988,7 +2149,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			SessionID:  "resume-sess-42",
 		}
 
-		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("resume-sess-42", "", "", "", "", nil, AttemptSettings{})
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -2042,7 +2203,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -2094,7 +2255,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			Issue:      issue,
 		}
 
-		wfn := o.makeWorkerFn("", "", "", "", "", nil, registry.UsageArrivalUndeclared)
+		wfn := o.makeWorkerFn("", "", "", "", "", nil, AttemptSettings{})
 
 		exitDone := make(chan struct{})
 		go func() {
@@ -2165,7 +2326,7 @@ func TestMakeWorkerFn_DerivesPostureFromReactionKind(t *testing.T) {
 			})
 
 			issue := workerTestIssue()
-			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil, registry.UsageArrivalUndeclared)
+			wfn := o.makeWorkerFn("", "", "", "", tt.reactionKind, nil, AttemptSettings{})
 
 			exitDone := make(chan struct{})
 			go func() {
@@ -2427,6 +2588,8 @@ func (c *candidateTrackerAdapter) FetchCandidateIssues(ctx context.Context) ([]d
 	}
 	return nil, nil
 }
+
+func (c *candidateTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
 
 func TestOrchestratorPreflightFailure(t *testing.T) {
 	t.Parallel()
@@ -4451,24 +4614,25 @@ func TestReconciliationGuardOnInvalidReload(t *testing.T) {
 	}
 }
 
-func TestReconciliationGuardEndToEnd(t *testing.T) {
-	t.Parallel()
+func promotionGate(cfg config.ServiceConfig) error {
+	return ValidateConfigForPromotion(cfg, registry.TrackerMeta{})
+}
 
-	tmpDir := t.TempDir()
-	workflowPath := filepath.Join(tmpDir, "WORKFLOW.md")
-
-	initialContent := `---
-tracker:
-  kind: mock
-  api_key: test-key
-  active_states:
+const validStateLists = `  active_states:
     - In Progress
   terminal_states:
     - Done
-polling:
+`
+
+func realWorkflowContent(root, stateLists string) string {
+	return `---
+tracker:
+  kind: mock
+  api_key: test-key
+` + stateLists + `polling:
   interval_ms: 60000
 workspace:
-  root: ` + tmpDir + `
+  root: ` + root + `
 hooks:
   timeout_ms: 5000
 agent:
@@ -4479,15 +4643,32 @@ agent:
 ---
 do {{ .issue.identifier }}
 `
-	if err := os.WriteFile(workflowPath, []byte(initialContent), 0o644); err != nil {
-		t.Fatalf("writing initial WORKFLOW.md: %v", err)
-	}
+}
 
-	wm, err := workflow.NewManager(workflowPath, discardLogger(),
-		workflow.WithValidateFunc(ValidateConfigForPromotion))
+func writeRealWorkflow(t *testing.T, path, stateLists string) {
+	t.Helper()
+	content := realWorkflowContent(filepath.Dir(path), stateLists)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("writing WORKFLOW.md: %v", err)
+	}
+}
+
+func mustRealWorkflowManager(t *testing.T) (*workflow.Manager, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	writeRealWorkflow(t, path, validStateLists)
+	wm, err := workflow.NewManager(path, discardLogger(),
+		workflow.WithValidateFunc(promotionGate))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
+	return wm, path
+}
+
+func TestReconciliationGuardEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	wm, workflowPath := mustRealWorkflowManager(t)
 
 	cfg := wm.Config()
 	if len(cfg.Tracker.ActiveStates) == 0 {
@@ -4537,30 +4718,8 @@ do {{ .issue.identifier }}
 		},
 	})
 
-	// Overwrite WORKFLOW.md with empty state lists (valid YAML, but
-	// semantically dangerous: both active_states and terminal_states
-	// are empty).
-	brokenContent := `---
-tracker:
-  kind: mock
-  api_key: test-key
-polling:
-  interval_ms: 60000
-workspace:
-  root: ` + tmpDir + `
-hooks:
-  timeout_ms: 5000
-agent:
-  kind: mock
-  command: /usr/bin/agent
-  max_concurrent_agents: 5
-  max_turns: 1
----
-do {{ .issue.identifier }}
-`
-	if err := os.WriteFile(workflowPath, []byte(brokenContent), 0o644); err != nil {
-		t.Fatalf("writing broken WORKFLOW.md: %v", err)
-	}
+	// Valid YAML, but both state lists are empty, which promotion must refuse.
+	writeRealWorkflow(t, workflowPath, "")
 
 	o.handleTick(context.Background())
 
@@ -4585,10 +4744,88 @@ do {{ .issue.identifier }}
 	}
 }
 
-// TestReloadPromotesConfigWithMissingBlockFault pins the fail-safe
-// invariant: a dispatch-routed kind with no settings block still
-// promotes through Reload without error and surfaces the
-// dispatch.agent.missing_block fault only at tick preflight.
+func TestHealthReportsInvalidReloadAndFailedPreflight(t *testing.T) {
+	t.Parallel()
+
+	wm, workflowPath := mustRealWorkflowManager(t)
+	regs := passingPreflightRegistries()
+	o := NewOrchestrator(OrchestratorParams{
+		State:           NewState(60000, 5, 0, nil, AgentTotals{}),
+		Logger:          discardLogger(),
+		TrackerAdapter:  &mockTrackerAdapter{},
+		AgentAdapter:    &mockAgentAdapter{},
+		WorkflowManager: wm,
+		Store:           &stubStore{},
+		PreflightParams: PreflightParams{
+			ReloadWorkflow:  wm.Reload,
+			ConfigFunc:      wm.Config,
+			TrackerRegistry: regs.TrackerRegistry,
+			AgentRegistry:   regs.AgentRegistry,
+		},
+	})
+
+	validFrom, validTo := tickWithin(o)
+
+	clean := o.Health()
+	for name, check := range map[string]SnapshotHealthCheck{
+		"Database":  clean.Database,
+		"Preflight": clean.Preflight.SnapshotHealthCheck,
+		"Workflow":  clean.Workflow.SnapshotHealthCheck,
+		"Poll":      clean.Poll.SnapshotHealthCheck,
+	} {
+		if check.ConsecutiveFailures != 0 || check.Error != "" || check.CheckedAt.IsZero() {
+			t.Errorf("Health().%s after a clean tick = %+v, want a passing check with CheckedAt set", name, check)
+		}
+	}
+	if clean.Poll.Outcome != "succeeded" {
+		t.Errorf("Health().Poll.Outcome after a clean tick = %q, want %q", clean.Poll.Outcome, "succeeded")
+	}
+	if clean.SCM != nil {
+		t.Errorf("Health().SCM = %+v, want nil without a provider", clean.SCM)
+	}
+
+	writeRealWorkflow(t, workflowPath, "")
+	failFrom, failTo := tickWithin(o)
+	tickWithin(o)
+
+	failed := o.Health()
+	if failed.Workflow.ConsecutiveFailures != 2 {
+		t.Errorf("Health().Workflow.ConsecutiveFailures = %d, want 2", failed.Workflow.ConsecutiveFailures)
+	}
+	requireWithin(t, "Health().Workflow.LastSuccessAt", failed.Workflow.LastSuccessAt, validFrom, validTo)
+	requireWithin(t, "Health().Workflow.FailingSince", failed.Workflow.FailingSince, failFrom, failTo)
+	loadErr := wm.LastLoadError()
+	if loadErr == nil || failed.Workflow.Error != loadErr.Error() {
+		t.Errorf("Health().Workflow.Error = %q, want LastLoadError() text %v", failed.Workflow.Error, loadErr)
+	}
+	if failed.Preflight.ConsecutiveFailures != 2 || !strings.Contains(failed.Preflight.Error, "workflow file cannot be loaded") {
+		t.Errorf("Health().Preflight = %+v, want 2 failures carrying the workflow load failure", failed.Preflight)
+	}
+	if failed.Poll.Outcome != "preflight_failed" || failed.Poll.Error != "" {
+		t.Errorf("Health().Poll = %q with error %q, want outcome %q and no error", failed.Poll.Outcome, failed.Poll.Error, "preflight_failed")
+	}
+
+	if err := os.WriteFile(workflowPath, []byte("---\ntracker: [\n---\n"), 0o644); err != nil {
+		t.Fatalf("writing malformed WORKFLOW.md: %v", err)
+	}
+	tickWithin(o)
+	malformed := o.Health()
+	if !strings.Contains(wm.LastLoadError().Error(), workflowPath) {
+		t.Fatalf("LastLoadError() = %v, want the malformed file's error naming its path", wm.LastLoadError())
+	}
+	dir := filepath.Dir(workflowPath)
+	for name, text := range map[string]string{"Workflow": malformed.Workflow.Error, "Preflight": malformed.Preflight.Error} {
+		if !strings.Contains(text, "WORKFLOW.md") || strings.Contains(text, dir) {
+			t.Errorf("Health().%s.Error = %q, want the base name without directory %s", name, text, dir)
+		}
+	}
+
+	cfg := wm.Config()
+	if !slices.Equal(cfg.Tracker.ActiveStates, []string{"In Progress"}) || !slices.Equal(cfg.Tracker.TerminalStates, []string{"Done"}) {
+		t.Errorf("Config() state lists = %v and %v, want the valid file's [In Progress] and [Done]", cfg.Tracker.ActiveStates, cfg.Tracker.TerminalStates)
+	}
+}
+
 func TestReloadPromotesConfigWithMissingBlockFault(t *testing.T) {
 	t.Parallel()
 
@@ -4618,7 +4855,7 @@ do {{ .issue.identifier }}
 	}
 
 	wm, err := workflow.NewManager(workflowPath, discardLogger(),
-		workflow.WithValidateFunc(ValidateConfigForPromotion))
+		workflow.WithValidateFunc(promotionGate))
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -5279,6 +5516,7 @@ func budgetOrchestrator(state *State, wm *stubWorkflowManager, store *stubStore,
 		State:           state,
 		Logger:          discardLogger(),
 		TrackerAdapter:  tracker,
+		Router:          route.NewRouter(tracker, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5294,6 +5532,7 @@ func budgetOrchestratorWithLogger(state *State, wm *stubWorkflowManager, store *
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
+		Router:          route.NewRouter(tracker, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5309,6 +5548,7 @@ func budgetOrchestratorWithMetrics(state *State, wm *stubWorkflowManager, store 
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
+		Router:          route.NewRouter(tracker, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5317,12 +5557,55 @@ func budgetOrchestratorWithMetrics(state *State, wm *stubWorkflowManager, store 
 	})
 }
 
+func TestHandleTick_FillsRetryHoldingNoRead(t *testing.T) {
+	t.Parallel()
+
+	candidates := []domain.Issue{
+		{ID: "iss-1", Identifier: "TEST-1", DisplayID: "acme/web#1", Title: "first title", URL: "https://example.test/1", IssueType: "Bug", Labels: []string{"a", "b"}, State: "To Do"},
+		{ID: "iss-2", Identifier: "TEST-2", DisplayID: "acme/web#2", Title: "candidate title", URL: "https://example.test/2", IssueType: "Story", Labels: []string{"c"}, State: "In Progress"},
+		{ID: "iss-4", Identifier: "TEST-4", Title: "fresh title", URL: "https://example.test/4", IssueType: "Task", Labels: []string{"new"}, State: "Done"},
+	}
+	partial := IssueIdentity{Title: "held title", URL: "https://example.test/held"}
+	complete := IssueIdentity{Title: "read title", URL: "https://example.test/read", IssueType: "Epic", Labels: []string{}, State: "Blocked"}
+	state := NewState(60000, 10, 0, nil, AgentTotals{})
+	for id, entry := range map[string]*RetryEntry{
+		"iss-1": {IssueID: "iss-1", Identifier: "TEST-1"},
+		"iss-2": {IssueID: "iss-2", Identifier: "TEST-2", DisplayID: "acme/web#held", IssueIdentity: partial},
+		"iss-3": {IssueID: "iss-3", Identifier: "TEST-3"},
+		"iss-4": {IssueID: "iss-4", Identifier: "TEST-4", IssueIdentity: complete},
+	} {
+		state.RetryAttempts[id] = entry
+		state.Claimed[id] = struct{}{}
+	}
+	tracker := &candidateTrackerAdapter{
+		mockTrackerAdapter: &mockTrackerAdapter{},
+		fetchCandidatesFn:  func(_ context.Context) ([]domain.Issue, error) { return candidates, nil },
+	}
+
+	budgetOrchestrator(state, budgetTickConfig(0), &stubStore{}, tracker).handleTick(context.Background())
+
+	type row struct{ displayID, title, url, issueType, labels, state string }
+	got := map[string]row{}
+	for _, r := range RuntimeSnapshot(state, time.Now()).Retrying {
+		got[r.IssueID] = row{r.DisplayID, r.IssueTitle, r.IssueURL, r.IssueType, strings.Join(r.IssueLabels, ","), r.State}
+	}
+	want := map[string]row{
+		"iss-1": {"acme/web#1", "first title", "https://example.test/1", "Bug", "a,b", "To Do"},
+		"iss-2": {"acme/web#held", "held title", "https://example.test/held", "Story", "c", "In Progress"},
+		"iss-3": {},
+		"iss-4": {"", "read title", "https://example.test/read", "Epic", "", "Blocked"},
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("Retrying rows after handleTick = %+v, want %+v", got, want)
+	}
+}
+
 func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 	t.Parallel()
 
 	issue := domain.Issue{ID: "iss-1", Identifier: "TEST-1", Title: "title", State: "To Do"}
 
-	t.Run("store returns exhausted IDs state populated", func(t *testing.T) {
+	t.Run("store returns exhausted IDs state populated and the issue is not dispatched", func(t *testing.T) {
 		t.Parallel()
 
 		wm := budgetTickConfig(3)
@@ -5338,21 +5621,6 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		if _, ok := state.BudgetExhausted[issue.ID]; !ok {
 			t.Errorf("BudgetExhausted[%s] missing after tick, want present", issue.ID)
 		}
-	})
-
-	t.Run("exhausted issue not dispatched", func(t *testing.T) {
-		t.Parallel()
-
-		wm := budgetTickConfig(3)
-		store := &stubStore{budgetExhaustedIDs: map[string]int{issue.ID: 1}}
-		state := NewState(60000, 10, 0, nil, AgentTotals{})
-		tracker := &candidateTrackerAdapter{
-			mockTrackerAdapter: &mockTrackerAdapter{},
-			fetchCandidatesFn:  func(_ context.Context) ([]domain.Issue, error) { return []domain.Issue{issue}, nil },
-		}
-
-		budgetOrchestrator(state, wm, store, tracker).handleTick(context.Background())
-
 		if _, running := state.Running[issue.ID]; running {
 			t.Errorf("Running[%s] present, want absent (budget exhausted)", issue.ID)
 		}
@@ -5417,6 +5685,97 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		// run_history on the next tick that has candidates.
 		if _, ok := state.BudgetExhausted[issue.ID]; ok {
 			t.Errorf("BudgetExhausted[%s] retained on empty candidate list, want cleared", issue.ID)
+		}
+	})
+
+	t.Run("dispatch context of a hold", func(t *testing.T) {
+		t.Parallel()
+
+		type holdContext struct {
+			rule, kind, model string
+			lineage           StageLineage
+		}
+		passAt := time.Date(2026, 3, 19, 9, 0, 0, 0, time.UTC)
+		fromRun := holdContext{"plan", "kind-b", "model-run", StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-run", DispatchedAt: passAt}}
+		fromHop := holdContext{"plan", "kind-b", "model-plan", StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-hop", DispatchedAt: passAt}}
+		held := holdContext{"implement", "kind-c", "model-held", StageLineage{ChainID: "chain-held", DispatchedAt: passAt.Add(-time.Hour)}}
+		latest := map[string]persistence.RunHistory{issue.ID: {
+			RuleName: "plan", AgentAdapter: "kind-b", ConfiguredModel: "model-run", StagePrevious: "specify", StagePreviousOutcome: "succeeded",
+			ChainID: "chain-run", DispatchedAt: "2026-03-19T09:00:00Z",
+		}}
+		waiting := persistence.StageHop{
+			IssueID: issue.ID, Identifier: issue.Identifier, HopCount: 1, SourceRule: "specify", TargetRule: "plan", TargetLabel: "Stage-Plan",
+			PreviousOutcome: "succeeded", ChainID: "chain-hop", HoppedAt: "2026-03-19T10:00:00Z", DispatchedAt: "2026-03-19T09:00:00Z",
+		}
+		dispatched := waiting
+		dispatched.RunDispatched = true
+		cfg := runConfig(t, map[string]any{
+			"agent":  map[string]any{"kind": "kind-a", "command": "a-cmd"},
+			"kind-b": map[string]any{},
+			"kind-c": map[string]any{},
+			"dispatch": map[string]any{"rules": []any{
+				map[string]any{"name": "plan", "stage": "Stage-Plan", "agent": "kind-b", "kind-b": map[string]any{"model": "model-plan"}},
+				map[string]any{"name": "implement", "stage": "stage-implement", "agent": "kind-c"},
+			}},
+		})
+		cfg.Agent.MaxSessions = 3
+		labeled := issue
+		labeled.Labels = []string{"Stage-Plan"}
+
+		tests := []struct {
+			name      string
+			prior     *BudgetExhaustedEntry
+			hop       *persistence.StageHop
+			runsErr   error
+			ticks     int
+			want      holdContext
+			wantReads int
+		}{
+			{name: "no prior record reads the latest agent run", ticks: 1, want: fromRun, wantReads: 1},
+			{name: "a waiting hop describes its target with no run history read", hop: &waiting, ticks: 1, want: fromHop},
+			{name: "a hop already followed by a run reads the latest agent run", hop: &dispatched, ticks: 1, want: fromRun, wantReads: 1},
+			{
+				name:  "a record the retry lane described keeps its context with no read",
+				prior: &BudgetExhaustedEntry{RuleName: held.rule, AgentKind: held.kind, ConfiguredModel: held.model, StageLineage: held.lineage},
+				ticks: 2, want: held,
+			},
+			{name: "a failed read leaves no context and the next tick reads again", runsErr: errors.New("db error"), ticks: 2, wantReads: 2},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				store := &stubStore{budgetExhaustedIDs: map[string]int{issue.ID: 1}, latestRuns: latest, latestRunsErr: tt.runsErr}
+				state := NewState(60000, 10, 0, nil, AgentTotals{})
+				if tt.prior != nil {
+					state.BudgetExhausted[issue.ID] = tt.prior
+				}
+				if tt.hop != nil {
+					PopulateStageHops(state, []persistence.StageHop{*tt.hop}, nil)
+				}
+				tracker := &candidateTrackerAdapter{
+					mockTrackerAdapter: &mockTrackerAdapter{},
+					fetchCandidatesFn:  func(context.Context) ([]domain.Issue, error) { return []domain.Issue{labeled}, nil },
+				}
+				orch := budgetOrchestrator(state, &stubWorkflowManager{config: cfg}, store, tracker)
+
+				for range tt.ticks {
+					orch.handleTick(context.Background())
+				}
+
+				entry := state.BudgetExhausted[issue.ID]
+				if entry == nil {
+					t.Fatalf("BudgetExhausted[%s] missing after %d ticks", issue.ID, tt.ticks)
+				}
+				got := holdContext{entry.RuleName, entry.AgentKind, entry.ConfiguredModel, entry.StageLineage}
+				if got != tt.want {
+					t.Errorf("BudgetExhausted[%s] rule, kind, model, lineage = %+v, want %+v", issue.ID, got, tt.want)
+				}
+				if reads := len(store.latestRunsCalls); reads != tt.wantReads {
+					t.Errorf("LatestAgentRuns calls = %d over %d ticks, want %d", reads, tt.ticks, tt.wantReads)
+				}
+			})
 		}
 	})
 }
@@ -5807,6 +6166,7 @@ func TestHandleTick_TokenWarningThreshold(t *testing.T) {
 
 		wm := budgetTickConfigTokens(0, 1000)
 		wm.config.Agent.TokenWarningPercent = 80
+		wm.config.CIFeedback.MaxRetries = 4
 		store := &stubStore{}
 		state := NewState(60000, 10, 0, nil, AgentTotals{})
 		tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
@@ -5818,6 +6178,12 @@ func TestHandleTick_TokenWarningThreshold(t *testing.T) {
 		}
 		if state.TokenWarningThreshold != 800 {
 			t.Errorf("state.TokenWarningThreshold = %d, want 800 (cfg.Agent.TokenWarningThreshold())", state.TokenWarningThreshold)
+		}
+		if got, ok := state.ReactionMaxAttempts[ReactionKindCI]; !ok || got != 4 {
+			t.Errorf("state.ReactionMaxAttempts[%q] = %d, %v, want 4, true (loaded max_retries)", ReactionKindCI, got, ok)
+		}
+		if got, ok := state.ReactionMaxAttempts[ReactionKindAutoMerge]; ok {
+			t.Errorf("state.ReactionMaxAttempts[%q] = %d, want absent at max_retries 0", ReactionKindAutoMerge, got)
 		}
 	})
 
@@ -6335,6 +6701,7 @@ func incrementalWriteOrchestrator(t *testing.T, store *stubStore) (*Orchestrator
 		CacheWriteTokens:  3,
 		ModelName:         "test-model",
 		APIRequestCount:   2,
+		UnaccountedTurns:  2,
 	}
 	state.Running["id-1"] = entry
 	tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
@@ -6372,6 +6739,9 @@ func TestMaybeWriteIncrementalMetadata(t *testing.T) {
 		}
 		if meta.ModelName != "test-model" {
 			t.Errorf("SessionMetadata.ModelName = %q, want %q", meta.ModelName, "test-model")
+		}
+		if meta.UnaccountedTurns != 2 {
+			t.Errorf("SessionMetadata.UnaccountedTurns = %d, want 2", meta.UnaccountedTurns)
 		}
 		if entry.LastMetadataWrite.IsZero() {
 			t.Error("RunningEntry.LastMetadataWrite still zero after successful write")
@@ -7184,6 +7554,7 @@ func drainTestOrchestrator(state *State, wm *stubWorkflowManager, store *stubSto
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
+		Router:          route.NewRouter(tracker, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -7895,6 +8266,8 @@ func (s *sweepThrottleTracker) FetchCandidateIssues(_ context.Context) ([]domain
 	return nil, nil
 }
 
+func (s *sweepThrottleTracker) SetTrackerStates(func() domain.TrackerStates) {}
+
 func (s *sweepThrottleTracker) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -7914,8 +8287,13 @@ func (s *sweepThrottleTracker) FetchIssueComments(_ context.Context, _ string) (
 func (s *sweepThrottleTracker) TransitionIssue(_ context.Context, _, _ string) error { return nil }
 
 func (s *sweepThrottleTracker) CommentIssue(_ context.Context, _, _ string) error { return nil }
+func (s *sweepThrottleTracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
 
 func (s *sweepThrottleTracker) AddLabel(_ context.Context, _, _ string) error { return nil }
+
+func (s *sweepThrottleTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 func TestHandleTickSweepThrottle(t *testing.T) {
 	t.Parallel()
@@ -8609,6 +8987,193 @@ func TestHandleTick_DispatchUsesResolvedIssue(t *testing.T) {
 	}
 }
 
+func TestHandleTick_WarnsOnceWhenAnIssueCarriesSeveralStageLabels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		labels          []string
+		wantKind        string
+		wantStageLabels []any
+	}{
+		{name: "two stage labels", labels: []string{"stage-implement", "stage-plan"}, wantKind: "kind-b", wantStageLabels: []any{"Stage-Plan", "stage-implement"}},
+		{name: "two stage labels beside others", labels: []string{"bug", "stage-plan", "stage-implement"}, wantKind: "kind-b", wantStageLabels: []any{"Stage-Plan", "stage-implement"}},
+		{name: "one stage label", labels: []string{"bug", "stage-implement"}, wantKind: "kind-c"},
+		{name: "no stage label", labels: []string{"bug"}, wantKind: "kind-a"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newRunHarness(t, runConfig(t, stagedRulesRaw()), "kind-a", "kind-b", "kind-c")
+			h.tracker.candidates = []domain.Issue{candidate("id-1", "S-1", tt.labels...)}
+			h.build()
+
+			h.o.handleTick(context.Background())
+			h.o.state.WorkerWg.Wait()
+
+			kind, _ := sessionOfWorkspace(t, h.started(), "S-1")
+			if kind != tt.wantKind {
+				t.Errorf("handleTick(labels %v) dispatched on adapter %q, want %q", tt.labels, kind, tt.wantKind)
+			}
+			warnings := logRecords(t, h.logs, severalStageLabelsMessage)
+			if tt.wantStageLabels == nil {
+				if len(warnings) != 0 {
+					t.Fatalf("handleTick(labels %v) logged %v, want no %q record", tt.labels, warnings, severalStageLabelsMessage)
+				}
+				return
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("handleTick(labels %v) logged %d %q records, want 1: %v", tt.labels, len(warnings), severalStageLabelsMessage, warnings)
+			}
+			record := warnings[0]
+			if labels, _ := record["stage_labels"].([]any); record["level"] != "WARN" || !slices.Equal(labels, tt.wantStageLabels) || record["rule_name"] != "plan" || record["issue_identifier"] != "S-1" {
+				t.Errorf("handleTick(labels %v) record = %v, want a WARN for S-1 with stage_labels %v and rule_name %q", tt.labels, record, tt.wantStageLabels, "plan")
+			}
+		})
+	}
+}
+
+func TestHandleTick_StageLineageChain(t *testing.T) {
+	t.Parallel()
+
+	const fresh = "<fresh>"
+	passAt := time.Date(2026, 3, 19, 9, 0, 0, 500_000_000, time.UTC)
+	hopReachedPlan := persistence.StageHop{
+		IssueID: "id-1", Identifier: "S-1", HopCount: 1, SourceRule: "specify", TargetRule: "plan", TargetLabel: "Stage-Plan",
+		PreviousOutcome: "succeeded", SourceDispatchID: "d0", HoppedAt: "2026-03-19T10:00:00Z", ChainID: "chain-hop",
+		DispatchedAt: "2026-03-19T09:00:00.5Z",
+	}
+	followedByRun := hopReachedPlan
+	followedByRun.RunDispatched = true
+	reachedPlan := StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-hop", DispatchedAt: passAt}
+	tests := []struct {
+		name       string
+		hops       []persistence.StageHop
+		want       map[string]StageLineage
+		wantBefore int
+		wantMarked []string
+		wantFirst  string
+	}{
+		{name: "dispatches no hop reached each start a chain", want: map[string]StageLineage{"id-1": {ChainID: fresh}, "id-2": {ChainID: fresh}}},
+		{
+			name: "a restored hop record hands its chain and pass time to the dispatch it reached and to no other",
+			hops: []persistence.StageHop{hopReachedPlan}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
+			wantBefore: 1, wantMarked: []string{"id-1"}, wantFirst: "id-1",
+		},
+		{
+			name: "a restored hop record already followed by a run is neither listed nor marked again",
+			hops: []persistence.StageHop{followedByRun}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newRunHarness(t, runConfig(t, stagedRulesRaw()), "kind-a", "kind-b", "kind-c")
+			PopulateStageHops(h.state, tt.hops, nil)
+			h.tracker.candidates = []domain.Issue{candidate("id-1", "S-1", "Stage-Plan"), candidate("id-2", "S-2", "Stage-Plan")}
+			h.build()
+			if before := len(RuntimeSnapshot(h.state, time.Now()).BetweenStages); before != tt.wantBefore {
+				t.Fatalf("len(BetweenStages) before the tick = %d, want %d", before, tt.wantBefore)
+			}
+
+			h.o.handleTick(context.Background())
+			h.o.state.WorkerWg.Wait()
+
+			seen := map[string]bool{}
+			for id, want := range tt.want {
+				entry := h.o.state.Running[id]
+				if entry == nil {
+					t.Fatalf("Running[%q] missing after handleTick", id)
+				}
+				if entry.StartedAt.IsZero() {
+					t.Fatalf("Running[%q].StartedAt is zero after handleTick", id)
+				}
+				if want.DispatchedAt.IsZero() {
+					want.DispatchedAt = entry.StartedAt
+				}
+				got := entry.StageLineage
+				if want.ChainID == fresh {
+					if got.ChainID == entry.DispatchID || seen[got.ChainID] {
+						t.Errorf("Running[%q] chain = %q, want a value that is neither the dispatch ID %q nor another entry's chain", id, got.ChainID, entry.DispatchID)
+					}
+					seen[got.ChainID] = true
+					if got.ChainID != "" {
+						got.ChainID = fresh
+					}
+				}
+				if got != want {
+					t.Errorf("Running[%q].StageLineage = %+v, want %+v", id, got, want)
+				}
+				if wantFirst := id == tt.wantFirst; entry.FirstAfterHop != wantFirst {
+					t.Errorf("Running[%q].FirstAfterHop = %t, want %t", id, entry.FirstAfterHop, wantFirst)
+				}
+			}
+			if after := RuntimeSnapshot(h.state, time.Now()).BetweenStages; len(after) != 0 {
+				t.Errorf("BetweenStages after the dispatch = %+v, want none", after)
+			}
+			for _, hop := range tt.hops {
+				if !h.state.StageHops[hop.IssueID].RunDispatched {
+					t.Errorf("StageHops[%q].RunDispatched = false after the dispatch, want true", hop.IssueID)
+				}
+			}
+			if !slices.Equal(h.store.dispatchMarked, tt.wantMarked) {
+				t.Errorf("MarkStageHopDispatched calls = %q, want %q", h.store.dispatchMarked, tt.wantMarked)
+			}
+		})
+	}
+}
+
+func TestHandleTick_StageHopDirectReadWithoutStateHoldsTheIssue(t *testing.T) {
+	t.Parallel()
+
+	h := newRunHarness(t, runConfig(t, stagedRulesRaw()), "kind-a", "kind-b", "kind-c")
+	h.state.StageHops["id-1"] = &StageHopEntry{Identifier: "S-1", Count: 1, SourceRule: "specify", TargetRule: "plan", TargetLabel: "Stage-Plan"}
+	h.tracker.candidates = []domain.Issue{candidate("id-1", "S-1")}
+	h.tracker.issues["id-1"] = domain.Issue{ID: "id-1", Identifier: "S-1", Title: "S-1"}
+	h.build()
+
+	h.o.handleTick(context.Background())
+	h.o.state.WorkerWg.Wait()
+
+	if _, running := h.o.state.Running["id-1"]; running {
+		t.Error("handleTick() dispatched an issue whose direct read showed no state, want held")
+	}
+	if hop := h.o.state.StageHops["id-1"]; hop == nil || hop.TargetObserved {
+		t.Errorf("handleTick() hop record = %+v, want kept and unobserved", hop)
+	}
+}
+
+func TestHandleTick_ParkReleasedByLabelRemovalEndsStandingEscalation(t *testing.T) {
+	t.Parallel()
+
+	h := newRunHarness(t, runConfig(t, stagedRulesRaw()), "kind-a", "kind-b", "kind-c")
+	rkey := ReactionKey("id-1", ReactionKindReview)
+	h.state.Parked["id-1"] = &ParkedEntry{Identifier: "S-1", Reason: parkReasonAgentBlocked, ParkedState: "To Do", Label: "needs-human", LabelApplied: true}
+	h.state.PendingReactions[rkey] = &PendingReaction{
+		IssueID: "id-1", Identifier: "S-1", Kind: ReactionKindReview,
+		EscalatedAt: time.Now().Add(-time.Hour), EscalationTrigger: EscalationTriggerBudget, EscalationSubject: "comment-set",
+	}
+	h.state.ReactionAttempts[rkey] = 3
+	h.tracker.candidates = []domain.Issue{candidate("id-1", "S-1")}
+	h.tracker.issues["id-1"] = candidate("id-1", "S-1")
+	h.build()
+
+	h.o.handleTick(context.Background())
+	h.o.state.WorkerWg.Wait()
+
+	sessionOfWorkspace(t, h.started(), "S-1")
+	if _, ok := h.state.PendingReactions[rkey]; ok {
+		t.Error("PendingReactions[review] after the park released and dispatched = present, want dropped")
+	}
+	if got, ok := h.state.ReactionAttempts[rkey]; ok {
+		t.Errorf("ReactionAttempts[review] after the park released and dispatched = %d, want none", got)
+	}
+}
+
 func TestHandleTick_CandidateHoldReasons(t *testing.T) {
 	t.Parallel()
 
@@ -8958,6 +9523,7 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 		State:           state1,
 		Logger:          discardLogger(),
 		TrackerAdapter:  tracker1,
+		Router:          route.NewRouter(tracker1, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store1,
@@ -9010,6 +9576,7 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 		State:           state2,
 		Logger:          logger,
 		TrackerAdapter:  tracker2,
+		Router:          route.NewRouter(tracker2, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store2,
@@ -9414,34 +9981,6 @@ func TestHandleTick_BudgetHoldNoticeParkedIssue(t *testing.T) {
 	}
 }
 
-func TestPostBudgetHoldNotice_NilTrackerAdapterWritesNoRow(t *testing.T) {
-	t.Parallel()
-
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	store := &stubStore{}
-	entry := &BudgetExhaustedEntry{
-		Reason: budgetReasonSession, UsedSessions: 4, BudgetSessions: 3, ExhaustedAt: time.Now().UTC(),
-	}
-
-	postBudgetHoldNotice(state, budgetHoldNoticeParams{
-		IssueID:        "ISS-NIL",
-		Entry:          entry,
-		Store:          store,
-		TrackerAdapter: nil,
-		Metrics:        &spyMetrics{},
-		Logger:         discardLogger(),
-		Ctx:            context.Background(),
-	})
-	state.TrackerOpsWg.Wait()
-
-	if len(store.budgetHoldNotices) != 0 {
-		t.Errorf("store.budgetHoldNotices = %+v, want none (a nil tracker adapter writes no row)", store.budgetHoldNotices)
-	}
-	if _, ok := state.BudgetHoldNoticed["ISS-NIL"]; ok {
-		t.Error("BudgetHoldNoticed[ISS-NIL] present, want absent (a nil tracker adapter writes no row)")
-	}
-}
-
 func TestPostBudgetHoldNotice_UpsertFails(t *testing.T) {
 	t.Parallel()
 
@@ -9455,13 +9994,12 @@ func TestPostBudgetHoldNotice_UpsertFails(t *testing.T) {
 	}
 
 	postBudgetHoldNotice(state, budgetHoldNoticeParams{
-		IssueID:        "ISS-UPSERT-FAIL",
-		Entry:          entry,
-		Store:          store,
-		TrackerAdapter: tracker,
-		Metrics:        &spyMetrics{},
-		Logger:         logger,
-		Ctx:            context.Background(),
+		IssueID: "ISS-UPSERT-FAIL",
+		Entry:   entry,
+		Store:   store,
+		Metrics: &spyMetrics{},
+		Logger:  logger,
+		Ctx:     context.Background(),
 	})
 	state.TrackerOpsWg.Wait()
 
@@ -9623,4 +10161,1071 @@ func TestReconcilePasses_DoNotBlockOnInFlightTriage(t *testing.T) {
 			t.Errorf("GetMergeability calls = %d, want 0 while a triage run is in flight", scm.calls)
 		}
 	})
+}
+
+type sessionRecorder struct {
+	adapter *startParamsRecorder
+}
+
+func newSessionRecorder(kind string) *sessionRecorder {
+	return &sessionRecorder{adapter: &startParamsRecorder{mockAgentAdapter: mockAgentAdapter{
+		startSessionFn: func(context.Context, domain.StartSessionParams) (domain.Session, error) {
+			return domain.Session{ID: "sess-" + kind}, nil
+		},
+	}}}
+}
+
+func (r *sessionRecorder) started() []domain.StartSessionParams {
+	return slices.DeleteFunc(r.adapter.recorded(), func(p domain.StartSessionParams) bool { return p.CredentialVerification })
+}
+
+func (r *sessionRecorder) verified() []domain.StartSessionParams {
+	return slices.DeleteFunc(r.adapter.recorded(), func(p domain.StartSessionParams) bool { return !p.CredentialVerification })
+}
+
+type runTracker struct {
+	*mockTrackerAdapter
+	mu               sync.Mutex
+	candidates       []domain.Issue
+	issues           map[string]domain.Issue
+	candidateFetches atomic.Int64
+}
+
+func (r *runTracker) FetchCandidateIssues(context.Context) ([]domain.Issue, error) {
+	r.candidateFetches.Add(1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.candidates), nil
+}
+
+func (r *runTracker) SetTrackerStates(func() domain.TrackerStates) {}
+
+func (r *runTracker) FetchIssueByID(_ context.Context, id string) (domain.Issue, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	issue, ok := r.issues[id]
+	if !ok {
+		return domain.Issue{}, &domain.TrackerError{Kind: domain.ErrTrackerNotFound, Message: "no such issue"}
+	}
+	return issue, nil
+}
+
+type runHarness struct {
+	t         *testing.T
+	wm        *stubWorkflowManager
+	state     *State
+	tracker   *runTracker
+	logs      *lockedBuf
+	recorders map[string]*sessionRecorder
+	store     *stubStore
+	metrics   domain.Metrics
+	meta      map[string]registry.AgentMeta
+
+	mu          sync.Mutex
+	unavailable map[string]bool
+
+	o      *Orchestrator
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func runConfig(t *testing.T, raw map[string]any) config.ServiceConfig {
+	t.Helper()
+	cfg := convertedConfig(t, raw)
+	cfg.Tracker.Kind = "mock"
+	cfg.Tracker.APIKey = "test-key"
+	cfg.Tracker.ActiveStates = []string{"To Do"}
+	cfg.Tracker.TerminalStates = []string{"Done"}
+	cfg.Tracker.HandoffState = "In Review"
+	cfg.Workspace.Root = t.TempDir()
+	cfg.Polling.IntervalMS = 60000
+	cfg.Agent.MaxTurns = 1
+	cfg.Agent.MaxRetryBackoffMS = 50
+	return cfg
+}
+
+func newRunHarness(t *testing.T, cfg config.ServiceConfig, kinds ...string) *runHarness {
+	t.Helper()
+	tmpl := mustParseTemplate(t, "work on {{ .issue.identifier }}")
+	h := &runHarness{
+		t:           t,
+		wm:          &stubWorkflowManager{config: cfg, template: tmpl, templateIndex: map[string]*prompt.Template{"/prompts/held.md": tmpl}},
+		state:       NewState(cfg.Polling.IntervalMS, cfg.Agent.MaxConcurrentAgents, 0, nil, AgentTotals{}),
+		tracker:     &runTracker{mockTrackerAdapter: &mockTrackerAdapter{}, issues: map[string]domain.Issue{}},
+		logs:        &lockedBuf{},
+		recorders:   map[string]*sessionRecorder{},
+		store:       &stubStore{},
+		unavailable: map[string]bool{},
+	}
+	for _, kind := range kinds {
+		h.recorders[kind] = newSessionRecorder(kind)
+	}
+	t.Cleanup(h.stop)
+	return h
+}
+
+func (h *runHarness) setAvailable(kind string, available bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.unavailable[kind] = !available
+}
+
+func (h *runHarness) build() {
+	h.t.Helper()
+	if h.o != nil {
+		return
+	}
+	regs := passingPreflightRegistries()
+	regs.AgentRegistry = &stubAgentRegistry{
+		getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
+		metaFunc: func(kind string) (registry.AgentMeta, bool) {
+			meta, ok := h.meta[kind]
+			return meta, ok
+		},
+	}
+	cfg := h.wm.Config()
+	h.o = NewOrchestrator(OrchestratorParams{
+		State:          h.state,
+		Logger:         slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		TrackerAdapter: h.tracker,
+		AgentAdapter:   h.recorders[cfg.Agent.Kind].adapter,
+		AgentAdapterByKind: func(kind string) (domain.AgentAdapter, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			recorder, ok := h.recorders[kind]
+			if !ok || h.unavailable[kind] {
+				return nil, fmt.Errorf("agent kind %q has no constructed adapter", kind)
+			}
+			return recorder.adapter, nil
+		},
+		WorkflowManager: h.wm,
+		Store:           h.store,
+		Metrics:         h.metrics,
+		PreflightParams: PreflightParams{
+			ReloadWorkflow:  func() error { return nil },
+			ConfigFunc:      h.wm.Config,
+			TrackerRegistry: regs.TrackerRegistry,
+			AgentRegistry:   regs.AgentRegistry,
+		},
+	})
+}
+
+func (h *runHarness) run() {
+	h.t.Helper()
+	h.build()
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	h.done = make(chan struct{})
+	go func() {
+		h.o.Run(ctx)
+		close(h.done)
+	}()
+}
+
+func (h *runHarness) stop() {
+	if h.cancel == nil {
+		return
+	}
+	h.cancel()
+	<-h.done
+	h.cancel = nil
+}
+
+func (h *runHarness) started() map[string][]domain.StartSessionParams {
+	got := map[string][]domain.StartSessionParams{}
+	for kind, recorder := range h.recorders {
+		if sessions := recorder.started(); len(sessions) > 0 {
+			got[kind] = sessions
+		}
+	}
+	return got
+}
+
+func (h *runHarness) waitForSessions(n int) map[string][]domain.StartSessionParams {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := h.started()
+		total := 0
+		for _, sessions := range got {
+			total += len(sessions)
+		}
+		if total >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("sessions started = %v after 5s, want at least %d; log: %s", got, n, h.logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (h *runHarness) waitForLog(message string) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(logRecords(h.t, h.logs, message)) == 0 {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("log holds no %q record after 5s; log: %s", message, h.logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func rawWithBackendRule(agent map[string]any, ruleAgent string) map[string]any {
+	return map[string]any{
+		"agent":    agent,
+		"dispatch": map[string]any{"rules": []any{backendRuleRaw(ruleAgent)}},
+	}
+}
+
+func withSSHHosts(raw map[string]any) {
+	raw["worker"] = map[string]any{"ssh_hosts": []any{"host-1"}}
+}
+
+func candidate(id, identifier string, labels ...string) domain.Issue {
+	return domain.Issue{ID: id, Identifier: identifier, Title: identifier, State: "To Do", Labels: labels}
+}
+
+func sessionOfWorkspace(t *testing.T, sessions map[string][]domain.StartSessionParams, identifier string) (string, domain.StartSessionParams) {
+	t.Helper()
+	for kind, list := range sessions {
+		for _, params := range list {
+			if filepath.Base(params.WorkspacePath) == identifier {
+				return kind, params
+			}
+		}
+	}
+	t.Fatalf("no session started for %s; sessions: %v", identifier, sessions)
+	return "", domain.StartSessionParams{}
+}
+
+func TestRun_SessionsLaunchTheirOwnKindsCommand(t *testing.T) {
+	t.Parallel()
+
+	type want struct {
+		kind, local, remote string
+		argv                []string
+	}
+	tests := []struct {
+		name   string
+		raw    func() map[string]any
+		issues []domain.Issue
+		want   map[string]want
+	}{
+		{
+			name: "default kind is the retired kind",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "legacy", "command": "legacy-wrapper --x"}, "legacy")
+			},
+			issues: []domain.Issue{candidate("id-1", "P-1"), candidate("id-2", "B-1", "backend")},
+			want: map[string]want{
+				"P-1": {kind: "modern", local: "legacy-wrapper --x serve", remote: "legacy-wrapper --x serve --remote"},
+				"B-1": {kind: "modern", local: "legacy-wrapper --x serve", remote: "legacy-wrapper --x serve --remote"},
+			},
+		},
+		{
+			name: "another kind is the default and a rule selects the retired kind",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+			},
+			issues: []domain.Issue{candidate("id-1", "P-1"), candidate("id-2", "B-1", "backend")},
+			want: map[string]want{
+				"P-1": {kind: "plain", local: "plain-cmd", remote: "plain-cmd"},
+				"B-1": {kind: "modern", local: "legacy-cli serve", remote: "legacy-cli serve --remote"},
+			},
+		},
+		{
+			name: "the replacement kind is the default kind",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "modern", "command": "modern-cmd"}, "legacy")
+			},
+			issues: []domain.Issue{candidate("id-2", "B-1", "backend")},
+			want:   map[string]want{"B-1": {kind: "modern", local: "modern-cmd", remote: "modern-cmd"}},
+		},
+		{
+			name: "a rule selects a kind that no conversion covers",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "kind-b")
+			},
+			issues: []domain.Issue{candidate("id-1", "P-1"), candidate("id-2", "B-1", "backend")},
+			want: map[string]want{
+				"P-1": {kind: "plain", local: "plain-cmd", remote: "plain-cmd"},
+				"B-1": {kind: "kind-b"},
+			},
+		},
+		{
+			name: "list agent.command belongs to the default kind",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": []any{"plain cmd", "--x"}}, "kind-b")
+			},
+			issues: []domain.Issue{candidate("id-1", "P-1"), candidate("id-2", "B-1", "backend")},
+			want: map[string]want{
+				"P-1": {kind: "plain", argv: []string{"plain cmd", "--x"}},
+				"B-1": {kind: "kind-b"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, remote := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, remote %v", tt.name, remote), func(t *testing.T) {
+				t.Parallel()
+
+				raw := tt.raw()
+				if remote {
+					withSSHHosts(raw)
+				}
+				h := newRunHarness(t, runConfig(t, raw), "plain", "modern", "kind-b", "legacy")
+				h.tracker.candidates = tt.issues
+
+				h.run()
+				sessions := h.waitForSessions(len(tt.issues))
+
+				for identifier, w := range tt.want {
+					kind, params := sessionOfWorkspace(t, sessions, identifier)
+					wantCommand := w.local
+					wantHost := ""
+					if remote {
+						wantCommand, wantHost = w.remote, "host-1"
+					}
+					if kind != w.kind || params.AgentConfig.Kind != w.kind {
+						t.Errorf("%s ran on adapter %q with AgentConfig.Kind %q, want %q", identifier, kind, params.AgentConfig.Kind, w.kind)
+					}
+					if params.AgentConfig.Command != wantCommand || !slices.Equal(params.AgentConfig.CommandArgv, w.argv) {
+						t.Errorf("%s AgentConfig command = %q / %q, want %q / %q", identifier, params.AgentConfig.Command, params.AgentConfig.CommandArgv, wantCommand, w.argv)
+					}
+					if params.SSHHost != wantHost {
+						t.Errorf("%s SSHHost = %q, want %q", identifier, params.SSHHost, wantHost)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRun_CredentialNamesFollowTheGovernedKind(t *testing.T) {
+	const credential = "LEGACY_KEY"
+
+	tests := []struct {
+		name          string
+		raw           func() map[string]any
+		set           bool
+		wantNames     []string
+		wantPlain     []string
+		wantOptionEnv bool
+		listedInPass  bool
+	}{
+		{
+			name: "variable set",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+			},
+			set:           true,
+			wantNames:     []string{credential},
+			wantOptionEnv: true,
+		},
+		{
+			name: "variable unset",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+			},
+			wantNames: []string{credential},
+		},
+		{
+			name: "variable disallowed",
+			raw: func() map[string]any {
+				raw := rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+				raw["worker"] = map[string]any{"ssh_hosts": []any{"host-1"}, "ssh_disallow_pass_env": []any{credential}}
+				return raw
+			},
+			set: true,
+		},
+		{
+			name: "conversion that governs nothing carries no name",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "modern", "command": "modern-cmd"}, "legacy")
+			},
+			set: true,
+		},
+		{
+			name: "operator lists the variable and it is unset",
+			raw: func() map[string]any {
+				raw := rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+				raw["worker"] = map[string]any{"ssh_hosts": []any{"host-1"}, "ssh_pass_env": []any{credential}}
+				return raw
+			},
+			wantNames:    []string{credential},
+			wantPlain:    []string{credential},
+			listedInPass: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.set {
+				t.Setenv(credential, "secret-value")
+			} else {
+				unsetEnvForRun(t, credential)
+			}
+			raw := tt.raw()
+			if _, hasWorker := raw["worker"]; !hasWorker {
+				withSSHHosts(raw)
+			}
+			h := newRunHarness(t, runConfig(t, raw), "plain", "modern")
+			h.tracker.candidates = []domain.Issue{candidate("id-1", "P-1"), candidate("id-2", "B-1", "backend")}
+
+			h.run()
+			sessions := h.waitForSessions(2)
+			h.stop()
+
+			_, plain := sessionOfWorkspace(t, sessions, "P-1")
+			if !slices.Equal(plain.SSHEnvNames, tt.wantPlain) {
+				t.Errorf("default kind session SSHEnvNames = %v, want %v", plain.SSHEnvNames, tt.wantPlain)
+			}
+			_, governed := sessionOfWorkspace(t, sessions, "B-1")
+			if !slices.Equal(governed.SSHEnvNames, tt.wantNames) {
+				t.Errorf("governed kind session SSHEnvNames = %v, want %v", governed.SSHEnvNames, tt.wantNames)
+			}
+			target := agentcore.LaunchTarget{SSHEnvNames: governed.SSHEnvNames}
+			carried := len(target.SSHOptions().Env) == 1
+			if carried != tt.wantOptionEnv {
+				t.Errorf("SSHOptions carries the credential = %v, want %v", carried, tt.wantOptionEnv)
+			}
+			named := false
+			for _, record := range logRecords(t, h.logs, "ssh_pass_env variable is not set or empty in the orchestrator environment") {
+				named = named || record["variable"] == credential
+			}
+			for _, record := range logRecords(t, h.logs, "ssh_pass_env variable is disallowed by ssh_disallow_pass_env, not carrying it") {
+				named = named || record["variable"] == credential
+			}
+			if named != tt.listedInPass {
+				t.Errorf("worker ssh_pass_env advisory names %s = %v, want %v", credential, named, tt.listedInPass)
+			}
+		})
+	}
+}
+
+func unsetEnvForRun(t *testing.T, name string) {
+	t.Helper()
+	if prior, ok := os.LookupEnv(name); ok {
+		t.Setenv(name, prior)
+	}
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("Unsetenv(%s): %v", name, err)
+	}
+}
+
+func TestRun_ConversionAdvisoryIsLoggedOnceAcrossTicks(t *testing.T) {
+	t.Parallel()
+
+	cfg := runConfig(t, rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy"))
+	cfg.Polling.IntervalMS = 20
+	h := newRunHarness(t, cfg, "plain", "modern")
+
+	h.run()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.tracker.candidateFetches.Load() < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("candidate fetches = %d after 5s, want at least 4 ticks", h.tracker.candidateFetches.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.stop()
+
+	records := logRecords(t, h.logs, "agent kind was removed and its configuration was converted to the replacement kind; the conversion will be removed in a later release")
+	if len(records) != 1 {
+		t.Fatalf("advisory records after several ticks = %v, want exactly one", records)
+	}
+	if records[0]["level"] != "WARN" || records[0]["agent_kind"] != "legacy" || records[0]["replacement_kind"] != "modern" {
+		t.Errorf("advisory record = %v, want a WARN carrying agent_kind %q and replacement_kind %q", records[0], "legacy", "modern")
+	}
+}
+
+type retryRow struct {
+	name        string
+	timerOnly   bool
+	raw         func() map[string]any
+	frozen      RetryEntry
+	issue       domain.Issue
+	unavailable string
+	wantKind    string
+	wantCommand string
+	wantArgv    []string
+	wantResume  string
+	wantMoved   bool
+	wantMovedTo DispatchResolution
+
+	wantStageLabels []any
+}
+
+const severalStageLabelsMessage = "several stage labels found"
+
+func stagedRulesRaw() map[string]any {
+	return map[string]any{
+		"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"},
+		"dispatch": map[string]any{"rules": []any{
+			map[string]any{"name": "plan", "stage": "Stage-Plan", "agent": "kind-b"},
+			map[string]any{"name": "implement", "stage": "stage-implement", "agent": "kind-c"},
+		}},
+	}
+}
+
+func seedRetry(h *runHarness, mode string, entry RetryEntry) {
+	h.t.Helper()
+	entry.IssueID, entry.Identifier = "id-retry", "R-1"
+	h.state.Claimed[entry.IssueID] = struct{}{}
+	if mode == "recovered" {
+		session := entry.SessionID
+		PopulateRetries(h.state, []persistence.PendingRetry{{Entry: persistence.RetryEntry{
+			IssueID: entry.IssueID, Identifier: entry.Identifier, Attempt: entry.Attempt, SessionID: &session,
+			RuleName: entry.RuleName, TemplateID: entry.TemplateID, AgentKind: entry.AgentKind,
+		}}}, nil)
+		h.build()
+		return
+	}
+	h.build()
+	ScheduleRetry(h.state, ScheduleRetryParams{
+		IssueID: entry.IssueID, Identifier: entry.Identifier, Attempt: entry.Attempt, DelayMS: 20,
+		SessionID: entry.SessionID, AgentKind: entry.AgentKind, RuleName: entry.RuleName, TemplateID: entry.TemplateID,
+		ReactionKind: entry.ReactionKind, RuleSettingsApplied: entry.RuleSettingsApplied,
+	}, h.o.onRetryFire)
+}
+
+func TestRun_RetriesDispatchOnTheSelectionTheConfigurationInForceGives(t *testing.T) {
+	t.Parallel()
+
+	const held = "/prompts/held.md"
+	plainDefault := func() map[string]any {
+		return map[string]any{"agent": map[string]any{"kind": "kind-b", "command": "b-cmd"}}
+	}
+	frozenA := RetryEntry{Attempt: 1, AgentKind: "kind-a", RuleName: "old-work", SessionID: "sess-old"}
+
+	rows := []retryRow{
+		{
+			name:        "kind moved off the frozen kind",
+			raw:         plainDefault,
+			frozen:      frozenA,
+			issue:       candidate("id-retry", "R-1"),
+			wantKind:    "kind-b",
+			wantCommand: "b-cmd",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-b"},
+		},
+		{
+			name:        "retired kind hand-migrated away",
+			raw:         plainDefault,
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "legacy", RuleName: "backend", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1"),
+			wantKind:    "kind-b",
+			wantCommand: "b-cmd",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-b"},
+		},
+		{
+			name:        "kind this binary does not register",
+			raw:         plainDefault,
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "ghost", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1"),
+			wantKind:    "kind-b",
+			wantCommand: "b-cmd",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-b"},
+		},
+		{
+			name: "kind only a rule reaches after agent.kind moved",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "kind-b", "command": "b-cmd"}, "kind-a")
+			},
+			frozen:     frozenA,
+			issue:      candidate("id-retry", "R-1", "unrelated"),
+			wantKind:   "kind-a",
+			wantResume: "sess-old",
+		},
+		{
+			name: "agent.command changed under the same kind",
+			raw: func() map[string]any {
+				return map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "new-cmd"}}
+			},
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "kind-a", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1"),
+			wantKind:    "kind-a",
+			wantCommand: "new-cmd",
+			wantResume:  "sess-old",
+		},
+		{
+			name: "retired kind with a conversion record",
+			raw: func() map[string]any {
+				return rawWithBackendRule(map[string]any{"kind": "plain", "command": "plain-cmd"}, "legacy")
+			},
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "legacy", RuleName: "backend", TemplateID: held, SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1", "unrelated"),
+			wantKind:    "modern",
+			wantCommand: "legacy-cli serve",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "modern", TemplateID: held, RuleName: "backend"},
+		},
+		{
+			name: "template that is not held",
+			raw: func() map[string]any {
+				return map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}}
+			},
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "kind-a", RuleName: "docs", TemplateID: "/prompts/gone.md", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1"),
+			wantKind:    "kind-a",
+			wantCommand: "a-cmd",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-a"},
+		},
+		{
+			name:        "review reaction on a handoff issue after the kind moved",
+			timerOnly:   true,
+			raw:         plainDefault,
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "ghost", ReactionKind: ReactionKindReview, SessionID: "sess-old"},
+			issue:       domain.Issue{ID: "id-retry", Identifier: "R-1", Title: "R-1", State: "In Review"},
+			wantKind:    "kind-b",
+			wantCommand: "b-cmd",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-b"},
+		},
+		{
+			name:            "several stage labels on the issue when the frozen kind is gone",
+			raw:             stagedRulesRaw,
+			frozen:          RetryEntry{Attempt: 1, AgentKind: "ghost", RuleName: "old-work", SessionID: "sess-old"},
+			issue:           candidate("id-retry", "R-1", "stage-implement", "stage-plan"),
+			wantKind:        "kind-b",
+			wantMoved:       true,
+			wantMovedTo:     DispatchResolution{AgentKind: "kind-b", RuleName: "plan"},
+			wantStageLabels: []any{"Stage-Plan", "stage-implement"},
+		},
+		{
+			name:        "one stage label on the issue when the frozen kind is gone",
+			raw:         stagedRulesRaw,
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "ghost", RuleName: "old-work", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1", "stage-implement"),
+			wantKind:    "kind-c",
+			wantMoved:   true,
+			wantMovedTo: DispatchResolution{AgentKind: "kind-c", RuleName: "implement"},
+		},
+		{
+			name:       "frozen staged selection stands after the stage label on the issue moved",
+			raw:        stagedRulesRaw,
+			frozen:     RetryEntry{Attempt: 1, AgentKind: "kind-b", RuleName: "plan", SessionID: "sess-old"},
+			issue:      candidate("id-retry", "R-1", "stage-implement"),
+			wantKind:   "kind-b",
+			wantResume: "sess-old",
+		},
+		{
+			name:       "frozen staged selection stands without a warning although the issue carries several stage labels",
+			raw:        stagedRulesRaw,
+			frozen:     RetryEntry{Attempt: 1, AgentKind: "kind-c", RuleName: "implement", SessionID: "sess-old"},
+			issue:      candidate("id-retry", "R-1", "stage-implement", "stage-plan"),
+			wantKind:   "kind-c",
+			wantResume: "sess-old",
+		},
+		{
+			name: "adapter lookup that fails and later succeeds",
+			raw: func() map[string]any {
+				return map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}}
+			},
+			frozen:      RetryEntry{Attempt: 1, AgentKind: "kind-a", SessionID: "sess-old"},
+			issue:       candidate("id-retry", "R-1"),
+			unavailable: "kind-a",
+			wantKind:    "kind-a",
+			wantCommand: "a-cmd",
+			wantResume:  "sess-old",
+		},
+	}
+
+	for _, tt := range rows {
+		modes := []string{"timer", "recovered"}
+		if tt.timerOnly {
+			modes = modes[:1]
+		}
+		for _, mode := range modes {
+			t.Run(tt.name+", "+mode, func(t *testing.T) {
+				t.Parallel()
+
+				h := newRunHarness(t, runConfig(t, tt.raw()), "kind-a", "kind-b", "kind-c", "plain", "modern")
+				h.tracker.issues["id-retry"] = tt.issue
+				if tt.unavailable != "" {
+					h.setAvailable(tt.unavailable, false)
+				}
+				seedRetry(h, mode, tt.frozen)
+
+				h.run()
+				if tt.unavailable != "" {
+					h.waitForLog("retry agent kind unavailable")
+					h.setAvailable(tt.unavailable, true)
+				}
+				sessions := h.waitForSessions(1)
+				h.stop()
+
+				kind, params := sessionOfWorkspace(t, sessions, "R-1")
+				if kind != tt.wantKind || params.AgentConfig.Kind != tt.wantKind {
+					t.Errorf("retry ran on adapter %q with AgentConfig.Kind %q, want %q", kind, params.AgentConfig.Kind, tt.wantKind)
+				}
+				if params.AgentConfig.Command != tt.wantCommand || !slices.Equal(params.AgentConfig.CommandArgv, tt.wantArgv) {
+					t.Errorf("retry AgentConfig command = %q / %q, want %q / %q", params.AgentConfig.Command, params.AgentConfig.CommandArgv, tt.wantCommand, tt.wantArgv)
+				}
+				if params.ResumeSessionID != tt.wantResume {
+					t.Errorf("retry ResumeSessionID = %q, want %q", params.ResumeSessionID, tt.wantResume)
+				}
+
+				warnings := logRecords(t, h.logs, severalStageLabelsMessage)
+				if tt.wantStageLabels == nil {
+					if len(warnings) != 0 {
+						t.Errorf("%q records = %v, want none", severalStageLabelsMessage, warnings)
+					}
+				} else if len(warnings) != 1 {
+					t.Errorf("%q records = %v, want exactly one", severalStageLabelsMessage, warnings)
+				} else if labels, _ := warnings[0]["stage_labels"].([]any); !slices.Equal(labels, tt.wantStageLabels) || warnings[0]["rule_name"] != tt.wantMovedTo.RuleName || warnings[0]["level"] != "WARN" {
+					t.Errorf("%q record = %v, want a WARN with stage_labels %v and rule_name %q", severalStageLabelsMessage, warnings[0], tt.wantStageLabels, tt.wantMovedTo.RuleName)
+				}
+
+				records := logRecords(t, h.logs, selectionChangedMessage)
+				if !tt.wantMoved {
+					if len(records) != 0 {
+						t.Errorf("selection records = %v, want none", records)
+					}
+					return
+				}
+				if len(records) != 1 {
+					t.Fatalf("selection records = %v, want exactly one", records)
+				}
+				got := records[0]
+				if got["dispatch_agent_kind"] != tt.wantMovedTo.AgentKind || got["dispatch_template_id"] != tt.wantMovedTo.TemplateID || got["dispatch_rule_name"] != tt.wantMovedTo.RuleName ||
+					got["agent_kind"] != tt.frozen.AgentKind || got["template_id"] != tt.frozen.TemplateID || got["rule_name"] != tt.frozen.RuleName {
+					t.Errorf("selection record = %v, want frozen {%q %q %q} and dispatched %+v", got, tt.frozen.AgentKind, tt.frozen.TemplateID, tt.frozen.RuleName, tt.wantMovedTo)
+				}
+			})
+		}
+	}
+}
+
+func (h *runHarness) waitForRunHistories(n int) []persistence.RunHistory {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h.store.mu.Lock()
+		rows := slices.Clone(h.store.runHistories)
+		h.store.mu.Unlock()
+		if len(rows) >= n {
+			return rows
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("run_history rows = %d after 5s, want at least %d; log: %s", len(rows), n, h.logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func ruleBlock(name, label, agent string, block map[string]any) map[string]any {
+	return map[string]any{"name": name, "match": map[string]any{"labels": []any{label}}, "agent": agent, agent: block}
+}
+
+func TestRun_TwoRulesOnOneKindDispatchWithTheirOwnSettings(t *testing.T) {
+	t.Parallel()
+
+	raw := map[string]any{
+		"agent":  map[string]any{"kind": "plain", "command": "plain-cmd"},
+		"kind-b": map[string]any{"model": "top-model", "effort": "high", "keep": 1},
+		"dispatch": map[string]any{"rules": []any{
+			ruleBlock("cheap", "cheap", "kind-b", map[string]any{"model": "model-a", "effort": nil}),
+			ruleBlock("strong", "strong", "kind-b", map[string]any{"model": "model-b"}),
+		}},
+	}
+	h := newRunHarness(t, runConfig(t, raw), "plain", "kind-b")
+	h.tracker.candidates = []domain.Issue{candidate("id-1", "C-1", "cheap"), candidate("id-2", "S-1", "strong"), candidate("id-3", "P-1")}
+
+	h.run()
+	sessions := h.waitForSessions(3)
+	rows := h.waitForRunHistories(3)
+	h.stop()
+
+	tests := []struct {
+		identifier, kind, rule, model, effort string
+		wantSettings                          map[string]any
+	}{
+		{identifier: "C-1", kind: "kind-b", rule: "cheap", model: "model-a", wantSettings: map[string]any{"model": "model-a", "keep": 1}},
+		{identifier: "S-1", kind: "kind-b", rule: "strong", model: "model-b", effort: "high", wantSettings: map[string]any{"model": "model-b", "effort": "high", "keep": 1}},
+		{identifier: "P-1", kind: "plain", wantSettings: map[string]any{}},
+	}
+	dispatched := map[string]map[string]any{}
+	for _, record := range logRecords(t, h.logs, "issue dispatched") {
+		dispatched[record["issue_identifier"].(string)] = record
+	}
+	for _, tt := range tests {
+		kind, params := sessionOfWorkspace(t, sessions, tt.identifier)
+		gotSettings := map[string]any{}
+		for _, key := range []string{"model", "effort", "keep"} {
+			if value, present := params.Settings[key]; present {
+				gotSettings[key] = value
+			}
+		}
+		if kind != tt.kind || !maps.Equal(gotSettings, tt.wantSettings) {
+			t.Errorf("%s working StartSession adapter, Settings = %q, %v, want %q, %v", tt.identifier, kind, gotSettings, tt.kind, tt.wantSettings)
+		}
+		row := rowOfIdentifier(t, rows, tt.identifier)
+		if row.ConfiguredModel != tt.model || row.ConfiguredEffort != tt.effort || row.RuleName != tt.rule {
+			t.Errorf("%s run_history configured model, effort, rule = %q, %q, %q, want %q, %q, %q", tt.identifier, row.ConfiguredModel, row.ConfiguredEffort, row.RuleName, tt.model, tt.effort, tt.rule)
+		}
+		record := dispatched[tt.identifier]
+		if record["agent_kind"] != tt.kind || record["rule_name"] != tt.rule || record["model"] != tt.model || record["effort"] != tt.effort {
+			t.Errorf("%s dispatch record = %v, want agent_kind %q, rule_name %q, model %q, effort %q", tt.identifier, record, tt.kind, tt.rule, tt.model, tt.effort)
+		}
+	}
+
+	var verifiedModels []string
+	for _, params := range h.recorders["kind-b"].verified() {
+		model, _ := params.Settings["model"].(string)
+		verifiedModels = append(verifiedModels, model)
+	}
+	slices.Sort(verifiedModels)
+	if !slices.Equal(verifiedModels, []string{"model-a", "model-b"}) {
+		t.Errorf("credential-verification StartSession models = %v, want each rule's model once", verifiedModels)
+	}
+}
+
+func rowOfIdentifier(t *testing.T, rows []persistence.RunHistory, identifier string) persistence.RunHistory {
+	t.Helper()
+	for _, row := range rows {
+		if row.Identifier == identifier {
+			return row
+		}
+	}
+	t.Fatalf("no run_history row for %s; rows: %+v", identifier, rows)
+	return persistence.RunHistory{}
+}
+
+func interactiveModeRaw(withBadBlock bool) map[string]any {
+	raw := map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}}
+	if withBadBlock {
+		raw["kind-a"] = map[string]any{"permission_mode": "default"}
+	}
+	withSSHHosts(raw)
+	return raw
+}
+
+func TestHandleTick_RefusedSettingsBlockStartsNothing(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyMetrics{}
+	h := newRunHarness(t, runConfig(t, interactiveModeRaw(true)), "kind-a")
+	h.metrics = spy
+	h.meta = map[string]registry.AgentMeta{"kind-a": settingsMeta()}
+	h.tracker.candidates = []domain.Issue{candidate("id-1", "A-1")}
+	h.build()
+	clean := runConfig(t, interactiveModeRaw(false))
+	h.o.preflightParams.ConfigFunc = func() config.ServiceConfig { return clean }
+
+	h.o.handleTick(context.Background())
+
+	if started := h.started(); len(started) != 0 || len(h.state.Running) != 0 || len(h.store.runHistories) != 0 {
+		t.Errorf("sessions, Running, run_history rows = %v, %v, %+v, want none for a refused block", started, h.state.Running, h.store.runHistories)
+	}
+	if used := h.o.hostPool.Snapshot()["host-1"]; used != 0 {
+		t.Errorf("host-1 usage = %d, want the acquired host released", used)
+	}
+	if !slices.Equal(spy.dispatches, []string{outcomeError}) {
+		t.Errorf("dispatch outcomes = %v, want one %q", spy.dispatches, outcomeError)
+	}
+	requireOneRecord(t, h.logs, "agent settings refused", map[string]any{"level": "ERROR", "agent_kind": "kind-a", "check": "kind-a.permission_mode.interactive"})
+
+	h.wm.setConfig(clean)
+	h.o.handleTick(context.Background())
+
+	if started := h.waitForSessions(1); len(started["kind-a"]) != 1 {
+		t.Errorf("sessions started after the block was fixed = %v, want the candidate dispatched on the next tick", started)
+	}
+}
+
+func TestRun_RetryAppliesTheSettingsInForceAtItsStart(t *testing.T) {
+	t.Parallel()
+
+	ruleRaw := func(block map[string]any) func() map[string]any {
+		return func() map[string]any {
+			return map[string]any{
+				"agent":  map[string]any{"kind": "kind-a", "command": "a-cmd"},
+				"kind-b": map[string]any{"model": "top-model", "effort": "high"},
+				"dispatch": map[string]any{"rules": []any{
+					map[string]any{"name": "cheap", "match": map[string]any{"labels": []any{"cheap"}}, "agent": "kind-b", "kind-b": maps.Clone(block)},
+				}},
+			}
+		}
+	}
+	frozenRule := RetryEntry{Attempt: 1, AgentKind: "kind-b", RuleName: "cheap", SessionID: "sess-old", RuleSettingsApplied: true}
+	reaction := frozenRule
+	reaction.ReactionKind = ReactionKindReview
+	kindA := RetryEntry{Attempt: 1, AgentKind: "kind-a", SessionID: "sess-old"}
+	topLevelChanged := func() map[string]any {
+		return map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}, "kind-a": map[string]any{"model": "new-model"}}
+	}
+
+	rows := []struct {
+		name                            string
+		raw                             func() map[string]any
+		meta                            bool
+		frozen                          RetryEntry
+		issue                           domain.Issue
+		modes                           []string
+		wantKind, wantModel, wantEffort string
+		wantRefusal                     bool
+	}{
+		{name: "top-level block changed since the frozen attempt", raw: topLevelChanged, frozen: kindA, issue: candidate("id-retry", "R-1"), wantKind: "kind-a", wantModel: "new-model"},
+		{name: "rule block in force, label since moved off the rule", raw: ruleRaw(map[string]any{"model": "rule-model"}), frozen: frozenRule, issue: candidate("id-retry", "R-1", "strong"), wantKind: "kind-b", wantModel: "rule-model", wantEffort: "high"},
+		{name: "reaction continuation of a held claim", modes: []string{"timer"}, raw: ruleRaw(map[string]any{"model": "rule-model", "effort": "low"}), frozen: reaction, issue: domain.Issue{ID: "id-retry", Identifier: "R-1", Title: "R-1", State: "In Review"}, wantKind: "kind-b", wantModel: "rule-model", wantEffort: "low"},
+		{name: "block a reload made refusable", modes: []string{"timer"}, meta: true, raw: func() map[string]any { return interactiveModeRaw(true) }, frozen: kindA, issue: candidate("id-retry", "R-1"), wantRefusal: true},
+	}
+
+	for _, tt := range rows {
+		modes := tt.modes
+		if modes == nil {
+			modes = []string{"timer", "recovered"}
+		}
+		for _, mode := range modes {
+			t.Run(tt.name+", "+mode, func(t *testing.T) {
+				t.Parallel()
+
+				h := newRunHarness(t, runConfig(t, tt.raw()), "kind-a", "kind-b")
+				h.tracker.issues["id-retry"] = tt.issue
+				if tt.meta {
+					h.meta = map[string]registry.AgentMeta{"kind-a": settingsMeta()}
+				}
+				seedRetry(h, mode, tt.frozen)
+
+				h.run()
+				if tt.wantRefusal {
+					h.waitForLog("retry agent settings refused")
+					h.stop()
+					if _, claimed := h.state.Claimed["id-retry"]; len(h.started()) != 0 || !claimed {
+						t.Errorf("sessions started, claim kept = %v, %v, want none and the claim kept for a refused retry", h.started(), claimed)
+					}
+					return
+				}
+				sessions := h.waitForSessions(1)
+				h.stop()
+
+				kind, params := sessionOfWorkspace(t, sessions, "R-1")
+				model, _ := params.Settings["model"].(string)
+				effort, _ := params.Settings["effort"].(string)
+				if kind != tt.wantKind || model != tt.wantModel || effort != tt.wantEffort || params.ResumeSessionID != "sess-old" {
+					t.Errorf("retry adapter, model, effort, resume = %q, %q, %q, %q, want %q, %q, %q, %q: a settings change never clears the resume identifier",
+						kind, model, effort, params.ResumeSessionID, tt.wantKind, tt.wantModel, tt.wantEffort, "sess-old")
+				}
+			})
+		}
+	}
+}
+
+func (s *stubStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *stubStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func TestHandleTick_FreshDispatchIsGivenPullRequestComments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		configured bool
+		noIdentity bool
+		wantIDs    []string
+	}{
+		{"a configured kind with a new comment", true, false, []string{"a", "b"}},
+		{"an unconfigured kind", false, false, nil},
+		{"a workspace without a pull request identity", true, true, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			issue := domain.Issue{ID: "iss-fresh-seed", Identifier: "TEST-SEED", Title: "title", State: "To Do"}
+			root := t.TempDir()
+			if !tt.noIdentity {
+				writeRecoverySCM(t, root, issue.Identifier, domain.SCMMetadata{Branch: "feature/fix", PRNumber: 10, Owner: "owner", Repo: "repo"})
+			}
+			wm := budgetTickConfig(0)
+			wm.config.Workspace.Root = root
+			wm.template = mustParseTemplate(t, commentsPromptTemplate)
+			state := NewState(60000, 10, 0, nil, AgentTotals{})
+			tracker := &candidateTrackerAdapter{
+				mockTrackerAdapter: &mockTrackerAdapter{},
+				fetchCandidatesFn:  func(context.Context) ([]domain.Issue, error) { return []domain.Issue{issue}, nil },
+			}
+			regs := passingPreflightRegistries()
+			regs.ReloadWorkflow = func() error { return nil }
+			regs.ConfigFunc = wm.Config
+			orch := NewOrchestrator(OrchestratorParams{
+				State:            state,
+				Logger:           discardLogger(),
+				TrackerAdapter:   tracker,
+				Router:           route.NewRouter(tracker, nil),
+				AgentAdapter:     &mockAgentAdapter{},
+				WorkflowManager:  wm,
+				Store:            &stubStore{},
+				PreflightParams:  regs,
+				SCMAdapter:       &mockSCMAdapter{comments: []domain.ReviewComment{summaryComment("a"), inlineComment("b")}},
+				ReviewConfig:     defaultReviewConfig(),
+				ReviewConfigured: tt.configured,
+			})
+
+			orch.handleTick(context.Background())
+			t.Cleanup(state.WorkerWg.Wait)
+
+			running, ok := state.Running[issue.ID]
+			if !ok {
+				t.Fatalf("Running[%s] missing after the tick, want a dispatched run", issue.ID)
+			}
+			t.Cleanup(running.CancelFunc)
+			if running.ReactionKind != "" {
+				t.Errorf("Running[%s].ReactionKind = %q, want empty for a fresh run", issue.ID, running.ReactionKind)
+			}
+			got := slices.Sorted(slices.Values(continuationCommentIDs(ReactionKindReview, running.ContinuationContext)))
+			if !slices.Equal(got, tt.wantIDs) {
+				t.Errorf("Running[%s] carries review comments %v, want %v", issue.ID, got, tt.wantIDs)
+			}
+			if tt.wantIDs == nil && running.ContinuationContext != nil {
+				t.Errorf("Running[%s].ContinuationContext = %v, want nil", issue.ID, running.ContinuationContext)
+			}
+		})
+	}
+}
+
+func (s *stubStore) DeleteStageHop(context.Context, string) error { return nil }
+
+func (s *stubStore) RecordStageHop(context.Context, persistence.StageHop) error { return nil }
+
+func (s *stubStore) RecordRunStageResult(context.Context, int64, string, string) error { return nil }
+
+func (s *stubStore) MarkStageHopObserved(context.Context, string) error { return nil }
+
+func (s *stubStore) MarkStageHopDispatched(_ context.Context, issueID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dispatchMarked = append(s.dispatchMarked, issueID)
+	return s.markDispatchedErr
+}
+
+func (s *stubStore) LatestAgentRuns(_ context.Context, issueIDs []string) (map[string]persistence.RunHistory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latestRunsCalls = append(s.latestRunsCalls, slices.Clone(issueIDs))
+	if s.latestRunsErr != nil {
+		return nil, s.latestRunsErr
+	}
+	runs := make(map[string]persistence.RunHistory)
+	for _, id := range issueIDs {
+		if run, ok := s.latestRuns[id]; ok {
+			runs[id] = run
+		}
+	}
+	return runs, nil
+}
+
+func (s *stubStore) ListStageHops(context.Context) ([]persistence.StageHop, error) {
+	return nil, nil
 }

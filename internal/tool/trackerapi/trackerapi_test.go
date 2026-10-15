@@ -26,6 +26,8 @@ func (m *mockTrackerAdapter) FetchCandidateIssues(ctx context.Context) ([]domain
 	return nil, nil
 }
 
+func (m *mockTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
+
 func (m *mockTrackerAdapter) FetchIssueByID(ctx context.Context, issueID string) (domain.Issue, error) {
 	if m.fetchByIDFn != nil {
 		return m.fetchByIDFn(ctx, issueID)
@@ -62,10 +64,15 @@ func (m *mockTrackerAdapter) TransitionIssue(ctx context.Context, issueID string
 func (m *mockTrackerAdapter) CommentIssue(_ context.Context, _ string, _ string) error {
 	return nil
 }
+func (m *mockTrackerAdapter) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
 
 func (m *mockTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error {
 	return nil
 }
+
+func (m *mockTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // projIssue returns an issue with the given identifier in project PROJ.
 func projIssue(id, identifier string) domain.Issue {

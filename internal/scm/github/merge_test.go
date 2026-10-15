@@ -695,7 +695,7 @@ func TestGetMergeability_Clean(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"head":{"sha":"sha1","ref":"feature/x"},"draft":false,"mergeable_state":"clean"}`))
+		_, _ = w.Write([]byte(`{"head":{"sha":"sha1","ref":"feature/x"},"draft":false,"mergeable_state":"clean","html_url":"https://github.com/owner/repo/pull/1"}`))
 	}))
 	defer srv.Close()
 
@@ -712,6 +712,9 @@ func TestGetMergeability_Clean(t *testing.T) {
 	}
 	if status.HeadSHA != "sha1" {
 		t.Errorf("GetMergeability().HeadSHA = %q, want %q", status.HeadSHA, "sha1")
+	}
+	if want := "https://github.com/owner/repo/pull/1"; status.URL != want {
+		t.Errorf("GetMergeability().URL = %q, want %q", status.URL, want)
 	}
 }
 

@@ -71,41 +71,46 @@ func isInconclusiveConclusion(conclusion domain.CheckConclusion) bool {
 // answers pending. A completed run whose conclusion is cancelled holds
 // the aggregate at pending unless another run forces failing.
 func AggregateCIStatus(runs []domain.CheckRun) domain.CIStatus {
-	if len(runs) == 0 {
-		return domain.CIStatusPending
-	}
-
-	anyFailing := false
-	anyWithholds := false
-	for _, run := range runs {
-		if run.Status != domain.CheckRunStatusCompleted {
-			anyWithholds = true
-		} else if isInconclusiveConclusion(run.Conclusion) {
-			anyWithholds = true
-		}
-		if IsFailingConclusion(run.Conclusion) {
-			anyFailing = true
-		}
-	}
-
-	if anyFailing {
+	tally := TallyCheckRuns(runs)
+	switch {
+	case tally.Failing > 0:
 		return domain.CIStatusFailing
-	}
-	if anyWithholds {
+	case tally.Pending > 0, len(runs) == 0:
 		return domain.CIStatusPending
+	default:
+		return domain.CIStatusPassing
 	}
-	return domain.CIStatusPassing
+}
+
+// CheckRunTally counts a check-run set by the outcome [AggregateCIStatus]
+// reads from each run; every run is counted once.
+type CheckRunTally struct {
+	Failing int
+	Pending int
+	Passing int
+}
+
+// TallyCheckRuns counts a run as failing when [IsFailingConclusion] holds,
+// otherwise pending when it has not completed or concluded cancelled,
+// otherwise passing.
+func TallyCheckRuns(runs []domain.CheckRun) CheckRunTally {
+	var tally CheckRunTally
+	for _, run := range runs {
+		switch {
+		case IsFailingConclusion(run.Conclusion):
+			tally.Failing++
+		case run.Status != domain.CheckRunStatusCompleted, isInconclusiveConclusion(run.Conclusion):
+			tally.Pending++
+		default:
+			tally.Passing++
+		}
+	}
+	return tally
 }
 
 // FailingCount counts the runs AggregateCIStatus treats as failing.
 func FailingCount(runs []domain.CheckRun) int {
-	count := 0
-	for _, run := range runs {
-		if IsFailingConclusion(run.Conclusion) {
-			count++
-		}
-	}
-	return count
+	return TallyCheckRuns(runs).Failing
 }
 
 // MergeGate reports the merge-gate conclusion a normalized check-run set

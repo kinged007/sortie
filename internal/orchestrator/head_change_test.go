@@ -14,6 +14,8 @@ import (
 // every other method is a no-op, since classifyHeadChange consults no
 // other store method.
 type headChangeStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	count int
@@ -190,3 +192,13 @@ func TestClassifyHeadChange(t *testing.T) {
 		}
 	})
 }
+
+func (s *headChangeStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *headChangeStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *headChangeStore) DeleteStageHop(context.Context, string) error { return nil }

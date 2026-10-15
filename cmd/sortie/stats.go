@@ -1,15 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -18,6 +16,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/runstats"
 	"github.com/sortie-ai/sortie/internal/server"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
@@ -27,606 +26,55 @@ import (
 // any relative --since or --until bound.
 var statsNow = time.Now
 
-// statsReport is the "sortie stats --format json" envelope. Every slice
-// field is never nil; every pointer field is null when the figure it
-// carries is unavailable.
-type statsReport struct {
-	GeneratedAt  string           `json:"generated_at"`
-	WorkflowPath string           `json:"workflow_path"`
-	DBPath       string           `json:"db_path"`
-	Since        *string          `json:"since"`
-	Until        *string          `json:"until"`
-	SchemaTier   string           `json:"schema_tier"`
-	Warnings     []string         `json:"warnings"`
-	Summary      statsSummary     `json:"summary"`
-	ByStatus     []statsGroup     `json:"by_status"`
-	ByAdapter    []statsGroup     `json:"by_adapter"`
-	ByRule       []statsGroup     `json:"by_rule"`
-	ByTemplate   []statsGroup     `json:"by_template"`
-	SelfReview   *statsSelfReview `json:"self_review"`
-}
+// statsChainTextRows is the number of by_chain entries the text form prints.
+// by_chain grows by one entry per qualifying pass, unlike every other
+// breakdown, and a report without --since reads every run on record.
+const statsChainTextRows = 20
 
-// statsSummary reports the report-wide figures. MeanTurnsSucceeded,
-// Tokens, CostUSD, and CostPerSucceededRunUSD are null on the base
-// schema tier; CostUSD and CostPerSucceededRunUSD are also null when
-// no priced run exists in range.
-type statsSummary struct {
-	Runs                   int           `json:"runs"`
-	Succeeded              int           `json:"succeeded"`
-	SuccessRate            float64       `json:"success_rate"`
-	Duration               statsDuration `json:"duration_seconds"`
-	MeanTurnsSucceeded     *float64      `json:"mean_turns_succeeded"`
-	Tokens                 *statsTokens  `json:"tokens"`
-	CostUSD                *float64      `json:"cost_usd"`
-	CostPerSucceededRunUSD *float64      `json:"cost_per_succeeded_run_usd"`
-	ZeroDurationRuns       int           `json:"zero_duration_runs"`
-	DurationExcludedRuns   int           `json:"duration_excluded_runs"`
-	CostUnpricedRuns       int           `json:"cost_unpriced_runs"`
-	TokensUnmeasuredRuns   int           `json:"tokens_unmeasured_runs"`
-}
-
-// statsDuration reports p50, p95, and the arithmetic mean over a sample
-// population, in seconds. All three are null when Samples is 0.
-type statsDuration struct {
-	P50     *float64 `json:"p50"`
-	P95     *float64 `json:"p95"`
-	Mean    *float64 `json:"mean"`
-	Samples int      `json:"samples"`
-}
-
-// statsTokens reports the five token sums as stored, never recomputed.
-type statsTokens struct {
-	Input      int64 `json:"input"`
-	Output     int64 `json:"output"`
-	Total      int64 `json:"total"`
-	CacheRead  int64 `json:"cache_read"`
-	CacheWrite int64 `json:"cache_write"`
-}
-
-// statsGroup is one row of a by_status, by_adapter, by_rule, or
-// by_template breakdown. MeanTurns, Tokens, CostUSD, and
-// CostPerSucceededRunUSD are null on the base schema tier; CostUSD and
-// CostPerSucceededRunUSD are also null when the group holds no priced
-// run. In by_status, Succeeded and SuccessRate are structural rather
-// than informative: the "succeeded" row necessarily reports Succeeded
-// equal to Runs.
-type statsGroup struct {
-	Name                   string        `json:"name"`
-	Runs                   int           `json:"runs"`
-	Succeeded              int           `json:"succeeded"`
-	SuccessRate            float64       `json:"success_rate"`
-	Share                  float64       `json:"share"`
-	Duration               statsDuration `json:"duration_seconds"`
-	MeanTurns              *float64      `json:"mean_turns"`
-	Tokens                 *statsTokens  `json:"tokens"`
-	CostUSD                *float64      `json:"cost_usd"`
-	CostPerSucceededRunUSD *float64      `json:"cost_per_succeeded_run_usd"`
-	TokensUnmeasuredRuns   int           `json:"tokens_unmeasured_runs"`
-}
-
-// statsSelfReview reports the self-review aggregation. MeanIterations is
-// null when RunsWithMetadata is 0. Present only on the full schema tier.
-type statsSelfReview struct {
-	RunsWithMetadata int                 `json:"runs_with_metadata"`
-	ByFinalVerdict   []statsVerdictCount `json:"by_final_verdict"`
-	CapReachedRuns   int                 `json:"cap_reached_runs"`
-	MeanIterations   *float64            `json:"mean_iterations"`
-	UnparsedRuns     int                 `json:"unparsed_runs"`
-}
-
-// statsVerdictCount is one entry of statsSelfReview.ByFinalVerdict.
-type statsVerdictCount struct {
-	Verdict string `json:"verdict"`
-	Runs    int    `json:"runs"`
-}
-
-// tier reports the report's schema_tier label for caps.
-func tier(caps persistence.RunHistoryCapabilities) string {
-	if caps.Full() {
-		return "full"
-	}
-	return "base"
-}
-
-// label maps an empty dimension value to the sentinel a reader sees for
-// a run that carries no adapter, rule, template, or (in principle) status.
-func label(v string) string {
-	if v == "" {
-		return "<none>"
-	}
-	return v
-}
-
-// duration computes row's duration in seconds from its stored RFC3339
-// timestamps. ok is false when either timestamp fails to parse or the
-// resulting difference is negative.
-func duration(row persistence.RunStatsRow) (seconds float64, ok bool) {
-	started, err := time.Parse(time.RFC3339, row.StartedAt)
-	if err != nil {
-		return 0, false
-	}
-	completed, err := time.Parse(time.RFC3339, row.CompletedAt)
-	if err != nil {
-		return 0, false
-	}
-	diff := completed.Sub(started).Seconds()
-	if diff < 0 {
-		return 0, false
-	}
-	return diff, true
-}
-
-// percentile returns the nearest-rank percentile p over sorted, which
-// MUST already be sorted ascending. No interpolation is performed.
-func percentile(sorted []float64, p float64) float64 {
-	n := len(sorted)
-	idx := int(math.Ceil(p/100*float64(n))) - 1
-	idx = max(0, min(idx, n-1))
-	return sorted[idx]
-}
-
-// priceOf returns the estimated USD cost for row under rates, or nil
-// when row's agent adapter has no rate entry.
-func priceOf(row persistence.RunStatsRow, rates server.TokenRates) *float64 {
-	rc, ok := rates[row.AgentAdapter]
-	if !ok {
+// statsPricer adapts the workflow's token rates to a [runstats.Pricer]. It
+// returns nil when rates holds no entry, which tells the aggregator that no
+// token_rates are configured.
+func statsPricer(rates server.TokenRates) runstats.Pricer {
+	if len(rates) == 0 {
 		return nil
 	}
-	usage := domain.TokenUsage{
-		InputTokens:      row.InputTokens,
-		OutputTokens:     row.OutputTokens,
-		CacheReadTokens:  row.CacheReadTokens,
-		CacheWriteTokens: row.CacheWriteTokens,
-	}
-	return server.EstimateCost(usage, &rc)
-}
-
-// statsSelfReviewAccum accumulates the self-review folding state across
-// every row that carries non-nil review metadata.
-type statsSelfReviewAccum struct {
-	runsWithMetadata int
-	byVerdict        map[string]int
-	capReachedRuns   int
-	iterationSum     int
-	unparsedRuns     int
-}
-
-// foldSelfReview unmarshals raw into a [domain.ReviewMetadata] and folds
-// the result into acc. A value that fails to unmarshal increments acc's
-// unparsed count and contributes to nothing else.
-func foldSelfReview(raw string, acc *statsSelfReviewAccum) {
-	var metadata domain.ReviewMetadata
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		acc.unparsedRuns++
-		return
-	}
-
-	acc.runsWithMetadata++
-	verdict := metadata.FinalVerdict
-	if verdict == "" {
-		verdict = "none"
-	}
-	acc.byVerdict[verdict]++
-	if metadata.CapReached {
-		acc.capReachedRuns++
-	}
-	acc.iterationSum += metadata.TotalIterations
-}
-
-// parseRangeBound parses a --since or --until flag value into a UTC
-// time bound. An empty string returns nil, nil, meaning the bound is
-// absent. raw MUST be an RFC3339 timestamp, a YYYY-MM-DD date (read as
-// 00:00:00Z on that date), or a positive Go duration (read as
-// statsNow() minus that duration); any other input, including a zero
-// or negative duration, is a usage error.
-func parseRangeBound(raw string) (*time.Time, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return new(t.UTC()), nil
-	}
-	if t, err := time.Parse("2006-01-02", raw); err == nil {
-		return new(t.UTC()), nil
-	}
-	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-		return new(statsNow().UTC().Add(-d)), nil
-	}
-	return nil, fmt.Errorf(
-		"invalid range bound %q: accepts an RFC3339 timestamp (2026-07-01T00:00:00Z), "+
-			"a date (2026-07-01), or a positive duration (24h)", raw)
-}
-
-// statsGroupAccum accumulates the folding state for one statsGroup row
-// before the derived figures are computed in statsAggregator.report.
-type statsGroupAccum struct {
-	name              string
-	runs              int
-	succeeded         int
-	turnSum           int
-	tokens            statsTokens
-	costUSD           float64
-	pricedRuns        int
-	measuredRuns      int
-	unmeasuredRuns    int
-	succeededMeasured int
-	durationSamples   []float64
-}
-
-// statsTotalAccum accumulates the report-wide folding state.
-type statsTotalAccum struct {
-	runs                 int
-	succeeded            int
-	succeededTurns       int
-	tokens               statsTokens
-	costUSD              float64
-	pricedRuns           int
-	costUnpricedRuns     int
-	measuredRuns         int
-	unmeasuredRuns       int
-	succeededMeasured    int
-	zeroDurationRuns     int
-	durationExcludedRuns int
-	succeededSamples     []float64
-}
-
-// statsAggregator folds a stream of [persistence.RunStatsRow] values,
-// via [statsAggregator.add], into the totals and per-dimension groups
-// [statsAggregator.report] renders into a [statsReport]. add touches no
-// [persistence.Store] method, as [persistence.Store.ScanRunHistoryRange]'s
-// visit callback requires.
-type statsAggregator struct {
-	caps            persistence.RunHistoryCapabilities
-	rates           server.TokenRates
-	ratesConfigured bool
-	tierLabel       string
-
-	total statsTotalAccum
-
-	byStatus   map[string]*statsGroupAccum
-	byAdapter  map[string]*statsGroupAccum
-	byRule     map[string]*statsGroupAccum
-	byTemplate map[string]*statsGroupAccum
-
-	selfReview statsSelfReviewAccum
-}
-
-// newStatsAggregator constructs a statsAggregator for caps and rates.
-// It derives the schema tier and whether rates are configured once,
-// from caps.Full and from rates holding at least one entry.
-func newStatsAggregator(caps persistence.RunHistoryCapabilities, rates server.TokenRates) *statsAggregator {
-	return &statsAggregator{
-		caps:            caps,
-		rates:           rates,
-		ratesConfigured: len(rates) > 0,
-		tierLabel:       tier(caps),
-		byStatus:        make(map[string]*statsGroupAccum),
-		byAdapter:       make(map[string]*statsGroupAccum),
-		byRule:          make(map[string]*statsGroupAccum),
-		byTemplate:      make(map[string]*statsGroupAccum),
-		selfReview:      statsSelfReviewAccum{byVerdict: make(map[string]int)},
-	}
-}
-
-// bumpStatsGroup returns groups' entry for name, creating it on first
-// use, and increments its run count and, when isSucceeded, its
-// succeeded count.
-func bumpStatsGroup(groups map[string]*statsGroupAccum, name string, isSucceeded bool) *statsGroupAccum {
-	g, ok := groups[name]
-	if !ok {
-		g = &statsGroupAccum{name: name}
-		groups[name] = g
-	}
-	g.runs++
-	if isSucceeded {
-		g.succeeded++
-	}
-	return g
-}
-
-// add folds one row into the aggregator. It is the visit callback
-// [persistence.Store.ScanRunHistoryRange] calls once per row; it calls
-// no Store method and always returns nil.
-func (a *statsAggregator) add(row persistence.RunStatsRow) error {
-	isSucceeded := row.Status == "succeeded"
-	a.total.runs++
-	if isSucceeded {
-		a.total.succeeded++
-	}
-
-	bumped := []*statsGroupAccum{
-		bumpStatsGroup(a.byStatus, label(row.Status), isSucceeded),
-		bumpStatsGroup(a.byAdapter, label(row.AgentAdapter), isSucceeded),
-	}
-
-	full := a.caps.Full()
-	if full {
-		bumped = append(bumped,
-			bumpStatsGroup(a.byRule, label(row.RuleName), isSucceeded),
-			bumpStatsGroup(a.byTemplate, label(row.TemplateID), isSucceeded),
-		)
-
-		for _, g := range bumped {
-			g.turnSum += row.TurnsCompleted
+	return func(agentKind string, usage domain.TokenUsage) *float64 {
+		entry, ok := rates[agentKind]
+		if !ok {
+			return nil
 		}
-		if isSucceeded {
-			a.total.succeededTurns += row.TurnsCompleted
-		}
-
-		if !row.TokensMeasured {
-			a.total.unmeasuredRuns++
-			for _, g := range bumped {
-				g.unmeasuredRuns++
-			}
-		} else {
-			for _, g := range bumped {
-				g.tokens.Input += row.InputTokens
-				g.tokens.Output += row.OutputTokens
-				g.tokens.Total += row.TotalTokens
-				g.tokens.CacheRead += row.CacheReadTokens
-				g.tokens.CacheWrite += row.CacheWriteTokens
-				g.measuredRuns++
-				if isSucceeded {
-					g.succeededMeasured++
-				}
-			}
-			a.total.tokens.Input += row.InputTokens
-			a.total.tokens.Output += row.OutputTokens
-			a.total.tokens.Total += row.TotalTokens
-			a.total.tokens.CacheRead += row.CacheReadTokens
-			a.total.tokens.CacheWrite += row.CacheWriteTokens
-			a.total.measuredRuns++
-			if isSucceeded {
-				a.total.succeededMeasured++
-			}
-
-			if a.ratesConfigured {
-				cost := priceOf(row, a.rates)
-				if cost == nil {
-					a.total.costUnpricedRuns++
-				} else {
-					a.total.costUSD += *cost
-					a.total.pricedRuns++
-					for _, g := range bumped {
-						g.costUSD += *cost
-						g.pricedRuns++
-					}
-				}
-			}
-		}
-
-		if row.ReviewMetadata != nil {
-			foldSelfReview(*row.ReviewMetadata, &a.selfReview)
-		}
+		return server.EstimateCost(usage, &entry)
 	}
-
-	seconds, ok := duration(row)
-	if !ok {
-		a.total.durationExcludedRuns++
-		return nil
-	}
-	if seconds == 0 {
-		a.total.zeroDurationRuns++
-	}
-	for _, g := range bumped {
-		g.durationSamples = append(g.durationSamples, seconds)
-	}
-	if isSucceeded {
-		a.total.succeededSamples = append(a.total.succeededSamples, seconds)
-	}
-
-	return nil
 }
 
-// round1, round2, and round4 round v to the named number of decimal
-// places so the JSON report is byte-stable.
-func round1(v float64) float64 { return math.Round(v*10) / 10 }
-func round2(v float64) float64 { return math.Round(v*100) / 100 }
-func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
-
-// durationStats computes p50, p95, and the mean over samples, in
-// seconds. All three are null when samples is empty. samples is sorted
-// in place by a copy so the caller's slice is unmodified.
-func durationStats(samples []float64) statsDuration {
-	d := statsDuration{Samples: len(samples)}
-	if len(samples) == 0 {
-		return d
-	}
-
-	sorted := slices.Clone(samples)
-	slices.Sort(sorted)
-
-	var sum float64
-	for _, s := range sorted {
-		sum += s
-	}
-
-	d.P50 = new(percentile(sorted, 50))
-	d.P95 = new(percentile(sorted, 95))
-	d.Mean = new(round1(sum / float64(len(sorted))))
-	return d
+// statsSource is what a stats report is read from and priced with.
+type statsSource struct {
+	dbPath       string
+	workflowPath string
+	rates        server.TokenRates
+	rateWarnings []string
 }
 
-// report computes every derived figure exactly once from a's folded
-// state and returns the complete statsReport. warnings are folded into
-// the envelope's Warnings field verbatim.
-func (a *statsAggregator) report(
-	generatedAt time.Time,
-	workflowPath, dbPath string,
-	since, until *time.Time,
-	warnings []string,
-) statsReport {
-	full := a.caps.Full()
+// report opens dbPath read-only and aggregates the runs completed in
+// [since, until). Each call opens its own connection, so concurrent calls
+// share nothing and a long scan never holds the orchestrator's store.
+func (src statsSource) report(ctx context.Context, since, until *time.Time, generatedAt time.Time) (runstats.Report, error) {
+	store, err := persistence.OpenReadOnly(ctx, src.dbPath)
+	if err != nil {
+		return runstats.Report{}, fmt.Errorf("open database %s: %w", src.dbPath, err)
+	}
+	defer store.Close() //nolint:errcheck,gosec // read-only handle; close error is non-actionable
 
-	rpt := statsReport{
-		GeneratedAt:  generatedAt.Format(time.RFC3339),
-		WorkflowPath: workflowPath,
-		DBPath:       dbPath,
-		SchemaTier:   a.tierLabel,
-		Warnings:     append([]string{}, warnings...),
-		Summary:      a.summary(full),
-		ByStatus:     a.groupSlice(a.byStatus, full),
-		ByAdapter:    a.groupSlice(a.byAdapter, full),
-		ByRule:       []statsGroup{},
-		ByTemplate:   []statsGroup{},
-	}
-	if since != nil {
-		rpt.Since = new(since.UTC().Format(time.RFC3339))
-	}
-	if until != nil {
-		rpt.Until = new(until.UTC().Format(time.RFC3339))
-	}
-	if full {
-		rpt.ByRule = a.groupSlice(a.byRule, full)
-		rpt.ByTemplate = a.groupSlice(a.byTemplate, full)
-		rpt.SelfReview = a.selfReviewReport()
+	caps, err := store.RunHistoryCapabilities(ctx)
+	if err != nil {
+		return runstats.Report{}, err
 	}
 
-	return rpt
-}
-
-// summary computes the report-wide statsSummary.
-func (a *statsAggregator) summary(full bool) statsSummary {
-	s := statsSummary{
-		Runs:                 a.total.runs,
-		Succeeded:            a.total.succeeded,
-		Duration:             durationStats(a.total.succeededSamples),
-		ZeroDurationRuns:     a.total.zeroDurationRuns,
-		DurationExcludedRuns: a.total.durationExcludedRuns,
-		CostUnpricedRuns:     a.total.costUnpricedRuns,
+	agg := runstats.New(caps, statsPricer(src.rates))
+	if err := store.ScanRunHistoryRange(ctx, caps, since, until, agg.Add); err != nil {
+		return runstats.Report{}, err
 	}
-	if s.Runs > 0 {
-		s.SuccessRate = round4(float64(s.Succeeded) / float64(s.Runs))
-	}
-	if full && s.Succeeded > 0 {
-		s.MeanTurnsSucceeded = new(round2(float64(a.total.succeededTurns) / float64(s.Succeeded)))
-	}
-	if full {
-		s.TokensUnmeasuredRuns = a.total.unmeasuredRuns
-	}
-	if full && a.total.measuredRuns > 0 {
-		s.Tokens = new(a.total.tokens)
-	}
-	if full && a.total.pricedRuns > 0 {
-		cost := round2(a.total.costUSD)
-		s.CostUSD = &cost
-		if a.total.succeededMeasured > 0 {
-			s.CostPerSucceededRunUSD = new(round2(cost / float64(a.total.succeededMeasured)))
-		}
-	}
-	return s
-}
-
-// groupSlice converts groups into a statsGroup slice, sorted by
-// descending runs with ties broken by ascending name under byte
-// comparison.
-func (a *statsAggregator) groupSlice(groups map[string]*statsGroupAccum, full bool) []statsGroup {
-	out := make([]statsGroup, 0, len(groups))
-	for _, g := range groups {
-		out = append(out, a.groupStat(g, full))
-	}
-	slices.SortFunc(out, func(x, y statsGroup) int {
-		if x.Runs != y.Runs {
-			return y.Runs - x.Runs
-		}
-		return strings.Compare(x.Name, y.Name)
-	})
-	return out
-}
-
-// groupStat computes the derived statsGroup figures for one accumulated
-// group.
-func (a *statsAggregator) groupStat(g *statsGroupAccum, full bool) statsGroup {
-	stat := statsGroup{
-		Name:      g.name,
-		Runs:      g.runs,
-		Succeeded: g.succeeded,
-		Duration:  durationStats(g.durationSamples),
-	}
-	if g.runs > 0 {
-		stat.SuccessRate = round4(float64(g.succeeded) / float64(g.runs))
-	}
-	if a.total.runs > 0 {
-		stat.Share = round4(float64(g.runs) / float64(a.total.runs))
-	}
-	if full {
-		stat.MeanTurns = new(round2(float64(g.turnSum) / float64(g.runs)))
-		stat.TokensUnmeasuredRuns = g.unmeasuredRuns
-		if g.measuredRuns > 0 {
-			stat.Tokens = new(g.tokens)
-		}
-		if g.pricedRuns > 0 {
-			cost := round2(g.costUSD)
-			stat.CostUSD = &cost
-			if g.succeededMeasured > 0 {
-				stat.CostPerSucceededRunUSD = new(round2(cost / float64(g.succeededMeasured)))
-			}
-		}
-	}
-	return stat
-}
-
-// selfReviewReport computes the derived statsSelfReview from a's folded
-// self-review state. by_final_verdict is sorted by ascending verdict.
-func (a *statsAggregator) selfReviewReport() *statsSelfReview {
-	sr := &statsSelfReview{
-		RunsWithMetadata: a.selfReview.runsWithMetadata,
-		ByFinalVerdict:   make([]statsVerdictCount, 0, len(a.selfReview.byVerdict)),
-		CapReachedRuns:   a.selfReview.capReachedRuns,
-		UnparsedRuns:     a.selfReview.unparsedRuns,
-	}
-	if a.selfReview.runsWithMetadata > 0 {
-		sr.MeanIterations = new(round2(float64(a.selfReview.iterationSum) / float64(a.selfReview.runsWithMetadata)))
-	}
-	for verdict, count := range a.selfReview.byVerdict {
-		sr.ByFinalVerdict = append(sr.ByFinalVerdict, statsVerdictCount{Verdict: verdict, Runs: count})
-	}
-	slices.SortFunc(sr.ByFinalVerdict, func(x, y statsVerdictCount) int {
-		return strings.Compare(x.Verdict, y.Verdict)
-	})
-	return sr
-}
-
-// degradedSchemaWarning names the figures the report leaves out and states
-// the remedy. It MUST NOT be called when caps is full.
-//
-// A partly migrated database is the common case, and on it the two lists
-// differ: the report falls back to the basic figures wholesale, so it drops
-// groups this database does carry as well as the ones it never recorded.
-// Naming only the unrecorded groups would let a reader conclude the
-// remaining figures are present when they are not.
-func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
-	groups := []struct {
-		recorded bool
-		name     string
-	}{
-		{caps.HasTurnsCompleted, "turns"},
-		{caps.HasReviewMetadata, "self-review results"},
-		{caps.HasRuleRouting, "dispatch-rule routing"},
-		{caps.HasTokens, "tokens and cost"},
-		{caps.HasTokenMeasurement, "which runs the coding agent could measure"},
-	}
-
-	var unrecorded, dropped []string
-	for _, g := range groups {
-		if g.recorded {
-			dropped = append(dropped, g.name)
-		} else {
-			unrecorded = append(unrecorded, g.name)
-		}
-	}
-
-	if len(dropped) == 0 {
-		return fmt.Sprintf(
-			"this database was written before sortie recorded %s, so the report leaves them out. "+
-				"Run sortie once with this workflow to add them.",
-			strings.Join(unrecorded, ", "))
-	}
-	return fmt.Sprintf(
-		"this database was written before sortie recorded %s. The report falls back to run counts and "+
-			"durations, so it also leaves out %s, which this database does carry. "+
-			"Run sortie once with this workflow to get the full report.",
-		strings.Join(unrecorded, ", "), strings.Join(dropped, ", "))
+	return agg.Report(generatedAt, src.workflowPath, src.dbPath, since, until, src.rateWarnings), nil
 }
 
 // formatShare renders a 0..1 fraction as a one-decimal percentage.
@@ -661,16 +109,16 @@ func formatSecondsDash(v *float64) string {
 	return server.FormatDuration(time.Duration(*v * float64(time.Second)))
 }
 
-// formatStatsDuration renders a statsDuration's p50, p95, mean, and
+// formatStatsDuration renders a [runstats.Duration]'s p50, p95, mean, and
 // sample count on one line.
-func formatStatsDuration(d statsDuration) string {
+func formatStatsDuration(d runstats.Duration) string {
 	return fmt.Sprintf("p50 %s   p95 %s   mean %s   samples %d",
 		formatSecondsDash(d.P50), formatSecondsDash(d.P95), formatSecondsDash(d.Mean), d.Samples)
 }
 
-// formatStatsTokens renders a statsTokens's five sums on one line, or
+// formatStatsTokens renders a [runstats.Tokens]'s five sums on one line, or
 // "-" when t is nil.
-func formatStatsTokens(t *statsTokens) string {
+func formatStatsTokens(t *runstats.Tokens) string {
 	if t == nil {
 		return "-"
 	}
@@ -681,7 +129,7 @@ func formatStatsTokens(t *statsTokens) string {
 
 // formatTokensTotalDash renders only t's Total field, or "-" when t is
 // nil, for the "total tokens" group table column.
-func formatTokensTotalDash(t *statsTokens) string {
+func formatTokensTotalDash(t *runstats.Tokens) string {
 	if t == nil {
 		return "-"
 	}
@@ -697,10 +145,35 @@ func formatTokensTotalDash(t *statsTokens) string {
 // Cells are tab-separated and flushed through a tabwriter so every column
 // lines up at the width of its widest cell. A row is never written
 // directly to w.
-func renderStatsGroupTable(w io.Writer, title, dimLabel string, groups []statsGroup, full, isOutcomeTable bool) {
+func renderStatsGroupTable(w io.Writer, title, dimLabel string, groups []runstats.Group, full, isOutcomeTable bool) {
 	fmt.Fprintln(w, title) //nolint:errcheck // stdout write failure is unrecoverable
 
-	header := []string{dimLabel, "runs"}
+	table := newStatsTable(w)
+	writeStatsRow(table, upperAll(append([]string{dimLabel}, statsGroupHeader(full, isOutcomeTable)...)))
+	for _, g := range groups {
+		writeStatsRow(table, append([]string{g.Name}, statsGroupCells(g, full, isOutcomeTable)...))
+	}
+	table.Flush() //nolint:errcheck,gosec // stdout write failure is unrecoverable
+}
+
+// renderStatsChainTable prints the "by stage chain" section: the first
+// statsChainTextRows entries, with the chain, issue, stage path, and last
+// hop result ahead of the figures of a non-outcome breakdown.
+func renderStatsChainTable(w io.Writer, chains []runstats.ChainGroup, full bool) {
+	fmt.Fprintln(w, "by stage chain") //nolint:errcheck // stdout write failure is unrecoverable
+
+	table := newStatsTable(w)
+	writeStatsRow(table, upperAll(append([]string{"chain", "issue", "stages", "last hop"}, statsGroupHeader(full, false)...)))
+	for _, c := range chains[:min(len(chains), statsChainTextRows)] {
+		lead := []string{c.Name, c.Issue, strings.Join(c.Stages, " -> "), cmp.Or(c.LastHop, "-")}
+		writeStatsRow(table, append(lead, statsGroupCells(c.Group, full, false)...))
+	}
+	table.Flush() //nolint:errcheck,gosec // stdout write failure is unrecoverable
+}
+
+// statsGroupHeader returns the header cells that follow a group's name.
+func statsGroupHeader(full, isOutcomeTable bool) []string {
+	header := []string{"runs"}
 	if isOutcomeTable {
 		header = append(header, "share")
 	} else {
@@ -710,28 +183,27 @@ func renderStatsGroupTable(w io.Writer, title, dimLabel string, groups []statsGr
 	if full {
 		header = append(header, "turns", "total tokens", "cost")
 	}
+	return header
+}
 
-	table := newStatsTable(w)
-	writeStatsRow(table, upperAll(header))
-
-	for _, g := range groups {
-		row := []string{g.Name, strconv.Itoa(g.Runs)}
-		if isOutcomeTable {
-			row = append(row, formatShare(g.Share))
-		} else {
-			row = append(row, strconv.Itoa(g.Succeeded), formatShare(g.SuccessRate))
-		}
-		row = append(row,
-			formatSecondsDash(g.Duration.P50), formatSecondsDash(g.Duration.P95), formatSecondsDash(g.Duration.Mean))
-		if full {
-			row = append(row,
-				formatFloatDash(g.MeanTurns, "%.1f"),
-				formatTokensTotalDash(g.Tokens),
-				formatCostDash(g.CostUSD))
-		}
-		writeStatsRow(table, row)
+// statsGroupCells returns the row cells that follow a group's name, in
+// the order of [statsGroupHeader].
+func statsGroupCells(g runstats.Group, full, isOutcomeTable bool) []string {
+	cells := []string{strconv.Itoa(g.Runs)}
+	if isOutcomeTable {
+		cells = append(cells, formatShare(g.Share))
+	} else {
+		cells = append(cells, strconv.Itoa(g.Succeeded), formatShare(g.SuccessRate))
 	}
-	table.Flush() //nolint:errcheck,gosec // stdout write failure is unrecoverable
+	cells = append(cells,
+		formatSecondsDash(g.Duration.P50), formatSecondsDash(g.Duration.P95), formatSecondsDash(g.Duration.Mean))
+	if full {
+		cells = append(cells,
+			formatFloatDash(g.MeanTurns, "%.1f"),
+			formatTokensTotalDash(g.Tokens),
+			formatCostDash(g.CostUSD))
+	}
+	return cells
 }
 
 // newStatsTable returns a tabwriter that indents every row by two spaces
@@ -758,7 +230,7 @@ func upperAll(cells []string) []string {
 }
 
 // renderStatsSelfReview prints the "self review" section.
-func renderStatsSelfReview(w io.Writer, sr *statsSelfReview) {
+func renderStatsSelfReview(w io.Writer, sr *runstats.SelfReview) {
 	fmt.Fprintln(w, "self review") //nolint:errcheck // stdout write failure is unrecoverable
 	if sr == nil {
 		return
@@ -776,7 +248,7 @@ func renderStatsSelfReview(w io.Writer, sr *statsSelfReview) {
 
 // statsFootnotes returns one line per non-zero disclosure counter in s,
 // naming the counter's value and its cause.
-func statsFootnotes(s statsSummary) []string {
+func statsFootnotes(s runstats.Summary, chains int) []string {
 	var lines []string
 	if s.ZeroDurationRuns > 0 {
 		lines = append(lines, fmt.Sprintf(
@@ -797,6 +269,11 @@ func statsFootnotes(s statsSummary) []string {
 		lines = append(lines, fmt.Sprintf(
 			"note: the cost figures skip %d of these runs, because token_rates has no price for the coding agent behind them.",
 			s.CostUnpricedRuns))
+	}
+	if chains > statsChainTextRows {
+		lines = append(lines, fmt.Sprintf(
+			"note: the breakdown by stage chain shows the %d stage chains with the most runs; --format json lists all %d.",
+			statsChainTextRows, chains))
 	}
 	return lines
 }
@@ -828,7 +305,7 @@ func emptyRangeMessage(since, until *string) string {
 
 // renderStatsText writes report to stdout in text form and writes
 // report.Warnings, one per line, to stderr.
-func renderStatsText(stdout, stderr io.Writer, report statsReport) {
+func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 	fmt.Fprintf(stdout, "workflow:  %s\n", report.WorkflowPath)                          //nolint:errcheck // stdout write failure is unrecoverable
 	fmt.Fprintf(stdout, "database:  %s\n", report.DBPath)                                //nolint:errcheck // stdout write failure is unrecoverable
 	fmt.Fprintf(stdout, "covering:  %s\n", formatStatsRange(report.Since, report.Until)) //nolint:errcheck // stdout write failure is unrecoverable
@@ -843,8 +320,8 @@ func renderStatsText(stdout, stderr io.Writer, report statsReport) {
 
 	full := report.SchemaTier == "full"
 
-	fmt.Fprintf(stdout, "runs %d   succeeded %d (%s)\n", //nolint:errcheck // stdout write failure is unrecoverable
-		report.Summary.Runs, report.Summary.Succeeded, formatShare(report.Summary.SuccessRate))
+	fmt.Fprintf(stdout, "runs %d   issues %d   succeeded %d (%s)\n", //nolint:errcheck // stdout write failure is unrecoverable
+		report.Summary.Runs, report.Summary.Issues, report.Summary.Succeeded, formatShare(report.Summary.SuccessRate))
 	fmt.Fprintf(stdout, "duration (succeeded)    %s\n", formatStatsDuration(report.Summary.Duration)) //nolint:errcheck // stdout write failure is unrecoverable
 	if full {
 		fmt.Fprintf(stdout, "turns (succeeded)       %s\n", //nolint:errcheck // stdout write failure is unrecoverable
@@ -854,7 +331,7 @@ func renderStatsText(stdout, stderr io.Writer, report statsReport) {
 		case report.Summary.CostUSD != nil:
 			fmt.Fprintf(stdout, "cost (measured runs)    %s   per succeeded run %s\n", //nolint:errcheck // stdout write failure is unrecoverable
 				server.FormatCost(*report.Summary.CostUSD), formatCostDash(report.Summary.CostPerSucceededRunUSD))
-		case report.Summary.CostUnpricedRuns == 0 && report.Summary.Tokens != nil:
+		case !report.RatesConfigured && report.Summary.Tokens != nil:
 			fmt.Fprintln(stdout, //nolint:errcheck // stdout write failure is unrecoverable
 				"cost                    not estimated; set token_rates in the workflow to price these runs")
 		default:
@@ -871,11 +348,27 @@ func renderStatsText(stdout, stderr io.Writer, report statsReport) {
 		renderStatsGroupTable(stdout, "by dispatch rule", "rule", report.ByRule, full, false)
 		fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 		renderStatsGroupTable(stdout, "by prompt template", "template", report.ByTemplate, full, false)
+		if len(report.ByModel) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsGroupTable(stdout, "by configured model", "model", report.ByModel, full, false)
+		}
+		if len(report.ByChain) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsChainTable(stdout, report.ByChain, full)
+		}
+		if len(report.ByTrigger) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsGroupTable(stdout, "by retry trigger", "trigger", report.ByTrigger, full, false)
+		}
+		if len(report.ByOrigin) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsGroupTable(stdout, "by run origin", "origin", report.ByOrigin, full, false)
+		}
 		fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 		renderStatsSelfReview(stdout, report.SelfReview)
 	}
 
-	if footnotes := statsFootnotes(report.Summary); len(footnotes) > 0 {
+	if footnotes := statsFootnotes(report.Summary, len(report.ByChain)); len(footnotes) > 0 {
 		fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 		for _, note := range footnotes {
 			fmt.Fprintln(stdout, note) //nolint:errcheck // stdout write failure is unrecoverable
@@ -933,12 +426,13 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 
-	since, err := parseRangeBound(*sinceRaw)
+	now := statsNow().UTC()
+	since, err := runstats.ParseRangeBound(*sinceRaw, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "sortie stats: --since: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return 1
 	}
-	until, err := parseRangeBound(*untilRaw)
+	until, err := runstats.ParseRangeBound(*untilRaw, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "sortie stats: --until: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return 1
@@ -966,34 +460,15 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	}
 
 	dbPath := resolveDBPath(cfg.DBPath, filepath.Dir(path))
-	store, err := persistence.OpenReadOnly(ctx, dbPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "sortie stats: open database %s: %s\n", dbPath, err) //nolint:errcheck // stderr write failure is unrecoverable
-		return 1
-	}
-	defer store.Close() //nolint:errcheck,gosec // read-only handle; close error is non-actionable
-
-	caps, err := store.RunHistoryCapabilities(ctx)
-	if err != nil {
-		fmt.Fprintf(stderr, "sortie stats: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
-		return 1
-	}
-
 	rawTokenRates, tokenRatesPresent := cfg.ExtensionValue("token_rates")
 	rates, rateWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
-	agg := newStatsAggregator(caps, rates)
-	if err := store.ScanRunHistoryRange(ctx, caps, since, until, agg.add); err != nil {
+	src := statsSource{dbPath: dbPath, workflowPath: path, rates: rates, rateWarnings: rateWarnings}
+	report, err := src.report(ctx, since, until, now)
+	if err != nil {
 		fmt.Fprintf(stderr, "sortie stats: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return 1
 	}
-
-	warnings := rateWarnings
-	if !caps.Full() {
-		warnings = append([]string{degradedSchemaWarning(caps)}, warnings...)
-	}
-
-	report := agg.report(statsNow().UTC(), path, dbPath, since, until, warnings)
 
 	if *format == "json" {
 		if err := writeJSON(stdout, report); err != nil {

@@ -2,7 +2,7 @@
 
 What to know before you change `internal/scm/gitlab`: the design decisions behind it, the places GitLab's model does not line up with ours, and the traps that cost someone a day.
 
-Last updated: 2026-08-23
+Last updated: 2026-10-10
 
 ## Shape of the package
 
@@ -74,7 +74,7 @@ The two failure modes are usefully distinguishable in the response: an unencoded
 
 GitLab issues are natively open or closed with no workflow engine, so the adapter derives state from labels, the same convention the GitHub and Gitea adapters use. The derivation rule itself lives in `internal/issuekit`; the adapter contributes only GitLab's spelling of the two native statuses and the wire decode.
 
-**A whole transition is one request.** The issue update route takes the state change and the label additions and removals together and applies them atomically, so there is no window in which an issue carries a terminal label while still open. Gitea needs up to five requests for the same outcome. When both lists name the same label, removal wins.
+**The labels of a transition are one request, and the state change is another.** The issue update route takes the label additions and removals together, and the adapter confirms the response carries the target label and none of the stale ones. The route commits a `state_event` before the labels of the same request, so a close or reopen would land before the labels it belongs with. The state change therefore travels alone, ordered against the label request so that every reading between the two is the start state or the target. When both lists name the same label, removal wins.
 
 **Labels are created on demand by an attach.** Naming a label that does not exist creates it as a project label and attaches it. That removes the label-hygiene problem that forced the Gitea adapter into an explicit create-on-missing policy: no name-to-id resolution, no separate create call, no silent no-op.
 
@@ -87,6 +87,12 @@ The mitigation is normative and lives at construction: **resolve the canonical s
 **Scoped labels do not enforce exclusivity on the floor.** The `key::value` convention is the obvious mechanism for mutually exclusive workflow states, and its automatic exclusivity is a paid feature. On the Community floor the separator is just two characters in a name, and it fails open rather than loudly: both values coexist on the issue. So the adapter always removes the previous state label explicitly, and operators may use the convention for readability without the adapter's behavior depending on it.
 
 **GitLab performs no concurrency control on issue updates.** Two simultaneous writers with opposing label deltas both succeed, with no conflict signal, and interleave nondeterministically. Two writers against one project silently corrupt each other's state; there is no server-side remedy to reach for.
+
+**An update the token may not make still answers 200.** A token without the permission to edit an issue's labels gets a successful response from the update route, with the labels unchanged. The status therefore proves nothing, so both label writes read the label list from the response and treat a list that contradicts the write as `tracker_payload_error`. The response carries the full list, so no second read follows an accepted write.
+
+**`remove_labels` matches names exactly.** A stored `Sortie:Review` is not removed by `sortie:review`, and a project holding both spellings needs both named. Removal reads the issue's labels, selects every spelling that names the requested label regardless of letter case, and sends them together in one `remove_labels` update. The merge request label command uses the same constructor on the merge request route, and trims its label first.
+
+**A label with only white space is refused.** The add trims the label before it looks up the stored casing, so a label with surrounding white space attaches its trimmed spelling and then fails the confirmation, which compares the label as given. A label with nothing but white space returns `tracker_payload_error` without sending a request.
 
 ## Blockers are structurally unavailable on the floor
 
@@ -119,6 +125,8 @@ State filtering stays client-side. The server-side label filter is AND across na
 Two more properties of that route: it defaults to **newest-first**, so ascending order is requested explicitly, and it **paginates**, unlike Gitea's equivalent.
 
 Internal notes are passed through. They are genuine human comments, and an operator who does not want them in prompts controls that by not writing them.
+
+**A note that carries agent text must not expose it to slash commands.** A recognized slash command at the start of a line in a note body runs as a quick action, so a literal `/close` in agent text would close the issue. A comment that carries agent text is therefore the text, a blank line, a Markdown fence, the literal, and the same fence, with the fence one backtick longer than the longest backtick run in the literal and at least three. GitLab extracts quick actions from rendered Markdown paragraphs only, so no line inside the fence runs, whatever it starts with. The guard for Sortie's own text is unchanged: a body consumed entirely as quick actions creates no note and is reported as a payload error.
 
 **There is a true batch state lookup**, which neither sibling adapter has: one request resolves many issues by their internal ids. Reconciliation for N running issues costs one request instead of N. Two caveats: the batch must request all states so a just-closed issue is still reported, and it must be **chunked**, because the request is a query string and a long enough one meets a URI-length limit imposed by the front-end web server rather than by GitLab.
 
@@ -222,7 +230,11 @@ The pipeline scope on that route is load-bearing rather than defensive: a commit
 
 **A commit-status entry is not always a job.** Jobs and external statuses share one identifier space, so the status list mixes entries whose id works on the job-log route with entries whose id does not, and nothing in the entry's own fields separates them. Resolve the real job set from the pipeline's jobs route and select only from entries appearing there, rather than calling the log route speculatively and reading a not-found as a negative. When the first failing entry is an external status, leave the log excerpt empty rather than fabricating one.
 
-**The job log is not plain text.** Every line carries three layers of markup: a high-precision timestamp, a stream token marking stdout or stderr and line continuation, and ANSI escape sequences plus collapsible-section markers with literal control bytes. Handing that to an agent puts terminal control bytes into a prompt. Strip all three layers, not only the ANSI one. The route also supports no partial fetch, so the whole trace is read and truncated client-side to the configured line budget, taking the tail.
+**The job log is not plain text.** Every line carries three layers of markup: a high-precision timestamp, a stream token marking stdout or stderr and line continuation, and ANSI escape sequences plus collapsible-section markers with literal control bytes. Handing that to an agent puts terminal control bytes into a prompt. Strip all three layers, not only the ANSI one.
+
+The route supports no partial fetch, so the trace is streamed up to the read ceiling. The excerpt is anchored on the stage in which the job stopped, not on the end of the trace. The section markers are the stage boundaries, so read them before stripping them. The anchor is the last runner stage that started before the first post-script stage (`after_script`, the cache and artifact uploads, cleanup); sections the job's own script writes are never the anchor.
+
+A failing `after_script` under `AFTER_SCRIPT_IGNORE_ERRORS: "false"` is not located as the failing stage; the excerpt covers the script stage that succeeded.
 
 ## The merge call
 

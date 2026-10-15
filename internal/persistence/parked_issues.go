@@ -17,24 +17,57 @@ type ParkedIssue struct {
 	Label        string // parking label the orchestrator applied
 	LabelApplied bool
 	ParkedAt     string // RFC 3339
+	IssueTitle   string // tracker title as read for the park; empty when unread
+	IssueURL     string // tracker web link as read for the park; empty when unread
+
+	// IssueType and IssueLabels are the tracker's issue type and labels as
+	// read for the park; IssueLabels is nil when the labels were never read.
+	IssueType   string
+	IssueLabels []string
+
+	// RuleName, AgentKind, ConfiguredModel, StagePrevious,
+	// StagePreviousOutcome, ChainID, and DispatchedAt describe the run the
+	// park follows. All are empty when the park records no run.
+	RuleName             string
+	AgentKind            string
+	ConfiguredModel      string
+	StagePrevious        string
+	StagePreviousOutcome string
+	ChainID              string
+	DispatchedAt         string // RFC 3339 with nanoseconds, UTC
 }
 
 // UpsertParkedIssue persists a park record using upsert semantics. If a
 // record for entry.IssueID already exists, it is replaced entirely.
 func (s *Store) UpsertParkedIssue(ctx context.Context, entry ParkedIssue) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO parked_issues (issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO parked_issues (issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at, issue_title, issue_url,
+			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (issue_id) DO UPDATE SET
-			identifier    = excluded.identifier,
-			display_id    = excluded.display_id,
-			reason        = excluded.reason,
-			parked_state  = excluded.parked_state,
-			label         = excluded.label,
-			label_applied = excluded.label_applied,
-			parked_at     = excluded.parked_at`,
+			identifier             = excluded.identifier,
+			display_id             = excluded.display_id,
+			reason                 = excluded.reason,
+			parked_state           = excluded.parked_state,
+			label                  = excluded.label,
+			label_applied          = excluded.label_applied,
+			parked_at              = excluded.parked_at,
+			issue_title            = excluded.issue_title,
+			issue_url              = excluded.issue_url,
+			rule_name              = excluded.rule_name,
+			agent_kind             = excluded.agent_kind,
+			configured_model       = excluded.configured_model,
+			stage_previous         = excluded.stage_previous,
+			stage_previous_outcome = excluded.stage_previous_outcome,
+			chain_id               = excluded.chain_id,
+			dispatched_at          = excluded.dispatched_at,
+			issue_type             = excluded.issue_type,
+			issue_labels           = excluded.issue_labels`,
 		entry.IssueID, entry.Identifier, entry.DisplayID, entry.Reason, entry.ParkedState,
-		entry.Label, entry.LabelApplied, entry.ParkedAt,
+		entry.Label, entry.LabelApplied, entry.ParkedAt, entry.IssueTitle, entry.IssueURL,
+		entry.RuleName, entry.AgentKind, entry.ConfiguredModel, entry.StagePrevious,
+		entry.StagePreviousOutcome, entry.ChainID, entry.DispatchedAt, entry.IssueType,
+		encodeIssueLabels(entry.IssueLabels),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert parked issue %q: %w", entry.IssueID, err)
@@ -68,7 +101,8 @@ func (s *Store) DeleteParkedIssue(ctx context.Context, issueID string) error {
 // unspecified. Returns an empty slice (not nil) when no records exist.
 func (s *Store) ListParkedIssues(ctx context.Context) ([]ParkedIssue, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at
+		`SELECT issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at, issue_title, issue_url,
+			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels
 		FROM parked_issues`)
 	if err != nil {
 		return nil, fmt.Errorf("list parked issues: %w", err)
@@ -79,11 +113,15 @@ func (s *Store) ListParkedIssues(ctx context.Context) ([]ParkedIssue, error) {
 	for rows.Next() {
 		var e ParkedIssue
 		var displayID sql.NullString
+		var labels string
 		if err := rows.Scan(&e.IssueID, &e.Identifier, &displayID, &e.Reason, &e.ParkedState,
-			&e.Label, &e.LabelApplied, &e.ParkedAt); err != nil {
+			&e.Label, &e.LabelApplied, &e.ParkedAt, &e.IssueTitle, &e.IssueURL,
+			&e.RuleName, &e.AgentKind, &e.ConfiguredModel, &e.StagePrevious, &e.StagePreviousOutcome,
+			&e.ChainID, &e.DispatchedAt, &e.IssueType, &labels); err != nil {
 			return nil, fmt.Errorf("scan parked issue: %w", err)
 		}
 		e.DisplayID = displayID.String
+		e.IssueLabels = decodeIssueLabels(labels)
 		entries = append(entries, e)
 	}
 	if err := rows.Err(); err != nil {

@@ -73,11 +73,6 @@ func (f *labelReviewSCMFake) DeleteBranch(_ context.Context, _, _, _ string) err
 	return nil
 }
 
-// labelReviewSCMPanicOnOthers panics if any SCMAdapter method other than
-// ListLabelEvents or RemoveLabel is called. Used to assert that label-review
-// detection reads only the journal substrate, never a label-snapshot method
-// (domain.SCMAdapter exposes no such method, but a future accidental import
-// of one would be caught here).
 type labelReviewSCMPanicOnOthers struct {
 	events []domain.LabelEvent
 }
@@ -109,7 +104,7 @@ func (p *labelReviewSCMPanicOnOthers) GetCIStatus(_ context.Context, _ int, _, _
 }
 
 func (p *labelReviewSCMPanicOnOthers) GetMergeability(_ context.Context, _ int, _, _ string) (domain.PRMergeStatus, error) {
-	panic("GetMergeability must not be called by the label-review reconcile")
+	return domain.PRMergeStatus{}, nil
 }
 
 func (p *labelReviewSCMPanicOnOthers) MergePR(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
@@ -126,6 +121,8 @@ func (p *labelReviewSCMPanicOnOthers) DeleteBranch(_ context.Context, _, _, _ st
 // value. Only the fingerprint methods carry behavior; the rest satisfy the
 // interface.
 type labelReviewFingerprintStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	marks  map[string]string
@@ -291,6 +288,7 @@ func TestReconcileLabelReviewCommands_Dispatch(t *testing.T) {
 	const issueID = "LR-D1"
 	state := stateWithLabelReviewPending(t, issueID, 42)
 	rkey := ReactionKey(issueID, ReactionKindLabelReview)
+	state.PendingReactions[rkey].RuleSettingsApplied = true
 	scm := &labelReviewSCMFake{
 		events: []domain.LabelEvent{
 			labelEvent("1", "sortie:review", "alice", true, labelReviewBaseTime.Add(-1*time.Minute)),
@@ -314,6 +312,9 @@ func TestReconcileLabelReviewCommands_Dispatch(t *testing.T) {
 	if retry.AgentKind != "mock" || retry.RuleName != "default" || retry.TemplateID != "tmpl-1" {
 		t.Errorf("RetryEntry frozen dispatch fields = (%q, %q, %q), want (mock, default, tmpl-1)",
 			retry.AgentKind, retry.RuleName, retry.TemplateID)
+	}
+	if !retry.RuleSettingsApplied {
+		t.Error("RetryEntry.RuleSettingsApplied = false, want the pending reaction's flag carried")
 	}
 
 	raw, ok := retry.ContinuationContext["label_review"]
@@ -501,7 +502,7 @@ func TestReconcileLabelReviewCommands_DepthOneWhileRunning(t *testing.T) {
 
 	const issueID = "LR-RUN"
 	state := stateWithLabelReviewPending(t, issueID, 10)
-	state.Running[issueID] = &RunningEntry{Identifier: issueID + "-ident"}
+	state.Running[issueID] = &RunningEntry{Identifier: issueID + "-ident", ReactionKind: ReactionKindLabelReview}
 
 	scm := &labelReviewSCMFake{
 		events: []domain.LabelEvent{
@@ -917,9 +918,6 @@ func TestReconcileLabelReviewCommands_DispatchLogsActorAndPRNumber(t *testing.T)
 	}
 }
 
-// TestReconcileLabelReviewCommands_JournalSubstrateNotSnapshot verifies that
-// detection uses only ListLabelEvents (the journal substrate); no other
-// SCMAdapter method is ever called for label-review detection or dispatch.
 func TestReconcileLabelReviewCommands_JournalSubstrateNotSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -990,6 +988,67 @@ func TestReconcileLabelCommands_StopPollingAfterTerminal(t *testing.T) {
 	}
 }
 
+func TestReconcileLabelCommands_DispatchesOnceOtherKindSessionEnds(t *testing.T) {
+	t.Parallel()
+
+	const issueID = "LBL-DEFER"
+
+	tests := []struct {
+		name      string
+		kind      string
+		label     string
+		state     func(t *testing.T) *State
+		params    func(ReconcileStore, domain.SCMAdapter) ReconcileParams
+		reconcile func(*State, ReconcileParams)
+	}{
+		{
+			name:   "label_review",
+			kind:   ReactionKindLabelReview,
+			label:  "sortie:review",
+			state:  func(t *testing.T) *State { return stateWithLabelReviewPending(t, issueID, 10) },
+			params: labelReviewParams,
+			reconcile: func(s *State, p ReconcileParams) {
+				reconcileLabelReviewCommands(s, p, discardLogger(), context.Background(), &domain.NoopMetrics{})
+			},
+		},
+		{
+			name:   "label_fix",
+			kind:   ReactionKindLabelFix,
+			label:  "sortie:fix",
+			state:  func(t *testing.T) *State { return stateWithLabelFixPending(t, issueID, 10, "feature/lbl-defer") },
+			params: labelFixParams,
+			reconcile: func(s *State, p ReconcileParams) {
+				reconcileLabelFixCommands(s, p, discardLogger(), context.Background(), &domain.NoopMetrics{})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := tt.state(t)
+			state.Running[issueID] = &RunningEntry{Identifier: issueID + "-ident", ReactionKind: ReactionKindCI}
+			scm := &labelReviewSCMFake{
+				events: []domain.LabelEvent{
+					labelEvent("1", tt.label, "alice", true, labelReviewBaseTime.Add(-1*time.Minute)),
+				},
+			}
+			params := tt.params(newLabelReviewFingerprintStore(), scm)
+
+			tt.reconcile(state, params)
+			delete(state.Running, issueID)
+			params.NowFunc = func() time.Time { return labelReviewBaseTime.Add(time.Hour) }
+			tt.reconcile(state, params)
+
+			retry := state.RetryAttempts[issueID]
+			if retry == nil || retry.ReactionKind != tt.kind {
+				t.Errorf("RetryAttempts[%q] = %+v, want a retry of kind %q", issueID, retry, tt.kind)
+			}
+		})
+	}
+}
+
 func TestLabelReviewMark_FixedWidthAndOrdering(t *testing.T) {
 	t.Parallel()
 
@@ -1051,17 +1110,14 @@ func TestBuildLabelReviewMap_FieldMapping(t *testing.T) {
 	}
 }
 
-// TestReconcileLabelReviewCommands_ForeignIncumbentDefers covers the first
-// arm of the three-way decision: a confirmed command with a foreign
-// incumbent occupying the retry slot defers instead of dispatching. The
-// fingerprint mark, the high-water mark, and the label must all stay
-// untouched, and the pending entry re-enqueues with a refreshed CreatedAt.
 func TestReconcileLabelReviewCommands_ForeignIncumbentDefers(t *testing.T) {
 	t.Parallel()
 
 	const issueID = "LR-FOREIGN"
 	state := stateWithLabelReviewPending(t, issueID, 10)
 	rkey := ReactionKey(issueID, ReactionKindLabelReview)
+	seededAt := labelReviewBaseTime.Add(-5 * time.Minute)
+	state.PendingReactions[rkey].CreatedAt = seededAt
 	state.RetryAttempts[issueID] = &RetryEntry{
 		IssueID:      issueID,
 		Attempt:      1,
@@ -1082,8 +1138,8 @@ func TestReconcileLabelReviewCommands_ForeignIncumbentDefers(t *testing.T) {
 	if !ok {
 		t.Fatal("PendingReactions entry dropped on a defer; want re-enqueued")
 	}
-	if !entry.CreatedAt.Equal(labelReviewBaseTime) {
-		t.Errorf("CreatedAt = %v, want refreshed to %v", entry.CreatedAt, labelReviewBaseTime)
+	if !entry.CreatedAt.Equal(seededAt) {
+		t.Errorf("CreatedAt = %v, want %v (a deferral leaves it unchanged)", entry.CreatedAt, seededAt)
 	}
 	incumbent := state.RetryAttempts[issueID]
 	if incumbent.ReactionKind != ReactionKindCI {
@@ -1147,3 +1203,13 @@ func TestReconcileLabelReviewCommands_SameKindCollapseAdvancesMarkAndReenqueues(
 		t.Errorf("HighWaterMark = %q, want %q", data.HighWaterMark, labelReviewMark(event))
 	}
 }
+
+func (s *labelReviewFingerprintStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *labelReviewFingerprintStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *labelReviewFingerprintStore) DeleteStageHop(context.Context, string) error { return nil }

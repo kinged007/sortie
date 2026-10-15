@@ -17,6 +17,8 @@ An agent orchestrator that ships as one statically-linked binary with no runtime
 - **Integration tests are env-gated** by a per-adapter `SORTIE_<ADAPTER>_TEST=1`. Without the gate set they must skip cleanly — never fail.
 - **`workflow.Manager.Reload()` is fail-safe.** On parse or validation error the previous `currentConfig` and `currentPrompt` are retained and `LastLoadError()` reports the failure. Preserve that invariant; never `os.Exit` on a bad WORKFLOW.md.
 - **Prompt templates render with `Option("missingkey=error")`.** Adding a template variable without wiring its data field is a runtime error, not an empty string.
+- **The dashboard draws structure with layout, never with characters.** No Unicode arrows, check marks, bullets or box glyphs to connect or mark values (`a → b`, `✓ done`), and no ` · ` separator where a column, a second line, a chip or a stepper can carry the split. Glyphs come from `web/src/components/icons.tsx`.
+- **The dashboard's build output under `internal/server/ui/dist` is committed.** `make ui-build` regenerates it from `web/`; commit it with the sources it was built from, and resolve a conflict in it by rebuilding, never by hand.
 
 ## Boundaries
 
@@ -24,6 +26,7 @@ An agent orchestrator that ships as one statically-linked binary with no runtime
 
 - Read the architecture section your task touches before implementing. Drift from the spec is a bug.
 - Implement adapter integrations as new packages behind the existing Go interface — additive only.
+- Keep documentation true in the same change. Whenever a spec, plan or code change alters the API or behavior (a feature, a fix, a refactor that changes a contract), find every document it makes wrong (architecture sections, `docs/workflow-reference.md`, adapter notes, guides, env and config references, event and API schemas, `CHANGELOG.md`) and update it in that change. A task that never mentions docs, or names only some of them, does not exempt the rest. Accepted ADRs in `docs/decisions/*.md` keep their Ask-first protection: report them as stale instead of editing them.
 
 ### Ask first
 

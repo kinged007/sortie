@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
@@ -966,6 +969,265 @@ func TestRuntimeSnapshot(t *testing.T) {
 	})
 }
 
+func TestRuntimeSnapshot_ConfiguredSettingsBesideTheReportedModel(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+	state.Running["ISS-1"] = &RunningEntry{
+		Issue: domain.Issue{ID: "ISS-1"}, StartedAt: now, RuleName: "cheap",
+		ConfiguredModel: "configured-model", ConfiguredEffort: "low", ModelName: "reported-model",
+	}
+
+	result := RuntimeSnapshot(state, now)
+
+	if len(result.Running) != 1 {
+		t.Fatalf("len(Running) = %d, want 1", len(result.Running))
+	}
+	if got := result.Running[0]; got.RuleName != "cheap" || got.ConfiguredModel != "configured-model" || got.ConfiguredEffort != "low" || got.ModelName != "reported-model" {
+		t.Errorf("snapshot rule, configured model, configured effort, model_name = %q, %q, %q, %q, want %q, %q, %q, %q",
+			got.RuleName, got.ConfiguredModel, got.ConfiguredEffort, got.ModelName, "cheap", "configured-model", "low", "reported-model")
+	}
+}
+
+func TestRuntimeSnapshot_StagePosition(t *testing.T) {
+	t.Parallel()
+
+	chains := [][]string{{"specify", "implement"}, {"triage", "implement"}}
+	tests := []struct {
+		name     string
+		chains   [][]string
+		rule     string
+		previous string
+		hops     int
+		want     *SnapshotStagePosition
+	}{
+		{"no chains configured", nil, "specify", "", 0, nil},
+		{"first stage of the first chain", chains, "specify", "", 0,
+			&SnapshotStagePosition{Chain: chains[0], Current: "specify", HopCeiling: 4}},
+		{"previous rule selects the chain that lists it before the rule", chains, "implement", "triage", 2,
+			&SnapshotStagePosition{Chain: chains[1], Current: "implement", HopCount: 2, HopCeiling: 4}},
+		{"previous rule on no chain falls back to the first chain holding the rule", chains, "implement", "gone", 1,
+			&SnapshotStagePosition{Chain: chains[0], Current: "implement", HopCount: 1, HopCeiling: 4}},
+		{"rule on no chain", chains, "review", "", 0, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			state.StageChains, state.HopCeiling = tt.chains, 4
+			lineage := StageLineage{PreviousRule: tt.previous}
+			agent := RuleAgent{AgentKind: "claude-code", ConfiguredModel: "sonnet"}
+			state.RuleAgents = map[string]RuleAgent{tt.rule: agent}
+			state.Running["run"] = &RunningEntry{Issue: domain.Issue{ID: "run"}, RuleName: tt.rule, StageLineage: lineage}
+			state.RetryAttempts["retry"] = &RetryEntry{IssueID: "retry", RuleName: tt.rule, StageLineage: lineage}
+			state.BudgetExhausted["budget"] = &BudgetExhaustedEntry{RuleName: tt.rule, StageLineage: lineage}
+			state.Parked["parked"] = &ParkedEntry{RuleName: tt.rule, StageLineage: lineage}
+			state.PendingReactions[ReactionKey("pending", ReactionKindCI)] = &PendingReaction{IssueID: "pending", Kind: ReactionKindCI, RuleName: tt.rule, StageLineage: lineage}
+			state.StageHops["hop"] = &StageHopEntry{SourceRule: tt.previous, TargetRule: tt.rule, Count: tt.hops}
+			if tt.hops > 0 {
+				for _, id := range []string{"run", "retry", "budget", "parked", "pending"} {
+					state.StageHops[id] = &StageHopEntry{Count: tt.hops}
+				}
+			}
+
+			result := RuntimeSnapshot(state, time.Time{})
+
+			hopIndex := slices.IndexFunc(result.BetweenStages, func(row SnapshotStageHop) bool { return row.IssueID == "hop" })
+			if len(result.Running) != 1 || len(result.Retrying) != 1 || len(result.BudgetExhausted) != 1 || len(result.Parked) != 1 || len(result.PendingReactions) != 1 || hopIndex < 0 {
+				t.Fatalf("RuntimeSnapshot rows = %d running, %d retrying, %d budget, %d parked, %d pending, between stages %+v, want 1 of each and the hop row",
+					len(result.Running), len(result.Retrying), len(result.BudgetExhausted), len(result.Parked), len(result.PendingReactions), result.BetweenStages)
+			}
+			hop := result.BetweenStages[hopIndex]
+			if hop.RuleName != tt.rule || hop.AgentKind != agent.AgentKind || hop.ConfiguredModel != agent.ConfiguredModel {
+				t.Errorf("BetweenStages hop rule, agent kind, model = %q, %q, %q, want %q, %q, %q",
+					hop.RuleName, hop.AgentKind, hop.ConfiguredModel, tt.rule, agent.AgentKind, agent.ConfiguredModel)
+			}
+			for kind, got := range map[string]*SnapshotStagePosition{
+				"Running":          result.Running[0].StagePosition,
+				"Retrying":         result.Retrying[0].StagePosition,
+				"BudgetExhausted":  result.BudgetExhausted[0].StagePosition,
+				"Parked":           result.Parked[0].StagePosition,
+				"PendingReactions": result.PendingReactions[0].StagePosition,
+				"BetweenStages":    hop.StagePosition,
+			} {
+				if !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("%s[0].StagePosition (chains %v, rule %q, previous %q) = %+v, want %+v", kind, tt.chains, tt.rule, tt.previous, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeSnapshot_PendingReactionWatchEndsAt(t *testing.T) {
+	t.Parallel()
+
+	created := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { v := created.Add(d); return &v }
+	windows := map[string]time.Duration{ReactionKindCI: 24 * time.Hour, ReactionKindReview: 30 * time.Minute}
+	tests := []struct {
+		name  string
+		entry PendingReaction
+		want  *time.Time
+	}{
+		{"ci counts from the recorded head", PendingReaction{Kind: ReactionKindCI, HeadRecordedAt: created.Add(10 * time.Minute)}, at(24*time.Hour + 10*time.Minute)},
+		{"ci without a recorded head counts from creation", PendingReaction{Kind: ReactionKindCI}, at(24 * time.Hour)},
+		{"review counts from the restart", PendingReaction{Kind: ReactionKindReview, WatchRestartedAt: created.Add(20 * time.Minute)}, at(50 * time.Minute)},
+		{"kind without a window", PendingReaction{Kind: ReactionKindMergeCompletion}, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			state.ReactionWatchWindows = windows
+			entry := tt.entry
+			entry.IssueID, entry.CreatedAt = "ISS-1", created
+			state.PendingReactions[ReactionKey(entry.IssueID, entry.Kind)] = &entry
+
+			rows := RuntimeSnapshot(state, created).PendingReactions
+
+			if len(rows) != 1 {
+				t.Fatalf("len(PendingReactions) = %d, want 1", len(rows))
+			}
+			got := rows[0].WatchEndsAt
+			if (got == nil) != (tt.want == nil) || got != nil && !got.Equal(*tt.want) {
+				t.Errorf("PendingReactions[0].WatchEndsAt for kind %q = %v, want %v", entry.Kind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeSnapshot_MasksRegisteredValueInIssueIdentity(t *testing.T) {
+	t.Parallel()
+
+	value := eventTestSecret(t)
+	redact.Add("test.state issue identity", value)
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+	state.Running["ISS-1"] = &RunningEntry{
+		Issue: domain.Issue{
+			ID: "ISS-1", Title: "rotate " + value, Labels: []string{"ops", "leak-" + value},
+			IssueType: "type-" + value, State: "state-" + value,
+		},
+		Continuation: ContinuationTarget{PRNumber: 7, Owner: "acme", Repo: "repo-" + value, Attempt: 1},
+	}
+	state.RetryAttempts["ISS-2"] = &RetryEntry{
+		IssueID: "ISS-2",
+		IssueIdentity: IssueIdentity{
+			Title: "rotate " + value, IssueType: "type-" + value,
+			Labels: []string{"ops", "leak-" + value}, State: "state-" + value,
+		},
+	}
+	state.BudgetExhausted["ISS-5"] = &BudgetExhaustedEntry{
+		Identifier: "PROJ-5", IssueIdentity: IssueIdentity{State: "state-" + value},
+	}
+	state.Parked["ISS-3"] = &ParkedEntry{
+		Identifier: "PROJ-3", IssueIdentity: IssueIdentity{Title: "rotate " + value, IssueType: "type-" + value, Labels: []string{"ops", "leak-" + value}},
+	}
+	state.StageHops["ISS-6"] = &StageHopEntry{
+		Identifier: "PROJ-6",
+		IssueIdentity: IssueIdentity{
+			Title: "rotate " + value, URL: "https://forge.example.com/" + value,
+			IssueType: "type-" + value, Labels: []string{"ops", "leak-" + value}, State: "state-" + value,
+		},
+	}
+	state.PendingReactions[ReactionKey("ISS-4", ReactionKindCI)] = &PendingReaction{
+		IssueID:    "ISS-4",
+		Identifier: "PROJ-4",
+		IssueIdentity: IssueIdentity{
+			IssueType: "type-" + value, Labels: []string{"ops", "leak-" + value}, State: "state-" + value,
+		},
+		Kind:           ReactionKindCI,
+		PullRequestURL: "https://forge.example.com/" + value,
+		KindData:       &CIReactionData{PRNumber: 7, Owner: "acme", Repo: "widgets", Branch: "feature/" + value},
+		LastCheck:      &ReactionCheck{CI: &CICheck{Status: "failing", FailingChecks: []string{"build-" + value}, Failing: 1}},
+	}
+
+	result := RuntimeSnapshot(state, now)
+
+	if len(result.Running) != 1 || len(result.Retrying) != 1 || len(result.Parked) != 1 || len(result.BudgetExhausted) != 1 {
+		t.Fatalf("RuntimeSnapshot rows = %d running, %d retrying, %d parked, %d budget, want 1, 1, 1, 1",
+			len(result.Running), len(result.Retrying), len(result.Parked), len(result.BudgetExhausted))
+	}
+	running, retrying := result.Running[0], result.Retrying[0]
+	if want := "rotate " + redact.Marker; running.IssueTitle != want {
+		t.Errorf("Running[0].IssueTitle = %q, want %q", running.IssueTitle, want)
+	}
+	if want := []string{"ops", "leak-" + redact.Marker}; !slices.Equal(running.IssueLabels, want) {
+		t.Errorf("Running[0].IssueLabels = %q, want %q", running.IssueLabels, want)
+	}
+	if want := "type-" + redact.Marker; running.IssueType != want {
+		t.Errorf("Running[0].IssueType = %q, want %q", running.IssueType, want)
+	}
+	if want := "state-" + redact.Marker; running.State != want {
+		t.Errorf("Running[0].State = %q, want %q", running.State, want)
+	}
+	if want := "acme/repo-" + redact.Marker; running.Continuation == nil || running.Continuation.Repository != want {
+		t.Errorf("Running[0].Continuation = %+v, want repository %q", running.Continuation, want)
+	}
+	if want := "rotate " + redact.Marker; retrying.IssueTitle != want {
+		t.Errorf("Retrying[0].IssueTitle = %q, want %q", retrying.IssueTitle, want)
+	}
+	if want := "type-" + redact.Marker; retrying.IssueType != want {
+		t.Errorf("Retrying[0].IssueType = %q, want %q", retrying.IssueType, want)
+	}
+	if want := []string{"ops", "leak-" + redact.Marker}; !slices.Equal(retrying.IssueLabels, want) {
+		t.Errorf("Retrying[0].IssueLabels = %q, want %q", retrying.IssueLabels, want)
+	}
+	if want := "state-" + redact.Marker; retrying.State != want {
+		t.Errorf("Retrying[0].State = %q, want %q", retrying.State, want)
+	}
+	if want := "state-" + redact.Marker; result.BudgetExhausted[0].State != want {
+		t.Errorf("BudgetExhausted[0].State = %q, want %q", result.BudgetExhausted[0].State, want)
+	}
+	if want := "rotate " + redact.Marker; result.Parked[0].IssueTitle != want {
+		t.Errorf("Parked[0].IssueTitle = %q, want %q", result.Parked[0].IssueTitle, want)
+	}
+	if len(result.BetweenStages) != 1 {
+		t.Fatalf("len(BetweenStages) = %d, want 1", len(result.BetweenStages))
+	}
+	if len(result.PendingReactions) != 1 {
+		t.Fatalf("len(PendingReactions) = %d, want 1", len(result.PendingReactions))
+	}
+	type issueFacts struct {
+		IssueType string
+		Labels    []string
+	}
+	wantFacts := issueFacts{"type-" + redact.Marker, []string{"ops", "leak-" + redact.Marker}}
+	parked, hopRow, reaction := result.Parked[0], result.BetweenStages[0], result.PendingReactions[0]
+	for name, got := range map[string]issueFacts{
+		"Parked[0]":           {parked.IssueType, parked.IssueLabels},
+		"BetweenStages[0]":    {hopRow.IssueType, hopRow.IssueLabels},
+		"PendingReactions[0]": {reaction.IssueType, reaction.IssueLabels},
+	} {
+		if !reflect.DeepEqual(got, wantFacts) {
+			t.Errorf("%s issue type, labels = %+v, want %+v", name, got, wantFacts)
+		}
+	}
+	for name, got := range map[string]string{"BetweenStages[0]": hopRow.State, "PendingReactions[0]": reaction.State} {
+		if want := "state-" + redact.Marker; got != want {
+			t.Errorf("%s.State = %q, want %q", name, got, want)
+		}
+	}
+	if hop, wantTitle, wantURL := result.BetweenStages[0], "rotate "+redact.Marker, "https://forge.example.com/"+redact.Marker; hop.IssueTitle != wantTitle || hop.IssueURL != wantURL {
+		t.Errorf("BetweenStages[0] title, url = %q, %q, want %q, %q", hop.IssueTitle, hop.IssueURL, wantTitle, wantURL)
+	}
+	row := result.PendingReactions[0]
+	if want := "feature/" + redact.Marker; row.PullRequest.Branch != want {
+		t.Errorf("PendingReactions[0].PullRequest.Branch = %q, want %q", row.PullRequest.Branch, want)
+	}
+	if want := "https://forge.example.com/" + redact.Marker; row.PullRequest.URL != want {
+		t.Errorf("PendingReactions[0].PullRequest.URL = %q, want %q", row.PullRequest.URL, want)
+	}
+	if want := []string{"build-" + redact.Marker}; !slices.Equal(row.LastCheck.CI.FailingChecks, want) {
+		t.Errorf("PendingReactions[0].LastCheck.CI.FailingChecks = %q, want %q", row.LastCheck.CI.FailingChecks, want)
+	}
+}
+
 func TestRuntimeSnapshot_WorkflowFile(t *testing.T) {
 	t.Parallel()
 
@@ -1695,20 +1957,17 @@ func TestIsKnownReactionKind_AcceptsLabelReview(t *testing.T) {
 	}
 }
 
-// TestReactionKindPins asserts the known-kind set by iterating
-// reactionKindPins itself, so a second hand-written list cannot diverge
-// from it.
 func TestReactionKindPins(t *testing.T) {
 	t.Parallel()
 
 	t.Run("isKnownReactionKind is true for exactly the registered kinds", func(t *testing.T) {
 		t.Parallel()
 
-		for kind := range reactionKindPins {
+		for kind := range reactionKinds {
 			t.Run(kind, func(t *testing.T) {
 				t.Parallel()
 				if !isKnownReactionKind(kind) {
-					t.Errorf("isKnownReactionKind(%q) = false, want true (registered in reactionKindPins)", kind)
+					t.Errorf("isKnownReactionKind(%q) = false, want true (registered in reactionKinds)", kind)
 				}
 			})
 		}
@@ -1718,16 +1977,38 @@ func TestReactionKindPins(t *testing.T) {
 		}
 	})
 
-	t.Run("reactionKindPinsWorkspace returns the registered value for each registered kind", func(t *testing.T) {
+	t.Run("pullRequestOf reads the pull request of exactly the registered kinds", func(t *testing.T) {
 		t.Parallel()
 
-		for kind, wantPins := range reactionKindPins {
-			t.Run(kind, func(t *testing.T) {
-				t.Parallel()
-				if got := reactionKindPinsWorkspace(kind); got != wantPins {
-					t.Errorf("reactionKindPinsWorkspace(%q) = %v, want %v", kind, got, wantPins)
-				}
-			})
+		tests := []struct {
+			kind   string
+			data   any
+			number int
+		}{
+			{ReactionKindCI, &CIReactionData{PRNumber: 1}, 1},
+			{ReactionKindReview, &ReviewReactionData{PRNumber: 2}, 2},
+			{ReactionKindBotReview, &BotReviewReactionData{PRNumber: 3}, 3},
+			{ReactionKindAutoMerge, &AutoMergeReactionData{PRNumber: 4}, 4},
+			{ReactionKindMergeConflict, &MergeConflictReactionData{PRNumber: 5}, 5},
+			{ReactionKindLabelReview, &LabelReviewReactionData{PRNumber: 6}, 6},
+			{ReactionKindLabelFix, &LabelFixReactionData{PRNumber: 7}, 7},
+			{ReactionKindMergeCompletion, &MergeCompletionReactionData{PRNumber: 8}, 8},
+		}
+
+		covered := make(map[string]bool, len(tests))
+		for _, tt := range tests {
+			covered[tt.kind] = true
+			if _, ok := reactionKinds[tt.kind]; !ok {
+				t.Errorf("table kind %q is not registered in reactionKinds", tt.kind)
+			}
+			if got := pullRequestOf(&PendingReaction{Kind: tt.kind, KindData: tt.data}).Number; got != tt.number {
+				t.Errorf("pullRequestOf(%q data).Number = %d, want %d", tt.kind, got, tt.number)
+			}
+		}
+		for kind := range reactionKinds {
+			if !covered[kind] {
+				t.Errorf("registered kind %q has no pullRequestOf table row", kind)
+			}
 		}
 	})
 
@@ -1830,7 +2111,6 @@ func TestBuildMergeCompletionReactionConfig(t *testing.T) {
 		name        string
 		rc          config.ReactionConfig
 		tracker     config.TrackerConfig
-		meta        registry.TrackerMeta
 		want        MergeCompletionReactionConfig
 		wantErr     bool
 		wantErrText string
@@ -1929,7 +2209,7 @@ func TestBuildMergeCompletionReactionConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := BuildMergeCompletionReactionConfig(tt.rc, tt.tracker, tt.meta)
+			got, err := BuildMergeCompletionReactionConfig(tt.rc, tt.tracker)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("BuildMergeCompletionReactionConfig(%+v, %+v) = %+v, want error", tt.rc, tt.tracker, got)
@@ -1947,62 +2227,6 @@ func TestBuildMergeCompletionReactionConfig(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestBuildMergeCompletionReactionConfig_StateListFallbackAsymmetry pins
-// the asymmetry: the terminal list never falls back to TrackerMeta
-// defaults, the active list does, and the fallback only tightens the
-// active check.
-func TestBuildMergeCompletionReactionConfig_StateListFallbackAsymmetry(t *testing.T) {
-	t.Parallel()
-
-	t.Run("terminal defaults never fill in an empty written list", func(t *testing.T) {
-		t.Parallel()
-
-		rc := config.ReactionConfig{Extra: map[string]any{"target_state": "done"}}
-		tracker := config.TrackerConfig{HandoffState: "in-review"}
-		meta := registry.TrackerMeta{DefaultTerminalStates: []string{"done"}}
-
-		_, err := BuildMergeCompletionReactionConfig(rc, tracker, meta)
-		if err == nil {
-			t.Fatal("BuildMergeCompletionReactionConfig(...) = nil error, want error (terminal defaults must not fill in)")
-		}
-		if !strings.Contains(err.Error(), "tracker.terminal_states") {
-			t.Errorf("BuildMergeCompletionReactionConfig(...) error = %q, want substring %q", err.Error(), "tracker.terminal_states")
-		}
-	})
-
-	t.Run("active defaults fill in and reject a target drawn from them", func(t *testing.T) {
-		t.Parallel()
-
-		rc := config.ReactionConfig{Extra: map[string]any{"target_state": "doing"}}
-		tracker := config.TrackerConfig{HandoffState: "in-review", TerminalStates: []string{"doing", "done"}}
-		meta := registry.TrackerMeta{DefaultActiveStates: []string{"doing"}}
-
-		_, err := BuildMergeCompletionReactionConfig(rc, tracker, meta)
-		if err == nil {
-			t.Fatal("BuildMergeCompletionReactionConfig(...) = nil error, want error (active defaults must fill in and reject)")
-		}
-		if !strings.Contains(err.Error(), "tracker.active_states") {
-			t.Errorf("BuildMergeCompletionReactionConfig(...) error = %q, want substring %q", err.Error(), "tracker.active_states")
-		}
-	})
-
-	t.Run("a target outside the active defaults and inside the written terminal list validates", func(t *testing.T) {
-		t.Parallel()
-
-		rc := config.ReactionConfig{Extra: map[string]any{"target_state": "done"}}
-		tracker := config.TrackerConfig{HandoffState: "in-review", TerminalStates: []string{"done"}}
-		meta := registry.TrackerMeta{DefaultActiveStates: []string{"doing"}}
-
-		got, err := BuildMergeCompletionReactionConfig(rc, tracker, meta)
-		if err != nil {
-			t.Fatalf("BuildMergeCompletionReactionConfig(...) unexpected error: %v", err)
-		}
-		if got.TargetState != "done" {
-			t.Errorf("BuildMergeCompletionReactionConfig(...).TargetState = %q, want %q", got.TargetState, "done")
-		}
-	})
 }
 
 func TestBuildLabelFixReactionConfig(t *testing.T) {
@@ -2030,58 +2254,18 @@ func TestBuildLabelFixReactionConfig(t *testing.T) {
 func TestPopulateParked(t *testing.T) {
 	t.Parallel()
 
-	t.Run("loads rows into state.Parked", func(t *testing.T) {
+	t.Run("loads a row with an empty parked_state", func(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 4, 0, nil, AgentTotals{})
 		rows := []persistence.ParkedIssue{
-			{
-				IssueID:      "id-1",
-				Identifier:   "PROJ-1",
-				DisplayID:    "PROJ-1-display",
-				Reason:       parkReasonAgentBlocked,
-				ParkedState:  "In Progress",
-				Label:        "needs-human",
-				LabelApplied: true,
-				ParkedAt:     "2026-08-17T00:00:00Z",
-			},
-			{
-				IssueID:     "id-2",
-				Identifier:  "PROJ-2",
-				Reason:      parkReasonHandoffAbsence,
-				ParkedState: "",
-				Label:       "needs-human",
-				ParkedAt:    "2026-08-17T01:00:00Z",
-			},
+			{IssueID: "id-2", Identifier: "PROJ-2", Reason: parkReasonHandoffAbsence, Label: "needs-human", ParkedAt: "2026-08-17T01:00:00Z"},
 		}
 
 		PopulateParked(state, rows, nil)
 
-		if len(state.Parked) != 2 {
-			t.Fatalf("len(state.Parked) = %d, want 2", len(state.Parked))
-		}
-
-		entry1, ok := state.Parked["id-1"]
-		if !ok {
-			t.Fatal("state.Parked missing id-1")
-		}
-		if entry1.Identifier != "PROJ-1" || entry1.DisplayID != "PROJ-1-display" ||
-			entry1.Reason != parkReasonAgentBlocked || entry1.ParkedState != "In Progress" ||
-			entry1.Label != "needs-human" || !entry1.LabelApplied {
-			t.Errorf("state.Parked[id-1] = %+v, want fields to match the persisted row", entry1)
-		}
-		if !entry1.ParkedAt.Equal(time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)) {
-			t.Errorf("state.Parked[id-1].ParkedAt = %v, want 2026-08-17T00:00:00Z", entry1.ParkedAt)
-		}
-
-		// Only an empty issue_id makes a row malformed; an empty
-		// parked_state is loaded, not skipped.
-		entry2, ok := state.Parked["id-2"]
-		if !ok {
-			t.Fatal("state.Parked missing id-2")
-		}
-		if entry2.ParkedState != "" {
-			t.Errorf("state.Parked[id-2].ParkedState = %q, want empty", entry2.ParkedState)
+		if entry, ok := state.Parked["id-2"]; !ok || entry.ParkedState != "" {
+			t.Errorf("state.Parked[id-2] = %+v, want the row loaded with an empty ParkedState", entry)
 		}
 	})
 
@@ -2128,7 +2312,7 @@ func TestRuntimeSnapshot_ParkedFields(t *testing.T) {
 
 	fixedNow := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 
-	t.Run("empty Parked produces zero count and nil slices", func(t *testing.T) {
+	t.Run("empty Parked is a non-nil empty list", func(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 10, 0, nil, AgentTotals{})
@@ -2138,15 +2322,12 @@ func TestRuntimeSnapshot_ParkedFields(t *testing.T) {
 		if result.ParkedCount != 0 {
 			t.Errorf("ParkedCount = %d, want 0", result.ParkedCount)
 		}
-		if result.Parked != nil {
-			t.Errorf("Parked = %v, want nil", result.Parked)
-		}
-		if result.ParkedReason != nil {
-			t.Errorf("ParkedReason = %v, want nil", result.ParkedReason)
+		if result.Parked == nil || len(result.Parked) != 0 {
+			t.Errorf("Parked = %#v, want a non-nil empty list", result.Parked)
 		}
 	})
 
-	t.Run("non-empty Parked sorted, counted, and reasoned", func(t *testing.T) {
+	t.Run("non-empty Parked sorted by identifier and counted", func(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 10, 0, nil, AgentTotals{})
@@ -2159,20 +2340,14 @@ func TestRuntimeSnapshot_ParkedFields(t *testing.T) {
 		if result.ParkedCount != 3 {
 			t.Errorf("ParkedCount = %d, want 3", result.ParkedCount)
 		}
-		want := []string{"ISS-A", "ISS-B", "ISS-C"}
+		want := []string{"PROJ-A", "PROJ-B", "PROJ-C"}
 		if len(result.Parked) != len(want) {
 			t.Fatalf("len(Parked) = %d, want %d", len(result.Parked), len(want))
 		}
-		for i, id := range want {
-			if result.Parked[i] != id {
-				t.Errorf("Parked[%d] = %q, want %q", i, result.Parked[i], id)
+		for i, identifier := range want {
+			if result.Parked[i].Identifier != identifier {
+				t.Errorf("Parked[%d].Identifier = %q, want %q", i, result.Parked[i].Identifier, identifier)
 			}
-		}
-		if got := result.ParkedReason["ISS-A"]; got != parkReasonHandoffAbsence {
-			t.Errorf("ParkedReason[ISS-A] = %q, want %q", got, parkReasonHandoffAbsence)
-		}
-		if got := result.ParkedReason["ISS-C"]; got != parkReasonAgentBlocked {
-			t.Errorf("ParkedReason[ISS-C] = %q, want %q", got, parkReasonAgentBlocked)
 		}
 	})
 }
@@ -2550,5 +2725,87 @@ func TestRuntimeSnapshot_TokensAwaited(t *testing.T) {
 				t.Errorf("AgentTotals.RunningNonReporting = %d, want %d", got, tt.wantNonReporting)
 			}
 		})
+	}
+}
+
+func reactionEscalationBuilders() map[string]func(escalation string) (string, error) {
+	tracker := config.TrackerConfig{
+		HandoffState:   "in-review",
+		ActiveStates:   []string{"doing"},
+		TerminalStates: []string{"done"},
+	}
+	rc := func(escalation string) config.ReactionConfig {
+		return config.ReactionConfig{Escalation: escalation, Extra: map[string]any{"target_state": "done"}}
+	}
+
+	return map[string]func(string) (string, error){
+		"review": func(escalation string) (string, error) {
+			got, err := BuildReviewReactionConfig(rc(escalation))
+			return got.Escalation, err
+		},
+		"bot review": func(escalation string) (string, error) {
+			got, err := BuildBotReviewReactionConfig(rc(escalation))
+			return got.Escalation, err
+		},
+		"auto merge": func(escalation string) (string, error) {
+			got, err := BuildAutoMergeReactionConfig(rc(escalation))
+			return got.Escalation, err
+		},
+		"merge conflict": func(escalation string) (string, error) {
+			got, err := BuildMergeConflictReactionConfig(rc(escalation))
+			return got.Escalation, err
+		},
+		"merge completion": func(escalation string) (string, error) {
+			got, err := BuildMergeCompletionReactionConfig(rc(escalation), tracker)
+			return got.Escalation, err
+		},
+	}
+}
+
+func TestReactionConfigBuilders_Escalation(t *testing.T) {
+	t.Parallel()
+
+	for name, build := range reactionEscalationBuilders() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, escalation := range []string{"label", "comment", "none"} {
+				got, err := build(escalation)
+				if err != nil {
+					t.Errorf("build(%q) error = %v, want nil", escalation, err)
+					continue
+				}
+				if got != escalation {
+					t.Errorf("build(%q).Escalation = %q, want %q", escalation, got, escalation)
+				}
+			}
+
+			_, err := build("email")
+			if err == nil {
+				t.Fatal(`build("email") error = nil, want an invalid escalation error`)
+			}
+			if want := `must be "label", "comment", or "none", got "email"`; !strings.Contains(err.Error(), want) {
+				t.Errorf(`build("email") error = %q, want it to contain %q`, err, want)
+			}
+		})
+	}
+}
+
+func TestBuildAutoMergeReactionConfig_OmittedEscalationResolvesToLabel(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.NewServiceConfig(map[string]any{
+		"reactions": map[string]any{"auto_merge": map[string]any{"provider": "github"}},
+	})
+	if err != nil {
+		t.Fatalf("NewServiceConfig: %v", err)
+	}
+
+	got, err := BuildAutoMergeReactionConfig(cfg.Reactions["auto_merge"])
+	if err != nil {
+		t.Fatalf("BuildAutoMergeReactionConfig: %v", err)
+	}
+	if got.Escalation != "label" {
+		t.Errorf("BuildAutoMergeReactionConfig(omitted escalation).Escalation = %q, want %q", got.Escalation, "label")
 	}
 }

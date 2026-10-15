@@ -10,11 +10,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
-	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 type handoffLabelCall struct {
@@ -38,6 +38,10 @@ func (t *recordingHandoffTracker) AddLabel(_ context.Context, issueID, label str
 	t.labelCalls = append(t.labelCalls, handoffLabelCall{issueID: issueID, label: label})
 	t.mu.Unlock()
 	return t.addLabelErr
+}
+
+func (t *recordingHandoffTracker) RemoveLabel(_ context.Context, _ string, _ string) error {
+	return nil
 }
 
 func (t *recordingHandoffTracker) labels() []handoffLabelCall {
@@ -343,6 +347,70 @@ func TestAbsenceCeilingParkPointStableAcrossMaxSessions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestParkExhaustedAbsencesRecordsFollowedRun(t *testing.T) {
+	t.Parallel()
+
+	const issueID = "TICK-RUN"
+	dispatchedAt := time.Date(2026, 3, 15, 11, 0, 0, 0, time.UTC)
+	latest := map[string]persistence.RunHistory{issueID: {
+		IssueID: issueID, AgentAdapter: "claude-code", RuleName: "implement", ConfiguredModel: "sonnet",
+		StagePrevious: "triage", StagePreviousOutcome: "succeeded", ChainID: "chain-1", DispatchedAt: "2026-03-15T11:00:00Z",
+	}}
+	followed := parkedRun{
+		RuleName:     "implement",
+		StageLineage: StageLineage{PreviousRule: "triage", PreviousOutcome: "succeeded", ChainID: "chain-1", DispatchedAt: dispatchedAt},
+		AgentKind:    "claude-code", ConfiguredModel: "sonnet",
+	}
+
+	tests := []struct {
+		name       string
+		absences   int
+		runsErr    error
+		wantParked bool
+		wantRun    parkedRun
+		wantReads  int
+	}{
+		{name: "latest agent run is recorded on the park", absences: 2, wantParked: true, wantRun: followed, wantReads: 1},
+		{name: "failed read still parks, without a run", absences: 2, runsErr: errors.New("database is locked"), wantParked: true, wantReads: 1},
+		{name: "below the ceiling parks nothing and reads nothing", absences: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := config.ServiceConfig{Agent: config.AgentConfig{MaxSessions: 3, MaxConsecutiveAbsences: 2}}
+			store := &stubStore{absenceCounts: map[string]int{issueID: tt.absences}, latestRuns: latest, latestRunsErr: tt.runsErr}
+			state := NewState(1000, 1, 0, nil, AgentTotals{})
+			orchestrator := NewOrchestrator(OrchestratorParams{
+				State:           state,
+				Logger:          discardLogger(),
+				TrackerAdapter:  newRecordingHandoffTracker(),
+				AgentAdapter:    &mockAgentAdapter{},
+				WorkflowManager: &stubWorkflowManager{config: cfg},
+				Store:           store,
+			})
+
+			orchestrator.parkExhaustedAbsences(context.Background(), cfg, []domain.Issue{candidateIssue(issueID, "PROJ-TICK", "To Do")})
+			state.TrackerOpsWg.Wait()
+
+			entry := state.Parked[issueID]
+			if (entry != nil) != tt.wantParked {
+				t.Fatalf("Parked[%s] = %+v, want parked = %v", issueID, entry, tt.wantParked)
+			}
+			if entry != nil {
+				got := parkedRun{RuleName: entry.RuleName, StageLineage: entry.StageLineage, AgentKind: entry.AgentKind, ConfiguredModel: entry.ConfiguredModel}
+				if got != tt.wantRun {
+					t.Errorf("Parked[%s] run = %+v, want %+v", issueID, got, tt.wantRun)
+				}
+			}
+			if reads := len(store.latestRunsCalls); reads != tt.wantReads {
+				t.Errorf("LatestAgentRuns calls = %d, want %d", reads, tt.wantReads)
+			}
+		})
+	}
 }
 
 func TestHandleWorkerExitDefaultCeilingAllowsSecondAbsenceRetry(t *testing.T) {
@@ -938,7 +1006,7 @@ func TestHandleTickAbsenceReleaseOrdering(t *testing.T) {
 		{ID: issueID, Identifier: "PROJ-ORD", Title: "T", State: "Done"},
 	}
 
-	orchestrator.refreshParkedIssues(ctx, candidates)
+	orchestrator.refreshParkedIssues(ctx, candidates, nil)
 	orchestrator.parkExhaustedAbsences(ctx, config.ServiceConfig{}, candidates)
 	state.TrackerOpsWg.Wait()
 
@@ -993,7 +1061,7 @@ func TestParkExhaustedAbsencesOffPolicyHoldsExistingParkAndSkipsNewPark(t *testi
 		{ID: freshIssueID, Identifier: "PROJ-FRESH", Title: "T", State: "To Do"},
 	}
 
-	orchestrator.refreshParkedIssues(context.Background(), candidates)
+	orchestrator.refreshParkedIssues(context.Background(), candidates, nil)
 	orchestrator.parkExhaustedAbsences(context.Background(), cfg, candidates)
 	state.TrackerOpsWg.Wait()
 
@@ -1025,12 +1093,12 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 		ActiveStates:      []string{"To Do", "In Progress"},
 		TerminalStates:    []string{"Done"},
 		MaxRetryBackoffMS: 300_000,
-		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+		MakeWorkerFn: func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 			return func(context.Context, domain.Issue, *int) {}
 		},
 		AgentAdapterByKind: func(string) (domain.AgentAdapter, error) { return &mockAgentAdapter{}, nil },
-		ResolveUsageDisposition: func(_, _ string) (registry.UsageArrival, registry.UsageAttribution) {
-			return registry.UsageArrivalUndeclared, registry.UsageAttributionUndeclared
+		ResolveAttemptSettings: func(_ DispatchResolution, _ string) AttemptSettings {
+			return AttemptSettings{}
 		},
 		OnRetryFire: noopRetryFire,
 		Ctx:         context.Background(),
@@ -1063,7 +1131,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 		Store:           store,
 	})
 
-	orchestrator.refreshParkedIssues(context.Background(), nil)
+	orchestrator.refreshParkedIssues(context.Background(), nil, nil)
 
 	if entry.ParkedState != "In Progress" {
 		t.Errorf("Parked[%s].ParkedState after backfill = %q, want %q", issueID, entry.ParkedState, "In Progress")
@@ -1075,7 +1143,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 	tickTracker.fetchStatesFn = func(_ context.Context, _ []string) (map[string]string, error) {
 		return map[string]string{issueID: "Done"}, nil
 	}
-	orchestrator.refreshParkedIssues(context.Background(), nil)
+	orchestrator.refreshParkedIssues(context.Background(), nil, nil)
 
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change observed after the backfill did not release the park")
@@ -1228,7 +1296,7 @@ func TestHandleWorkerExitAbsenceParkRecordsObservedStateAndReleasesWithoutBackfi
 	})
 	candidates := []domain.Issue{{ID: issueID, Identifier: "PROJ-OBS", Title: "T", State: "Done"}}
 
-	orchestrator.refreshParkedIssues(context.Background(), candidates)
+	orchestrator.refreshParkedIssues(context.Background(), candidates, nil)
 
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change did not release the worker-exit absence park")

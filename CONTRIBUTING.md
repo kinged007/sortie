@@ -19,7 +19,7 @@ For larger work - new features, new adapters, architectural changes - open an is
 
 ## Setup
 
-**Requirements:** Go 1.26.1 (see [go.mod](go.mod)), golangci-lint.
+**Requirements:** Go 1.26.2 (see [go.mod](go.mod)), golangci-lint, gopls, and [lychee](https://github.com/lycheeverse/lychee) for documentation changes.
 
 ```bash
 git clone https://github.com/sortie-ai/sortie.git
@@ -28,11 +28,34 @@ make test    # runs all tests with -race
 make build   # compiles to ./sortie
 make lint    # golangci-lint and comment style of changed files
 make fmt     # gofmt + goimports
+make lint-docs  # links and anchors in tracked Markdown files
+make test-darwin  # darwin-only tests; macOS only, fails on any other host
 ```
 
 All commands go through the Makefile. If `make test` passes, the change is safe to submit.
 
 The SQLite dependency is [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) -a pure-Go driver. No C compiler needed.
+
+### Dashboard
+
+The dashboard application lives in `web/`. Go-only changes need none of this: `make build` and `make test` never call Node, and `go install` builds the full binary from committed files.
+
+A change under `web/` needs Node 24.15.0 or later and npm 11.10.0 or later; older versions are refused. CI uses Node 24.22.0. `make ui-install` comes first:
+
+```bash
+make ui-install    # npm ci in web/
+make ui-build      # writes internal/server/ui/dist
+make ui-lint       # Oxlint and the TypeScript check
+make ui-fmt        # Oxfmt, rewrites files
+make ui-fmt-check  # fails on any formatting difference
+make ui-check      # lint, format check, and the build output check
+```
+
+The response types of the JSON API reach the application through two generated files, `web/src/api/types.gen.ts` and `docs/api.schema.json`. A change to a JSON response type fails `go test ./internal/server` until both are regenerated with `go test ./internal/server -run TestAPIContract -update`. The command needs no Node, and neither file is edited by hand.
+
+A change under `web/` passes `make ui-check`, which `make check` also runs. `internal/server/ui/dist` is the build output the binary embeds. It comes from `make ui-build`, is committed with the sources it was built from, and is never edited by hand. A conflict in it is resolved by rebuilding. The Dashboard CI job runs on every pull request and fails when the committed output differs from a fresh build.
+
+If `make ui-install` or `make ui-build` reports a missing native binding, run `make ui-install` again: it replaces `web/node_modules` with a clean install from the committed `web/package-lock.json`. If the binding is still missing, the lockfile lacks your platform: run `npm install` in `web/`, then review the lockfile change and commit it with the rebuilt output.
 
 ### Integration tests
 
@@ -80,6 +103,7 @@ The linter config in [.golangci.yml](.golangci.yml) catches most issues. Beyond 
 - Failure format: `FuncName(input) = got, want expected`.
 - Standard library only - no third-party assertion frameworks.
 - Fixtures live in `testdata/` within each package.
+- A test that only a macOS host can run lives in a `_darwin_test.go` file and never skips: the macOS CI job selects tests by that suffix and fails on a skip. An env-gated integration test skips by design, so none lives in such a file.
 
 ## Commits and PRs
 
@@ -91,7 +115,7 @@ fix(workspace): reject symlinks escaping workspace root
 test(tracker): cover pagination edge cases in Jira adapter
 ```
 
-PRs use the [template](.github/pull_request_template.md). One logical change per PR. CI lints, tests (including on Windows), and builds the binary - all must pass.
+PRs use the [template](.github/pull_request_template.md). One logical change per PR. CI lints, tests (including on Windows, and the darwin-only tests on macOS), and builds the binary - all must pass.
 
 ## What will not be merged
 

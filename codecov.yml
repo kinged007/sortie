@@ -19,3 +19,4 @@ ignore:
   - "internal/adaptertest/**"
   - "tools/qualify/**"
   - "internal/agent/clientprotocol/wire_gen.go"
+  - "internal/server/ui/dist/**"

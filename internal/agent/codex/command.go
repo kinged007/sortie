@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
@@ -28,11 +29,11 @@ type passthroughConfig struct {
 // with a non-string value for a string field reports a fault rather
 // than defaulting.
 func parsePassthroughConfig(config map[string]any) (passthroughConfig, *typeutil.TypeFault) {
-	model, fault := typeutil.StringField(config, "model")
+	model, fault := registry.ModelSetting(config)
 	if fault != nil {
 		return passthroughConfig{}, fault
 	}
-	effort, fault := typeutil.StringField(config, "effort")
+	effort, fault := registry.EffortSetting(config)
 	if fault != nil {
 		return passthroughConfig{}, fault
 	}
@@ -95,7 +96,8 @@ func renderMCPServerOverrides(servers []mcpconfig.Server, processEnv []string) (
 
 // renderMCPServerTable renders one server as a TOML inline table.
 // Structural keys, the runtime's own field names (command, args, env,
-// env_vars, url, env_http_headers, enabled), are emitted bare. A key
+// env_vars, url, env_http_headers, default_tools_approval_mode,
+// enabled), are emitted bare. A key
 // carrying an operator-controlled name, an environment variable name
 // on the stdio branch or a header name on the HTTP branch, is emitted
 // as a TOML quoted key: the only form safe for a name outside the
@@ -160,6 +162,12 @@ func renderMCPServerTable(server mcpconfig.Server, envLookup map[string]string) 
 	default:
 		return "", fmt.Errorf("entry carries neither command nor url")
 	}
+
+	// The runtime asks for approval before calling a tool that declares
+	// no annotations, and the thread's never-ask approval policy turns
+	// that ask into a refusal, so without this no tool on the server
+	// could ever run.
+	fields = append(fields, `default_tools_approval_mode="approve"`)
 
 	if server.Enabled != nil {
 		fields = append(fields, fmt.Sprintf("enabled=%t", *server.Enabled))

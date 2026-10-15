@@ -25,14 +25,18 @@ func TestBuildBudgetHoldComment(t *testing.T) {
 
 	recordedAt := mustParseRFC3339(t, "2026-08-25T09:14:03Z")
 	usedTokens := int64(128400)
+	zeroTokens := int64(0)
+	threeUnmeasured := 3
+	zeroUnmeasured := 0
 	zeroStopped := 0
 	oneStopped := 1
 	twoStopped := 2
 
 	tests := []struct {
-		name  string
-		entry *BudgetExhaustedEntry
-		want  string
+		name     string
+		entry    *BudgetExhaustedEntry
+		want     string
+		wantLine string
 	}{
 		{
 			name: "session-only hold",
@@ -64,6 +68,21 @@ func TestBuildBudgetHoldComment(t *testing.T) {
 				"Tokens: 128400 of 100000\n" +
 				"Sessions: 5 of 3\n" +
 				"Raising agent.max_tokens raises this ceiling.",
+		},
+		{
+			name:     "no usage reported prints the Tokens line as not measured",
+			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &threeUnmeasured, BudgetTokens: 500000, ExhaustedAt: recordedAt},
+			wantLine: "Tokens: not measured of 500000",
+		},
+		{
+			name:     "an unaccounted turn on a zero sum prints the Tokens line as not measured",
+			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &zeroUnmeasured, UnaccountedTurns: 1, BudgetTokens: 500000, ExhaustedAt: recordedAt},
+			wantLine: "Tokens: not measured of 500000",
+		},
+		{
+			name:     "measured zero prints the Tokens line as 0",
+			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &zeroUnmeasured, BudgetTokens: 500000, ExhaustedAt: recordedAt},
+			wantLine: "Tokens: 0 of 500000",
 		},
 		{
 			name: "reason absent from budgetHoldCeilingWords omits the Ceiling and closing lines",
@@ -134,20 +153,18 @@ func TestBuildBudgetHoldComment(t *testing.T) {
 				"Raising agent.max_tokens raises this ceiling.",
 		},
 		{
-			name: "nil StoppedInFlight (not evaluated) renders the same golden as zero (evaluated, none)",
+			name: "unset session ceiling omits the Sessions line and nil StoppedInFlight omits the Stopped in flight line",
 			entry: &BudgetExhaustedEntry{
-				Reason:         budgetReasonToken,
-				UsedSessions:   5,
-				BudgetSessions: 3,
-				UsedTokens:     &usedTokens,
-				BudgetTokens:   100000,
-				ExhaustedAt:    recordedAt,
+				Reason:       budgetReasonToken,
+				UsedSessions: 5,
+				UsedTokens:   &usedTokens,
+				BudgetTokens: 100000,
+				ExhaustedAt:  recordedAt,
 			},
 			want: "Sortie stopped dispatching this issue.\n" +
 				"Recorded: 2026-08-25T09:14:03Z\n" +
 				"Ceiling: token budget (agent.max_tokens)\n" +
 				"Tokens: 128400 of 100000\n" +
-				"Sessions: 5 of 3\n" +
 				"Raising agent.max_tokens raises this ceiling.",
 		},
 		{
@@ -174,6 +191,12 @@ func TestBuildBudgetHoldComment(t *testing.T) {
 
 			got := buildBudgetHoldComment(tt.entry)
 
+			if tt.wantLine != "" {
+				if !strings.Contains(got, tt.wantLine) {
+					t.Errorf("buildBudgetHoldComment(%+v) =\n%q\nwant a line %q", tt.entry, got, tt.wantLine)
+				}
+				return
+			}
 			if got != tt.want {
 				t.Errorf("buildBudgetHoldComment(%+v) =\n%q\nwant\n%q", tt.entry, got, tt.want)
 			}

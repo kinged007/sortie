@@ -136,10 +136,8 @@ func TestValidateConfig_ErrorRows(t *testing.T) {
 	}
 }
 
-// TestValidateConfig_StateListWarnings asserts that an
-// empty or untrimmed tracker.active_states or tracker.terminal_states
-// element is a warning, because the fault only costs matches at query
-// time rather than blocking Jira construction.
+// An untrimmed state element is a warning, because the fault only costs
+// matches at query time rather than blocking Jira construction.
 func TestValidateConfig_StateListWarnings(t *testing.T) {
 	t.Parallel()
 
@@ -147,7 +145,7 @@ func TestValidateConfig_StateListWarnings(t *testing.T) {
 		Endpoint:       "https://x.atlassian.net",
 		APIKey:         "user@test.com:tok",
 		Project:        "PROJ",
-		ActiveStates:   []string{" review", ""},
+		ActiveStates:   []string{" review"},
 		TerminalStates: []string{"done "},
 	}
 
@@ -155,7 +153,6 @@ func TestValidateConfig_StateListWarnings(t *testing.T) {
 
 	for _, wantCheck := range []string{
 		"tracker.active_states.untrimmed_element",
-		"tracker.active_states.empty_element",
 		"tracker.terminal_states.untrimmed_element",
 	} {
 		if !hasCheck(got, wantCheck) {

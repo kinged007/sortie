@@ -85,27 +85,24 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 		})
 	}
 
-	// Template static analysis.
-	tmpl, parseErr := prompt.Parse(wf.PromptTemplate, path, wf.FrontMatterLines)
-	if parseErr == nil {
-		for _, w := range prompt.AnalyzeTemplate(tmpl) {
-			warningDiags = append(warningDiags, validateDiag{
-				Severity: "warning",
-				Check:    templateWarnCheck(w.Kind),
-				Message:  w.Message,
-			})
-		}
-	}
-
 	logger := slog.New(slog.DiscardHandler)
 
 	mgr, err := workflow.NewManager(path, logger,
-		workflow.WithValidateFunc(orchestrator.ValidateConfigForPromotion),
+		workflow.WithValidateFunc(workflowValidate),
 		workflow.WithAgentKindProbe(registry.Agents.Has),
+		workflow.WithRetiredAgents(registry.RetiredAgentOf),
 		workflow.WithAdvisoryFunc(workflowAdvisories))
 	if err != nil {
 		emitDiags(stdout, stderr, *format, mapManagerError(err), warningDiags)
 		return 1
+	}
+
+	for _, w := range prompt.AnalyzeTemplates(promptTemplates(mgr)) {
+		warningDiags = append(warningDiags, validateDiag{
+			Severity: "warning",
+			Check:    templateWarnCheck(w.Kind),
+			Message:  fmt.Sprintf("%s (line %d): %s", w.Source, w.Line, w.Message),
+		})
 	}
 
 	preflightParams := orchestrator.PreflightParams{
@@ -134,10 +131,8 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 	// block dispatch even when the dispatch preflight passes, so both the
 	// exit code and the JSON valid flag key on the union of preflight,
 	// reaction, and activation errors.
-	trackerMeta, _ := registry.Trackers.Meta(cfg.Tracker.Kind)
-
 	var forgeDiags []validateDiag
-	for _, rd := range orchestrator.ValidateReactionConfigs(cfg, trackerMeta) {
+	for _, rd := range orchestrator.ValidateReactionConfigs(cfg) {
 		forgeDiags = append(forgeDiags, validateDiag{Severity: rd.Severity, Check: rd.Check, Message: rd.Message})
 	}
 	forgeDiags = append(forgeDiags, activationChecks(cfg)...)
@@ -236,13 +231,13 @@ func mapPreflightErrors(errs []orchestrator.PreflightError) []validateDiag {
 // activationChecks reports the offline-decidable SCM and CI activation
 // faults in the resolved config: an active SCM reaction naming an
 // unregistered provider, active SCM reactions disagreeing on the
-// provider, and a reactions.ci_failure.provider (or its deprecated
-// ci_feedback.kind equivalent) naming no registered CI provider. The
-// resolved CI feedback kind joins the same active-SCM-reaction provider
-// set the runtime uses, so a disagreement between reactions.ci_failure
-// and another active SCM reaction is caught here too. It reuses
-// scmProviderConflict and the adapter registries the runtime consults at
-// construction, so it constructs no adapter and opens no socket.
+// provider, and a reactions.ci_failure.provider naming no registered CI
+// provider. The resolved CI feedback kind joins the same
+// active-SCM-reaction provider set the runtime uses, so a disagreement
+// between reactions.ci_failure and another active SCM reaction is caught
+// here too. It reuses scmProviderConflict and the adapter registries the
+// runtime consults at construction, so it constructs no adapter and
+// opens no socket.
 func activationChecks(cfg config.ServiceConfig) []validateDiag {
 	var diags []validateDiag
 
@@ -272,6 +267,26 @@ func activationChecks(cfg config.ServiceConfig) []validateDiag {
 	return diags
 }
 
+// promptTemplates returns the body template, then the default template and
+// the rule templates in rule order, each distinct template once.
+func promptTemplates(mgr *workflow.Manager) []*prompt.Template {
+	dispatch := mgr.Config().Dispatch
+	ids := []string{"", dispatch.Default.TemplateID}
+	for _, rule := range dispatch.Rules {
+		ids = append(ids, rule.Selection.TemplateID)
+	}
+	var templates []*prompt.Template
+	seen := make(map[string]struct{})
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		templates = append(templates, mgr.PromptTemplateByID(id))
+	}
+	return templates
+}
+
 func templateWarnCheck(k prompt.WarnKind) string {
 	switch k {
 	case prompt.WarnDotContext:
@@ -280,6 +295,8 @@ func templateWarnCheck(k prompt.WarnKind) string {
 		return "unknown_var"
 	case prompt.WarnUnknownField:
 		return "unknown_field"
+	case prompt.WarnUnusedPartial:
+		return "unused_partial"
 	default:
 		return "template_warning"
 	}

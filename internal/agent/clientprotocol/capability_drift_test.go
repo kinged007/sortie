@@ -2,6 +2,7 @@ package clientprotocol
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -331,22 +332,6 @@ func TestLiveCapabilityGapLabelsAddsTokenCountsOnlyWhenUnmeasured(t *testing.T) 
 	}
 }
 
-// TestNightlyReachability confirms the nightly workflow's own matrix
-// rows and go-test steps actually reach and arm
-// assertCapabilityGapLabelsMatchProfile, per the inputs the drift
-// check's binding depends on: at least one row names this package;
-// each such row names a distinct runtime command, so a duplicated
-// shard is still caught; the profile coordinate carries a non-empty
-// value in the environment that row's go-test step inherits (the union
-// of the job-level and step-level env mappings, innermost winning,
-// resolved through a matrix expression where the row supplies one);
-// that value names a file that exists; exactly one top-level Test
-// function in this package calls the comparison helper; and each row's
-// run_filter, compiled as a Go regexp, matches that function's name. A
-// coordinate declared where the step does not inherit it, a coordinate
-// naming a file that does not exist, and an assertion the nightly's
-// -run selector cannot reach each fail here rather than passing green
-// and inert.
 func TestNightlyReachability(t *testing.T) {
 	doc, err := readNightlyWorkflow()
 	if err != nil {
@@ -368,7 +353,12 @@ func TestNightlyReachability(t *testing.T) {
 		t.Fatalf("resolve repository root: %v", err)
 	}
 
-	commands := map[string]string{}
+	type shard struct {
+		command string
+		reaches bool
+	}
+	shards := map[shard]string{}
+	commandReached := map[string]bool{}
 	for _, row := range rows {
 		name := row.row["name"]
 
@@ -385,27 +375,39 @@ func TestNightlyReachability(t *testing.T) {
 		if command == "" {
 			t.Errorf("row %q: no %s in the environment job %q's go-test step inherits, or it is empty", name, capabilityDriftCommandEnv, row.jobName)
 		}
-		if previous, duplicate := commands[command]; duplicate {
-			t.Errorf("rows %q and %q both drive this package with %s %q, want one row per runtime", previous, name, capabilityDriftCommandEnv, command)
-		}
-		commands[command] = name
 
-		value := nightlyMatrixValue(row.row, env[capabilityDriftProfileEnv])
-		if value == "" {
-			t.Errorf("row %q: no %s in the environment job %q's go-test step inherits, or it is empty", name, capabilityDriftProfileEnv, row.jobName)
+		runFilter, skipFilter := row.row["run_filter"], row.row["skip_filter"]
+		runPattern, runErr := regexp.Compile(runFilter)
+		var skipPattern *regexp.Regexp
+		var skipErr error
+		if skipFilter != "" {
+			skipPattern, skipErr = regexp.Compile(skipFilter)
+		}
+		if compileErr := errors.Join(runErr, skipErr); compileErr != nil {
+			t.Errorf("row %q: compile run_filter %q and skip_filter %q as Go regexps: %v", name, runFilter, skipFilter, compileErr)
 			continue
 		}
-		if _, statErr := os.Stat(filepath.Join(root, value)); statErr != nil {
-			t.Errorf("row %q: resolve the file %s names, %q: nothing exists under %s", name, capabilityDriftProfileEnv, value, root)
-		}
+		reaches := runPattern.MatchString(callers[0]) && (skipPattern == nil || !skipPattern.MatchString(callers[0]))
 
-		pattern, compileErr := regexp.Compile(row.row["run_filter"])
-		if compileErr != nil {
-			t.Errorf("row %q: compile run_filter %q as a Go regexp: %v", name, row.row["run_filter"], compileErr)
+		key := shard{command: command, reaches: reaches}
+		if previous, duplicate := shards[key]; duplicate {
+			t.Errorf("rows %q and %q both drive this package with %s %q and reaches=%v, want one row per runtime and tier", previous, name, capabilityDriftCommandEnv, command, reaches)
+		}
+		shards[key] = name
+		commandReached[command] = commandReached[command] || reaches
+
+		if !reaches {
 			continue
 		}
-		if !pattern.MatchString(callers[0]) {
-			t.Errorf("row %q: run_filter %q does not match the calling test function %s", name, row.row["run_filter"], callers[0])
+		profile := nightlyMatrixValue(row.row, env[capabilityDriftProfileEnv])
+		if _, statErr := os.Stat(filepath.Join(root, profile)); profile == "" || statErr != nil {
+			t.Errorf("row %q: %s = %q names no existing file under %s", name, capabilityDriftProfileEnv, profile, root)
+		}
+	}
+
+	for command, reached := range commandReached {
+		if !reached {
+			t.Errorf("no row that reaches %s drives %s %q", callers[0], capabilityDriftCommandEnv, command)
 		}
 	}
 }

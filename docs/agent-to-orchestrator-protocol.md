@@ -2,7 +2,7 @@
 
 A specification for out-of-band advisory signaling between autonomous coding agents and the Sortie orchestration service via filesystem sentinel files.
 
-**Version:** 1.0 \
+**Version:** 1.1 \
 **Status:** Normative \
 **Audience:** Implementers of orchestrator readers, agent adapter writers, workflow authors, and coding agent runtimes seeking to participate in Sortie-managed execution.
 
@@ -46,6 +46,7 @@ This document specifies:
 
 - The canonical file path, format, and parsing rules for the status file.
 - The recognized vocabulary in version 1 and the orchestrator's behavioral response to each value.
+- The statement an agent may write after the status token: its bounds, its normalization, and where the orchestrator publishes it.
 - Read timing, write responsibility, cleanup obligations, and idempotency guarantees.
 - The relationship to tracker-mediated state transitions and handoff mechanisms.
 - Auto-injection of protocol instructions into agent prompts.
@@ -96,15 +97,16 @@ Relative to the agent's working directory (which MUST equal the per-issue worksp
 
 ### 2.2 File format
 
-The status file is a UTF-8 encoded plain-text file. The parsing algorithm is:
+The status file is a UTF-8 encoded plain-text file. The whole file has a budget of 1024 bytes, the status token line included. The parsing algorithm is:
 
-1. Read the file contents as a byte sequence.
-2. Split on the newline character (`0x0A`).
+1. Read the file contents as a byte sequence, at most the first 1024 bytes. A file longer than that is read to the bound and no further, and the reader records that it was cut.
+2. Split on the first newline character (`0x0A`).
 3. Take the first line.
 4. Trim leading and trailing ASCII whitespace (`0x09`, `0x0A`, `0x0D`, `0x20`).
 5. The resulting string is the **status token**.
+6. The bytes after the first newline, verbatim, are the **statement**. The statement is empty when the file holds no newline.
 
-Lines after the first are reserved for future use and MUST be ignored by version 1 readers. This reservation establishes an upgrade path to multi-line formats (e.g., structured context) without breaking backward compatibility.
+The lines after the first are the statement: free text in which the agent gives its reason for the status. The reader keeps the statement only when the status token is recognized (Section 2.3). Section 2.7 defines how the orchestrator normalizes and publishes it.
 
 The status token is case-sensitive. Implementations MUST NOT normalize case.
 
@@ -127,9 +129,9 @@ To clarify the two distinct suppression effects:
 
 The agent has completed its work and determined that the results require human review before further automated action is appropriate. Typical causes include: a pull request is ready for review, architectural decisions are embedded in the output that require validation, or the agent has low confidence in its solution.
 
-**Orchestrator behavior:** Like `blocked`, this value triggers a soft stop: the turn loop breaks, continuation retries are suppressed, and the issue claim is released. Unlike `blocked`, when `tracker.handoff_state` is configured ([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)), the issue is in an active tracker state, and the dispatch drives issue state, the orchestrator performs the handoff transition before releasing the claim. Where the dispatch does not drive issue state, no transition is attempted and the claim is released. If the handoff transition fails (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
+**Orchestrator behavior:** Like `blocked`, this value triggers a soft stop: the turn loop breaks, continuation retries are suppressed, and the issue claim is released. Unlike `blocked`, when `tracker.handoff_state` is configured ([architecture Section 5.3.1](architecture/05-workflow-specification.md#531-tracker-object)), the issue is in an active tracker state, and the dispatch drives issue state, the orchestrator performs the handoff transition before releasing the claim, except that where the run's rule carries `next` and the hop is made, the exit adds the next rule's stage label in place of the transition and the issue stays in its active state ([architecture Section 5.3.9](architecture/05-workflow-specification.md#539-dispatch-object-optional)). Where the dispatch does not drive issue state, no transition is attempted and the claim is released. If the handoff transition fails (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
 
-The transition is additionally subject to the run's `tracker.handoff_evidence` verdict ([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)). Where that verdict withholds the transition, the orchestrator re-reads the issue's tracker state once before recording the outcome. When that read does not find the issue terminal, no tracker write is attempted: the issue keeps its active state and its claim, and the exit takes the exponential-backoff failure path instead of releasing the claim. When that read does find the issue terminal, the exit releases the claim and records `succeeded` instead, exactly as it would have had the issue already been observed terminal.
+The transition, or the hop that replaces it, is additionally subject to the run's `tracker.handoff_evidence` verdict ([architecture Section 7.3](architecture/07-orchestration-state-machine.md#73-transition-triggers)). Where that verdict withholds the transition, the orchestrator re-reads the issue's tracker state once before recording the outcome. When that read does not find the issue terminal, no tracker write is attempted: the issue keeps its active state and its claim, and the exit takes the exponential-backoff failure path instead of releasing the claim. When that read does find the issue terminal, the exit releases the claim and records `succeeded` instead, exactly as it would have had the issue already been observed terminal.
 
 This distinction reflects the semantic difference between the two values: `blocked` means "I cannot proceed" (no completed work to hand off), while `needs-human-review` means "work is complete, ready for review" (completed work should be visible in the tracker via handoff).
 
@@ -149,7 +151,7 @@ For all three recognized values, the orchestrator:
 8. Releases the issue claim.
 9. Logs the status token value at `info` level with the issue identifier.
 
-Additionally, for `needs-human-review` and a stood `no-change-needed` declaration: when the relevant target state is configured (`tracker.handoff_state` for `needs-human-review`; `tracker.no_change_state`, or `tracker.handoff_state` where that field is unset, for `no-change-needed`) and the issue is in an active tracker state, the orchestrator attempts the handoff transition between steps 6 and 8. See Section 2.3.2 for failure handling and Section 2.3.6 for the declared run's target resolution.
+Additionally, for `needs-human-review` and a stood `no-change-needed` declaration: when the relevant target state is configured (`tracker.handoff_state` for `needs-human-review`; `tracker.no_change_state`, or `tracker.handoff_state` where that field is unset, for `no-change-needed`) and the issue is in an active tracker state, the orchestrator attempts the handoff transition between steps 6 and 8, or the hop that replaces it where the run's rule carries `next`: the exit adds the next rule's stage label, writes no tracker state, and the issue stays in its active state for the next stage's dispatch. A hop that is not made, because the label add failed, the hop ceiling was reached, or a reload removed `next`, leaves the exit to the handoff transition. See Section 2.3.2 for failure handling and Section 2.3.6 for the declared run's target resolution.
 
 Steps 7 and 8 carry one exception, for `needs-human-review` only. Where the run's `tracker.handoff_evidence` verdict withholds that transition and the verification read described in Section 2.3.2 does not find the issue in a terminal state, the orchestrator keeps the issue claim and schedules a retry on the exponential-backoff failure path. That retry is a failure-path retry rather than a continuation retry, so step 2 still holds and the run takes no further turns. Where that read does find the issue terminal, steps 7 and 8 apply as written. A stood `no-change-needed` declaration is always treated as positive evidence (Section 2.3.6), so this exception never applies to it; steps 7 and 8 always hold as written for a stood declaration.
 
@@ -177,7 +179,7 @@ The agent has determined that the requested outcome already held before it began
 
 The self-review phase's verification commands and review turn are what can falsify this declaration. The declaration stands only where the phase confirms it: exactly one recorded iteration, ending on a `pass` verdict, with no verification result failing. A phase that ran no verification command still confirms, because `self_review.verification_commands` is optional and an absent check is not a falsification. Any other phase outcome, including a fix turn that produced a second iteration, retracts the declaration: the orchestrator clears it to the empty string and the run continues on the ordinary path, exactly as if the run had exhausted its turn budget with no status file written.
 
-Where the declaration stands, it is treated as positive evidence under `tracker.handoff_evidence`: no absence verdict is computed, the run is recorded as `succeeded`, no session-failure comment is written, no continuation retry is scheduled, the consecutive-absence count is not advanced, that count is reset, and a park held for consecutive absences is released. The transition target is `tracker.no_change_state` where that field is configured, and `tracker.handoff_state` otherwise; where no handoff path applies (Section 3.6), the declaration changes no issue state. A terminal tracker state observed at exit keeps its own meaning and is not affected by this value (Section 2.3.2).
+Where the declaration stands, it is treated as positive evidence under `tracker.handoff_evidence`: no absence verdict is computed, the run is recorded as `succeeded`, no session-failure comment is written, no continuation retry is scheduled, the consecutive-absence count is not advanced, that count is reset, and a park held for consecutive absences is released. The transition target is `tracker.no_change_state` where that field is configured, and `tracker.handoff_state` otherwise; where no handoff path applies (Section 3.6), the declaration changes no issue state. On a rule that carries `next`, a stood declaration hops like any other successful run and selects `tracker.no_change_state` only when the hop is not made; the next stage's template learns of the declaration from `stage.previous_outcome`, which is `no_change`. A terminal tracker state observed at exit keeps its own meaning and is not affected by this value (Section 2.3.2).
 
 ### 2.4 Absent file
 
@@ -200,7 +202,53 @@ If the orchestrator encounters any error while reading the status file (permissi
 
 Read errors MUST NOT cause the worker run to fail. The protocol is advisory; its unavailability does not affect core orchestration correctness.
 
-Non-UTF-8 or binary content is not a read error. The parsing algorithm (Section 2.2) operates on raw bytes and does not validate encoding. Binary content that survives the first-line split produces a token that will not match any recognized value and is handled as an unrecognized token (Section 2.5).
+Non-UTF-8 or binary content is not a read error. The parsing algorithm (Section 2.2) operates on raw bytes and does not validate encoding. Binary content in the first line produces a token that will not match any recognized value and is handled as an unrecognized token (Section 2.5). Binary content in the statement is normalized before publication (Section 2.7): control characters are removed and each invalid UTF-8 sequence becomes U+FFFD. It neither fails the read nor discards the statement.
+
+### 2.7 Statement
+
+A recognized status token may be followed by a statement. The statement is written for the people who read the issue, and the orchestrator may publish it.
+
+#### 2.7.1 Capture
+
+The orchestrator keeps the statement that belongs to the status token that ends the run. The statement is kept or discarded at each read as follows:
+
+| Read | Statement |
+|---|---|
+| After a coding turn, recognized token | Kept with the token |
+| After a review turn or a fix turn inside the self-review phase, token `blocked` | Kept, replacing any statement already kept |
+| After a review turn or a fix turn inside the self-review phase, token `needs-human-review` or `no-change-needed` | Discarded with the consumed token (Section 2.3.5) |
+| Retraction of a `no-change-needed` declaration (Section 2.3.6) | Cleared with the token |
+
+The kept statement is therefore empty whenever the run's soft-stop token is empty. A statement that comes with an unrecognized or absent token is never kept.
+
+#### 2.7.2 Normalization
+
+Before publication the orchestrator normalizes the kept statement in this order:
+
+1. When the file was longer than 1024 bytes, drop a trailing incomplete UTF-8 sequence left by the cut.
+2. Mask every registered secret (Section 7.4) in the text as written. When the file was longer than 1024 bytes, the masking also removes a trailing fragment that is a prefix of a registered secret, so the cut cannot leave the start of a secret behind; the fragment is found before any secret inside it is masked.
+3. Convert CRLF and lone CR to LF.
+4. Delete every C0 control character except tab and line feed, and delete DEL.
+5. Replace each invalid UTF-8 sequence with U+FFFD.
+6. Mask every registered secret again, removing a trailing fragment as in step 2.
+7. Trim leading and trailing whitespace.
+8. When the file was longer than 1024 bytes, append an ellipsis (U+2026).
+9. When the result holds more than 1024 characters, keep its first 1024 and append an ellipsis.
+
+Masking runs on both sides of steps 3 to 5: before them so that a secret which itself holds a byte they rewrite is still recognized, and after them so that removing a byte cannot assemble a registered secret once masking has run. A statement that is empty after step 7 is absent.
+
+#### 2.7.3 Absence
+
+An absent statement is the same as a status file that holds only the token. A one-line file, a file whose lines after the first are blank, and a statement that normalization empties all produce today's comment and notifications unchanged, with no reason attached.
+
+#### 2.7.4 Where the reason goes
+
+The orchestrator publishes the statement only with the `session.stopped` event, which a soft stop on any of the three recognized values produces:
+
+- **Tracker comment.** When a `notifications` entry of kind `tracker_comment` lists `session.stopped`, or the deprecated `tracker.comments.on_completion` setting is on, the stop comment carries the statement after Sortie's own text as one literal block: the comment that accompanies the park for `blocked`, and the completion comment for `no-change-needed` and `needs-human-review`. The tracker shows the block as literal text and acts on nothing inside it. Sortie's own text never changes.
+- **Slack and webhook.** Every Slack or webhook entry that lists `session.stopped` receives the statement apart from the message body. Slack appends it after the body with `&`, `<`, and `>` escaped; the webhook carries it in the `agent_text` key.
+
+A `session.failed` event never carries a statement, including a `needs-human-review` run whose handoff evidence withheld the transition. Neither does an `agent.message` notification.
 
 ## 3. Operational semantics
 
@@ -277,7 +325,8 @@ The protocol is designed so that every failure mode degrades to normal orchestra
 | File exists, unrecognized value | Normal (ignore, warn) |
 | File exists, empty after trimming | Normal (empty string is unrecognized) |
 | File unreadable (permission, I/O) | Normal (warn, treat as absent) |
-| File contains binary/non-UTF-8 data | Normal (first-line parse yields unrecognized token) |
+| First line contains binary/non-UTF-8 data | Normal (first-line parse yields unrecognized token) |
+| Statement contains binary/non-UTF-8 data | Honor the signal; the statement is normalized (Section 2.7.2) |
 | `.sortie/` directory does not exist | Normal (file does not exist) |
 
 This exhaustive fail-safe property is a deliberate design choice. In a system managing autonomous agents whose behavior is not fully predictable, every advisory channel must degrade gracefully. The file-based sentinel is the only mechanism among the six alternatives evaluated (Section 5) where all failure modes are unconditionally safe.
@@ -351,11 +400,13 @@ The `.sortie/status` file protocol and the `tracker.handoff_state` configuration
 
 | `.sortie/status` value | Worker exit | Handoff transition | Continuation retry |
 |---|---|---|---|
-| `needs-human-review` | Normal | Performed (if configured, issue is active, and the dispatch drives issue state) | Suppressed |
-| `no-change-needed`, stood | Normal | Performed to `tracker.no_change_state`, or `tracker.handoff_state` where that field is unset (if configured, issue is active, and the dispatch drives issue state) | Suppressed |
+| `needs-human-review` | Normal | Performed (if configured, issue is active, and the dispatch drives issue state), or replaced by the stage hop where the run's rule carries `next` and the hop is made | Suppressed |
+| `no-change-needed`, stood | Normal | Performed to `tracker.no_change_state`, or `tracker.handoff_state` where that field is unset (if configured, issue is active, and the dispatch drives issue state), or replaced by the stage hop where the run's rule carries `next` and the hop is made | Suppressed |
 | `blocked` | Normal | Skipped; issue parked instead where the dispatch drives issue state | Suppressed |
-| absent or unrecognized | Normal | Performed (if configured, issue is active, and the dispatch drives issue state) | Depends on handoff result |
+| absent or unrecognized | Normal | Performed (if configured, issue is active, and the dispatch drives issue state), or replaced by the stage hop where the run's rule carries `next` and the hop is made | Depends on handoff result |
 | (any) | Error | Skipped | Standard error retry |
+
+A stage hop replaces the handoff transition with a stage label write. A hop is made only where the same conditions that select the handoff transition hold, the run's rule carries `next`, the consecutive hop count is below `dispatch.max_consecutive_hops`, and the label add succeeds. A made hop writes no tracker state, leaves the issue in its active state, releases the claim, and seeds no reaction; the poll tick then dispatches the next stage on a fresh session. Where the hop is not made, the row's handoff transition applies unchanged. A `blocked` exit and an error exit never hop.
 
 The parking label the orchestrator applies on a `blocked` park is a non-state write: it marks the issue without transitioning it, the same way the handoff transition moves the issue's state without touching any label.
 
@@ -367,7 +418,7 @@ All three values suppress continuation retries and release the issue claim.
 
 When a `handoff_state` is configured and the agent writes `blocked`, the orchestrator skips the handoff transition entirely. The issue remains in its current tracker state. This is correct: blocked work should not advance in the tracker.
 
-When a `handoff_state` is configured and the agent writes `needs-human-review`, the orchestrator attempts the handoff transition. On success, the issue moves to the configured handoff state. On failure (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
+When a `handoff_state` is configured and the agent writes `needs-human-review`, the orchestrator attempts the hop where the run's rule carries `next`, and the handoff transition otherwise or where the hop is not made. On success of the transition, the issue moves to the configured handoff state. On failure (network error, permission denied, nil adapter), the orchestrator logs a warning and releases the claim without scheduling a retry.
 
 When a `handoff_state` is configured and a `no-change-needed` declaration stands, the orchestrator attempts the handoff transition to `tracker.no_change_state`, or to `tracker.handoff_state` where that field is unset. Failure handling is identical to `needs-human-review`'s. Where no `handoff_state` is configured, the declaration changes no issue state, whether or not `tracker.no_change_state` is set.
 
@@ -391,7 +442,7 @@ The ordering of first-turn suffixes is:
 
 This ordering places the protocol instructions at the end, closest to the agent's point of attention, and avoids interleaving with tool documentation.
 
-The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to write it, and the exact command to use. It does not explain the orchestrator's internal logic.
+The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to write it, the exact command to use, and what to write after the value. It does not explain the orchestrator's internal logic.
 
 Example injection text:
 
@@ -409,6 +460,17 @@ complete and awaiting review. Use "no-change-needed" when the requested outcome
 already held before you started and you made no change to reach it. Do not write
 "no-change-needed" if you performed any work. Do not write this file during normal
 productive work.
+
+Give your reason on the lines after the value: for "blocked", what you need from a
+person; for "no-change-needed", why nothing had to change; for
+"needs-human-review", what the reviewer should check. For example:
+
+    mkdir -p .sortie && printf '%s\n' "blocked" "The ticket asks for both soft and hard delete of invoices." "Which one should the API expose?" > .sortie/status
+
+Sortie may publish the reason in its comment on the issue and in operator
+notifications, so write it for the people who read the issue, name files by their
+path in the repository, never include credentials or other secrets, and keep the
+whole file under 1024 bytes.
 ```
 
 ### 4.2 Prompt injection safety
@@ -469,7 +531,7 @@ The protocol's design aligns with several principles from the distributed system
 
 **Observable signaling.** The "Codified Context" framework [7] describes a three-tier infrastructure for AI agents in complex codebases, where routing between tiers occurs through observable signals. The `.sortie/status` file serves as an observable signal at the orchestration tier, consistent with this architectural pattern.
 
-**Minimal orchestration complexity.** Google's agent white paper (2025) argues that orchestration should begin with a perception-reasoning-action loop of minimal complexity. The protocol adheres to this principle: one file, one token, read-after-turn.
+**Minimal orchestration complexity.** Google's agent white paper (2025) argues that orchestration should begin with a perception-reasoning-action loop of minimal complexity. The protocol adheres to this principle: one file, one token with an optional reason, read-after-turn.
 
 **Traceability.** Wang et al.'s work on OpenHands demonstrates that explicit event-stream mechanisms provide full traceability of agent actions. The status file is a minimal instance of the same principle: an explicit, logged, inspectable signal that becomes part of the run history.
 
@@ -477,7 +539,7 @@ The protocol's design aligns with several principles from the distributed system
 
 ### 6.1 Version identification
 
-This document specifies version 1 of the protocol. The protocol version is implicit in the set of recognized status tokens. There is no explicit version field in the file format.
+This document specifies version 1.1 of the protocol. Version 1.1 gives the lines after the first the meaning of a statement (Section 2.7) and leaves the status vocabulary of version 1 unchanged. The protocol version is implicit in the set of recognized status tokens and the lines the reader gives meaning to. There is no explicit version field in the file format.
 
 ### 6.2 Evolution rules
 
@@ -491,23 +553,17 @@ The following rules govern protocol evolution:
 
 4. **Unrecognized values are always ignored.** This is the core forward-compatibility mechanism. A version-1 orchestrator encountering a version-2 token degrades gracefully to default behavior.
 
-5. **The file format (Section 2.2) is fixed.** Future versions may assign semantics to lines beyond the first, but the first-line parsing algorithm does not change.
+5. **The first-line parsing algorithm (Section 2.2) is fixed.** The lines after the first are free text, the statement, as Section 2.2 defines. A version 1.0 reader ignores them, and a version 1.1 reader publishes them under Section 2.7.
 
 ### 6.3 Reserved namespace
 
 The `.sortie/` directory within the workspace is reserved for orchestrator-agent communication files. Future extensions may define additional files in this namespace (e.g., `.sortie/metrics`, `.sortie/log`). Each new file requires its own specification addendum.
 
-### 6.4 Multi-line extension path
+### 6.4 Statement and extension
 
-Version 1 ignores all lines after the first. A future version may define a structured format for additional lines:
+Version 1.1 defines the lines after the first as free text (Section 2.7). A version 1.0 orchestrator ignores them, so a file that carries a statement still parses to its status token under every version.
 
-```
-blocked
-reason: missing API key STRIPE_SECRET_KEY
-context: checked env, checked .env, checked vault
-```
-
-Version 1 orchestrators encountering this file will correctly parse the first line as `blocked` and ignore the remaining lines. This provides a non-breaking upgrade path to richer signaling without changing the wire format.
+The orchestrator does not parse the statement. Structured, machine-readable context is not part of version 1.1, and a future version defines it by specification addendum (Section 6.3).
 
 ## 7. Security considerations
 
@@ -531,7 +587,9 @@ An agent that rapidly creates and overwrites the status file cannot degrade orch
 
 ### 7.4 Information leakage
 
-The status file contains a single token from a fixed vocabulary. It does not carry secrets, credentials, or sensitive data. The token is logged by the orchestrator; this logging does not create an information leakage vector.
+The status token comes from a fixed vocabulary and carries no sensitive data. The orchestrator logs it, and that logging does not create an information leakage vector.
+
+The statement is agent-authored text, and the orchestrator publishes it in a tracker comment that people outside the deployment may read, and to every Slack or webhook entry subscribed to `session.stopped` (Section 2.7.4). Before publication the orchestrator masks every registered secret, the credential values it holds for its own configuration. It masks only those secrets. It does not detect token-shaped strings, host paths, or other sensitive content, so what keeps those out of the statement is the injected instruction to name files by repository path and never include credentials (Section 4.1), which is a request to the agent and not a guarantee. The tracker comment holds the statement in one literal block, which keeps a mention, link, markup, or command inside it from taking effect.
 
 ## 8. Implementation guidance
 
@@ -541,24 +599,30 @@ The orchestrator reader is a function called within the worker turn loop. It MUS
 
 1. Construct the status file path from the workspace path.
 2. Validate that the constructed path is contained within the workspace root.
-3. Attempt to read the file. On any error (including "not found"), return an empty status.
+3. Attempt to read the file, up to 1024 bytes and one byte more to detect a longer file. On any error (including "not found"), return an empty status.
 4. Parse the first line per Section 2.2.
-5. Return the status token to the caller.
+5. Return the status token to the caller, together with the statement and whether the file was cut at the bound. The statement is empty unless the token is recognized.
 
-The caller (worker turn loop) compares the token against recognized values.
+The caller (worker turn loop) compares the token against recognized values and keeps the statement under Section 2.7.1.
 
 ### 8.2 Agent writer
 
 Any agent runtime that wishes to participate in the protocol MUST:
 
 1. Create the `.sortie/` directory if it does not exist.
-2. Write the status token followed by a newline to `.sortie/status`.
+2. Write the status token followed by a newline to `.sortie/status`. An agent that has a reason writes it on the lines after the token, and keeps the whole file under 1024 bytes.
 3. Use atomic write semantics where available (write to temporary file, rename). This is recommended but not required, because the orchestrator reads only after the turn completes, at which point the agent is no longer writing.
 
 Minimal implementation:
 
 ```sh
 mkdir -p .sortie && echo "blocked" > .sortie/status
+```
+
+Implementation with a reason:
+
+```sh
+mkdir -p .sortie && printf '%s\n' "blocked" "The ticket asks for both soft and hard delete of invoices." "Which one should the API expose?" > .sortie/status
 ```
 
 ### 8.3 Operator inspection
@@ -585,6 +649,7 @@ An implementation conforms to this specification if it satisfies all of the foll
 8. A link, a wrong entry type, or an entry replaced while being opened, at the workspace directory, the `.sortie/` directory, or the status file, is treated as a read error per Section 7.2.
 9. Every removal named in item 5, not the pre-dispatch cleanup alone, applies the same rejection, and every one tolerates a failed removal without changing the run's control flow, per Section 3.4.
 10. The orchestrator parks the issue on `blocked` where the dispatch drives issue state, and holds it out of dispatch until it observes a release per Section 2.3.1 and Section 3.5.
+11. The orchestrator reads at most 1024 bytes of the file, keeps the statement of the token that ends the run, and publishes it only after the normalization and masking of Section 2.7.2, only with `session.stopped`, and as the literal block and separate fields Section 2.7.4 describes.
 
 ## References
 

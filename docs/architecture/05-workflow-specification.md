@@ -42,10 +42,11 @@ Top-level keys:
 - `workspace`
 - `hooks`
 - `agent`
-- `ci_feedback` (deprecated; use `reactions.ci_failure` instead)
-- `dispatch`
-- `reactions`
 - `db_path`
+- `self_review`
+- `reactions`
+- `dispatch`
+- `notifications`
 
 Unknown keys should be ignored for forward compatibility.
 
@@ -71,9 +72,9 @@ Fields:
 - `project` (string)
   - Project identifier. Interpretation is adapter-defined (project key for Jira, `owner/repo` for GitHub, team key for Linear). Required for dispatch when the tracker adapter requires project scoping.
 - `active_states` (list of strings)
-  - Default values are adapter-defined; must be configured explicitly when the adapter's defaults differ from deployment expectations.
+  - No default on any tracker; the workflow's list is the only source of active states. An empty list dispatches no issue and draws a preflight warning. A blank entry (empty or only white space) is a configuration error.
 - `terminal_states` (list of strings)
-  - Default values are adapter-defined; must be configured explicitly when the adapter's defaults differ from deployment expectations.
+  - No default on any tracker. A tracker that derives issue state from labels requires a non-empty list, because a closed issue reads as the first entry; an empty list is a configuration error there. A blank entry (empty or only white space) is a configuration error on every tracker.
 - `query_filter` (string, optional)
   - Adapter-defined query fragment that narrows the base candidate and terminal-state queries.
   - The orchestrator passes this value to the tracker adapter without interpretation.
@@ -83,6 +84,8 @@ Fields:
   - Target tracker state for orchestrator-initiated handoff transitions after a successful worker run (see ADR-0007).
   - Supports `$VAR` environment indirection.
   - When absent, no handoff transition is performed; the orchestrator uses continuation retry as before.
+  - Required when any dispatch rule carries `next` (Section 5.3.9): every path on which a hop is not made lands on the handoff transition, and without a handoff state it would degrade to a continuation retry that re-runs the same stage.
+  - A successful run of a rule that carries `next` takes this transition only when the hop to the next stage is not made (Section 5.3.9, Stage chains); when the hop is made, no transition is written and the issue stays in its active state.
   - Empty values, including `$VAR` references that resolve to empty, are treated as configuration errors.
   - Must not appear in `active_states` (would cause immediate re-dispatch after handoff).
   - Must not appear in `terminal_states` (handoff is not terminal; the issue may return to active).
@@ -94,7 +97,8 @@ Fields:
   - When absent, a declared run targets `handoff_state` instead; a deployment that does not set this field sees no change in where its issues land.
   - Empty values, including `$VAR` references that resolve to empty, are treated as configuration errors.
   - Requires `handoff_state` to be non-empty: a declared run performs no transition where no handoff path applies.
-  - Must equal `handoff_state` (case-insensitive) or name a member of `terminal_states` exactly as written in front matter (case-insensitive); no other value is permitted, and no tracker adapter's default terminal-state list is consulted.
+  - A declared run of a rule that carries `next` hops like any other successful run and selects this state only when the hop is not made.
+  - Must equal `handoff_state` (case-insensitive) or name a member of `terminal_states` exactly as written in front matter (case-insensitive); no other value is permitted, and the list is read as written.
   - Changes take effect for future worker exits, not in-flight sessions.
 - `in_progress_state` (string, optional)
   - Target tracker state for dispatch-time transitions. When configured, the worker calls `TransitionIssue` as the first step of each attempt, before workspace preparation.
@@ -107,6 +111,11 @@ Fields:
   - Transition failure is non-fatal: the worker logs a warning and continues to workspace preparation.
   - If the issue is already in the target state (case-insensitive comparison), the `TransitionIssue` call is skipped and a debug-level message is logged.
   - Changes take effect for future dispatches, not in-flight sessions.
+- `comments` (object, optional; deprecated)
+  - Toggles for the comments the orchestrator posts at session lifecycle points. Keys: `on_dispatch`, `on_completion`, `on_failure`. Each is a boolean defaulting to `false`; a non-boolean value is rejected with a configuration error. The `SORTIE_TRACKER_COMMENTS_ON_DISPATCH`, `SORTIE_TRACKER_COMMENTS_ON_COMPLETION`, and `SORTIE_TRACKER_COMMENTS_ON_FAILURE` environment overrides set the three keys before the mapping below applies.
+  - Each key that resolves to `true` subscribes the built-in `tracker_comment` destination (Section 5.3.10) to a set of events: `on_dispatch` to `session.started`; `on_completion` to `session.completed` and `session.stopped`; `on_failure` to `session.failed`. The mapping unions with the `events` of an explicit `tracker_comment` entry, so holding both forms never posts a comment twice.
+  - The settings keep working. A resolved `true` value draws a deprecation advisory (Section 5.3.10) that names the events to list in a `tracker_comment` entry before the key is removed. Sortie never rewrites `WORKFLOW.md`, and no removal date is set.
+  - Changes take effect for future dispatches and worker exits, not in-flight sessions.
 
 #### 5.3.2 `polling` (object)
 
@@ -166,15 +175,19 @@ Fields:
 
 - `kind` (string)
   - Specifies which agent adapter to use. Default: `claude-code`.
-  - Other supported values: `copilot-cli`, `codex`, `opencode`, `kiro`, `pi`, `mock`, and `agent-client-protocol`.
+  - Other supported values: `copilot-cli`, `codex`, `opencode`, `pi`, `mock`, and `agent-client-protocol`.
   - Other kinds (for example, HTTP-based adapters) are available only if you register them separately.
   - Parallels `tracker.kind`.
-  - This is the default agent kind used when no `dispatch.rules` entry overrides it; see §5.3.10 for the override mechanism.
-  - `kiro` is deprecated, with `agent-client-protocol` as its replacement. The kind stays registered and a configuration naming it keeps working.
-- `command` (string)
-  - The command the agent adapter uses to launch the agent process. A local subprocess adapter splits it on whitespace into an argument vector; an SSH worker passes it to the remote shell unsplit. Adapter-defined default.
-  - When `agent.kind` requires a local command, this field must be present and non-empty.
-  - HTTP-based agent adapters do not require a local command.
+  - This is the default agent kind used when no `dispatch.rules` entry overrides it; see §5.3.9 for the override mechanism.
+  - A retired kind has no adapter, and its registry declaration names a replacement kind. A configuration that names a retired kind in `agent.kind`, `dispatch.default.agent`, or a `dispatch.rules` entry's `agent` is converted at load onto the replacement kind, together with the settings block the retired kind read. The conversion runs on startup, on reload, and in `sortie validate`, rewrites the configuration in memory only, and leaves the workflow file untouched. Each conversion emits one `agent.kind.retired` advisory, and a setting the conversion cannot carry fails the load as a configuration error (§6.1, §6.3). A kind that is registered as a live adapter is never converted, even when the registry also declares it retired.
+- `command` (string or list of strings)
+  - The command the default agent kind's adapter uses to launch the agent process. The default kind is `dispatch.default.agent` when set, and `agent.kind` otherwise. Adapter-defined default.
+  - String form: a local subprocess adapter splits the string on whitespace into an argument vector; an SSH worker passes it to the remote shell unsplit.
+  - List form: element zero names the executable and each later element is one argument. A local launch resolves element zero whole, whitespace included, and passes the other elements verbatim, without splitting. An SSH worker quotes every element as one word for the remote shell, so the remote shell does not expand or split any of them. The list form is how a path or argument that holds whitespace reaches the agent process.
+  - A list MUST NOT be empty, every element MUST be a non-empty string, and element zero MUST hold a non-whitespace character. A violation is rejected when the configuration is parsed, and the failing check names the element (`agent.command[0]`). `SORTIE_AGENT_COMMAND` sets the string form and replaces a list the file holds.
+  - Command governance: a session launches only a command written for its own kind. `agent.command`, in either form, is the default kind's command. A kind that replaces a converted retired kind launches the converted command. Every other kind launches its adapter's default command, so `agent.command` MAY be omitted for a kind that has one.
+  - Preflight reports `agent.command` for each kind a selection can reach (`agent.kind`, `dispatch.default.agent`, and every `dispatch.rules` entry's `agent`) that launches a command and has neither a command written for it nor a default command. A kind other than the default kind draws a message naming the selector that reaches it.
+  - HTTP-based agent adapters do not launch a command.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
   - Must be positive. A non-positive value is rejected when the configuration is parsed.
@@ -232,44 +245,13 @@ Fields:
   - `0`, a negative value, and a value above the largest millisecond count whose conversion to a duration stays positive are rejected as a configuration error at parse time, so startup, `sortie validate`, and the reload fail-safe path all reject them.
   - Overridable through `SORTIE_AGENT_STOP_GRACE_MS`.
   - Takes effect for future worker attempts, not an in-flight session.
-  - In `claude-code`, `copilot-cli`, `kiro`, `opencode`, and `pi`, the same value also bounds a cancelled turn's escalation to a force kill.
+  - In `claude-code`, `copilot-cli`, `opencode`, and `pi`, the same value also bounds a cancelled turn's escalation to a force kill.
 
 Adapter-specific pass-through config:
 
-Each adapter may define its own configuration fields in a sub-object named after its `kind` value. These are pass-through values interpreted by the adapter and not by the orchestrator core. For example, a Codex adapter may accept `codex.approval_policy` and `codex.thread_sandbox`; a Claude Code adapter may accept `claude-code.permission_mode`; an OpenCode adapter may accept `opencode.variant` and `opencode.allowed_tools`; a Kiro adapter may accept `kiro.model` and `kiro.trust_tools`. The orchestrator forwards the sub-object to the adapter. An adapter may declare a validator that preflight runs over its own sub-object, and an adapter may declare metadata that a core preflight rule reads to refuse a value of that sub-object.
+Each adapter may define its own configuration fields in a sub-object named after its `kind` value. These are pass-through values interpreted by the adapter and not by the orchestrator core. For example, a Codex adapter may accept `codex.approval_policy` and `codex.thread_sandbox`; a Claude Code adapter may accept `claude-code.permission_mode`; an OpenCode adapter may accept `opencode.variant` and `opencode.allowed_tools`. The orchestrator resolves the sub-object for each attempt and hands it to the adapter as a session input (§10.1); an adapter holds none of it between sessions. The keys `model` and `effort` mean the same in the block of every kind that reads them (§10.1): a string handed to the runtime as written, where an absent key, a null, and an empty string all leave the runtime's own default in charge. The orchestrator reads only those two keys, for validation advisories and for recording, and never interprets their values. A change to a block applies from the next attempt without a restart, while a running session keeps the block it started with (§5.3.9). An adapter may declare a validator that preflight runs over its own sub-object, and an adapter may declare metadata that a core preflight rule reads to refuse, or to warn about, a value of that sub-object.
 
-#### 5.3.6 `ci_feedback` (object, optional, **deprecated**)
-
-**Deprecated.** Use `reactions.ci_failure` instead (Section 5.3.9). When both `ci_feedback` and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and a deprecation warning is logged.
-
-CI feedback loop configuration. Feature activation follows the same pattern as other optional sections (`server.port`, `worker.ssh_hosts`): presence of the `kind` field activates the feature; there is no separate `enabled` flag. When the section is absent or `kind` is empty, CI feedback is disabled and no `CIStatusProvider` is constructed.
-
-Fields:
-
-- `kind` (string)
-  - Identifies the CI status provider adapter (e.g. `github`). Empty string or absent means CI feedback is disabled.
-  - The orchestrator resolves the adapter via the CI provider registry at startup.
-- `max_retries` (integer)
-  - Maximum number of CI-fix continuation dispatches per issue before escalation.
-  - Default: `2`. Zero means escalate immediately on first CI failure (no fix attempts).
-  - MUST be non-negative; negative values are rejected with a configuration error.
-- `max_log_lines` (integer)
-  - Maximum number of log tail lines fetched from the first failing check run for prompt injection.
-  - Default: `50`. Zero disables log fetching.
-  - MUST be non-negative; negative values are rejected with a configuration error.
-- `escalation` (string)
-  - Action taken when `max_retries` is exceeded.
-  - Valid values: `label` (default), `comment`.
-  - `label`: adds `escalation_label` to the tracker issue.
-  - `comment`: posts a plain-text escalation comment listing failing checks and the ref.
-  - Invalid values are rejected with a configuration error.
-- `escalation_label` (string)
-  - Label applied when escalation is `label`.
-  - Default: `needs-human`.
-
-The CI provider adapter receives `max_log_lines` and the pass-through config sub-object named by `ci_feedback.kind` from `Extensions[kind]`. The orchestrator merges tracker credentials (API key, project, endpoint) into that CI adapter config only when the tracker and CI feedback `kind` values match.
-
-#### 5.3.7 `db_path` (string, optional)
+#### 5.3.6 `db_path` (string, optional)
 
 Filesystem path for the SQLite database file.
 
@@ -282,7 +264,7 @@ Filesystem path for the SQLite database file.
 - If the value resolves to an empty string after environment expansion (e.g., an unset `$VAR`), startup fails with a configuration error.
 - Changes to `db_path` during dynamic reload update the in-memory config but have no effect on the already-open database connection; a restart is required.
 
-#### 5.3.8 `self_review` (object, optional)
+#### 5.3.7 `self_review` (object, optional)
 
 Self-review loop configuration. When `enabled` is true and `verification_commands` is non-empty, the orchestrator runs a bounded review-fix cycle after the coding turn loop completes. Each iteration executes verification commands, generates a workspace diff, and presents both to the agent for a structured verdict. Disabled by default; zero overhead when disabled.
 
@@ -296,7 +278,7 @@ Fields:
   - Each iteration consists of a review turn and (if the verdict is `iterate`) a fix turn. `max_iterations: N` means up to `2N − 1` additional agent turns.
 - `verification_commands` (list of strings)
   - Shell commands executed during each review iteration. Required when `enabled` is true.
-  - Each command runs in its own subprocess with the workspace as `cwd` and a per-command timeout. Its process group, its Job Object on Windows, is terminated when it exits, times out, or is cancelled, resending that termination until the group or job reports no member left or a 2-second bound elapses, and its exit status decides whether it passed. A Windows command running without a Job Object, because one could not be created or assigned, has only its direct process reached by that termination. A termination that still cannot confirm the group or job empty once the bound elapses is reported as a warning.
+  - Each command runs in its own subprocess with the workspace as `cwd` and a per-command timeout. Its process group, its Job Object on Windows, is terminated when it exits, times out, or is cancelled, resending that termination until no process of the group or job is still alive or a 2-second bound elapses, and its exit status decides whether it passed. A Windows command running without a Job Object, because one could not be created or assigned, has only its direct process reached by that termination. A termination that cannot confirm that no process of the group or job is still alive once the bound elapses is reported as a warning.
 - `verification_timeout_ms` (integer)
   - Per-command timeout in milliseconds. Default: `120000` (2 minutes).
 - `max_diff_bytes` (integer)
@@ -304,11 +286,9 @@ Fields:
 - `reviewer` (string)
   - Which agent performs the review. Default: `"same"`. Only `"same"` (reuse the current session) is supported in v1.
 
-#### 5.3.9 `reactions` (object, optional)
+#### 5.3.8 `reactions` (object, optional)
 
 Reaction configuration. Each key under `reactions` identifies a reaction kind (e.g. `ci_failure`, `review_comments`). The orchestrator creates pending reaction entries on normal worker exit and processes them during the reconcile tick. Reaction kinds are extensible: unknown kind keys are parsed into a generic `ReactionConfig` and made available to future consumers.
-
-The `reactions` section supersedes the deprecated `ci_feedback` top-level key. When both `ci_feedback` and `reactions.ci_failure` are present, `reactions.ci_failure` takes precedence and a deprecation warning is logged.
 
 **Common fields per reaction kind:**
 
@@ -321,7 +301,7 @@ Each reaction kind sub-object shares a common field schema:
   - MUST be non-negative; negative values are rejected with a configuration error.
   - `review_comments` and `bot_review` do not consume this field. Each bounds its dispatches with its own `max_continuation_turns` instead, and a value set here has no effect on those two kinds.
 - `escalation` (string)
-  - Action taken when the kind stops dispatching continuations and hands the subject to a person. Two conditions reach it: the kind's dispatch budget is exhausted, whether that budget is `max_retries` or `max_continuation_turns`, or a `triage` command answers `escalate`. Valid values: `label` (default), `comment`.
+  - Action taken when the kind stops dispatching continuations and hands the subject to a person. These conditions reach it: the kind's dispatch budget is exhausted, whether that budget is `max_retries` or `max_continuation_turns`; a `triage` command answers `escalate`; the forge refuses the merge call of `auto_merge`, or the tracker refuses the issue move of `merge_completion`, with an authentication or payload error, which escalates at once; and, for `merge_completion`, a merged pull request that the forge reports without a merge commit after the fixed grace period. For `review_comments` and `bot_review`, an exhausted budget reaches the escalation only when a comment arrives that no earlier run of the issue was given, and for `bot_review` only an inline comment counts. Valid values: `label` (default), `comment` (deprecated), and `none`. Every escalation emits its `escalation.<kind>` event (Section 5.3.10) whatever the value. `label` applies the label, and the event reaches only the destinations subscribed to it. `none` applies no label, and the event reaches only the destinations subscribed to it. `comment` applies no label and subscribes the `tracker_comment` destination to the event, keeps working, and draws a deprecation advisory whose replacement is `escalation: none` plus the event in the `events` of a `tracker_comment` entry. An omitted `escalation` resolves to `label` for every kind, `auto_merge` included, and draws no advisory. An escalation stays in force until its kind's ending fact: while it stands, the kind dispatches nothing and applies its action once for the subject it escalated, and it ends when the pull request merges, closes, or is missing, when the issue reaches a terminal state, when a person moves the issue out of `tracker.handoff_state` or releases its park so Sortie runs the issue again, or on a fact of the kind itself (Sections 11A.7 to 11G.6). An escalation survives a restart.
 - `escalation_label` (string)
   - Label applied when `escalation` is `label`. Default: `needs-human`.
 - `triage` (object)
@@ -335,10 +315,10 @@ Remaining keys within a kind sub-object are collected into an `Extra` map for ki
 
 **Reaction kind: `ci_failure`**
 
-Equivalent to the deprecated `ci_feedback` section. See Section 11A for the CI feedback contract. Extra fields:
+See Section 11A for the CI feedback contract. Extra fields:
 
-- `max_log_lines` (integer, via Extra): maximum CI log tail lines. Default: `50`.
-- `watch_window_ms` (integer, via Extra): bounds a pending CI entry's age, measured from the last recorded head. Default: `86400000` (twenty-four hours). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound.
+- `max_log_lines` (integer, via Extra): maximum number of log lines in the CI failure log excerpt (Section 11A.2). Default: `50`.
+- `watch_window_ms` (integer, via Extra): bounds a pending CI entry's age, measured from the last recorded head. Default: `86400000` (twenty-four hours). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound. A standing escalation is never aged out.
 
 **Reaction kind: `review_comments`**
 
@@ -349,7 +329,7 @@ Extra fields:
 - `poll_interval_ms` (integer, via Extra): polling interval for review comments. Default: `120000` (2 minutes). Minimum: `30000`.
 - `debounce_ms` (integer, via Extra): debounce window after the last detected comment before dispatching. Default: `60000` (60 seconds). MUST be non-negative.
 - `max_continuation_turns` (integer, via Extra): maximum review-fix continuation dispatches per issue before escalation. Default: `3`. MUST be positive.
-- `watch_window_ms` (integer, via Extra): bounds a pending review-comments entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound.
+- `watch_window_ms` (integer, via Extra): bounds a pending review-comments entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound. A standing escalation is never aged out.
 
 Example:
 
@@ -374,7 +354,7 @@ Extra fields:
 - `require_ci` (boolean, via Extra): whether merge requires CI success. Default: `true`.
 - `delete_branch` (boolean, via Extra): whether to delete the head branch after merge. Default: `true`.
 - `poll_interval_ms` (integer, via Extra): polling interval for merge-precondition checks. Default: `60000` (1 minute). Minimum: `30000`.
-- `watch_window_ms` (integer, via Extra): bounds a pending auto-merge entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound.
+- `watch_window_ms` (integer, via Extra): bounds a pending auto-merge entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound. A standing escalation is never aged out.
 
 Example:
 
@@ -400,7 +380,7 @@ Extra fields:
 - `bot_usernames` (list of strings, via Extra): allowlist of bot logins. A comment is bot-authored when the platform reports a bot user type or when its author login matches an entry here, case-insensitively. Default: empty. A value that is not a list, or a list holding a non-string element, is rejected with a configuration error.
 - `poll_interval_ms` (integer, via Extra): polling interval for bot comments. Default: `60000` (1 minute). Minimum: `30000`.
 - `max_continuation_turns` (integer, via Extra): maximum bot-fix continuation dispatches per issue before escalation. Default: `5`. MUST be positive.
-- `watch_window_ms` (integer, via Extra): bounds a pending bot-review entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound.
+- `watch_window_ms` (integer, via Extra): bounds a pending bot-review entry's age, measured from the entry's creation. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound. A standing escalation is never aged out.
 
 The kind reads no `debounce_ms` field: bot comments arrive in bulk on push and dispatch immediately.
 
@@ -413,17 +393,17 @@ Merge-conflict detection and resolution. When configured, the orchestrator polls
 Extra fields:
 
 - `poll_interval_ms` (integer, via Extra): polling interval for the conflict-detection state machine. Default: `60000` (1 minute). Minimum: `30000`.
-- `watch_window_ms` (integer, via Extra): bounds a pending merge-conflict entry's age, measured from the entry's creation rather than from the last recorded head. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound.
+- `watch_window_ms` (integer, via Extra): bounds a pending merge-conflict entry's age, measured from the entry's creation rather than from the last recorded head. Default: `1800000` (thirty minutes). MUST be non-negative and MUST NOT exceed `9223372036854`. `0` removes the clock bound. A standing escalation is never aged out.
 
 **Reaction kind: `merge_completion`**
 
 Merge-completion detection. When configured, the orchestrator observes the merge state of Sortie-managed PRs independently of who performs the merge and transitions the linked issue to a single configured terminal state exactly once. See Section 11G for the full contract. (Runtime kind value: `merge-completion`.)
 
-The kind constrains two `tracker` fields, both checked when its configuration is constructed: `handoff_state` MUST be non-empty, and `terminal_states` MUST be written non-empty in front matter rather than left to the tracker adapter's default list.
+The kind constrains two `tracker` fields, both checked when its configuration is constructed: `handoff_state` MUST be non-empty, and `terminal_states` MUST be written non-empty in front matter.
 
 Extra fields:
 
-- `target_state` (string, via Extra): the single tracker terminal state the linked issue moves to once its pull request merges. Required, no default. MUST NOT equal `tracker.handoff_state`; MUST NOT be a member of `tracker.active_states`, falling back to the tracker adapter's default active-state list when that field is empty; MUST be a member of `tracker.terminal_states` exactly as written in configuration, with no fallback to the adapter's default terminal-state list. All three comparisons are case-insensitive.
+- `target_state` (string, via Extra): the single tracker terminal state the linked issue moves to once its pull request merges. Required, no default. MUST NOT equal `tracker.handoff_state`; MUST NOT be a member of `tracker.active_states`; MUST be a member of `tracker.terminal_states`. Both lists are read exactly as written in configuration. All three comparisons are case-insensitive.
 - `poll_interval_ms` (integer, via Extra): polling interval for the merge-observation state machine. Default: `60000` (1 minute). Minimum: `30000`.
 
 The kind carries no `watch_window_ms`: a pull request may remain unmerged for any length of time without starting a failure clock.
@@ -432,45 +412,150 @@ The kind carries no `watch_window_ms`: a pull request may remain unmerged for an
 
 - Reaction kind keys MUST match `[a-z][a-z0-9_-]*`.
 - Invalid kind keys are rejected with a configuration error.
-- Per-kind common fields follow the same validation as the deprecated `ci_feedback` equivalents.
+- Per-kind common fields are validated as follows: `max_retries` MUST be a non-negative integer, `escalation` MUST be `label`, `comment`, or `none`, and `provider`, `escalation`, and `escalation_label` MUST be strings. Each violation is rejected with a configuration error.
 - Extra fields are kind-specific; the orchestrator validates them when constructing the kind-specific config (e.g. `BuildReviewReactionConfig`).
 - A `triage` block under any reaction key other than `ci_failure`, `review_comments`, `bot_review`, or `merge_conflicts` is rejected with a configuration error, as is a block whose `script` is absent, not a string, or blank, and one whose `timeout_ms` falls outside the closed range `1` to `600000`.
 
-#### 5.3.10 `dispatch` (object, optional)
+#### 5.3.9 `dispatch` (object, optional)
 
-Routes the initial dispatch to an `(agent_kind, template_id)` selection per first-match-wins rules. When absent, the orchestrator behaves identically to today: the resolver returns the top-level defaults (`agent.kind` and the Markdown body template).
+Routes the initial dispatch to an `(agent_kind, template_id)` selection. A rule that carries a stage label is selected by that label; the other rules are first-match-wins. A rule may name the rule that follows it with `next`, so that a successful run advances the issue to that rule's stage instead of ending on the handoff state. When absent, the orchestrator behaves identically to today: the resolver returns the top-level defaults (`agent.kind` and the Markdown body template).
 
 Fields:
 
-- `rules` (list of `DispatchRule`, optional): ordered list of dispatch rules; first-match-wins.
+- `rules` (list of `DispatchRule`, optional): list of dispatch rules. Rules without a stage label are evaluated in order and the first match wins; a rule with a stage label is selected by that label before they are evaluated.
 - `default` (object, optional): carries `agent` and `template` overrides applied when no rule matches.
+- `max_consecutive_hops` (integer, optional): per-issue ceiling on consecutive automatic hops (see Stage chains below). When absent or null it defaults to the larger of `10` and the number of hops in the longest configured chain. A zero or negative value, a value that is not an integer, and a value below the number of hops in the longest configured chain are configuration errors. Changes take effect for future worker exits, not in-flight sessions.
+- `partials` (list of strings, optional): the files whose define blocks every prompt template of the workflow can call (see Partials below). Each entry is a path or a glob pattern relative to the workflow directory. When absent, null, or an empty list, no partial is selected. A value that is not a list is a configuration error.
 
-Each `DispatchRule` has four keys:
+Each `DispatchRule` has six keys and an optional settings block:
 
-- `name` (optional): operator-supplied rule identifier used in metrics labels and freeze-on-dispatch persistence. When present, the value MUST match the pattern `^[a-z][a-z0-9_-]*$`. When absent or empty, the rule has no operator-visible name and metrics label the rule as the sentinel `<none>`.
+- `name` (optional unless the rule carries a settings block or a stage label): operator-supplied rule identifier used in metrics labels, in run history, and to find the rule again after a reload. When present, the value MUST match the pattern `^[a-z][a-z0-9_-]*$`. When absent or empty, the rule has no operator-visible name and metrics label the rule as the sentinel `<none>`. A rule that carries a settings block MUST have a name, and the name MUST NOT be `default`, which run history and statistics give the `dispatch.default` selection. A rule that carries a stage label or a `next` MUST have a name.
+- `stage`: a label that selects the rule. A rule that carries it is selected by that label instead of by a `match` block, so `stage` and `match` are mutually exclusive on one rule.
+- `next`: the `name` of the rule that follows this one. A successful run of this rule advances the issue to the named rule instead of taking the handoff write. The named rule MUST exist, MUST NOT be the rule that carries `next`, and MUST carry a stage label. A rule that carries no `next` ends on the handoff state. `next` may sit on a rule without a stage label, so that an entry rule selected by an ordinary `match` can start a chain. Each rule has at most one `next`. `dispatch.default` and `match` do not accept it.
 - `match`: a block whose keys define the predicate evaluated against the issue.
 - `agent`: optional override of the agent kind for matching issues.
 - `template`: optional override of the prompt template path for matching issues.
+- `<kind>`: an optional settings block named for the agent kind the rule runs.
+
+A rule MUST carry at least one of `match`, `stage`, `agent`, `template`, or a settings block; `next` does not satisfy this requirement. A rule key that names a registered agent kind, or equals the rule's own `agent` value, is its settings block; any other unrecognized key is a configuration error. `dispatch.default` carries no settings block: a key in it that names an agent kind is a configuration error, because the top-level block of each kind holds the default settings.
+
+**Rule settings blocks**
+
+The rule's kind is its `agent`, else `dispatch.default.agent`, else `agent.kind`. The block MUST be named for that kind, MUST be a mapping (an empty block is written `{}`), and MUST NOT write `kind`, `command`, or any of the four `agent` timeouts, which the orchestrator derives from the `agent` section and which stay workflow-wide. Each violation is a configuration error, so a reload that introduces one keeps the last good configuration, and so does a change of `agent.kind` or `dispatch.default.agent` that leaves a block under a rule now running another kind.
+
+The block an attempt runs with is the top-level block of the rule's kind with the rule's block laid over it, one level deep:
+
+- A key the rule writes replaces the inherited value whole, whatever its type; maps are not merged and lists are not appended.
+- A key the rule writes as null removes the inherited key, so the adapter applies its own default.
+- Every other key is inherited.
+- A kind with no top-level block inherits nothing, and the rule's block is the whole block.
+- A block is laid only over the top-level block of its own kind.
+
+No key is defaulted or coerced before the overlay. `$VAR` references in a rule's block resolve as they do in a top-level block. A block for a removed agent kind converts together with the kind; a conversion that would change the command the replacement kind launches fails the load, because a rule cannot set a command.
+
+**Stage labels**
+
+A stage label is taken literally: it has no glob characters and no `$VAR` resolution, and white space around it is part of it. It MUST be a string with at least one character other than white space. Two rules MUST NOT carry stage labels that differ at most in case. A rule that carries a stage label is not a catch-all, because only its label selects it.
+
+Stage labels compare case-insensitively against the label set the tracker adapter reports, which is lowercase. Selection, the duplicate check, and the collision check below all use this one comparison.
+
+A stage label MUST NOT equal, under that comparison, a state name the workflow configures (an active or terminal state, compared as written in front matter, and the handoff, in-progress, and no-change states) or a label the orchestrator applies to issues (a reaction's escalation label or the parking label). The check reads configuration only and makes no tracker call. A reaction block for `ci_failure` that names no provider is disabled and its escalation label is not compared.
+
+An issue that carries the stage labels of several rules is selected by the three-step precedence of the resolution semantics below, and the dispatch logs one warning naming every stage label it found.
 
 **Match-block keys and semantics**
 
-Match keys are evaluated with AND semantics across keys and OR semantics within a single key. String-valued keys accept either a single string or a list of strings; a scalar is treated as a one-element list. Comparisons against `issue_type` and `assignee` are case-insensitive:
+Match keys are evaluated with AND semantics across keys and OR semantics within a single key. String-valued keys accept either a single string or a list of strings; a scalar is treated as a one-element list. Comparisons against `issue_type`, `assignee`, and `title` are case-insensitive:
 
 - `labels` (string or list of glob patterns): matches when the issue carries at least one label matching any pattern; glob syntax (e.g. `bug/*`, `*-urgent`).
 - `issue_type` (string or list of strings): case-insensitive equality match against the issue type field; matches when the issue type equals any list entry.
 - `priority` (predicate object): numeric comparison via one operator key: `eq`, `in`, `lt`, `lte`, `gt`, or `gte`. The predicate object MUST have exactly one operator key.
 - `identifier` (string or list of glob patterns): matches against the issue identifier string.
 - `assignee` (string or list of strings): case-insensitive equality match against the issue assignee; matches when the assignee equals any list entry.
+- `title` (string or list of phrases): matches when any phrase appears in the issue title as whole words. A `title` key that is null, bare, or an empty list is a configuration error, unlike the other list-valued keys, where it leaves the key out of the match, so a rule whose only key is `title` is never a catch-all. A phrase that is empty or only white space is a configuration error. Phrases are kept as written; normalization happens at match time:
+  - Every case form of a letter compares equal on both sides, so σ, ς, and Σ match one another, as do s, S, and ſ. This is simple case folding, not full case folding: ß stays distinct from ss. The emoji variation selectors U+FE0E and U+FE0F are dropped on both sides, each run of white space becomes one space, and white space at either end is dropped. Nothing else is folded: no Unicode normalization form, no accent folding, no stemming, and no other variation selector or combining mark is dropped.
+  - A word is a run of letters, digits, and combining marks; every other character, underscore and hyphen included, separates words. An occurrence of a phrase in the title matches only where it neither starts nor ends inside a word. A phrase whose first character is not part of a word carries no constraint at its start, and one whose last character is not part of a word is constrained at its end only by a combining mark that follows it in the title. Every occurrence is tried, overlapping ones included.
+  - Han, Hiragana, Katakana, Thai, Lao, Khmer, and Myanmar are written without spaces between words, so each character of these scripts is a word of its own. Hangul is not in this set. A combining mark always joins the character before it, in every script, and is never a word boundary.
+  - The phrase search is literal: `*`, `?`, and brackets match only themselves, unlike in `labels` and `identifier`. There is no regular expression and no wildcard.
+  - An issue with an empty title never matches.
 
 **Resolution semantics and freeze-on-dispatch invariant**
 
-First-match wins: evaluation stops at the first rule whose `match` block succeeds. Absent rule fields fall through to `dispatch.default`, then to the top-level `agent.kind` and the Markdown-body template (the pre-dispatch top-level defaults).
+Stage labels are evaluated before the ordered rules. An issue that carries the stage label of a rule is selected by that rule, whatever its position in the list. When it carries several, the selection follows three steps in order:
 
-The resolved `(agent_kind, template_id, rule_name)` is recorded on `RunningEntry` at the initial dispatch and propagated through `RetryEntry`. Retries and reaction-driven continuations reuse the frozen selection without re-evaluating rules.
+1. While the issue's hop count has not reset since its latest hop and the issue carries the label that hop added, the issue is selected by the rule that hop targeted, provided a rule of that name still exists. The orchestrator recorded where it sent the issue, so a stage label a failed removal left behind cannot capture it, whether or not that label lies on the target's chain.
+2. Otherwise the issue is selected by the rule furthest along the `next` links among the rules whose labels it carries. A rule is furthest along when no other candidate is reached from it by following `next`.
+3. Where the candidates do not lie on one chain, the rule listed first among the furthest-along candidates is selected.
+
+The warning above is logged in each case. With no `next` anywhere, no hop record exists and every candidate is furthest along, so the rule listed first is selected. An issue that carries none is routed by the rules without a stage label, and a rule with a stage label never matches it. A catch-all is a rule with neither a stage label nor a `match` key; only the last rule without a stage label may be one, while a rule with a stage label may follow it.
+
+Among the rules without a stage label, first-match wins: evaluation stops at the first rule whose `match` block succeeds. Absent rule fields fall through to `dispatch.default`, then to the top-level `agent.kind` and the Markdown-body template (the pre-dispatch top-level defaults).
+
+The default agent kind is `dispatch.default.agent` when set, and `agent.kind` otherwise. It is the kind every selection without an agent of its own runs, and the only kind that launches `agent.command` as written.
+
+The resolved `(agent_kind, template_id, rule_name)` is recorded on `RunningEntry` at dispatch and propagated through `RetryEntry`. The previous-stage pair rendered as `stage.previous` and `stage.previous_outcome` (Section 5.4) travels with the selection and is frozen with it, so a retry or reaction continuation, also one recovered after a restart, renders the same pair. The stage chain identifier travels with the selection beside that pair and is frozen with it: a dispatch no hop reached starts a chain, a dispatch a hop reached inherits the hop's chain, and a retry or reaction continuation carries the chain of the run it continues. The selection is frozen per claim; the settings are not. Every attempt, whether the first dispatch, a retry, or a reaction continuation, resolves its settings block from the configuration in force when it starts: the top-level block of the frozen kind with the frozen rule's block laid over it. A running session never changes settings. When no rule carries the frozen name any longer, or the rule no longer carries a block for the frozen kind, the attempt runs on the top-level block and logs one `Info` record naming the rule. A retry or reaction-driven continuation does not re-evaluate rules while the configuration in force still launches its frozen selection. At each retry timer the orchestrator selects again from the configuration in force:
+
+- The frozen selection stands, with its session identifier, when its kind is still named by `agent.kind`, `dispatch.default.agent`, or a rule, and its template is still held. The kind launches its own command as the configuration now states it.
+- A frozen kind that a conversion record retired is replaced by its replacement kind, keeping the frozen template and rule name.
+- Otherwise the issue is routed afresh by rule evaluation, stage labels first. This covers a kind the configuration no longer names, a kind this binary does not register, and a template the workflow no longer holds.
+- A selection that differs from the frozen one in kind or template starts without a resume session identifier, because session identifiers are adapter-specific. The continuation context, reaction kind, attempt number, and last SSH host carry over.
+- When the selected kind's adapter is unavailable because its construction failed at startup, the retry is rescheduled with backoff and keeps its claim and continuation (§8.4).
+
+A change of resolved settings between attempts never clears the session identifier; only a changed kind or template does. A selection the retry changes emits one `Info` record (§13.1).
+
+An attempt whose resolved block fails an error-severity settings check starts no session (§8.4).
+
+**Stage chains**
+
+A rule that carries `next` advances the issue instead of ending on the handoff state. The advance, called a hop, applies where the run would otherwise take the handoff write: the issue is still active, the exit is not a blocked soft stop, the dispatch drives issue state, the frozen `tracker.handoff_evidence` policy permits the write, and the run's rule carries `next` in the configuration in force at the exit. A declaration that the requested outcome already held, once it stands, is a success and hops like any other; it selects `tracker.no_change_state` only when the hop is not made. A blocked, failed, timed-out, stalled, or terminal exit never hops.
+
+A hop is one tracker write in two calls. The orchestrator adds the next rule's stage label, then removes every other configured stage label that the dispatch read showed on the issue. It releases the issue's claim, queued retry, and pending reactions, and seeds no reaction from the exit. It writes no tracker state: the issue stays in its active state, and the next poll tick selects the next rule by its label, takes a fresh claim, freezes a fresh selection, and starts a fresh session without resuming the previous stage's. The next dispatch performs `tracker.in_progress_state` as every dispatch does.
+
+When the hop is not made, the exit takes the disposition it would have taken had the rule carried no `next`, which is the handoff write with its own target selection and failure semantics. That fallback applies when the label add fails, when the hop ceiling is reached, and when a reload removed `next` from the rule. When the add succeeds and a removal fails, the hop stands and the issue routes forward by the precedence above; one warning is logged, and the leftover label is removed by the next hop or by a person.
+
+Until a read observes the label a hop added, the issue is dispatched on no rule other than the hop's target, because a candidate listing can lag a write and would otherwise run the previous stage again. When a candidate listing shows the issue without the target label, the orchestrator reads the issue directly. A read that shows the label dispatches the target. A read that shows neither the label nor a terminal or inactive state releases the hold, and the issue routes by the labels that read shows. A failed read holds the issue for that tick. The hold survives a restart.
+
+Two guards bound a chain. At load, `next` MUST name an existing rule other than its own, the named rule MUST carry a stage label, and the `next` links MUST NOT form a cycle; `next` also requires `tracker.handoff_state`. At runtime, the orchestrator keeps a durable count of consecutive hops per issue, and a hop that would exceed `dispatch.max_consecutive_hops` is not made. The count resets when the issue is observed in a terminal state or in any state outside the active states, when a handoff transition succeeds, when the issue is parked, and when a park on it is released. It does not reset when a stage label changes while the issue stays active, because a label move cannot be told apart from tracker automation that rebuilds a cycle. The load path also emits an advisory when `agent.max_sessions` is positive and smaller than the number of runs the longest chain needs.
+
+Prompt templates see the chain through the `stage` object (Section 5.4).
+
+```yaml
+dispatch:
+  max_consecutive_hops: 10
+  rules:
+    - name: specify
+      match:
+        labels: ["feature"]
+      next: implement
+      template: ./prompts/specify.md
+    - name: implement
+      stage: stage-implement
+      template: ./prompts/implement.md
+```
+
+A successful run of `specify` adds `stage-implement` to the issue and leaves it active; the next tick dispatches `implement`; a successful run of `implement` ends on `tracker.handoff_state`.
+
+**Partials**
+
+A partial is a file that `dispatch.partials` selects. It holds define blocks, named templates written `{{ define "name" }}...{{ end }}`, that a prompt template calls with `{{ template "name" . }}`. A prompt template is the Markdown body of `WORKFLOW.md`, the default template, or a rule template. Every prompt template sees every partial, whichever rule it serves, and a workflow MAY set `partials` without `rules` or `default`. Each prompt template compiles in its own template set: the define blocks of every partial plus its own. A define block of one prompt template is never visible to another.
+
+Path rules. Entries are taken literally, with no `$VAR` resolution and no `~` expansion, and are joined and cleaned as a rule template path is. An absolute entry, a `~`-prefixed entry, and an entry that leaves the workflow directory tree are configuration errors, reported before any directory is read. Every selected file MUST lie inside the tree after symlink evaluation and MUST be a regular file. A file that fails either test fails the load and is never skipped. A message names a file by its path inside the tree, never by a symlink's outside target.
+
+Expansion. An entry that holds a glob metacharacter is a pattern, expanded below the workflow directory so that the directory's own path never takes part in the match: a metacharacter in that path cannot make an entry match no file. `/` separates path elements on every OS. On Windows `\` separates elements as well and escapes nothing; elsewhere `\` escapes the next character. The class `[[]` matches a literal `[` on every OS. An entry without a metacharacter is not expanded, and a missing file fails with the cause the filesystem reports. A pattern that is malformed, or that matches no file, is a configuration error. An expansion drops a file whose base name starts with `.`, such as an editor lock file, unless the last element of the entry starts with `.`. Load order is list order, lexical within an entry, and a file that several entries select loads once, at its first position.
+
+Content. A partial MUST NOT carry front matter, and a leading UTF-8 byte-order mark is ignored. A partial holds define blocks only: white space and comments may stand outside them, while text or an action outside a define block fails the load, because the text of a partial is never callable and a call by file name does not exist. Partials are read again on every load, as rule templates are.
+
+Names. A define name comes from one source. Within the template set of a prompt template, a name MUST be defined by at most one of: a single partial, or the prompt template itself. The rule covers two partials, a partial and a prompt template, `{{ block }}` (which defines its name as `define` does), and empty define blocks. A load that breaks it fails and names both files. The name `prompt` is reserved for the prompt template itself and MUST NOT be defined by a partial. Two prompt templates MAY define the same name, since each compiles in its own set. A partial MAY call a name that each prompt template defines, which gives shared text with per-template differences.
+
+Calls. A call to a name the template set does not define fails the load for every prompt template, with or without partials. The check follows calls through partials and covers both branches of every conditional, `range`, and `with`, so a call in a branch no current issue takes still fails the load. A call cycle is not an error.
+
+Fault location. Every parse and load-check fault names the file and the line within that file that hold it. Only the line of the body template carries the front matter offset.
+
+`sortie validate` warns about a define block that no prompt template calls. The warning does not fail the workflow.
 
 **Template lifecycle**
 
-Per-rule template paths are relative to `filepath.Dir(workflow_path)`. Absolute paths, `~`-prefixed paths, and symlink escapes outside the workflow directory tree are rejected at load time. The `ResolveRule` function and full algorithm details are in §5.3.10's source spec.
+Per-rule template paths and `dispatch.partials` entries are relative to the workflow directory. Absolute paths, `~`-prefixed paths, and symlink escapes outside the workflow directory tree are rejected at load time. A load reads `WORKFLOW.md`, every distinct template file, and every partial, and builds every prompt template of the load from the same partials. Nothing a load builds outlives it, so the next load reads every file again, and a fault in any of them fails the whole load. The `ResolveRule` function and full algorithm details are in §5.3.9's source spec.
 
 Example:
 
@@ -497,35 +582,119 @@ dispatch:
     template: templates/default.md
 ```
 
-#### 5.3.11 `notifications` (list, optional)
+#### 5.3.10 `notifications` (list, optional)
 
-The `notifications` list configures the backends behind the `notify_operator` tool (Section 10.4.5). While a session runs, the agent calls the tool to escalate a decision, report progress, or flag a blocker to a real-time channel. The tool is registered only when at least one valid backend is configured; an empty or absent list leaves it unregistered, so the agent is never offered a tool it cannot use.
+The `notifications` list configures every outbound message Sortie sends to a destination other than the issue's own tracker fields: Slack and webhook backends, and the built-in `tracker_comment` destination that posts comments on the tracker issue. Each entry names the event types it receives. Two producers feed the list: the agent, through the `notify_operator` tool (Section 10.4.5), which produces `agent.message`, and the orchestrator, which produces every other event in the catalog below (Section 10.4.7). The tool is registered only when at least one entry receives `agent.message`, so the agent is never offered a tool it cannot use.
 
-The value is a sequence, not a single object. Each entry is a map carrying a required `kind` discriminator and that backend's own fields. A second channel is a second list entry.
+The value is a sequence, not a single object. Each entry is a map carrying a required `kind` discriminator, an `events` list, and that backend's own fields. A second channel is a second list entry.
 
 ```yaml
 notifications:
+  - kind: tracker_comment
+    events: [session.completed, session.stopped, session.failed, escalation.ci_failure, auto_merge.merged, budget.held]
   - kind: slack
     webhook_url: $SORTIE_SLACK_WEBHOOK_URL
+    events: [agent.message, session.stopped, session.failed]
     max_per_session: 20
   - kind: webhook
     url: $SORTIE_OPS_WEBHOOK_URL
+    events: [session.started, session.completed, session.stopped, session.failed]
 ```
 
 Per-entry fields:
 
 - `kind` (string)
-  - Required. The registry discriminator, resolved against the notifier registry (Section 10.4.7) at sidecar startup. v1 backends are `webhook` and `slack`.
+  - Required. The registry discriminator, resolved against the notifier registry (Section 10.4.7). v1 backends are `webhook` and `slack`. The reserved value `tracker_comment` selects the built-in destination and is not a registry entry.
+- `events` (list of strings)
+  - The event types the entry receives, listed explicitly. There is no wildcard and no filter beyond the event type.
+  - Optional on a registered kind: an entry that omits it receives `agent.message` only, as every entry did before the key existed, and draws a deprecation advisory that suggests `events: [agent.message]`.
+  - Required on `tracker_comment`. An empty list (`[]`) means only the subscriptions synthesized from deprecated settings.
+  - Each element MUST be a string naming a type in the catalog, and no type repeats. `agent.message` MUST NOT appear on `tracker_comment`.
 - `max_per_session` (integer, optional)
-  - The `notify_operator` call cap for the whole agent run, shared by every tool server process of the dispatch (Section 10.4.5). It is not a per-entry default: an omitted, `null`, or `0` value contributes nothing to cap selection, which then falls back to the default of `20` only when every entry is `0` or unset (see "Validation and resolution" below). `0` never means unlimited. A negative value is rejected at config parse time.
+  - The `notify_operator` call cap for the whole agent run, shared by every tool server process of the dispatch (Section 10.4.5). It is not a per-entry default: an omitted, `null`, or `0` value contributes nothing to cap selection, which then falls back to the default of `20` only when every entry that receives `agent.message` is `0` or unset. `0` never means unlimited. A negative value is rejected at config parse time. The value has no effect on an entry that does not receive `agent.message`, and an orchestrator event never counts against it.
 - backend-specific fields
-  - Passed through to the backend constructor untyped, with `$VAR` references resolved. The `webhook` backend requires `url`; the `slack` backend requires `webhook_url`.
+  - Passed through to the backend constructor untyped, with `$VAR` references resolved. The `webhook` backend requires `url`; the `slack` backend requires `webhook_url`. A `tracker_comment` entry carries no key other than `kind` and `events`.
+
+**Event catalog.** The catalog is closed and lives in the domain model. Validation accepts exactly these names.
+
+| Event type | Meaning |
+|---|---|
+| `session.started` | A session was dispatched on an issue whose dispatch drives issue state |
+| `session.completed` | A worker exited normally |
+| `session.stopped` | A worker exited on a soft stop: `blocked`, `needs-human-review`, or `no-change-needed`; it carries the agent's reason when the agent wrote one (Section 21.1) |
+| `session.failed` | A worker exited with an error, or its handoff was withheld by the evidence verdict |
+| `escalation.ci_failure`, `escalation.review_comments`, `escalation.bot_review`, `escalation.merge_conflicts`, `escalation.auto_merge`, `escalation.merge_completion` | The matching reaction (Section 5.3.8) handed its subject to a person, under any `escalation` value |
+| `auto_merge.merged` | The auto-merge reaction merged a pull request |
+| `budget.held` | An issue was held out of dispatch by `agent.max_sessions` or `agent.max_tokens` |
+| `stage.advanced` | A stage hop was made: the issue moved to the next stage, whether or not every old stage label was removed |
+| `stage.not_advanced` | A stage hop was due and not made, because the next stage's label could not be added or the hop ceiling was reached; the event carries the reason |
+| `agent.message` | The agent called `notify_operator` |
+
+**The `tracker_comment` destination.** The destination posts an event's body as a comment on the event's issue through the tracker adapter, and renders nothing else of the event except the agent's reason on a `session.stopped` event, which it posts after the body as one literal block (Section 10.4.7, Section 21.1). It is available only when `tracker.kind` is configured. At most one entry has this kind. The destination receives the union of three sets: the `events` of its explicit entry, the subscriptions synthesized from `tracker.comments` and from `escalation: comment` (Section 5.3.1, Section 5.3.8), and, while no explicit entry exists, implicit subscriptions to `auto_merge.merged` and `budget.held`. The union is monotone: writing the new form never withdraws a comment an old key enabled, and one event is delivered at most once to a destination however many subscriptions select it. An operator who keeps `tracker.comments.on_completion: true` and also lists `session.completed` on a `tracker_comment` entry gets one comment per completion.
+
+**An explicit entry is authoritative for the two formerly ungated comments.** The auto-merge success comment and the budget-hold comment were posted without any configuration gate. They keep posting through implicit subscriptions only while no `tracker_comment` entry exists. An entry is the operator's own statement of what the issue receives, so it receives `auto_merge.merged` and `budget.held` only when it lists them. With no tracker configured no implicit destination exists.
+
+A front matter fragment written in the old form, with completion and failure comments, a commenting CI reaction, and one Slack channel for the agent:
+
+```yaml
+tracker:
+  kind: github
+  api_key: $SORTIE_GITHUB_TOKEN
+  project: acme/billing-api
+  comments:
+    on_completion: true
+    on_failure: true
+
+reactions:
+  ci_failure:
+    provider: github
+    escalation: comment
+
+notifications:
+  - kind: slack
+    webhook_url: $SORTIE_SLACK_WEBHOOK_URL
+```
+
+The same comments and messages in the new form. The two formerly ungated events are listed because an explicit entry ends their implicit subscriptions; neither feature is configured here, so they post nothing until it is:
+
+```yaml
+tracker:
+  kind: github
+  api_key: $SORTIE_GITHUB_TOKEN
+  project: acme/billing-api
+
+reactions:
+  ci_failure:
+    provider: github
+    escalation: none                 # no label; the comment comes from the subscription below
+
+notifications:
+  - kind: tracker_comment
+    events: [session.completed, session.stopped, session.failed, escalation.ci_failure, auto_merge.merged, budget.held]
+  - kind: slack
+    webhook_url: $SORTIE_SLACK_WEBHOOK_URL
+    events: [agent.message]
+```
+
+**Delivery.** The orchestrator delivers its events to Slack and webhook destinations from the main process. A destination for orchestrator events is an entry of a registered kind whose `events` hold at least one orchestrator event; the main process builds it with the backend constructor the sidecar uses. A failed delivery to one destination is logged and does not prevent delivery to the others, and nothing is retried (Section 10.4.7). The orchestrator never claims a notification slot, so its events cannot interact with the `notify_operator` cap.
 
 Validation and resolution:
 
 - The list is structurally validated when the config is parsed: a non-sequence value, an entry that is not a map, an entry with an empty `kind`, or a negative `max_per_session` aborts config construction (Section 6.3).
-- When more than one backend is configured, the effective cap is the maximum non-zero `max_per_session` across entries, falling back to the default when every entry is `0` or unset. The cap belongs to the dispatch (Section 10.4.5): a runtime that starts a new tool server process for each turn shares the same count across every turn of the run rather than restarting it.
-- A backend secret SHOULD be given as a reference to a `SORTIE_`-prefixed environment variable (`$SORTIE_NAME` or `${SORTIE_NAME}`). The `notify_operator` tool runs in a separate `sortie mcp-server` process whose environment is constructed by the agent's MCP host. The orchestrator guarantees that only its `SORTIE_`-prefixed variables are propagated into that process for `$VAR` resolution; the host MAY additionally inherit other variables from its own environment, so a reference without the prefix is not guaranteed to resolve and MAY resolve to the empty string. References are expanded against the sidecar process environment with no prefix enforcement, so the `SORTIE_` prefix is the way to guarantee a secret resolves regardless of host. When a required secret resolves to the empty string, the backend rejects it, which surfaces as a fatal sidecar startup error rather than a notification posted nowhere.
+- `events` is validated at the same point. A non-sequence value, a non-string element, a name outside the catalog, a repeated name, `agent.message` on `tracker_comment`, a `tracker_comment` entry without `events`, a second `tracker_comment` entry, a `tracker_comment` entry while `tracker.kind` is empty, and a `tracker_comment` entry carrying any key other than `kind` and `events` each abort config construction.
+- Workflow validation constructs every destination for orchestrator events, so an unknown `kind` or a required secret that resolves to the empty string on such an entry fails startup and rejects a reload (Section 6.2).
+- When more than one entry receives `agent.message`, the effective cap is the maximum non-zero `max_per_session` across those entries, falling back to the default when each is `0` or unset. The cap belongs to the dispatch (Section 10.4.5): a runtime that starts a new tool server process for each turn shares the same count across every turn of the run rather than restarting it.
+- A backend secret SHOULD be given as a reference to a `SORTIE_`-prefixed environment variable (`$SORTIE_NAME` or `${SORTIE_NAME}`). The `notify_operator` tool runs in a separate `sortie mcp-server` process whose environment is constructed by the agent's MCP host. The orchestrator guarantees that only its `SORTIE_`-prefixed variables are propagated into that process for `$VAR` resolution; the host MAY additionally inherit other variables from its own environment, so a reference without the prefix is not guaranteed to resolve and MAY resolve to the empty string. References are expanded against the sidecar process environment with no prefix enforcement, so the `SORTIE_` prefix is the way to guarantee a secret resolves regardless of host. When a required secret resolves to the empty string, the backend rejects it, which surfaces as a fatal sidecar startup error rather than a notification posted nowhere. The prefix is mandatory for an entry that receives `agent.message`, because the sidecar builds it; an entry that receives only orchestrator events is built only in the main process.
+
+**Deprecation advisories.** Each deprecated form the loaded configuration relies on produces one configuration advisory that names its replacement. An advisory is logged once per configuration change, appears as a warning in `sortie validate` without changing `valid` or the exit status, and appears in the dry run. Nothing is logged per event. The conditions are:
+
+- `tracker.comments.on_dispatch`, `on_completion`, or `on_failure` resolves to `true`, from the file or from its environment override.
+- A reaction with a non-empty `provider` among `ci_failure`, `review_comments`, `bot_review`, `merge_conflicts`, `auto_merge`, and `merge_completion` sets `escalation: comment`.
+- `tracker.kind` is configured, no `tracker_comment` entry exists, and `reactions.auto_merge.provider` is non-empty: the auto-merge success comment posts only through the implicit subscription.
+- `tracker.kind` is configured, no `tracker_comment` entry exists, and `agent.max_sessions` or `agent.max_tokens` is above `0`: the budget-hold comment posts only through the implicit subscription.
+- An entry that is not `tracker_comment` omits `events`.
+
+No removal date or removal version is set for any deprecated form.
 
 ### 5.4 Prompt Template Contract
 
@@ -550,6 +719,19 @@ Template input variables:
   - `turn_number` (integer): current turn number within the session.
   - `max_turns` (integer): configured maximum turns per session.
   - `is_continuation` (boolean): true when this is a continuation turn in a multi-turn session, as distinct from a retry after an error.
+- `stage` (object)
+  - Always present, on every render of every turn; its three fields are strings and are empty when they do not apply, so a template that references them never fails.
+  - `current` (string): the name of the selected rule when that rule carries a stage label, computed at each dispatch from the configuration in force; otherwise empty.
+  - `previous` (string): the name of the rule whose hop led to this dispatch; filled when the dispatch selects the target of the issue's latest hop and the hop count has not reset since; otherwise empty.
+  - `previous_outcome` (string): `succeeded`, or `no_change` when the previous stage's run declared that the requested outcome already held; empty when `previous` is empty.
+  - `previous` and `previous_outcome` are frozen with the dispatch selection, so a retry or reaction continuation renders the pair its first dispatch rendered, also after a restart.
+
+Define blocks and calls:
+
+- A prompt template calls the define blocks of every partial (§5.3.9) and its own with the built-in `template` action. The FuncMap gains no entry for it.
+- A define block executes with the value its call passes as dot, and `$` inside it is that value; the engine has no dynamic scoping. `{{ template "name" . }}` outside every `range` and `with` body passes the whole input data, `issue`, `attempt`, `run`, `stage`, and every continuation key included. A call without an argument passes nil, and any field reference in the block then fails the render.
+- A define block executes under the same strict rules as the template that calls it: an unknown variable or function fails the render.
+- An undefined call, a name defined twice, and text outside a define block of a partial are `template_parse_error` at load, never at render. Each is located at the file and line that hold it.
 
 Fallback prompt behavior:
 
@@ -563,11 +745,12 @@ Error classes:
 - `missing_workflow_file`
 - `workflow_parse_error`
 - `workflow_front_matter_not_a_map`
-- `template_parse_error` (during prompt rendering)
-- `template_render_error` (unknown variable/filter, invalid interpolation)
+- `template_parse_error` (at workflow load, in the body template, a rule or default template, or a partial: a syntax error, an undefined call, a name defined twice, or text outside the define blocks of a partial)
+- `template_render_error` (unknown variable/filter, invalid interpolation, during prompt rendering)
 
 Dispatch gating behavior:
 
 - Workflow file read/YAML errors block new dispatches until fixed.
-- Template errors fail only the affected run attempt.
+- Template parse errors, including every fault in a partial, fail the load and block new dispatches until fixed. A reload that hits one keeps the last known good configuration and templates.
+- Template render errors fail only the affected run attempt. A render error inside a define block names the file that holds the block and the line within it.
 

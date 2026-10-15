@@ -56,8 +56,8 @@ Structured logs are the safety net: when the HTTP server is disabled, when Prome
 
 The embedded HTTP server specified in [architecture Section 13.7](../architecture/18-logging-status-and-observability.md#137-http-server) provides:
 
-- **JSON API** (`/api/v1/*`) for programmatic access to runtime state, per-issue detail, and operational triggers.
-- **HTML Dashboard** (`/`) for browser-based monitoring with zero external tools.
+- **JSON API** (`/api/v1/*`) for programmatic access to runtime state, per-issue detail, run history, and operational triggers.
+- **Dashboard** (`/`) for browser-based monitoring with zero external tools: a client-side application compiled into the binary, served under `/ui/` and reading only the JSON API; `/` redirects to it.
 
 This tier is enabled by default on port 7678 and serves Sortie-specific data that has no standard metric equivalent: workspace paths, agent event messages, retry queue reasons, `.sortie/status` values, run history context, and per-issue debugging detail. It satisfies the architecture's runtime snapshot requirement (Section 13.3) and the human-readable status surface requirement (Section 13.4).
 
@@ -90,7 +90,7 @@ All metrics use the `sortie_` prefix per Prometheus naming conventions. Metrics 
 | `sortie_agent_runtime_seconds_total` | Counter | — | Cumulative agent runtime in seconds |
 | `sortie_dispatches_total` | Counter | `outcome={success,error}` | Dispatch attempts and their outcomes |
 | `sortie_worker_exits_total` | Counter | `exit_type={normal,error,cancelled}` | Worker exit events by type |
-| `sortie_retries_total` | Counter | `trigger={error,continuation,timer}` | Retry scheduling events by trigger |
+| `sortie_retries_total` | Counter | `trigger={error,continuation,timer,stall,ci_fix}` | Retry scheduling events by trigger |
 | `sortie_reconciliation_actions_total` | Counter | `action={stop,cleanup,keep}` | Reconciliation outcomes per issue |
 | `sortie_poll_cycles_total` | Counter | `result={success,error,skipped}` | Poll tick outcomes |
 | `sortie_tracker_requests_total` | Counter | `operation={fetch_candidates,fetch_issue,fetch_comments,transition},result={success,error}` | Tracker adapter API calls |
@@ -149,7 +149,7 @@ No single tier satisfies all personas. The combination provides:
 
 ### Considered Options in Detail
 
-**Embedded HTTP server with JSON API + HTML dashboard.** The [architecture Section 13.7](../architecture/18-logging-status-and-observability.md#137-http-server) spec: `GET /api/v1/state`, `GET /api/v1/<identifier>`, `POST /api/v1/refresh`, and `/` dashboard via `html/template`. Pros: zero dependencies, full control over Sortie-specific data presentation (retry queue delays, turn counts, `.sortie/status`), aligns with single-binary deployment. Cons: diverges from Go ecosystem conventions, no alerting integration (operators cannot define PromQL alerts), no historical time-series queries, custom dashboard maintenance burden, and bespoke JSON shapes require custom clients. This option is chosen as the primary surface because the Sortie-specific context it provides has no standard metric equivalent.
+**Embedded HTTP server with JSON API + HTML dashboard.** The [architecture Section 13.7](../architecture/18-logging-status-and-observability.md#137-http-server) spec: `GET /api/v1/state`, `GET /api/v1/<identifier>`, `POST /api/v1/refresh`, and a browser dashboard at `/` built on that API. Pros: zero dependencies, full control over Sortie-specific data presentation (retry queue delays, turn counts, `.sortie/status`), aligns with single-binary deployment. Cons: diverges from Go ecosystem conventions, no alerting integration (operators cannot define PromQL alerts), no historical time-series queries, custom dashboard maintenance burden, and bespoke JSON shapes require custom clients. This option is chosen as the primary surface because the Sortie-specific context it provides has no standard metric equivalent.
 
 **Prometheus `/metrics` endpoint.** Standard Prometheus exposition via `prometheus/client_golang`. Pros: industry standard (26,000+ importers, CNCF #1 monitoring tool), alerting via PromQL for free, historical queries via Prometheus/Grafana, pure Go library (~3 MB, no CGo), interoperates with Alertmanager/Thanos/Cortex/Mimir, and forward-compatible with OTel via Prometheus 3.x OTLP ingestion. Cons: requires a running Prometheus instance (violates zero-infrastructure for operators without one), lacks rich Sortie-specific context (workspace paths, agent event messages), no built-in dashboard. This option is chosen as the opt-in integration point for production monitoring stacks.
 

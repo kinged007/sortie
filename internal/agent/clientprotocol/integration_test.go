@@ -22,6 +22,27 @@
 // known to satisfy that contract, since both were driven through the
 // handshake alone.
 //
+// The scripted-model cases launch the same runtime against a loopback
+// scripted model endpoint, replace every named credential with a
+// sentinel, spend no quota, and skip when either coordinate is unset.
+// They also resume a session the runtime created, so the runtime must
+// continue it through session/load or session/resume; a runtime that
+// cannot gets no scripted case:
+//
+//	SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV
+//	                                  the name of the environment variable
+//	                                  through which the runtime takes its
+//	                                  model base address
+//	SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV
+//	                                  comma-separated names of the
+//	                                  environment variables the runtime
+//	                                  reads its credential from
+//	SORTIE_CLIENTPROTOCOL_ASKING_COMMAND
+//	                                  the same runtime's launch command
+//	                                  in a posture that asks before
+//	                                  running a tool; unset skips the
+//	                                  refusal case with a logged reason
+//
 // Run:
 //
 //	SORTIE_CLIENTPROTOCOL_TEST=1 SORTIE_CLIENTPROTOCOL_COMMAND="..." \
@@ -35,18 +56,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
 type liveProtocolCapture struct {
 	clientPath string
 	agentPath  string
+	started    time.Time
 	expect     captureExpectation
 	events     func() []domain.AgentEvent // nil for expectHandshakeOnly
 }
@@ -72,10 +97,17 @@ func skipUnlessClientProtocolIntegration(t *testing.T) {
 // accommodate a real model's latency.
 func integrationAgentConfig(t *testing.T, expect captureExpectation, events func() []domain.AgentEvent) domain.AgentConfig {
 	t.Helper()
+	config, _ := captureAgentConfig(t, os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND"), expect, events)
+	return config
+}
+
+func captureAgentConfig(t *testing.T, command string, expect captureExpectation, events func() []domain.AgentEvent) (domain.AgentConfig, liveProtocolCapture) {
+	t.Helper()
 	dir := t.TempDir()
 	capture := liveProtocolCapture{
 		clientPath: filepath.Join(dir, "client.jsonl"),
 		agentPath:  filepath.Join(dir, "agent.jsonl"),
+		started:    time.Now(),
 		expect:     expect,
 		events:     events,
 	}
@@ -87,10 +119,10 @@ func integrationAgentConfig(t *testing.T, expect captureExpectation, events func
 	t.Cleanup(func() { assertLiveProtocolConformance(t, capture) })
 
 	return domain.AgentConfig{
-		Command:       wrapperPath + " " + os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND"),
+		Command:       wrapperPath + " " + command,
 		TurnTimeoutMS: 300000,
 		ReadTimeoutMS: 30000,
-	}
+	}, capture
 }
 
 func capturedJSONLines(t *testing.T, path string) [][]byte {
@@ -99,8 +131,18 @@ func capturedJSONLines(t *testing.T, path string) [][]byte {
 	if err != nil {
 		t.Fatalf("capturedJSONLines(%q) error = %v", path, err)
 	}
+	return splitCapturedFrames(raw)
+}
+
+func splitCapturedFrames(raw []byte) [][]byte {
+	// Stopping the session kills the capture's tee mid-copy, so a final line
+	// without its newline is a torn copy, not a frame the agent sent.
+	text := string(raw)
+	if end := strings.LastIndexByte(text, '\n'); end < len(text)-1 {
+		text = text[:end+1]
+	}
 	var lines [][]byte
-	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(text), "\n") {
 		if line != "" {
 			lines = append(lines, []byte(line))
 		}
@@ -114,6 +156,13 @@ func jsonRPCIDKey(raw json.RawMessage) string {
 
 func assertLiveProtocolConformance(t *testing.T, capture liveProtocolCapture) {
 	t.Helper()
+
+	defer func() {
+		if t.Failed() {
+			logCapturedFrames(t, "client", capture.clientPath, capture.started)
+			logCapturedFrames(t, "agent", capture.agentPath, capture.started)
+		}
+	}()
 
 	requestMethods := make(map[string]string)
 	for _, line := range capturedJSONLines(t, capture.clientPath) {
@@ -197,6 +246,28 @@ func assertLiveProtocolConformance(t *testing.T, capture liveProtocolCapture) {
 	t.Logf("live shape observation: %+v", observed)
 }
 
+// logCapturedFrames logs every frame one side of the capture recorded, and
+// when that side last wrote relative to started, so a failed handshake shows
+// which request went unanswered and how long the runtime had been silent.
+func logCapturedFrames(t *testing.T, side, path string, started time.Time) {
+	t.Helper()
+	if info, err := os.Stat(path); err == nil {
+		t.Logf("%s capture: last write %v after StartSession began", side, info.ModTime().Sub(started).Round(100*time.Millisecond))
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // path is created under this test's temp directory
+	if err != nil {
+		t.Logf("%s capture: %v", side, err)
+		return
+	}
+	const maxFrameBytes = 400
+	for i, line := range splitCapturedFrames(raw) {
+		if len(line) > maxFrameBytes {
+			line = append(line[:maxFrameBytes:maxFrameBytes], "..."...)
+		}
+		t.Logf("%s frame %d: %s", side, i, line)
+	}
+}
+
 // gitInitWorkspace creates a temp directory and runs git init inside
 // it, matching the sibling agent packages' own integration fixture:
 // several protocol-speaking runtimes expect a git repository by
@@ -211,11 +282,9 @@ func gitInitWorkspace(t *testing.T) string {
 	return dir
 }
 
-// mustNewClientProtocolAdapter constructs a *ClientProtocolAdapter or
-// fails the test immediately.
 func mustNewClientProtocolAdapter(t *testing.T) *ClientProtocolAdapter {
 	t.Helper()
-	a, err := NewClientProtocolAdapter(map[string]any{})
+	a, err := NewClientProtocolAdapter()
 	if err != nil {
 		t.Fatalf("NewClientProtocolAdapter: %v", err)
 	}
@@ -260,8 +329,6 @@ func makeEventCollector(t *testing.T) (onEvent func(domain.AgentEvent), collecte
 	return onEvent, collected
 }
 
-// assertContainsEventType fails t when no event in events has the
-// given type.
 func assertContainsEventType(t *testing.T, events []domain.AgentEvent, eventType domain.AgentEventType) {
 	t.Helper()
 	for _, e := range events {
@@ -276,8 +343,6 @@ func assertContainsEventType(t *testing.T, events []domain.AgentEvent, eventType
 	t.Errorf("expected event type %q not found; got types: %v", eventType, types)
 }
 
-// TestIntegration_StartSession verifies that StartSession returns a
-// populated Session with a non-empty session id and process PID.
 func TestIntegration_StartSession(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
@@ -335,18 +400,7 @@ func TestIntegration_StopSession(t *testing.T) {
 	}
 }
 
-// TestIntegration_RunTurnWithPermissionContinuation drives one full
-// session: start a session, run a turn whose prompt asks the model to
-// write and then read back a file (an action a protocol-speaking
-// runtime's default posture typically pauses on for approval),
-// observe the normalized events, and stop the session. The
-// adapter's own posture answers any session/request_permission it
-// receives by selecting a refusing option and letting the turn
-// continue, per this piece's refusal-reply design; this test observes
-// that continuation when the runtime asked, and reports plainly when
-// it did not, since a live runtime's default approval posture is
-// outside this suite's control.
-func TestIntegration_RunTurnWithPermissionContinuation(t *testing.T) {
+func TestIntegration_ToolForcingTurn(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
 	adapter := mustNewClientProtocolAdapter(t)
@@ -384,90 +438,13 @@ func TestIntegration_RunTurnWithPermissionContinuation(t *testing.T) {
 	}
 
 	assertContainsEventType(t, events, domain.EventSessionStarted)
-
-	var sawPermissionContinuation bool
-	for _, e := range events {
-		if e.Type == domain.EventNotification && strings.Contains(e.Message, "refused a permission request") {
-			sawPermissionContinuation = true
-			break
-		}
-	}
-	if sawPermissionContinuation {
-		t.Log("observed a session/request_permission the adapter refused, and the turn continued past it to completion")
-	} else {
-		t.Log("no session/request_permission was observed on this run; this runtime's default approval posture may not require one for this prompt")
-	}
-}
-
-// TestIntegration_SessionContinuation drives one session through a
-// full turn, stops it, then starts a second session against the same
-// workspace naming the first session's identifier as ResumeSessionID.
-// It reads the outcome through the once-per-session capability notice
-// the second session's first turn emits: the notice names the session
-// continuation label only when the entry was lowered, so its absence
-// is the positive confirmation and its presence is the clean,
-// non-failing fallback either way. This runtime's own
-// support for continuation is not asserted either way; whichever
-// branch fires, a confirmed continuation must return the identifier
-// the first session held, and an unconfirmed one must still complete
-// its turn.
-func TestIntegration_SessionContinuation(t *testing.T) {
-	skipUnlessClientProtocolIntegration(t)
-
-	adapter := mustNewClientProtocolAdapter(t)
-	workspace := gitInitWorkspace(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-
-	onEvent1, collected1 := makeEventCollector(t)
-	firstSession := mustStartClientProtocolSession(t, ctx, adapter, workspace, expectCompletedTurn, collected1)
-
-	if _, err := adapter.RunTurn(ctx, firstSession, domain.RunTurnParams{
-		Prompt:  "Reply with exactly one word: acknowledged.",
-		OnEvent: onEvent1,
-	}); err != nil {
-		t.Fatalf("first session RunTurn: %v", err)
-	}
-
-	if err := adapter.StopSession(ctx, firstSession); err != nil {
-		t.Fatalf("StopSession (first session): %v", err)
-	}
-
-	onEvent2, collected2 := makeEventCollector(t)
-	secondSession, err := adapter.StartSession(ctx, domain.StartSessionParams{
-		WorkspacePath:   workspace,
-		AgentConfig:     integrationAgentConfig(t, expectCompletedTurn, collected2),
-		ResumeSessionID: firstSession.ID,
-	})
-	if err != nil {
-		t.Fatalf("StartSession (continuation): %v", err)
-	}
-	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), secondSession) })
-
-	if _, err := adapter.RunTurn(ctx, secondSession, domain.RunTurnParams{
-		Prompt:  "Reply with exactly one word: acknowledged.",
-		OnEvent: onEvent2,
-	}); err != nil {
-		t.Fatalf("second session RunTurn: %v", err)
-	}
-
-	notice := firstNotification(t, collected2())
-	confirmed := !strings.Contains(notice.Message, capabilityLabelSessionContinuation)
-	if confirmed {
-		t.Log("session continuation was confirmed by this runtime")
-		if secondSession.ID != firstSession.ID {
-			t.Errorf("second session id = %q, want %q: a confirmed continuation must return the identifier it actually loaded or resumed", secondSession.ID, firstSession.ID)
-		}
-	} else {
-		t.Log("session continuation was not confirmed by this runtime; the entry was lowered and the run fell back to a fresh session cleanly")
-	}
 }
 
 func TestIntegration_CredentialVerification(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
-	adapter, err := NewClientProtocolAdapter(map[string]any{})
+	passthrough := map[string]any{}
+	adapter, err := NewClientProtocolAdapter()
 	if err != nil {
 		t.Fatalf("NewClientProtocolAdapter() error = %v", err)
 	}
@@ -483,9 +460,7 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 	}
 
 	t.Run("working credential verifies", func(t *testing.T) {
-		if _, err := credentialtest.VerifyLive(adapter, params(t)); err != nil {
-			t.Fatalf("VerifyCredential() error = %v, want nil", err)
-		}
+		credentialtest.VerifyLiveUsage(t, "agent-client-protocol", adapter, params(t), passthrough)
 	})
 
 	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
@@ -500,7 +475,7 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 func TestIntegration_EarlyExit(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
-	adapter, err := NewClientProtocolAdapter(map[string]any{})
+	adapter, err := NewClientProtocolAdapter()
 	if err != nil {
 		t.Fatalf("NewClientProtocolAdapter() error = %v", err)
 	}
@@ -534,5 +509,59 @@ func TestIntegration_EarlyExit(t *testing.T) {
 		} else {
 			credentialtest.RequireEarlyExitReport(t, err)
 		}
+	})
+}
+
+var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func TestIntegration_ScriptedModel(t *testing.T) {
+	skipUnlessClientProtocolIntegration(t)
+
+	baseURLEnv := os.Getenv("SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV")
+	if baseURLEnv == "" {
+		t.Skip("skipping scripted model cases: SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV must name the variable through which the runtime takes its model base address")
+	}
+	credentialNames := credentialtest.CredentialNames("SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV")
+	if len(credentialNames) == 0 {
+		t.Skip("skipping scripted model cases: SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV must name the credential variables, or a real key in the environment would reach the endpoint")
+	}
+	if !environmentNamePattern.MatchString(baseURLEnv) {
+		t.Fatalf("SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV = %q, want a name matching %s", baseURLEnv, environmentNamePattern)
+	}
+
+	askingCommand := os.Getenv("SORTIE_CLIENTPROTOCOL_ASKING_COMMAND")
+	var skipRefusal string
+	if askingCommand == "" {
+		skipRefusal = "skipping permission refusal: SORTIE_CLIENTPROTOCOL_ASKING_COMMAND must name the runtime's launch command in a posture that asks before running a tool"
+	}
+
+	fakemodel.AssertConformance(t, fakemodel.Binding{
+		Kind:          "agent-client-protocol",
+		Passthrough:   map[string]any{},
+		CredentialEnv: credentialNames,
+		Read:          fakemodel.ReadFile,
+		PermissionRefusal: &fakemodel.PermissionRefusal{
+			Guarded: fakemodel.CatFile,
+			Notice:  agentcore.DecideHumanRequest(agentcore.ClassPermission, true, agentcore.AnswerPending).Notice,
+			Skip:    skipRefusal,
+		},
+		Launch: func(t *testing.T, env fakemodel.Environment) fakemodel.Launch {
+			command := os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND")
+			expect := expectScriptedToolTurn
+			switch env.Scenario {
+			case fakemodel.ScenarioExhaustion, fakemodel.ScenarioCancellation, fakemodel.ScenarioStop:
+				expect = expectHandshakeOnly
+			case fakemodel.ScenarioContinuation:
+				expect = expectCompletedTurn
+			case fakemodel.ScenarioPermissionRefusal:
+				command = askingCommand
+			}
+			config, capture := captureAgentConfig(t, command, expect, env.Events)
+			return fakemodel.Launch{
+				Config:  config,
+				Env:     map[string]string{baseURLEnv: env.URL},
+				Streams: []string{capture.clientPath, capture.agentPath},
+			}
+		},
 	})
 }

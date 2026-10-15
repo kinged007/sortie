@@ -1,7 +1,6 @@
 package gitea
 
 import (
-	"log/slog"
 	"strconv"
 
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -73,8 +72,9 @@ func giteaLabelNames(labels []giteaLabel) []string {
 // blocker read through the shared resolver or [GiteaAdapter.FetchIssueByID].
 //
 // DisplayID is left empty; callers apply [setDisplayID] after normalization.
-// The state lists and log are threaded to [issuekit.DeriveLabelState].
-func normalizeIssue(gi giteaIssue, activeStates, terminalStates []string, handoffState string, log *slog.Logger) domain.Issue {
+// State is derived by model under states, with a closed native status read as
+// closed.
+func normalizeIssue(gi giteaIssue, model *issuekit.LabelStateModel, states issuekit.LabelStates) domain.Issue {
 	num := strconv.Itoa(gi.Number)
 	labelNames := giteaLabelNames(gi.Labels)
 
@@ -83,14 +83,12 @@ func normalizeIssue(gi giteaIssue, activeStates, terminalStates []string, handof
 		assignee = gi.Assignees[0].Login
 	}
 
-	states := issuekit.LabelStates{Active: activeStates, Terminal: terminalStates, Handoff: handoffState}
-
 	return domain.Issue{
 		ID:                 num,
 		Identifier:         num,
 		Title:              gi.Title,
 		Description:        gi.Body,
-		State:              issuekit.DeriveLabelState(labelNames, gi.State, "open", "closed", states, num, log),
+		State:              model.Derive(states, num, labelNames, gi.State == "closed"),
 		BranchName:         gi.Ref,
 		URL:                gi.HTMLURL,
 		Labels:             issuekit.NormalizeLabels(labelNames),
@@ -129,18 +127,17 @@ func normalizeComments(raw []giteaComment) []domain.Comment {
 
 // normalizeBlockers converts blocker issue responses to [domain.BlockerRef]
 // values. Returns a non-nil empty slice when input is empty. Each blocker's
-// state is derived from its labels and native state, and its DisplayID is
-// qualified the same way [setDisplayID] qualifies an issue's own DisplayID.
-func normalizeBlockers(blockers []giteaIssue, activeStates, terminalStates []string, handoffState, owner, repo string, log *slog.Logger) []domain.BlockerRef {
-	states := issuekit.LabelStates{Active: activeStates, Terminal: terminalStates, Handoff: handoffState}
-
+// state is derived by model under states from its labels and native state, and
+// its DisplayID is qualified the same way [setDisplayID] qualifies an issue's
+// own DisplayID.
+func normalizeBlockers(blockers []giteaIssue, model *issuekit.LabelStateModel, states issuekit.LabelStates, owner, repo string) []domain.BlockerRef {
 	refs := make([]domain.BlockerRef, 0, len(blockers))
 	for _, b := range blockers {
 		num := strconv.Itoa(b.Number)
 		ref := domain.BlockerRef{
 			ID:         num,
 			Identifier: num,
-			State:      issuekit.DeriveLabelState(giteaLabelNames(b.Labels), b.State, "open", "closed", states, num, log),
+			State:      model.Derive(states, num, giteaLabelNames(b.Labels), b.State == "closed"),
 		}
 		if ref.DisplayID == "" {
 			ref.DisplayID = owner + "/" + repo + "#" + num

@@ -24,6 +24,7 @@ type giteaPullRequest struct {
 	MergeCommitSHA     *string     `json:"merge_commit_sha"`
 	Draft              bool        `json:"draft"`
 	State              string      `json:"state"`
+	HTMLURL            string      `json:"html_url"`
 	RequestedReviewers []giteaUser `json:"requested_reviewers"`
 	Head               struct {
 		SHA string `json:"sha"`
@@ -106,6 +107,7 @@ func (a *GiteaSCMAdapter) GetMergeability(ctx context.Context, prNumber int, own
 		Merged:         pr.Merged,
 		MergeCommitSHA: mergeCommitSHA,
 		Closed:         strings.EqualFold(pr.State, "closed"),
+		URL:            pr.HTMLURL,
 	}, nil
 }
 

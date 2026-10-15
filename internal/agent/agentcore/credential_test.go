@@ -114,6 +114,15 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 			wantMessage: boundMessage,
 		},
 		{
+			name: "turn completed after the bound elapsed passes",
+			run: func(ctx context.Context, _ context.CancelFunc) (domain.TurnResult, error) {
+				<-ctx.Done()
+				return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
+			},
+			turnBound: 20 * time.Millisecond,
+			wantNil:   true,
+		},
+		{
 			name: "ssh connection failure returned unchanged",
 			run: func(context.Context, context.CancelFunc) (domain.TurnResult, error) {
 				return domain.TurnResult{}, connFailed
@@ -356,11 +365,6 @@ func TestCredentialErrorBuilders(t *testing.T) {
 			name:        "refused",
 			err:         CredentialRefusedError("API key is invalid.", cause),
 			wantMessage: "the agent runtime refused its credential: API key is invalid.",
-		},
-		{
-			name:        "absent",
-			err:         CredentialAbsentError("whoami exited with status 1", cause),
-			wantMessage: "the agent runtime reports no usable credential: whoami exited with status 1",
 		},
 	}
 	for _, tt := range tests {

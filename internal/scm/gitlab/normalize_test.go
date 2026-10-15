@@ -5,8 +5,15 @@ import (
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+func normalizeUnder(gi gitlabIssue, project string, active, terminal []string) domain.Issue {
+	model := issuekit.NewLabelStateModel(issuekit.NewStateSource(domain.TrackerStates{Active: active, Terminal: terminal}), nil)
+	return normalizeIssue(gi, project, model, model.Snapshot())
+}
 
 func TestNormalizeIssue_AllFields(t *testing.T) {
 	t.Parallel()
@@ -20,7 +27,7 @@ func TestNormalizeIssue_AllFields(t *testing.T) {
 	active := []string{"backlog", "in-progress", "review"}
 	terminal := []string{"done", "wontfix"}
 
-	got := normalizeIssue(gi, "acme/widgets", active, terminal, "", nil)
+	got := normalizeUnder(gi, "acme/widgets", active, terminal)
 
 	// issue_full.json carries iid=42 and a distinct global id=91042; the
 	// global id must never surface in ID, Identifier, or DisplayID.
@@ -84,7 +91,7 @@ func TestNormalizeIssue_DisplayIDFallback(t *testing.T) {
 	t.Parallel()
 
 	gi := gitlabIssue{IID: 7, State: "opened"}
-	got := normalizeIssue(gi, "acme/subgroup/widgets", nil, nil, "", nil)
+	got := normalizeUnder(gi, "acme/subgroup/widgets", nil, nil)
 
 	if want := "acme/subgroup/widgets#7"; got.DisplayID != want {
 		t.Errorf("DisplayID = %q, want %q when references.full is empty", got.DisplayID, want)
@@ -95,7 +102,7 @@ func TestNormalizeIssue_NonNilEmptyLabels(t *testing.T) {
 	t.Parallel()
 
 	gi := gitlabIssue{IID: 1, State: "opened", Labels: nil}
-	got := normalizeIssue(gi, "acme/widgets", nil, nil, "", nil)
+	got := normalizeUnder(gi, "acme/widgets", nil, nil)
 
 	if got.Labels == nil {
 		t.Error("Labels is nil, want non-nil empty slice")
@@ -109,7 +116,7 @@ func TestNormalizeIssue_EmptyAssignees(t *testing.T) {
 	t.Parallel()
 
 	gi := gitlabIssue{IID: 1, State: "opened", Assignees: nil}
-	got := normalizeIssue(gi, "acme/widgets", nil, nil, "", nil)
+	got := normalizeUnder(gi, "acme/widgets", nil, nil)
 
 	if got.Assignee != "" {
 		t.Errorf("Assignee = %q, want empty string for no assignees", got.Assignee)
@@ -124,7 +131,7 @@ func TestNormalizeIssue_MultipleAssignees(t *testing.T) {
 		State:     "opened",
 		Assignees: []gitlabUser{{Username: "alice"}, {Username: "bob"}},
 	}
-	got := normalizeIssue(gi, "acme/widgets", nil, nil, "", nil)
+	got := normalizeUnder(gi, "acme/widgets", nil, nil)
 
 	if got.Assignee != "alice" {
 		t.Errorf("Assignee = %q, want the first assignee %q", got.Assignee, "alice")
@@ -141,7 +148,7 @@ func TestNormalizeIssue_BlockedByAlwaysNonNilEmpty(t *testing.T) {
 	t.Parallel()
 
 	gi := gitlabIssue{IID: 1, State: "opened"}
-	got := normalizeIssue(gi, "acme/widgets", nil, nil, "", nil)
+	got := normalizeUnder(gi, "acme/widgets", nil, nil)
 
 	if got.BlockedBy == nil {
 		t.Error("BlockedBy is nil, want non-nil empty slice")

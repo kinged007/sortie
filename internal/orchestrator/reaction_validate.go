@@ -12,9 +12,8 @@ import (
 //
 // The builder-validated reaction kinds are inspected with the same builders
 // the orchestrator runs at construction, so the offline verdict cannot
-// diverge from the construction verdict. trackerMeta MUST come from the
-// tracker registry's Meta(cfg.Tracker.Kind) lookup.
-func ValidateReactionConfigs(cfg config.ServiceConfig, trackerMeta registry.TrackerMeta) []registry.ValidationDiag {
+// diverge from the construction verdict.
+func ValidateReactionConfigs(cfg config.ServiceConfig) []registry.ValidationDiag {
 	var diags []registry.ValidationDiag
 
 	if rc, ok := cfg.Reactions["review_comments"]; ok && rc.Provider != "" {
@@ -58,7 +57,7 @@ func ValidateReactionConfigs(cfg config.ServiceConfig, trackerMeta registry.Trac
 	}
 
 	if rc, ok := cfg.Reactions["merge_completion"]; ok && rc.Provider != "" {
-		if _, err := BuildMergeCompletionReactionConfig(rc, cfg.Tracker, trackerMeta); err != nil {
+		if _, err := BuildMergeCompletionReactionConfig(rc, cfg.Tracker); err != nil {
 			diags = append(diags, registry.ValidationDiag{
 				Severity: "error",
 				Check:    "reactions.merge_completion",

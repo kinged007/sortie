@@ -414,8 +414,6 @@ func TestReconcileAutoMerge_FingerprintDedup(t *testing.T) {
 	}
 }
 
-// TestReconcileAutoMerge_MaxRetriesEscalation verifies that exhausting
-// MaxRetries triggers escalation instead of another merge attempt.
 func TestReconcileAutoMerge_MaxRetriesEscalation(t *testing.T) {
 	t.Parallel()
 
@@ -426,20 +424,37 @@ func TestReconcileAutoMerge_MaxRetriesEscalation(t *testing.T) {
 	store := &reviewReconcileStore{}
 	metrics := newAutoMergeMetricsSpy()
 	tracker := &reviewTrackerStub{}
-	scm := &controlledSCMAdapter{}
+	var mergeCalls int
+	scm := &controlledSCMAdapter{
+		mergePRFn: func(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
+			mergeCalls++
+			return domain.MergeResult{}, nil
+		},
+	}
 	params := autoMergeParams(store, scm, tracker)
 
 	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
-
 	state.TrackerOpsWg.Wait()
 
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-MAX:merge] still present after max-retries escalation; want removed")
+	entry := assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
+	if entry.EscalationSubject != "" {
+		t.Errorf("EscalationSubject = %q, want empty for the count check", entry.EscalationSubject)
 	}
-
+	if state.ReactionAttempts[rkey] != 5 {
+		t.Errorf("ReactionAttempts[%s] = %d, want 5 (kept)", rkey, state.ReactionAttempts[rkey])
+	}
 	if metrics.autoMerge["escalated"] != 1 {
 		t.Errorf("IncAutoMergeReactions(escalated) = %d, want 1", metrics.autoMerge["escalated"])
 	}
+
+	makeDue(t, state, rkey)
+	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
+	state.TrackerOpsWg.Wait()
+
+	if metrics.autoMerge["escalated"] != 1 || mergeCalls != 0 {
+		t.Errorf("standing pass: escalated = %d, MergePR calls = %d, want 1, 0", metrics.autoMerge["escalated"], mergeCalls)
+	}
+	assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
 }
 
 // TestReconcileAutoMerge_AlreadyMergedSuccess verifies that ErrSCMConflict with
@@ -485,8 +500,6 @@ func TestReconcileAutoMerge_AlreadyMergedSuccess(t *testing.T) {
 	}
 }
 
-// TestReconcileAutoMerge_AuthEscalatesImmediately verifies that ErrSCMAuth on
-// MergePR causes immediate escalation without re-enqueuing.
 func TestReconcileAutoMerge_AuthEscalatesImmediately(t *testing.T) {
 	t.Parallel()
 
@@ -519,8 +532,8 @@ func TestReconcileAutoMerge_AuthEscalatesImmediately(t *testing.T) {
 	state.TrackerOpsWg.Wait()
 
 	rkey := ReactionKey("AM-AU", ReactionKindAutoMerge)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-AU:merge] still present after ErrSCMAuth; want escalated and removed")
+	if entry := assertEscalationBegan(t, state, rkey, EscalationTriggerRefused); entry.EscalationSubject == "" {
+		t.Error("EscalationSubject is empty, want the merge fingerprint of the refused call")
 	}
 
 	if metrics.autoMerge["escalated"] != 1 {
@@ -557,23 +570,18 @@ func TestReconcileAutoMerge_AuthDedupe(t *testing.T) {
 	store := &reviewReconcileStore{}
 	params := autoMergeParams(store, scm, tracker)
 
-	// Tick 1: entry is escalated and removed; auth error logged once.
 	state := stateWithAutoMergePending(t, "AM-DD", 50)
 	reconcileAutoMerge(state, params, log, context.Background(), newAutoMergeMetricsSpy())
 	state.TrackerOpsWg.Wait()
 
 	buf.reset()
 
-	// Tick 2: re-seed the entry in a state that already has the auth-logged
-	// marker set. The auth error must not log again.
 	rkey := ReactionKey("AM-DD", ReactionKindAutoMerge)
 	state.PendingReactions[rkey] = newAutoMergePending("AM-DD", 50)
 	metrics2 := newAutoMergeMetricsSpy()
 	reconcileAutoMerge(state, params, log, context.Background(), metrics2)
 	state.TrackerOpsWg.Wait()
 
-	// The second tick escalates again because the entry is re-seeded, but
-	// must not emit another ERROR for auth.
 	if buf.contains("auto_merge runtime auth failure") {
 		t.Error("auth failure ERROR logged on second tick; want deduplicated (one log per issue lifetime)")
 	}
@@ -798,10 +806,7 @@ func TestReconcileAutoMerge_CrossKindIsolationOnEscalation(t *testing.T) {
 	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
 	state.TrackerOpsWg.Wait()
 
-	// Merge-kind entry must be escalated and removed.
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-XKE:merge] still present after escalation; want removed")
-	}
+	assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
 
 	// Review-kind retry entry must be intact.
 	retryEntry, ok := state.RetryAttempts["AM-XKE"]
@@ -818,35 +823,54 @@ func TestReconcileAutoMerge_CrossKindIsolationOnEscalation(t *testing.T) {
 	}
 }
 
-// TestReconcileAutoMerge_PreflightFailed verifies that entries are skipped when
-// the preflight flag is set.
 func TestReconcileAutoMerge_PreflightFailed(t *testing.T) {
 	t.Parallel()
 
-	state := stateWithAutoMergePending(t, "AM-PF", 54)
-	state.AutoMergePreflightFailed = true
-
-	store := &reviewReconcileStore{}
-	metrics := newAutoMergeMetricsSpy()
-
-	var mergeCalled bool
-	scm := &controlledSCMAdapter{
-		mergePRFn: func(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
-			mergeCalled = true
-			return domain.MergeResult{}, nil
-		},
-	}
-	params := autoMergeParams(store, scm, nil)
-
-	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
-
-	if mergeCalled {
-		t.Error("MergePR called despite preflight failure; want skipped")
+	tests := []struct {
+		name          string
+		escalated     bool
+		wantRemaining bool
+	}{
+		{name: "an entry with no escalation is dropped", wantRemaining: false},
+		{name: "a standing escalation survives", escalated: true, wantRemaining: true},
 	}
 
-	rkey := ReactionKey("AM-PF", ReactionKindAutoMerge)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-PF:merge] still present after preflight skip; want dropped (not re-enqueued)")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := stateWithAutoMergePending(t, "AM-PF", 54)
+			state.AutoMergePreflightFailed = true
+			rkey := ReactionKey("AM-PF", ReactionKindAutoMerge)
+			if tt.escalated {
+				entry := state.PendingReactions[rkey]
+				entry.EscalatedAt = autoMergeBaseTime
+				entry.EscalationTrigger = EscalationTriggerRefused
+				entry.EscalationSubject = "merge-fp"
+			}
+
+			var mergeCalled bool
+			scm := &controlledSCMAdapter{
+				mergePRFn: func(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
+					mergeCalled = true
+					return domain.MergeResult{}, nil
+				},
+			}
+			params := autoMergeParams(&reviewReconcileStore{}, scm, nil)
+
+			reconcileAutoMerge(state, params, discardLogger(), context.Background(), newAutoMergeMetricsSpy())
+
+			if mergeCalled {
+				t.Error("MergePR called despite preflight failure; want skipped")
+			}
+			entry, ok := state.PendingReactions[rkey]
+			if ok != tt.wantRemaining {
+				t.Fatalf("PendingReactions[AM-PF:merge] present = %t after the preflight skip, want %t", ok, tt.wantRemaining)
+			}
+			if ok && entry.EscalatedAt.IsZero() {
+				t.Error("EscalatedAt is zero, want the escalation still standing")
+			}
+		})
 	}
 }
 
@@ -924,7 +948,7 @@ func TestReconcileAutoMerge_PreflightRetryExhausts(t *testing.T) {
 			return domain.MergeResult{}, nil
 		},
 	}
-	_ = realSCM
+	verifier.scm = realSCM
 	params := autoMergeParams(store, verifier, nil)
 
 	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
@@ -1168,38 +1192,6 @@ func TestReconcileAutoMerge_WatchWindowNonDefaultTakesEffect(t *testing.T) {
 			t.Errorf("GetMergeability calls = %d, want 1 (entry survived the watch-window check)", calls)
 		}
 	})
-}
-
-// TestReconcileAutoMerge_WatchWindowElapsedLogsRenamedAttribute pins the
-// drop-on-age log record: message text and the window_ms attribute name
-// (renamed from ttl_ms). A regression that reverts the rename or the wording
-// must fail this test.
-func TestReconcileAutoMerge_WatchWindowElapsedLogsRenamedAttribute(t *testing.T) {
-	t.Parallel()
-
-	issueID := "AM-WWLOG"
-	state := stateWithAutoMergePending(t, issueID, 20)
-	mergeKey := ReactionKey(issueID, ReactionKindAutoMerge)
-	state.PendingReactions[mergeKey].CreatedAt = autoMergeBaseTime.Add(-31 * time.Minute)
-
-	store := &reviewReconcileStore{}
-	metrics := newAutoMergeMetricsSpy()
-	scm := &controlledSCMAdapter{}
-	params := autoMergeParams(store, scm, nil)
-	params.AutoMergePendingTTL = 30 * time.Minute
-	log, buf := logCapture()
-
-	reconcileAutoMerge(state, params, log, context.Background(), metrics)
-
-	output := buf.String()
-	const msg = "auto_merge watch window elapsed, dropping"
-	assertLogLineHasIntAttr(t, output, msg, "window_ms", int(30*time.Minute/time.Millisecond))
-	if strings.Contains(output, "ttl_ms") {
-		t.Errorf("log output contains stale attribute %q: %s", "ttl_ms", output)
-	}
-	if strings.Contains(output, "exceeded ttl") {
-		t.Errorf("log output contains stale message wording %q: %s", "exceeded ttl", output)
-	}
 }
 
 // TestBuildAutoMergeFingerprint verifies the SHA-256 hex fingerprint builder.

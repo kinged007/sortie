@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 )
 
@@ -31,11 +33,11 @@ type budgetHoldNoticeParams struct {
 	IssueID string
 	Entry   *BudgetExhaustedEntry
 
-	Store          budgetHoldNoticeStore
-	TrackerAdapter domain.TrackerAdapter // nil skips the notice entirely
-	Metrics        domain.Metrics
-	Logger         *slog.Logger
-	Ctx            context.Context
+	Store    budgetHoldNoticeStore
+	Delivery route.Delivery // non-empty: the caller routed the event and found a destination
+	Metrics  domain.Metrics
+	Logger   *slog.Logger
+	Ctx      context.Context
 }
 
 // budgetHoldCeilingWords names each budget-hold reason in the words the
@@ -74,12 +76,9 @@ func budgetHoldNoticeAllowed(state *State, now time.Time) bool {
 }
 
 // postBudgetHoldNotice writes the durable notice row, records the memory
-// entry, and starts the detached comment write. It makes no decision
-// about whether a notice is due; the caller has already decided.
+// entry, and starts the detached delivery. It makes no decision about
+// whether a notice is due; the caller has already decided.
 func postBudgetHoldNotice(state *State, params budgetHoldNoticeParams) {
-	if params.TrackerAdapter == nil {
-		return
-	}
 	ctx := params.Ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -100,24 +99,40 @@ func postBudgetHoldNotice(state *State, params budgetHoldNoticeParams) {
 	}
 	state.BudgetHoldNoticed[params.IssueID] = params.Entry.Reason
 
-	issueID := params.IssueID
-	text := buildBudgetHoldComment(params.Entry)
-	tracker := params.TrackerAdapter
 	m := params.Metrics
 	noticeLog := log
 
-	state.TrackerOpsWg.Go(func() {
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-
-		if err := tracker.CommentIssue(dctx, issueID, text); err != nil {
+	deliverDetached(ctx, &state.TrackerOpsWg, params.Delivery, log, func(received bool, err error) {
+		if !received {
+			return
+		}
+		if err != nil {
 			noticeLog.Warn("budget hold notice failed", slog.Any("error", err))
 			m.IncTrackerComments("budget_hold", "error")
-		} else {
-			noticeLog.Info("budget hold notice posted")
-			m.IncTrackerComments("budget_hold", "success")
+			return
 		}
+		noticeLog.Info("budget hold notice posted")
+		m.IncTrackerComments("budget_hold", "success")
 	})
+}
+
+// budgetHoldTokenSpend words the entry's token sum for the notice: unknown
+// spend is never printed as zero, and a sum that leaves spend out is marked
+// as a lower bound. The entry's UsedTokens must be non-nil.
+func budgetHoldTokenSpend(entry *BudgetExhaustedEntry) string {
+	used := *entry.UsedTokens
+	var unmeasured int
+	if entry.UnmeasuredSessions != nil {
+		unmeasured = *entry.UnmeasuredSessions
+	}
+	switch {
+	case !SpendIncomplete(unmeasured, entry.UnaccountedTurns):
+		return strconv.FormatInt(used, 10)
+	case used == 0:
+		return "not measured"
+	default:
+		return fmt.Sprintf("at least %d", used)
+	}
 }
 
 // releaseBudgetHoldNotice deletes the durable row and the memory entry for
@@ -170,7 +185,7 @@ func buildBudgetHoldComment(entry *BudgetExhaustedEntry) string {
 	}
 
 	if entry.BudgetTokens > 0 && entry.UsedTokens != nil {
-		lines = append(lines, fmt.Sprintf("Tokens: %d of %d", *entry.UsedTokens, entry.BudgetTokens))
+		lines = append(lines, fmt.Sprintf("Tokens: %s of %d", budgetHoldTokenSpend(entry), entry.BudgetTokens))
 	}
 	if entry.BudgetSessions > 0 {
 		lines = append(lines, fmt.Sprintf("Sessions: %d of %d", entry.UsedSessions, entry.BudgetSessions))

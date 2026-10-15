@@ -41,14 +41,21 @@ var _ domain.TrackerAdapter = (*FileAdapter)(nil)
 // Overrides are not persisted to disk; they exist only for the
 // lifetime of the adapter instance. Safe for concurrent use.
 type FileAdapter struct {
-	path         string
-	activeStates map[string]bool
+	*issuekit.StateSource
+	path string
 
 	mu               sync.RWMutex
 	overrides        map[string]string           // issue ID -> overridden state
 	commentOverrides map[string][]domain.Comment // issue ID -> appended comments
-	labelOverrides   map[string]string           // issue ID -> label to merge into raw.Labels
+	labelOverrides   map[string][]labelOverride  // issue ID -> label writes layered over raw.Labels
 	metrics          domain.Metrics              // nil-safe: check before calling
+}
+
+// labelOverride is one label write: the label's latest spelling and
+// whether the issue carries it.
+type labelOverride struct {
+	label   string
+	present bool
 }
 
 // NewFileAdapter creates a [FileAdapter] from adapter configuration.
@@ -57,11 +64,11 @@ type FileAdapter struct {
 //
 // Optional config keys:
 //   - "active_states" ([]any holding strings): states considered active
-//     for [FileAdapter.FetchCandidateIssues]. If empty, all issues are
-//     candidates.
+//     for [FileAdapter.FetchCandidateIssues]. If empty, no issue is a
+//     candidate.
 //
 // Returns a [*domain.TrackerError] with Kind [domain.ErrTrackerPayload]
-// if "path" is missing or empty.
+// if "path" is missing or empty, or if a state key holds a non-string.
 func NewFileAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	path, fault := typeutil.StringField(config, "path")
 	if fault != nil {
@@ -74,20 +81,29 @@ func NewFileAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		}
 	}
 
+	states, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &FileAdapter{
+		StateSource:      issuekit.NewStateSource(states),
 		path:             path,
-		activeStates:     toStringSet(typeutil.ExtractStringSlice(config["active_states"])),
 		overrides:        make(map[string]string),
 		commentOverrides: make(map[string][]domain.Comment),
-		labelOverrides:   make(map[string]string),
+		labelOverrides:   make(map[string][]labelOverride),
 	}, nil
 }
 
 // FetchCandidateIssues returns issues whose state matches the
-// configured active states. Comments are set to nil on all returned
-// issues.
+// configured active states, ignoring letter case. Comments are set to
+// nil on all returned issues. An empty active list returns no issue.
 func (a *FileAdapter) FetchCandidateIssues(_ context.Context) ([]domain.Issue, error) {
 	issues := make([]domain.Issue, 0)
+	active := toStringSet(a.TrackerStates().Active)
+	if len(active) == 0 {
+		return issues, nil
+	}
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
 		raws, err := loadIssues(a.path)
 		if err != nil {
@@ -100,7 +116,7 @@ func (a *FileAdapter) FetchCandidateIssues(_ context.Context) ([]domain.Issue, e
 		issues = make([]domain.Issue, 0, len(raws))
 		for _, raw := range raws {
 			raw = a.applyOverride(raw)
-			if len(a.activeStates) > 0 && !a.activeStates[strings.ToLower(raw.State)] {
+			if !active[strings.ToLower(raw.State)] {
 				continue
 			}
 			iss := normalize(raw)
@@ -331,33 +347,46 @@ func (a *FileAdapter) TransitionIssue(_ context.Context, issueID string, targetS
 // with Kind [domain.ErrTrackerNotFound] if the issue does not exist.
 func (a *FileAdapter) CommentIssue(_ context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		raws, err := loadIssues(a.path)
-		if err != nil {
-			return err
-		}
-
-		found := false
-		for _, raw := range raws {
-			if raw.ID == issueID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerNotFound,
-				Message: fmt.Sprintf("issue not found: %s", issueID),
-			}
-		}
-
-		a.mu.Lock()
-		a.commentOverrides[issueID] = append(a.commentOverrides[issueID], domain.Comment{
-			Body:      text,
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		})
-		a.mu.Unlock()
-		return nil
+		return a.postComment(issueID, text)
 	})
+}
+
+// CommentIssueWithLiteral records a comment whose body is text followed by
+// literal in a fenced Markdown code block, otherwise as
+// [FileAdapter.CommentIssue] does.
+func (a *FileAdapter) CommentIssueWithLiteral(_ context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *FileAdapter) postComment(issueID, body string) error {
+	raws, err := loadIssues(a.path)
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for _, raw := range raws {
+		if raw.ID == issueID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerNotFound,
+			Message: fmt.Sprintf("issue not found: %s", issueID),
+		}
+	}
+
+	a.mu.Lock()
+	a.commentOverrides[issueID] = append(a.commentOverrides[issueID], domain.Comment{
+		Body:      body,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	a.mu.Unlock()
+	return nil
 }
 
 // SetMetrics configures the metrics recorder for tracker API call
@@ -369,31 +398,132 @@ func (a *FileAdapter) SetMetrics(m domain.Metrics) {
 	a.metrics = m
 }
 
-// AddLabel records the label in the adapter's in-memory label overlay, so
-// it is visible on subsequent reads of the issue. Only one label per issue
-// is retained; a second call for the same issue ID overwrites the first.
-func (a *FileAdapter) AddLabel(_ context.Context, issueID string, label string) error {
+// AddLabel records the label in the adapter's in-memory label overlay and
+// confirms it against the issue's labels. Every label written this way is
+// kept, and a label removed earlier by [FileAdapter.RemoveLabel] is shown
+// again. The fixture file is never modified. Returns a [*domain.TrackerError]
+// with Kind [domain.ErrTrackerNotFound] if the issue does not exist in the
+// fixture, and [domain.ErrTrackerPayload] if the label is blank.
+func (a *FileAdapter) AddLabel(ctx context.Context, issueID string, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		a.mu.Lock()
-		a.labelOverrides[issueID] = label
-		a.mu.Unlock()
-		return nil
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
 	})
+}
+
+// RemoveLabel hides every label of the issue that names label, ignoring
+// letter case, until a later [FileAdapter.AddLabel] shows it again. An issue
+// that carries none is left unchanged. The fixture file is never modified.
+// Returns a [*domain.TrackerError] with Kind [domain.ErrTrackerNotFound] if
+// the issue does not exist in the fixture, and [domain.ErrTrackerPayload] if
+// the label is blank.
+func (a *FileAdapter) RemoveLabel(ctx context.Context, issueID string, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+// labelOps returns the overlay calls behind the shared label drivers. The
+// overlay is the tracker, so both writes report the issue's label set.
+func (a *FileAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	return issuekit.IssueLabelOps{
+		Read: func(_ context.Context) ([]issuekit.IssueLabel, error) {
+			labels, err := a.labelsAfter(issueID, nil)
+			if err != nil {
+				return nil, err
+			}
+			names := make([]issuekit.IssueLabel, len(labels))
+			for i, name := range labels {
+				names[i] = issuekit.IssueLabel{Name: name}
+			}
+			return names, nil
+		},
+		Add: func(_ context.Context, label string) (issuekit.LabelWrite, error) {
+			return a.writeLabels(issueID, []labelOverride{{label: label, present: true}})
+		},
+		Remove: func(_ context.Context, labels []issuekit.IssueLabel) (issuekit.LabelWrite, error) {
+			writes := make([]labelOverride, len(labels))
+			for i, l := range labels {
+				writes[i] = labelOverride{label: l.Name}
+			}
+			return a.writeLabels(issueID, writes)
+		},
+	}
+}
+
+func (a *FileAdapter) writeLabels(issueID string, writes []labelOverride) (issuekit.LabelWrite, error) {
+	labels, err := a.labelsAfter(issueID, writes)
+	if err != nil {
+		return issuekit.LabelWrite{}, err
+	}
+	return issuekit.LabelWrite{After: labels, Reported: true}, nil
+}
+
+// labelsAfter applies writes to the issue's overlay and returns the labels
+// the issue carries afterwards; no writes reads them. The overlay changes
+// only when the fixture holds the issue.
+func (a *FileAdapter) labelsAfter(issueID string, writes []labelOverride) ([]string, error) {
+	raws, err := loadIssues(a.path)
+	if err != nil {
+		return nil, err
+	}
+	idx := slices.IndexFunc(raws, func(raw rawIssue) bool { return raw.ID == issueID })
+	if idx < 0 {
+		return nil, &domain.TrackerError{
+			Kind:    domain.ErrTrackerNotFound,
+			Message: fmt.Sprintf("issue not found: %s", issueID),
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, write := range writes {
+		a.setLabelOverride(issueID, write)
+	}
+	return a.applyOverride(raws[idx]).Labels, nil
+}
+
+// setLabelOverride sets the issue's entry for the label, keeping its
+// position, or appends one. Caller must hold a.mu for writing.
+func (a *FileAdapter) setLabelOverride(issueID string, write labelOverride) {
+	entries := a.labelOverrides[issueID]
+	for i, entry := range entries {
+		if issuekit.SameLabel(entry.label, write.label) {
+			entries[i] = write
+			return
+		}
+	}
+	a.labelOverrides[issueID] = append(entries, write)
 }
 
 // applyOverride returns a copy of raw with its State replaced by the
 // in-memory state override when one exists, and with the in-memory label
-// override merged into Labels (case-insensitive against the existing
-// entries) when one exists. Caller must hold at least a read lock on a.mu.
+// overrides applied to Labels: a label an entry marks removed is dropped,
+// then each present entry that no remaining label names is appended in
+// entry order. Caller must hold at least a read lock on a.mu.
 func (a *FileAdapter) applyOverride(raw rawIssue) rawIssue {
 	if st, ok := a.overrides[raw.ID]; ok {
 		raw.State = st
 	}
-	if label, ok := a.labelOverrides[raw.ID]; ok && !slices.ContainsFunc(raw.Labels, func(l string) bool {
-		return strings.EqualFold(l, label)
-	}) {
-		raw.Labels = append(raw.Labels, label)
+	entries := a.labelOverrides[raw.ID]
+	if len(entries) == 0 {
+		return raw
 	}
+
+	labels := make([]string, 0, len(raw.Labels)+len(entries))
+	for _, name := range raw.Labels {
+		removed := slices.ContainsFunc(entries, func(entry labelOverride) bool {
+			return !entry.present && issuekit.SameLabel(name, entry.label)
+		})
+		if !removed {
+			labels = append(labels, name)
+		}
+	}
+	for _, entry := range entries {
+		if entry.present && !slices.ContainsFunc(labels, func(name string) bool { return issuekit.SameLabel(name, entry.label) }) {
+			labels = append(labels, entry.label)
+		}
+	}
+	raw.Labels = labels
 	return raw
 }
 

@@ -71,6 +71,51 @@ var migration019SQL string
 //go:embed sql/020_cache_write_tokens.sql
 var migration020SQL string
 
+//go:embed sql/021_run_history_configured_settings.sql
+var migration021SQL string
+
+//go:embed sql/022_reaction_handoffs.sql
+var migration022SQL string
+
+//go:embed sql/023_stage_hops.sql
+var migration023SQL string
+
+//go:embed sql/024_stage_chains.sql
+var migration024SQL string
+
+//go:embed sql/025_issue_identity.sql
+var migration025SQL string
+
+//go:embed sql/026_retry_trigger_parked_identity.sql
+var migration026SQL string
+
+//go:embed sql/027_dispatch_context.sql
+var migration027SQL string
+
+//go:embed sql/028_run_origin.sql
+var migration028SQL string
+
+//go:embed sql/029_session_metadata_unaccounted_turns.sql
+var migration029SQL string
+
+//go:embed sql/030_issue_outcomes.sql
+var migration030SQL string
+
+//go:embed sql/031_park_and_hop_context.sql
+var migration031SQL string
+
+//go:embed sql/032_first_after_hop.sql
+var migration032SQL string
+
+//go:embed sql/033_reaction_escalations.sql
+var migration033SQL string
+
+//go:embed sql/034_attention_acknowledgements.sql
+var migration034SQL string
+
+//go:embed sql/035_run_history_display_identifier_index.sql
+var migration035SQL string
+
 var migrations = []Migration{
 	{Version: 1, Description: "core persistence tables", SQL: migration001SQL},
 	{Version: 2, Description: "extended token metrics", SQL: migration002SQL},
@@ -92,4 +137,19 @@ var migrations = []Migration{
 	{Version: 18, Description: "unmeasured_sessions column on aggregate_metrics", SQL: migration018SQL},
 	{Version: 19, Description: "unaccounted_turns column on run_history", SQL: migration019SQL},
 	{Version: 20, Description: "cache_write_tokens column on run_history, session_metadata, and aggregate_metrics", SQL: migration020SQL},
+	{Version: 21, Description: "configured model, configured effort, and reported model on run_history", SQL: migration021SQL},
+	{Version: 22, Description: "review comments each issue's runs were given", SQL: migration022SQL},
+	{Version: 23, Description: "stage hop counts and the previous stage on retry entries and run history", SQL: migration023SQL},
+	{Version: 24, Description: "stage chain identifier and hop result on run history, retry entries, and stage hops", SQL: migration024SQL},
+	{Version: 25, Description: "issue identity on retry entries and run history", SQL: migration025SQL},
+	{Version: 26, Description: "retry trigger and parked issue identity", SQL: migration026SQL},
+	{Version: 27, Description: "dispatch context on retry entries, run history, and stage hops", SQL: migration027SQL},
+	{Version: 28, Description: "run origin on run history and retry entries", SQL: migration028SQL},
+	{Version: 29, Description: "unaccounted_turns column on session_metadata", SQL: migration029SQL},
+	{Version: 30, Description: "issue outcomes", SQL: migration030SQL},
+	{Version: 31, Description: "run context and issue facts on parked issues and issue facts on stage hops", SQL: migration031SQL},
+	{Version: 32, Description: "first run after a stage hop on run history", SQL: migration032SQL},
+	{Version: 33, Description: "reaction escalation records", SQL: migration033SQL},
+	{Version: 34, Description: "attention acknowledgements", SQL: migration034SQL},
+	{Version: 35, Description: "display_identifier index on run_history", SQL: migration035SQL},
 }

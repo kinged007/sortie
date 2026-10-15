@@ -1,0 +1,66 @@
+workflow:  WORKFLOW_PATH
+database:  DB_PATH
+covering:  2026-01-01T00:00:00Z until 2026-02-01T00:00:00Z
+generated: 2026-02-01T09:00:00Z
+
+runs 6   issues 5   succeeded 3 (50.0%)
+duration (succeeded)    p50 20m 0s   p95 30m 0s   mean 20m 0s   samples 3
+turns (succeeded)       4.0
+tokens (measured runs)  input 3,900,000   output 760,000   total 4,660,000   cache read 50,000   cache write 10,000
+cost (measured runs)    $19.52   per succeeded run $6.51
+
+by outcome
+  OUTCOME    RUNS  SHARE  P50     P95     MEAN    TURNS  TOTAL TOKENS  COST
+  succeeded  3     50.0%  20m 0s  30m 0s  20m 0s  4.0    4,200,000     $17.87
+  failed     2     33.3%  5m 0s   5m 0s   5m 0s   1.5    350,000       $1.65
+  ci_failed  1     16.7%  0s      0s      0s      0.0    110,000       -
+
+by coding agent
+  AGENT        RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN     TURNS  TOTAL TOKENS  COST
+  claude-code  4     2          50.0%         5m 0s   30m 0s  11m 15s  2.5    4,060,000     $19.52
+  <none>       1     0          0.0%          -       -       -        1.0    -             -
+  codex        1     1          100.0%        20m 0s  20m 0s  20m 0s   4.0    600,000       -
+
+by dispatch rule
+  RULE       RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN     TURNS  TOTAL TOKENS  COST
+  implement  3     2          66.7%         10m 0s  20m 0s  11m 40s  3.0    2,150,000     $7.52
+  <none>     2     0          0.0%          0s      0s      0s       0.5    110,000       -
+  review     1     1          100.0%        30m 0s  30m 0s  30m 0s   5.0    2,400,000     $12.00
+
+by prompt template
+  TEMPLATE  RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN    TURNS  TOTAL TOKENS  COST
+  <none>    3     1          33.3%         0s      20m 0s  10m 0s  1.7    710,000       -
+  tpl-a     2     1          50.0%         5m 0s   10m 0s  7m 30s  2.5    1,550,000     $7.52
+  tpl-b     1     1          100.0%        30m 0s  30m 0s  30m 0s  5.0    2,400,000     $12.00
+
+by configured model
+  MODEL          RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN    TURNS  TOTAL TOKENS  COST
+  <none>         2     0          0.0%          0s      0s      0s      0.5    110,000       -
+  claude-sonnet  2     1          50.0%         5m 0s   10m 0s  7m 30s  2.5    1,550,000     $7.52
+  claude-opus    1     1          100.0%        30m 0s  30m 0s  30m 0s  5.0    2,400,000     $12.00
+  gpt-5          1     1          100.0%        20m 0s  20m 0s  20m 0s  4.0    600,000       -
+
+by stage chain
+  CHAIN    ISSUE   STAGES               LAST HOP  RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN    TURNS  TOTAL TOKENS  COST
+  chain-1  PROJ-2  implement -> review  advanced  2     2          100.0%        10m 0s  30m 0s  20m 0s  4.0    3,600,000     $17.87
+  chain-2  PROJ-3  implement            failed    1     0          0.0%          5m 0s   5m 0s   5m 0s   2.0    350,000       $1.65
+
+by retry trigger
+  TRIGGER    RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN     TURNS  TOTAL TOKENS  COST
+  <unknown>  4     2          50.0%         10m 0s  20m 0s  11m 40s  2.5    2,150,000     $7.52
+  <none>     1     0          0.0%          0s      0s      0s       0.0    110,000       -
+  ci_fix     1     1          100.0%        30m 0s  30m 0s  30m 0s   5.0    2,400,000     $12.00
+
+by run origin
+  ORIGIN     RUNS  SUCCEEDED  SUCCESS RATE  P50     P95     MEAN     TURNS  TOTAL TOKENS  COST
+  <unknown>  4     2          50.0%         10m 0s  20m 0s  11m 40s  2.5    2,150,000     $7.52
+  <none>     1     0          0.0%          0s      0s      0s       0.0    110,000       -
+  ci_fix     1     1          100.0%        30m 0s  30m 0s  30m 0s   5.0    2,400,000     $12.00
+
+self review
+  runs reviewed 2   iterate 1   pass 1   hit iteration cap 1   mean iterations 2.50
+
+note: 1 of these runs took no measurable time. A run that a CI result closed out carries the same start and finish time.
+note: the duration figures skip 1 of these runs, whose recorded start and finish times were unusable.
+note: the token and cost figures skip 1 of these runs, because the coding agent behind them reported no token usage.
+note: the cost figures skip 1 of these runs, because token_rates has no price for the coding agent behind them.

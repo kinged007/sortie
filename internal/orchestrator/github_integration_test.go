@@ -236,9 +236,7 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry.Agents.Get(%q): %v", "mock", err)
 	}
-	agentAdapter, err := agentFactory(map[string]any{
-		"max_turns": 1,
-	})
+	agentAdapter, err := agentFactory()
 	if err != nil {
 		t.Fatalf("NewMockAdapter: %v", err)
 	}
@@ -319,29 +317,35 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 	// Poll the GitHub issue for the handoff transition to complete.
 	// HandleWorkerExit persists run history before calling TransitionIssue,
 	// so we cannot rely on run history alone; we must wait for the actual
-	// label swap and state change on GitHub.
+	// label swap on GitHub. The swap adds the new label before removing the
+	// old one, so 'review' alone is an intermediate state, not completion.
 	t.Logf("waiting for orchestrator to dispatch and complete issue #%s...", issueNumber)
 	var issue githubIssueResponse
+	hasLabel := func(name string) bool {
+		for _, l := range issue.Labels {
+			if strings.EqualFold(l.Name, name) {
+				return true
+			}
+		}
+		return false
+	}
 	deadline := time.After(60 * time.Second)
 	for {
 		select {
 		case <-deadline:
 			orchCancel()
 			<-done
-			t.Fatalf("timed out waiting for issue #%s to transition to 'review'", issueNumber)
+			labels := make([]string, len(issue.Labels))
+			for i, l := range issue.Labels {
+				labels[i] = l.Name
+			}
+			t.Fatalf("timed out waiting for issue #%s to swap 'backlog' for 'review'; last labels = %v", issueNumber, labels)
 		default:
 		}
 
 		issue = ghClient.fetchIssue(t, issueNumber)
-		hasReview := false
-		for _, l := range issue.Labels {
-			if strings.EqualFold(l.Name, "review") {
-				hasReview = true
-				break
-			}
-		}
-		if hasReview {
-			t.Logf("issue #%s transitioned: state=%q, labels include 'review'", issueNumber, issue.State)
+		if hasLabel("review") && !hasLabel("backlog") {
+			t.Logf("issue #%s transitioned: state=%q, 'backlog' swapped for 'review'", issueNumber, issue.State)
 			break
 		}
 		time.Sleep(2 * time.Second)
@@ -358,25 +362,6 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 	// parks the issue for a reviewer instead of closing it.
 	if issue.State != "open" {
 		t.Errorf("issue state = %q, want %q", issue.State, "open")
-	}
-
-	hasLabel := func(name string) bool {
-		for _, l := range issue.Labels {
-			if strings.EqualFold(l.Name, name) {
-				return true
-			}
-		}
-		return false
-	}
-	if !hasLabel("review") {
-		labels := make([]string, len(issue.Labels))
-		for i, l := range issue.Labels {
-			labels[i] = l.Name
-		}
-		t.Errorf("issue labels = %v, want 'review' present", labels)
-	}
-	if hasLabel("backlog") {
-		t.Error("issue still has 'backlog' label after handoff to 'review'")
 	}
 
 	entries, err := store.QueryRunHistoryByIssue(ctx, issueNumber)

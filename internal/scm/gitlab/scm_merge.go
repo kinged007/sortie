@@ -26,6 +26,7 @@ type gitlabMergeRequest struct {
 	TargetBranch        string          `json:"target_branch"`
 	MergeCommitSHA      string          `json:"merge_commit_sha"`
 	DetailedMergeStatus string          `json:"detailed_merge_status"`
+	WebURL              string          `json:"web_url"`
 	HeadPipeline        *gitlabPipeline `json:"head_pipeline"`
 
 	// Labels carries the merge request's label names in their stored
@@ -174,6 +175,7 @@ func (a *GitLabSCMAdapter) GetMergeability(ctx context.Context, prNumber int, ow
 		Merged:         merged,
 		MergeCommitSHA: mergeCommitSHA,
 		Closed:         mr.State == "closed",
+		URL:            mr.WebURL,
 	}, nil
 }
 

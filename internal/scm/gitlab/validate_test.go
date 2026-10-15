@@ -444,7 +444,7 @@ func TestValidateConfig(t *testing.T) {
 			Project:        "my project",
 			Endpoint:       "ftp://host",
 			APIKey:         " padded-key ",
-			ActiveStates:   []string{"", "done"},
+			ActiveStates:   []string{" backlog", "done"},
 			TerminalStates: []string{"Done"},
 			QueryFilter:    "state=closed",
 		}
@@ -456,7 +456,7 @@ func TestValidateConfig(t *testing.T) {
 			"tracker.endpoint.invalid",
 			"tracker.project.format",
 			"tracker.api_key.gitlab_whitespace",
-			"tracker.active_states.empty_element",
+			"tracker.active_states.untrimmed_element",
 			"tracker.states.overlap",
 			"tracker.query_filter.invalid",
 		}

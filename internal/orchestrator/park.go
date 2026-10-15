@@ -28,6 +28,7 @@ type ParkStore interface {
 	DeleteParkedIssue(ctx context.Context, issueID string) error
 	DeleteRetryEntry(ctx context.Context, issueID string) error
 	ResetHandoffAbsenceSequence(ctx context.Context, issueID string) error
+	DeleteStageHop(ctx context.Context, issueID string) error
 }
 
 // parkObserverStore widens [ParkStore] with the one method the release pass
@@ -39,16 +40,39 @@ type parkObserverStore interface {
 	MarkParkedIssueLabelApplied(ctx context.Context, issueID string) error
 }
 
+// parkedRun is the run a park follows: its dispatch rule, its frozen stage
+// lineage (pass dispatch time included), its agent kind, and its configured
+// model. The zero value records no run.
+type parkedRun struct {
+	RuleName        string
+	StageLineage    StageLineage
+	AgentKind       string
+	ConfiguredModel string
+}
+
+// parkedRunOf returns the run row describes: AgentKind from AgentAdapter,
+// StageLineage through [stageLineageOf].
+func parkedRunOf(row persistence.RunHistory) parkedRun {
+	return parkedRun{
+		RuleName:        row.RuleName,
+		StageLineage:    stageLineageOf(row),
+		AgentKind:       row.AgentAdapter,
+		ConfiguredModel: row.ConfiguredModel,
+	}
+}
+
 // parkIssueParams carries the inputs of one park.
 type parkIssueParams struct {
 	IssueID       string
 	Identifier    string
 	DisplayID     string
-	ObservedState string // tracker state to record as parked_state
+	IssueIdentity IssueIdentity // the issue as read; zero when unread
+	ObservedState string        // tracker state to record as parked_state
 	Reason        string
 	Label         string // resolved parking label; empty disables the label write
 	Absences      int    // log attribute only; omitted from the record when zero
 	Ceiling       int    // log attribute only; omitted from the record when zero
+	Run           parkedRun
 
 	Store          ParkStore
 	TrackerAdapter domain.TrackerAdapter // nil skips the label write
@@ -58,7 +82,8 @@ type parkIssueParams struct {
 }
 
 // parkIssue records the park, releases the claim, cancels and deletes any
-// pending retry, and starts the detached parking-label write.
+// pending retry, resets the issue's stage hop count, and starts the detached
+// parking-label write.
 func parkIssue(state *State, params parkIssueParams) {
 	ctx := params.Ctx
 	if ctx == nil {
@@ -72,15 +97,26 @@ func parkIssue(state *State, params parkIssueParams) {
 	CancelRetry(state, params.IssueID)
 	delete(state.Claimed, params.IssueID)
 
+	// An issue parked again still carries the label of its earlier park,
+	// since an unpark never removes it.
+	identity := params.IssueIdentity
+	identity.Labels = labelsWithout(identity.Labels, params.Label)
+
 	parkedAt := time.Now().UTC()
 	entry := &ParkedEntry{
-		Identifier:   params.Identifier,
-		DisplayID:    params.DisplayID,
-		Reason:       params.Reason,
-		ParkedState:  params.ObservedState,
-		Label:        params.Label,
-		LabelApplied: false,
-		ParkedAt:     parkedAt,
+		Identifier:    params.Identifier,
+		DisplayID:     params.DisplayID,
+		IssueIdentity: identity,
+		Reason:        params.Reason,
+		ParkedState:   params.ObservedState,
+		Label:         params.Label,
+		LabelApplied:  false,
+		ParkedAt:      parkedAt,
+
+		RuleName:        params.Run.RuleName,
+		StageLineage:    params.Run.StageLineage,
+		AgentKind:       params.Run.AgentKind,
+		ConfiguredModel: params.Run.ConfiguredModel,
 	}
 	state.Parked[params.IssueID] = entry
 
@@ -90,6 +126,7 @@ func parkIssue(state *State, params parkIssueParams) {
 	if err := params.Store.DeleteRetryEntry(ctx, params.IssueID); err != nil {
 		log.Error("failed to delete retry entry after park", slog.Any("error", err))
 	}
+	resetStageHop(ctx, state, params.Store, params.IssueID, stageResetParked, log)
 
 	params.Metrics.IncIssueParks(params.Reason)
 
@@ -126,8 +163,9 @@ func parkIssue(state *State, params parkIssueParams) {
 	})
 }
 
-// unparkIssue lifts the park and deletes the persisted row. It is a no-op
-// when issueID is absent from state.Parked.
+// unparkIssue lifts the park, deletes the persisted row, and resets the
+// issue's stage hop count. It is a no-op when issueID is absent from
+// state.Parked.
 func unparkIssue(ctx context.Context, state *State, issueID, trigger string, store ParkStore, log *slog.Logger) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -148,6 +186,7 @@ func unparkIssue(ctx context.Context, state *State, issueID, trigger string, sto
 	if err := store.ResetHandoffAbsenceSequence(ctx, issueID); err != nil {
 		log.Error("failed to reset handoff absence sequence after unpark", slog.Any("error", err))
 	}
+	resetStageHop(ctx, state, store, issueID, stageResetUnparked, log)
 
 	log.Info("issue unparked",
 		slog.String("trigger", trigger),
@@ -175,13 +214,29 @@ func PopulateParked(state *State, rows []persistence.ParkedIssue, log *slog.Logg
 		}
 
 		state.Parked[row.IssueID] = &ParkedEntry{
-			Identifier:   row.Identifier,
-			DisplayID:    row.DisplayID,
+			Identifier: row.Identifier,
+			DisplayID:  row.DisplayID,
+			IssueIdentity: IssueIdentity{
+				Title:     row.IssueTitle,
+				URL:       row.IssueURL,
+				IssueType: row.IssueType,
+				Labels:    row.IssueLabels,
+			},
 			Reason:       row.Reason,
 			ParkedState:  row.ParkedState,
 			Label:        row.Label,
 			LabelApplied: row.LabelApplied,
 			ParkedAt:     parkedAt,
+
+			RuleName: row.RuleName,
+			StageLineage: StageLineage{
+				PreviousRule:    row.StagePrevious,
+				PreviousOutcome: row.StagePreviousOutcome,
+				ChainID:         row.ChainID,
+				DispatchedAt:    parseDispatchedAt(row.DispatchedAt),
+			},
+			AgentKind:       row.AgentKind,
+			ConfiguredModel: row.ConfiguredModel,
 		}
 	}
 }
@@ -233,6 +288,18 @@ func observeParkedLabels(ctx context.Context, state *State, store parkObserverSt
 	}
 }
 
+// labelsWithout returns a copy of labels without each label that
+// [strings.EqualFold] matches to drop, comparing as [observeParkedLabels]
+// does. A nil labels stays nil.
+func labelsWithout(labels []string, drop string) []string {
+	if labels == nil {
+		return nil
+	}
+	return slices.DeleteFunc(slices.Clone(labels), func(label string) bool {
+		return strings.EqualFold(label, drop)
+	})
+}
+
 // parkedIssueRow builds the persisted row for the given runtime park entry.
 func parkedIssueRow(issueID string, entry *ParkedEntry) persistence.ParkedIssue {
 	return persistence.ParkedIssue{
@@ -244,5 +311,17 @@ func parkedIssueRow(issueID string, entry *ParkedEntry) persistence.ParkedIssue 
 		Label:        entry.Label,
 		LabelApplied: entry.LabelApplied,
 		ParkedAt:     entry.ParkedAt.Format(time.RFC3339),
+		IssueTitle:   entry.IssueIdentity.Title,
+		IssueURL:     entry.IssueIdentity.URL,
+		IssueType:    entry.IssueIdentity.IssueType,
+		IssueLabels:  entry.IssueIdentity.Labels,
+
+		RuleName:             entry.RuleName,
+		AgentKind:            entry.AgentKind,
+		ConfiguredModel:      entry.ConfiguredModel,
+		StagePrevious:        entry.StageLineage.PreviousRule,
+		StagePreviousOutcome: entry.StageLineage.PreviousOutcome,
+		ChainID:              entry.StageLineage.ChainID,
+		DispatchedAt:         formatDispatchedAt(entry.StageLineage.DispatchedAt),
 	}
 }

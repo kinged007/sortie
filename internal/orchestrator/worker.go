@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
@@ -17,6 +18,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -154,6 +156,10 @@ type WorkerResult struct {
 	// when SoftStop is false.
 	SoftStopReason string
 
+	// SoftStopStatement is the text the agent wrote after the status token
+	// that produced SoftStopReason, zero whenever SoftStop is false.
+	SoftStopStatement workspace.StatusStatement
+
 	// ReviewMetadata summarizes the self-review outcome. Nil when self-review
 	// is disabled or the worker exited before the phase.
 	ReviewMetadata *domain.ReviewMetadata
@@ -194,6 +200,11 @@ type WorkerResult struct {
 	// APIRequestCount is the number of admitted token_usage events the worker
 	// relayed this run. Zero before the first turn began.
 	APIRequestCount int
+
+	// HandedOffComments maps a reaction kind to the IDs of the comments the
+	// run's first prompt presented under that kind's template variable.
+	// Set only on [WorkerExitNormal].
+	HandedOffComments map[string][]string
 }
 
 // SessionToolRegistryFunc builds the first-turn tool advertisement.
@@ -264,6 +275,15 @@ type WorkerDeps struct {
 	// TrackerAdapter fetches issue states for mid-turn re-checks.
 	TrackerAdapter domain.TrackerAdapter
 
+	// Router selects the destinations of the session.started event. Nil
+	// routes nothing.
+	Router *route.Router
+
+	// TrackerOpsWg counts the detached part of the session.started
+	// delivery, so shutdown drains it with the other tracker writes. Nil
+	// leaves that delivery untracked.
+	TrackerOpsWg *sync.WaitGroup
+
 	// AgentAdapter manages agent session lifecycle.
 	AgentAdapter domain.AgentAdapter
 
@@ -287,6 +307,9 @@ type WorkerDeps struct {
 	// admits every figure.
 	UsageArrival registry.UsageArrival
 
+	// AgentSettings is the settings block resolved for this attempt.
+	AgentSettings config.AgentSettings
+
 	// OnEvent relays agent events to the serialized event loop. Called from
 	// the worker goroutine; must be concurrency-safe.
 	OnEvent func(issueID string, event domain.AgentEvent)
@@ -298,6 +321,12 @@ type WorkerDeps struct {
 	// OnTurnStarted reports turnsStarted before each turn runs. Called from
 	// the worker goroutine; must be concurrency-safe. Nil disables it.
 	OnTurnStarted func(issueID string, turnsStarted int)
+
+	// OnUnaccountedTurns reports the run's cumulative count of turns that
+	// spent tokens no figure was proven to cover, each time a turn raises it.
+	// Called from the worker goroutine; must be concurrency-safe. Nil
+	// disables it.
+	OnUnaccountedTurns func(issueID string, unaccountedTurns int)
 
 	// ResumeSessionID is the previous attempt's session ID, non-empty on
 	// continuation retries so the adapter can resume the conversation.
@@ -355,6 +384,11 @@ type WorkerDeps struct {
 	// the first-turn prompt. Non-nil only for reaction continuations.
 	ContinuationContext map[string]any
 
+	// ReactionKind is the reaction kind that caused this dispatch, empty for
+	// a fresh run. A fresh run accepts a seeded continuation only when it
+	// leaves the template's own text intact.
+	ReactionKind string
+
 	// Posture selects the worker behavior for this dispatch. The predicate
 	// methods [DispatchPosture.RunsSetupHooks] and
 	// [DispatchPosture.DrivesIssueState] gate the worker guards. Derived from
@@ -398,17 +432,21 @@ func isTurnSuccess(reason domain.AgentEventType) bool {
 	return reason == domain.EventTurnCompleted
 }
 
-// toDomainAgentConfig converts a config-layer AgentConfig to the
-// domain-layer one. kind comes from the caller rather than c.Kind because
-// the dispatch-frozen kind and the configuration's default can differ.
-func toDomainAgentConfig(c config.AgentConfig, kind string) domain.AgentConfig {
+// toDomainAgentConfig builds the domain-layer agent configuration a
+// session of kind starts with. kind comes from the caller rather than
+// cfg.Agent.Kind because the dispatch-frozen kind and the configuration's
+// default can differ, and so does the command: it is the one written for
+// kind in the session's own launch mode, remote or local.
+func toDomainAgentConfig(cfg config.ServiceConfig, kind string, remote bool) domain.AgentConfig {
+	command := cfg.AgentCommand(kind, remote)
 	return domain.AgentConfig{
 		Kind:           kind,
-		Command:        c.Command,
-		TurnTimeoutMS:  c.TurnTimeoutMS,
-		ReadTimeoutMS:  c.ReadTimeoutMS,
-		StallTimeoutMS: c.StallTimeoutMS,
-		StopGraceMS:    c.StopGraceMS,
+		Command:        command.Line,
+		CommandArgv:    command.Argv,
+		TurnTimeoutMS:  cfg.Agent.TurnTimeoutMS,
+		ReadTimeoutMS:  cfg.Agent.ReadTimeoutMS,
+		StallTimeoutMS: cfg.Agent.StallTimeoutMS,
+		StopGraceMS:    cfg.Agent.StopGraceMS,
 	}
 }
 
@@ -473,9 +511,10 @@ func effectiveTurnTimeoutMS(turnTimeoutMS int) int {
 // runBoundedTurn calls adapter.RunTurn under a deadline derived from
 // turnTimeoutMS. A parent ctx already done takes priority over the deadline,
 // so stall detection, reconciliation, and shutdown keep reporting their own
-// cancellation; only a turn context that expired while ctx stayed live is
-// reported as [domain.ErrTurnTimeout]. Every other outcome is returned
-// unchanged. ctx is never replaced for the caller; identity carries the
+// cancellation; only an outcome the adapter reports as cancelled, from a
+// turn context that expired while ctx stayed live, is reported as
+// [domain.ErrTurnTimeout]. Every other outcome, a turn that completed or
+// failed after the deadline among them, is returned unchanged. ctx is never replaced for the caller; identity carries the
 // caller's attributes naming the turn in any log record produced.
 func runBoundedTurn(
 	ctx context.Context,
@@ -500,7 +539,7 @@ func runBoundedTurn(
 	if ctx.Err() != nil {
 		return result, err
 	}
-	if errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
+	if agentcore.CancelledOutcome(result, err) && errors.Is(turnCtx.Err(), context.DeadlineExceeded) {
 		attrs := append([]slog.Attr{slog.Int("turn_timeout_ms", effectiveMS)}, identity...)
 		logger.LogAttrs(ctx, slog.LevelWarn, "turn timeout exceeded", attrs...)
 		cause := err
@@ -634,6 +673,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	foldTurnResult := func(result domain.TurnResult) (carriesMeasurement bool) {
 		if result.SpendUnaccounted {
 			localUnaccounted++
+			if deps.OnUnaccountedTurns != nil {
+				deps.OnUnaccountedTurns(issue.ID, localUnaccounted)
+			}
 		}
 		carriesMeasurement = hasUsage(result.Usage) || result.UsageMeasured
 		if carriesMeasurement && !admitMeasurement() {
@@ -710,17 +752,10 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 	}
 
-	// Post a claim-acknowledging comment, after the transition and before
-	// workspace prep. Failure is non-fatal. A dispatch that does not drive
-	// issue state is not a work claim, so it posts none.
-	if cfg.Tracker.Comments.OnDispatch && deps.Posture.DrivesIssueState() {
-		if err := deps.TrackerAdapter.CommentIssue(ctx, issue.ID, dispatchComment); err != nil {
-			logger.Warn("dispatch comment failed", slog.Any("error", err))
-			deps.Metrics.IncTrackerComments("dispatch", "error")
-		} else {
-			logger.Info("dispatch comment posted")
-			deps.Metrics.IncTrackerComments("dispatch", "success")
-		}
+	// A dispatch that does not drive issue state is not a work claim, so
+	// it publishes no session.started event.
+	if deps.Posture.DrivesIssueState() {
+		publishSessionStarted(ctx, issue, attempt, agentKind, deps, logger)
 	}
 
 	// Pre-declared so the panic recovery defer can access them.
@@ -895,8 +930,6 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			return
 		}
 
-		settings := config.ResolveAgentSettings(cfg, agentKind, filepath.Dir(deps.WorkflowPath))
-
 		generatedPath, genErr := GenerateMCPConfig(MCPConfigParams{
 			BinaryPath:            execPath,
 			WorkflowPath:          deps.WorkflowPath,
@@ -907,7 +940,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			DispatchID:            deps.DispatchID,
 			Attempt:               attempt,
 			AgentKind:             agentKind,
-			OperatorMCPConfigPath: settings.MCPConfigPath,
+			OperatorMCPConfigPath: deps.AgentSettings.MCPConfigPath,
 			ProcessEnv:            CollectSortieEnv(),
 		})
 		if genErr != nil {
@@ -934,7 +967,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		logger.Info("mcp config written",
 			slog.String("mcp_config_path", generatedPath),
 			slog.String("agent_kind", agentKind),
-			slog.String("operator_mcp_config_path", settings.MCPConfigPath))
+			slog.String("operator_mcp_config_path", deps.AgentSettings.MCPConfigPath))
 	}
 
 	writeDispatchIdentity := func(sessionID string) {
@@ -968,19 +1001,21 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		return
 	}
 
+	remote := strings.TrimSpace(deps.SSHHost) != ""
 	var sshEnvNames []string
-	if strings.TrimSpace(deps.SSHHost) != "" && deps.SSHEnvNamesFunc != nil {
+	if remote && deps.SSHEnvNamesFunc != nil {
 		sshEnvNames = deps.SSHEnvNamesFunc(agentKind)
 	}
 
 	params := domain.StartSessionParams{
 		WorkspacePath:            wsResult.Path,
-		AgentConfig:              toDomainAgentConfig(cfg.Agent, agentKind),
+		AgentConfig:              toDomainAgentConfig(cfg, agentKind, remote),
 		ResumeSessionID:          deps.ResumeSessionID,
 		SSHHost:                  deps.SSHHost,
 		SSHStrictHostKeyChecking: deps.SSHStrictHostKeyChecking,
 		SSHEnvNames:              sshEnvNames,
 		MCPConfigPath:            mcpConfigPath,
+		Settings:                 deps.AgentSettings.Passthrough,
 	}
 
 	deps.OnEvent(issue.ID, domain.AgentEvent{
@@ -1086,13 +1121,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 
 	sessionStartedAt = time.Now().UTC()
 
-	maxTurns := cfg.Agent.MaxTurns
-	if maxTurns < 1 {
+	maxTurns := cfg.Agent.TurnLimit()
+	if cfg.Agent.MaxTurns < 1 {
 		logger.Warn("clamped agent max_turns to 1", slog.Int("configured_max_turns", cfg.Agent.MaxTurns))
-		maxTurns = 1
 	}
 	turnNumber := 1
 	activeStates := cfg.Tracker.ActiveStates
+	stageOption := prompt.WithStage(stageRenderFrom(ctx))
 
 	publishWorkerState := func(turn int) error {
 		if mcpConfigPath == "" {
@@ -1159,9 +1194,15 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	// it after self-review has had a chance to run.
 	var pendingSoftStopReason string
 
+	// pendingSoftStopStatement is the statement of the read that produced
+	// pendingSoftStopReason, and is zero whenever that reason is empty.
+	var pendingSoftStopStatement workspace.StatusStatement
+
 	if err := publishWorkerState(0); err != nil {
 		logger.Warn("failed to write status state file at session start", slog.Any("error", err))
 	}
+
+	var presentedComments map[string][]string
 
 	for {
 		if ctx.Err() != nil {
@@ -1188,17 +1229,17 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 
 		issueMap := issue.ToTemplateMap()
-		var renderOpts []prompt.RenderOption
+		var rendered string
+		var err error
 		if turnNumber == 1 {
 			contCtx := deps.ContinuationContext
 			if contCtx == nil {
 				contCtx = ContinuationFromContext(ctx)
 			}
-			if contCtx != nil {
-				renderOpts = append(renderOpts, prompt.WithContinuationContext(contCtx))
-			}
+			rendered, presentedComments, err = renderFirstTurnPrompt(tmpl, issueMap, attemptInt, maxTurns, contCtx, deps.ReactionKind == "", stageOption)
+		} else {
+			rendered, err = prompt.BuildTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, stageOption)
 		}
-		rendered, err := prompt.BuildTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, renderOpts...)
 		cancelledAtEnding = ctx.Err() != nil
 		if err != nil {
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
@@ -1331,9 +1372,10 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		// Read the A2O status file to detect agent-reported blockage before
 		// a wasted tracker call. A recognized signal leaves the loop so the
 		// single post-loop teardown is the only exit path.
-		statusSignal := workspace.ReadStatusFile(wsResult.Path, logger)
-		if statusSignal.IsRecognized() {
-			pendingSoftStopReason = string(statusSignal)
+		statusFile := workspace.ReadStatusFile(wsResult.Path, logger)
+		if statusFile.Signal.IsRecognized() {
+			pendingSoftStopReason = string(statusFile.Signal)
+			pendingSoftStopStatement = statusFile.Statement
 			break
 		}
 
@@ -1367,7 +1409,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				return
 			}
 
-			if stateStr, ok := refreshed[issue.ID]; ok {
+			// An empty state may be a label edit in flight; reconcile alone
+			// stops a run whose issue lost its state label.
+			if stateStr, ok := refreshed[issue.ID]; ok && stateStr != "" {
 				issue.State = stateStr
 				observedIssueState = stateStr
 			}
@@ -1408,8 +1452,8 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			)
 			workspace.CleanupStatusFile(wsResult.Path, logger)
 		}
-		var phaseSignal workspace.StatusSignal
-		reviewMeta, phaseSignal, cancelledAtEnding, phaseErr = runSelfReviewLoop(ctx, RunSelfReviewParams{
+		var phaseStatus workspace.StatusFile
+		reviewMeta, phaseStatus, cancelledAtEnding, phaseErr = runSelfReviewLoop(ctx, RunSelfReviewParams{
 			Session:       session,
 			Issue:         issue,
 			WorkspacePath: wsResult.Path,
@@ -1433,11 +1477,15 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			TurnTimeoutMS:  cfg.Agent.TurnTimeoutMS,
 		})
 		// A blocked signal read inside the phase becomes the run's soft-stop
-		// reason unconditionally.
-		if phaseSignal == workspace.StatusBlocked {
+		// reason unconditionally, together with its statement.
+		if phaseStatus.Signal == workspace.StatusBlocked {
 			pendingSoftStopReason = string(workspace.StatusBlocked)
+			pendingSoftStopStatement = phaseStatus.Statement
 		}
 		pendingSoftStopReason = retractUnconfirmedNoChangeDeclaration(pendingSoftStopReason, reviewMeta, logger)
+		if pendingSoftStopReason == "" {
+			pendingSoftStopStatement = workspace.StatusStatement{}
+		}
 		phaseCut = phaseErr == nil && cancelledAtEnding
 	} else if selfReviewAdmitted {
 		phaseCut = true
@@ -1581,6 +1629,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		SSHHost:                      deps.SSHHost,
 		SoftStop:                     pendingSoftStopReason != "",
 		SoftStopReason:               pendingSoftStopReason,
+		SoftStopStatement:            pendingSoftStopStatement,
 		ReviewMetadata:               reviewMeta,
 		ObservedIssueState:           observedIssueState,
 		Usage:                        localUsage,
@@ -1588,7 +1637,95 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		APIRequestCount:              localRequestCount,
 		UsageMeasured:                localMeasured,
 		UnaccountedTurns:             localUnaccounted,
+		HandedOffComments:            presentedComments,
 	})
+}
+
+// renderFirstTurnPrompt renders the first turn's template output and
+// reports, per reaction kind, the comment IDs that output presented to the
+// agent. A kind's IDs count as presented when rendering without that
+// kind's variable changes the output or fails, because the template then
+// showed the list to the agent. A fresh run's seeded continuation is kept
+// only when its render still contains every line of the unseeded render in
+// order; otherwise the unseeded render is returned and nothing is presented,
+// since a template that switches modes on the seed would lose its task text.
+// baseOpts apply to every render, the unseeded probes included.
+func renderFirstTurnPrompt(tmpl *prompt.Template, issueMap map[string]any, attempt, maxTurns int, continuation map[string]any, freshRun bool, baseOpts ...prompt.RenderOption) (string, map[string][]string, error) {
+	render := func(seed map[string]any) (string, error) {
+		opts := slices.Clone(baseOpts)
+		if seed != nil {
+			opts = append(opts, prompt.WithContinuationContext(seed))
+		}
+		return prompt.BuildTurnPrompt(tmpl, issueMap, attempt, 1, maxTurns, opts...)
+	}
+
+	if continuation == nil {
+		rendered, err := render(nil)
+		return rendered, nil, err
+	}
+
+	if freshRun {
+		unseeded, err := render(nil)
+		if err != nil {
+			return "", nil, err
+		}
+		seeded, seededErr := render(continuation)
+		if seededErr != nil || !keepsEveryLine(seeded, unseeded) {
+			return unseeded, nil, nil
+		}
+		return seeded, presentedComments(render, seeded, continuation), nil
+	}
+
+	rendered, err := render(continuation)
+	if err != nil {
+		return "", nil, err
+	}
+	return rendered, presentedComments(render, rendered, continuation), nil
+}
+
+// presentedComments returns the IDs of the review-family kinds whose
+// variable in continuation affects the rendered output. It returns nil when
+// no kind qualifies.
+func presentedComments(render func(map[string]any) (string, error), rendered string, continuation map[string]any) map[string][]string {
+	var presented map[string][]string
+	for _, kind := range []string{ReactionKindReview, ReactionKindBotReview} {
+		ids := continuationCommentIDs(kind, continuation)
+		if len(ids) == 0 {
+			continue
+		}
+		withoutKind := maps.Clone(continuation)
+		withoutKind[commentTemplateKey(kind)] = nil
+		alternative, err := render(withoutKind)
+		if err == nil && alternative == rendered {
+			continue
+		}
+		if presented == nil {
+			presented = make(map[string][]string)
+		}
+		presented[kind] = ids
+	}
+	return presented
+}
+
+// keepsEveryLine reports whether every line of base appears in rendered, in
+// the same order, with other lines allowed between them.
+func keepsEveryLine(rendered, base string) bool {
+	renderedLines := strings.Split(rendered, "\n")
+	next := 0
+	for line := range strings.SplitSeq(base, "\n") {
+		found := false
+		for ; next < len(renderedLines); next++ {
+			if renderedLines[next] == line {
+				found = true
+				next++
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // retractUnconfirmedNoChangeDeclaration clears pendingSoftStopReason when it

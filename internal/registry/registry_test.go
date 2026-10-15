@@ -159,6 +159,64 @@ func TestRegister_Panics(t *testing.T) {
 	}
 }
 
+func TestRegister_ReservedKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		register func()
+	}{
+		{
+			name: "Register on a registry that reserves the kind",
+			register: func() {
+				NewRegistry[testConstructor, testMeta]("test", "builtin").Register("builtin", dummyConstructor())
+			},
+		},
+		{
+			name: "RegisterWithMeta on a registry that reserves the kind",
+			register: func() {
+				NewRegistry[testConstructor, testMeta]("test", "builtin").RegisterWithMeta("builtin", dummyConstructor(), testMeta{})
+			},
+		},
+		{
+			name: "the notifier registry reserves the tracker comment kind",
+			register: func() {
+				Notifiers.Register(domain.TrackerCommentKind, func(map[string]any) (domain.Notifier, error) { return nil, nil })
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				v := recover()
+				if v == nil {
+					t.Fatalf("%s did not panic", tt.name)
+				}
+				if msg := fmt.Sprint(v); !strings.Contains(msg, "reserved") {
+					t.Errorf("%s panic = %q, want it to contain %q", tt.name, msg, "reserved")
+				}
+			}()
+
+			tt.register()
+		})
+	}
+}
+
+func TestRegister_UnreservedKindOnReservingRegistry(t *testing.T) {
+	t.Parallel()
+
+	r := NewRegistry[testConstructor, testMeta]("test", "builtin")
+
+	r.Register("other", dummyConstructor())
+
+	if _, err := r.Get("other"); err != nil {
+		t.Errorf("Get(%q) error = %v, want nil after registering an unreserved kind", "other", err)
+	}
+}
+
 func TestKinds(t *testing.T) {
 	t.Parallel()
 
@@ -279,11 +337,8 @@ func TestRegisterWithMeta_AndMeta(t *testing.T) {
 	})
 }
 
-// dummyAgentConstructor returns an AgentConstructor whose construction
-// result is never inspected by these tests; only its registration and
-// retrieval matter.
 func dummyAgentConstructor() AgentConstructor {
-	return func(map[string]any) (domain.AgentAdapter, error) { return nil, nil }
+	return func() (domain.AgentAdapter, error) { return nil, nil }
 }
 
 // TestRegisterWithMeta_AndMeta_AgentValidateAgentConfig pins that
@@ -443,6 +498,8 @@ func (m *mockTrackerAdapter) FetchCandidateIssues(_ context.Context) ([]domain.I
 	return nil, nil
 }
 
+func (m *mockTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
+
 func (m *mockTrackerAdapter) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -470,10 +527,15 @@ func (m *mockTrackerAdapter) TransitionIssue(_ context.Context, _ string, _ stri
 func (m *mockTrackerAdapter) CommentIssue(_ context.Context, _ string, _ string) error {
 	return nil
 }
+func (m *mockTrackerAdapter) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
 
 func (m *mockTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error {
 	return nil
 }
+
+func (m *mockTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 func TestTrackerRegistry(t *testing.T) {
 	t.Parallel()
@@ -517,7 +579,7 @@ func TestAgentRegistry(t *testing.T) {
 	t.Parallel()
 
 	r := NewRegistry[AgentConstructor, AgentMeta]("agent")
-	r.Register("mock", func(_ map[string]any) (domain.AgentAdapter, error) {
+	r.Register("mock", func() (domain.AgentAdapter, error) {
 		return &mockAgentAdapter{}, nil
 	})
 
@@ -526,7 +588,7 @@ func TestAgentRegistry(t *testing.T) {
 		t.Fatalf("Get(%q) unexpected error: %v", "mock", err)
 	}
 
-	adapter, err := constructor(nil)
+	adapter, err := constructor()
 	if err != nil {
 		t.Fatalf("AgentConstructor() unexpected error: %v", err)
 	}

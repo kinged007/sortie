@@ -31,34 +31,3 @@ func TestIsTerminalState(t *testing.T) {
 		})
 	}
 }
-
-func TestIsActiveState(t *testing.T) {
-	t.Parallel()
-
-	active := []string{"backlog", "in-progress", "review"}
-
-	tests := []struct {
-		name         string
-		state        string
-		activeStates []string
-		want         bool
-	}{
-		{"backlog is active", "backlog", active, true},
-		{"in-progress is active", "in-progress", active, true},
-		{"review is active", "review", active, true},
-		{"terminal state not active", "done", active, false},
-		{"empty state not active", "", active, false},
-		{"empty active list", "backlog", nil, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := isActiveState(tt.state, tt.activeStates)
-			if got != tt.want {
-				t.Errorf("isActiveState(%q) = %v, want %v", tt.state, got, tt.want)
-			}
-		})
-	}
-}

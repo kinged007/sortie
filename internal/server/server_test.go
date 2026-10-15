@@ -52,19 +52,6 @@ func TestNew(t *testing.T) {
 	})
 }
 
-func TestOnStateChange(t *testing.T) {
-	t.Parallel()
-
-	srv := New(Params{
-		SnapshotFn: fixedSnapshot(orchestrator.RuntimeSnapshotResult{}),
-		RefreshFn:  acceptingRefresh(),
-		Logger:     slog.New(slog.DiscardHandler),
-	})
-
-	// OnStateChange is a no-op; just verify it does not panic.
-	srv.OnStateChange()
-}
-
 func TestServerLifecycle(t *testing.T) {
 	t.Parallel()
 

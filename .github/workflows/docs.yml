@@ -1,0 +1,93 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - lychee.toml
+      - Makefile
+      - default.mk
+      - .github/workflows/docs.yml
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**.md'
+      - lychee.toml
+      - Makefile
+      - default.mk
+      - .github/workflows/docs.yml
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  links:
+    name: Links
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install lychee
+        uses: sortie-ai/shared-workflows/.github/actions/setup-lychee@12099056fde09c3b1ef701128316e9fb883eba90 # v1.1.0
+
+      - name: Check links and anchors
+        env:
+          EVENT: ${{ github.event_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          case "$EVENT" in
+            schedule|workflow_dispatch) make lint-docs LYCHEE_FLAGS= ;;
+            *) make lint-docs ;;
+          esac
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs: [links]
+    if: >-
+      (failure() || cancelled())
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Post failure
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_CI }}
+          LINKS: ${{ needs.links.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK}" ]; then
+            echo "::warning::Discord webhook is not configured; skipping"
+            exit 0
+          fi
+
+          jq -n --arg result "${LINKS}" --arg url "${RUN_URL}" \
+            'if $result == "failure" then
+               {title: "Documentation has broken links", color: 15548997,
+                description: "Broken links or anchors are listed in the run log."}
+             else
+               {title: "Documentation link check didn’t finish", color: 9807270,
+                description: "The check ended as \($result)."}
+             end
+             + {url: $url}' >embed.json
+          scripts/discord-notify.sh --embed <embed.json

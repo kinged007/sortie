@@ -67,6 +67,24 @@ func assertEnvAbsent(t *testing.T, env []string, key string) {
 	}
 }
 
+const titleAgentDisabledMember = `{"title":{"disable":true}}`
+
+func decodeConfigDocument(t *testing.T, content string) map[string]json.RawMessage {
+	t.Helper()
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &doc); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", content, err)
+	}
+	return doc
+}
+
+func assertTitleAgentDisabled(t *testing.T, doc map[string]json.RawMessage) {
+	t.Helper()
+	if got := string(doc["agent"]); got != titleAgentDisabledMember {
+		t.Errorf("document agent = %s, want %s", got, titleAgentDisabledMember)
+	}
+}
+
 // assertHasArgPair fails if flag and value do not appear as consecutive
 // elements in args.
 func assertHasArgPair(t *testing.T, args []string, flag, value string) {
@@ -107,7 +125,7 @@ func newTestSessionState(workspacePath, sessionID string) *sessionState {
 	}
 }
 
-func TestNewOpenCodeAdapter_ParsePassthroughConfig(t *testing.T) {
+func TestParsePassthroughConfigAndCrossField(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -208,11 +226,15 @@ func TestNewOpenCodeAdapter_ParsePassthroughConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			a, err := NewOpenCodeAdapter(tt.config)
+			pt, fault := parsePassthroughConfig(tt.config)
+			if fault != nil {
+				t.Fatalf("parsePassthroughConfig(%v) fault = %v", tt.config, fault)
+			}
+			err := checkCrossField(pt)
 
 			if tt.wantErr {
 				if err == nil {
-					t.Fatal("NewOpenCodeAdapter() error = nil, want error")
+					t.Fatal("checkCrossField() error = nil, want error")
 				}
 				if !strings.Contains(err.Error(), "bash") {
 					t.Errorf("error = %q, want it to mention %q", err.Error(), "bash")
@@ -221,15 +243,10 @@ func TestNewOpenCodeAdapter_ParsePassthroughConfig(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("NewOpenCodeAdapter() error = %v", err)
-			}
-
-			oc, ok := a.(*OpenCodeAdapter)
-			if !ok {
-				t.Fatalf("adapter type = %T, want *OpenCodeAdapter", a)
+				t.Fatalf("checkCrossField() error = %v", err)
 			}
 			if tt.checkFunc != nil {
-				tt.checkFunc(t, oc.passthrough)
+				tt.checkFunc(t, pt)
 			}
 		})
 	}
@@ -299,37 +316,36 @@ func TestMCPInjectionConformance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translateMCPServers() error = %v", err)
 		}
-		document, err := json.Marshal(mcpConfigDocument{MCP: servers})
+		document, err := buildInlineConfig(passthroughConfig{}, servers)
 		if err != nil {
-			t.Fatalf("json.Marshal() error = %v", err)
+			t.Fatalf("buildInlineConfig() error = %v", err)
 		}
 
 		state := newTestSessionState("/workspace", "")
-		state.major = major1
-		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{}, major1)
-		if err != nil {
-			t.Fatalf("buildRunEnv() error = %v", err)
-		}
-		env = append(env, "OPENCODE_CONFIG_CONTENT="+string(document))
+		args := buildRunArgs(state, passthroughConfig{})
+		env := buildRunEnv([]string{"PATH=/usr/bin"})
+		env = append(env, "OPENCODE_CONFIG_CONTENT="+document)
 
 		agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
 	})
 
-	t.Run("remote launch delivers nothing", func(t *testing.T) {
+	t.Run("remote launch delivers no tool servers", func(t *testing.T) {
 		t.Parallel()
 
-		state := newTestSessionState("/workspace", "")
-		state.major = major1
-		args := buildRunArgs(state, "do work", passthroughConfig{})
-		env, err := buildRunEnv([]string{"PATH=/usr/bin"}, passthroughConfig{}, major1)
+		servers, err := translateMCPServers(mcpConfigPath, true)
 		if err != nil {
-			t.Fatalf("buildRunEnv() error = %v", err)
+			t.Fatalf("translateMCPServers() error = %v", err)
+		}
+		document, err := buildInlineConfig(passthroughConfig{}, servers)
+		if err != nil {
+			t.Fatalf("buildInlineConfig() error = %v", err)
 		}
 
-		// StartSession's remote guard skips rendering entirely, so a
-		// remote session's turn environment carries nothing to append
-		// here.
+		state := newTestSessionState("/workspace", "")
+		args := buildRunArgs(state, passthroughConfig{})
+		env := buildRunEnv([]string{"PATH=/usr/bin"})
+		env = append(env, "OPENCODE_CONFIG_CONTENT="+document)
+
 		agenttest.AssertMCPInjection(t, registry.MCPInjectionUnsupported, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
 	})
 }
@@ -497,9 +513,6 @@ func TestTranslateMCPServers(t *testing.T) {
 	})
 }
 
-// TestBuildInlineConfig asserts the 2.x inline document's marshaled
-// shape: share is always present as "disabled"; permission, compaction,
-// and mcp are each present only when their source data is non-empty.
 func TestBuildInlineConfig(t *testing.T) {
 	t.Parallel()
 
@@ -511,14 +524,24 @@ func TestBuildInlineConfig(t *testing.T) {
 		name        string
 		pt          passthroughConfig
 		servers     map[string]mcpConfigDocumentEntry
-		wantPerm    bool
+		wantPerm    string
 		wantCompact bool
 		wantMCP     bool
 	}{
-		{name: "bare configuration carries only share"},
-		{name: "a tool policy adds permission", pt: passthroughConfig{AllowedTools: []string{"read"}}, wantPerm: true},
-		{name: "disable_autocompact adds compaction", pt: passthroughConfig{DisableAutocompact: true}, wantCompact: true},
-		{name: "servers add mcp", servers: servers, wantMCP: true},
+		{name: "bypass on without lists carries only share", pt: passthroughConfig{DangerousSkipPermissions: true}},
+		{name: "bypass off without lists asks for external_directory", wantPerm: `{"external_directory":"ask"}`},
+		{
+			name:     "bypass off with denied_tools only keeps the denies and asks",
+			pt:       passthroughConfig{DeniedTools: []string{"bash"}},
+			wantPerm: `{"bash":"deny","external_directory":"ask"}`,
+		},
+		{
+			name:     "a list naming external_directory keeps its own action",
+			pt:       passthroughConfig{DeniedTools: []string{"external_directory"}},
+			wantPerm: `{"external_directory":"deny"}`,
+		},
+		{name: "disable_autocompact adds compaction", pt: passthroughConfig{DangerousSkipPermissions: true, DisableAutocompact: true}, wantCompact: true},
+		{name: "servers add mcp", pt: passthroughConfig{DangerousSkipPermissions: true}, servers: servers, wantMCP: true},
 	}
 
 	for _, tt := range tests {
@@ -538,8 +561,9 @@ func TestBuildInlineConfig(t *testing.T) {
 			if string(doc["share"]) != `"disabled"` {
 				t.Errorf("buildInlineConfig() share = %s, want %q", doc["share"], "disabled")
 			}
-			if _, ok := doc["permission"]; ok != tt.wantPerm {
-				t.Errorf("buildInlineConfig() permission present = %v, want %v", ok, tt.wantPerm)
+			assertTitleAgentDisabled(t, doc)
+			if got := string(doc["permission"]); got != tt.wantPerm {
+				t.Errorf("buildInlineConfig(%+v) permission = %q, want %q", tt.pt, got, tt.wantPerm)
 			}
 			compaction, hasCompaction := doc["compaction"]
 			if hasCompaction != tt.wantCompact {
@@ -554,6 +578,25 @@ func TestBuildInlineConfig(t *testing.T) {
 	}
 }
 
+func TestBuildTurnEnv_CarriesTitleAgentDisabled(t *testing.T) {
+	t.Parallel()
+
+	content, err := buildInlineConfig(passthroughConfig{}, nil)
+	if err != nil {
+		t.Fatalf("buildInlineConfig() error = %v", err)
+	}
+	state := newTestSessionState("/workspace", "")
+	state.turnConfigContent = content
+
+	env := buildTurnEnv(state)
+
+	carried, ok := envLookup(env, "OPENCODE_CONFIG_CONTENT")
+	if !ok {
+		t.Fatalf("buildTurnEnv() env lacks OPENCODE_CONFIG_CONTENT, want the turn document")
+	}
+	assertTitleAgentDisabled(t, decodeConfigDocument(t, carried))
+}
+
 // TestRunTurn_InheritedOpencodeConfigContentScrubbed asserts that an
 // inherited OPENCODE_CONFIG_CONTENT value from the parent process is
 // scrubbed from the turn environment, so only the adapter's own
@@ -563,10 +606,7 @@ func TestRunTurn_InheritedOpencodeConfigContentScrubbed(t *testing.T) {
 
 	base := []string{"OPENCODE_CONFIG_CONTENT=inherited-from-parent-process", "PATH=/usr/bin"}
 
-	env, err := buildRunEnv(base, passthroughConfig{}, major1)
-	if err != nil {
-		t.Fatalf("buildRunEnv() error = %v", err)
-	}
+	env := buildRunEnv(base)
 
 	assertEnvAbsent(t, env, "OPENCODE_CONFIG_CONTENT")
 
@@ -584,51 +624,50 @@ func TestBuildRunArgs(t *testing.T) {
 		name        string
 		sessionID   string
 		pt          passthroughConfig
-		prompt      string
 		wantPresent []string
 		wantPairs   [][2]string
 		wantAbsent  []string
+		wantArgs    []string
 	}{
+		{
+			name:     "minimal_vector_carries_no_directory_variant_or_prompt",
+			pt:       passthroughConfig{},
+			wantArgs: []string{"run", "--format", "json", "--standalone"},
+		},
+		{
+			name:     "effort_rides_the_model_suffix",
+			pt:       passthroughConfig{Model: "provider/model", Effort: "high"},
+			wantArgs: []string{"run", "--format", "json", "--standalone", "--model", "provider/model#high"},
+		},
 		{
 			name:       "fresh_session",
 			sessionID:  "",
 			pt:         passthroughConfig{},
-			prompt:     "do work",
 			wantAbsent: []string{"--session"},
 		},
 		{
 			name:      "resume_session",
 			sessionID: "ses_abc",
 			pt:        passthroughConfig{},
-			prompt:    "continue",
 			wantPairs: [][2]string{{"--session", "ses_abc"}},
 		},
 		{
 			name:        "skip_permissions_default",
 			sessionID:   "",
 			pt:          passthroughConfig{DangerousSkipPermissions: true},
-			prompt:      "work",
 			wantPresent: []string{"--dangerously-skip-permissions"},
 		},
 		{
 			name:       "skip_permissions_disabled",
 			sessionID:  "",
 			pt:         passthroughConfig{DangerousSkipPermissions: false},
-			prompt:     "work",
 			wantAbsent: []string{"--dangerously-skip-permissions"},
 		},
 		{
 			name:      "model_flag",
 			sessionID: "",
 			pt:        passthroughConfig{Model: "anthropic/claude-3-5-sonnet"},
-			prompt:    "work",
 			wantPairs: [][2]string{{"--model", "anthropic/claude-3-5-sonnet"}},
-		},
-		{
-			name:      "prompt_after_dashdash",
-			sessionID: "",
-			pt:        passthroughConfig{},
-			prompt:    "my --prompt with flags",
 		},
 	}
 
@@ -637,8 +676,9 @@ func TestBuildRunArgs(t *testing.T) {
 			t.Parallel()
 
 			state := newTestSessionState("/tmp/workspace", tt.sessionID)
-			args := buildRunArgs(state, tt.prompt, tt.pt)
+			args := buildRunArgs(state, tt.pt)
 
+			assertHasFlag(t, args, "--standalone")
 			for _, flag := range tt.wantPresent {
 				assertHasFlag(t, args, flag)
 			}
@@ -648,17 +688,8 @@ func TestBuildRunArgs(t *testing.T) {
 			for _, flag := range tt.wantAbsent {
 				assertNoFlag(t, args, flag)
 			}
-
-			// Prompt must be the last argument, after "--".
-			if len(args) < 2 {
-				t.Fatalf("args too short: %v", args)
-			}
-			lastTwo := args[len(args)-2:]
-			if lastTwo[0] != "--" {
-				t.Errorf("second-to-last arg = %q, want %q", lastTwo[0], "--")
-			}
-			if lastTwo[1] != tt.prompt {
-				t.Errorf("last arg = %q, want prompt %q", lastTwo[1], tt.prompt)
+			if tt.wantArgs != nil && !slices.Equal(args, tt.wantArgs) {
+				t.Errorf("buildRunArgs(%+v) = %v, want %v", tt.pt, args, tt.wantArgs)
 			}
 		})
 	}
@@ -679,7 +710,7 @@ func TestBuildRunArgs_DefaultConfigurationSkipsPermissions(t *testing.T) {
 	}
 
 	state := newTestSessionState("/tmp/workspace", "")
-	args := buildRunArgs(state, "work", pt)
+	args := buildRunArgs(state, pt)
 
 	assertHasFlag(t, args, "--dangerously-skip-permissions")
 }
@@ -736,42 +767,27 @@ func TestBuildRunEnv(t *testing.T) {
 	tests := []struct {
 		name      string
 		base      []string
-		pt        passthroughConfig
 		checkFunc func(t *testing.T, env []string)
 	}{
 		{
 			name: "baseline_always_set",
 			base: []string{},
-			pt:   passthroughConfig{},
 			checkFunc: func(t *testing.T, env []string) {
 				t.Helper()
-				assertEnvPresent(t, env, "OPENCODE_AUTO_SHARE", "false")
 				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOUPDATE", "true")
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_LSP_DOWNLOAD", "true")
 			},
 		},
 		{
-			name: "autocompact_default_true",
-			base: []string{},
-			pt:   passthroughConfig{DisableAutocompact: true},
+			name: "inherited_autoupdate_overridden",
+			base: []string{"OPENCODE_DISABLE_AUTOUPDATE=false"},
 			checkFunc: func(t *testing.T, env []string) {
 				t.Helper()
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOCOMPACT", "true")
-			},
-		},
-		{
-			name: "autocompact_disabled",
-			base: []string{},
-			pt:   passthroughConfig{DisableAutocompact: false},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOCOMPACT", "false")
+				assertEnvPresent(t, env, "OPENCODE_DISABLE_AUTOUPDATE", "true")
 			},
 		},
 		{
 			name: "inherited_permission_removed",
 			base: []string{"OPENCODE_PERMISSION=old_value", "OTHER_VAR=keep"},
-			pt:   passthroughConfig{},
 			checkFunc: func(t *testing.T, env []string) {
 				t.Helper()
 				assertEnvAbsent(t, env, "OPENCODE_PERMISSION")
@@ -779,53 +795,17 @@ func TestBuildRunEnv(t *testing.T) {
 			},
 		},
 		{
-			name: "allowed_tools_policy",
-			base: []string{},
-			pt:   passthroughConfig{AllowedTools: []string{"read"}},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				raw, ok := envLookup(env, "OPENCODE_PERMISSION")
-				if !ok {
-					t.Fatal("OPENCODE_PERMISSION absent")
-				}
-				var policy map[string]string
-				if err := json.Unmarshal([]byte(raw), &policy); err != nil {
-					t.Fatalf("OPENCODE_PERMISSION unmarshal: %v", err)
-				}
-				if policy["read"] != "allow" {
-					t.Errorf("OPENCODE_PERMISSION[read] = %q, want %q", policy["read"], "allow")
-				}
-				if policy["bash"] != "deny" {
-					t.Errorf("OPENCODE_PERMISSION[bash] = %q, want %q", policy["bash"], "deny")
-				}
+			name: "inherited_policy_variables_removed",
+			base: []string{
+				"OPENCODE_AUTO_SHARE=true",
+				"OPENCODE_DISABLE_AUTOCOMPACT=false",
+				"OPENCODE_DISABLE_LSP_DOWNLOAD=false",
 			},
-		},
-		{
-			name: "denied_tools_policy",
-			base: []string{},
-			pt:   passthroughConfig{DeniedTools: []string{"bash"}},
 			checkFunc: func(t *testing.T, env []string) {
 				t.Helper()
-				raw, ok := envLookup(env, "OPENCODE_PERMISSION")
-				if !ok {
-					t.Fatal("OPENCODE_PERMISSION absent")
-				}
-				var policy map[string]string
-				if err := json.Unmarshal([]byte(raw), &policy); err != nil {
-					t.Fatalf("OPENCODE_PERMISSION unmarshal: %v", err)
-				}
-				if policy["bash"] != "deny" {
-					t.Errorf("OPENCODE_PERMISSION[bash] = %q, want %q", policy["bash"], "deny")
-				}
-			},
-		},
-		{
-			name: "no_policy_no_permission_key",
-			base: []string{},
-			pt:   passthroughConfig{},
-			checkFunc: func(t *testing.T, env []string) {
-				t.Helper()
-				assertEnvAbsent(t, env, "OPENCODE_PERMISSION")
+				assertEnvAbsent(t, env, "OPENCODE_AUTO_SHARE")
+				assertEnvAbsent(t, env, "OPENCODE_DISABLE_AUTOCOMPACT")
+				assertEnvAbsent(t, env, "OPENCODE_DISABLE_LSP_DOWNLOAD")
 			},
 		},
 	}
@@ -834,13 +814,9 @@ func TestBuildRunEnv(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			env, err := buildRunEnv(tt.base, tt.pt, major1)
-			if err != nil {
-				t.Fatalf("buildRunEnv() error = %v", err)
-			}
-			if tt.checkFunc != nil {
-				tt.checkFunc(t, env)
-			}
+			env := buildRunEnv(tt.base)
+
+			tt.checkFunc(t, env)
 		})
 	}
 }

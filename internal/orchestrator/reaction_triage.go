@@ -689,6 +689,16 @@ const (
 	// EscalationTriggerTriage is the escalation a triage command asked
 	// for, with no budget spent on the subject.
 	EscalationTriggerTriage ReactionEscalationTrigger = "triage"
+
+	// EscalationTriggerRefused is the escalation a kind fires when the
+	// forge or the tracker answered a write with an authentication or
+	// payload error, so repeating the write cannot help.
+	EscalationTriggerRefused ReactionEscalationTrigger = "refused"
+
+	// EscalationTriggerMissingMergeCommit is the escalation merge
+	// completion fires when the grace period for the forge to report the
+	// merge commit of a merged pull request has run out.
+	EscalationTriggerMissingMergeCommit ReactionEscalationTrigger = "missing_merge_commit"
 )
 
 // buildTriageEscalationComment returns the operator-facing comment for

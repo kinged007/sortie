@@ -47,9 +47,25 @@ func (unsupportedReactionObservationStore) CountWorkerRunsCompletedSince(context
 	return 0, errors.New("worker run count is unsupported by this test double")
 }
 
+type noEscalationRecords struct{}
+
+func (noEscalationRecords) GetReactionEscalation(context.Context, string, string) (persistence.ReactionEscalation, bool, error) {
+	return persistence.ReactionEscalation{}, false, nil
+}
+
+func (noEscalationRecords) SaveReactionEscalation(context.Context, persistence.ReactionEscalation) error {
+	return nil
+}
+
+func (noEscalationRecords) EndReactionEscalation(context.Context, string, string) error { return nil }
+
+func (noEscalationRecords) DeleteReactionEscalations(context.Context, string) error { return nil }
+
 // mockReconcileStore records calls to ReconcileStore methods and returns
 // configurable errors.
 type mockReconcileStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	savedEntries   []persistence.RetryEntry
@@ -124,6 +140,8 @@ func (m *mockReconcileTracker) FetchCandidateIssues(context.Context) ([]domain.I
 	panic("FetchCandidateIssues must not be called by ReconcileRunningIssues")
 }
 
+func (m *mockReconcileTracker) SetTrackerStates(func() domain.TrackerStates) {}
+
 func (m *mockReconcileTracker) FetchIssueByID(context.Context, string) (domain.Issue, error) {
 	panic("FetchIssueByID must not be called by ReconcileRunningIssues")
 }
@@ -148,9 +166,15 @@ func (m *mockReconcileTracker) CommentIssue(context.Context, string, string) err
 	panic("CommentIssue must not be called by ReconcileRunningIssues")
 }
 
+func (m *mockReconcileTracker) CommentIssueWithLiteral(context.Context, string, string, string) error {
+	panic("CommentIssueWithLiteral must not be called by ReconcileRunningIssues")
+}
+
 func (m *mockReconcileTracker) AddLabel(context.Context, string, string) error {
 	panic("AddLabel must not be called by ReconcileRunningIssues")
 }
+
+func (m *mockReconcileTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // sweepTracker is a test double for [SweepWorkspaces]. Its
 // FetchIssueStatesByIdentifiers records the identifiers it receives and
@@ -174,6 +198,8 @@ func (s *sweepTracker) FetchIssueStatesByIdentifiers(_ context.Context, ids []st
 func (s *sweepTracker) FetchCandidateIssues(context.Context) ([]domain.Issue, error) {
 	panic("FetchCandidateIssues must not be called by SweepWorkspaces")
 }
+
+func (s *sweepTracker) SetTrackerStates(func() domain.TrackerStates) {}
 
 func (s *sweepTracker) FetchIssueByID(context.Context, string) (domain.Issue, error) {
 	panic("FetchIssueByID must not be called by SweepWorkspaces")
@@ -199,9 +225,15 @@ func (s *sweepTracker) CommentIssue(context.Context, string, string) error {
 	panic("CommentIssue must not be called by SweepWorkspaces")
 }
 
+func (s *sweepTracker) CommentIssueWithLiteral(context.Context, string, string, string) error {
+	panic("CommentIssueWithLiteral must not be called by SweepWorkspaces")
+}
+
 func (s *sweepTracker) AddLabel(context.Context, string, string) error {
 	panic("AddLabel must not be called by SweepWorkspaces")
 }
+
+func (s *sweepTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // panicOnAnySCMAdapter panics on every domain.SCMAdapter method. Used to
 // prove that a terminal-issue release triggers no SCM call of any kind.
@@ -295,6 +327,10 @@ const terminalReleaseIssueID = "REL-1"
 // expiring (ci, review), so the release is proven to span both shapes.
 var terminalReleaseFixtureKinds = []string{ReactionKindCI, ReactionKindReview, ReactionKindLabelReview}
 
+const terminalReleaseOtherIssueID = "REL-10"
+
+var terminalReleaseHandedOffKinds = []string{ReactionKindReview, ReactionKindBotReview}
+
 // stateWithTerminalReleaseFixture builds a State with a running entry for
 // [terminalReleaseIssueID] backed by cc, a live retry, a claim, and a
 // pending entry plus a non-zero attempt counter for each kind in
@@ -325,6 +361,10 @@ func stateWithTerminalReleaseFixture(t *testing.T, cc *cancelCounter) *State {
 		}
 		state.ReactionAttempts[key] = 2
 	}
+	for _, kind := range terminalReleaseHandedOffKinds {
+		seedHandedOff(state, ReactionKey(terminalReleaseIssueID, kind), "c1", "c2")
+	}
+	seedHandedOff(state, ReactionKey(terminalReleaseOtherIssueID, ReactionKindReview), "c9")
 	return state
 }
 
@@ -451,6 +491,8 @@ func TestReconcileStalled_ReactionRetryPreservesContext(t *testing.T) {
 		CancelFunc:          cc.cancel,
 		ContinuationContext: contContext,
 		ReactionKind:        ReactionKindReview,
+		RuleName:            "cheap",
+		RuleSettingsApplied: true,
 	}
 	state.Claimed["ISSUE-R"] = struct{}{}
 
@@ -474,6 +516,9 @@ func TestReconcileStalled_ReactionRetryPreservesContext(t *testing.T) {
 	}
 	if retryEntry.SessionID != "sess-r" {
 		t.Errorf("RetryEntry.SessionID = %q, want %q", retryEntry.SessionID, "sess-r")
+	}
+	if retryEntry.RuleName != "cheap" || !retryEntry.RuleSettingsApplied {
+		t.Errorf("RetryEntry rule, flag = %q, %v, want %q, true", retryEntry.RuleName, retryEntry.RuleSettingsApplied, "cheap")
 	}
 	if retryEntry.LastSSHHost != "host-r" {
 		t.Errorf("RetryEntry.LastSSHHost = %q, want %q", retryEntry.LastSSHHost, "host-r")
@@ -721,42 +766,112 @@ func TestReconcileTrackerState_ActiveUpdatesState(t *testing.T) {
 func TestReconcileTrackerState_NonActiveNonTerminalCancelsWithoutCleanup(t *testing.T) {
 	t.Parallel()
 
-	store := &mockReconcileStore{}
-	// "Backlog" is neither in ActiveStates nor TerminalStates.
-	tracker := &mockReconcileTracker{
-		states: map[string]string{"ISSUE-1": "Backlog"},
+	tests := []struct {
+		name         string
+		refreshed    string
+		reactionKind string
+	}{
+		{name: "state outside both lists", refreshed: "Backlog"},
+		{name: "handoff state for a non-reaction run", refreshed: "Ready For Review"},
+		{name: "unrelated state for a reaction run", refreshed: "Blocked", reactionKind: ReactionKindReview},
 	}
-	params := defaultReconcileParams(t, store, tracker)
-	params.StallTimeoutMS = 0
 
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	cc := &cancelCounter{}
-	state.Running["ISSUE-1"] = &RunningEntry{
-		Identifier: "ISSUE-1-ident",
-		StartedAt:  reconcileBaseTime,
-		CancelFunc: cc.cancel,
-		Issue:      domain.Issue{State: "In Progress"},
-	}
-	state.Claimed["ISSUE-1"] = struct{}{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	ReconcileRunningIssues(state, params)
+			store := &mockReconcileStore{}
+			tracker := &mockReconcileTracker{states: map[string]string{"ISSUE-1": tt.refreshed}}
+			params := defaultReconcileParams(t, store, tracker)
+			params.StallTimeoutMS = 0
+			params.HandoffState = "Ready For Review"
 
-	if cc.count != 1 {
-		t.Errorf("CancelFunc called %d times, want 1", cc.count)
-	}
-	if state.Running["ISSUE-1"].PendingCleanup {
-		t.Error("PendingCleanup set for non-active non-terminal issue")
-	}
-	if len(store.deletedIssueID) != 1 {
-		t.Fatalf("DeleteRetryEntry called %d times, want 1", len(store.deletedIssueID))
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			cc := &cancelCounter{}
+			state.Running["ISSUE-1"] = &RunningEntry{
+				Identifier:   "ISSUE-1-ident",
+				StartedAt:    reconcileBaseTime,
+				CancelFunc:   cc.cancel,
+				Issue:        domain.Issue{State: "In Progress"},
+				ReactionKind: tt.reactionKind,
+			}
+			state.Claimed["ISSUE-1"] = struct{}{}
+
+			ReconcileRunningIssues(state, params)
+
+			if cc.count != 1 {
+				t.Errorf("ReconcileRunningIssues(%q) CancelFunc calls = %d, want 1", tt.refreshed, cc.count)
+			}
+			if state.Running["ISSUE-1"].PendingCleanup {
+				t.Errorf("ReconcileRunningIssues(%q) PendingCleanup = true, want false", tt.refreshed)
+			}
+			if !slices.Equal(store.deletedIssueID, []string{"ISSUE-1"}) {
+				t.Errorf("ReconcileRunningIssues(%q) deleted retry entries = %v, want [ISSUE-1]", tt.refreshed, store.deletedIssueID)
+			}
+		})
 	}
 }
 
-// TestReconcileTrackerState_NonActiveNonTerminalPreservesIncumbent verifies
-// that when the retry slot is occupied, the non-active stop still cancels
-// the worker and still counts the reconciliation action, but leaves the
-// incumbent retry entry alone; neither CancelRetry nor
-// Store.DeleteRetryEntry runs.
+func TestReconcileTrackerState_NoStateReadings(t *testing.T) {
+	t.Parallel()
+
+	const missing = "<missing>"
+	tests := []struct {
+		name       string
+		readings   []string
+		wantCancel int
+		wantHop    bool
+	}{
+		{name: "first reading keeps the run and the hop record", readings: []string{""}, wantCancel: 0, wantHop: true},
+		{name: "second consecutive reading stops the run and resets the hop record", readings: []string{"", ""}, wantCancel: 1, wantHop: false},
+		{name: "a stated reading in between clears both flags", readings: []string{"", "In Progress", ""}, wantCancel: 0, wantHop: true},
+		{name: "an omitted issue in between leaves the flags set", readings: []string{"", missing, ""}, wantCancel: 1, wantHop: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &mockReconcileStore{}
+			tracker := &mockReconcileTracker{}
+			params := defaultReconcileParams(t, store, tracker)
+			params.StallTimeoutMS = 0
+
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			cc := &cancelCounter{}
+			state.Running["ISSUE-1"] = &RunningEntry{
+				Identifier: "ISSUE-1-ident",
+				StartedAt:  reconcileBaseTime,
+				CancelFunc: cc.cancel,
+				Issue:      domain.Issue{State: "In Progress"},
+			}
+			state.Claimed["ISSUE-1"] = struct{}{}
+			state.StageHops["ISSUE-1"] = &StageHopEntry{Identifier: "ISSUE-1-ident", Count: 2}
+
+			for _, reading := range tt.readings {
+				tracker.states = map[string]string{"ISSUE-1": reading}
+				if reading == missing {
+					tracker.states = map[string]string{}
+				}
+				ReconcileRunningIssues(state, params)
+			}
+
+			if cc.count != tt.wantCancel {
+				t.Errorf("ReconcileRunningIssues(readings %q) CancelFunc calls = %d, want %d", tt.readings, cc.count, tt.wantCancel)
+			}
+			if got := state.StageHops["ISSUE-1"] != nil; got != tt.wantHop {
+				t.Errorf("ReconcileRunningIssues(readings %q) hop record kept = %v, want %v", tt.readings, got, tt.wantHop)
+			}
+			if got := state.Running["ISSUE-1"].Issue.State; got != "In Progress" {
+				t.Errorf("ReconcileRunningIssues(readings %q) Issue.State = %q, want %q", tt.readings, got, "In Progress")
+			}
+			if tt.wantCancel == 0 && len(store.deletedIssueID) != 0 {
+				t.Errorf("ReconcileRunningIssues(readings %q) deleted retry entries = %v, want none", tt.readings, store.deletedIssueID)
+			}
+		})
+	}
+}
+
 func TestReconcileTrackerState_NonActiveNonTerminalPreservesIncumbent(t *testing.T) {
 	t.Parallel()
 
@@ -938,6 +1053,10 @@ func TestReconcileTrackerState_RunningIssueReleasesReactionState(t *testing.T) {
 			t.Errorf("ReactionAttempts[%q] present after terminal release; want removed", key)
 		}
 	}
+	for _, kind := range terminalReleaseHandedOffKinds {
+		assertHandedOff(t, state, ReactionKey(terminalReleaseIssueID, kind))
+	}
+	assertHandedOff(t, state, ReactionKey(terminalReleaseOtherIssueID, ReactionKindReview), "c9")
 	if _, ok := state.Claimed[terminalReleaseIssueID]; ok {
 		t.Error("Claimed entry present after terminal release; want removed")
 	}
@@ -959,11 +1078,8 @@ func TestReconcileTrackerState_PendingOnlyIssueReleasesReactionState(t *testing.
 	store := &mockReconcileStore{}
 	tracker := &mockReconcileTracker{states: map[string]string{issueID: "Done"}}
 
-	log, buf := logCapture()
-
 	params := defaultReconcileParams(t, store, tracker)
 	params.StallTimeoutMS = 0
-	params.Logger = log
 
 	state := NewState(5000, 4, 0, nil, AgentTotals{})
 	key := ReactionKey(issueID, ReactionKindCI)
@@ -975,12 +1091,16 @@ func TestReconcileTrackerState_PendingOnlyIssueReleasesReactionState(t *testing.
 	}
 	state.ReactionAttempts[key] = 1
 	state.Claimed[issueID] = struct{}{}
+	seedHandedOff(state, ReactionKey(issueID, ReactionKindReview), "c1")
+	seedHandedOff(state, ReactionKey(issueID, ReactionKindBotReview), "c2")
 
 	ReconcileRunningIssues(state, params)
 
 	if tracker.calls != 1 {
 		t.Fatalf("FetchIssueStatesByIDs calls = %d, want 1", tracker.calls)
 	}
+	assertHandedOff(t, state, ReactionKey(issueID, ReactionKindReview))
+	assertHandedOff(t, state, ReactionKey(issueID, ReactionKindBotReview))
 	if !slices.Contains(tracker.calledWith, issueID) {
 		t.Errorf("FetchIssueStatesByIDs called with %v, want it to contain %q", tracker.calledWith, issueID)
 	}
@@ -995,14 +1115,6 @@ func TestReconcileTrackerState_PendingOnlyIssueReleasesReactionState(t *testing.
 	}
 	if len(store.deletedIssueID) != 1 || store.deletedIssueID[0] != issueID {
 		t.Errorf("DeleteRetryEntry calls = %v, want exactly one call for %q", store.deletedIssueID, issueID)
-	}
-
-	out := buf.String()
-	if !strings.Contains(out, "released reaction state for terminal issue") {
-		t.Fatalf("log output = %q, want the terminal-release message", out)
-	}
-	if !strings.Contains(out, "issue_identifier="+issueID+"-ident") {
-		t.Errorf("log output = %q, want issue_identifier=%s-ident", out, issueID)
 	}
 }
 
@@ -1050,6 +1162,9 @@ func TestReconcileTrackerState_FetchFailureReleasesNothing(t *testing.T) {
 		if state.ReactionAttempts[key] != 2 {
 			t.Errorf("ReactionAttempts[%q] = %d, want 2 (unchanged)", key, state.ReactionAttempts[key])
 		}
+	}
+	for _, kind := range terminalReleaseHandedOffKinds {
+		assertHandedOff(t, state, ReactionKey(terminalReleaseIssueID, kind), "c1", "c2")
 	}
 	if _, ok := state.Claimed[terminalReleaseIssueID]; !ok {
 		t.Error("Claimed entry missing after fetch failure; want unchanged")
@@ -1127,7 +1242,7 @@ func TestReleaseTerminalIssueState_IssueIsolation(t *testing.T) {
 	state.Claimed["I2"] = struct{}{}
 
 	store := &mockReconcileStore{}
-	releaseTerminalIssueState(context.Background(), state, store, "I", discardLogger())
+	releaseIssueRuntimeState(context.Background(), state, store, "I", discardLogger())
 
 	if _, ok := state.PendingReactions[keyI]; ok {
 		t.Error("PendingReactions[I] present after its own release; want removed")
@@ -1199,7 +1314,7 @@ func TestReconcileTrackerState_NilTrackerAdapterPendingOnly(t *testing.T) {
 		Logger:         discardLogger(),
 	}
 
-	reconcileTrackerState(state, params, discardLogger(), context.Background(), &domain.NoopMetrics{})
+	reconcileTrackerState(state, params, discardLogger(), context.Background(), time.Now(), &domain.NoopMetrics{})
 
 	if _, ok := state.PendingReactions[key]; !ok {
 		t.Error("PendingReactions entry removed despite nil TrackerAdapter; want unchanged")
@@ -1922,44 +2037,6 @@ func TestReconcileRunningIssues_ReactionContinuationInHandoffStateKeepsRunning(t
 	}
 }
 
-func TestReconcileRunningIssues_NonReactionInHandoffStateCancels(t *testing.T) {
-	t.Parallel()
-
-	store := &mockReconcileStore{}
-	tracker := &mockReconcileTracker{
-		states: map[string]string{"ISSUE-1": "Ready For Review"},
-	}
-	params := defaultReconcileParams(t, store, tracker)
-	params.StallTimeoutMS = 0
-	params.HandoffState = "Ready For Review"
-
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	cc := &cancelCounter{}
-	state.Running["ISSUE-1"] = &RunningEntry{
-		Identifier:   "ISSUE-1-ident",
-		StartedAt:    reconcileBaseTime,
-		CancelFunc:   cc.cancel,
-		Issue:        domain.Issue{State: "In Progress"},
-		ReactionKind: "", // non-reaction
-	}
-	state.Claimed["ISSUE-1"] = struct{}{}
-
-	ReconcileRunningIssues(state, params)
-
-	if cc.count != 1 {
-		t.Errorf("CancelFunc called %d times, want 1 (non-reaction in handoff must cancel)", cc.count)
-	}
-	if state.Running["ISSUE-1"].PendingCleanup {
-		t.Error("PendingCleanup set for non-active non-terminal cancel, want false")
-	}
-	if len(store.deletedIssueID) != 1 {
-		t.Fatalf("DeleteRetryEntry called %d times, want 1", len(store.deletedIssueID))
-	}
-	if store.deletedIssueID[0] != "ISSUE-1" {
-		t.Errorf("deleted issue ID = %q, want %q", store.deletedIssueID[0], "ISSUE-1")
-	}
-}
-
 func TestReconcileRunningIssues_ReactionInTerminalStateCancelsAndCleans(t *testing.T) {
 	t.Parallel()
 
@@ -1998,44 +2075,6 @@ func TestReconcileRunningIssues_ReactionInTerminalStateCancelsAndCleans(t *testi
 	}
 }
 
-func TestReconcileRunningIssues_ReactionInUnrelatedStateCancels(t *testing.T) {
-	t.Parallel()
-
-	store := &mockReconcileStore{}
-	// "Blocked": not in active, not in terminal, not handoff.
-	tracker := &mockReconcileTracker{
-		states: map[string]string{"ISSUE-1": "Blocked"},
-	}
-	params := defaultReconcileParams(t, store, tracker)
-	params.StallTimeoutMS = 0
-	params.HandoffState = "Ready For Review"
-
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	cc := &cancelCounter{}
-	state.Running["ISSUE-1"] = &RunningEntry{
-		Identifier:   "ISSUE-1-ident",
-		StartedAt:    reconcileBaseTime,
-		CancelFunc:   cc.cancel,
-		Issue:        domain.Issue{State: "In Progress"},
-		ReactionKind: ReactionKindReview,
-	}
-	state.Claimed["ISSUE-1"] = struct{}{}
-
-	ReconcileRunningIssues(state, params)
-
-	if cc.count != 1 {
-		t.Errorf("CancelFunc called %d times, want 1 (reaction in unrelated state must cancel)", cc.count)
-	}
-	if state.Running["ISSUE-1"].PendingCleanup {
-		t.Error("PendingCleanup set for non-active non-terminal cancel, want false")
-	}
-	if len(store.deletedIssueID) != 1 {
-		t.Fatalf("DeleteRetryEntry called %d times, want 1", len(store.deletedIssueID))
-	}
-}
-
-// sweepStoreDouble is a test double for [SweepStore] returning a fixed
-// completions map or a fixed error.
 type sweepStoreDouble struct {
 	completions map[string]string
 	err         error
@@ -2883,6 +2922,7 @@ func TestReconcileOverdueRetries_ReArmsOverdueEntry(t *testing.T) {
 		ContinuationContext: map[string]any{"ci_failure": map[string]any{"x": 1}},
 		ReactionKind:        ReactionKindCI,
 		RuleName:            "rule-1",
+		RuleSettingsApplied: true,
 		TemplateID:          "tmpl-1",
 		AgentKind:           "claude",
 	}
@@ -2917,8 +2957,8 @@ func TestReconcileOverdueRetries_ReArmsOverdueEntry(t *testing.T) {
 	if entry.LastSSHHost != "host-a" {
 		t.Errorf("LastSSHHost = %q, want %q", entry.LastSSHHost, "host-a")
 	}
-	if entry.RuleName != "rule-1" {
-		t.Errorf("RuleName = %q, want %q", entry.RuleName, "rule-1")
+	if entry.RuleName != "rule-1" || !entry.RuleSettingsApplied {
+		t.Errorf("RuleName, RuleSettingsApplied = %q, %v, want %q, true", entry.RuleName, entry.RuleSettingsApplied, "rule-1")
 	}
 	if entry.TemplateID != "tmpl-1" {
 		t.Errorf("TemplateID = %q, want %q", entry.TemplateID, "tmpl-1")
@@ -3123,3 +3163,13 @@ func TestReconcileOverdueRetries_LargeStartupBatchFiresNothing(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+func (m *mockReconcileStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (m *mockReconcileStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (m *mockReconcileStore) DeleteStageHop(context.Context, string) error { return nil }

@@ -38,6 +38,50 @@ test-coverage-html: test-coverage ## Generate an HTML coverage report
 	$(GO) tool cover -html=$(COVERAGE_OUT) -o $(COVERAGE_HTML)
 	@printf '$(GREEN)Coverage report written to $(BOLD)$(COVERAGE_HTML)$(RESET)\n'
 
+.PHONY: test-darwin
+test-darwin: ## Run the darwin-only tests on a macOS host; fails on a skipped test or an empty selection
+	@goos=$$($(GO) env GOOS); \
+	if [ "$$goos" != "darwin" ]; then \
+		printf '$(RED)test-darwin needs a macOS host: go env GOOS reports "%s"$(RESET)\n' "$$goos"; \
+		exit 1; \
+	fi; \
+	tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/darwin_test.XXXXXX") && \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	files=$$(find . \( -name '.?*' -o -path ./tools \) -prune -o -type f -name '*_darwin_test.go' -print); \
+	dirs=$$(printf '%s\n' "$$files" | sed -n 's|/[^/]*$$||p' | sort -u); \
+	: >"$$tmp/declared"; : >"$$tmp/missing"; : >"$$tmp/skipped"; \
+	run_failed=0; runs=0; \
+	for dir in $$dirs; do \
+		names=$$(cat "$$dir"/*_darwin_test.go | sed -n 's/^func \(Test[A-Z0-9_][A-Za-z0-9_]*\)(.*\*testing\.T).*/\1/p' | sort -u); \
+		if [ -z "$$names" ]; then continue; fi; \
+		pattern=$$(printf '%s\n' $$names | paste -s -d '|' -); \
+		runs=$$((runs + 1)); \
+		stream="$$tmp/run$$runs.json"; \
+		CGO_ENABLED=0 $(GO) test -race -count=1 -json -run "^($$pattern)\$$" "$$dir" >"$$stream" || run_failed=1; \
+		for name in $$names; do \
+			printf '%s\n' "$$dir $$name" >>"$$tmp/declared"; \
+			grep -q "\"Action\":\"pass\".*\"Test\":\"$$name\"" "$$stream" || printf '%s\n' "$$dir $$name" >>"$$tmp/missing"; \
+		done; \
+		sed -n 's/.*"Action":"skip".*"Test":"\([^"]*\)".*/\1/p' "$$stream" | while read -r skipped; do \
+			printf '%s\n' "$$dir $$skipped" >>"$$tmp/skipped"; \
+		done; \
+	done; \
+	if [ ! -s "$$tmp/declared" ]; then \
+		printf '$(RED)test-darwin: no top-level test declared in any *_darwin_test.go file$(RESET)\n'; \
+		exit 1; \
+	fi; \
+	if [ -s "$$tmp/missing" ] || [ -s "$$tmp/skipped" ] || [ "$$run_failed" -ne 0 ]; then \
+		printf '$(RED)test-darwin: the darwin-only tests did not all pass$(RESET)\n'; \
+		if [ -s "$$tmp/missing" ]; then printf 'declared tests without a pass event:\n'; sed 's/^/  /' "$$tmp/missing"; fi; \
+		if [ -s "$$tmp/skipped" ]; then printf 'skipped tests:\n'; sed 's/^/  /' "$$tmp/skipped"; fi; \
+		if [ "$$run_failed" -ne 0 ]; then printf 'a go test run exited non-zero\n'; fi; \
+		cat "$$tmp"/run*.json; \
+		exit 1; \
+	fi; \
+	cat "$$tmp"/run*.json | sed -n 's/.*"Action":"pass".*"Test":"\([^"]*\)".*/\1/p'; \
+	passed=$$(cat "$$tmp"/run*.json | grep -cE '"Action":"pass".*"Test":"[^"]'); \
+	printf '$(GREEN)test-darwin: %s darwin-only tests executed$(RESET)\n' "$$passed"
+
 ##@ Quality
 
 .PHONY: fmt
@@ -81,6 +125,14 @@ lint-shell: ## Run shellcheck on every tracked shell script
 	printf '%s\n' "$$files"; \
 	git ls-files -z '*.sh' | xargs -0 $(SHELLCHECK) -x --
 
+.PHONY: lint-docs
+lint-docs: ## Check links and anchors in every tracked Markdown file (LYCHEE_FLAGS= adds external links)
+	git ls-files -z '*.md' | xargs -0 $(LYCHEE) --no-progress $(LYCHEE_FLAGS) --
+
+.PHONY: lint-gopls
+lint-gopls: ## Run gopls diagnostics, hints included, minus what .golangci.yml and //nolint suppress
+	@GOPLS='$(GOPLS)' scripts/lint-gopls.sh
+
 .PHONY: fmt-check
 fmt-check: ## Show formatting drift without rewriting any file
 	$(LINTER) fmt --diff ./...
@@ -97,13 +149,48 @@ generate-check: ## Verify wire_gen.go matches what the generator emits, without 
 	fi
 
 .PHONY: check
-check: lint lint-no-tests lint-shell test test-shell generate-check lint-tools lint-tools-no-tests test-tools ## Run the CI gates; shell lint covers all tracked scripts
+check: lint lint-no-tests lint-gopls lint-shell lint-docs test test-shell generate-check ui-check lint-tools lint-tools-no-tests test-tools ## Run the CI gates; shell lint covers all tracked scripts
 
 .PHONY: tidy
 tidy: ## Tidy go.sum and prune stale entries from go.mod
 	$(GO) mod tidy
 
-##@ Tool module (tools/qualify)
+##@ Dashboard
+
+.PHONY: ui-install
+ui-install: ## Install the dashboard dependencies from the lockfile
+	cd web && $(NPM) ci
+
+.PHONY: ui-build
+ui-build: ## Build the dashboard into internal/server/ui/dist
+	cd web && $(NPM) run build
+
+.PHONY: ui-lint
+ui-lint: ## Lint and type-check the dashboard sources
+	cd web && $(NPM) run lint
+	cd web && $(NPM) run typecheck
+
+.PHONY: ui-fmt
+ui-fmt: ## Format the dashboard sources
+	cd web && $(NPM) run fmt
+
+.PHONY: ui-fmt-check
+ui-fmt-check: ## Show dashboard formatting drift without rewriting any file
+	cd web && $(NPM) run fmt:check
+
+.PHONY: ui-build-check
+ui-build-check: ui-build ## Verify the committed dashboard output matches a fresh build
+	@entries=$$(git status --porcelain --untracked-files=all -- internal/server/ui/dist); \
+	if [ -n "$$entries" ]; then \
+		printf '$(RED)internal/server/ui/dist does not match a fresh build: run make ui-build, then commit internal/server/ui/dist with the sources it was built from$(RESET)\n'; \
+		printf '%s\n' "$$entries"; \
+		exit 1; \
+	fi
+
+.PHONY: ui-check
+ui-check: ui-lint ui-fmt-check ui-build-check ## Run the dashboard gates: lint, format check, output drift
+
+##@ Qualify module
 
 TOOLS_LINT_GOOS := $(filter-out windows,$(LINT_GOOS))
 

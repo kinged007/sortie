@@ -20,6 +20,8 @@ import (
 // reconcileLabelFixCommands never reads the flag: a fresh event past the
 // stored mark still dispatches regardless of its value.
 type labelFixDispatchedFlagStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	mark       string
@@ -176,6 +178,7 @@ func TestReconcileLabelFixCommands_Dispatch(t *testing.T) {
 	const issueID = "LF-D1"
 	state := stateWithLabelFixPending(t, issueID, 42, "feature/lf-42")
 	rkey := ReactionKey(issueID, ReactionKindLabelFix)
+	state.PendingReactions[rkey].RuleSettingsApplied = true
 	event := labelEvent("1", "sortie:fix", "alice", true, labelReviewBaseTime.Add(-1*time.Minute))
 	scm := &labelReviewSCMFake{events: []domain.LabelEvent{event}}
 	store := newLabelReviewFingerprintStore()
@@ -196,6 +199,9 @@ func TestReconcileLabelFixCommands_Dispatch(t *testing.T) {
 	if retry.AgentKind != "mock" || retry.RuleName != "default" || retry.TemplateID != "tmpl-1" {
 		t.Errorf("RetryEntry frozen dispatch fields = (%q, %q, %q), want (mock, default, tmpl-1)",
 			retry.AgentKind, retry.RuleName, retry.TemplateID)
+	}
+	if !retry.RuleSettingsApplied {
+		t.Error("RetryEntry.RuleSettingsApplied = false, want the pending reaction's flag carried")
 	}
 
 	raw, ok := retry.ContinuationContext["label_fix"]
@@ -383,7 +389,7 @@ func TestReconcileLabelFixCommands_DepthOneWhileRunning(t *testing.T) {
 
 	const issueID = "LF-RUN"
 	state := stateWithLabelFixPending(t, issueID, 10, "feature/lf-run")
-	state.Running[issueID] = &RunningEntry{Identifier: issueID + "-ident"}
+	state.Running[issueID] = &RunningEntry{Identifier: issueID + "-ident", ReactionKind: ReactionKindLabelFix}
 
 	scm := &labelReviewSCMFake{
 		events: []domain.LabelEvent{
@@ -806,9 +812,6 @@ func TestReconcileLabelFixCommands_DispatchLogsActorAndPRNumber(t *testing.T) {
 	}
 }
 
-// TestReconcileLabelFixCommands_JournalSubstrateNotSnapshot verifies that
-// detection uses only ListLabelEvents (the journal substrate); no other
-// SCMAdapter method is ever called for label-fix detection or dispatch.
 func TestReconcileLabelFixCommands_JournalSubstrateNotSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -863,17 +866,14 @@ func TestBuildLabelFixMap_FieldMapping(t *testing.T) {
 	}
 }
 
-// TestReconcileLabelFixCommands_ForeignIncumbentDefers mirrors
-// TestReconcileLabelReviewCommands_ForeignIncumbentDefers for the
-// label-fix kind: a confirmed command with a foreign incumbent occupying
-// the retry slot defers instead of dispatching, leaving the fingerprint
-// mark, the high-water mark, and the label untouched.
 func TestReconcileLabelFixCommands_ForeignIncumbentDefers(t *testing.T) {
 	t.Parallel()
 
 	const issueID = "LF-FOREIGN"
 	state := stateWithLabelFixPending(t, issueID, 10, "feature/lf-foreign")
 	rkey := ReactionKey(issueID, ReactionKindLabelFix)
+	seededAt := labelReviewBaseTime.Add(-5 * time.Minute)
+	state.PendingReactions[rkey].CreatedAt = seededAt
 	state.RetryAttempts[issueID] = &RetryEntry{
 		IssueID:      issueID,
 		Attempt:      1,
@@ -894,8 +894,8 @@ func TestReconcileLabelFixCommands_ForeignIncumbentDefers(t *testing.T) {
 	if !ok {
 		t.Fatal("PendingReactions entry dropped on a defer; want re-enqueued")
 	}
-	if !entry.CreatedAt.Equal(labelReviewBaseTime) {
-		t.Errorf("CreatedAt = %v, want refreshed to %v", entry.CreatedAt, labelReviewBaseTime)
+	if !entry.CreatedAt.Equal(seededAt) {
+		t.Errorf("CreatedAt = %v, want %v (a deferral leaves it unchanged)", entry.CreatedAt, seededAt)
 	}
 	incumbent := state.RetryAttempts[issueID]
 	if incumbent.ReactionKind != ReactionKindCI {
@@ -959,3 +959,13 @@ func TestReconcileLabelFixCommands_SameKindCollapseAdvancesMarkAndReenqueues(t *
 		t.Errorf("HighWaterMark = %q, want %q", data.HighWaterMark, labelReviewMark(event))
 	}
 }
+
+func (s *labelFixDispatchedFlagStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *labelFixDispatchedFlagStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *labelFixDispatchedFlagStore) DeleteStageHop(context.Context, string) error { return nil }

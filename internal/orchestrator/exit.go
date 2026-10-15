@@ -1,17 +1,21 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/workspace"
@@ -36,11 +40,17 @@ type WorkerExitStore interface {
 	UpsertSessionMetadata(ctx context.Context, meta persistence.SessionMetadata) error
 	SaveRetryEntry(ctx context.Context, entry persistence.RetryEntry) error
 	DeleteRetryEntry(ctx context.Context, issueID string) error
+	DeleteReactionEscalations(ctx context.Context, issueID string) error
 	QueryConsecutiveHandoffAbsenceCounts(ctx context.Context, issueIDs []string) (map[string]int, error)
 	ResetHandoffAbsenceSequence(ctx context.Context, issueID string) error
 	UpsertParkedIssue(ctx context.Context, entry persistence.ParkedIssue) error
 	DeleteParkedIssue(ctx context.Context, issueID string) error
 	CountWorkerRunsCompletedSince(ctx context.Context, issueID string, since time.Time) (int, error)
+	AddReactionHandedOffComments(ctx context.Context, issueID, kind string, commentIDs []string) error
+	RecordStageHop(ctx context.Context, hop persistence.StageHop) error
+	DeleteStageHop(ctx context.Context, issueID string) error
+	RecordRunStageResult(ctx context.Context, runID int64, targetRule, result string) error
+	RecordIssueOutcome(ctx context.Context, outcome persistence.IssueOutcome) error
 }
 
 // HandleWorkerExitParams holds the dependencies for [HandleWorkerExit] that
@@ -87,6 +97,10 @@ type HandleWorkerExitParams struct {
 	// needed. Empty falls back to HandoffState.
 	NoChangeState string
 
+	// Dispatch is the dispatch configuration in force, which holds the
+	// rule's next link and the hop ceiling read at this exit.
+	Dispatch config.DispatchConfig
+
 	// ActiveStates determines whether the issue is still active at exit
 	// (case-insensitive).
 	ActiveStates []string
@@ -100,8 +114,9 @@ type HandleWorkerExitParams struct {
 	// [domain.NoopMetrics].
 	Metrics domain.Metrics
 
-	// CommentsConfig holds the completion/failure comment flags.
-	CommentsConfig config.TrackerCommentsConfig
+	// Router selects the destinations of the session events the exit
+	// publishes. Nil routes nothing.
+	Router *route.Router
 
 	// HostPool releases hosts on exit. Nil means no release (local or tests).
 	HostPool *HostPool
@@ -119,6 +134,8 @@ type HandleWorkerExitParams struct {
 	// the process; each enqueue path gates on its flag and a non-nil
 	// SCMAdapter.
 	AutoMergeReactionConfigured bool
+
+	ReviewReactionConfigured bool
 
 	BotReviewReactionConfigured bool
 
@@ -376,6 +393,23 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		runError = evidenceErr
 	}
 
+	issueIdentity := issueIdentityOf(entry.Issue)
+
+	// Prefer workerResult.SessionID (authoritative from the adapter) over
+	// entry.SessionID, which depends on EventSessionStarted having been
+	// processed before exit.
+	sessionID := workerResult.SessionID
+	if sessionID == "" {
+		sessionID = entry.SessionID
+	}
+
+	// A retry restored from a row that never stored what started it holds
+	// neither a trigger nor a reaction kind; its origin is unknown, not none.
+	var trigger *string
+	if entry.RetryAttempt == nil || entry.Trigger != "" || entry.ReactionKind != "" {
+		trigger = new(entry.Trigger)
+	}
+
 	// RunHistory.Attempt is 1-based for display; normalizeAttempt returns the
 	// 0-based retry counter, so add 1.
 	runHistory := persistence.RunHistory{
@@ -393,6 +427,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		TurnsCompleted:   workerResult.TurnsCompleted,
 		RuleName:         entry.RuleName,
 		TemplateID:       entry.TemplateID,
+		ConfiguredModel:  entry.ConfiguredModel,
+		ConfiguredEffort: entry.ConfiguredEffort,
+		ReportedModel:    entry.ModelName,
 		InputTokens:      entry.AgentInputTokens,
 		OutputTokens:     entry.AgentOutputTokens,
 		TotalTokens:      entry.AgentTotalTokens,
@@ -400,6 +437,21 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		CacheWriteTokens: entry.CacheWriteTokens,
 		TokensMeasured:   measured,
 		UnaccountedTurns: workerResult.UnaccountedTurns,
+
+		IssueTitle: issueIdentity.Title,
+		IssueURL:   issueIdentity.URL,
+
+		StagePrevious:        entry.StageLineage.PreviousRule,
+		StagePreviousOutcome: entry.StageLineage.PreviousOutcome,
+		ChainID:              entry.StageLineage.ChainID,
+		DispatchedAt:         formatDispatchedAt(entry.StageLineage.DispatchedAt),
+
+		Trigger:      trigger,
+		ReactionKind: entry.ReactionKind,
+		SessionID:    sessionID,
+		SSHHost:      entry.SSHHost,
+
+		FirstAfterHop: entry.FirstAfterHop,
 	}
 	// A row recording no measurement must carry zero in all five token
 	// columns. The reconciliation above can populate them from a worker
@@ -421,13 +473,6 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		}
 	}
 
-	// Prefer workerResult.SessionID (authoritative from the adapter) over
-	// entry.SessionID, which depends on EventSessionStarted having been
-	// processed before exit.
-	sessionID := workerResult.SessionID
-	if sessionID == "" {
-		sessionID = entry.SessionID
-	}
 	// The entry lags the worker's tally when the context ended before a
 	// turn-started message was delivered; a turn that errored still ran.
 	turnsSeen := max(entry.TurnCount, workerResult.TurnsStarted)
@@ -468,11 +513,24 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	}
 
 	runHistoryPersisted := true
-	if _, err := params.Store.AppendRunHistory(ctx, runHistory); err != nil {
+	var runID int64
+	if row, err := params.Store.AppendRunHistory(ctx, runHistory); err != nil {
 		runHistoryPersisted = false
 		log.Error("failed to persist run history",
 			slog.Any("error", err),
 		)
+	} else {
+		runID = row.ID
+	}
+
+	identity := sessionEvent{
+		IssueID:    workerResult.IssueID,
+		Identifier: cmp.Or(workerResult.Identifier, entry.Identifier),
+		DisplayID:  entry.Issue.DisplayID,
+		DispatchID: entry.DispatchID,
+		SessionID:  cmp.Or(workerResult.SessionID, entry.SessionID),
+		Attempt:    workerResult.Attempt,
+		Agent:      workerResult.AgentAdapter,
 	}
 
 	if evidenceWorkObserved {
@@ -481,6 +539,13 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 				slog.Any("error", err),
 			)
 		}
+	}
+
+	followedRun := parkedRun{
+		RuleName:        entry.RuleName,
+		StageLineage:    entry.StageLineage,
+		AgentKind:       entry.AgentKind,
+		ConfiguredModel: entry.ConfiguredModel,
 	}
 
 	consecutiveAbsences := 0
@@ -525,6 +590,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 				workerResult.IssueID,
 				workerResult.Identifier,
 				entry.Issue.DisplayID,
+				issueIdentityOf(entry.Issue),
+				followedRun,
 				observation,
 				consecutiveAbsences,
 				absenceCeiling,
@@ -569,8 +636,18 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	case WorkerExitNormal:
 		state.Completed[workerResult.IssueID] = struct{}{}
 
+		for kind, commentIDs := range workerResult.HandedOffComments {
+			recordHandedOffComments(ctx, state, params.Store, workerResult.IssueID, kind, commentIDs, log)
+		}
+
 		_, claimedAtExit := state.Claimed[workerResult.IssueID]
 		terminalSuppressed := false
+		hopMade := false
+
+		// A successful handoff replaces the state the run read, and a
+		// reaction waits hours or days, so it records the state the exit
+		// wrote.
+		reactionIdentity := issueIdentityOf(entry.Issue)
 
 		switch {
 		case blockedSoftStop:
@@ -584,6 +661,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					IssueID:        workerResult.IssueID,
 					Identifier:     workerResult.Identifier,
 					DisplayID:      entry.Issue.DisplayID,
+					IssueIdentity:  issueIdentityOf(entry.Issue),
+					Run:            followedRun,
 					ObservedState:  observation,
 					Reason:         parkReasonAgentBlocked,
 					Label:          params.HandoffParkingLabel,
@@ -612,6 +691,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 			terminalSuppressed = true
 			CancelRetry(state, workerResult.IssueID)
 			delete(state.Claimed, workerResult.IssueID)
+			resetStageHop(ctx, state, params.Store, workerResult.IssueID, stageResetTerminal, log)
+			recordIssueOutcome(ctx, params.Store, terminalOutcome(workerResult.IssueID, observation, now), log)
 
 		case handoffPath && evidenceWithheld && absenceParked:
 			// Parking already cancelled the sequence, deleted any persisted
@@ -643,10 +724,17 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					LastSSHHost:         workerResult.SSHHost,
 					ContinuationContext: entry.ContinuationContext,
 					ReactionKind:        entry.ReactionKind,
+					Continuation:        entry.Continuation,
 					AgentKind:           entry.AgentKind,
+					ConfiguredModel:     entry.ConfiguredModel,
 					RuleName:            entry.RuleName,
+					StageLineage:        entry.StageLineage,
+					RuleSettingsApplied: entry.RuleSettingsApplied,
 					TemplateID:          entry.TemplateID,
 					Logger:              log,
+
+					IssueIdentity: issueIdentityOf(entry.Issue),
+					Trigger:       triggerError,
 				}, params.OnRetryFire)
 				metrics.IncRetries(triggerError)
 				retryScheduled = true
@@ -681,18 +769,24 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 						slog.Bool("no_change_declared", noChangeDeclared),
 					)
 					ScheduleRetry(state, ScheduleRetryParams{
-						IssueID:     workerResult.IssueID,
-						Identifier:  workerResult.Identifier,
-						DisplayID:   entry.Issue.DisplayID,
-						Attempt:     NextAttempt(entry.RetryAttempt),
-						DelayMS:     continuationDelayMS,
-						Error:       "",
-						LastSSHHost: workerResult.SSHHost,
-						SessionID:   sessionID,
-						AgentKind:   entry.AgentKind,
-						RuleName:    entry.RuleName,
-						TemplateID:  entry.TemplateID,
-						Logger:      log,
+						IssueID:             workerResult.IssueID,
+						Identifier:          workerResult.Identifier,
+						DisplayID:           entry.Issue.DisplayID,
+						Attempt:             NextAttempt(entry.RetryAttempt),
+						DelayMS:             continuationDelayMS,
+						Error:               "",
+						LastSSHHost:         workerResult.SSHHost,
+						SessionID:           sessionID,
+						AgentKind:           entry.AgentKind,
+						ConfiguredModel:     entry.ConfiguredModel,
+						RuleName:            entry.RuleName,
+						StageLineage:        entry.StageLineage,
+						RuleSettingsApplied: entry.RuleSettingsApplied,
+						TemplateID:          entry.TemplateID,
+						Logger:              log,
+
+						IssueIdentity: issueIdentityOf(entry.Issue),
+						Trigger:       triggerContinuation,
 					}, params.OnRetryFire)
 					metrics.IncRetries(triggerContinuation)
 					retryScheduled = true
@@ -703,6 +797,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 				// completed. With no terminal states configured the read
 				// cannot suppress the write, so skip it.
 				verifiedTerminal := false
+				var verifiedTerminalState string
 				if len(params.TerminalStates) > 0 {
 					if verified, verifyErr := params.TrackerAdapter.FetchIssueStatesByIDs(ctx, []string{workerResult.IssueID}); verifyErr != nil {
 						log.Warn("handoff verification read failed, proceeding with handoff",
@@ -724,12 +819,25 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 						}
 						terminalSuppressed = true
 						verifiedTerminal = true
+						verifiedTerminalState = verifiedState
+					}
+				}
+
+				var hop stageHopDecision
+				if !verifiedTerminal {
+					hop = advanceStage(ctx, state, entry, workerResult, params, noChangeDeclared, log)
+					if hop.Result != "" {
+						reportStageHop(ctx, state, params, runID, identity, hop, log)
 					}
 				}
 
 				if verifiedTerminal {
 					CancelRetry(state, workerResult.IssueID)
 					delete(state.Claimed, workerResult.IssueID)
+					resetStageHop(ctx, state, params.Store, workerResult.IssueID, stageResetTerminal, log)
+					recordIssueOutcome(ctx, params.Store, terminalOutcome(workerResult.IssueID, verifiedTerminalState, now), log)
+				} else if hop.made() {
+					hopMade = true
 				} else if err := params.TrackerAdapter.TransitionIssue(ctx, workerResult.IssueID, resolvedTarget); err != nil {
 					metrics.IncHandoffTransitions(handoffError)
 					if workerResult.SoftStop {
@@ -752,18 +860,24 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 							slog.Any("error", err),
 						)
 						ScheduleRetry(state, ScheduleRetryParams{
-							IssueID:     workerResult.IssueID,
-							Identifier:  workerResult.Identifier,
-							DisplayID:   entry.Issue.DisplayID,
-							Attempt:     NextAttempt(entry.RetryAttempt),
-							DelayMS:     continuationDelayMS,
-							Error:       "",
-							LastSSHHost: workerResult.SSHHost,
-							SessionID:   sessionID,
-							AgentKind:   entry.AgentKind,
-							RuleName:    entry.RuleName,
-							TemplateID:  entry.TemplateID,
-							Logger:      log,
+							IssueID:             workerResult.IssueID,
+							Identifier:          workerResult.Identifier,
+							DisplayID:           entry.Issue.DisplayID,
+							Attempt:             NextAttempt(entry.RetryAttempt),
+							DelayMS:             continuationDelayMS,
+							Error:               "",
+							LastSSHHost:         workerResult.SSHHost,
+							SessionID:           sessionID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+							Logger:              log,
+
+							IssueIdentity: issueIdentityOf(entry.Issue),
+							Trigger:       triggerContinuation,
 						}, params.OnRetryFire)
 						metrics.IncRetries(triggerContinuation)
 						retryScheduled = true
@@ -773,15 +887,20 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					// during the session is still valid, so the incumbent is
 					// kept rather than cancelled.
 					logRetrySlotDeferral(log, triggerContinuation, incumbent)
+					recordIssueOutcome(ctx, params.Store, handoffOutcome(workerResult.IssueID, resolvedTarget, params.TerminalStates, now), log)
 					metrics.IncHandoffTransitions(handoffSuccess)
+					reactionIdentity.State = resolvedTarget
 					log.Info("handoff transition succeeded, incumbent preserved",
 						slog.String("handoff_state", params.HandoffState),
 						slog.String("target_state", resolvedTarget),
 						slog.Bool("no_change_declared", noChangeDeclared),
 					)
+					resetStageHop(ctx, state, params.Store, workerResult.IssueID, stageResetHandoff, log)
 					retryDeferred = true
 					claimRetainedForIncumbent = true
 				} else {
+					recordIssueOutcome(ctx, params.Store, handoffOutcome(workerResult.IssueID, resolvedTarget, params.TerminalStates, now), log)
+					reactionIdentity.State = resolvedTarget
 					log.Info("handoff transition succeeded, releasing claim",
 						slog.String("handoff_state", params.HandoffState),
 						slog.String("target_state", resolvedTarget),
@@ -790,6 +909,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					metrics.IncHandoffTransitions(handoffSuccess)
 					CancelRetry(state, workerResult.IssueID)
 					delete(state.Claimed, workerResult.IssueID)
+					resetStageHop(ctx, state, params.Store, workerResult.IssueID, stageResetHandoff, log)
 				}
 			}
 
@@ -817,18 +937,24 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 				retryDeferred = true
 			} else {
 				ScheduleRetry(state, ScheduleRetryParams{
-					IssueID:     workerResult.IssueID,
-					Identifier:  workerResult.Identifier,
-					DisplayID:   entry.Issue.DisplayID,
-					Attempt:     NextAttempt(entry.RetryAttempt),
-					DelayMS:     continuationDelayMS,
-					Error:       "",
-					LastSSHHost: workerResult.SSHHost,
-					SessionID:   sessionID,
-					AgentKind:   entry.AgentKind,
-					RuleName:    entry.RuleName,
-					TemplateID:  entry.TemplateID,
-					Logger:      log,
+					IssueID:             workerResult.IssueID,
+					Identifier:          workerResult.Identifier,
+					DisplayID:           entry.Issue.DisplayID,
+					Attempt:             NextAttempt(entry.RetryAttempt),
+					DelayMS:             continuationDelayMS,
+					Error:               "",
+					LastSSHHost:         workerResult.SSHHost,
+					SessionID:           sessionID,
+					AgentKind:           entry.AgentKind,
+					ConfiguredModel:     entry.ConfiguredModel,
+					RuleName:            entry.RuleName,
+					StageLineage:        entry.StageLineage,
+					RuleSettingsApplied: entry.RuleSettingsApplied,
+					TemplateID:          entry.TemplateID,
+					Logger:              log,
+
+					IssueIdentity: issueIdentityOf(entry.Issue),
+					Trigger:       triggerContinuation,
 				}, params.OnRetryFire)
 				metrics.IncRetries(triggerContinuation)
 				retryScheduled = true
@@ -840,6 +966,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 			// exactly the population this arm would otherwise strand.
 			if params.HandoffState != "" {
 				metrics.IncHandoffTransitions(handoffSkipped)
+			}
+			if !issueIsActive {
+				resetStageHop(ctx, state, params.Store, workerResult.IssueID, stageResetNotActive, log)
 			}
 			if incumbent := retrySlotIncumbent(state, workerResult.IssueID); incumbent != nil {
 				logRetrySlotDeferral(log, triggerContinuation, incumbent)
@@ -857,7 +986,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		if claimRetainedForIncumbent {
 			stillClaimed = false
 		}
-		reactionEnqueueAllowed := claimedAtExit && (handoffPath || stillClaimed) && !terminalSuppressed
+		// A made hop leaves the issue active on its next stage, which owns any
+		// reaction from here on, so the run that hopped seeds none.
+		reactionEnqueueAllowed := claimedAtExit && (handoffPath || stillClaimed) && !terminalSuppressed && !hopMade
 
 		// Seed a pending CI check when CI provider and SCM adapter are both
 		// configured and the workspace carries PR identity: the reaction
@@ -872,6 +1003,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 						nowCI = params.NowFunc().UTC()
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindCI)
+					replaced := state.PendingReactions[rkey]
 					state.PendingReactions[rkey] = &PendingReaction{
 						IssueID:     workerResult.IssueID,
 						Identifier:  workerResult.Identifier,
@@ -887,10 +1019,16 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 							Branch:   scm.Branch,
 							SHA:      scm.SHA,
 						},
-						AgentKind:  entry.AgentKind,
-						RuleName:   entry.RuleName,
-						TemplateID: entry.TemplateID,
+						AgentKind:           entry.AgentKind,
+						ConfiguredModel:     entry.ConfiguredModel,
+						RuleName:            entry.RuleName,
+						StageLineage:        entry.StageLineage,
+						RuleSettingsApplied: entry.RuleSettingsApplied,
+						TemplateID:          entry.TemplateID,
+
+						IssueIdentity: reactionIdentity,
 					}
+					carryEscalation(state.PendingReactions[rkey], replaced)
 				} else if scm.Branch != "" {
 					log.Debug("ci watch not seeded: workspace metadata missing pull request identity",
 						slog.Int("pr_number", scm.PRNumber),
@@ -901,9 +1039,12 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 			}
 		}
 
-		// Seed a pending review check when the SCM adapter is configured and
-		// the workspace has PR metadata with repository identity.
-		if params.SCMAdapter != nil && workerResult.WorkspacePath != "" {
+		// Seed a pending review check when the SCM adapter is configured, the
+		// review reaction is enabled (ReviewReactionConfigured), and the
+		// workspace has PR metadata with repository identity. Without the
+		// flag any other SCM-backed reaction would also seed a review entry,
+		// whose zero-valued config escalates the first actionable comment.
+		if params.SCMAdapter != nil && params.ReviewReactionConfigured && workerResult.WorkspacePath != "" {
 			if reactionEnqueueAllowed {
 				scm := workspace.ReadSCMMetadata(workerResult.WorkspacePath, log)
 				if scm.PRNumber > 0 && scm.Branch != "" && scm.Owner != "" && scm.Repo != "" {
@@ -929,9 +1070,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Branch:   scm.Branch,
 								SHA:      scm.SHA,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -966,9 +1112,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Branch:   scm.Branch,
 								SHA:      scm.SHA,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1002,9 +1153,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Branch:   scm.Branch,
 								SHA:      scm.SHA,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1039,9 +1195,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Branch:   scm.Branch,
 								SHA:      scm.SHA,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1077,9 +1238,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Owner:    scm.Owner,
 								Repo:     scm.Repo,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1115,9 +1281,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Repo:     scm.Repo,
 								Branch:   scm.Branch,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1150,9 +1321,14 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 								Owner:    scm.Owner,
 								Repo:     scm.Repo,
 							},
-							AgentKind:  entry.AgentKind,
-							RuleName:   entry.RuleName,
-							TemplateID: entry.TemplateID,
+							AgentKind:           entry.AgentKind,
+							ConfiguredModel:     entry.ConfiguredModel,
+							RuleName:            entry.RuleName,
+							StageLineage:        entry.StageLineage,
+							RuleSettingsApplied: entry.RuleSettingsApplied,
+							TemplateID:          entry.TemplateID,
+
+							IssueIdentity: reactionIdentity,
 						}
 					}
 				}
@@ -1199,10 +1375,17 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					LastSSHHost:         workerResult.SSHHost,
 					ContinuationContext: entry.ContinuationContext,
 					ReactionKind:        entry.ReactionKind,
+					Continuation:        entry.Continuation,
 					AgentKind:           entry.AgentKind,
+					ConfiguredModel:     entry.ConfiguredModel,
 					RuleName:            entry.RuleName,
+					StageLineage:        entry.StageLineage,
+					RuleSettingsApplied: entry.RuleSettingsApplied,
 					TemplateID:          entry.TemplateID,
 					Logger:              log,
+
+					IssueIdentity: issueIdentityOf(entry.Issue),
+					Trigger:       triggerError,
 				}, params.OnRetryFire)
 				metrics.IncRetries(triggerError)
 				retryScheduled = true
@@ -1218,17 +1401,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 	if retryScheduled {
 		if retryEntry, ok := state.RetryAttempts[workerResult.IssueID]; ok {
 			if !isKnownReactionKind(retryEntry.ReactionKind) {
-				pEntry := persistence.RetryEntry{
-					IssueID:    retryEntry.IssueID,
-					Identifier: retryEntry.Identifier,
-					Attempt:    retryEntry.Attempt,
-					DueAtMs:    retryEntry.DueAtMS,
-					Error:      stringPtr(retryEntry.Error),
-					SessionID:  stringPtr(retryEntry.SessionID),
-					RuleName:   retryEntry.RuleName,
-					TemplateID: retryEntry.TemplateID,
-					AgentKind:  retryEntry.AgentKind,
-				}
+				pEntry := retryEntryRow(retryEntry)
 				if err := params.Store.SaveRetryEntry(ctx, pEntry); err != nil {
 					log.Error("failed to persist retry entry",
 						slog.Any("error", err),
@@ -1238,69 +1411,59 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		}
 	}
 
-	// Build the comment text synchronously to capture exit-time data, then
-	// fire CommentIssue in a detached goroutine so the event loop never
-	// blocks.
-	var commentText string
-	var lifecycle string
-
 	runDuration := max(now.Sub(entry.StartedAt), 0)
 
 	// A deferral leaves work queued exactly as a scheduled retry does, so the
 	// comments report re-queuing for either outcome.
 	retryPending := retryScheduled || retryDeferred
 
-	switch workerResult.ExitKind {
-	case WorkerExitNormal:
-		if evidenceWithheld {
-			if params.CommentsConfig.OnFailure {
-				commentText = buildFailureComment(runDuration, retryPending, nextAttempt)
-				lifecycle = "failure"
+	// The body is built synchronously to capture exit-time data; the
+	// delivery is detached so the event loop never blocks.
+	var eventType domain.EventType
+	var severity, body, agentText, lifecycle string
+	switch {
+	case workerResult.ExitKind == WorkerExitCancelled:
+		return
+	case workerResult.ExitKind == WorkerExitNormal && !evidenceWithheld:
+		lifecycle = "completion"
+		if workerResult.SoftStop {
+			eventType = domain.EventSessionStopped
+			body = buildSoftStopComment(runDuration, workerResult.TurnsCompleted, workerResult.SoftStopReason)
+			agentText = publicStatement(workerResult.SoftStopStatement)
+			if workerResult.SoftStopReason == string(workspace.StatusNoChangeNeeded) {
+				severity = "info"
 			}
-		} else if params.CommentsConfig.OnCompletion {
-			if workerResult.SoftStop {
-				commentText = buildSoftStopComment(runDuration, workerResult.TurnsCompleted, workerResult.SoftStopReason)
-			} else {
-				commentText = buildCompletionComment(runDuration, workerResult.TurnsCompleted, retryPending)
-			}
-			lifecycle = "completion"
+		} else {
+			eventType = domain.EventSessionCompleted
+			body = buildCompletionComment(runDuration, workerResult.TurnsCompleted, retryPending)
 		}
-	case WorkerExitCancelled:
-		// No comment on cancellation.
 	default:
-		if params.CommentsConfig.OnFailure {
-			commentText = buildFailureComment(runDuration, retryPending, nextAttempt)
-			lifecycle = "failure"
+		lifecycle = "failure"
+		eventType = domain.EventSessionFailed
+		body = buildFailureComment(runDuration, retryPending, nextAttempt)
+	}
+
+	exitEvent := identity
+	exitEvent.AgentText = agentText
+	delivery := params.Router.Route(exitEvent.notification(eventType, severity, body))
+
+	deliverDetached(ctx, &state.TrackerOpsWg, delivery, log, func(received bool, err error) {
+		if !received {
+			return
 		}
-	}
-
-	if commentText != "" && params.TrackerAdapter != nil {
-		issueID := workerResult.IssueID
-		tracker := params.TrackerAdapter
-		m := metrics
-		commentLog := log
-		lc := lifecycle
-		ct := commentText
-
-		state.TrackerOpsWg.Go(func() {
-			dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-
-			if err := tracker.CommentIssue(dctx, issueID, ct); err != nil {
-				commentLog.Warn("tracker comment failed",
-					slog.String("lifecycle", lc),
-					slog.Any("error", err),
-				)
-				m.IncTrackerComments(lc, "error")
-			} else {
-				commentLog.Info("tracker comment posted",
-					slog.String("lifecycle", lc),
-				)
-				m.IncTrackerComments(lc, "success")
-			}
-		})
-	}
-
+		if err != nil {
+			log.Warn("tracker comment failed",
+				slog.String("lifecycle", lifecycle),
+				slog.Any("error", err),
+			)
+			metrics.IncTrackerComments(lifecycle, "error")
+			return
+		}
+		log.Info("tracker comment posted",
+			slog.String("lifecycle", lifecycle),
+		)
+		metrics.IncTrackerComments(lifecycle, "success")
+	})
 }
 
 // computeBackoffDelay returns the exponential backoff delay in ms for the
@@ -1446,4 +1609,74 @@ func buildFailureComment(elapsed time.Duration, retryScheduled bool, nextAttempt
 func buildSoftStopComment(elapsed time.Duration, turnsCompleted int, reason string) string {
 	return fmt.Sprintf("Sortie session completed (agent signaled: %s).\nDuration: %s\nTurns: %d",
 		reason, elapsed.Truncate(time.Second).String(), turnsCompleted)
+}
+
+// maxPublicStatementRunes bounds the agent text a destination receives.
+const maxPublicStatementRunes = 1024
+
+// publicStatement returns the agent's stop statement in the form every
+// destination may show, or "" when nothing is left to show.
+//
+// Control characters are removed and invalid UTF-8 replaced before
+// masking, so removing one cannot assemble a registered value after the
+// mask ran. A statement cut at the read bound is masked as truncated text,
+// which also removes a trailing fragment of a registered value, and ends in
+// an ellipsis.
+func publicStatement(statement workspace.StatusStatement) string {
+	text := statement.Text
+	if statement.Truncated {
+		text = dropIncompleteTrailingRune(text)
+	}
+	mask := redact.Mask
+	if statement.Truncated {
+		mask = redact.MaskTruncated
+	}
+	// A registered value may itself hold a byte the cleanup rewrites, so
+	// it is masked as written before the cleanup and once more after it.
+	// Both passes look for a fragment the cut left, since the first one
+	// can mask a shorter value inside that fragment.
+	text = mask(text)
+	text = strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
+	text = removeControlBytes(text)
+	text = strings.ToValidUTF8(text, "\uFFFD")
+	text = mask(text)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if statement.Truncated {
+		text += "\u2026"
+	}
+	return redact.Truncate(text, maxPublicStatementRunes)
+}
+
+// dropIncompleteTrailingRune removes a final multi-byte sequence that the
+// cut left without its continuation bytes.
+func dropIncompleteTrailingRune(text string) string {
+	for i := len(text) - 1; i >= 0 && i >= len(text)-utf8.UTFMax; i-- {
+		if !utf8.RuneStart(text[i]) {
+			continue
+		}
+		if utf8.FullRuneInString(text[i:]) {
+			return text
+		}
+		return text[:i]
+	}
+	return text
+}
+
+// removeControlBytes deletes every C0 control character except tab and
+// line feed, and DEL. Each is a single ASCII byte, so no multi-byte
+// sequence is affected.
+func removeControlBytes(text string) string {
+	var kept strings.Builder
+	kept.Grow(len(text))
+	for i := 0; i < len(text); i++ {
+		b := text[i]
+		if (b < 0x20 && b != '\t' && b != '\n') || b == 0x7f {
+			continue
+		}
+		kept.WriteByte(b)
+	}
+	return kept.String()
 }

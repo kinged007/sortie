@@ -32,14 +32,19 @@ import (
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
+// defaultCommand is what a session launches when it is given no command.
+const defaultCommand = "codex app-server"
+
 func init() {
 	registry.Agents.RegisterWithMeta("codex", NewCodexAdapter, registry.AgentMeta{
 		RequiresCommand:     true,
+		DefaultCommand:      defaultCommand,
 		ValidateAgentConfig: validateConfig,
 		MCPInjection:        registry.MCPInjectionTranslated,
 		UsageArrival:        registry.UsageArrivalIncremental,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
+		EffortForwarding:    registry.EffortForwarded,
 	})
 }
 
@@ -51,8 +56,6 @@ var _ domain.AgentAdapter = (*CodexAdapter)(nil)
 // concurrent sessions; per-session state is held in [sessionState] via
 // the [domain.Session] Internal field.
 type CodexAdapter struct {
-	passthrough passthroughConfig
-
 	// drainGrace bounds the post-reap release goroutine's wait for the
 	// connection's own reader to end normally, once StartSession copies
 	// it into sessionState.drainGrace. A non-positive value resolves to
@@ -69,6 +72,8 @@ type sessionState struct {
 	target      agentcore.LaunchTarget
 	agentConfig domain.AgentConfig
 	turnCount   int
+
+	passthrough passthroughConfig
 
 	threadID string
 
@@ -137,7 +142,7 @@ type sessionState struct {
 	// through reportStderr. It guards no write to the peer; conn owns
 	// its own outgoing queue and writer goroutine.
 	mu              sync.Mutex
-	proc            *os.Process
+	group           *procutil.Group
 	waitCh          <-chan struct{}
 	stdin           io.WriteCloser
 	pipes           *procutil.OwnedPipes
@@ -367,25 +372,22 @@ func reportMCPStartupFailure(msg jsonrpc.Message, logger *slog.Logger) {
 	}
 }
 
-// NewCodexAdapter creates a [CodexAdapter] from adapter configuration.
-// The config parameter is the raw map from the "codex" sub-object in
-// WORKFLOW.md. Command resolution is deferred to
-// [CodexAdapter.StartSession].
-func NewCodexAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, fault := parsePassthroughConfig(config)
-	if fault != nil {
-		return nil, fault
-	}
-	adapter := &CodexAdapter{passthrough: pt}
-
-	return adapter, nil
+// NewCodexAdapter creates a [CodexAdapter]. Settings and command
+// resolution are deferred to [CodexAdapter.StartSession].
+func NewCodexAdapter() (domain.AgentAdapter, error) {
+	return &CodexAdapter{}, nil
 }
 
-// StartSession validates the workspace path, resolves the codex binary,
-// launches the app-server subprocess, performs the initialization handshake,
-// authenticates if needed, and starts or resumes a thread.
+// StartSession parses the session's settings, validates the workspace path,
+// resolves the codex binary, launches the app-server subprocess, performs
+// the initialization handshake, authenticates if needed, and starts or
+// resumes a thread.
 func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	target, agentErr := agentcore.ResolveLaunchTarget(params, "codex app-server")
+	pt, fault := parsePassthroughConfig(params.Settings)
+	if fault != nil {
+		return domain.Session{}, agentcore.SettingsError(fault.Error(), fault)
+	}
+	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
 	}
@@ -413,6 +415,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	state := &sessionState{
 		target:                 target,
 		agentConfig:            params.AgentConfig,
+		passthrough:            pt,
 		acc:                    agentcore.NewRunUsage(),
 		credentialVerification: params.CredentialVerification,
 	}
@@ -443,8 +446,11 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 	prefixedStdin := launch.PrefixStdin(stdinPipe)
 
 	logger := slog.Default().With(slog.String("component", "codex-adapter"))
-	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
+	pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, logger)
 	if err != nil {
+		if cancelled := agentcore.SessionStartCancelledError(ctx, err); cancelled != nil {
+			return domain.Session{}, cancelled
+		}
 		var startErr *procutil.StartError
 		if !errors.As(err, &startErr) {
 			return domain.Session{}, &domain.AgentError{
@@ -481,7 +487,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		}
 	}
 
-	state.proc = cmd.Process
+	state.group = group
 	state.stdin = prefixedStdin
 	state.pipes = pipes
 	state.drainGrace = a.drainGrace
@@ -502,7 +508,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			state.pipes.CloseStdout() //nolint:errcheck,gosec // unblock the reader goroutine on the read end
 		}
 		state.mu.Unlock()
-		procutil.KillProcessGroup(cmd.Process.Pid) //nolint:errcheck,gosec // best-effort cleanup
+		group.Kill() //nolint:errcheck,gosec // best-effort cleanup
 		// Wait briefly for cleanup.
 		select {
 		case <-state.waitCh:
@@ -515,7 +521,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 		state.reportStderr(logger)
 
 		state.mu.Lock()
-		state.proc = nil
+		state.group = nil
 		state.stdin = nil
 		if state.pipes != nil {
 			state.pipes.Close() //nolint:errcheck,gosec // best-effort cleanup; StartSession's failure paths return no session to close these later
@@ -597,7 +603,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			logger.Warn("thread resume failed, starting new thread",
 				slog.String("resume_id", params.ResumeSessionID),
 				slog.Any("error", resumeErr))
-			tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
+			tid, startedModel, startErr := startThread(ctx, state, pt, logger)
 			if startErr != nil {
 				observation := earlyExitObservation(ctx, startErr, target, state)
 				state.closeConn()
@@ -621,7 +627,7 @@ func (a *CodexAdapter) StartSession(ctx context.Context, params domain.StartSess
 			model = resumedModel
 		}
 	} else {
-		tid, startedModel, startErr := startThread(ctx, state, a.passthrough, logger)
+		tid, startedModel, startErr := startThread(ctx, state, pt, logger)
 		if startErr != nil {
 			observation := earlyExitObservation(ctx, startErr, target, state)
 			state.closeConn()
@@ -706,14 +712,14 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 		"cwd":      state.target.WorkspacePath,
 	}
 
-	if state.turnCount == 1 || a.passthrough.TurnSandboxPolicy != nil {
-		turnParams["sandboxPolicy"] = buildSandboxPolicy(state, a.passthrough)
+	if state.turnCount == 1 || state.passthrough.TurnSandboxPolicy != nil {
+		turnParams["sandboxPolicy"] = buildSandboxPolicy(state, state.passthrough)
 	}
-	if a.passthrough.Model != "" {
-		turnParams["model"] = a.passthrough.Model
+	if state.passthrough.Model != "" {
+		turnParams["model"] = state.passthrough.Model
 	}
-	if a.passthrough.Effort != "" {
-		turnParams["effort"] = a.passthrough.Effort
+	if state.passthrough.Effort != "" {
+		turnParams["effort"] = state.passthrough.Effort
 	}
 
 	resp, err := state.conn.Call(ctx, "turn/start", turnParams)
@@ -779,7 +785,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 			// turn/completed: past this deadline the interrupt is presumed
 			// lost, and the loop returns rather than reading until stdout
 			// closes.
-			cancelDeadline = time.After(readTimeout(state))
+			cancelDeadline = time.After(agentcore.ReadTimeout(state.agentConfig))
 			continue
 
 		case <-cancelDeadline:
@@ -984,6 +990,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 						Timestamp:      now,
 						ToolName:       toolName,
 						ToolDurationMS: durationMS,
+						ToolError:      item.Status == "failed" || item.Status == "declined",
 					})
 				}
 				if item.Type == "agentMessage" && item.Text != "" {
@@ -1175,15 +1182,10 @@ func (a *CodexAdapter) StopSession(ctx context.Context, session domain.Session) 
 	procutil.CloseWithoutWaiting(state.stdin)
 	waitCh := state.waitCh
 	pipes := state.pipes
-	pid := 0
-	if state.proc != nil {
-		pid = state.proc.Pid
-	}
+	group := state.group
 	state.mu.Unlock()
 
-	if pid > 0 {
-		procutil.SignalGraceful(pid) //nolint:errcheck,gosec // best-effort graceful shutdown
-	}
+	group.SignalGraceful() //nolint:errcheck,gosec // best-effort graceful shutdown
 
 	logger := logging.WithSession(
 		slog.Default().With(slog.String("component", "codex-adapter")),
@@ -1200,9 +1202,7 @@ func (a *CodexAdapter) StopSession(ctx context.Context, session domain.Session) 
 			logger.Warn("agent did not exit inside the graceful period and was force-terminated",
 				slog.String("outcome", outcome), slog.Duration("grace", grace),
 				slog.Duration("elapsed", time.Since(started)))
-			if pid > 0 {
-				procutil.KillProcessGroup(pid) //nolint:errcheck,gosec // best-effort force kill
-			}
+			group.Kill() //nolint:errcheck,gosec // best-effort force kill
 			// Wait again briefly for cleanup.
 			select {
 			case <-waitCh:
@@ -1244,7 +1244,7 @@ func (a *CodexAdapter) StopSession(ctx context.Context, session domain.Session) 
 	// reported a runtime that failed, and there is nothing to explain
 	// for one that stopped on request.
 	state.mu.Lock()
-	state.proc = nil
+	state.group = nil
 	state.stdin = nil
 	if state.pipes != nil {
 		state.pipes.Close() //nolint:errcheck,gosec // best-effort cleanup

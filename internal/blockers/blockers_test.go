@@ -20,6 +20,8 @@ var _ domain.TrackerAdapter = (*fakeTrackerAdapter)(nil)
 func (fakeTrackerAdapter) FetchCandidateIssues(context.Context) ([]domain.Issue, error) {
 	return nil, nil
 }
+
+func (fakeTrackerAdapter) SetTrackerStates(func() domain.TrackerStates) {}
 func (fakeTrackerAdapter) FetchIssueByID(context.Context, string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -37,7 +39,12 @@ func (fakeTrackerAdapter) FetchIssueComments(context.Context, string) ([]domain.
 }
 func (fakeTrackerAdapter) TransitionIssue(context.Context, string, string) error { return nil }
 func (fakeTrackerAdapter) CommentIssue(context.Context, string, string) error    { return nil }
-func (fakeTrackerAdapter) AddLabel(context.Context, string, string) error        { return nil }
+func (fakeTrackerAdapter) CommentIssueWithLiteral(context.Context, string, string, string) error {
+	return nil
+}
+func (fakeTrackerAdapter) AddLabel(context.Context, string, string) error { return nil }
+
+func (fakeTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // fakeBlockerReaderAdapter embeds fakeTrackerAdapter and additionally
 // implements domain.BlockerReader, recording every call and returning

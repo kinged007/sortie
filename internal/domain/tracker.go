@@ -5,6 +5,22 @@ import (
 	"errors"
 )
 
+// TrackerStates is the workflow's state vocabulary as written in front
+// matter, with no default applied and no entry normalized.
+type TrackerStates struct {
+	// Active is tracker.active_states.
+	Active []string
+
+	// Terminal is tracker.terminal_states.
+	Terminal []string
+
+	// Handoff is tracker.handoff_state.
+	Handoff string
+
+	// InProgress is tracker.in_progress_state.
+	InProgress string
+}
+
 // TrackerAdapter defines the contract that all issue tracker
 // integrations must satisfy.
 //
@@ -13,7 +29,8 @@ import (
 // poll loop and reconciliation goroutine.
 type TrackerAdapter interface {
 	// FetchCandidateIssues returns issues in configured active states
-	// for the configured project.
+	// for the configured project. An empty active list returns no issue
+	// and sends no request.
 	//
 	// Results are normalized to [Issue]. The Comments field may be nil
 	// (not fetched) to reduce API cost; callers requiring comments must
@@ -47,7 +64,8 @@ type TrackerAdapter interface {
 	//
 	// The returned map is keyed by issue ID with the value being the
 	// current state name. Issues not found in the tracker are omitted
-	// from the map (not an error). Used for active-run reconciliation.
+	// from the map (not an error). An empty state means the issue reads no
+	// configured state. Used for active-run reconciliation.
 	FetchIssueStatesByIDs(ctx context.Context, issueIDs []string) (map[string]string, error)
 
 	// FetchIssueStatesByIdentifiers returns the current state for each
@@ -106,12 +124,73 @@ type TrackerAdapter interface {
 	// All errors are non-fatal; the orchestrator logs WARN and continues.
 	CommentIssue(ctx context.Context, issueID string, text string) error
 
-	// AddLabel adds a label to the specified issue. Used for CI failure
-	// escalation. Returns nil on success.
+	// CommentIssueWithLiteral posts text followed by literal rendered as the
+	// tracker's literal block, so the tracker shows literal verbatim and acts
+	// on nothing in it. literal is non-empty valid UTF-8 holding no C0
+	// control character other than tab and line feed, and no DEL. Errors and
+	// cancellation behave as [TrackerAdapter.CommentIssue] documents.
+	CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error
+
+	// AddLabel adds a label to the specified issue and removes no other
+	// label. A tracker that models a label group as single-select may
+	// replace the group's other label on the issue.
 	//
-	// Adapters that do not support labels return nil (no-op) rather
-	// than an error. The orchestrator treats all errors as non-fatal.
+	// Stored labels are compared with the label ignoring letter case, and
+	// the label is used as given, without trimming. Returns nil only when
+	// the issue's label set after the write, as the write's response or a
+	// read issued after it reports it, carries the label. A [TrackerAdapter.FetchIssueByID]
+	// that starts after the nil return reflects the write unless another
+	// party changed the issue's labels in between; the candidate listing
+	// carries every label the tracker reports for each issue and shows the
+	// write once the tracker's own listing does.
+	//
+	// Returns a [*TrackerError] on failure:
+	//   - [ErrTrackerTransport]: network or server failure.
+	//   - [ErrTrackerAuth]: insufficient permissions.
+	//   - [ErrTrackerAPI]: non-success response from the tracker.
+	//   - [ErrTrackerNotFound]: the issue does not exist or is not visible.
+	//   - [ErrTrackerPayload]: the label is blank (only white space), the
+	//     tracker rejected the write as invalid, or it acknowledged the
+	//     write and the issue does not carry the label.
+	//
+	// When ctx is canceled or its deadline is exceeded, implementations
+	// may return ctx.Err() directly. The orchestrator treats all errors as
+	// non-fatal.
 	AddLabel(ctx context.Context, issueID string, label string) error
+
+	// RemoveLabel removes from the specified issue every label that names
+	// label, and no other label. Labels name one another when they compare
+	// equal ignoring letter case, so an issue carrying both "Stage-Plan" and
+	// "stage-plan" carries neither after RemoveLabel("stage-plan"). The
+	// label is matched as given, without trimming.
+	//
+	// An issue that carries no such label returns nil and receives no write
+	// request. Otherwise a nil return means the issue's label set after
+	// the write, as the write's response or a read issued after it reports
+	// it, carries no label naming the argument. A
+	// [TrackerAdapter.FetchIssueByID] that starts after the nil return
+	// reflects the removal unless another party changed the issue's labels
+	// in between; the candidate listing shows it once the tracker's own
+	// listing does.
+	//
+	// Returns a [*TrackerError] on failure:
+	//   - [ErrTrackerTransport]: network or server failure.
+	//   - [ErrTrackerAuth]: insufficient permissions.
+	//   - [ErrTrackerAPI]: non-success response from the tracker.
+	//   - [ErrTrackerNotFound]: the issue does not exist or is not visible.
+	//   - [ErrTrackerPayload]: the label is blank (only white space), the
+	//     tracker rejected the write as invalid, or it acknowledged the
+	//     removal and the issue still carries the label.
+	//
+	// When ctx is canceled or its deadline is exceeded, implementations
+	// may return ctx.Err() directly.
+	RemoveLabel(ctx context.Context, issueID string, label string) error
+
+	// SetTrackerStates installs the function the adapter calls at the start
+	// of each operation that reads the workflow's state lists; until then
+	// the adapter uses the lists it was constructed with. Safe for
+	// concurrent use.
+	SetTrackerStates(current func() TrackerStates)
 }
 
 // BlockerReader is the optional capability a tracker adapter

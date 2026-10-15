@@ -1,6 +1,7 @@
 package config
 
 import (
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -70,6 +71,50 @@ func TestValidateFrontMatterDispatchRulesSequence(t *testing.T) {
 				},
 			},
 			wantCount: 0,
+		},
+		{
+			name:      "the key naming the rule's own agent draws no warning",
+			raw:       dispatchRaw("", map[string]any{"name": "r", "agent": "mock", "mock": map[string]any{"model": "m"}}),
+			wantCount: 0,
+		},
+		{
+			name:      "the key naming dispatch.default.agent draws no warning for a rule without agent",
+			raw:       dispatchRaw("codex", map[string]any{"name": "r", "codex": map[string]any{"model": "m"}}),
+			wantCount: 0,
+		},
+		{
+			name: "the key naming agent.kind draws no warning for a rule without agent",
+			raw: map[string]any{
+				"agent":    map[string]any{"kind": "opencode"},
+				"dispatch": dispatchRaw("", map[string]any{"name": "r", "opencode": map[string]any{"model": "m"}})["dispatch"],
+			},
+			wantCount: 0,
+		},
+		{
+			name:       "a kind key other than the rule's own kind still warns",
+			raw:        dispatchRaw("", map[string]any{"name": "r", "agent": "mock", "codex": map[string]any{}}),
+			wantCount:  1,
+			wantChecks: []string{"unknown_sub_key"},
+			wantFields: []string{"dispatch.rules[0].codex"},
+		},
+		{
+			name:      "a rule carrying stage draws no warning",
+			raw:       dispatchRaw("", map[string]any{"name": "plan", "stage": "stage-plan", "agent": "mock"}),
+			wantCount: 0,
+		},
+		{
+			name:       "an unrecognized key beside stage still warns",
+			raw:        dispatchRaw("", map[string]any{"name": "plan", "stage": "stage-plan", "typo_field": "value"}),
+			wantCount:  1,
+			wantChecks: []string{"unknown_sub_key"},
+			wantFields: []string{"dispatch.rules[0].typo_field"},
+		},
+		{
+			name:       "stage under dispatch.default is not a recognized key",
+			raw:        map[string]any{"dispatch": map[string]any{"default": map[string]any{"stage": "stage-plan"}}},
+			wantCount:  1,
+			wantChecks: []string{"unknown_sub_key"},
+			wantFields: []string{"dispatch.default.stage"},
 		},
 	}
 
@@ -396,6 +441,31 @@ func TestValidateFrontMatter(t *testing.T) {
 		},
 
 		{
+			name:      "agent.command as a string passes",
+			raw:       map[string]any{"agent": map[string]any{"command": "agent --fast"}},
+			wantCount: 0,
+		},
+		{
+			name:      "agent.command as a list of strings draws no type_mismatch",
+			raw:       map[string]any{"agent": map[string]any{"command": []any{"agent", "a b"}}},
+			wantCount: 0,
+		},
+		{
+			name:       "agent.command as a mapping still draws type_mismatch",
+			raw:        map[string]any{"agent": map[string]any{"command": map[string]any{"run": "agent"}}},
+			wantCount:  1,
+			wantChecks: []string{"type_mismatch"},
+			wantFields: []string{"agent.command"},
+		},
+		{
+			name:       "agent.command as a number still draws type_mismatch",
+			raw:        map[string]any{"agent": map[string]any{"command": 7}},
+			wantCount:  1,
+			wantChecks: []string{"type_mismatch"},
+			wantFields: []string{"agent.command"},
+		},
+
+		{
 			name: "tracker section is scalar not map",
 			raw:  map[string]any{"tracker": "not-a-map"},
 			// Sections iterate alphabetically: agent, hooks, polling, tracker.
@@ -684,25 +754,6 @@ func TestValidateFrontMatter(t *testing.T) {
 			wantCount:  1,
 			wantChecks: []string{"type_mismatch"},
 			wantFields: []string{"self_review.max_iterations"},
-		},
-		{
-			// ci_feedback without a "kind" is never read by the config
-			// layer (buildCIFeedbackConfig returns early), but the same
-			// unconditional type check applies.
-			name: "kind-less ci_feedback block accepts out-of-range integer without warning",
-			raw: map[string]any{
-				"ci_feedback": map[string]any{"max_retries": float64(1e20)},
-			},
-			wantCount: 0,
-		},
-		{
-			name: "kind-less ci_feedback block still warns on non-numeric value",
-			raw: map[string]any{
-				"ci_feedback": map[string]any{"max_retries": "abc"},
-			},
-			wantCount:  1,
-			wantChecks: []string{"type_mismatch"},
-			wantFields: []string{"ci_feedback.max_retries"},
 		},
 
 		{
@@ -1136,6 +1187,65 @@ func TestTypeMatches_FieldInt(t *testing.T) {
 
 			if got != tt.want {
 				t.Errorf("typeMatches(%v, FieldInt) = %v, want %v", tt.v, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateFrontMatterDispatchMatchTitle(t *testing.T) {
+	t.Parallel()
+
+	matchRaw := func(match map[string]any) map[string]any {
+		return dispatchRaw("", map[string]any{"name": "r", "agent": "mock", "match": match})
+	}
+	tests := []struct {
+		name         string
+		raw          map[string]any
+		wantField    string
+		wantMessage  string
+		wantWarnings int
+	}{
+		{name: "a scalar title draws no warning", raw: matchRaw(map[string]any{"title": "[docs]"})},
+		{name: "a title list beside labels draws no warning", raw: matchRaw(map[string]any{"title": []any{"[docs]", "wip:"}, "labels": []any{"bug"}})},
+		{name: "a misspelled title key still warns", raw: matchRaw(map[string]any{"titel": "fix"}), wantWarnings: 1, wantField: "dispatch.rules[0].match.titel", wantMessage: `unknown match key "titel"`},
+		{name: "an unrecognized key beside title still warns", raw: matchRaw(map[string]any{"title": "fix", "not_a_key": "x"}), wantWarnings: 1, wantField: "dispatch.rules[0].match.not_a_key", wantMessage: `unknown match key "not_a_key"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ValidateFrontMatter(tt.raw, ServiceConfig{Agent: AgentConfig{Kind: "mock"}})
+
+			if len(got) != tt.wantWarnings {
+				t.Fatalf("ValidateFrontMatter() returned %d warnings, want %d\nwarnings: %+v", len(got), tt.wantWarnings, got)
+			}
+			if tt.wantWarnings == 0 {
+				return
+			}
+			if got[0].Check != "unknown_sub_key" || got[0].Field != tt.wantField || got[0].Message != tt.wantMessage {
+				t.Errorf("ValidateFrontMatter()[0] = {Check:%q Field:%q Message:%q}, want {Check:%q Field:%q Message:%q}",
+					got[0].Check, got[0].Field, got[0].Message, "unknown_sub_key", tt.wantField, tt.wantMessage)
+			}
+		})
+	}
+}
+
+func TestValidateFrontMatterEveryBuilderMatchKeyIsKnown(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range slices.Sorted(maps.Keys(matchKeyAllowed)) {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+
+			raw := dispatchRaw("", map[string]any{"name": "r", "agent": "mock", "match": map[string]any{key: "x"}})
+
+			got := ValidateFrontMatter(raw, ServiceConfig{Agent: AgentConfig{Kind: "mock"}})
+
+			for _, w := range got {
+				if w.Check == "unknown_sub_key" {
+					t.Errorf("ValidateFrontMatter(match key %q) warning = %+v, want no unknown_sub_key", key, w)
+				}
 			}
 		})
 	}

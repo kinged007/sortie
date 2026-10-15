@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +62,29 @@ func WithAgentKindProbe(probe func(kind string) bool) ManagerOption {
 	return func(m *Manager) { m.agentKindProbe = probe }
 }
 
+// WithRetiredAgents sets the lookup the manager passes to every
+// configuration load, so a workflow naming a retired agent kind loads
+// converted onto its replacement kind. Callers wire the closure to the
+// retirement registry; the workflow package never imports the registry
+// package itself. A nil lookup, the default, converts nothing.
+func WithRetiredAgents(lookup config.RetiredAgentLookup) ManagerOption {
+	return func(m *Manager) { m.retiredAgents = lookup }
+}
+
+// LoadStatus is the outcome of the workflow file's recent loads.
+type LoadStatus struct {
+	// LastLoadAt is when the latest load ended, whether it succeeded or failed.
+	LastLoadAt time.Time
+	// LastSuccessAt is when a load last succeeded and promoted its configuration.
+	LastSuccessAt time.Time
+	// ConsecutiveFailures counts the loads that failed since LastSuccessAt.
+	ConsecutiveFailures int
+	// FailingSince is when the first of those loads ended; zero while ConsecutiveFailures is 0.
+	FailingSince time.Time
+	// LastError is the latest load's error, nil when it succeeded.
+	LastError error
+}
+
 // Manager watches a workflow file for changes and maintains the current
 // effective configuration. The latest config and prompt template are
 // available via [Manager.Config] and [Manager.PromptTemplate]. Safe for
@@ -72,6 +94,7 @@ type Manager struct {
 	logger         *slog.Logger
 	validateFunc   ValidateFunc
 	agentKindProbe func(kind string) bool
+	retiredAgents  config.RetiredAgentLookup
 	advisoryFunc   AdvisoryFunc
 
 	mu                   sync.RWMutex
@@ -79,6 +102,8 @@ type Manager struct {
 	currentPrompt        *prompt.Template
 	currentTemplateIndex map[string]*prompt.Template
 	lastLoadErr          error
+	loadStatus           LoadStatus
+	loadNotifier         func()
 
 	watcher *fsnotify.Watcher
 	done    chan struct{}
@@ -120,6 +145,9 @@ func NewManager(path string, logger *slog.Logger, opts ...ManagerOption) (*Manag
 	m.currentConfig = cfg
 	m.currentPrompt = tmpl
 	m.currentTemplateIndex = index
+	m.mu.Lock()
+	m.recordLoadLocked(nil)
+	m.mu.Unlock()
 	return m, nil
 }
 
@@ -181,6 +209,32 @@ func (m *Manager) LastLoadError() error {
 	return m.lastLoadErr
 }
 
+// LoadStatus returns the outcome of the recent loads. Safe for
+// concurrent use.
+func (m *Manager) LoadStatus() LoadStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.loadStatus
+}
+
+// recordLoadLocked records one load outcome next to lastLoadErr. The
+// caller MUST hold m.mu for writing.
+func (m *Manager) recordLoadLocked(err error) {
+	now := time.Now()
+	m.loadStatus.LastLoadAt = now
+	m.loadStatus.LastError = err
+	if err == nil {
+		m.loadStatus.LastSuccessAt = now
+		m.loadStatus.ConsecutiveFailures = 0
+		m.loadStatus.FailingSince = time.Time{}
+		return
+	}
+	if m.loadStatus.ConsecutiveFailures == 0 {
+		m.loadStatus.FailingSince = now
+	}
+	m.loadStatus.ConsecutiveFailures++
+}
+
 func (m *Manager) currentLogger() *slog.Logger {
 	m.mu.RLock()
 	l := m.logger
@@ -201,6 +255,28 @@ func (m *Manager) SetLogger(logger *slog.Logger) {
 	m.mu.Unlock()
 }
 
+// SetLoadNotifier registers a function the watcher calls after each load it
+// records, whether the load succeeded or failed. The function runs after the
+// manager lock is released, so [Manager.Config] and [Manager.LoadStatus]
+// already return that load's outcome. [Manager.Reload] does not call it, and
+// loads recorded before registration notify nothing. A nil argument clears
+// the notifier. Safe for concurrent use; the file-watcher goroutine may be
+// running.
+func (m *Manager) SetLoadNotifier(notify func()) {
+	m.mu.Lock()
+	m.loadNotifier = notify
+	m.mu.Unlock()
+}
+
+func (m *Manager) notifyLoad() {
+	m.mu.RLock()
+	notify := m.loadNotifier
+	m.mu.RUnlock()
+	if notify != nil {
+		notify()
+	}
+}
+
 // Reload synchronously re-reads the workflow file, parses config and
 // prompt, and swaps the effective values. On error the previous config
 // is retained and the error is returned. This supports the orchestrator's
@@ -210,6 +286,7 @@ func (m *Manager) Reload() error {
 	if err != nil {
 		m.mu.Lock()
 		m.lastLoadErr = err
+		m.recordLoadLocked(err)
 		m.mu.Unlock()
 		return err
 	}
@@ -218,6 +295,7 @@ func (m *Manager) Reload() error {
 		if err := m.validateFunc(cfg); err != nil {
 			m.mu.Lock()
 			m.lastLoadErr = err
+			m.recordLoadLocked(err)
 			m.mu.Unlock()
 			return err
 		}
@@ -228,6 +306,7 @@ func (m *Manager) Reload() error {
 	m.currentPrompt = tmpl
 	m.currentTemplateIndex = index
 	m.lastLoadErr = nil
+	m.recordLoadLocked(nil)
 	m.mu.Unlock()
 	return nil
 }
@@ -324,7 +403,9 @@ func (m *Manager) reload() {
 		logger.Error("workflow reload failed", slog.Any("error", err), slog.String("path", m.path))
 		m.mu.Lock()
 		m.lastLoadErr = err
+		m.recordLoadLocked(err)
 		m.mu.Unlock()
+		m.notifyLoad()
 		return
 	}
 
@@ -334,7 +415,9 @@ func (m *Manager) reload() {
 				slog.Any("error", err), slog.String("path", m.path))
 			m.mu.Lock()
 			m.lastLoadErr = err
+			m.recordLoadLocked(err)
 			m.mu.Unlock()
+			m.notifyLoad()
 			return
 		}
 	}
@@ -344,12 +427,14 @@ func (m *Manager) reload() {
 	m.currentPrompt = tmpl
 	m.currentTemplateIndex = index
 	m.lastLoadErr = nil
+	m.recordLoadLocked(nil)
 	m.mu.Unlock()
 	logger.Info("workflow reloaded", slog.String("path", m.path))
+	m.notifyLoad()
 }
 
 // loadPipeline runs the full Load -> NewServiceConfig -> dispatch
-// build -> Parse pipeline. Returns the parsed service config, the
+// build -> partials -> Parse pipeline. Returns the parsed service config, the
 // body template, and the per-template index keyed by resolved
 // absolute path (empty key holds the body template). On any error
 // the caller retains the previous values and surfaces the error via
@@ -360,7 +445,39 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 		return config.ServiceConfig{}, nil, nil, err
 	}
 
-	cfg, err := config.NewServiceConfig(wf.Config)
+	cfg, err := config.NewServiceConfig(wf.Config, config.WithRetiredAgents(m.retiredAgents))
+	if err != nil {
+		return config.ServiceConfig{}, nil, nil, err
+	}
+
+	probe := m.agentKindProbe
+	if probe == nil {
+		// Permissive default: callers without an orchestrator
+		// dependency (dryrun, tests) accept any agent kind. The
+		// startup preflight rejects unknown kinds as a second gate.
+		probe = func(string) bool { return true }
+	}
+
+	dispatchCfg, err := config.BuildDispatchConfig(wf.Config, filepath.Dir(m.path), probe, cfg.Agent.Kind)
+	if err != nil {
+		return config.ServiceConfig{}, nil, nil, err
+	}
+	cfg.SetDispatch(dispatchCfg)
+	if err := config.ValidateNextRequiresHandoff(dispatchCfg, cfg.Tracker.HandoffState); err != nil {
+		return config.ServiceConfig{}, nil, nil, err
+	}
+
+	partials, err := loadPartials(dispatchCfg.Partials)
+	if err != nil {
+		return config.ServiceConfig{}, nil, nil, err
+	}
+
+	tmpl, err := prompt.ParseWithPartials(wf.PromptTemplate, m.path, wf.FrontMatterLines, partials)
+	if err != nil {
+		return config.ServiceConfig{}, nil, nil, err
+	}
+
+	index, err := loadPerRuleTemplates(dispatchCfg, tmpl, partials)
 	if err != nil {
 		return config.ServiceConfig{}, nil, nil, err
 	}
@@ -368,7 +485,7 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 	// Advisory: a label-review dispatch renders the frozen work template, so
 	// without a {{ if .label_review }} branch it posts no review. This scan
 	// is best-effort and never fails the load.
-	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.ReviewLabel != "" && !strings.Contains(wf.PromptTemplate, "label_review") {
+	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.ReviewLabel != "" && !tmpl.Mentions("label_review") {
 		cfg.AddAdvisories(config.Advisory{
 			Check:   "reactions.label_commands.review_branch_missing",
 			Text:    "reactions.label_commands is active with a review label, but the prompt template has no {{ if .label_review }} branch; a label-review dispatch posts no review",
@@ -384,7 +501,7 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 	// content-write scope, so without a {{ if .label_fix }} branch it runs
 	// the normal work prompt against a real checkout with push capability.
 	// This scan is best-effort and never fails the load.
-	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.FixLabel != "" && !strings.Contains(wf.PromptTemplate, "label_fix") {
+	if cfg.LabelCommands.Provider != "" && cfg.LabelCommands.FixLabel != "" && !tmpl.Mentions("label_fix") {
 		cfg.AddAdvisories(config.Advisory{
 			Check:   "reactions.label_commands.fix_branch_missing",
 			Text:    "reactions.label_commands is active with a fix label, but the prompt template has no {{ if .label_fix }} branch; a label-fix dispatch runs the normal work prompt against a checkout that can push",
@@ -396,42 +513,50 @@ func (m *Manager) loadPipeline() (config.ServiceConfig, *prompt.Template, map[st
 		})
 	}
 
-	probe := m.agentKindProbe
-	if probe == nil {
-		// Permissive default: callers without an orchestrator
-		// dependency (dryrun, tests) accept any agent kind. The
-		// startup preflight rejects unknown kinds as a second gate.
-		probe = func(string) bool { return true }
-	}
-
-	dispatchCfg, err := config.BuildDispatchConfig(wf.Config, filepath.Dir(m.path), probe)
-	if err != nil {
-		return config.ServiceConfig{}, nil, nil, err
-	}
-	cfg.SetDispatch(dispatchCfg)
-
 	if m.advisoryFunc != nil {
 		cfg.AddAdvisories(m.advisoryFunc(cfg)...)
-	}
-
-	tmpl, err := prompt.Parse(wf.PromptTemplate, m.path, wf.FrontMatterLines)
-	if err != nil {
-		return config.ServiceConfig{}, nil, nil, err
-	}
-
-	index, err := loadPerRuleTemplates(dispatchCfg, tmpl)
-	if err != nil {
-		return config.ServiceConfig{}, nil, nil, err
 	}
 
 	return cfg, tmpl, index, nil
 }
 
+// loadPartials reads and compiles every partial of the dispatch config.
+// It returns a nil [*prompt.Partials] when the config selects none.
+func loadPartials(selected []config.DispatchPartial) (*prompt.Partials, error) {
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	files := make([]prompt.PartialFile, 0, len(selected))
+	for _, p := range selected {
+		raw, err := os.ReadFile(p.Path) //nolint:gosec // path was resolved and validated by BuildDispatchConfig
+		if err != nil {
+			return nil, &prompt.TemplateError{
+				Kind:   prompt.ErrTemplateParse,
+				Source: p.Path,
+				Err:    fmt.Errorf("read partial: %w", err),
+			}
+		}
+		if hasFrontMatterMarker(raw) {
+			return nil, &prompt.TemplateError{
+				Kind:   prompt.ErrTemplateParse,
+				Source: p.Path,
+				Err:    fmt.Errorf("partials must not carry front matter"),
+			}
+		}
+		files = append(files, prompt.PartialFile{
+			Path: p.Path,
+			Name: p.Name,
+			Body: string(bytes.TrimPrefix(raw, []byte(utf8BOM))),
+		})
+	}
+	return prompt.ParsePartials(files)
+}
+
 // loadPerRuleTemplates reads and parses every unique per-rule
 // template referenced by the dispatch config. The returned index is
 // keyed by resolved absolute path; the empty-string key holds the
-// already-parsed body template.
-func loadPerRuleTemplates(dispatchCfg config.DispatchConfig, body *prompt.Template) (map[string]*prompt.Template, error) {
+// already-parsed body template. Every template compiles against partials.
+func loadPerRuleTemplates(dispatchCfg config.DispatchConfig, body *prompt.Template, partials *prompt.Partials) (map[string]*prompt.Template, error) {
 	index := map[string]*prompt.Template{"": body}
 
 	unique := make(map[string]struct{})
@@ -461,7 +586,7 @@ func loadPerRuleTemplates(dispatchCfg config.DispatchConfig, body *prompt.Templa
 				Err:    fmt.Errorf("per-rule templates must not carry front matter"),
 			}
 		}
-		parsed, err := prompt.Parse(string(bodyBytes), absPath, 0)
+		parsed, err := prompt.ParseWithPartials(string(bodyBytes), absPath, 0, partials)
 		if err != nil {
 			return nil, err
 		}

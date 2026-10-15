@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -71,6 +72,18 @@ func TestUpsertParkedIssue_RoundTrip(t *testing.T) {
 		Label:        "needs-human",
 		LabelApplied: false,
 		ParkedAt:     "2026-08-17T00:00:00Z",
+		IssueTitle:   "Flaky login redirect",
+		IssueURL:     "https://tracker.example.test/browse/PROJ-1",
+
+		IssueType:            "Bug",
+		IssueLabels:          []string{"feature", "stage-implement"},
+		RuleName:             "implement",
+		AgentKind:            "claude-code",
+		ConfiguredModel:      "model-a",
+		StagePrevious:        "plan",
+		StagePreviousOutcome: "succeeded",
+		ChainID:              "chain-1",
+		DispatchedAt:         "2026-08-16T22:00:00.123456789Z",
 	}
 	if err := s.UpsertParkedIssue(ctx, entry); err != nil {
 		t.Fatalf("UpsertParkedIssue: %v", err)
@@ -83,7 +96,7 @@ func TestUpsertParkedIssue_RoundTrip(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("ListParkedIssues() length = %d, want 1", len(rows))
 	}
-	if rows[0] != entry {
+	if !reflect.DeepEqual(rows[0], entry) {
 		t.Errorf("ListParkedIssues()[0] = %+v, want %+v", rows[0], entry)
 	}
 }
@@ -98,15 +111,20 @@ func TestUpsertParkedIssue_RewritesExistingRow(t *testing.T) {
 	if err := s.UpsertParkedIssue(ctx, ParkedIssue{
 		IssueID: issueID, Identifier: "PROJ-2", Reason: "agent_blocked",
 		ParkedState: "In Progress", Label: "needs-human", ParkedAt: "2026-08-17T00:00:00Z",
+		IssueTitle: "Old title", IssueURL: "https://tracker.example.test/browse/OLD",
+		IssueType: "Bug", IssueLabels: []string{"old"}, RuleName: "implement", AgentKind: "claude-code",
+		ConfiguredModel: "model-a", StagePrevious: "plan", StagePreviousOutcome: "succeeded",
+		ChainID: "chain-1", DispatchedAt: "2026-08-16T22:00:00Z",
 	}); err != nil {
 		t.Fatalf("UpsertParkedIssue (initial): %v", err)
 	}
 
-	if err := s.UpsertParkedIssue(ctx, ParkedIssue{
+	rewritten := ParkedIssue{
 		IssueID: issueID, Identifier: "PROJ-2", Reason: "handoff_absence",
 		ParkedState: "Blocked", Label: "operator-needed", LabelApplied: true,
-		ParkedAt: "2026-08-17T01:00:00Z",
-	}); err != nil {
+		ParkedAt: "2026-08-17T01:00:00Z", IssueTitle: "New title", IssueURL: "https://tracker.example.test/browse/PROJ-2",
+	}
+	if err := s.UpsertParkedIssue(ctx, rewritten); err != nil {
 		t.Fatalf("UpsertParkedIssue (rewrite): %v", err)
 	}
 
@@ -117,8 +135,8 @@ func TestUpsertParkedIssue_RewritesExistingRow(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("ListParkedIssues() length = %d, want 1 (rewrite, not a duplicate row)", len(rows))
 	}
-	if rows[0].Reason != "handoff_absence" || !rows[0].LabelApplied {
-		t.Errorf("ListParkedIssues()[0] = %+v, want the rewritten row", rows[0])
+	if !reflect.DeepEqual(rows[0], rewritten) {
+		t.Errorf("ListParkedIssues()[0] = %+v, want %+v", rows[0], rewritten)
 	}
 }
 

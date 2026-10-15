@@ -252,6 +252,223 @@ func TestResolveLaunchTarget(t *testing.T) {
 	}
 }
 
+func makeArgvParams(t *testing.T, workspace, sshHost string, argv []string) domain.StartSessionParams {
+	t.Helper()
+	return domain.StartSessionParams{
+		WorkspacePath: workspace,
+		SSHHost:       sshHost,
+		AgentConfig:   domain.AgentConfig{CommandArgv: argv},
+	}
+}
+
+func spacedDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "dir with space")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir(%q): %v", dir, err)
+	}
+	return dir
+}
+
+func TestResolveLaunchTarget_CommandArgvLocal(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	binPath := agenttest.FakeRuntime(t, spacedDir(t), "agent", agenttest.OutputScenario, agenttest.Output{})
+	rest := []string{"one two", "$HOME", "it's", ""}
+
+	t.Run("element zero resolves whole and the rest are the arguments", func(t *testing.T) {
+		t.Parallel()
+
+		argv := append([]string{binPath}, rest...)
+
+		got, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "", argv), "sortie-no-such-binary-xyzzy")
+
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget(argv %q) error = %v", argv, agentErr)
+		}
+		if got.Command != binPath {
+			t.Errorf("LaunchTarget.Command = %q, want %q", got.Command, binPath)
+		}
+		if !slices.Equal(got.Args, rest) {
+			t.Errorf("LaunchTarget.Args = %q, want %q", got.Args, rest)
+		}
+		if got.RemoteCommand != "" {
+			t.Errorf("LaunchTarget.RemoteCommand = %q, want empty in local mode", got.RemoteCommand)
+		}
+	})
+
+	t.Run("arguments are a copy of the list", func(t *testing.T) {
+		t.Parallel()
+
+		argv := []string{binPath, "first"}
+
+		got, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "", argv), "")
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget(argv %q) error = %v", argv, agentErr)
+		}
+		argv[1] = "changed"
+
+		if !slices.Equal(got.Args, []string{"first"}) {
+			t.Errorf("LaunchTarget.Args = %q after the caller changed its list, want %q", got.Args, []string{"first"})
+		}
+	})
+
+	t.Run("a single element list has no arguments", func(t *testing.T) {
+		t.Parallel()
+
+		got, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "", []string{binPath}), "")
+
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget error = %v", agentErr)
+		}
+		if len(got.Args) != 0 {
+			t.Errorf("LaunchTarget.Args = %q, want none", got.Args)
+		}
+	})
+
+	t.Run("missing executable draws the not-found error", func(t *testing.T) {
+		t.Parallel()
+
+		_, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "", []string{filepath.Join(spacedDir(t), "absent"), "x"}), "")
+
+		if agentErr == nil {
+			t.Fatal("ResolveLaunchTarget returned no error, want ErrAgentNotFound")
+		}
+		if agentErr.Kind != domain.ErrAgentNotFound {
+			t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrAgentNotFound)
+		}
+	})
+
+	t.Run("list wins over the default command", func(t *testing.T) {
+		t.Parallel()
+
+		got, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "", []string{binPath}), "sortie-no-such-binary-xyzzy")
+
+		if agentErr != nil {
+			t.Fatalf("ResolveLaunchTarget error = %v, want the list to launch", agentErr)
+		}
+		if got.Command != binPath {
+			t.Errorf("LaunchTarget.Command = %q, want %q", got.Command, binPath)
+		}
+	})
+}
+
+func TestResolveLaunchTarget_CommandArgvRemote(t *testing.T) {
+	workspace := t.TempDir()
+	t.Setenv("PATH", fakeSSHDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	argv := []string{"/opt/dir with space/agent", "one two", "$HOME", "it's", ""}
+
+	got, agentErr := ResolveLaunchTarget(makeArgvParams(t, workspace, "user@host", argv), "claude")
+
+	if agentErr != nil {
+		t.Fatalf("ResolveLaunchTarget(argv %q) error = %v", argv, agentErr)
+	}
+	if want := sshutil.QuoteArgv(argv); got.RemoteCommand != want {
+		t.Errorf("LaunchTarget.RemoteCommand = %q, want %q", got.RemoteCommand, want)
+	}
+	if got.SSHHost != "user@host" {
+		t.Errorf("LaunchTarget.SSHHost = %q, want %q", got.SSHHost, "user@host")
+	}
+	if got.Args != nil {
+		t.Errorf("LaunchTarget.Args = %q, want nil in ssh mode", got.Args)
+	}
+}
+
+func TestAppendCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		command domain.AgentCommand
+		remote  bool
+		args    []string
+		want    domain.AgentCommand
+	}{
+		{
+			name:    "list stays a list locally",
+			command: domain.AgentCommand{Argv: []string{"agent", "x y"}},
+			args:    []string{"acp", "-a"},
+			want:    domain.AgentCommand{Argv: []string{"agent", "x y", "acp", "-a"}},
+		},
+		{
+			name:    "list stays a list remotely",
+			command: domain.AgentCommand{Argv: []string{"agent"}},
+			remote:  true,
+			args:    []string{"acp", "-a"},
+			want:    domain.AgentCommand{Argv: []string{"agent", "acp", "-a"}},
+		},
+		{
+			name:    "local string with plain arguments stays a string",
+			command: domain.AgentCommand{Line: "agent --fast"},
+			args:    []string{"acp", "--model", "m-1"},
+			want:    domain.AgentCommand{Line: "agent --fast acp --model m-1"},
+		},
+		{
+			name:    "local string drops trailing whitespace before the arguments",
+			command: domain.AgentCommand{Line: "agent \t\n"},
+			args:    []string{"acp"},
+			want:    domain.AgentCommand{Line: "agent acp"},
+		},
+		{
+			name:    "local string with a spaced argument becomes the list of its words",
+			command: domain.AgentCommand{Line: "agent  --fast"},
+			args:    []string{"acp", "--agent", "space name"},
+			want:    domain.AgentCommand{Argv: []string{"agent", "--fast", "acp", "--agent", "space name"}},
+		},
+		{
+			name:    "local string with an empty argument becomes a list",
+			command: domain.AgentCommand{Line: "agent"},
+			args:    []string{"--agent", ""},
+			want:    domain.AgentCommand{Argv: []string{"agent", "--agent", ""}},
+		},
+		{
+			name:    "local string with a tab in an argument becomes a list",
+			command: domain.AgentCommand{Line: "agent"},
+			args:    []string{"a\tb"},
+			want:    domain.AgentCommand{Argv: []string{"agent", "a\tb"}},
+		},
+		{
+			name:    "local string with a non-breaking space in an argument becomes a list",
+			command: domain.AgentCommand{Line: "agent"},
+			args:    []string{"a b"},
+			want:    domain.AgentCommand{Argv: []string{"agent", "a b"}},
+		},
+		{
+			name:    "remote string places arguments in front of the terminator",
+			command: domain.AgentCommand{Line: "agent;"},
+			remote:  true,
+			args:    []string{"acp", "--agent", "space name", ""},
+			want:    domain.AgentCommand{Line: `agent acp --agent 'space name' '' ;`},
+		},
+		{
+			name:    "remote string keeps a spaced argument in one word",
+			command: domain.AgentCommand{Line: "agent"},
+			remote:  true,
+			args:    []string{"--agent", "it's"},
+			want:    domain.AgentCommand{Line: `agent --agent 'it'\''s'`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := AppendCommandArgs(tt.command, tt.remote, tt.args...)
+
+			if got.Line != tt.want.Line || !slices.Equal(got.Argv, tt.want.Argv) {
+				t.Errorf("AppendCommandArgs(%+v, remote=%v, %q) = %+v, want %+v", tt.command, tt.remote, tt.args, got, tt.want)
+			}
+			if !tt.remote && got.Line != "" {
+				wantWords := append(strings.Fields(tt.command.Line), tt.args...)
+				if gotWords := strings.Fields(got.Line); !slices.Equal(gotWords, wantWords) {
+					t.Errorf("strings.Fields(AppendCommandArgs(%+v, %q).Line) = %q, want the base words then the arguments %q", tt.command, tt.args, gotWords, wantWords)
+				}
+			}
+		})
+	}
+}
+
 // TestResolveLaunchTarget_SSHEnvNames asserts that ResolveLaunchTarget
 // sets LaunchTarget.SSHEnvNames from params.SSHEnvNames in SSH mode and
 // leaves it nil in local mode, even when the caller sets it.
@@ -340,6 +557,48 @@ func TestLaunchTarget_SSHOptions(t *testing.T) {
 	})
 }
 
+func TestLaunchTarget_SSHOptions_WithheldEnv(t *testing.T) {
+	// Not parallel: sets process environment via t.Setenv.
+	t.Setenv("SSH_WITHHELD_TEST_KEPT", "kept-value")
+	t.Setenv("SSH_WITHHELD_TEST_HELD", "held-value")
+	t.Setenv("SSH_WITHHELD_TEST_SETTING", "held-setting-value")
+
+	withheld := []string{"SSH_WITHHELD_TEST_HELD", "SSH_WITHHELD_TEST_SETTING", "SSH_WITHHELD_TEST_ABSENT"}
+	target := LaunchTarget{
+		SSHEnvNames: []string{"SSH_WITHHELD_TEST_KEPT", "SSH_WITHHELD_TEST_HELD", "SSH_WITHHELD_TEST_SETTING"},
+		WithheldEnv: slices.Clone(withheld),
+	}
+	settings := []sshutil.EnvVar{
+		{Name: "SSH_WITHHELD_TEST_SETTING", Value: "managed"},
+		{Name: "SSH_WITHHELD_TEST_OTHER", Value: "other"},
+	}
+
+	got := target.SSHOptions(settings...)
+
+	wantEnv := []sshutil.EnvVar{
+		{Name: "SSH_WITHHELD_TEST_KEPT", Value: "kept-value"},
+		{Name: "SSH_WITHHELD_TEST_OTHER", Value: "other"},
+	}
+	if !slices.Equal(got.Env, wantEnv) {
+		t.Errorf("SSHOptions(...).Env = %+v, want %+v", got.Env, wantEnv)
+	}
+	if !slices.Equal(got.Unset, withheld) {
+		t.Errorf("SSHOptions(...).Unset = %v, want %v", got.Unset, withheld)
+	}
+
+	got.Unset[0] = "MUTATED"
+	if !slices.Equal(target.WithheldEnv, withheld) {
+		t.Errorf("LaunchTarget.WithheldEnv = %v after the caller edited Unset, want %v", target.WithheldEnv, withheld)
+	}
+
+	t.Run("no withheld names yields nil Unset", func(t *testing.T) {
+		var empty LaunchTarget
+		if got := empty.SSHOptions(); got.Unset != nil {
+			t.Errorf("SSHOptions() Unset = %v, want nil", got.Unset)
+		}
+	})
+}
+
 func TestLaunchTarget_BindWorkspace(t *testing.T) {
 	t.Parallel()
 
@@ -387,6 +646,64 @@ func TestLaunchTarget_BindWorkspace(t *testing.T) {
 		want := setPWD(os.Environ(), ws)
 		if !slices.Equal(cmd.Env, want) {
 			t.Errorf("BindWorkspace().Env = %v, want os.Environ() plus PWD=%s", cmd.Env, ws)
+		}
+	})
+
+	t.Run("withheld entries are removed and exactly one PWD remains", func(t *testing.T) {
+		t.Parallel()
+		ws := t.TempDir()
+		target := LaunchTarget{WorkspacePath: ws, WithheldEnv: []string{"HELD", "ABSENT"}}
+		env := []string{"FOO=bar", "HELD=1", "PWD=/some/other/path", "HELD=2", "HELD_NOT=3"}
+		original := slices.Clone(env)
+		cmd := exec.Command("true")
+		cmd.Env = env
+
+		if agentErr := target.BindWorkspace(cmd); agentErr != nil {
+			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
+		}
+
+		want := []string{"FOO=bar", "HELD_NOT=3", "PWD=" + ws}
+		if !slices.Equal(cmd.Env, want) {
+			t.Errorf("BindWorkspace().Env = %v, want %v", cmd.Env, want)
+		}
+		if !slices.Equal(env, original) {
+			t.Errorf("caller's env slice = %v after BindWorkspace, want it unchanged: %v", env, original)
+		}
+	})
+
+	t.Run("nil Env drops withheld names from the inherited environment", func(t *testing.T) {
+		t.Parallel()
+		ws := t.TempDir()
+		const name = "PATH"
+		if _, ok := os.LookupEnv(name); !ok {
+			t.Skipf("%s is not set in the test environment", name)
+		}
+		target := LaunchTarget{WorkspacePath: ws, WithheldEnv: []string{name}}
+		cmd := exec.Command("true")
+
+		if agentErr := target.BindWorkspace(cmd); agentErr != nil {
+			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
+		}
+
+		if slices.ContainsFunc(cmd.Env, func(entry string) bool { return isEnvEntryNamed(entry, name) }) {
+			t.Errorf("BindWorkspace().Env still holds an entry named %s", name)
+		}
+	})
+
+	t.Run("failed verification leaves Env untouched", func(t *testing.T) {
+		t.Parallel()
+		target := LaunchTarget{WorkspacePath: filepath.Join(t.TempDir(), "missing"), WithheldEnv: []string{"HELD"}}
+		env := []string{"FOO=bar", "HELD=1", "PWD=/some/other/path"}
+		cmd := exec.Command("true")
+		cmd.Env = slices.Clone(env)
+
+		agentErr := target.BindWorkspace(cmd)
+
+		if agentErr == nil {
+			t.Fatal("BindWorkspace(missing workspace) error = nil, want non-nil")
+		}
+		if !slices.Equal(cmd.Env, env) {
+			t.Errorf("BindWorkspace().Env = %v after a failed bind, want %v", cmd.Env, env)
 		}
 	})
 
@@ -527,5 +844,36 @@ func TestAuxiliaryTimeout(t *testing.T) {
 		if got := AuxiliaryTimeout(domain.AgentConfig{ReadTimeoutMS: tt.readTimeoutMS}); got != tt.want {
 			t.Errorf("AuxiliaryTimeout(ReadTimeoutMS=%d) = %v, want %v", tt.readTimeoutMS, got, tt.want)
 		}
+	}
+}
+
+func TestIsEnvEntryNamed(t *testing.T) {
+	t.Parallel()
+
+	foldsCase := runtime.GOOS == "windows"
+
+	tests := []struct {
+		name  string
+		entry string
+		want  bool
+	}{
+		{name: "exact name", entry: "HELD=1", want: true},
+		{name: "empty value", entry: "HELD=", want: true},
+		{name: "value containing equals", entry: "HELD=a=b", want: true},
+		{name: "other case", entry: "held=1", want: foldsCase},
+		{name: "longer name", entry: "HELD_NOT=1", want: false},
+		{name: "prefix of the name", entry: "HEL=1", want: false},
+		{name: "no equals sign", entry: "HELD", want: false},
+		{name: "name only in the value", entry: "OTHER=HELD", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := isEnvEntryNamed(tt.entry, "HELD"); got != tt.want {
+				t.Errorf("isEnvEntryNamed(%q, %q) = %v, want %v", tt.entry, "HELD", got, tt.want)
+			}
+		})
 	}
 }

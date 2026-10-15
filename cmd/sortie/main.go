@@ -30,6 +30,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -42,7 +43,6 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/clientprotocol"
 	_ "github.com/sortie-ai/sortie/internal/agent/codex"
 	_ "github.com/sortie-ai/sortie/internal/agent/copilot"
-	_ "github.com/sortie-ai/sortie/internal/agent/kiro"
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
 	_ "github.com/sortie-ai/sortie/internal/agent/pi"
@@ -61,6 +61,10 @@ import (
 // to drain active connections on graceful shutdown. Overridden in tests to
 // exercise the shutdown-error path without a 5-second wait.
 var serverShutdownTimeout = 5 * time.Second
+
+// startupDone, when set, is called once startup has finished and the
+// orchestrator is about to run. Tests set it to stop [run] without a deadline.
+var startupDone func()
 
 // abandonCh is created by main before [run] is called, and the signal
 // goroutine closes it on a second interrupt so every in-flight shutdown
@@ -101,8 +105,7 @@ func buildAgentAdapterCache(cfg config.ServiceConfig, defaultAdapter domain.Agen
 			)
 			continue
 		}
-		cfgMap := config.AgentAdapterConfig(cfg, kind)
-		adapter, err := ctor(cfgMap)
+		adapter, err := ctor()
 		if err != nil {
 			log.Warn("skipping agent adapter cache entry, construction failed",
 				slog.String("kind", kind),
@@ -289,6 +292,7 @@ func handleSignals(sigCh <-chan os.Signal, abandon chan struct{}) {
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	startedAt := time.Now()
 	br, code := boot(ctx, bootParams{args: args, stdout: stdout, stderr: stderr})
 	if code != 0 || br.mgr == nil {
 		return code
@@ -362,6 +366,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		totals,
 	)
 	state.TokenWarningThreshold = br.cfg.Agent.TokenWarningThreshold()
+	state.MaxSessions = br.cfg.Agent.MaxSessions
 	orchestrator.PopulateRetries(state, pendingRetries, br.logger)
 
 	parkedRows, err := store.ListParkedIssues(ctx)
@@ -371,6 +376,13 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		orchestrator.PopulateParked(state, parkedRows, br.logger)
 	}
 
+	stageHopRows, err := store.ListStageHops(ctx)
+	if err != nil {
+		br.logger.Warn("failed to load stage hop records, starting with none", slog.Any("error", err))
+	} else {
+		orchestrator.PopulateStageHops(state, stageHopRows, br.logger)
+	}
+
 	budgetHoldNoticeRows, err := store.ListBudgetHoldNotices(ctx)
 	if err != nil {
 		br.logger.Warn("failed to load budget hold notices, starting with none", slog.Any("error", err))
@@ -378,13 +390,19 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		orchestrator.PopulateBudgetHoldNotices(state, budgetHoldNoticeRows, br.logger)
 	}
 
+	attentionAcknowledgementRows, err := store.ListAttentionAcknowledgements(ctx)
+	if err != nil {
+		br.logger.Warn("failed to load attention acknowledgements, starting with none", slog.Any("error", err))
+	} else {
+		orchestrator.PopulateAttentionAcknowledgements(state, attentionAcknowledgementRows, br.logger)
+	}
+
 	agentCtor, err := registry.Agents.Get(br.cfg.Agent.Kind)
 	if err != nil {
 		br.logger.Error("unknown agent kind", slog.String("kind", br.cfg.Agent.Kind), slog.Any("error", err))
 		return 1
 	}
-	agentCfgMap := config.AgentAdapterConfig(br.cfg, br.cfg.Agent.Kind)
-	agentAdapter, err := agentCtor(agentCfgMap)
+	agentAdapter, err := agentCtor()
 	if err != nil {
 		br.logger.Error("failed to construct agent adapter", slog.Any("error", err))
 		return 1
@@ -485,6 +503,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	}
 
 	var scmAdapter domain.SCMAdapter
+	var scmProvider string
 	var reviewConfig orchestrator.ReviewReactionConfig
 	var autoMergeConfig orchestrator.AutoMergeReactionConfig
 	var autoMergeConfigured bool
@@ -530,6 +549,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 	if len(activeKindNames) > 0 {
 		provider := activeProviders[0]
+		scmProvider = provider
 		scmCtor, scmErr := registry.SCMAdapters.Get(provider)
 		if scmErr != nil {
 			br.logger.Error("unknown SCM adapter kind",
@@ -679,9 +699,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 
 		if mergeCompletionActive {
-			trackerMeta, _ := registry.Trackers.Meta(br.cfg.Tracker.Kind)
 			var mcErr error
-			mergeCompletionConfig, mcErr = orchestrator.BuildMergeCompletionReactionConfig(mergeCompletionRC, br.cfg.Tracker, trackerMeta)
+			mergeCompletionConfig, mcErr = orchestrator.BuildMergeCompletionReactionConfig(mergeCompletionRC, br.cfg.Tracker)
 			if mcErr != nil {
 				br.logger.Error("invalid merge_completion reaction config", slog.Any("error", mcErr))
 				return 1
@@ -699,33 +718,35 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	recoveryEnabled := br.cfg.Tracker.HandoffState != "" && (ciProvider != nil || scmAdapter != nil)
 	recoveryOutcome := orchestrator.PendingReactionRecoveryResult{}
 	var recoveryErr error
+	recoveryNow := time.Now().UTC()
+	recoveryLookback := orchestrator.PendingReactionRecoveryLookback
+	recoveryParams := orchestrator.PendingReactionRecoveryParams{
+		WorkspaceRoot:                     br.cfg.Workspace.Root,
+		TrackerAdapter:                    br.trackerAdapter,
+		HandoffState:                      br.cfg.Tracker.HandoffState,
+		TerminalStates:                    br.cfg.Tracker.TerminalStates,
+		CIProvider:                        ciProvider,
+		SCMAdapter:                        scmAdapter,
+		AutoMergeReactionConfigured:       autoMergeConfigured,
+		ReviewReactionConfigured:          reviewActive,
+		BotReviewReactionConfigured:       botReviewConfigured,
+		MergeConflictReactionConfigured:   mergeConflictConfigured,
+		LabelReviewReactionConfigured:     labelReviewConfigured,
+		LabelFixReactionConfigured:        labelFixConfigured,
+		MergeCompletionReactionConfigured: mergeCompletionConfigured,
+		RecoveryLookback:                  recoveryLookback,
+		MaxCandidates:                     orchestrator.PendingReactionRecoveryMaxCandidates,
+		NowFunc: func() time.Time {
+			return recoveryNow
+		},
+		Logger: br.logger,
+	}
 	if recoveryEnabled {
-		recoveryNow := time.Now().UTC()
-		recoveryLookback := orchestrator.PendingReactionRecoveryLookback
 		recoveryCutoff := recoveryNow.Add(-recoveryLookback)
 		var recoveryRuns []persistence.RunHistory
 		recoveryRuns, recoveryErr = store.LoadLatestSuccessfulRunsForReactionRecovery(ctx, recoveryCutoff, orchestrator.PendingReactionRecoveryMaxCandidates)
 		if recoveryErr == nil {
-			recoveryOutcome, recoveryErr = orchestrator.RecoverPendingReactions(ctx, state, recoveryRuns, orchestrator.PendingReactionRecoveryParams{
-				WorkspaceRoot:                     br.cfg.Workspace.Root,
-				TrackerAdapter:                    br.trackerAdapter,
-				HandoffState:                      br.cfg.Tracker.HandoffState,
-				TerminalStates:                    br.cfg.Tracker.TerminalStates,
-				CIProvider:                        ciProvider,
-				SCMAdapter:                        scmAdapter,
-				AutoMergeReactionConfigured:       autoMergeConfigured,
-				BotReviewReactionConfigured:       botReviewConfigured,
-				MergeConflictReactionConfigured:   mergeConflictConfigured,
-				LabelReviewReactionConfigured:     labelReviewConfigured,
-				LabelFixReactionConfigured:        labelFixConfigured,
-				MergeCompletionReactionConfigured: mergeCompletionConfigured,
-				RecoveryLookback:                  recoveryLookback,
-				MaxCandidates:                     orchestrator.PendingReactionRecoveryMaxCandidates,
-				NowFunc: func() time.Time {
-					return recoveryNow
-				},
-				Logger: br.logger,
-			})
+			recoveryOutcome, recoveryErr = orchestrator.RecoverPendingReactions(ctx, state, recoveryRuns, recoveryParams)
 		}
 	}
 	recoveryLogAttrs := []any{
@@ -750,6 +771,18 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	} else {
 		recoveryLogAttrs = append(recoveryLogAttrs, slog.Bool("success", true))
 		br.logger.Info("pending reaction recovery completed", recoveryLogAttrs...)
+	}
+
+	restored, restoreErr := orchestrator.RestoreReactionEscalations(ctx, state, store, recoveryParams)
+	restoreLogAttrs := []any{
+		slog.Int("applied", restored.Applied),
+		slog.Int("rebuilt", restored.Rebuilt),
+		slog.Int("ended", restored.Ended),
+	}
+	if restoreErr != nil {
+		br.logger.Error("reaction escalation restore failed", append(restoreLogAttrs, slog.Any("error", restoreErr))...)
+	} else {
+		br.logger.Info("reaction escalation restore completed", restoreLogAttrs...)
 	}
 
 	// Attempt to bind the HTTP server before constructing metrics so
@@ -795,6 +828,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	// constructible is closed before the registry is returned: the worker
 	// reads only tool metadata, never executing the tools, so the
 	// connection is not needed beyond construction.
+	//
+	// The notification entries come from the live configuration, so a reload
+	// that adds or removes an agent.message subscriber changes what the next
+	// session advertises.
 	sessionToolFunc := func(ctx context.Context, issueID, workspacePath string) (*domain.ToolRegistry, error) {
 		sessionTools, err := BuildSessionToolRegistry(ctx, br.logger, SessionToolParams{
 			TrackerAdapter:        br.trackerAdapter,
@@ -803,7 +840,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			MaxTokens:             br.cfg.Agent.MaxTokens,
 			MaxSessions:           br.cfg.Agent.MaxSessions,
 			TokenWarningThreshold: br.mgr.Config().Agent.TokenWarningThreshold(),
-			Notifications:         br.cfg.Notifications.Backends,
+			Notifications:         br.mgr.Config().Notifications.Backends,
 			IssueID:               issueID,
 			WorkspacePath:         workspacePath,
 		})
@@ -820,6 +857,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		State:                             state,
 		Logger:                            br.logger,
 		TrackerAdapter:                    br.trackerAdapter,
+		Router:                            route.NewRouter(br.trackerAdapter, registry.Notifiers.Get),
 		AgentAdapter:                      agentAdapter,
 		AgentAdapterByKind:                agentAdapterByKind,
 		WorkflowManager:                   br.mgr,
@@ -832,7 +870,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		DBPath:                            dbPath,
 		CIProvider:                        ciProvider,
 		SCMAdapter:                        scmAdapter,
+		SCMProvider:                       scmProvider,
 		ReviewConfig:                      reviewConfig,
+		ReviewConfigured:                  reviewActive,
 		AutoMergeConfig:                   autoMergeConfig,
 		AutoMergeReactionConfigured:       autoMergeConfigured,
 		BotReviewConfig:                   botReviewConfig,
@@ -852,50 +892,36 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	var srv *server.Server
 	if serverEnabled {
 		rawTokenRates, tokenRatesPresent := br.cfg.ExtensionValue("token_rates")
-		tokenRates, _ := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
+		tokenRates, rateWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
 		addr := net.JoinHostPort(br.serverHost, strconv.Itoa(br.serverPort))
 		srv = server.New(server.Params{
 			SnapshotFn:       o.SnapshotFunc(),
 			RefreshFn:        o.RefreshFunc(),
+			RetryNowFn:       o.RetryNowFunc(),
+			AcknowledgeFn:    o.AcknowledgeFunc(),
+			CheckNowFn:       o.CheckNowFunc(),
+			WorkflowShapeFn:  o.WorkflowShape,
+			HealthFn:         o.Health,
 			Logger:           br.logger,
 			Addr:             addr,
 			Version:          Version,
-			StartedAt:        time.Now(),
-			SlotFunc:         func() int { return br.mgr.Config().Agent.MaxConcurrentAgents },
+			StartedAt:        startedAt,
 			MetricsRegistry:  promMetrics.Registry(),
 			DBPingFn:         func(ctx context.Context) error { return store.Ping(ctx) },
 			PreflightFn:      o.PreflightOK,
 			WorkflowLoadedFn: func() bool { return br.mgr.Config().Tracker.Kind != "" },
 			TokenRates:       tokenRates,
-			RunHistoryFn: func(ctx context.Context, limit int) ([]server.RunHistoryEntry, error) {
-				runs, err := store.QueryRecentRunHistory(ctx, limit, 0)
-				if err != nil {
-					return nil, err
-				}
-				out := make([]server.RunHistoryEntry, len(runs))
-				for i, r := range runs {
-					out[i] = server.RunHistoryEntry{
-						Identifier:     r.Identifier,
-						DisplayID:      r.DisplayID,
-						Attempt:        r.Attempt,
-						Status:         r.Status,
-						WorkflowFile:   r.WorkflowFile,
-						StartedAt:      r.StartedAt,
-						CompletedAt:    r.CompletedAt,
-						Error:          r.Error,
-						TurnsCompleted: r.TurnsCompleted,
-					}
-				}
-				return out, nil
-			},
+			RunHistory:       runHistoryReader{store: store},
+			Stats:            statsSource{dbPath: dbPath, workflowPath: br.path, rates: tokenRates, rateWarnings: rateWarnings}.report,
 		})
 		o.AddObserver(srv)
+		br.mgr.SetLoadNotifier(srv.OnStateChange)
 
+		br.logger.Info("http server listening",
+			slog.String("addr", ln.Addr().String()),
+		)
 		go func() {
-			br.logger.Info("http server listening",
-				slog.String("addr", ln.Addr().String()),
-			)
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				br.logger.Error("http server error", slog.Any("error", err))
 			}
@@ -910,6 +936,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}()
 	}
 
+	if startupDone != nil {
+		startupDone()
+	}
 	o.Run(ctx)
 
 	if srv != nil {

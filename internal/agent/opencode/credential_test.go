@@ -21,7 +21,7 @@ func TestCredentialVerification(t *testing.T) {
 	verifiedBin := writeRunFixtureScript(t, t.TempDir(), "simple_turn.jsonl")
 	unverifiedBin := writeRunFixtureScript(t, t.TempDir(), "logical_failure_exit0.jsonl")
 
-	adapter, err := NewOpenCodeAdapter(map[string]any{})
+	adapter, err := NewOpenCodeAdapter()
 	if err != nil {
 		t.Fatalf("NewOpenCodeAdapter() error = %v", err)
 	}
@@ -55,15 +55,15 @@ func TestDeleteVerificationSession_CarriesManagedEnv(t *testing.T) {
 func writeSSHExit255Script(t *testing.T, dir string, runOutput []byte) string {
 	t.Helper()
 	exportPath := filepath.Join(dir, "export.json")
-	if err := os.WriteFile(exportPath, []byte(`{"messages":[]}`), 0o644); err != nil {
+	if err := os.WriteFile(exportPath, []byte(`{"info":{"id":""},"messages":[]}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(export.json): %v", err)
 	}
 	runPath := filepath.Join(dir, "run.jsonl")
 	if err := os.WriteFile(runPath, runOutput, 0o644); err != nil {
 		t.Fatalf("WriteFile(run.jsonl): %v", err)
 	}
-	body := `case "$1" in
-  export) cat '` + exportPath + `'; exit 0;;
+	body := `case "$1 $2" in
+  "session export") cat '` + exportPath + `'; exit 0;;
 esac
 cat '` + runPath + `'
 exit 255
@@ -93,7 +93,7 @@ func TestRunTurn_SSHExit255WithoutForkPerTurn(t *testing.T) {
 			tmpDir := t.TempDir()
 			script := writeSSHExit255Script(t, tmpDir, tt.runOutput)
 
-			a, _ := NewOpenCodeAdapter(map[string]any{})
+			a, _ := NewOpenCodeAdapter()
 			session := mustBuildSSHSessionWithLocalScript(t, tmpDir, script, "example.test")
 
 			_, result, err := collectEvents(t, a, session, "work")

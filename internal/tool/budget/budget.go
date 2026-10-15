@@ -35,9 +35,10 @@ type BudgetUsage struct {
 	UnmeasuredSessions int
 
 	// UnaccountedTurns is the summed count of turns that spent tokens no
-	// figure was proven to cover, so a non-zero value makes
-	// CompletedTotalTokens a lower bound even when every session was
-	// measured.
+	// figure was proven to cover, across the completed sessions and the
+	// matched running session, so a non-zero value makes the sum of
+	// CompletedTotalTokens and RunningTotalTokens a lower bound even when
+	// every session was measured.
 	UnaccountedTurns int
 
 	// RunningMeasured is true when a session_metadata row matched the

@@ -58,31 +58,22 @@ func DiagOwnerRepoProject(project string) []ValidationDiag {
 	return nil
 }
 
-// DiagStateLabelElements reports an empty element and an untrimmed
-// element of one configured state list: an element that is empty or
-// whitespace-only, and, separately, a non-empty element carrying leading
-// or trailing whitespace. Both faults never match an issue state, but a
-// caller states its own severity, because whether the fault blocks
-// construction is a fact about that adapter, not about the check itself.
+// DiagStateLabelElements reports each element of one configured state list
+// that carries leading or trailing whitespace, which never matches an
+// issue state. A caller states its own severity, because whether the
+// fault blocks construction is a fact about that adapter, not about the
+// check itself.
 func DiagStateLabelElements(field string, states []string, sev DiagSeverity) []ValidationDiag {
 	var diags []ValidationDiag
 	for i, s := range states {
-		trimmed := strings.TrimSpace(s)
-		if trimmed == "" {
-			diags = append(diags, ValidationDiag{
-				Severity: string(sev),
-				Check:    field + ".empty_element",
-				Message:  fmt.Sprintf("%s[%d]: empty state value never matches an issue state", field, i),
-			})
+		if strings.TrimSpace(s) == s {
 			continue
 		}
-		if trimmed != s {
-			diags = append(diags, ValidationDiag{
-				Severity: string(sev),
-				Check:    field + ".untrimmed_element",
-				Message:  fmt.Sprintf("%s[%d]: state value has leading or trailing whitespace and never matches an issue state", field, i),
-			})
-		}
+		diags = append(diags, ValidationDiag{
+			Severity: string(sev),
+			Check:    field + ".untrimmed_element",
+			Message:  fmt.Sprintf("%s[%d]: state value has leading or trailing whitespace and never matches an issue state", field, i),
+		})
 	}
 	return diags
 }

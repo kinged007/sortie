@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -33,8 +34,10 @@ type LaunchTarget struct {
 
 	// Args contains initial CLI arguments inserted before per-turn
 	// arguments. Non-empty only in local mode when the configured command
-	// contains multiple tokens (e.g., "codex app-server" yields
-	// Args: ["app-server"]). Empty in SSH mode.
+	// holds more than its executable: the words after the first of a
+	// string command (e.g., "codex app-server" yields Args:
+	// ["app-server"]), or the elements after element zero of a list
+	// command. Empty in SSH mode.
 	Args []string
 
 	// WorkspacePath is the validated absolute path to the agent workspace
@@ -58,6 +61,11 @@ type LaunchTarget struct {
 	// a remote session, passed through from StartSessionParams. Empty
 	// in local mode.
 	SSHEnvNames []string
+
+	// WithheldEnv lists environment variable names no launch through this
+	// target carries: a local launch runs without them, and a remote launch
+	// neither carries them nor lets the remote shell pass them to the agent.
+	WithheldEnv []string
 }
 
 // ResolveLaunchTarget resolves the workspace path and agent binary for a
@@ -65,8 +73,12 @@ type LaunchTarget struct {
 // params.SSHHost. It returns a populated [LaunchTarget] and a nil error on
 // success, or a zero [LaunchTarget] and a [*domain.AgentError] on failure.
 //
-// defaultCommand is the fallback agent command when params.AgentConfig.Command
-// is empty (e.g., "claude", "copilot", "codex app-server").
+// defaultCommand is the fallback agent command when params.AgentConfig holds
+// no command (e.g., "claude", "copilot", "codex app-server"). A non-empty
+// params.AgentConfig.CommandArgv is the command instead: locally element zero
+// resolves whole, whitespace included, and the rest become Args; over SSH
+// every element is single-quoted into RemoteCommand. This is the only reader
+// of CommandArgv.
 //
 // Adapter-specific post-resolution steps (canary version checks, auth
 // preflights) are the caller's responsibility and must run after
@@ -77,8 +89,13 @@ func ResolveLaunchTarget(params domain.StartSessionParams, defaultCommand string
 		return LaunchTarget{}, agentErr
 	}
 
-	command := cmp.Or(params.AgentConfig.Command, defaultCommand)
 	sshHost := strings.TrimSpace(params.SSHHost)
+
+	if argv := params.AgentConfig.CommandArgv; len(argv) > 0 {
+		return resolveArgvLaunch(params, absPath, sshHost, argv)
+	}
+
+	command := cmp.Or(params.AgentConfig.Command, defaultCommand)
 
 	if strings.TrimSpace(command) == "" {
 		return LaunchTarget{}, &domain.AgentError{
@@ -88,23 +105,7 @@ func ResolveLaunchTarget(params domain.StartSessionParams, defaultCommand string
 	}
 
 	if sshHost != "" {
-		sshPath, lookErr := exec.LookPath("ssh")
-		if lookErr != nil {
-			return LaunchTarget{}, &domain.AgentError{
-				Kind:    domain.ErrAgentNotFound,
-				Message: "ssh binary not found on orchestrator host",
-				Err:     lookErr,
-			}
-		}
-		return LaunchTarget{
-			Command:                  sshPath,
-			Args:                     nil,
-			WorkspacePath:            absPath,
-			RemoteCommand:            command,
-			SSHHost:                  sshHost,
-			SSHStrictHostKeyChecking: params.SSHStrictHostKeyChecking,
-			SSHEnvNames:              params.SSHEnvNames,
-		}, nil
+		return resolveSSHLaunch(params, absPath, sshHost, command)
 	}
 
 	parts := strings.Fields(command)
@@ -127,6 +128,68 @@ func ResolveLaunchTarget(params domain.StartSessionParams, defaultCommand string
 	}, nil
 }
 
+func resolveSSHLaunch(params domain.StartSessionParams, absPath, sshHost, remoteCommand string) (LaunchTarget, *domain.AgentError) {
+	sshPath, lookErr := exec.LookPath("ssh")
+	if lookErr != nil {
+		return LaunchTarget{}, &domain.AgentError{
+			Kind:    domain.ErrAgentNotFound,
+			Message: "ssh binary not found on orchestrator host",
+			Err:     lookErr,
+		}
+	}
+	return LaunchTarget{
+		Command:                  sshPath,
+		Args:                     nil,
+		WorkspacePath:            absPath,
+		RemoteCommand:            remoteCommand,
+		SSHHost:                  sshHost,
+		SSHStrictHostKeyChecking: params.SSHStrictHostKeyChecking,
+		SSHEnvNames:              params.SSHEnvNames,
+	}, nil
+}
+
+func resolveArgvLaunch(params domain.StartSessionParams, absPath, sshHost string, argv []string) (LaunchTarget, *domain.AgentError) {
+	if sshHost != "" {
+		return resolveSSHLaunch(params, absPath, sshHost, sshutil.QuoteArgv(argv))
+	}
+	resolved, agentErr := lookPath(argv[0])
+	if agentErr != nil {
+		return LaunchTarget{}, agentErr
+	}
+	return LaunchTarget{
+		Command:       resolved,
+		Args:          slices.Clone(argv[1:]),
+		WorkspacePath: absPath,
+	}, nil
+}
+
+// AppendCommandArgs returns command, which names an executable,
+// followed by args, in the form that launches exactly that argv. A list
+// stays a list in both launch modes. A string launched locally stays a
+// string only when every argument is non-empty and holds no space rune,
+// since the local launch splits it on whitespace; otherwise it becomes
+// the list of its whitespace-separated words followed by args. A string
+// launched remotely stays a string with args quoted for the remote
+// shell and placed where the launch places its own arguments.
+func AppendCommandArgs(command domain.AgentCommand, remote bool, args ...string) domain.AgentCommand {
+	switch {
+	case len(command.Argv) > 0:
+		return domain.AgentCommand{Argv: append(slices.Clone(command.Argv), args...)}
+	case remote:
+		return domain.AgentCommand{Line: sshutil.AppendArgs(command.Line, args...)}
+	case slices.ContainsFunc(args, breaksWhitespaceSplit):
+		return domain.AgentCommand{Argv: append(strings.Fields(command.Line), args...)}
+	}
+	words := append([]string{strings.TrimRightFunc(command.Line, unicode.IsSpace)}, args...)
+	return domain.AgentCommand{Line: strings.Join(words, " ")}
+}
+
+// breaksWhitespaceSplit reports whether a whitespace split would not
+// yield arg as one word: it is empty or holds a space rune.
+func breaksWhitespaceSplit(arg string) bool {
+	return arg == "" || strings.ContainsFunc(arg, unicode.IsSpace)
+}
+
 // SSHOptions resolves t's SSH transport options for one remote
 // launch. It reads each of t.SSHEnvNames with [os.LookupEnv], in
 // order, carrying a name only when its value holds a non-whitespace
@@ -144,9 +207,15 @@ func ResolveLaunchTarget(params domain.StartSessionParams, defaultCommand string
 // t.SSHEnvNames. SSHOptions calls os.LookupEnv on every call, so
 // calling it once per launch reflects the orchestrator's environment
 // at that moment.
+//
+// A name in t.WithheldEnv is never carried, whether t.SSHEnvNames or a
+// settings entry names it, and is returned as the options' Unset list.
 func (t LaunchTarget) SSHOptions(settings ...sshutil.EnvVar) sshutil.SSHOptions {
 	var carried []sshutil.EnvVar
-	skip := make(map[string]bool, len(t.SSHEnvNames)+len(settings))
+	skip := make(map[string]bool, len(t.WithheldEnv)+len(t.SSHEnvNames)+len(settings))
+	for _, name := range t.WithheldEnv {
+		skip[name] = true
+	}
 	for _, entry := range settings {
 		skip[entry.Name] = true
 	}
@@ -165,7 +234,7 @@ func (t LaunchTarget) SSHOptions(settings ...sshutil.EnvVar) sshutil.SSHOptions 
 
 	added := make(map[string]bool, len(settings))
 	for _, entry := range settings {
-		if entry.Value == "" || added[entry.Name] {
+		if entry.Value == "" || added[entry.Name] || slices.Contains(t.WithheldEnv, entry.Name) {
 			continue
 		}
 		added[entry.Name] = true
@@ -175,6 +244,7 @@ func (t LaunchTarget) SSHOptions(settings ...sshutil.EnvVar) sshutil.SSHOptions 
 	return sshutil.SSHOptions{
 		StrictHostKeyChecking: t.SSHStrictHostKeyChecking,
 		Env:                   carried,
+		Unset:                 slices.Clone(t.WithheldEnv),
 	}
 }
 
@@ -182,7 +252,8 @@ func (t LaunchTarget) SSHOptions(settings ...sshutil.EnvVar) sshutil.SSHOptions 
 // cmd.Dir to it, sets cmd.Env to os.Environ() when it is nil, and
 // replaces every PWD entry already in cmd.Env with one naming the same
 // verified path, so a subprocess that trusts PWD over its own working
-// directory still lands in the workspace. On failure cmd.Dir and
+// directory still lands in the workspace. It also removes every entry
+// named in t.WithheldEnv from cmd.Env. On failure cmd.Dir and
 // cmd.Env are left untouched and the verification error is returned;
 // the caller must not start cmd.
 //
@@ -197,8 +268,22 @@ func (t LaunchTarget) BindWorkspace(cmd *exec.Cmd) *domain.AgentError {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
+	cmd.Env = dropEnvNames(cmd.Env, t.WithheldEnv)
 	cmd.Env = setPWD(cmd.Env, absPath)
 	return nil
+}
+
+// dropEnvNames returns env without the entries named in names, compared
+// as [isEnvEntryNamed] compares.
+func dropEnvNames(env, names []string) []string {
+	if len(names) == 0 {
+		return env
+	}
+	return slices.DeleteFunc(slices.Clone(env), func(entry string) bool {
+		return slices.ContainsFunc(names, func(name string) bool {
+			return isEnvEntryNamed(entry, name)
+		})
+	})
 }
 
 // setPWD returns env with every entry named PWD removed (case-
@@ -216,18 +301,23 @@ func setPWD(env []string, value string) []string {
 	return append(filtered, "PWD="+value)
 }
 
-// isPWDEntry reports whether entry is an env-slice assignment of PWD,
-// comparing case-insensitively on Windows to match that platform's own
-// environment-variable name resolution.
+// isPWDEntry reports whether entry is an env-slice assignment of PWD.
 func isPWDEntry(entry string) bool {
+	return isEnvEntryNamed(entry, "PWD")
+}
+
+// isEnvEntryNamed reports whether entry is an env-slice assignment of
+// name, comparing case-insensitively on Windows to match that platform's
+// own environment-variable name resolution.
+func isEnvEntryNamed(entry, name string) bool {
 	key, _, found := strings.Cut(entry, "=")
 	if !found {
 		return false
 	}
 	if runtime.GOOS == "windows" {
-		return strings.EqualFold(key, "PWD")
+		return strings.EqualFold(key, name)
 	}
-	return key == "PWD"
+	return key == name
 }
 
 // AuxiliaryCommand builds a one-shot runtime subcommand run in the
@@ -268,9 +358,5 @@ func prependPreamble(preamble, stdin io.Reader) io.Reader {
 // AuxiliaryTimeout returns the bound for an auxiliary launch: twice
 // cfg.ReadTimeoutMS, capped at 30 seconds, and never non-positive.
 func AuxiliaryTimeout(cfg domain.AgentConfig) time.Duration {
-	readTimeout := time.Duration(cfg.ReadTimeoutMS) * time.Millisecond
-	if readTimeout <= 0 {
-		readTimeout = 30 * time.Second
-	}
-	return min(2*readTimeout, 30*time.Second)
+	return min(2*ReadTimeout(cfg), 30*time.Second)
 }

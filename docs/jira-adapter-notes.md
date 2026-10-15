@@ -2,7 +2,7 @@
 
 Notes for a developer changing Sortie's Jira tracker adapter: the decisions it encodes, the places Jira's model does not line up with ours, and the failure modes worth recognizing before you spend a day rediscovering one.
 
-Last updated: 2026-08-23
+Last updated: 2026-10-10
 
 ## One adapter, two products
 
@@ -61,6 +61,20 @@ The flattener emits only `text` nodes and appends a newline after block-level on
 On Server the same fields are plain strings carrying wiki markup, passed through verbatim with no translation, so agents see the raw markup tokens rather than clean prose. That is deliberate: translating a markup dialect is not the adapter's job, and the rendered-HTML expansion is not requested.
 
 Comment creation mirrors the split. On Cloud the text is split on newlines into one paragraph node per line, because a single node with embedded newlines does not render as line breaks.
+
+A comment that carries agent text keeps the split and ends in a literal block. On Cloud the paragraph nodes for Sortie's text are followed by one `codeBlock` node holding one text node with the whole literal, newlines included.
+
+On Server the body is the text, two line feeds, `{noformat}`, a line feed, the literal, a line feed, and `{noformat}`. The closing marker is matched without regard to letter case, so the adapter inserts U+200B after every `{` that starts the word `noformat` in the literal; otherwise the literal could end the block early. Server also parses `[~user]` mentions inside a `{noformat}` block, so the adapter inserts U+200B after every `[` followed by `~`. The text stays as written but notifies nobody.
+
+Server rendering is covered by a request-body test only. Whether the renderer closes on a case-insensitive match is unchecked, and the integration suite cannot post a version 2 comment because it refuses a Cloud host.
+
+## Label writes
+
+A label edit answers 204 with no body, so neither an add nor a removal can confirm itself; the shared label writers read the issue's labels (`GET /issue/{key}?fields=labels`) after every Jira write. Removal sends one `PUT` whose `update.labels` holds one `{"remove": name}` entry per matching spelling the read found, so an issue carrying `Stage-Plan` and `stage-plan` loses both in one request. The adapter never sends `fields.labels`, the replace form, which would drop a label a person adds between the read and the write.
+
+Two behaviors are unverified, and the design holds for either outcome. Whether `remove` folds letter case is unknown, so the request names only spellings read from the issue and never the caller's spelling. What Jira answers for removing a label the issue lacks is unknown, so the adapter never sends one; a rejection of the edit is settled by the confirming read.
+
+Atlassian documents eventual consistency for its search endpoints only. Nothing documents the lag of the direct issue read after a write, so the integration suite reads the issue immediately after each write and removal with no wait. A candidate listing is a search and can trail the write; the orchestrator confirms its own label writes with a direct read. Data Center has no lab, so the Server arm of the label writes has no live coverage.
 
 ## Pagination
 

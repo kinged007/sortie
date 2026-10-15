@@ -339,9 +339,7 @@ func TestValidateConfig(t *testing.T) {
 			wantWarnCount: 0,
 		},
 		{
-			// Nil state lists are valid because the constructor applies
-			// defaultActiveStates / defaultTerminalStates.
-			name: "valid config with nil state lists – zero diagnostics (defaults-apply path)",
+			name: "valid config with nil state lists – zero diagnostics",
 			fields: registry.TrackerConfigFields{
 				Kind:    "linear",
 				Project: "SOR",
@@ -384,21 +382,6 @@ func TestValidateConfig(t *testing.T) {
 			},
 			wantChecks:    []string{"tracker.states.overlap"},
 			wantWarnCount: 1,
-		},
-		{
-			// An empty element in a present active_states list aborts adapter
-			// construction, so it must produce a tracker.active_states.empty_element
-			// error rather than a warning.
-			name: "present active list with empty element – empty_element error",
-			fields: registry.TrackerConfigFields{
-				Kind:           "linear",
-				Project:        "ENG",
-				APIKey:         "lin_api_testtoken123",
-				ActiveStates:   []string{"Backlog", ""},
-				TerminalStates: []string{"Done"},
-			},
-			wantChecks:   []string{"tracker.active_states.empty_element"},
-			wantErrCount: 1,
 		},
 		{
 			// An untrimmed element in a present active_states list cannot match

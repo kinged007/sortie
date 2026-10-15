@@ -256,6 +256,8 @@ func inFlightTriageRun(fingerprint string, cancel func()) *ReactionTriageRun {
 // MarkReactionDispatched carries behavior, the rest satisfy the
 // interface but are never expected to be called by the gate.
 type triageGateStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	markCalls int
@@ -1222,3 +1224,13 @@ func TestReactionTriageSupportedKinds(t *testing.T) {
 			got, config.TriageSupportedReactionKeys)
 	}
 }
+
+func (s *triageGateStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func (s *triageGateStore) ListReactionHandedOffComments(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *triageGateStore) DeleteStageHop(context.Context, string) error { return nil }

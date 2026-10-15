@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 )
 
@@ -105,18 +106,18 @@ type jiraComment struct {
 }
 
 // normalizeSearchIssue maps a Jira API issue to a domain.Issue. The
-// endpoint is used to construct the browse URL. Labels are lowercased,
-// priority parsed as integer (nil on failure), and blocker refs
-// extracted from issuelinks. The description body is extracted per
-// apiVersion: ADF is flattened on "3", the raw wiki-markup string is
-// preserved on "2".
+// endpoint is used to construct the browse URL, which carries no userinfo
+// of the endpoint. Labels are lowercased, priority parsed as integer (nil
+// on failure), and blocker refs extracted from issuelinks. The description
+// body is extracted per apiVersion: ADF is flattened on "3", the raw
+// wiki-markup string is preserved on "2".
 func normalizeSearchIssue(apiVersion, endpoint string, ji jiraIssue) domain.Issue {
 	issue := domain.Issue{
 		ID:          ji.ID,
 		Identifier:  ji.Key,
 		Title:       ji.Fields.Summary,
 		Description: extractBody(apiVersion, ji.Fields.Description),
-		URL:         endpoint + "/browse/" + ji.Key,
+		URL:         httpkit.RedactURLUserinfo(endpoint) + "/browse/" + ji.Key,
 		CreatedAt:   ji.Fields.Created,
 		UpdatedAt:   ji.Fields.Updated,
 	}

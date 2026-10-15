@@ -1,10 +1,12 @@
 package agentcore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
@@ -128,6 +130,11 @@ type TurnEvidence struct {
 	// ExitCode is the turn's process exit code. Meaningful only when
 	// ExitObserved is true.
 	ExitCode int
+
+	// WaitErr is the turn's own wait error, nil for exit 0. It becomes
+	// the Err of the non-zero-exit row's error, so an exit by a signal
+	// names the signal. Meaningful only when ExitObserved is true.
+	WaitErr error
 
 	// Work is the per-turn work evidence. Consulted only when the runtime
 	// reported no terminal outcome.
@@ -436,9 +443,45 @@ func FinalizeTurn(
 	if disposition.Row == RowExitedBeforeOutput {
 		return result, ev.EarlyExit
 	}
+	cause := ev.Cause
+	if disposition.Row == RowNonZeroExit {
+		cause = ev.WaitErr
+	}
 	return result, &domain.AgentError{
 		Kind:    disposition.ErrorKind,
 		Message: disposition.ErrorMessage,
-		Err:     ev.Cause,
+		Err:     cause,
+	}
+}
+
+// CancelledOutcome reports whether a turn's result and error say the
+// turn was cancelled: the result's exit reason is a cancellation, err is
+// a [domain.AgentError] of kind [domain.ErrTurnCancelled], or err matches
+// [context.Canceled] or [context.DeadlineExceeded].
+func CancelledOutcome(result domain.TurnResult, err error) bool {
+	if result.ExitReason == domain.EventTurnCancelled {
+		return true
+	}
+	if agentErr, ok := errors.AsType[*domain.AgentError](err); ok && agentErr.Kind == domain.ErrTurnCancelled {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// SessionStartCancelledError returns the cancellation a session start
+// reports when its own context ended and a launch refused to start for
+// it: a [domain.AgentError] of kind [domain.ErrTurnCancelled] whose cause
+// is ctx's error. It returns nil unless startErr is a
+// [procutil.StartError] with Cancelled set and ctx is done, so a launch
+// bounded by a deadline of its own keeps its caller's report.
+func SessionStartCancelledError(ctx context.Context, startErr error) *domain.AgentError {
+	start, ok := errors.AsType[*procutil.StartError](startErr)
+	if !ok || !start.Cancelled || ctx.Err() == nil {
+		return nil
+	}
+	return &domain.AgentError{
+		Kind:    domain.ErrTurnCancelled,
+		Message: "session start cancelled",
+		Err:     ctx.Err(),
 	}
 }

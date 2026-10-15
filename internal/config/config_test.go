@@ -5,13 +5,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/redact"
 )
 
@@ -1555,10 +1561,10 @@ func TestNewServiceConfig(t *testing.T) {
 		t.Parallel()
 		_, err := NewServiceConfig(map[string]any{
 			"reactions": map[string]any{
-				"CI_Feedback": map[string]any{},
+				"CI_Failure": map[string]any{},
 			},
 		})
-		assertConfigErrorField(t, err, "reactions.CI_Feedback")
+		assertConfigErrorField(t, err, "reactions.CI_Failure")
 	})
 
 	t.Run("Reactions/ProviderNonStringRejected", func(t *testing.T) {
@@ -2196,14 +2202,14 @@ func TestNewServiceConfig_TypeFaultOwnerGroups(t *testing.T) {
 			wrongGot:   "boolean",
 		},
 		{
-			name:  "ci_feedback.kind",
-			field: "ci_feedback.kind",
+			name:  "reactions.ci_failure.provider",
+			field: "reactions.ci_failure.provider",
 			buildRaw: func(v any) map[string]any {
 				m := map[string]any{}
 				if v != nil {
-					m["kind"] = v
+					m["provider"] = v
 				}
-				return map[string]any{"ci_feedback": m}
+				return map[string]any{"reactions": map[string]any{"ci_failure": m}}
 			},
 			wrongValue: []any{"webhook"},
 			wrongGot:   "list",
@@ -2771,14 +2777,14 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 			t.Fatalf("NewServiceConfig: %v", err)
 		}
 		if cfg.CIFeedback != (CIFeedbackConfig{}) {
-			t.Errorf("CIFeedback = %+v, want zero value when ci_feedback absent", cfg.CIFeedback)
+			t.Errorf("CIFeedback = %+v, want zero value when no CI feedback is configured", cfg.CIFeedback)
 		}
 	})
 
 	t.Run("KindWithDefaults", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github"},
+			"reactions": map[string]any{"ci_failure": map[string]any{"provider": "github"}},
 		})
 		if err != nil {
 			t.Fatalf("NewServiceConfig: %v", err)
@@ -2793,7 +2799,7 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 	t.Run("ExplicitMaxRetries", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github", "max_retries": 5},
+			"reactions": map[string]any{"ci_failure": map[string]any{"provider": "github", "max_retries": 5}},
 		})
 		if err != nil {
 			t.Fatalf("NewServiceConfig: %v", err)
@@ -2804,7 +2810,7 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 	t.Run("ValidEscalation/Comment", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github", "escalation": "comment"},
+			"reactions": map[string]any{"ci_failure": map[string]any{"provider": "github", "escalation": "comment"}},
 		})
 		if err != nil {
 			t.Fatalf("NewServiceConfig: %v", err)
@@ -2815,7 +2821,7 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 	t.Run("ValidEscalation/Label", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github", "escalation": "label"},
+			"reactions": map[string]any{"ci_failure": map[string]any{"provider": "github", "escalation": "label"}},
 		})
 		if err != nil {
 			t.Fatalf("NewServiceConfig: %v", err)
@@ -2826,18 +2832,20 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 	t.Run("InvalidEscalation/Rejected", func(t *testing.T) {
 		t.Parallel()
 		_, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github", "escalation": "slack"},
+			"reactions": map[string]any{"ci_failure": map[string]any{"provider": "github", "escalation": "slack"}},
 		})
-		assertConfigErrorField(t, err, "ci_feedback.escalation")
+		assertConfigErrorField(t, err, "reactions.ci_failure.escalation")
 	})
 
 	t.Run("CustomEscalationLabel", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{
-				"kind":             "github",
-				"escalation":       "label",
-				"escalation_label": "blocked-by-ci",
+			"reactions": map[string]any{
+				"ci_failure": map[string]any{
+					"provider":         "github",
+					"escalation":       "label",
+					"escalation_label": "blocked-by-ci",
+				},
 			},
 		})
 		if err != nil {
@@ -2845,48 +2853,6 @@ func TestNewServiceConfig_CIFeedback(t *testing.T) {
 		}
 		assertStringEqual(t, "CIFeedback.EscalationLabel", "blocked-by-ci", cfg.CIFeedback.EscalationLabel)
 	})
-
-	t.Run("NotLeakedToExtensions", func(t *testing.T) {
-		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{"kind": "github"},
-		})
-		if err != nil {
-			t.Fatalf("NewServiceConfig: %v", err)
-		}
-		if _, ok := cfg.extensions["ci_feedback"]; ok {
-			t.Error("ci_feedback leaked into cfg.extensions; want absent")
-		}
-	})
-}
-
-func TestNewServiceConfig_CIFeedbackAndLabelCommandsAdvisoriesAccumulate(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := NewServiceConfig(map[string]any{
-		"ci_feedback": map[string]any{"kind": "github"},
-		"reactions": map[string]any{
-			"ci_failure": map[string]any{"provider": "github-actions"},
-			"label_commands": map[string]any{
-				"provider":         "github",
-				"poll_interval_ms": 5000,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewServiceConfig: unexpected error: %v", err)
-	}
-
-	got := cfg.Advisories()
-	if len(got) != 2 {
-		t.Fatalf("Advisories() = %+v, want 2 entries", got)
-	}
-	if !hasAdvisory(got, "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
-		t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", got)
-	}
-	if !hasAdvisory(got, "reactions.label_commands.poll_interval_ms.clamped", "clamped label_commands poll_interval_ms to floor") {
-		t.Errorf("Advisories() = %+v, want the poll_interval_ms.clamped advisory", got)
-	}
 }
 
 func TestNewServiceConfig_SelfReview(t *testing.T) {
@@ -3451,8 +3417,6 @@ func TestPopulateCIFeedbackFromReactions(t *testing.T) {
 	}
 }
 
-// TestCIFailureMigration verifies the full precedence logic for the
-// reactions.ci_failure -> CIFeedback migration path through NewServiceConfig.
 func TestCIFailureMigration(t *testing.T) {
 	t.Parallel()
 
@@ -3578,13 +3542,9 @@ func TestCIFailureMigration(t *testing.T) {
 		assertStringEqual(t, "CIFeedback.Kind", "", cfg.CIFeedback.Kind)
 	})
 
-	t.Run("Precedence/BothPresent/ReactionsWins", func(t *testing.T) {
+	t.Run("ReactionsCIFailure/ExplicitValues", func(t *testing.T) {
 		t.Parallel()
 		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{
-				"kind":        "circle-ci",
-				"max_retries": 1,
-			},
 			"reactions": map[string]any{
 				"ci_failure": map[string]any{
 					"provider":         "github-actions",
@@ -3603,36 +3563,6 @@ func TestCIFailureMigration(t *testing.T) {
 		assertIntEqual(t, "CIFeedback.MaxLogLines", 75, cfg.CIFeedback.MaxLogLines)
 		assertStringEqual(t, "CIFeedback.Escalation", "comment", cfg.CIFeedback.Escalation)
 		assertStringEqual(t, "CIFeedback.EscalationLabel", "ci-blocked", cfg.CIFeedback.EscalationLabel)
-
-		if !hasAdvisory(cfg.Advisories(), "ci_feedback.deprecated", "ci_feedback section is deprecated; using reactions.ci_failure instead") {
-			t.Errorf("Advisories() = %+v, want the ci_feedback.deprecated advisory", cfg.Advisories())
-		}
-	})
-
-	t.Run("Precedence/CIFeedbackOnly", func(t *testing.T) {
-		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{
-			"ci_feedback": map[string]any{
-				"kind":        "github",
-				"max_retries": 3,
-			},
-		})
-		if err != nil {
-			t.Fatalf("NewServiceConfig: %v", err)
-		}
-		assertStringEqual(t, "CIFeedback.Kind", "github", cfg.CIFeedback.Kind)
-		assertIntEqual(t, "CIFeedback.MaxRetries", 3, cfg.CIFeedback.MaxRetries)
-	})
-
-	t.Run("Precedence/NeitherPresent", func(t *testing.T) {
-		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{})
-		if err != nil {
-			t.Fatalf("NewServiceConfig: %v", err)
-		}
-		if cfg.CIFeedback != (CIFeedbackConfig{}) {
-			t.Errorf("CIFeedback = %+v, want zero value when neither section present", cfg.CIFeedback)
-		}
 	})
 
 	t.Run("Provider/ParsedForNonCIReaction", func(t *testing.T) {
@@ -3975,6 +3905,11 @@ func TestNewServiceConfigExtensions(t *testing.T) {
 	})
 }
 
+func agentAdapterMap(cfg ServiceConfig, kind string) map[string]any {
+	passthrough, _, _ := agentAdapterConfig(cfg, kind)
+	return passthrough
+}
+
 // TestAgentAdapterConfig_ExactlySixKeysWithNoExtensions asserts that
 // AgentAdapterConfig returns exactly the six documented keys when
 // cfg.extensions carries no sub-object for kind.
@@ -3992,7 +3927,7 @@ func TestAgentAdapterConfig_ExactlySixKeysWithNoExtensions(t *testing.T) {
 		},
 	}
 
-	got := AgentAdapterConfig(cfg, "claude-code")
+	got := agentAdapterMap(cfg, "claude-code")
 
 	want := map[string]any{
 		"kind":             "claude-code",
@@ -4020,7 +3955,7 @@ func TestAgentAdapterConfig_KindParameterOverridesAgentKind(t *testing.T) {
 
 	cfg := ServiceConfig{Agent: AgentConfig{Kind: "claude-code"}}
 
-	got := AgentAdapterConfig(cfg, "codex")
+	got := agentAdapterMap(cfg, "codex")
 
 	if got["kind"] != "codex" {
 		t.Errorf(`AgentAdapterConfig(cfg, "codex")["kind"] = %v, want "codex"`, got["kind"])
@@ -4050,7 +3985,7 @@ func TestAgentAdapterConfig_ExtensionCollisionWithOrchestratorOnlyFieldSurvives(
 		},
 	}
 
-	got := AgentAdapterConfig(cfg, "codex")
+	got := agentAdapterMap(cfg, "codex")
 
 	if got["max_turns"] != float64(5) {
 		t.Errorf(`AgentAdapterConfig()["max_turns"] = %v, want the extension value 5 (not shadowed by cfg.Agent.MaxTurns)`, got["max_turns"])
@@ -4088,7 +4023,7 @@ func TestAgentAdapterConfig_DoesNotOverwriteDocumentedKeys(t *testing.T) {
 		},
 	}
 
-	got := AgentAdapterConfig(cfg, "codex")
+	got := agentAdapterMap(cfg, "codex")
 
 	if got["command"] != "codex" {
 		t.Errorf(`AgentAdapterConfig()["command"] = %v, want "codex" (the typed field, not the extension override)`, got["command"])
@@ -4103,10 +4038,10 @@ func TestAgentAdapterConfig_FreshMapPerCall(t *testing.T) {
 
 	cfg := ServiceConfig{Agent: AgentConfig{Kind: "codex", Command: "codex"}}
 
-	first := AgentAdapterConfig(cfg, "codex")
+	first := agentAdapterMap(cfg, "codex")
 	first["command"] = "mutated"
 
-	second := AgentAdapterConfig(cfg, "codex")
+	second := agentAdapterMap(cfg, "codex")
 	if second["command"] != "codex" {
 		t.Errorf(`AgentAdapterConfig() second call ["command"] = %v, want "codex" (unaffected by mutating the first call's map)`, second["command"])
 	}
@@ -4227,7 +4162,7 @@ func TestResolveAgentSettings_BlockPresenceMatchesAgentAdapterConfig(t *testing.
 	cfg := ServiceConfig{extensions: map[string]any{"codex": "o3"}}
 
 	_, wantPresence, wantDescription := agentAdapterConfig(cfg, "codex")
-	got := ResolveAgentSettings(cfg, "codex", "")
+	got := ResolveAgentSettings(cfg, SettingsSelection{Kind: "codex"}, "")
 
 	if got.BlockPresence != wantPresence {
 		t.Errorf("ResolveAgentSettings().BlockPresence = %v, want %v", got.BlockPresence, wantPresence)
@@ -4337,7 +4272,7 @@ func TestResolveAgentSettings_MCPConfigPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := ResolveAgentSettings(tt.cfg, tt.kind, tt.workflowDir)
+			got := ResolveAgentSettings(tt.cfg, SettingsSelection{Kind: tt.kind}, tt.workflowDir)
 
 			if got.MCPConfigPath != tt.wantPath {
 				t.Errorf("ResolveAgentSettings(cfg, %q, %q).MCPConfigPath = %q, want %q", tt.kind, tt.workflowDir, got.MCPConfigPath, tt.wantPath)
@@ -4362,8 +4297,8 @@ func TestResolveAgentSettings_PassthroughMatchesAgentAdapterConfig(t *testing.T)
 		},
 	}
 
-	got := ResolveAgentSettings(cfg, "codex", "")
-	want := AgentAdapterConfig(cfg, "codex")
+	got := ResolveAgentSettings(cfg, SettingsSelection{Kind: "codex"}, "")
+	want := agentAdapterMap(cfg, "codex")
 
 	if len(got.Passthrough) != len(want) {
 		t.Fatalf("ResolveAgentSettings().Passthrough = %v (len %d), want %v (len %d)", got.Passthrough, len(got.Passthrough), want, len(want))
@@ -4383,10 +4318,10 @@ func TestResolveAgentSettings_IndependentAllocationAcrossCalls(t *testing.T) {
 
 	cfg := ServiceConfig{Agent: AgentConfig{Kind: "codex", Command: "codex"}}
 
-	first := ResolveAgentSettings(cfg, "codex", "")
+	first := ResolveAgentSettings(cfg, SettingsSelection{Kind: "codex"}, "")
 	first.Passthrough["command"] = "mutated"
 
-	second := ResolveAgentSettings(cfg, "codex", "")
+	second := ResolveAgentSettings(cfg, SettingsSelection{Kind: "codex"}, "")
 	if second.Passthrough["command"] != "codex" {
 		t.Errorf(`ResolveAgentSettings() second call Passthrough["command"] = %v, want "codex" (unaffected by mutating the first call's map)`, second.Passthrough["command"])
 	}
@@ -4829,4 +4764,413 @@ func TestNewServiceConfig_RegistersNotificationBackendURLWhole(t *testing.T) {
 		t.Fatalf("NewServiceConfig() error = %v", err)
 	}
 	requireConfigMasked(t, url)
+}
+
+func TestParseAgentCommand(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		raw         any
+		want        domain.AgentCommand
+		wantField   string
+		wantMessage string
+	}{
+		{name: "absent", raw: nil},
+		{name: "empty string", raw: ""},
+		{name: "string form", raw: "agent --fast", want: domain.AgentCommand{Line: "agent --fast"}},
+		{name: "list form", raw: []any{"agent", "--fast"}, want: domain.AgentCommand{Argv: []string{"agent", "--fast"}}},
+		{
+			name: "elements kept exactly as written",
+			raw:  []any{"/opt/dir with space/agent", "a b", "$HOME", "it's"},
+			want: domain.AgentCommand{Argv: []string{"/opt/dir with space/agent", "a b", "$HOME", "it's"}},
+		},
+		{name: "whitespace-only later element", raw: []any{"agent", "  "}, want: domain.AgentCommand{Argv: []string{"agent", "  "}}},
+		{name: "boolean", raw: true, wantField: "agent.command", wantMessage: "expected string or list, got boolean"},
+		{name: "integer", raw: 7, wantField: "agent.command", wantMessage: "expected string or list, got integer"},
+		{name: "mapping", raw: map[string]any{"a": "b"}, wantField: "agent.command", wantMessage: "expected string or list, got mapping"},
+		{name: "empty list", raw: []any{}, wantField: "agent.command", wantMessage: "must not be an empty list"},
+		{name: "non-string element", raw: []any{"agent", 7}, wantField: "agent.command[1]", wantMessage: "expected string, got integer"},
+		{name: "null element", raw: []any{"agent", nil}, wantField: "agent.command[1]", wantMessage: "expected string, got null"},
+		{name: "empty element", raw: []any{"agent", ""}, wantField: "agent.command[1]", wantMessage: "must not be empty"},
+		{name: "empty element zero", raw: []any{"", "x"}, wantField: "agent.command[0]", wantMessage: "must not be empty"},
+		{name: "whitespace-only element zero", raw: []any{" \t", "x"}, wantField: "agent.command[0]", wantMessage: "must not be empty"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseAgentCommand(tt.raw)
+
+			if tt.wantField != "" {
+				requireConversionError(t, err, tt.wantField, tt.wantMessage)
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAgentCommand(%v) error = %v", tt.raw, err)
+			}
+			if !commandsEqual(got, tt.want) {
+				t.Errorf("parseAgentCommand(%v) = %+v, want %+v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewServiceConfig_AgentCommandForms(t *testing.T) {
+	t.Parallel()
+
+	t.Run("list loads with no string form", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": []any{"agent dir/agent", "a b"}}})
+		if err != nil {
+			t.Fatalf("NewServiceConfig() error = %v", err)
+		}
+
+		if cfg.Agent.Command != "" {
+			t.Errorf("Agent.Command = %q, want empty for the list form", cfg.Agent.Command)
+		}
+		if want := []string{"agent dir/agent", "a b"}; !slices.Equal(cfg.Agent.CommandArgv, want) {
+			t.Errorf("Agent.CommandArgv = %q, want %q", cfg.Agent.CommandArgv, want)
+		}
+	})
+
+	t.Run("string loads with no list form", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": "agent --fast"}})
+		if err != nil {
+			t.Fatalf("NewServiceConfig() error = %v", err)
+		}
+
+		if cfg.Agent.Command != "agent --fast" || cfg.Agent.CommandArgv != nil {
+			t.Errorf("Agent.Command, Agent.CommandArgv = %q, %q, want the string form only", cfg.Agent.Command, cfg.Agent.CommandArgv)
+		}
+	})
+
+	t.Run("malformed list fails the load", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": []any{"agent", ""}}})
+
+		assertConfigErrorField(t, err, "agent.command[1]")
+	})
+
+	t.Run("wrong type fails the load", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": 5}})
+
+		assertConfigErrorField(t, err, "agent.command")
+	})
+}
+
+func TestAgentAdapterConfig_SeedsTheLocalCommandForm(t *testing.T) {
+	t.Parallel()
+
+	t.Run("string", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": "agent --fast"}})
+		if err != nil {
+			t.Fatalf("NewServiceConfig() error = %v", err)
+		}
+
+		if got := agentAdapterMap(cfg, cfg.Agent.Kind)["command"]; got != "agent --fast" {
+			t.Errorf(`AgentAdapterConfig()["command"] = %#v, want %q`, got, "agent --fast")
+		}
+	})
+
+	t.Run("list is a copy", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": []any{"agent", "a b"}}})
+		if err != nil {
+			t.Fatalf("NewServiceConfig() error = %v", err)
+		}
+
+		first, _ := agentAdapterMap(cfg, cfg.Agent.Kind)["command"].([]string)
+		if !slices.Equal(first, []string{"agent", "a b"}) {
+			t.Fatalf(`AgentAdapterConfig()["command"] = %#v, want the list []string{"agent", "a b"}`, first)
+		}
+		first[0] = "mutated"
+
+		if cfg.Agent.CommandArgv[0] != "agent" {
+			t.Errorf("Agent.CommandArgv[0] = %q after mutating the adapter map's list, want %q", cfg.Agent.CommandArgv[0], "agent")
+		}
+	})
+}
+
+func TestNewServiceConfigEnvOverrides_AgentCommandReplacesAList(t *testing.T) {
+	setDotEnvPathForTest(t, "")
+	t.Setenv("SORTIE_AGENT_COMMAND", "env-agent --flag")
+
+	cfg, err := NewServiceConfig(map[string]any{"agent": map[string]any{"command": []any{"file-agent", "a b"}}})
+	if err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+
+	if cfg.Agent.Command != "env-agent --flag" {
+		t.Errorf("Agent.Command = %q, want %q", cfg.Agent.Command, "env-agent --flag")
+	}
+	if cfg.Agent.CommandArgv != nil {
+		t.Errorf("Agent.CommandArgv = %q, want nil once SORTIE_AGENT_COMMAND replaced the list", cfg.Agent.CommandArgv)
+	}
+}
+
+func TestAgentCommand(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range governanceRows {
+		for _, hosts := range []bool{false, true} {
+			for _, remote := range []bool{false, true} {
+				name := fmt.Sprintf("%s, ssh_hosts set %v, remote %v", row.name, hosts, remote)
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					raw := row.raw()
+					if hosts {
+						withSSHHosts(raw)
+					}
+					cfg := loadConvertedWithDispatch(t, raw)
+					want := row.wantLocal
+					if remote {
+						want = row.wantRemote
+					}
+
+					got := cfg.AgentCommand(replacementKind, remote)
+
+					if !commandsEqual(got, want) {
+						t.Errorf("AgentCommand(%q, %v) = %+v, want %+v", replacementKind, remote, got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAgentCommand_OwnedByTheDefaultKind(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := NewServiceConfig(map[string]any{
+		"agent":    map[string]any{"kind": "kind-a", "command": []any{"cmd a", "--x"}},
+		"dispatch": map[string]any{"default": map[string]any{"agent": "kind-b"}},
+	})
+	if err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	dispatch, err := BuildDispatchConfig(map[string]any{"dispatch": map[string]any{"default": map[string]any{"agent": "kind-b"}}}, mkDispatchDir(t), alwaysRegistered, "")
+	if err != nil {
+		t.Fatalf("BuildDispatchConfig() error = %v", err)
+	}
+	cfg.SetDispatch(dispatch)
+
+	for _, remote := range []bool{false, true} {
+		got := cfg.AgentCommand("kind-b", remote)
+		if want := (domain.AgentCommand{Argv: []string{"cmd a", "--x"}}); !commandsEqual(got, want) {
+			t.Errorf("AgentCommand(%q, %v) = %+v, want agent.command %+v", "kind-b", remote, got, want)
+		}
+		if got := cfg.AgentCommand("kind-a", remote); !got.IsZero() {
+			t.Errorf("AgentCommand(%q, %v) = %+v, want zero for a kind that is not the default kind", "kind-a", remote, got)
+		}
+	}
+
+	first := cfg.AgentCommand("kind-b", false)
+	first.Argv[0] = "mutated"
+	if second := cfg.AgentCommand("kind-b", false); second.Argv[0] != "cmd a" {
+		t.Errorf("AgentCommand(%q, false).Argv[0] = %q after mutating an earlier result, want %q", "kind-b", second.Argv[0], "cmd a")
+	}
+}
+
+func overlayConfig(topLevel map[string]any, rules ...DispatchRule) ServiceConfig {
+	cfg := ServiceConfig{
+		Agent:    AgentConfig{Kind: "opencode", Command: "oc", TurnTimeoutMS: 3600000, ReadTimeoutMS: 5000, StallTimeoutMS: 300000, StopGraceMS: 5000},
+		Dispatch: DispatchConfig{Rules: rules},
+	}
+	if topLevel != nil {
+		cfg.extensions = map[string]any{"opencode": topLevel}
+	}
+	return cfg
+}
+
+func withDerivedKeys(extra map[string]any) map[string]any {
+	want := map[string]any{
+		"kind": "opencode", "command": "oc", "turn_timeout_ms": 3600000,
+		"read_timeout_ms": 5000, "stall_timeout_ms": 300000, "stop_grace_ms": 5000,
+	}
+	maps.Copy(want, extra)
+	return want
+}
+
+func lowCostRule(kind string, block map[string]any) DispatchRule {
+	return DispatchRule{Name: "low-cost", SettingsKind: kind, Settings: block}
+}
+
+func TestResolveAgentSettings_RuleBlockOverlay(t *testing.T) {
+	t.Parallel()
+
+	topModel := map[string]any{"model": "a"}
+	tests := []struct {
+		name     string
+		cfg      ServiceConfig
+		ruleName string
+		wantPass map[string]any
+		applied  bool
+	}{
+		{
+			name:     "value replaces, null removes, the rest is inherited",
+			cfg:      overlayConfig(map[string]any{"model": "a", "effort": "h", "x": 1}, lowCostRule("opencode", map[string]any{"model": "b", "effort": nil, "y": map[string]any{"k": "v"}})),
+			ruleName: "low-cost",
+			wantPass: withDerivedKeys(map[string]any{"model": "b", "x": 1, "y": map[string]any{"k": "v"}}),
+			applied:  true,
+		},
+		{
+			name:     "a kind with no top-level block takes the rule block whole",
+			cfg:      overlayConfig(nil, lowCostRule("opencode", map[string]any{"model": "b", "effort": nil})),
+			ruleName: "low-cost",
+			wantPass: withDerivedKeys(map[string]any{"model": "b"}),
+			applied:  true,
+		},
+		{
+			name:     "maps, lists and strings replace the inherited value whole",
+			cfg:      overlayConfig(map[string]any{"policy": map[string]any{"a": 1, "b": 2}, "tools": []any{"read", "edit"}, "effort": "h"}, lowCostRule("opencode", map[string]any{"policy": map[string]any{"c": 3}, "tools": []any{"glob"}, "effort": "low"})),
+			ruleName: "low-cost",
+			wantPass: withDerivedKeys(map[string]any{"policy": map[string]any{"c": 3}, "tools": []any{"glob"}, "effort": "low"}),
+			applied:  true,
+		},
+		{name: "a rule block for another kind is ignored", cfg: overlayConfig(topModel, lowCostRule("codex", map[string]any{"model": "b"})), ruleName: "low-cost", wantPass: withDerivedKeys(topModel)},
+		{name: "a rule name no rule carries leaves the top-level block", cfg: overlayConfig(topModel, lowCostRule("opencode", map[string]any{"model": "b"})), ruleName: "gone", wantPass: withDerivedKeys(topModel)},
+		{name: "a rule without a block leaves the top-level block", cfg: overlayConfig(topModel, DispatchRule{Name: "low-cost"}), ruleName: "low-cost", wantPass: withDerivedKeys(topModel)},
+		{name: "no rule selected leaves the top-level block", cfg: overlayConfig(topModel, lowCostRule("opencode", map[string]any{"model": "b"})), wantPass: withDerivedKeys(topModel)},
+		{name: "null model and effort resolve to the empty string", cfg: overlayConfig(map[string]any{"model": nil, "effort": nil}), wantPass: withDerivedKeys(map[string]any{"model": nil, "effort": nil})},
+		{name: "wrong-typed model resolves to the empty string", cfg: overlayConfig(map[string]any{"model": 7, "effort": "high"}), wantPass: withDerivedKeys(map[string]any{"model": 7, "effort": "high"})},
+		{name: "wrong-typed effort resolves to the empty string", cfg: overlayConfig(map[string]any{"model": "m", "effort": []any{"high"}}), wantPass: withDerivedKeys(map[string]any{"model": "m", "effort": []any{"high"}})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ResolveAgentSettings(tt.cfg, SettingsSelection{Kind: "opencode", RuleName: tt.ruleName}, "")
+
+			wantModel, _ := tt.wantPass["model"].(string)
+			wantEffort, _ := tt.wantPass["effort"].(string)
+			if !reflect.DeepEqual(got.Passthrough, tt.wantPass) || got.Model != wantModel || got.Effort != wantEffort {
+				t.Errorf("ResolveAgentSettings(rule %q) Passthrough, Model, Effort = %v, %q, %q, want %v, %q, %q",
+					tt.ruleName, got.Passthrough, got.Model, got.Effort, tt.wantPass, wantModel, wantEffort)
+			}
+			if wantRule := map[bool]string{true: tt.ruleName}[tt.applied]; got.RuleName != wantRule {
+				t.Errorf("ResolveAgentSettings(rule %q).RuleName = %q, want %q", tt.ruleName, got.RuleName, wantRule)
+			}
+		})
+	}
+}
+
+func TestResolveAgentSettings_RuleBlockNeverMutatesTheConfiguration(t *testing.T) {
+	t.Parallel()
+
+	topLevel := map[string]any{"model": "a", "y": map[string]any{"k": "old"}}
+	block := map[string]any{"model": "b", "effort": nil, "y": map[string]any{"k": "v"}}
+	cfg := overlayConfig(topLevel, lowCostRule("opencode", block))
+
+	_ = ResolveAgentSettings(cfg, SettingsSelection{Kind: "opencode", RuleName: "low-cost"}, "")
+
+	if want := map[string]any{"model": "a", "y": map[string]any{"k": "old"}}; !reflect.DeepEqual(topLevel, want) {
+		t.Errorf("top-level block after resolve = %v, want %v", topLevel, want)
+	}
+	if want := map[string]any{"model": "b", "effort": nil, "y": map[string]any{"k": "v"}}; !reflect.DeepEqual(block, want) {
+		t.Errorf("rule block after resolve = %v, want %v", block, want)
+	}
+}
+
+func TestResolveAgentSettings_RuleBlockRecomputesMCPConfigPath(t *testing.T) {
+	t.Parallel()
+
+	cfg := overlayConfig(map[string]any{"mcp_config": "top.json"}, lowCostRule("opencode", map[string]any{"mcp_config": "rule.json"}))
+
+	got := ResolveAgentSettings(cfg, SettingsSelection{Kind: "opencode", RuleName: "low-cost"}, "/wf")
+
+	if want := filepath.Join("/wf", "rule.json"); got.MCPConfigPath != want {
+		t.Errorf("MCPConfigPath = %q, want %q", got.MCPConfigPath, want)
+	}
+}
+
+func ruleBlockRaw(t *testing.T, doc string) map[string]any {
+	t.Helper()
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(doc), &raw); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	return raw
+}
+
+func TestNewServiceConfig_ResolvesDollarVarInRuleBlockOncePerAlias(t *testing.T) {
+	secret := randomConfigSecret(t)
+	t.Setenv("SORTIE_TEST_1191_MODEL", "x$SORTIE_TEST_1191_NESTED")
+	t.Setenv("SORTIE_TEST_1191_NESTED", "expanded-twice")
+	t.Setenv("SORTIE_TEST_1191_SECRET", secret)
+	raw := ruleBlockRaw(t, `
+agent: {kind: opencode}
+opencode: &oc {model: "$SORTIE_TEST_1191_MODEL", env: {OPENAI_API_KEY: "$SORTIE_TEST_1191_SECRET"}}
+dispatch:
+  rules:
+    - {name: r, match: {labels: [x]}, opencode: *oc}
+`)
+
+	cfg, err := NewServiceConfig(raw)
+	if err != nil {
+		t.Fatalf("NewServiceConfig() error = %v", err)
+	}
+	dispatch, err := BuildDispatchConfig(raw, mkDispatchDir(t), kindsRegistered("opencode"), "opencode")
+	if err != nil {
+		t.Fatalf("BuildDispatchConfig() error = %v", err)
+	}
+
+	const want = "x$SORTIE_TEST_1191_NESTED"
+	if top, rule := cfg.ExtensionSection("opencode")["model"], dispatch.Rules[0].Settings["model"]; top != want || rule != want {
+		t.Errorf("model in the top-level block, rule block = %v, %v, want %q in both (one resolution per alias)", top, rule, want)
+	}
+	if got := cfg.extensionsPreResolution["dispatch.rules[0].opencode.model"]; got != "$SORTIE_TEST_1191_MODEL" {
+		t.Errorf("pre-resolution literal at dispatch.rules[0].opencode.model = %q, want %q", got, "$SORTIE_TEST_1191_MODEL")
+	}
+	requireConfigMasked(t, secret)
+}
+
+func TestNewServiceConfig_ReactionEscalationNone(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"ci_failure", "review_comments", "bot_review", "merge_conflicts", "auto_merge", "merge_completion"} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := NewServiceConfig(map[string]any{
+				"reactions": map[string]any{key: map[string]any{"provider": "github", "escalation": "none", "target_state": "Done"}},
+			})
+			if err != nil {
+				t.Fatalf("NewServiceConfig(%s escalation none): %v", key, err)
+			}
+
+			got := cfg.Reactions[key].Escalation
+			if key == "ci_failure" {
+				got = cfg.CIFeedback.Escalation
+			}
+			assertStringEqual(t, key+" escalation", "none", got)
+		})
+	}
+}
+
+func TestNewServiceConfig_ReactionEscalationRejected(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewServiceConfig(map[string]any{
+		"reactions": map[string]any{"auto_merge": map[string]any{"provider": "github", "escalation": "email"}},
+	})
+
+	var ce *ConfigError
+	if !errors.As(err, &ce) {
+		t.Fatalf("NewServiceConfig(escalation email) error = %v, want *ConfigError", err)
+	}
+	assertStringEqual(t, "ConfigError.Field", "reactions.auto_merge.escalation", ce.Field)
+	assertStringEqual(t, "ConfigError.Message", `must be "label", "comment", or "none", got "email"`, ce.Message)
 }

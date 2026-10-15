@@ -5,7 +5,6 @@ package server
 
 import (
 	"context"
-	"html/template"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,7 +14,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/server/ui"
 )
 
 // SnapshotFunc returns a point-in-time capture of the orchestrator's
@@ -28,22 +29,24 @@ type SnapshotFunc func() (orchestrator.RuntimeSnapshotResult, error)
 // false if it was coalesced (channel already has a pending signal).
 type RefreshFunc func() bool
 
-// SlotFunc returns the current maximum concurrent agent count.
-// Called on each dashboard render to compute available slots.
-// If nil, available slots defaults to 0.
-type SlotFunc func() int
+// RetryNowFunc makes the scheduled retry of the issue with the given
+// identifier due now; ctx is the request's context.
+type RetryNowFunc func(ctx context.Context, identifier string) orchestrator.RetryNowResult
 
-// RunHistoryFunc returns recent run history entries for the dashboard.
-// Called on each dashboard render. If nil, the run history section
-// is omitted.
-type RunHistoryFunc func(ctx context.Context, limit int) ([]RunHistoryEntry, error)
+// AcknowledgeFunc records that a person has seen the attention item with the
+// given ID; ctx is the request's context.
+type AcknowledgeFunc func(ctx context.Context, itemID string) orchestrator.AcknowledgeResult
+
+// CheckNowFunc makes the next check of an issue's pending pull request
+// reaction of the given kind due now; ctx is the request's context.
+type CheckNowFunc func(ctx context.Context, identifier, kind string) orchestrator.CheckNowResult
 
 // RunHistoryEntry is a server-layer view of a completed run attempt.
 // Decoupled from persistence types to avoid leaking internal packages.
 type RunHistoryEntry struct {
 	// Identifier is the tracker-assigned issue identifier (e.g., "PROJ-123").
 	Identifier string
-	// DisplayID is the short display label shown on the dashboard.
+	// DisplayID is the short display label that the JSON API reports.
 	DisplayID string
 	// Attempt is the one-based retry attempt number.
 	Attempt int
@@ -61,6 +64,146 @@ type RunHistoryEntry struct {
 	Error *string
 	// TurnsCompleted is the number of agent turns completed before exit.
 	TurnsCompleted int
+	// RuleName is the dispatch rule that routed the run; empty when none did.
+	RuleName string
+	// ChainID is the stage chain the run belongs to; empty for a run
+	// recorded before chains existed.
+	ChainID string
+	// StagePrevious is the rule whose hop led to the run; empty when none
+	// did.
+	StagePrevious string
+	// StageTarget is the rule the run's hop decision targeted; empty when
+	// the run reached none.
+	StageTarget string
+	// StageResult is the result of the run's hop decision; empty when
+	// StageTarget is.
+	StageResult string
+	// ID is the run's identifier in run history; it grows with every
+	// recorded run and is the paging key.
+	ID int64
+	// IssueID is the tracker-assigned issue ID.
+	IssueID string
+	// IssueTitle is the title as recorded, unmasked.
+	IssueTitle string
+	// IssueURL is the tracker link as recorded, unmasked.
+	IssueURL string
+	// AgentKind is the agent adapter kind that ran the session.
+	AgentKind string
+	// ConfiguredModel is the model the dispatch rule configured.
+	ConfiguredModel string
+	// ConfiguredEffort is the reasoning effort the dispatch rule configured.
+	ConfiguredEffort string
+	// ReportedModel is the model the agent reported using.
+	ReportedModel string
+	// DispatchedAt is the dispatch timestamp as stored; empty when unrecorded.
+	DispatchedAt string
+	// Tokens holds the run's token figures; meaningful only when
+	// TokensMeasured is true.
+	Tokens domain.TokenUsage
+	// TokensMeasured is false when the agent reported no usage.
+	TokensMeasured bool
+	// UnaccountedTurns counts turns whose usage the agent never reported.
+	UnaccountedTurns int
+	// StagePreviousOutcome is the outcome of the run that led to this one.
+	StagePreviousOutcome string
+	// ReviewMetadata is the self-review JSON as recorded; nil when
+	// self-review did not run.
+	ReviewMetadata *string
+	// OriginRecorded is false for a run recorded before the origin fields
+	// existed; Trigger, ReactionKind, SessionID, and SSHHost are then unknown.
+	OriginRecorded bool
+	// Trigger is what started the retry that dispatched the run; empty for
+	// none, nil when the run's retry never stored it.
+	Trigger *string
+	// ReactionKind is the dispatching retry's reaction kind; empty for none.
+	ReactionKind string
+	// SessionID is the agent session the run used; empty when it started none.
+	SessionID string
+	// SSHHost is the SSH worker the run executed on; empty for a local run.
+	SSHHost string
+}
+
+// RunHistoryQuery selects completed runs; a zero field matches every run.
+type RunHistoryQuery struct {
+	IssueID, Identifier, Status, StageTarget string
+	// RuleName nil matches every run; a pointer to "" selects the runs that
+	// record no rule name.
+	RuleName *string
+	// Since keeps runs completed at or after it.
+	Since *time.Time
+	// Until keeps runs completed before it.
+	Until *time.Time
+	// EndedSince keeps runs of issues whose outcome was observed at or after it.
+	EndedSince *time.Time
+	// EndedUntil keeps runs of issues whose outcome was observed before it.
+	EndedUntil *time.Time
+	// BeforeID keeps runs recorded before this run ID; 0 starts at the newest.
+	BeforeID int64
+	// Limit is the most runs returned.
+	Limit int
+}
+
+// IssueGroupQuery selects the issues of run history by issue; a zero field
+// matches every run.
+type IssueGroupQuery struct {
+	// IssueKey keeps the issues with a run whose identifier or display
+	// identifier equals it.
+	IssueKey, Status, StageTarget string
+	// RuleName nil matches every run; a pointer to "" selects the runs that
+	// record no rule name.
+	RuleName *string
+	// BeforeID continues after the group whose newest matching run has this
+	// ID; 0 starts at the newest group.
+	BeforeID int64
+	// Limit is the most groups returned.
+	Limit int
+}
+
+// IssueGroupKey is one issue with a matching run and the ID of its newest
+// matching run.
+type IssueGroupKey struct {
+	IssueID     string
+	NewestRunID int64
+}
+
+// IssueOutcome is how an issue's latest work ended, as the orchestrator
+// observed it. State is empty for a merged outcome; MergeReactionKind,
+// PRNumber, and PRRepository are set only for a merged outcome.
+type IssueOutcome struct {
+	// Kind is "handed_off", "merged", or "terminal".
+	Kind string
+	// ObservedAt is when the outcome was observed, as stored.
+	ObservedAt string
+	// State is the tracker state a handoff wrote or a terminal read found,
+	// unmasked.
+	State string
+	// MergeReactionKind is the reaction kind that observed the merge.
+	MergeReactionKind string
+	// PRNumber is the merged pull request number.
+	PRNumber int
+	// PRRepository is the merged pull request's owner/repo, unmasked.
+	PRRepository string
+}
+
+// IssueRunTotals is one issue's spend over all of its runs.
+type IssueRunTotals struct {
+	// Usage counts runs and prices spend per agent kind.
+	Usage orchestrator.SnapshotIssueUsage
+	// Tokens sums each token class over the measured runs.
+	Tokens domain.TokenUsage
+}
+
+// RunHistoryReader reads persisted run history. Runs come newest first, and
+// an implementation is safe for concurrent use.
+type RunHistoryReader interface {
+	QueryRuns(ctx context.Context, q RunHistoryQuery) ([]RunHistoryEntry, error)
+	// QueryIssueGroups returns the issues whose runs match q, ordered by their
+	// newest matching run, newest first.
+	QueryIssueGroups(ctx context.Context, q IssueGroupQuery) ([]IssueGroupKey, error)
+	IssueTotals(ctx context.Context, issueID string) (IssueRunTotals, error)
+	// IssueOutcomes returns the outcome of each listed issue that has one,
+	// keyed by issue ID.
+	IssueOutcomes(ctx context.Context, issueIDs []string) (map[string]IssueOutcome, error)
 }
 
 // DBPingFunc checks whether the SQLite database is accessible.
@@ -74,9 +217,30 @@ type Params struct {
 	// GET /api/v1/state and GET /api/v1/{identifier}.
 	SnapshotFn SnapshotFunc
 
+	// WorkflowShapeFn returns the effective workflow shape. Called on
+	// each GET /api/v1/state; nil omits config.
+	WorkflowShapeFn func() orchestrator.WorkflowShape
+
+	// HealthFn returns the health of Sortie's own checks. Called on each
+	// GET /api/v1/state; nil omits health.
+	HealthFn func() orchestrator.SnapshotHealth
+
 	// RefreshFn signals an immediate poll+reconciliation cycle.
 	// Called on POST /api/v1/refresh.
 	RefreshFn RefreshFunc
+
+	// RetryNowFn makes an issue's scheduled retry due now. Called on
+	// POST /api/v1/retries/{identifier}/run; nil answers 503.
+	RetryNowFn RetryNowFunc
+
+	// AcknowledgeFn records that a person has seen an attention item. Called
+	// on POST /api/v1/attention/{id}/acknowledge; nil answers 503.
+	AcknowledgeFn AcknowledgeFunc
+
+	// CheckNowFn makes the next check of a pending pull request reaction due
+	// now. Called on POST /api/v1/reactions/{identifier}/{kind}/check; nil
+	// answers 503.
+	CheckNowFn CheckNowFunc
 
 	// Logger is the structured logger for request and error logging.
 	Logger *slog.Logger
@@ -84,17 +248,12 @@ type Params struct {
 	// Addr is the TCP address to listen on (e.g. "127.0.0.1:8080").
 	Addr string
 
-	// Version is the build version string displayed on the dashboard.
-	// Falls back to "dev" when empty.
+	// Version is the build version string that the JSON API reports.
 	Version string
 
 	// StartedAt is the time the process started, used to compute
-	// uptime on the dashboard.
+	// uptime in the JSON API.
 	StartedAt time.Time
-
-	// SlotFunc returns the current max concurrent agents from config.
-	// If nil, available slots displays as 0 on the dashboard.
-	SlotFunc SlotFunc
 
 	// MetricsRegistry is an optional Prometheus registry for the
 	// /metrics endpoint. When non-nil, New registers a handler at
@@ -117,37 +276,48 @@ type Params struct {
 	// When nil, the workflow check always reports "pass".
 	WorkflowLoadedFn func() bool
 
-	// RunHistoryFn returns recent run history entries for the
-	// dashboard. Called on each dashboard render. When nil, the run
-	// history section is omitted.
-	RunHistoryFn RunHistoryFunc
+	// RunHistory reads persisted run history. When nil, GET /api/v1/runs
+	// answers 503, GET /api/v1/{identifier} serves live detail with a null
+	// history.
+	RunHistory RunHistoryReader
 
 	// TokenRates maps agent adapter kind strings to per-token USD
-	// rates for cost estimation on the dashboard. When nil or empty,
-	// the dashboard shows raw token counts without cost estimates.
+	// rates for cost estimation in the JSON API. When nil or empty,
+	// the API reports raw token counts without cost estimates.
 	TokenRates TokenRates
+
+	// Stats computes the run statistics report. Called on each
+	// GET /api/v1/stats; nil answers 503.
+	Stats StatsFunc
 }
 
-// Server is the embedded HTTP server for JSON API, dashboard, and
-// metrics endpoints. Construct via [New]. Safe for concurrent use
+// Server is the embedded HTTP server for the JSON API, the dashboard
+// application's assets, and metrics endpoints. Construct via [New]. Safe for concurrent use
 // after construction.
 type Server struct {
-	httpServer    *http.Server
-	mux           *http.ServeMux
-	logger        *slog.Logger
-	snapshotFn    SnapshotFunc
-	refreshFn     RefreshFunc
-	dashboardTmpl *template.Template
-	version       string
-	startedAt     time.Time
-	slotFunc      SlotFunc
+	httpServer      *http.Server
+	mux             *http.ServeMux
+	logger          *slog.Logger
+	snapshotFn      SnapshotFunc
+	refreshFn       RefreshFunc
+	retryNowFn      RetryNowFunc
+	acknowledgeFn   AcknowledgeFunc
+	checkNowFn      CheckNowFunc
+	workflowShapeFn func() orchestrator.WorkflowShape
+	healthFn        func() orchestrator.SnapshotHealth
+	version         string
+	startedAt       time.Time
 
 	drainingFlag     atomic.Bool
 	dbPingFn         DBPingFunc
 	preflightFn      func() bool
 	workflowLoadedFn func() bool
-	runHistoryFn     RunHistoryFunc
+	runHistory       RunHistoryReader
 	tokenRates       TokenRates
+	stats            StatsFunc
+
+	changes *changeFeed
+	timing  streamTiming
 }
 
 // Compile-time assertion: Server satisfies orchestrator.Observer.
@@ -171,34 +341,37 @@ func New(params Params) *Server {
 
 	mux := http.NewServeMux()
 
-	tmpl := template.Must(
-		template.New("dashboard").Funcs(template.FuncMap{
-			"fmtInt":  FormatInt,
-			"fmtCost": FormatCost,
-			"even":    func(i int) bool { return i%2 == 0 },
-		}).Parse(dashboardHTML),
-	)
-
 	s := &Server{
 		mux:              mux,
 		logger:           logger,
 		snapshotFn:       params.SnapshotFn,
 		refreshFn:        params.RefreshFn,
-		dashboardTmpl:    tmpl,
+		retryNowFn:       params.RetryNowFn,
+		acknowledgeFn:    params.AcknowledgeFn,
+		checkNowFn:       params.CheckNowFn,
+		workflowShapeFn:  params.WorkflowShapeFn,
+		healthFn:         params.HealthFn,
 		version:          params.Version,
 		startedAt:        params.StartedAt,
-		slotFunc:         params.SlotFunc,
 		dbPingFn:         params.DBPingFn,
 		preflightFn:      params.PreflightFn,
 		workflowLoadedFn: params.WorkflowLoadedFn,
-		runHistoryFn:     params.RunHistoryFn,
+		runHistory:       params.RunHistory,
 		tokenRates:       params.TokenRates,
+		stats:            params.Stats,
+		changes:          newChangeFeed(),
+		timing: streamTiming{
+			heartbeat:      15 * time.Second,
+			signalInterval: time.Second,
+			frameDeadline:  2 * time.Second,
+		},
 	}
 
 	// Method-specific pattern so non-GET methods receive the default
 	// 405 response from Go's ServeMux.
-	mux.HandleFunc("GET /{$}", s.handleDashboard)
+	mux.HandleFunc("GET /{$}", handleRoot)
 	mux.HandleFunc("GET /favicon.ico", handleFavicon)
+	mux.Handle("GET /ui/", ui.Handler())
 
 	// Method-specific patterns ensure non-GET methods receive the
 	// default 405 response from Go's ServeMux.
@@ -209,7 +382,14 @@ func New(params Params) *Server {
 	// 405 responses use JSON error envelopes instead of the default
 	// plain-text body from Go's ServeMux.
 	mux.HandleFunc("/api/v1/state", s.routeState)
+	mux.HandleFunc("/api/v1/runs", s.routeRuns)
+	mux.HandleFunc("/api/v1/runs/issues", s.routeIssueGroups)
+	mux.HandleFunc("/api/v1/stats", s.routeStats)
 	mux.HandleFunc("/api/v1/refresh", s.routeRefresh)
+	mux.HandleFunc("/api/v1/retries/{identifier}/run", s.routeRetryNow)
+	mux.HandleFunc("/api/v1/attention/{id}/acknowledge", s.routeAcknowledge)
+	mux.HandleFunc("/api/v1/reactions/{identifier}/{kind}/check", s.routeCheckNow)
+	mux.HandleFunc("/api/v1/events", s.routeEvents)
 	mux.HandleFunc("/api/v1/{identifier}", s.routeIssueDetail)
 
 	if params.MetricsRegistry != nil {
@@ -227,6 +407,7 @@ func New(params Params) *Server {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	s.httpServer.RegisterOnShutdown(s.changes.close)
 
 	return s
 }
@@ -255,7 +436,9 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // Shutdown gracefully shuts down the server without interrupting
 // in-flight requests. Sets the draining flag as defense-in-depth
-// before delegating to [http.Server.Shutdown].
+// before delegating to [http.Server.Shutdown]. Every open event stream
+// ends as soon as shutdown begins, so its connection stops counting as
+// active.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.drainingFlag.Store(true)
 	return s.httpServer.Shutdown(ctx)
@@ -269,5 +452,18 @@ func (s *Server) SetDraining() {
 	s.drainingFlag.Store(true)
 }
 
-// OnStateChange satisfies [orchestrator.Observer]. Currently a no-op.
-func (s *Server) OnStateChange() {}
+// OnStateChange satisfies [orchestrator.Observer] and tells every open event
+// stream that something the API serves has changed. It performs no I/O,
+// never blocks, and waits on nothing, so it is safe for concurrent use from
+// any goroutine, before [Server.Serve] and after [Server.Shutdown].
+func (s *Server) OnStateChange() {
+	s.changes.publish()
+}
+
+// handleRoot redirects to the dashboard application. The header is written
+// directly because [http.Redirect] adds a body to GET responses, and the
+// status is 302 so that browsers do not cache a redirect that may change.
+func handleRoot(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Location", "/ui/")
+	w.WriteHeader(http.StatusFound)
+}

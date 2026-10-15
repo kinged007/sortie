@@ -1,12 +1,16 @@
 package orchestrator
 
 import (
+	"log/slog"
 	"path"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/logging"
 )
 
 // ResolutionLayer identifies the layer that produced a dispatch
@@ -44,10 +48,9 @@ func (l ResolutionLayer) String() string {
 }
 
 // DispatchResolution carries the agent kind, template ID, rule name,
-// and layer chosen for a single issue's initial dispatch. The
-// orchestrator persists these on [RunningEntry] and propagates them
-// through [RetryEntry] so retries and reaction continuations reuse
-// the original selection.
+// and layer chosen for a single issue's dispatch. The orchestrator
+// records these on [RunningEntry] and propagates them through
+// [RetryEntry].
 type DispatchResolution struct {
 	// AgentKind is the resolved adapter kind. Always non-empty for a
 	// well-configured workflow; the resolver coalesces missing values
@@ -67,32 +70,48 @@ type DispatchResolution struct {
 	MatchedAt ResolutionLayer
 }
 
+// HopRoute names the rule and stage label of an issue's latest automatic
+// stage hop. The zero value means the issue has no hop record.
+type HopRoute struct {
+	TargetRule  string
+	TargetLabel string
+}
+
 // ResolveRule selects the dispatch agent kind, template ID, and rule
-// name for an issue against a [config.DispatchConfig]. It is pure: no
-// I/O, no time dependence, no goroutine. defaultAgentKind is the
-// workflow-wide agent kind (typically cfg.Agent.Kind);
-// defaultTemplateID is the body-template sentinel (typically the
-// empty string). The same inputs always produce the same output.
-func ResolveRule(issue domain.Issue, dispatch config.DispatchConfig, defaultAgentKind, defaultTemplateID string) DispatchResolution {
-	for _, rule := range dispatch.Rules {
-		if !rule.IsCatchAll && !matchRule(rule.Match, issue) {
-			continue
-		}
-		return DispatchResolution{
-			AgentKind:  coalesce(rule.Selection.AgentKind, dispatch.Default.AgentKind, defaultAgentKind),
-			TemplateID: coalesce(rule.Selection.TemplateID, dispatch.Default.TemplateID, defaultTemplateID),
-			RuleName:   rule.Name,
-			MatchedAt:  ResolvedFromRule,
+// name for an issue against a [config.DispatchConfig]. The target of the
+// issue's latest hop is selected first while the issue carries the stage
+// label that hop added and a rule of that name exists. Otherwise a rule
+// whose stage label the issue carries is selected, the most downstream one
+// along next links when the issue carries several, the one lowest in the
+// list among equals. Otherwise the rules without a stage label are tried
+// in order. It is pure: no I/O, no logging, no time dependence, no
+// goroutine. defaultAgentKind is the workflow-wide agent kind (typically
+// cfg.Agent.Kind); defaultTemplateID is the body-template sentinel
+// (typically the empty string). The same inputs always produce the same
+// output.
+func ResolveRule(issue domain.Issue, dispatch config.DispatchConfig, hop HopRoute, defaultAgentKind, defaultTemplateID string) DispatchResolution {
+	if hop.TargetRule != "" && carriesLabel(issue.Labels, hop.TargetLabel) {
+		if rule, ok := dispatch.RuleByName(hop.TargetRule); ok {
+			return ruleResolution(rule, dispatch, defaultAgentKind, defaultTemplateID)
 		}
 	}
 
-	if dispatch.Default.AgentKind != "" || dispatch.Default.TemplateID != "" {
-		return DispatchResolution{
-			AgentKind:  coalesce(dispatch.Default.AgentKind, defaultAgentKind),
-			TemplateID: coalesce(dispatch.Default.TemplateID, defaultTemplateID),
-			RuleName:   "default",
-			MatchedAt:  ResolvedFromDefault,
+	if staged := stageCandidates(issue, dispatch.Rules); len(staged) > 0 {
+		return ruleResolution(dispatch.Rules[pickStageCandidate(staged, dispatch.Rules)], dispatch, defaultAgentKind, defaultTemplateID)
+	}
+
+	for _, rule := range dispatch.Rules {
+		if rule.Stage != "" {
+			continue
 		}
+		if !rule.IsCatchAll && !matchRule(rule.Match, issue) {
+			continue
+		}
+		return ruleResolution(rule, dispatch, defaultAgentKind, defaultTemplateID)
+	}
+
+	if resolution, ok := defaultSelection(dispatch, defaultAgentKind, defaultTemplateID); ok {
+		return resolution
 	}
 
 	return DispatchResolution{
@@ -101,6 +120,130 @@ func ResolveRule(issue domain.Issue, dispatch config.DispatchConfig, defaultAgen
 		RuleName:   "",
 		MatchedAt:  ResolvedFromFallback,
 	}
+}
+
+// defaultSelection returns the dispatch default block's resolution and true
+// when the block names an agent kind or a template.
+func defaultSelection(dispatch config.DispatchConfig, defaultAgentKind, defaultTemplateID string) (DispatchResolution, bool) {
+	if dispatch.Default.AgentKind == "" && dispatch.Default.TemplateID == "" {
+		return DispatchResolution{}, false
+	}
+	return DispatchResolution{
+		AgentKind:  coalesce(dispatch.Default.AgentKind, defaultAgentKind),
+		TemplateID: coalesce(dispatch.Default.TemplateID, defaultTemplateID),
+		RuleName:   "default",
+		MatchedAt:  ResolvedFromDefault,
+	}, true
+}
+
+func ruleResolution(rule config.DispatchRule, dispatch config.DispatchConfig, defaultAgentKind, defaultTemplateID string) DispatchResolution {
+	return DispatchResolution{
+		AgentKind:  coalesce(rule.Selection.AgentKind, dispatch.Default.AgentKind, defaultAgentKind),
+		TemplateID: coalesce(rule.Selection.TemplateID, dispatch.Default.TemplateID, defaultTemplateID),
+		RuleName:   rule.Name,
+		MatchedAt:  ResolvedFromRule,
+	}
+}
+
+// carriesLabel reports whether labels holds a label equal to stageLabel
+// under [config.StageLabelsEqual].
+func carriesLabel(labels []string, stageLabel string) bool {
+	return slices.ContainsFunc(labels, func(label string) bool { return config.StageLabelsEqual(stageLabel, label) })
+}
+
+// stageCandidates returns the indices, in list order, of the rules whose
+// stage label the issue carries.
+func stageCandidates(issue domain.Issue, rules []config.DispatchRule) []int {
+	var indices []int
+	for i, rule := range rules {
+		if rule.Stage == "" {
+			continue
+		}
+		if carriesLabel(issue.Labels, rule.Stage) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// pickStageCandidate returns the index among staged of the rule that no
+// other staged rule is downstream of, the lowest index when several
+// qualify, so an issue carrying the labels of several stages of one chain
+// takes the furthest. staged must be non-empty.
+func pickStageCandidate(staged []int, rules []config.DispatchRule) int {
+	for _, i := range staged {
+		if !slices.ContainsFunc(staged, func(j int) bool { return j != i && reachesByNext(rules, i, j) }) {
+			return i
+		}
+	}
+	return staged[0]
+}
+
+// reachesByNext reports whether following next links from rules[from]
+// arrives at rules[to]. The walk stops at a repeated rule, so a loop in a
+// configuration that skipped validation cannot spin.
+func reachesByNext(rules []config.DispatchRule, from, to int) bool {
+	visited := map[int]struct{}{from: {}}
+	for current := from; rules[current].Next != ""; {
+		following := slices.IndexFunc(rules, func(r config.DispatchRule) bool { return r.Name == rules[current].Next })
+		if following < 0 {
+			return false
+		}
+		if following == to {
+			return true
+		}
+		if _, seen := visited[following]; seen {
+			return false
+		}
+		visited[following] = struct{}{}
+		current = following
+	}
+	return false
+}
+
+// warnSeveralStageLabels logs one warning naming every stage label the
+// issue carries when it carries two or more. ruleName is the rule the
+// evaluation selected. [ResolveRule] stays silent so each lane that
+// evaluates the rules logs once per evaluation.
+func warnSeveralStageLabels(log *slog.Logger, issue domain.Issue, dispatch config.DispatchConfig, ruleName string) {
+	staged := stageCandidates(issue, dispatch.Rules)
+	if len(staged) < 2 {
+		return
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	labels := make([]string, len(staged))
+	for i, index := range staged {
+		labels[i] = dispatch.Rules[index].Stage
+	}
+	logging.WithIssue(log, issue.ID, issue.Identifier).Warn("several stage labels found",
+		slog.Any("stage_labels", labels),
+		slog.String("rule_name", ruleName))
+}
+
+// retrySelection selects the agent kind, template ID, and rule name a
+// waiting retry dispatches on under cfg, the configuration in force.
+// frozen is the selection the retry entry carries. The frozen selection
+// stands, with a retired kind replaced by its replacement, while its
+// kind is still reachable and its template is still held; otherwise the
+// issue is routed afresh. The second result is true only when the
+// issue was routed afresh, by hop and the issue's labels. templateHeld
+// reports whether the workflow holds a template for an ID.
+func retrySelection(cfg config.ServiceConfig, templateHeld func(id string) bool, frozen DispatchResolution, issue domain.Issue, hop HopRoute) (DispatchResolution, bool) {
+	target := frozen.AgentKind
+	for _, conversion := range cfg.AgentKindConversions() {
+		if conversion.Kind == target {
+			target = conversion.Replacement
+			break
+		}
+	}
+
+	reachable := slices.ContainsFunc(orderedUniqueAgentKinds(cfg), func(ref agentKindRef) bool { return ref.Kind == target })
+	if reachable && templateHeld(frozen.TemplateID) {
+		return DispatchResolution{AgentKind: target, TemplateID: frozen.TemplateID, RuleName: frozen.RuleName, MatchedAt: frozen.MatchedAt}, false
+	}
+	return ResolveRule(issue, cfg.Dispatch, hop, cfg.Agent.Kind, ""), true
 }
 
 // coalesce returns the first non-empty string from the arguments. An
@@ -156,6 +299,11 @@ func matchRule(m config.DispatchMatch, issue domain.Issue) bool {
 			return false
 		}
 	}
+	if len(m.Title) > 0 {
+		if !anyTitlePhraseMatch(m.Title, issue.Title) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -193,6 +341,131 @@ func anyCIEq(allowed []string, value string) bool {
 		}
 	}
 	return false
+}
+
+// anyTitlePhraseMatch reports whether any phrase occurs in title as
+// whole words, ignoring letter case and white-space differences. The
+// search is literal: no character of a phrase is a wildcard. An empty
+// title never matches.
+func anyTitlePhraseMatch(phrases []string, title string) bool {
+	t := normalizeTitleText(title)
+	if t == "" {
+		return false
+	}
+	for _, phrase := range phrases {
+		p := normalizeTitleText(phrase)
+		if p == "" {
+			continue
+		}
+		// Every occurrence is tried, overlapping ones included: the
+		// first can sit inside a longer word while a later one is whole.
+		for from := 0; from < len(t); {
+			idx := strings.Index(t[from:], p)
+			if idx < 0 {
+				break
+			}
+			i := from + idx
+			if isWholeOccurrence(t, p, i) {
+				return true
+			}
+			_, size := utf8.DecodeRuneInString(t[i:])
+			from = i + size
+		}
+	}
+	return false
+}
+
+// normalizeTitleText folds every case form of a letter to one rune, drops
+// the emoji variation selectors, replaces each run of white space with one
+// space, and trims the ends. The fold is simple, not full: ß stays distinct
+// from ss, and accents and Unicode forms stay as written.
+func normalizeTitleText(s string) string {
+	var b strings.Builder
+	pendingSpace := false
+	for _, original := range s {
+		r := foldCase(original)
+		if isEmojiPresentationSelector(r) {
+			continue
+		}
+		if unicode.IsSpace(r) {
+			pendingSpace = true
+			continue
+		}
+		if pendingSpace && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		pendingSpace = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// foldCase maps r to the smallest letter in its simple case-folding orbit,
+// so σ, ς, and Σ, or s, S, and ſ, compare equal. Lowercasing runs first
+// because İ reaches i only through it. Only letters join an orbit, which
+// keeps U+0345 a combining mark rather than a spelling of ι.
+func foldCase(r rune) rune {
+	r = unicode.ToLower(r)
+	if !unicode.IsLetter(r) {
+		return r
+	}
+	canon := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < canon && unicode.IsLetter(f) {
+			canon = f
+		}
+	}
+	return canon
+}
+
+// isEmojiPresentationSelector reports whether r is U+FE0E or U+FE0F.
+// They only pick the glyph style of the rune before them and are
+// invisible, so a phrase typed without one must match a title that
+// carries one.
+func isEmojiPresentationSelector(r rune) bool {
+	return r == '\uFE0E' || r == '\uFE0F'
+}
+
+// isWholeOccurrence reports whether the occurrence of p in t at byte
+// offset i neither starts nor ends inside a word.
+func isWholeOccurrence(t, p string, i int) bool {
+	if i > 0 {
+		before, _ := utf8.DecodeLastRuneInString(t[:i])
+		first, _ := utf8.DecodeRuneInString(p)
+		if runesJoin(before, first) {
+			return false
+		}
+	}
+	if end := i + len(p); end < len(t) {
+		last, _ := utf8.DecodeLastRuneInString(p)
+		after, _ := utf8.DecodeRuneInString(t[end:])
+		if runesJoin(last, after) {
+			return false
+		}
+	}
+	return true
+}
+
+// runesJoin reports whether adjacent runes a and b belong to one word.
+// A combining mark always stays with the rune before it, in every
+// script, so a match never separates a base character from its vowel,
+// tone, or variation sign.
+func runesJoin(a, b rune) bool {
+	if unicode.IsMark(b) {
+		return true
+	}
+	return isWordRune(a) && isWordRune(b) && !isUnspacedScriptRune(a) && !isUnspacedScriptRune(b)
+}
+
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsMark(r) || unicode.IsDigit(r)
+}
+
+// isUnspacedScriptRune reports whether r is written without spaces
+// between words, so every character boundary in these scripts is a
+// word boundary. Hangul is excluded because Korean uses spaces.
+func isUnspacedScriptRune(r rune) bool {
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Thai, unicode.Lao, unicode.Khmer, unicode.Myanmar)
 }
 
 // priorityPredicateMatch dispatches by operator. Unknown operators

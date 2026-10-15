@@ -14,6 +14,9 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/prompt"
+	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
@@ -204,6 +207,14 @@ type RunningEntry struct {
 	// for first dispatches and non-reaction retries. Runtime-only.
 	ReactionKind string
 
+	// Trigger is the OriginTrigger of the retry whose fire dispatched the
+	// entry; empty for a poll-tick dispatch. Runtime-only.
+	Trigger string
+
+	// Continuation names the pull request and try of a reaction
+	// continuation; the zero value for every other dispatch. Runtime-only.
+	Continuation ContinuationTarget
+
 	// SelfReviewActive is true during the self-review phase. Mutated only
 	// by the event loop via selfReviewCh.
 	SelfReviewActive bool
@@ -214,10 +225,28 @@ type RunningEntry struct {
 	// active at dispatch.
 	AgentKind string
 
-	// RuleName is the dispatch rule frozen at initial dispatch. Empty when
-	// the workflow-wide fallback fired, "default" when the default block
-	// matched.
+	// RuleName is the dispatch rule the run was dispatched under. Empty
+	// when the workflow-wide fallback fired, "default" when the default
+	// block matched.
 	RuleName string
+
+	// StageLineage is the frozen stage.previous pair and chain this run
+	// was dispatched with; its ChainID is never empty.
+	StageLineage StageLineage
+
+	// FirstAfterHop reports that the poll tick dispatched this run as the
+	// first run after the issue's stage hop. A retry never sets it.
+	// Runtime-only.
+	FirstAfterHop bool
+
+	// RuleSettingsApplied reports that the rule's settings block applied
+	// to this attempt.
+	RuleSettingsApplied bool
+
+	// ConfiguredModel and ConfiguredEffort are what the operator asked
+	// for, empty when unset; ModelName is what the runtime reported.
+	ConfiguredModel  string
+	ConfiguredEffort string
 
 	// TemplateID is the resolved template registry key frozen at dispatch.
 	// Empty selects the WORKFLOW.md body template.
@@ -246,6 +275,16 @@ type RunningEntry struct {
 	// confirming read. 0 when the dispatch read failed.
 	IssueTokensCompleted int64
 
+	// IssueUsage is the issue's completed-session usage as of the last
+	// successful read on this entry, written on the event loop at dispatch
+	// and by a confirming read. Nil while no read has succeeded.
+	IssueUsage *persistence.IssueTokenUsage
+
+	// UnaccountedTurns is the running session's count of turns that spent
+	// tokens no figure was proven to cover, as its worker last relayed it.
+	// Written only on the event loop.
+	UnaccountedTurns int
+
 	// TokenCeilingStopRequest is set once the ceiling decides to stop this
 	// run. Non-nil alone does not mean the ceiling ended it; decided at exit.
 	TokenCeilingStopRequest *TokenCeilingStopRequest
@@ -268,25 +307,36 @@ type RunningEntry struct {
 	// token warning reaching its threshold and cleared once that write
 	// succeeds.
 	MetadataWritePending bool
+
+	// NoStateObserved is true after a reconcile read the issue in no state
+	// and no later reconcile read it in a state. Set and cleared only by
+	// [reconcileTrackerState].
+	NoStateObserved bool
 }
 
 // RetryEntry holds the runtime state for a pending retry. IssueID,
-// Identifier, Attempt, DueAtMS, and Error map to persistence.RetryEntry;
+// Identifier, DisplayID, IssueIdentity, Attempt, DueAtMS, and Error map to
+// persistence.RetryEntry;
 // the rest is runtime-only and reconstructed on startup from persisted
 // due_at timestamps.
 type RetryEntry struct {
-	IssueID     string
-	Identifier  string
-	DisplayID   string
-	SessionID   string
-	Attempt     int
-	DueAtMS     int64
-	Error       string
-	TimerHandle *time.Timer
+	IssueID       string
+	Identifier    string
+	DisplayID     string
+	IssueIdentity IssueIdentity
+	SessionID     string
+	Attempt       int
+	DueAtMS       int64
+	Error         string
+	TimerHandle   *time.Timer
 
 	// LastSSHHost is the SSH host from the previous attempt, passed as the
 	// preferred host to [HostPool.AcquireHost]. Runtime-only.
 	LastSSHHost string
+
+	// noStateObserved is true when the fire that scheduled this entry read
+	// the issue in no state. Runtime-only.
+	noStateObserved bool
 
 	// scheduledAt is time.Now() when ScheduleRetry created this entry. Its
 	// monotonic reading makes staleness detection immune to wall-clock
@@ -307,23 +357,49 @@ type RetryEntry struct {
 	// dispatch. Runtime-only.
 	ReactionKind string
 
-	// RuleName is the dispatch rule frozen at initial dispatch, propagated
-	// verbatim through every retry.
+	// Trigger is the sortie_retries_total trigger label the schedule that
+	// created the entry recorded; empty when that schedule records none.
+	Trigger string
+
+	// OriginTrigger is what started the retry, kept through every
+	// put-back by the retry timer; empty when the retry never recorded it.
+	OriginTrigger string
+
+	// RuleName is the dispatch rule of the run this retry follows.
 	RuleName string
 
-	// TemplateID is the resolved template registry key frozen at initial
-	// dispatch, propagated verbatim through every retry.
+	// StageLineage is the frozen stage lineage of the run this retry
+	// follows.
+	StageLineage StageLineage
+
+	// RuleSettingsApplied reports that the run this retry follows ran
+	// with its rule's settings block.
+	RuleSettingsApplied bool
+
+	// TemplateID is the resolved template registry key of the run this
+	// retry follows.
 	TemplateID string
 
-	// AgentKind is the adapter kind frozen at initial dispatch, propagated
-	// so [HandleRetryTimer] resolves the adapter without re-running rule
-	// resolution.
+	// AgentKind is the adapter kind of the run this retry follows.
 	AgentKind string
+
+	// ConfiguredModel is the model the run this retry follows was configured
+	// with; empty when unset.
+	ConfiguredModel string
+
+	// Continuation names the pull request and try of the reaction
+	// continuation this retry dispatches; the zero value for every other
+	// retry. Runtime-only.
+	Continuation ContinuationTarget
 
 	// pausedSinceMS is the wall-clock ms at which this entry first took one
 	// of HandleRetryTimer's paused-by-issue-state arms. Zero means not
 	// paused. Runtime-only: never persisted, never on ScheduleRetryParams.
 	pausedSinceMS int64
+
+	// dueBeforeRequestMS is the DueAtMS the entry had before the first request
+	// that made it due now; zero when no request did. Runtime-only.
+	dueBeforeRequestMS int64
 }
 
 // ReactionKindCI is the reaction kind for CI failure reactions.
@@ -385,24 +461,63 @@ func watchWindowMS(extra map[string]any, def int) (int, error) {
 	return n, nil
 }
 
-// reactionKindPins is the single registry of reaction kinds. Presence in
-// the map means the kind is known; the value reports whether a pending
-// entry pins its workspace against sweep candidacy. Both
-// [isKnownReactionKind] and [reactionKindPinsWorkspace] read it, so a kind
-// cannot be recognized without an explicit pin classification.
-var reactionKindPins = map[string]bool{
-	ReactionKindCI:              true,
-	ReactionKindReview:          true,
-	ReactionKindBotReview:       true,
-	ReactionKindAutoMerge:       true,
-	ReactionKindMergeConflict:   true,
-	ReactionKindLabelReview:     false,
-	ReactionKindLabelFix:        false,
-	ReactionKindMergeCompletion: false,
+// attemptCounting classifies whether a kind's pass counts tries in
+// [State.ReactionAttempts]. It is a named type rather than a bool so a
+// registry literal cannot swap it with pinsWorkspace and still compile.
+type attemptCounting bool
+
+const (
+	countsAttempts   attemptCounting = true
+	countsNoAttempts attemptCounting = false
+)
+
+// escalation classifies whether a kind's pass escalates to a person. It is
+// a named type for the same reason as [attemptCounting].
+type escalation bool
+
+const (
+	escalates      escalation = true
+	neverEscalates escalation = false
+)
+
+// reactionKindSpec classifies one registered reaction kind.
+type reactionKindSpec struct {
+	configKey     string          // key of the reactions section of WORKFLOW.md the kind is configured under
+	pinsWorkspace bool            // a pending entry of the kind excludes its workspace from sweep candidacy
+	attempts      attemptCounting // the kind's pass counts tries in State.ReactionAttempts
+	escalates     escalation      // the kind's pass escalates and keeps a durable escalation record
+}
+
+// reactionKinds is the single registry of reaction kinds. Presence in the
+// map means the kind is known. Every entry is an unkeyed literal so the
+// compiler rejects a kind registered without its configuration key, its
+// pin classification, its attempt counting, or its escalation class.
+var reactionKinds = map[string]reactionKindSpec{
+	ReactionKindCI:              {"ci_failure", true, countsAttempts, escalates},
+	ReactionKindReview:          {"review_comments", true, countsAttempts, escalates},
+	ReactionKindBotReview:       {"bot_review", true, countsAttempts, escalates},
+	ReactionKindAutoMerge:       {"auto_merge", true, countsAttempts, escalates},
+	ReactionKindMergeConflict:   {"merge_conflicts", true, countsAttempts, escalates},
+	ReactionKindLabelReview:     {"label_commands", false, countsNoAttempts, neverEscalates},
+	ReactionKindLabelFix:        {"label_commands", false, countsNoAttempts, neverEscalates},
+	ReactionKindMergeCompletion: {"merge_completion", false, countsAttempts, escalates},
+}
+
+// EscalatingReactionKinds returns the registered reaction kinds whose pass
+// escalates, sorted.
+func EscalatingReactionKinds() []string {
+	kinds := make([]string, 0, len(reactionKinds))
+	for kind, spec := range reactionKinds {
+		if spec.escalates == escalates {
+			kinds = append(kinds, kind)
+		}
+	}
+	slices.Sort(kinds)
+	return kinds
 }
 
 func isKnownReactionKind(kind string) bool {
-	_, known := reactionKindPins[kind]
+	_, known := reactionKinds[kind]
 	return known
 }
 
@@ -411,11 +526,17 @@ func isKnownReactionKind(kind string) bool {
 // unregistered kind returns true, the non-destructive default: retention
 // is safe for a kind the rest of the system does not yet classify.
 func reactionKindPinsWorkspace(kind string) bool {
-	pins, known := reactionKindPins[kind]
+	spec, known := reactionKinds[kind]
 	if !known {
 		return true
 	}
-	return pins
+	return spec.pinsWorkspace
+}
+
+// ReactionConfigKey returns the reactions key kind is configured under, or
+// "" for a kind outside the registry, the empty kind included.
+func ReactionConfigKey(kind string) string {
+	return reactionKinds[kind].configKey
 }
 
 // ReactionKey returns the composite map key for a pending reaction.
@@ -436,6 +557,12 @@ type PendingReaction struct {
 
 	DisplayID string
 
+	// IssueIdentity is the issue as the run that created the reaction read
+	// it, with the handoff target as State when that run's exit moved the
+	// issue to it. Restored from run history it holds the title and link
+	// alone, with nil Labels.
+	IssueIdentity IssueIdentity
+
 	// Attempt is the overall run attempt number from the completed worker.
 	Attempt int
 
@@ -446,6 +573,8 @@ type PendingReaction struct {
 	// preference on fix redispatch.
 	LastSSHHost string
 
+	// CreatedAt is when the worker exit or startup recovery created the
+	// entry; never rewritten.
 	CreatedAt time.Time
 
 	// PendingAttempts counts consecutive passes that reached no dispatch,
@@ -456,40 +585,124 @@ type PendingReaction struct {
 	// immediately.
 	PendingRetryAt time.Time
 
+	// dueBeforeRequest is the PendingRetryAt the entry had before a request
+	// made its check due now; zero when no request did. Runtime-only.
+	dueBeforeRequest time.Time
+
+	// attemptsBeforeRequest is the PendingAttempts the entry had then; a new
+	// pull request head zeroes it. Runtime-only.
+	attemptsBeforeRequest int
+
 	// HeadRecordedAt is when this process recorded the commit currently
 	// evaluated. Zero until first recorded, and zero for a startup-restored
 	// entry, because a head recorded by a previous process cannot bound a
-	// query over this process's activity. Read only by kinds whose subject
-	// is the pull request head.
+	// query over this process's activity. The exception is a restored
+	// standing escalation of a kind whose subject is the head: it takes the
+	// escalation time, which no run of the previous process can precede.
+	// Read only by kinds whose subject is the pull request head.
 	HeadRecordedAt time.Time
 
-	// EscalatedForCurrentHead reports whether escalation has been applied
-	// for the recorded commit. Cleared when a different head is recorded,
-	// so an exhausted budget escalates at most once per commit. Read only
-	// by kinds whose subject is the pull request head.
-	EscalatedForCurrentHead bool
+	// EscalatedAt is when the standing escalation began; zero while none
+	// stands.
+	EscalatedAt time.Time
+
+	// EscalationTrigger is why the standing escalation began; empty while
+	// none stands.
+	EscalationTrigger ReactionEscalationTrigger
+
+	// EscalationSubject is what the standing escalation was about, in the
+	// kind's own terms; empty while none stands or when the escalation has
+	// no subject to latch on.
+	EscalationSubject string
+
+	// NoStateObserved reports that a tracker reading found the issue in no
+	// state while an escalation stands. Two consecutive readings end it.
+	NoStateObserved bool
+
+	// resumeAfterRestart marks a merge-completion entry restored at startup
+	// with a standing escalation: its first due pass runs the normal path
+	// once.
+	resumeAfterRestart bool
+
+	// escalationUnsaved marks a standing escalation whose record could not
+	// be saved; each later due pass of the entry saves it again.
+	escalationUnsaved bool
+
+	// WatchRestartedAt is when a retry-slot deferral last restarted the
+	// entry's watch window; zero when none has.
+	WatchRestartedAt time.Time
+
+	// PullRequestURL is the pull request's web page as the latest read of
+	// it reported; empty until a read reports one.
+	PullRequestURL string
+
+	// Wait is why the entry waits for its next check, as the pass that last
+	// returned it to the pending set recorded it; empty until one has.
+	Wait string
+
+	// LastCheck is what the latest completed check observed; nil until one
+	// completes, and always nil for kinds that record no result.
+	LastCheck *ReactionCheck
 
 	// KindData holds kind-specific typed data (CI uses [*CIReactionData]).
 	// Each kind's reconcile function asserts the type once.
 	KindData any
 
-	// AgentKind is the dispatch-frozen adapter kind from the completed
-	// worker, propagated so the same adapter handles the follow-up turn.
+	// AgentKind is the adapter kind of the completed worker.
 	AgentKind string
 
-	// RuleName is the dispatch-frozen rule name from the completed worker,
-	// propagated so the continuation appears under the same rule.
+	// RuleName is the rule name of the completed worker.
 	RuleName string
 
-	// TemplateID is the dispatch-frozen template key from the completed
-	// worker, propagated so the continuation renders the same template.
+	// StageLineage is the frozen stage lineage of the completed worker.
+	StageLineage StageLineage
+
+	// RuleSettingsApplied reports that the completed worker ran with its
+	// rule's settings block.
+	RuleSettingsApplied bool
+
+	// TemplateID is the template key of the completed worker.
 	TemplateID string
+
+	// ConfiguredModel is the model the completed worker was configured with;
+	// empty when unset.
+	ConfiguredModel string
 
 	// Triage is the in-flight or finished triage run for the current
 	// subject. Nil when none started, cleared when the fingerprint moves.
 	// Runtime-only.
 	Triage *ReactionTriageRun
 }
+
+// ReactionCheck is what one completed check of a pending reaction observed.
+// Exactly one of CI, Comments, and Mergeability is set.
+type ReactionCheck struct {
+	ObservedAt   time.Time
+	HeadSHA      string // the head commit the check read; ci and merge-conflict only
+	CI           *CICheck
+	Comments     *CommentCheck
+	Mergeability *MergeabilityCheck
+}
+
+// CICheck is a CI verdict and its check runs by outcome.
+type CICheck struct {
+	Status        string   // the verdict the reaction acted on
+	FailingChecks []string // names of the failing runs in the provider's order; never nil
+	Failing       int
+	Pending       int
+	Passing       int
+}
+
+// CommentCheck counts the comments a review check found actionable and, of
+// those, the ones the reaction acts on next.
+type CommentCheck struct {
+	Actionable int
+	New        int
+}
+
+// MergeabilityCheck reports whether the pull request merges without
+// conflicts; a nil Mergeable means the provider had not computed it.
+type MergeabilityCheck struct{ Mergeable *bool }
 
 // CIReactionData holds CI-specific fields for a pending CI reaction,
 // stored in [PendingReaction.KindData] for Kind == [ReactionKindCI].
@@ -700,6 +913,7 @@ type MergeCompletionReactionConfig struct {
 type BudgetExhaustedEntry struct {
 	Identifier         string // human-readable ticket key; empty when the candidate carried none
 	DisplayID          string // qualified form of Identifier; empty when Identifier is display-ready
+	IssueIdentity      IssueIdentity
 	Reason             string // budgetReasonSession or budgetReasonToken
 	UsedSessions       int    // completed sessions counted from run history
 	BudgetSessions     int    // configured agent.max_sessions; 0 means unlimited
@@ -707,7 +921,36 @@ type BudgetExhaustedEntry struct {
 	BudgetTokens       int64  // configured agent.max_tokens; 0 means unlimited
 	UnmeasuredSessions *int   // nil exactly when UsedTokens is nil; else runs whose spend is unknown
 	StoppedInFlight    *int   // nil exactly when UsedTokens is nil; else sessions the token ceiling stopped mid-run
+	UnaccountedTurns   int    // taken from the read that set UsedTokens; 0 while UsedTokens is nil
 	ExhaustedAt        time.Time
+
+	// RuleName, StageLineage, AgentKind, and ConfiguredModel describe the
+	// dispatch the hold blocks. The record holds a dispatch context exactly
+	// when AgentKind is non-empty.
+	RuleName        string
+	StageLineage    StageLineage
+	AgentKind       string
+	ConfiguredModel string
+}
+
+// setTokenUsage fills the token-axis fields from one read of the issue's
+// run history. It copies the counts, so the entry never aliases the
+// caller's usage value.
+func (e *BudgetExhaustedEntry) setTokenUsage(usage persistence.IssueTokenUsage) {
+	used, unmeasured, stopped := usage.TotalTokens, usage.UnmeasuredSessions, usage.StoppedInFlight
+	e.UsedTokens = &used
+	e.UnmeasuredSessions = &unmeasured
+	e.StoppedInFlight = &stopped
+	e.UnaccountedTurns = usage.UnaccountedTurns
+}
+
+// SpendIncomplete reports whether a token sum carrying the given counts
+// leaves spend out, making the sum a lower bound.
+func SpendIncomplete(unmeasuredSessions, unaccountedTurns int) bool {
+	return persistence.IssueTokenUsage{
+		UnmeasuredSessions: unmeasuredSessions,
+		UnaccountedTurns:   unaccountedTurns,
+	}.SpendIncomplete()
 }
 
 // BudgetAnnouncement remembers what the operator was already told about a
@@ -721,19 +964,209 @@ type BudgetAnnouncement struct {
 // ParkedEntry is the runtime view of one issue held out of primary
 // dispatch until the orchestrator observes that a person acted on it.
 type ParkedEntry struct {
-	Identifier   string
-	DisplayID    string
-	Reason       string // "agent_blocked" or "handoff_absence"
-	ParkedState  string // tracker state observed at park time; empty when unobserved
-	Label        string // parking label the orchestrator applied
-	LabelApplied bool
-	ParkedAt     time.Time
+	Identifier string
+	DisplayID  string
+	// IssueIdentity is the issue's title, link, issue type, and labels as
+	// read for the park; the zero value holds no read. Its State is never
+	// served: ParkedState is.
+	IssueIdentity IssueIdentity
+	Reason        string // "agent_blocked" or "handoff_absence"
+	ParkedState   string // tracker state observed at park time; empty when unobserved
+	Label         string // parking label the orchestrator applied
+	LabelApplied  bool
+	ParkedAt      time.Time
+
+	// RuleName, StageLineage, AgentKind, and ConfiguredModel describe the
+	// run the park follows. The park records a run exactly when AgentKind
+	// is non-empty.
+	RuleName        string
+	StageLineage    StageLineage
+	AgentKind       string
+	ConfiguredModel string
+}
+
+// IssueIdentity names an issue to a person beside its key: the tracker's
+// title, web link, issue type, labels, and state as the orchestrator read
+// them. The zero value holds no read of the issue. Labels is nil while the
+// labels are unread and an empty non-nil slice when a read found none.
+type IssueIdentity struct {
+	Title     string
+	URL       string
+	IssueType string
+	Labels    []string
+	State     string
+}
+
+// issueIdentityOf returns the identity issue carries, unmasked. Labels is
+// a new non-nil slice.
+func issueIdentityOf(issue domain.Issue) IssueIdentity {
+	labels := make([]string, len(issue.Labels))
+	copy(labels, issue.Labels)
+	return IssueIdentity{
+		Title:     issue.Title,
+		URL:       issue.URL,
+		IssueType: issue.IssueType,
+		Labels:    labels,
+		State:     issue.State,
+	}
+}
+
+// isZero reports whether id holds no read of its issue.
+func (id IssueIdentity) isZero() bool {
+	return id.Title == "" && id.URL == "" && id.IssueType == "" && id.Labels == nil && id.State == ""
+}
+
+// holdsPartialRead reports whether id names its issue by title or link but
+// never read its labels: an identity restored from a retry row or a run
+// history row written before those facts were kept.
+func (id IssueIdentity) holdsPartialRead() bool {
+	return (id.Title != "" || id.URL != "") && id.Labels == nil
+}
+
+// filledFrom returns id completed by read. A zero id becomes read; a
+// partial read takes the type, labels, and state of read and keeps its
+// title and link, so a held title or link is never replaced; any other id
+// is returned unchanged.
+func (id IssueIdentity) filledFrom(read IssueIdentity) IssueIdentity {
+	switch {
+	case id.isZero():
+		return read
+	case id.holdsPartialRead():
+		id.IssueType = read.IssueType
+		id.Labels = read.Labels
+		id.State = read.State
+	}
+	return id
+}
+
+// maskedIdentity returns id with every secret registered for redaction
+// replaced by its marker. A nil Labels stays nil.
+func maskedIdentity(id IssueIdentity) IssueIdentity {
+	masked := IssueIdentity{
+		Title:     redact.Mask(id.Title),
+		URL:       redact.Mask(id.URL),
+		IssueType: redact.Mask(id.IssueType),
+		State:     redact.Mask(id.State),
+	}
+	if id.Labels != nil {
+		masked.Labels = maskedLabels(id.Labels)
+	}
+	return masked
+}
+
+// maskedLabels returns a new slice of labels with every registered secret
+// replaced by its marker; it is empty and non-nil when labels is. State
+// keeps the unmasked labels because stage advancement reads them.
+func maskedLabels(labels []string) []string {
+	masked := make([]string, len(labels))
+	for i, label := range labels {
+		masked[i] = redact.Mask(label)
+	}
+	return masked
+}
+
+// StageLineage is the frozen stage.previous pair and chain identifier of a
+// selection.
+type StageLineage struct {
+	// PreviousRule is the rule whose hop led to the dispatch; empty when
+	// none did.
+	PreviousRule string
+
+	// PreviousOutcome is "succeeded" or "no_change"; empty when
+	// PreviousRule is empty.
+	PreviousOutcome string
+
+	// ChainID groups the runs of one pass through a chain of stages. It is
+	// empty only on a value read from a row written before chains were
+	// recorded, and never on a [RunningEntry].
+	ChainID string
+
+	// DispatchedAt is the start of the first run of the pass ChainID names.
+	// It is zero only on a value restored from a row that could not be
+	// dated.
+	DispatchedAt time.Time
+}
+
+// formatDispatchedAt returns the persisted form of a pass dispatch time:
+// RFC 3339 with nanoseconds in UTC, so a restored value equals the served
+// one. The zero time becomes the empty string.
+func formatDispatchedAt(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// parseDispatchedAt reverses [formatDispatchedAt]. An empty or malformed
+// value yields the zero time.
+func parseDispatchedAt(value string) time.Time {
+	at, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return at.UTC()
+}
+
+// ContinuationTarget is the pull request a reaction continuation works on
+// and which try of its reaction it is. The zero value continues no reaction.
+type ContinuationTarget struct {
+	PRNumber int
+	Owner    string
+	Repo     string
+	Attempt  int // 0 for a kind that counts no tries
+}
+
+// RuleAgent is the agent kind and configured model a dispatch of one rule
+// resolves to under the configuration in force.
+type RuleAgent struct {
+	AgentKind       string
+	ConfiguredModel string
+}
+
+// StageHopEntry is the runtime view of one issue's stage_hops row.
+type StageHopEntry struct {
+	Identifier       string
+	Count            int
+	SourceRule       string
+	TargetRule       string
+	TargetLabel      string
+	PreviousOutcome  string
+	SourceDispatchID string
+
+	// TargetObserved reports that a tracker read has shown TargetLabel on
+	// the issue since the hop, which releases the dispatch hold.
+	TargetObserved bool
+
+	HoppedAt time.Time
+
+	// ChainID is the chain of the run whose exit made the hop.
+	ChainID string
+
+	// DisplayID is the qualified form of Identifier the hopping run read;
+	// empty when Identifier is display-ready.
+	DisplayID string
+
+	// IssueIdentity holds the title, issue type, and state the hopping run
+	// read and the labels the hop leaves on the issue.
+	IssueIdentity IssueIdentity
+
+	// DispatchedAt is the start of the first run of the pass ChainID names.
+	DispatchedAt time.Time
+
+	// RunDispatched reports that a run of the issue was dispatched after the
+	// hop, which ends the issue's listing between stages.
+	RunDispatched bool
+
+	// NoStateObserved is true after a reconcile read the issue in no state
+	// and no later reconcile read it in a state. Set and cleared only by
+	// [reconcileTrackerState].
+	NoStateObserved bool
 }
 
 // State is the single authoritative runtime state owned by the
 // orchestrator. Not safe for concurrent access: all mutations are
-// serialized through the event loop goroutine, except WorkerWg, which is
-// goroutine-safe. The agent_totals and completed set are backed by SQLite
+// serialized through the event loop goroutine, except WorkerWg and
+// TrackerOpsWg, which are goroutine-safe. The agent_totals and completed set are backed by SQLite
 // and survive restarts.
 type State struct {
 	// WorkerWg tracks in-flight worker goroutines spawned by
@@ -742,7 +1175,11 @@ type State struct {
 	WorkerWg sync.WaitGroup
 
 	// TrackerOpsWg tracks fire-and-forget tracker API goroutines, drained
-	// after worker shutdown so they are not orphaned on exit.
+	// after worker shutdown so they are not orphaned on exit. A worker adds
+	// to it for the detached part of the session.started delivery before
+	// it reports its exit and only while its context is live, and the
+	// drain cancels every worker before it waits, so an add cannot race
+	// the wait.
 	TrackerOpsWg sync.WaitGroup
 
 	// TriageWg tracks in-flight reaction triage goroutines so shutdown can
@@ -767,6 +1204,35 @@ type State struct {
 	// ceiling, refreshed on every poll tick. 0 means unlimited. Written
 	// only on the event-loop goroutine.
 	MaxTokens int
+
+	// MaxSessions mirrors config.Agent.MaxSessions, refreshed on every poll
+	// tick. 0 means unlimited. Written only on the event-loop goroutine.
+	MaxSessions int
+
+	// StageChains and HopCeiling mirror config.Dispatch.Chains and
+	// config.Dispatch.HopCeiling, refreshed on every poll tick. Set before the
+	// event loop serves a snapshot. Written only on the event-loop goroutine.
+	StageChains [][]string
+	HopCeiling  int
+
+	// RuleAgents maps the name of each rule a stage hop can target to the
+	// agent kind and model a dispatch of it resolves to. It mirrors the
+	// configuration, is refreshed on every poll tick, and is set before the
+	// event loop serves a snapshot. Written only on the event-loop
+	// goroutine.
+	RuleAgents map[string]RuleAgent
+
+	// ReactionMaxAttempts maps a reaction kind to the ceiling its pass
+	// applies to [State.ReactionAttempts]; a kind with none is absent. Set
+	// before the event loop serves a snapshot and replaced every poll tick.
+	// Written only on the event-loop goroutine.
+	ReactionMaxAttempts map[string]int
+
+	// ReactionWatchWindows maps a reaction kind to the watch window its pass
+	// applies; a kind with none, or with a window of 0, is absent. Set before
+	// the event loop serves a snapshot and replaced every poll tick. Written
+	// only on the event-loop goroutine.
+	ReactionWatchWindows map[string]time.Duration
 
 	// TokenWarningThreshold mirrors config.Agent.TokenWarningThreshold()
 	// for the in-flight token warning, refreshed on every poll tick. 0
@@ -823,6 +1289,20 @@ type State struct {
 	// person acts on it. The durable mirror is the parked_issues table.
 	Parked map[string]*ParkedEntry
 
+	// AttentionAcknowledgements maps an attention item ID to when a person
+	// acknowledged the item. The durable mirror is the
+	// attention_acknowledgements table. Only the event loop mutates this map.
+	AttentionAcknowledgements map[string]time.Time
+
+	// StageHops maps issue ID to the issue's consecutive automatic stage
+	// hops since the last reset. The durable mirror is the stage_hops
+	// table. Only the event loop may mutate this map.
+	StageHops map[string]*StageHopEntry
+
+	// ActiveOrder maps the ID of each issue the row lists hold to the time it
+	// is ordered by. Runtime-only; written only on the event-loop goroutine.
+	ActiveOrder map[string]time.Time
+
 	// AgentTotals holds aggregate token counts and cumulative runtime
 	// seconds across all ended sessions. Active-session elapsed time is
 	// computed at snapshot time.
@@ -836,6 +1316,21 @@ type State struct {
 	// reaction-triggered continuations. Reset when the issue leaves Running
 	// or RetryAttempts. Runtime-only.
 	ReactionAttempts map[string]int
+
+	// ReactionHandedOffComments maps composite key (issueID:kind) to the set
+	// of [domain.ReviewComment] IDs the issue's runs were given for that
+	// kind, a cache over the reaction_handoffs rows. A present
+	// key is authoritative for this process; an absent key means the rows
+	// were not loaded, never that the set is empty. Only the review and
+	// bot-review kinds use it.
+	ReactionHandedOffComments map[string]map[string]struct{}
+
+	// ReactionReportedComments maps composite key (issueID:kind) to the IDs
+	// of bot-review comments a spent budget or a triage escalation already
+	// reported to a person. It is deleted wherever the kind's
+	// [State.ReactionAttempts] entry is and never reaches the store.
+	// Runtime-only.
+	ReactionReportedComments map[string]map[string]struct{}
 
 	// PendingReactions maps composite key (issueID:kind) to a
 	// [PendingReaction]. Populated by [HandleWorkerExit], consumed by
@@ -895,6 +1390,21 @@ func ContinuationFromContext(ctx context.Context) map[string]any {
 	return v
 }
 
+type stageRenderCtxKey struct{}
+
+// withStageRender returns a child context carrying the stage render
+// context a worker passes to every prompt render.
+func withStageRender(ctx context.Context, render prompt.StageContext) context.Context {
+	return context.WithValue(ctx, stageRenderCtxKey{}, render)
+}
+
+// stageRenderFrom extracts the value injected by [withStageRender], or the
+// zero [prompt.StageContext] when absent.
+func stageRenderFrom(ctx context.Context) prompt.StageContext {
+	render, _ := ctx.Value(stageRenderCtxKey{}).(prompt.StageContext)
+	return render
+}
+
 // NewState creates an initialized [State] with empty collections and the
 // provided config values. maxConcurrentByState keys must be pre-normalized
 // to lowercase by the caller.
@@ -903,23 +1413,28 @@ func NewState(pollIntervalMS, maxConcurrentAgents, maxTokens int, maxConcurrentB
 		maxConcurrentByState = make(map[string]int)
 	}
 	return &State{
-		PollIntervalMS:        pollIntervalMS,
-		MaxConcurrentAgents:   maxConcurrentAgents,
-		MaxTokens:             maxTokens,
-		MaxConcurrentByState:  maxConcurrentByState,
-		Running:               make(map[string]*RunningEntry),
-		Claimed:               make(map[string]struct{}),
-		RetryAttempts:         make(map[string]*RetryEntry),
-		Completed:             make(map[string]struct{}),
-		BudgetExhausted:       make(map[string]*BudgetExhaustedEntry),
-		BudgetAnnounced:       make(map[string]BudgetAnnouncement),
-		BudgetHoldNoticed:     make(map[string]string),
-		Parked:                make(map[string]*ParkedEntry),
-		AgentTotals:           totals,
-		ReactionAttempts:      make(map[string]int),
-		PendingReactions:      make(map[string]*PendingReaction),
-		AutoMergeAuthLogged:   make(map[string]struct{}),
-		TokenBudgetIncomplete: make(map[string]struct{}),
+		PollIntervalMS:            pollIntervalMS,
+		MaxConcurrentAgents:       maxConcurrentAgents,
+		MaxTokens:                 maxTokens,
+		MaxConcurrentByState:      maxConcurrentByState,
+		Running:                   make(map[string]*RunningEntry),
+		Claimed:                   make(map[string]struct{}),
+		RetryAttempts:             make(map[string]*RetryEntry),
+		Completed:                 make(map[string]struct{}),
+		BudgetExhausted:           make(map[string]*BudgetExhaustedEntry),
+		BudgetAnnounced:           make(map[string]BudgetAnnouncement),
+		BudgetHoldNoticed:         make(map[string]string),
+		Parked:                    make(map[string]*ParkedEntry),
+		AttentionAcknowledgements: make(map[string]time.Time),
+		StageHops:                 make(map[string]*StageHopEntry),
+		ActiveOrder:               make(map[string]time.Time),
+		AgentTotals:               totals,
+		ReactionAttempts:          make(map[string]int),
+		ReactionHandedOffComments: make(map[string]map[string]struct{}),
+		ReactionReportedComments:  make(map[string]map[string]struct{}),
+		PendingReactions:          make(map[string]*PendingReaction),
+		AutoMergeAuthLogged:       make(map[string]struct{}),
+		TokenBudgetIncomplete:     make(map[string]struct{}),
 	}
 }
 
@@ -939,12 +1454,75 @@ func RunningCountByState(running map[string]*RunningEntry, state string) int {
 	return count
 }
 
+// SnapshotIssueUsage is a running issue's completed-session usage,
+// value-copied by [RuntimeSnapshot]. Each ByKind value is shaped for cost
+// estimation: InputTokens spans fresh input and both cache classes, and
+// TotalTokens is left zero because pricing never reads it.
+type SnapshotIssueUsage struct {
+	Sessions           int                          `json:"sessions"`
+	TotalTokens        int64                        `json:"total_tokens"`
+	UnmeasuredSessions int                          `json:"unmeasured_sessions"`
+	UnaccountedTurns   int                          `json:"unaccounted_turns"`
+	ByKind             map[string]domain.TokenUsage `json:"by_kind"`
+}
+
+// SnapshotStagePosition is where a row's rule stands on its stage chain.
+type SnapshotStagePosition struct {
+	Chain      []string `json:"chain"`
+	Current    string   `json:"current"`
+	HopCount   int      `json:"hop_count"`
+	HopCeiling int      `json:"hop_ceiling"`
+}
+
+// SnapshotContinuation is the pull request a running reaction continuation
+// works on and which try of its reaction it is.
+type SnapshotContinuation struct {
+	Number     int    `json:"number"`
+	Repository string `json:"repository"` // owner/repo, masked
+	Attempt    int    `json:"attempt"`    // 0 for a kind that counts no tries
+}
+
+// SnapshotStageHop is a read-only view of one issue between stages: a hop was
+// made and no run of the issue was dispatched since. IssueTitle, IssueURL,
+// IssueType, IssueLabels, and State are masked. IssueLabels is nil exactly
+// when the record holds no read of the labels. StagePosition is nil when
+// RuleName is on no stage chain, and AgentKind and ConfiguredModel are empty
+// when the configuration names no rule with a stage label for it.
+type SnapshotStageHop struct {
+	IssueID      string    `json:"issue_id"`
+	Identifier   string    `json:"issue_identifier"`
+	DisplayID    string    `json:"display_identifier,omitempty"`
+	IssueTitle   string    `json:"issue_title,omitempty"`
+	IssueURL     string    `json:"issue_url,omitempty"`
+	IssueType    string    `json:"issue_type,omitempty"`
+	IssueLabels  []string  `json:"issue_labels,omitzero"`
+	State        string    `json:"state,omitempty"`
+	SourceRule   string    `json:"source_rule"`
+	TargetRule   string    `json:"target_rule"`
+	TargetLabel  string    `json:"target_label"`
+	HoppedAt     time.Time `json:"hopped_at"`
+	DispatchedAt time.Time `json:"dispatched_at"`
+
+	RuleName        string                 `json:"rule_name,omitempty"`
+	StagePosition   *SnapshotStagePosition `json:"stage_position"`
+	AgentKind       string                 `json:"agent_kind,omitempty"`
+	ConfiguredModel string                 `json:"configured_model,omitempty"`
+}
+
 // SnapshotRunningEntry is a read-only view of a running session, produced
-// by [RuntimeSnapshot].
+// by [RuntimeSnapshot]. IssueTitle, IssueURL, IssueType, IssueLabels, and
+// State are masked, and IssueLabels is never nil. IssueUsage is nil exactly
+// when no usage read has succeeded for the run. StagePosition is nil when
+// the entry's rule is on no stage chain, and Continuation is nil unless the
+// session continues a reaction.
 type SnapshotRunningEntry struct {
 	IssueID             string                    `json:"issue_id"`
 	Identifier          string                    `json:"issue_identifier"`
 	DisplayID           string                    `json:"display_identifier,omitempty"`
+	IssueTitle          string                    `json:"issue_title,omitempty"`
+	IssueURL            string                    `json:"issue_url,omitempty"`
+	IssueLabels         []string                  `json:"issue_labels"`
+	IssueType           string                    `json:"issue_type,omitempty"`
 	State               string                    `json:"state"`
 	SessionID           string                    `json:"session_id"`
 	TurnCount           int                       `json:"turn_count"`
@@ -970,37 +1548,154 @@ type SnapshotRunningEntry struct {
 	SelfReviewIteration int                       `json:"self_review_iteration,omitempty"`
 	AgentKind           string                    `json:"agent_kind,omitempty"`
 	RuleName            string                    `json:"rule_name,omitempty"`
+	StageLineage        StageLineage              `json:"stage_lineage"`
+	StagePosition       *SnapshotStagePosition    `json:"stage_position"`
+	ReactionKind        string                    `json:"reaction_kind,omitempty"`
+	ReactionConfigKey   string                    `json:"reaction_config_key,omitempty"`
+	Continuation        *SnapshotContinuation     `json:"continuation,omitempty"`
+	ConfiguredModel     string                    `json:"configured_model,omitempty"`
+	ConfiguredEffort    string                    `json:"configured_effort,omitempty"`
 	UsageMeasured       bool                      `json:"tokens_measured"`
 	UsageArrival        registry.UsageArrival     `json:"usage_arrival"`
 	UsageAttribution    registry.UsageAttribution `json:"usage_attribution"`
 	TokensPending       bool                      `json:"tokens_pending"`
 	TokensAwaited       bool                      `json:"tokens_awaited"`
+	IssueUsage          *SnapshotIssueUsage       `json:"issue_usage,omitempty"`
+	UnaccountedTurns    int                       `json:"unaccounted_turns"`
 }
 
 // SnapshotRetryEntry is a read-only view of a pending retry, produced by
-// [RuntimeSnapshot].
+// [RuntimeSnapshot]. IssueTitle, IssueURL, IssueType, IssueLabels, and State
+// are masked. IssueLabels is nil exactly when the entry holds no read of the
+// labels. StagePosition is nil when the entry's rule is on no stage chain.
 type SnapshotRetryEntry struct {
-	IssueID    string `json:"issue_id"`
-	Identifier string `json:"issue_identifier"`
-	DisplayID  string `json:"display_identifier,omitempty"`
-	Attempt    int    `json:"attempt"`
-	DueAtMS    int64  `json:"due_at_ms"`
-	Error      string `json:"error"`
+	IssueID           string                 `json:"issue_id"`
+	Identifier        string                 `json:"issue_identifier"`
+	DisplayID         string                 `json:"display_identifier,omitempty"`
+	IssueTitle        string                 `json:"issue_title,omitempty"`
+	IssueURL          string                 `json:"issue_url,omitempty"`
+	IssueType         string                 `json:"issue_type,omitempty"`
+	IssueLabels       []string               `json:"issue_labels,omitzero"`
+	State             string                 `json:"state,omitempty"`
+	Attempt           int                    `json:"attempt"`
+	DueAtMS           int64                  `json:"due_at_ms"`
+	Error             string                 `json:"error"`
+	Trigger           string                 `json:"trigger,omitempty"`
+	ReactionKind      string                 `json:"reaction_kind,omitempty"`
+	ReactionConfigKey string                 `json:"reaction_config_key,omitempty"`
+	RuleName          string                 `json:"rule_name,omitempty"`
+	AgentKind         string                 `json:"agent_kind,omitempty"`
+	ConfiguredModel   string                 `json:"configured_model,omitempty"`
+	StageLineage      StageLineage           `json:"stage_lineage"`
+	StagePosition     *SnapshotStagePosition `json:"stage_position"`
+	Paused            bool                   `json:"paused"`
+}
+
+// SnapshotParkedEntry is a read-only view of one parked issue, produced by
+// [RuntimeSnapshot]. IssueTitle, IssueURL, IssueType, IssueLabels, and
+// ParkedState are masked. IssueLabels is nil exactly when the entry holds no
+// read of the labels. StagePosition is nil when the park follows no run or
+// RuleName is on no stage chain, and DispatchedAt is zero when the park
+// follows no run or that run's pass is undated.
+type SnapshotParkedEntry struct {
+	IssueID      string    `json:"issue_id"`
+	Identifier   string    `json:"issue_identifier"`
+	DisplayID    string    `json:"display_identifier,omitempty"`
+	IssueTitle   string    `json:"issue_title,omitempty"`
+	IssueURL     string    `json:"issue_url,omitempty"`
+	IssueType    string    `json:"issue_type,omitempty"`
+	IssueLabels  []string  `json:"issue_labels,omitzero"`
+	DispatchedAt time.Time `json:"dispatched_at"`
+	Reason       string    `json:"reason"`
+	ParkedState  string    `json:"parked_state,omitempty"`
+	Label        string    `json:"label"`
+	LabelApplied bool      `json:"label_applied"`
+	ParkedAt     time.Time `json:"parked_at"`
+
+	RuleName        string                 `json:"rule_name,omitempty"`
+	StagePosition   *SnapshotStagePosition `json:"stage_position"`
+	AgentKind       string                 `json:"agent_kind,omitempty"`
+	ConfiguredModel string                 `json:"configured_model,omitempty"`
 }
 
 // SnapshotBudgetEntry is a read-only, value-copied view of one issue held
 // out of dispatch by a budget ceiling, produced by [RuntimeSnapshot].
+// IssueTitle, IssueURL, IssueType, IssueLabels, and State are masked.
+// IssueLabels is nil exactly when the entry holds no read of the labels.
+// StagePosition is nil when RuleName is on no stage chain.
 type SnapshotBudgetEntry struct {
 	IssueID            string    `json:"issue_id"`
 	Identifier         string    `json:"issue_identifier"`
 	DisplayID          string    `json:"display_identifier,omitempty"`
+	IssueTitle         string    `json:"issue_title,omitempty"`
+	IssueURL           string    `json:"issue_url,omitempty"`
+	IssueType          string    `json:"issue_type,omitempty"`
+	IssueLabels        []string  `json:"issue_labels,omitzero"`
+	State              string    `json:"state,omitempty"`
 	Reason             string    `json:"reason"`
 	UsedSessions       int       `json:"used_sessions"`
 	BudgetSessions     int       `json:"budget_sessions"`
 	UsedTokens         *int64    `json:"used_tokens"`
 	BudgetTokens       int64     `json:"budget_tokens"`
 	UnmeasuredSessions *int      `json:"unmeasured_sessions"`
+	StoppedInFlight    *int      `json:"stopped_in_flight"`
+	UnaccountedTurns   int       `json:"unaccounted_turns"`
 	ExhaustedAt        time.Time `json:"exhausted_at"`
+
+	RuleName        string                 `json:"rule_name,omitempty"`
+	StageLineage    StageLineage           `json:"stage_lineage"`
+	StagePosition   *SnapshotStagePosition `json:"stage_position"`
+	AgentKind       string                 `json:"agent_kind,omitempty"`
+	ConfiguredModel string                 `json:"configured_model,omitempty"`
+}
+
+// SnapshotPendingReaction is a read-only view of one pending reaction,
+// produced by [RuntimeSnapshot]. Every runtime-derived string is masked,
+// IssueType, IssueLabels, and State included. IssueLabels is nil exactly when
+// the reaction holds no read of the labels. StagePosition is nil when
+// RuleName is on no stage chain.
+type SnapshotPendingReaction struct {
+	IssueID      string              `json:"issue_id"`
+	Identifier   string              `json:"issue_identifier"`
+	DisplayID    string              `json:"display_identifier,omitempty"`
+	IssueTitle   string              `json:"issue_title,omitempty"`
+	IssueURL     string              `json:"issue_url,omitempty"`
+	IssueType    string              `json:"issue_type,omitempty"`
+	IssueLabels  []string            `json:"issue_labels,omitzero"`
+	State        string              `json:"state,omitempty"`
+	Kind         string              `json:"kind"`
+	ConfigKey    string              `json:"config_key"`
+	PullRequest  SnapshotPullRequest `json:"pull_request"`
+	CreatedAt    time.Time           `json:"created_at"`
+	DispatchedAt time.Time           `json:"dispatched_at"`
+	NextPollAt   time.Time           `json:"next_poll_at"`
+	Wait         string              `json:"wait,omitempty"`
+	UsedAttempts *int                `json:"used_attempts"`
+	MaxAttempts  *int                `json:"max_attempts"`
+	// EscalatedAt is when the standing escalation began; nil while none stands.
+	EscalatedAt *time.Time `json:"escalated_at"`
+	// EscalationTrigger is why the standing escalation began; set exactly
+	// when EscalatedAt is non-nil.
+	EscalationTrigger string `json:"escalation_trigger,omitempty"`
+	// WatchEndsAt is when the reaction stops watching unless its watch
+	// restarts first; nil for a kind without a watch window or a window of 0,
+	// and while an escalation stands.
+	WatchEndsAt *time.Time     `json:"watch_ends_at"`
+	LastCheck   *ReactionCheck `json:"last_check"`
+
+	RuleName        string                 `json:"rule_name,omitempty"`
+	StagePosition   *SnapshotStagePosition `json:"stage_position"`
+	AgentKind       string                 `json:"agent_kind,omitempty"`
+	ConfiguredModel string                 `json:"configured_model,omitempty"`
+}
+
+// SnapshotPullRequest is the pull request a pending reaction watches.
+type SnapshotPullRequest struct {
+	Number     int    `json:"number"`
+	Repository string `json:"repository"`
+	URL        string `json:"url,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	HeadSHA    string `json:"head_sha,omitempty"`
 }
 
 // SnapshotAgentTotals holds aggregate token counts and runtime seconds at a
@@ -1034,8 +1729,26 @@ type RuntimeSnapshotResult struct {
 	BudgetExhaustedCount int                    `json:"budget_exhausted_count"`
 	BudgetExhausted      []SnapshotBudgetEntry  `json:"budget_exhausted"`
 	ParkedCount          int                    `json:"parked_count"`
-	Parked               []string               `json:"parked,omitempty"`
-	ParkedReason         map[string]string      `json:"parked_reason,omitempty"`
+	Parked               []SnapshotParkedEntry  `json:"parked"`
+
+	// PendingReactions is never nil.
+	PendingReactions []SnapshotPendingReaction `json:"pending_reactions"`
+
+	// BetweenStages is never nil.
+	BetweenStages []SnapshotStageHop `json:"between_stages"`
+
+	// ActiveOrder maps every issue ID the row lists hold to its order time.
+	// It shares nothing with State.
+	ActiveOrder map[string]time.Time `json:"-"`
+
+	// MaxTokens and MaxSessions are the token ceiling and session budget in
+	// force at capture; 0 means no limit.
+	MaxTokens   int `json:"max_tokens"`
+	MaxSessions int `json:"max_sessions"`
+
+	// AttentionAcknowledgements is a copy of State.AttentionAcknowledgements,
+	// keyed by attention item ID.
+	AttentionAcknowledgements map[string]time.Time `json:"-"`
 }
 
 // ActiveElapsedSeconds sums wall-clock elapsed seconds across all running
@@ -1092,11 +1805,36 @@ func turnHasEnded(turnCount int, lastEvent domain.AgentEventType) bool {
 	return turnCount > 1 || isTurnTerminalEvent(lastEvent)
 }
 
+// SnapshotIssueUsageOf copies a running entry's usage read into the shape the
+// snapshot serves, sharing no map with state. A nil read stays nil so the
+// absence of a successful read is not served as zero usage.
+func SnapshotIssueUsageOf(usage *persistence.IssueTokenUsage) *SnapshotIssueUsage {
+	if usage == nil {
+		return nil
+	}
+	byKind := make(map[string]domain.TokenUsage, len(usage.ByKind))
+	for kind, spent := range usage.ByKind {
+		byKind[kind] = domain.TokenUsage{
+			InputTokens:      spent.FreshInputTokens + spent.CacheReadTokens + spent.CacheWriteTokens,
+			OutputTokens:     spent.OutputTokens,
+			CacheReadTokens:  spent.CacheReadTokens,
+			CacheWriteTokens: spent.CacheWriteTokens,
+		}
+	}
+	return &SnapshotIssueUsage{
+		Sessions:           usage.Sessions,
+		TotalTokens:        usage.TotalTokens,
+		UnmeasuredSessions: usage.UnmeasuredSessions,
+		UnaccountedTurns:   usage.UnaccountedTurns,
+		ByKind:             byKind,
+	}
+}
+
 // RuntimeSnapshot captures a point-in-time view of the orchestrator's
 // runtime state. now is normalized to UTC internally.
 //
-// Running, Retrying, and AgentTotals are copied out and may be retained
-// without synchronization. RateLimits is shallow-copied and may alias
+// Running, Retrying, Parked, PendingReactions, BetweenStages, and AgentTotals are copied out and
+// may be retained without synchronization. RateLimits is shallow-copied and may alias
 // nested mutable values; callers must treat it and its referents as
 // read-only.
 //
@@ -1137,11 +1875,16 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			modelRequests = make(map[string]int, len(entry.RequestsByModel))
 			maps.Copy(modelRequests, entry.RequestsByModel)
 		}
+		identity := maskedIdentity(issueIdentityOf(entry.Issue))
 		snap.Running = append(snap.Running, SnapshotRunningEntry{
 			IssueID:             entry.Issue.ID,
 			Identifier:          entry.Identifier,
 			DisplayID:           entry.Issue.DisplayID,
-			State:               entry.Issue.State,
+			IssueTitle:          identity.Title,
+			IssueURL:            identity.URL,
+			IssueLabels:         maskedLabels(entry.Issue.Labels),
+			IssueType:           identity.IssueType,
+			State:               redact.Mask(entry.Issue.State),
 			SessionID:           entry.SessionID,
 			TurnCount:           entry.TurnCount,
 			LastAgentEvent:      entry.LastAgentEvent,
@@ -1166,12 +1909,21 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			SelfReviewIteration: entry.SelfReviewIteration,
 			AgentKind:           entry.AgentKind,
 			RuleName:            entry.RuleName,
+			StageLineage:        entry.StageLineage,
+			StagePosition:       stagePosition(state, entry.Issue.ID, entry.RuleName, entry.StageLineage.PreviousRule),
+			ReactionKind:        entry.ReactionKind,
+			ReactionConfigKey:   ReactionConfigKey(entry.ReactionKind),
+			Continuation:        snapshotContinuation(entry.Continuation),
+			ConfiguredModel:     entry.ConfiguredModel,
+			ConfiguredEffort:    entry.ConfiguredEffort,
 			UsageMeasured:       entry.UsageMeasured,
 			UsageArrival:        entry.UsageArrival,
 			UsageAttribution:    entry.UsageAttribution,
 			TokensPending: entry.UsageArrival == registry.UsageArrivalTurnEnd &&
 				entry.UsageMeasured && !isTurnTerminalEvent(entry.LastAgentEvent),
-			TokensAwaited: tokensAwaited,
+			TokensAwaited:    tokensAwaited,
+			IssueUsage:       SnapshotIssueUsageOf(entry.IssueUsage),
+			UnaccountedTurns: entry.UnaccountedTurns,
 		})
 
 		if !entry.StartedAt.IsZero() {
@@ -1184,13 +1936,29 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	for _, entry := range state.RetryAttempts {
+		identity := maskedIdentity(entry.IssueIdentity)
 		snap.Retrying = append(snap.Retrying, SnapshotRetryEntry{
-			IssueID:    entry.IssueID,
-			Identifier: entry.Identifier,
-			DisplayID:  entry.DisplayID,
-			Attempt:    entry.Attempt,
-			DueAtMS:    entry.DueAtMS,
-			Error:      entry.Error,
+			IssueID:     entry.IssueID,
+			Identifier:  entry.Identifier,
+			DisplayID:   entry.DisplayID,
+			IssueTitle:  identity.Title,
+			IssueURL:    identity.URL,
+			IssueType:   identity.IssueType,
+			IssueLabels: identity.Labels,
+			State:       identity.State,
+			Attempt:     entry.Attempt,
+			DueAtMS:     entry.DueAtMS,
+			Error:       entry.Error,
+
+			Trigger:           entry.Trigger,
+			ReactionKind:      entry.ReactionKind,
+			ReactionConfigKey: ReactionConfigKey(entry.ReactionKind),
+			RuleName:          entry.RuleName,
+			AgentKind:         entry.AgentKind,
+			ConfiguredModel:   entry.ConfiguredModel,
+			StageLineage:      entry.StageLineage,
+			StagePosition:     stagePosition(state, entry.IssueID, entry.RuleName, entry.StageLineage.PreviousRule),
+			Paused:            entry.pausedSinceMS != 0,
 		})
 	}
 
@@ -1206,20 +1974,37 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 		RunningNonReporting: runningNonReporting,
 	}
 
+	snap.MaxTokens = state.MaxTokens
+	snap.MaxSessions = state.MaxSessions
+	snap.AttentionAcknowledgements = maps.Clone(state.AttentionAcknowledgements)
+
 	snap.BudgetExhaustedCount = len(state.BudgetExhausted)
 	budgetExhausted := make([]SnapshotBudgetEntry, 0, len(state.BudgetExhausted))
 	for id, entry := range state.BudgetExhausted {
+		identity := maskedIdentity(entry.IssueIdentity)
 		budgetExhausted = append(budgetExhausted, SnapshotBudgetEntry{
 			IssueID:            id,
 			Identifier:         entry.Identifier,
 			DisplayID:          entry.DisplayID,
+			IssueTitle:         identity.Title,
+			IssueURL:           identity.URL,
+			IssueType:          identity.IssueType,
+			IssueLabels:        identity.Labels,
+			State:              identity.State,
 			Reason:             entry.Reason,
 			UsedSessions:       entry.UsedSessions,
 			BudgetSessions:     entry.BudgetSessions,
 			UsedTokens:         entry.UsedTokens,
 			BudgetTokens:       entry.BudgetTokens,
 			UnmeasuredSessions: entry.UnmeasuredSessions,
+			StoppedInFlight:    entry.StoppedInFlight,
+			UnaccountedTurns:   entry.UnaccountedTurns,
 			ExhaustedAt:        entry.ExhaustedAt,
+			RuleName:           entry.RuleName,
+			StageLineage:       entry.StageLineage,
+			StagePosition:      stagePosition(state, id, entry.RuleName, entry.StageLineage.PreviousRule),
+			AgentKind:          entry.AgentKind,
+			ConfiguredModel:    entry.ConfiguredModel,
 		})
 	}
 	slices.SortFunc(budgetExhausted, func(a, b SnapshotBudgetEntry) int {
@@ -1228,26 +2013,260 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	snap.BudgetExhausted = budgetExhausted
 
 	snap.ParkedCount = len(state.Parked)
-	if len(state.Parked) > 0 {
-		ids := make([]string, 0, len(state.Parked))
-		for id := range state.Parked {
-			ids = append(ids, id)
-		}
-		slices.Sort(ids)
-		snap.Parked = ids
+	parked := make([]SnapshotParkedEntry, 0, len(state.Parked))
+	for id, entry := range state.Parked {
+		identity := maskedIdentity(entry.IssueIdentity)
+		parked = append(parked, SnapshotParkedEntry{
+			IssueID:      id,
+			Identifier:   entry.Identifier,
+			DisplayID:    entry.DisplayID,
+			IssueTitle:   identity.Title,
+			IssueURL:     identity.URL,
+			IssueType:    identity.IssueType,
+			IssueLabels:  identity.Labels,
+			DispatchedAt: entry.StageLineage.DispatchedAt,
+			Reason:       entry.Reason,
+			ParkedState:  redact.Mask(entry.ParkedState),
+			Label:        entry.Label,
+			LabelApplied: entry.LabelApplied,
+			ParkedAt:     entry.ParkedAt,
 
-		reasons := make(map[string]string, len(state.Parked))
-		for _, id := range ids {
-			reasons[id] = state.Parked[id].Reason
-		}
-		snap.ParkedReason = reasons
+			RuleName:        entry.RuleName,
+			StagePosition:   stagePosition(state, id, entry.RuleName, entry.StageLineage.PreviousRule),
+			AgentKind:       entry.AgentKind,
+			ConfiguredModel: entry.ConfiguredModel,
+		})
 	}
+	slices.SortFunc(parked, func(a, b SnapshotParkedEntry) int {
+		return cmp.Or(cmp.Compare(a.Identifier, b.Identifier), cmp.Compare(a.IssueID, b.IssueID))
+	})
+	snap.Parked = parked
+
+	snap.PendingReactions = snapshotPendingReactions(state)
+	snap.BetweenStages = snapshotBetweenStages(state)
+	snap.ActiveOrder = activeOrderOf(state)
 
 	if state.AgentRateLimits != nil {
 		snap.RateLimits = maps.Clone(state.AgentRateLimits.Data)
 	}
 
 	return snap
+}
+
+// snapshotPendingReactions builds the pending-reaction rows sorted by issue
+// identifier, issue ID, and kind. It shares no slice, map, or pointer with
+// state and masks every runtime-derived string.
+func snapshotPendingReactions(state *State) []SnapshotPendingReaction {
+	rows := make([]SnapshotPendingReaction, 0, len(state.PendingReactions))
+	for _, entry := range state.PendingReactions {
+		pr := pullRequestOf(entry)
+		identity := maskedIdentity(entry.IssueIdentity)
+		row := SnapshotPendingReaction{
+			IssueID:     entry.IssueID,
+			Identifier:  entry.Identifier,
+			DisplayID:   entry.DisplayID,
+			IssueTitle:  identity.Title,
+			IssueURL:    identity.URL,
+			IssueType:   identity.IssueType,
+			IssueLabels: identity.Labels,
+			State:       identity.State,
+			Kind:        entry.Kind,
+			ConfigKey:   ReactionConfigKey(entry.Kind),
+			PullRequest: SnapshotPullRequest{
+				Number:     pr.Number,
+				Repository: redact.Mask(pr.Owner + "/" + pr.Repo),
+				URL:        redact.Mask(entry.PullRequestURL),
+				Branch:     redact.Mask(pr.Branch),
+				HeadSHA:    redact.Mask(pr.HeadSHA),
+			},
+			CreatedAt:    entry.CreatedAt,
+			DispatchedAt: entry.StageLineage.DispatchedAt,
+			NextPollAt:   cmp.Or(entry.PendingRetryAt, entry.CreatedAt),
+			Wait:         entry.Wait,
+			LastCheck:    snapshotReactionCheck(entry.LastCheck),
+
+			RuleName:        entry.RuleName,
+			StagePosition:   stagePosition(state, entry.IssueID, entry.RuleName, entry.StageLineage.PreviousRule),
+			AgentKind:       entry.AgentKind,
+			ConfiguredModel: entry.ConfiguredModel,
+		}
+		if reactionKinds[entry.Kind].attempts == countsAttempts {
+			used := state.ReactionAttempts[ReactionKey(entry.IssueID, entry.Kind)]
+			row.UsedAttempts = &used
+		}
+		if ceiling, ok := state.ReactionMaxAttempts[entry.Kind]; ok {
+			row.MaxAttempts = &ceiling
+		}
+		if !entry.EscalatedAt.IsZero() {
+			escalatedAt := entry.EscalatedAt
+			row.EscalatedAt = &escalatedAt
+			row.EscalationTrigger = string(entry.EscalationTrigger)
+		}
+		if window, ok := state.ReactionWatchWindows[entry.Kind]; ok && entry.EscalatedAt.IsZero() {
+			watchEndsAt := watchBasis(entry).Add(window)
+			row.WatchEndsAt = &watchEndsAt
+		}
+		rows = append(rows, row)
+	}
+	slices.SortFunc(rows, func(a, b SnapshotPendingReaction) int {
+		return cmp.Or(
+			cmp.Compare(a.Identifier, b.Identifier),
+			cmp.Compare(a.IssueID, b.IssueID),
+			cmp.Compare(a.Kind, b.Kind),
+		)
+	})
+	return rows
+}
+
+// watchBasis returns the instant the pass for entry's kind measures its watch
+// window from.
+func watchBasis(entry *PendingReaction) time.Time {
+	switch entry.Kind {
+	case ReactionKindCI:
+		return cmp.Or(entry.HeadRecordedAt, entry.CreatedAt)
+	case ReactionKindAutoMerge:
+		return entry.CreatedAt
+	default:
+		return watchWindowStart(entry)
+	}
+}
+
+// snapshotBetweenStages builds the rows of issues whose hop no dispatched run
+// has followed, sorted by issue identifier, then issue ID. An issue that is
+// running or queued for a retry is left out, so a failed write of the
+// dispatch flag or a retry restored after a restart does not list it twice.
+func snapshotBetweenStages(state *State) []SnapshotStageHop {
+	rows := make([]SnapshotStageHop, 0, len(state.StageHops))
+	for id, hop := range state.StageHops {
+		if !listedBetweenStages(state, id, hop) {
+			continue
+		}
+		identity := maskedIdentity(hop.IssueIdentity)
+		agent := state.RuleAgents[hop.TargetRule]
+		rows = append(rows, SnapshotStageHop{
+			IssueID:      id,
+			Identifier:   hop.Identifier,
+			DisplayID:    hop.DisplayID,
+			IssueTitle:   identity.Title,
+			IssueURL:     identity.URL,
+			IssueType:    identity.IssueType,
+			IssueLabels:  identity.Labels,
+			State:        identity.State,
+			SourceRule:   hop.SourceRule,
+			TargetRule:   hop.TargetRule,
+			TargetLabel:  hop.TargetLabel,
+			HoppedAt:     hop.HoppedAt,
+			DispatchedAt: hop.DispatchedAt,
+
+			RuleName:        hop.TargetRule,
+			StagePosition:   stagePosition(state, id, hop.TargetRule, hop.SourceRule),
+			AgentKind:       agent.AgentKind,
+			ConfiguredModel: agent.ConfiguredModel,
+		})
+	}
+	slices.SortFunc(rows, func(a, b SnapshotStageHop) int {
+		return cmp.Or(cmp.Compare(a.Identifier, b.Identifier), cmp.Compare(a.IssueID, b.IssueID))
+	})
+	return rows
+}
+
+// listedBetweenStages reports whether hop puts the issue in the between-stages
+// list: no dispatched run has followed it, and the issue is neither running
+// nor queued for a retry.
+func listedBetweenStages(state *State, issueID string, hop *StageHopEntry) bool {
+	if hop.RunDispatched {
+		return false
+	}
+	if _, running := state.Running[issueID]; running {
+		return false
+	}
+	_, retrying := state.RetryAttempts[issueID]
+	return !retrying
+}
+
+// snapshotContinuation returns the view of target, or nil for the zero value.
+func snapshotContinuation(target ContinuationTarget) *SnapshotContinuation {
+	if target == (ContinuationTarget{}) {
+		return nil
+	}
+	return &SnapshotContinuation{
+		Number:     target.PRNumber,
+		Repository: redact.Mask(target.Owner + "/" + target.Repo),
+		Attempt:    target.Attempt,
+	}
+}
+
+// stagePosition returns where rule stands on the stage chains in force, or
+// nil when no chain holds it. When previous is set, a chain that lists it
+// immediately before rule wins over the first chain that merely holds rule.
+// The chain is copied, so the result shares nothing with state.
+func stagePosition(state *State, issueID, rule, previous string) *SnapshotStagePosition {
+	chain := chainHolding(state.StageChains, rule, previous)
+	if chain == nil && previous != "" {
+		chain = chainHolding(state.StageChains, rule, "")
+	}
+	if chain == nil {
+		return nil
+	}
+	position := &SnapshotStagePosition{
+		Chain:      slices.Clone(chain),
+		Current:    rule,
+		HopCeiling: state.HopCeiling,
+	}
+	if hop, ok := state.StageHops[issueID]; ok {
+		position.HopCount = hop.Count
+	}
+	return position
+}
+
+// chainHolding returns the first chain that holds rule and, when previous is
+// non-empty, lists previous immediately before it; nil when none does.
+func chainHolding(chains [][]string, rule, previous string) []string {
+	for _, chain := range chains {
+		i := slices.Index(chain, rule)
+		if i < 0 {
+			continue
+		}
+		if previous == "" || (i > 0 && chain[i-1] == previous) {
+			return chain
+		}
+	}
+	return nil
+}
+
+// snapshotReactionCheck deep-copies check with the head and failing check
+// names masked. A nil check stays nil; FailingChecks of a CI check is never
+// nil.
+func snapshotReactionCheck(check *ReactionCheck) *ReactionCheck {
+	if check == nil {
+		return nil
+	}
+	out := &ReactionCheck{
+		ObservedAt: check.ObservedAt,
+		HeadSHA:    redact.Mask(check.HeadSHA),
+	}
+	if check.CI != nil {
+		failing := make([]string, len(check.CI.FailingChecks))
+		for i, name := range check.CI.FailingChecks {
+			failing[i] = redact.Mask(name)
+		}
+		ci := *check.CI
+		ci.FailingChecks = failing
+		out.CI = &ci
+	}
+	if check.Comments != nil {
+		comments := *check.Comments
+		out.Comments = &comments
+	}
+	if check.Mergeability != nil {
+		mergeability := MergeabilityCheck{}
+		if check.Mergeability.Mergeable != nil {
+			mergeable := *check.Mergeability.Mergeable
+			mergeability.Mergeable = &mergeable
+		}
+		out.Mergeability = &mergeability
+	}
+	return out
 }
 
 // BuildReviewReactionConfig extracts and validates review-specific
@@ -1266,8 +2285,8 @@ func BuildReviewReactionConfig(rc config.ReactionConfig) (ReviewReactionConfig, 
 	if cfg.Escalation == "" {
 		cfg.Escalation = "label"
 	}
-	if cfg.Escalation != "label" && cfg.Escalation != "comment" {
-		return ReviewReactionConfig{}, fmt.Errorf("invalid escalation %q: must be \"label\" or \"comment\"", cfg.Escalation)
+	if err := checkEscalation(cfg.Escalation); err != nil {
+		return ReviewReactionConfig{}, err
 	}
 
 	if cfg.EscalationLabel == "" {
@@ -1335,8 +2354,8 @@ func BuildBotReviewReactionConfig(rc config.ReactionConfig) (BotReviewReactionCo
 	if cfg.Escalation == "" {
 		cfg.Escalation = "label"
 	}
-	if cfg.Escalation != "label" && cfg.Escalation != "comment" {
-		return BotReviewReactionConfig{}, fmt.Errorf("invalid escalation %q: must be \"label\" or \"comment\"", cfg.Escalation)
+	if err := checkEscalation(cfg.Escalation); err != nil {
+		return BotReviewReactionConfig{}, err
 	}
 
 	if cfg.EscalationLabel == "" {
@@ -1390,6 +2409,17 @@ func BuildBotReviewReactionConfig(rc config.ReactionConfig) (BotReviewReactionCo
 	return cfg, nil
 }
 
+// checkEscalation reports an error unless escalation is a value a
+// reaction's escalation setting accepts.
+func checkEscalation(escalation string) error {
+	switch escalation {
+	case "label", "comment", "none":
+		return nil
+	default:
+		return fmt.Errorf("invalid escalation: must be \"label\", \"comment\", or \"none\", got %q", escalation)
+	}
+}
+
 // BuildAutoMergeReactionConfig extracts and validates auto-merge-specific
 // configuration from a [config.ReactionConfig].
 func BuildAutoMergeReactionConfig(rc config.ReactionConfig) (AutoMergeReactionConfig, error) {
@@ -1407,8 +2437,8 @@ func BuildAutoMergeReactionConfig(rc config.ReactionConfig) (AutoMergeReactionCo
 	if cfg.Escalation == "" {
 		cfg.Escalation = "comment"
 	}
-	if cfg.Escalation != "label" && cfg.Escalation != "comment" {
-		return AutoMergeReactionConfig{}, fmt.Errorf("invalid escalation %q: must be \"label\" or \"comment\"", cfg.Escalation)
+	if err := checkEscalation(cfg.Escalation); err != nil {
+		return AutoMergeReactionConfig{}, err
 	}
 
 	if cfg.EscalationLabel == "" {
@@ -1483,8 +2513,8 @@ func BuildMergeConflictReactionConfig(rc config.ReactionConfig) (MergeConflictRe
 	if cfg.Escalation == "" {
 		cfg.Escalation = "label"
 	}
-	if cfg.Escalation != "label" && cfg.Escalation != "comment" {
-		return MergeConflictReactionConfig{}, fmt.Errorf("invalid escalation %q: must be \"label\" or \"comment\"", cfg.Escalation)
+	if err := checkEscalation(cfg.Escalation); err != nil {
+		return MergeConflictReactionConfig{}, err
 	}
 
 	if cfg.EscalationLabel == "" {
@@ -1535,12 +2565,9 @@ func BuildLabelFixReactionConfig(cfg config.LabelCommandsConfig) LabelFixReactio
 
 // BuildMergeCompletionReactionConfig extracts and validates
 // merge-completion-specific configuration from a [config.ReactionConfig].
-//
-// meta resolves the default active-state list only; the terminal list is
-// read from tracker as written, with no fallback to
-// [registry.TrackerMeta.DefaultTerminalStates], so the offline validator
-// and the runtime terminal drop agree on what "terminal" means.
-func BuildMergeCompletionReactionConfig(rc config.ReactionConfig, tracker config.TrackerConfig, meta registry.TrackerMeta) (MergeCompletionReactionConfig, error) {
+// The state lists are read from tracker as written, so the offline
+// validator and the runtime terminal drop agree on what "terminal" means.
+func BuildMergeCompletionReactionConfig(rc config.ReactionConfig, tracker config.TrackerConfig) (MergeCompletionReactionConfig, error) {
 	cfg := MergeCompletionReactionConfig{
 		PollIntervalMS:  60000,
 		Escalation:      rc.Escalation,
@@ -1551,8 +2578,8 @@ func BuildMergeCompletionReactionConfig(rc config.ReactionConfig, tracker config
 	if cfg.Escalation == "" {
 		cfg.Escalation = "label"
 	}
-	if cfg.Escalation != "label" && cfg.Escalation != "comment" {
-		return MergeCompletionReactionConfig{}, fmt.Errorf("invalid escalation %q: must be \"label\" or \"comment\"", cfg.Escalation)
+	if err := checkEscalation(cfg.Escalation); err != nil {
+		return MergeCompletionReactionConfig{}, err
 	}
 
 	if cfg.EscalationLabel == "" {
@@ -1577,15 +2604,10 @@ func BuildMergeCompletionReactionConfig(rc config.ReactionConfig, tracker config
 		return MergeCompletionReactionConfig{}, fmt.Errorf("target_state is required")
 	}
 
-	effectiveActive := tracker.ActiveStates
-	if len(effectiveActive) == 0 {
-		effectiveActive = meta.DefaultActiveStates
-	}
-
 	if strings.EqualFold(cfg.TargetState, tracker.HandoffState) {
 		return MergeCompletionReactionConfig{}, fmt.Errorf("invalid target_state %q: must not equal tracker.handoff_state", cfg.TargetState)
 	}
-	if _, active := stateSet(effectiveActive)[strings.ToLower(cfg.TargetState)]; active {
+	if _, active := stateSet(tracker.ActiveStates)[strings.ToLower(cfg.TargetState)]; active {
 		return MergeCompletionReactionConfig{}, fmt.Errorf("invalid target_state %q: must not be a member of tracker.active_states", cfg.TargetState)
 	}
 	if _, terminal := stateSet(tracker.TerminalStates)[strings.ToLower(cfg.TargetState)]; !terminal {

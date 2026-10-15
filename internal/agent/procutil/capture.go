@@ -1,6 +1,7 @@
 package procutil
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -43,10 +44,16 @@ type CaptureResult struct {
 	// OutputComplete is true when every captured stream reached end of
 	// file within DrainGrace after the reap.
 	OutputComplete bool
-	// TerminatedLeftovers is true when the reap's termination reached a
-	// process of the launch's process group or Job Object other than
-	// the direct child. On Windows a console host is never counted.
+	// TerminatedLeftovers is true when the reap found a live process of
+	// the launch's process group or Job Object other than the direct
+	// child: on Unix a live member observed before or during the reap's
+	// group drain, on Windows a running Job Object member, where a
+	// console host is never counted.
 	TerminatedLeftovers bool
+	// Stopped is true when a stop began while the direct child was
+	// still running. False means the child reached an exit of its own,
+	// however long the drain after it ran.
+	Stopped bool
 }
 
 // CaptureAbandonedWarning is the message of the one record Wait logs
@@ -161,13 +168,17 @@ type Capture struct {
 // suspended until its Job Object assignment), closes the parent's
 // write ends, starts one reader per pipe, and starts the reap.
 //
+// ctx MUST be the context cmd was created with through
+// [exec.CommandContext], or [context.Background] for a command created
+// without one: on Windows it decides whether the suspended process is
+// resumed, and a context done by then fails the start with
+// [StartError.Cancelled] set.
+//
 // cmd.Stdout and cmd.Stderr MUST be nil on entry; StartCapture panics
 // otherwise. Every error it returns is a *[StartError]. Before
 // returning an error it closes every descriptor it created and resets
-// cmd.Stdout and cmd.Stderr to nil; after a [StageProcessResume]
-// failure the process has already been terminated and reaped, and its
-// teardown logged.
-func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
+// cmd.Stdout and cmd.Stderr to nil.
+func StartCapture(ctx context.Context, cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 	if cmd.Stdout != nil || cmd.Stderr != nil {
 		panic("procutil: StartCapture requires nil cmd.Stdout and cmd.Stderr")
 	}
@@ -184,7 +195,7 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 	var streams []*captureStream
 	var writeEnds []*os.File
 
-	fail := func(stage StartStage, err error) (*Capture, error) {
+	fail := func(se *StartError) (*Capture, error) {
 		for _, s := range streams {
 			s.file.Close() //nolint:errcheck,gosec // best-effort cleanup after a failed launch
 		}
@@ -193,13 +204,13 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 		}
 		cmd.Stdout = nil
 		cmd.Stderr = nil
-		return nil, &StartError{Stage: stage, Err: err}
+		return nil, se
 	}
 
 	if sameWriter(params.Stdout, params.Stderr) {
 		read, write, err := os.Pipe()
 		if err != nil {
-			return fail(StageStdoutPipe, err)
+			return fail(&StartError{Stage: StageStdoutPipe, Err: err})
 		}
 		cmd.Stdout, cmd.Stderr = write, write
 		writeEnds = append(writeEnds, write)
@@ -208,7 +219,7 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 		if params.Stdout != nil {
 			read, write, err := os.Pipe()
 			if err != nil {
-				return fail(StageStdoutPipe, err)
+				return fail(&StartError{Stage: StageStdoutPipe, Err: err})
 			}
 			cmd.Stdout = write
 			writeEnds = append(writeEnds, write)
@@ -217,7 +228,7 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 		if params.Stderr != nil {
 			read, write, err := os.Pipe()
 			if err != nil {
-				return fail(StageStderrPipe, err)
+				return fail(&StartError{Stage: StageStderrPipe, Err: err})
 			}
 			cmd.Stderr = write
 			writeEnds = append(writeEnds, write)
@@ -225,13 +236,9 @@ func StartCapture(cmd *exec.Cmd, params CaptureParams) (*Capture, error) {
 		}
 	}
 
-	jobHandle, startedAt, startErr := startAndAssign(cmd, logger, true)
+	_, jobHandle, startedAt, startErr := startAndAssign(ctx, cmd, logger, true)
 	if startErr != nil {
-		stage := StageProcessResume
-		if cmd.Process == nil {
-			stage = StageProcessStart
-		}
-		return fail(stage, startErr)
+		return fail(startErr)
 	}
 
 	// A write end passed to exec.Cmd as an *os.File is never closed by
@@ -293,7 +300,7 @@ func (c *Capture) Wait() CaptureResult {
 				slog.Duration("drain_bound", c.drainGrace))
 		}
 
-		c.result = CaptureResult{WaitErr: waitErr, OutputComplete: complete, TerminatedLeftovers: leftover}
+		c.result = CaptureResult{WaitErr: waitErr, OutputComplete: complete, TerminatedLeftovers: leftover, Stopped: c.reaper.Stopped()}
 	})
 	return c.result
 }
@@ -327,11 +334,12 @@ func (c *Capture) awaitStreams() bool {
 // RunCapture calls [SetGroupCancel](cmd, stopGrace), then StartCapture,
 // then Wait. cmd MUST be built with [exec.CommandContext]; a command
 // built without one fails at [StageProcessStart], because os/exec
-// rejects a cancellation function without a context. A non-positive
-// stopGrace resolves to [DefaultStopGrace] inside SetGroupCancel.
-func RunCapture(cmd *exec.Cmd, stopGrace time.Duration, params CaptureParams) (CaptureResult, error) {
+// rejects a cancellation function without a context. ctx MUST be the
+// context cmd was created with. A non-positive stopGrace resolves to
+// [DefaultStopGrace] inside SetGroupCancel.
+func RunCapture(ctx context.Context, cmd *exec.Cmd, stopGrace time.Duration, params CaptureParams) (CaptureResult, error) {
 	SetGroupCancel(cmd, stopGrace)
-	c, err := StartCapture(cmd, params)
+	c, err := StartCapture(ctx, cmd, params)
 	if err != nil {
 		return CaptureResult{}, err
 	}

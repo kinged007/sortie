@@ -4,6 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +70,178 @@ func TestShellQuote(t *testing.T) {
 			got := shellQuote(tt.input)
 			if got != tt.want {
 				t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuoteArgv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"no elements", nil, ""},
+		{"one plain element is still quoted", []string{"agent"}, "'agent'"},
+		{"elements join by one space", []string{"agent", "acp", "-a"}, "'agent' 'acp' '-a'"},
+		{"space in an element", []string{"agent", "space name"}, "'agent' 'space name'"},
+		{"single quote in an element", []string{"agent", "it's"}, `'agent' 'it'\''s'`},
+		{"empty element", []string{"agent", ""}, "'agent' ''"},
+		{"assignment shaped element zero", []string{"FOO=bar", "x"}, "'FOO=bar' 'x'"},
+		{"reserved word element zero", []string{"if", "x"}, "'if' 'x'"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := QuoteArgv(tt.argv)
+
+			if got != tt.want {
+				t.Errorf("QuoteArgv(%q) = %q, want %q", tt.argv, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAppendArgs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		fragment string
+		args     []string
+		want     string
+	}{
+		{"no arguments leave the fragment as written", "agent;\n", nil, "agent;\n"},
+		{"safe arguments stay unquoted", "agent", []string{"acp", "-a", "--model", "claude-sonnet-4.6"}, "agent acp -a --model claude-sonnet-4.6"},
+		{"safe charset covers path and assignment characters", "agent", []string{"a_b@c%d+e=f:g,h./i-j"}, "agent a_b@c%d+e=f:g,h./i-j"},
+		{"unsafe arguments are single-quoted", "agent", []string{"space name", "$HOME", "it's", "a;b"}, `agent 'space name' '$HOME' 'it'\''s' 'a;b'`},
+		{"empty argument is quoted", "agent", []string{""}, "agent ''"},
+		{"non-ASCII argument is quoted", "agent", []string{"héllo"}, "agent 'héllo'"},
+		{"trailing semicolon", "agent;", []string{"a"}, "agent a ;"},
+		{"trailing ampersand", "agent &", []string{"a"}, "agent a &"},
+		{"blanks around the terminator", "agent \t; ", []string{"a"}, "agent a ;"},
+		{"trailing newline", "agent\n", []string{"a"}, "agent a"},
+		{"trailing newline after a semicolon", "agent;\n", []string{"a"}, "agent a ;"},
+		{"escaped semicolon is the command's own argument", `find . -exec agent \;`, []string{"a"}, `find . -exec agent \; a`},
+		{"doubled ampersand is an incomplete operator", "agent &&", []string{"a"}, "agent && a"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := AppendArgs(tt.fragment, tt.args...)
+
+			if got != tt.want {
+				t.Errorf("AppendArgs(%q, %q) = %q, want %q", tt.fragment, tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+var awkwardArgs = []string{"plain", "$HOME", "$(id)", "`id`", "it's", `say "hi"`, "a;b", "two words", "", "-n", "*", `a\b`, "tab\there", "line\nbreak", "héllo"}
+
+func requirePOSIXShell(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a POSIX shell is not available on Windows")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not found on PATH")
+	}
+	return sh
+}
+
+func runShellFragment(t *testing.T, sh, fragment, pathDir string) []string {
+	t.Helper()
+
+	cmd := exec.Command(sh, "-c", fragment)
+	cmd.Env = append(os.Environ(), "PATH="+pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("sh -c %q: %v", fragment, err)
+	}
+	words := strings.Split(string(out), "\x00")
+	return words[:len(words)-1]
+}
+
+func writeArgPrinter(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\0' \"$@\"\n"), 0o755); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+func TestAppendArgs_ShellPassesEachArgumentAsOneWord(t *testing.T) {
+	sh := requirePOSIXShell(t)
+
+	tests := []struct {
+		name     string
+		fragment string
+	}{
+		{"plain command", `printf '%s\0'`},
+		{"trailing semicolon", `printf '%s\0';`},
+		{"trailing ampersand", `printf '%s\0' &`},
+		{"trailing newline", "printf '%s\\0'\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShellFragment(t, sh, AppendArgs(tt.fragment, awkwardArgs...)+"\nwait", t.TempDir())
+
+			if !slices.Equal(got, awkwardArgs) {
+				t.Errorf("shell words after AppendArgs(%q, ...) = %q, want %q", tt.fragment, got, awkwardArgs)
+			}
+		})
+	}
+}
+
+func TestBuildSSHLaunch_QuoteArgvReachesTheRuntimeAsItsElements(t *testing.T) {
+	sh := requirePOSIXShell(t)
+	dir := filepath.Join(t.TempDir(), "dir with space")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	argv := []string{writeArgPrinter(t, dir, "agent"), "one two", "$HOME", "it's", ""}
+	agentArgs := []string{"--flag", "a b", "$(id)"}
+	launch := BuildSSHLaunch("h", t.TempDir(), QuoteArgv(argv), agentArgs, SSHOptions{})
+
+	got := runShellFragment(t, sh, launch.Args[len(launch.Args)-1], t.TempDir())
+
+	want := append(slices.Clone(argv[1:]), agentArgs...)
+	if !slices.Equal(got, want) {
+		t.Errorf("words the launched command received = %q, want %q", got, want)
+	}
+}
+
+func TestQuoteArgv_ShellNeverReadsElementZeroSpecially(t *testing.T) {
+	sh := requirePOSIXShell(t)
+	dir := t.TempDir()
+	writeArgPrinter(t, dir, "FOO=bar")
+	writeArgPrinter(t, dir, "if")
+
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{"assignment shaped", []string{"FOO=bar", "x"}},
+		{"reserved word", []string{"if", "x"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShellFragment(t, sh, QuoteArgv(tt.argv), dir)
+
+			if want := tt.argv[1:]; !slices.Equal(got, want) {
+				t.Errorf("words the launched command received = %q, want %q", got, want)
 			}
 		})
 	}
@@ -422,6 +599,140 @@ func TestBuildSSHLaunch_PanicsOnReservedEnvName(t *testing.T) {
 			{Name: "_sortie_complete", Value: secretValue},
 		},
 	})
+}
+
+func TestBuildSSHLaunch_Unset(t *testing.T) {
+	t.Parallel()
+
+	const carriedPreamble = "unset _sortie_env && export A='x' && _sortie_complete=1"
+	carriedImport := fmt.Sprintf(`cd -- '/w' && { command -v dd >/dev/null 2>&1 || { echo 'sortie: dd is required on the remote host to receive environment variables' >&2; exit 1; }; } && unset _sortie_complete && _sortie_env=$(dd bs=1 count=%d 2>/dev/null) && eval "$_sortie_env" && [ "${_sortie_complete-}" = 1 ] && `, len(carriedPreamble))
+
+	tests := []struct {
+		name         string
+		opts         SSHOptions
+		wantFinal    string
+		wantPreamble string
+	}{
+		{
+			name:      "unset without carried variables",
+			opts:      SSHOptions{Unset: []string{"FOO", "BAR"}},
+			wantFinal: "cd -- '/w' && unset FOO BAR && { run --acp 'a'\n}",
+		},
+		{
+			name:         "unset after the import step and before the agent group",
+			opts:         SSHOptions{Env: []EnvVar{{Name: "A", Value: "x"}}, Unset: []string{"FOO"}},
+			wantFinal:    carriedImport + "unset FOO && { run --acp 'a'\n}",
+			wantPreamble: carriedPreamble,
+		},
+		{
+			name:      "nil Unset leaves the command as it was",
+			opts:      SSHOptions{},
+			wantFinal: "cd -- '/w' && { run --acp 'a'\n}",
+		},
+		{
+			name:      "empty Unset leaves the command as it was",
+			opts:      SSHOptions{Unset: []string{}},
+			wantFinal: "cd -- '/w' && { run --acp 'a'\n}",
+		},
+		{
+			name:         "empty Unset leaves the carried command as it was",
+			opts:         SSHOptions{Env: []EnvVar{{Name: "A", Value: "x"}}, Unset: []string{}},
+			wantFinal:    carriedImport + "{ run --acp 'a'\n}",
+			wantPreamble: carriedPreamble,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			launch := BuildSSHLaunch("h", "/w", "run --acp", []string{"a"}, tt.opts)
+
+			gotFinal := launch.Args[len(launch.Args)-1]
+			if gotFinal != tt.wantFinal {
+				t.Errorf("BuildSSHLaunch(...).Args final element = %q, want %q", gotFinal, tt.wantFinal)
+			}
+			if gotPreamble := string(mustReadAllBytes(t, launch.StdinReader())); gotPreamble != tt.wantPreamble {
+				t.Errorf("BuildSSHLaunch(...) preamble = %q, want %q", gotPreamble, tt.wantPreamble)
+			}
+		})
+	}
+}
+
+func TestBuildSSHLaunch_UnsetRemovesTheVariableBeforeTheAgentRuns(t *testing.T) {
+	sh := requirePOSIXShell(t)
+
+	const name = "SORTIE_TEST_WITHHELD"
+
+	tests := []struct {
+		name  string
+		unset []string
+		want  string
+	}{
+		{name: "unset names the variable", unset: []string{name}, want: "unset"},
+		{name: "no unset leaves the variable in effect", want: "leaked"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			launch := BuildSSHLaunch("h", t.TempDir(), `printf '%s' "${`+name+`-unset}"`, nil, SSHOptions{Unset: tt.unset})
+
+			cmd := exec.Command(sh, "-c", launch.Args[len(launch.Args)-1])
+			cmd.Env = append(os.Environ(), name+"=leaked")
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("sh -c on the remote command: %v", err)
+			}
+
+			if got := string(out); got != tt.want {
+				t.Errorf("value the agent saw for %s = %q, want %q", name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildSSHLaunch_PanicsOnInvalidOrReservedUnsetName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		unset []string
+		opts  SSHOptions
+		leak  string
+	}{
+		{name: "invalid name without Env", unset: []string{"OK", "1BAD"}, leak: "1BAD"},
+		{name: "reserved name without Env", unset: []string{"OK", "_sortie_complete"}, leak: "_sortie_complete"},
+		{name: "invalid name with Env", unset: []string{"OK", "1BAD"}, opts: SSHOptions{Env: []EnvVar{{Name: "A", Value: "x"}}}, leak: "1BAD"},
+		{name: "reserved name with Env", unset: []string{"OK", "_sortie_complete"}, opts: SSHOptions{Env: []EnvVar{{Name: "A", Value: "x"}}}, leak: "_sortie_complete"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := tt.opts
+			opts.Unset = tt.unset
+
+			r := recoverFrom(func() { BuildSSHLaunch("h", "/w", "cmd", nil, opts) })
+
+			if r == nil {
+				t.Fatalf("BuildSSHLaunch(Unset=%q) did not panic", tt.unset)
+			}
+			msg := fmt.Sprint(r)
+			if !strings.Contains(msg, "Unset[1]") {
+				t.Errorf("BuildSSHLaunch(Unset=%q) panic = %q, want it to name Unset[1]", tt.unset, msg)
+			}
+			if strings.Contains(msg, tt.leak) {
+				t.Errorf("BuildSSHLaunch(Unset=%q) panic = %q, want it to omit the name %q", tt.unset, msg, tt.leak)
+			}
+		})
+	}
+}
+
+func recoverFrom(f func()) (recovered any) {
+	defer func() { recovered = recover() }()
+	f()
+	return nil
 }
 
 // recordingWriteCloser is a test double for io.WriteCloser that

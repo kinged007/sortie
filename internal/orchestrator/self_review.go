@@ -109,7 +109,7 @@ func generateWorkspaceDiff(ctx context.Context, workspacePath string, maxDiffByt
 	// Stage intent-to-add so new files appear in the diff. Best-effort:
 	// its outcome is ignored, as before.
 	if intentCmd, intentErr := workspace.GitCommand(ctx, workspacePath, "add", "--intent-to-add", "."); intentErr == nil {
-		_, _ = procutil.RunCapture(intentCmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
+		_, _ = procutil.RunCapture(ctx, intentCmd, procutil.DefaultStopGrace, procutil.CaptureParams{})
 	}
 
 	output, cmdErr := runGitDiffCombined(ctx, workspacePath, "diff", "HEAD")
@@ -140,7 +140,7 @@ func runGitDiffCombined(ctx context.Context, workspacePath string, args ...strin
 		return nil, err
 	}
 	var combined bytes.Buffer
-	result, err := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
+	result, err := procutil.RunCapture(ctx, cmd, procutil.DefaultStopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +155,21 @@ func runGitDiffCombined(ctx context.Context, workspacePath string, args ...strin
 		return combined.Bytes(), fmt.Errorf("git %s: output did not complete within %s", args[0], procutil.DefaultDrainGrace)
 	}
 	return combined.Bytes(), nil
+}
+
+func timedOutVerification(command string, duration time.Duration, stdout, stderr *cappedWriter, logger *slog.Logger) domain.VerificationResult {
+	logger.Info("verification command timed out",
+		slog.String("command", command),
+		slog.Int64("duration_ms", duration.Milliseconds()),
+	)
+	return domain.VerificationResult{
+		Command:    command,
+		ExitCode:   -1,
+		Stdout:     stdout.String(),
+		Stderr:     stderr.String(),
+		DurationMS: duration.Milliseconds(),
+		TimedOut:   true,
+	}
 }
 
 func runSingleVerification(ctx context.Context, command, workspacePath string, timeoutMS int, logger *slog.Logger, metrics domain.Metrics) domain.VerificationResult {
@@ -190,12 +205,17 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 	stdoutBuf.max = int(domain.MaxVerificationOutputBytes)
 	stderrBuf.max = int(domain.MaxVerificationOutputBytes)
 
-	result, startErr := procutil.RunCapture(cmd, procutil.DefaultStopGrace, procutil.CaptureParams{
+	result, startErr := procutil.RunCapture(cmdCtx, cmd, procutil.DefaultStopGrace, procutil.CaptureParams{
 		Stdout: &stdoutBuf,
 		Stderr: &stderrBuf,
 		Logger: logger,
 	})
 	duration := time.Since(start)
+
+	if errors.Is(startErr, context.DeadlineExceeded) {
+		metrics.ObserveSelfReviewVerificationDuration(command, duration.Seconds())
+		return timedOutVerification(command, duration, &stdoutBuf, &stderrBuf, logger)
+	}
 
 	if startErr != nil {
 		logger.Warn("verification command failed to start",
@@ -212,30 +232,12 @@ func runSingleVerification(ctx context.Context, command, workspacePath string, t
 
 	metrics.ObserveSelfReviewVerificationDuration(command, duration.Seconds())
 
-	// RunCapture drains output after the direct child is reaped, so a
-	// descendant that outlives the command can carry the context past
-	// its deadline once the command itself has already finished. The
-	// wait records which of the two happened; the context read here no
-	// longer can.
-	endedOnItsOwn := !procutil.StoppedByCancellation(result.WaitErr)
-
-	if result.TerminatedLeftovers && endedOnItsOwn {
+	if result.TerminatedLeftovers && !result.Stopped {
 		logger.Info(procutil.LeftoversTerminatedMessage, slog.String("command", command)) //nolint:sloglint // procutil.LeftoversTerminatedMessage is a fixed string constant
 	}
 
-	if !endedOnItsOwn && cmdCtx.Err() == context.DeadlineExceeded {
-		logger.Info("verification command timed out",
-			slog.String("command", command),
-			slog.Int64("duration_ms", duration.Milliseconds()),
-		)
-		return domain.VerificationResult{
-			Command:    command,
-			ExitCode:   -1,
-			Stdout:     stdoutBuf.String(),
-			Stderr:     stderrBuf.String(),
-			DurationMS: duration.Milliseconds(),
-			TimedOut:   true,
-		}
+	if result.Stopped && cmdCtx.Err() == context.DeadlineExceeded {
+		return timedOutVerification(command, duration, &stdoutBuf, &stderrBuf, logger)
 	}
 
 	exitCode := 0
@@ -480,22 +482,22 @@ func writeReviewSummary(workspacePath string, meta domain.ReviewMetadata, logger
 // the returned signal is recognized, so a recognized value is never
 // observed by a later read at the same site.
 //
-// The removal is best-effort and never changes the returned signal: the
+// The removal is best-effort and never changes the returned file: the
 // caller sees the value that was read, whether or not the file was
 // actually removed.
-func readAndConsumeStatusSignal(workspacePath string, logger *slog.Logger) workspace.StatusSignal {
-	signal := workspace.ReadStatusFile(workspacePath, logger)
-	if signal.IsRecognized() {
+func readAndConsumeStatusSignal(workspacePath string, logger *slog.Logger) workspace.StatusFile {
+	status := workspace.ReadStatusFile(workspacePath, logger)
+	if status.Signal.IsRecognized() {
 		workspace.CleanupStatusFile(workspacePath, logger)
 	}
-	return signal
+	return status
 }
 
-func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain.ReviewMetadata, workspace.StatusSignal, bool, error) {
+func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain.ReviewMetadata, workspace.StatusFile, bool, error) {
 	maxIter := params.Config.MaxIterations
 	iterations := make([]domain.ReviewIterationRecord, 0, maxIter)
 	logger := params.Logger
-	terminalSignal := workspace.StatusNone
+	var terminalStatus workspace.StatusFile
 	var expiryErr error
 
 	// cancelledAtEnding is read at each cut point rather than once the loop
@@ -585,20 +587,20 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 		*params.TurnsCompleted++
 
 		// Check A2O status for early abort signals.
-		statusSignal := readAndConsumeStatusSignal(params.WorkspacePath, logger)
-		if statusSignal == workspace.StatusBlocked {
+		statusFile := readAndConsumeStatusSignal(params.WorkspacePath, logger)
+		if statusFile.Signal == workspace.StatusBlocked {
 			logger.Info("self-review aborted by agent status",
 				slog.Int("iteration", i),
-				slog.String("status", string(statusSignal)),
+				slog.String("status", string(statusFile.Signal)),
 			)
 			iterations = append(iterations, domain.ReviewIterationRecord{
 				Iteration:           i,
 				DiffSizeBytes:       diffSize,
 				DiffTruncated:       truncated,
 				VerificationResults: verificationResults,
-				VerdictParseError:   fmt.Sprintf("aborted: agent status %q", statusSignal),
+				VerdictParseError:   fmt.Sprintf("aborted: agent status %q", statusFile.Signal),
 			})
-			terminalSignal = workspace.StatusBlocked
+			terminalStatus = statusFile
 			break
 		}
 
@@ -705,14 +707,14 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 		*params.TurnsCompleted++
 
 		// Check A2O status after fix turn.
-		statusSignal = readAndConsumeStatusSignal(params.WorkspacePath, logger)
-		if statusSignal == workspace.StatusBlocked {
+		statusFile = readAndConsumeStatusSignal(params.WorkspacePath, logger)
+		if statusFile.Signal == workspace.StatusBlocked {
 			logger.Info("self-review aborted by agent status after fix",
 				slog.Int("iteration", i),
-				slog.String("status", string(statusSignal)),
+				slog.String("status", string(statusFile.Signal)),
 			)
-			iterations[len(iterations)-1].VerdictParseError = fmt.Sprintf("aborted: agent status %q", statusSignal)
-			terminalSignal = workspace.StatusBlocked
+			iterations[len(iterations)-1].VerdictParseError = fmt.Sprintf("aborted: agent status %q", statusFile.Signal)
+			terminalStatus = statusFile
 			break
 		}
 	}
@@ -748,5 +750,5 @@ func runSelfReviewLoop(ctx context.Context, params RunSelfReviewParams) (*domain
 
 	params.Metrics.IncSelfReviewSessions(finalVerdict)
 
-	return meta, terminalSignal, cancelledAtEnding, expiryErr
+	return meta, terminalStatus, cancelledAtEnding, expiryErr
 }

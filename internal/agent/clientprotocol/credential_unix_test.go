@@ -65,6 +65,10 @@ func runCredentialAgent(_ []string, params credentialAgentParams) int {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "credential agent: read input: %v\n", err)
+		return 2
+	}
 	return 0
 }
 
@@ -96,7 +100,7 @@ func TestCredentialVerification(t *testing.T) {
 	verifiedBin := agenttest.FakeRuntime(t, t.TempDir(), "protocol-agent", credentialAgentScenario, credentialAgentParams{Outcome: credentialAgentEndTurn})
 	unverifiedBin := agenttest.FakeRuntime(t, t.TempDir(), "protocol-agent", credentialAgentScenario, credentialAgentParams{Outcome: credentialAgentAuthAuth})
 
-	adapter, err := NewClientProtocolAdapter(map[string]any{})
+	adapter, err := NewClientProtocolAdapter()
 	if err != nil {
 		t.Fatalf("NewClientProtocolAdapter() error = %v", err)
 	}

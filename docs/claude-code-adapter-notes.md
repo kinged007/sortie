@@ -1,12 +1,12 @@
 # Claude Code adapter notes
 
-Working notes for anyone changing Sortie's Claude Code adapter in `internal/agent/claude`: why it is built the way it is, where the CLI's model and ours disagree, and what has cost someone a day.
+Working notes for anyone changing Sortie's Claude Code adapter in `internal/agent/claude`.
 
-Last updated: 2026-08-23
+Last updated: 2026-10-10
 
 ## Where to get the volatile facts
 
-This file deliberately carries no flag table, no event catalogue, and no payload dump. The CLI ships faster than we can track it and Anthropic documents it better than we ever will. Read the argument surface off `claude --help` on the version you are targeting, read the headless output format, permission modes, session storage, and hook behavior from Anthropic's published Claude Code documentation, and reach for Context7 or the upstream package when the rendered docs are thin. For what Sortie actually sends and reads, the adapter's own `buildArgs` and `parse.go` are the authority.
+This file carries no flag table, no event catalogue, and no payload dump. Read the flags off `claude --help` on the version you target. Read the headless output format, permission modes, session storage, and hooks from Anthropic's Claude Code documentation. For what Sortie actually sends and reads, `buildArgs` and `parse.go` are the authority.
 
 ## Shape of the integration
 
@@ -14,9 +14,13 @@ The adapter registers the `claude-code` kind and drives the CLI in headless prin
 
 Sortie mints the session UUID itself before the first turn and passes it in, rather than reading an ID out of the stream and hoping to catch it. That single decision removes a whole class of failure: a turn that dies before it prints anything still leaves a resumable session, and continuation never depends on parsing. Continuation turns resume that exact ID rather than asking for the most recent conversation in the directory, which is ambiguous the moment more than one session exists there.
 
-The subprocess inherits Sortie's environment verbatim. The adapter manages no credentials and sets no telemetry variables: whatever authenticates the CLI, and whatever exports its traces, has to be in the environment of the Sortie process. That also means an operator variable you did not think about is present in the child.
+The subprocess inherits Sortie's environment, with one exception. The adapter manages no credentials and sets no telemetry variables, so whatever authenticates the CLI or exports its traces must be in Sortie's own environment. Any operator variable you did not think about also reaches the child.
 
-The CLI can be pointed at a non-Anthropic backend as well, a cloud vendor's hosted models or a gateway in front of them. For this adapter that changes nothing at all: same argv, same stream, same parse, same disposition. The only thing it changes is which variables have to be present in Sortie's environment before the subprocess starts, and those names belong to the vendor's documentation rather than to this file. Do not add a preflight that checks for one provider's variable; there is more than one way for this CLI to be authenticated and the adapter deliberately checks for none of them.
+The exception is `CLAUDE_CODE_EFFORT_LEVEL`. When the block sets `effort`, the adapter withholds that variable on every launch, local and SSH, because Claude Code lets it silently outrank `--effort`. When `effort` is unset, the variable passes through.
+
+An unrecognized `--effort` value shows up as a stderr line starting `Warning: Unknown --effort value`. It is the one stderr line that a successful turn raises to a warning in Sortie's log, once per session.
+
+The CLI can also run against a cloud vendor's hosted models or a gateway. For this adapter nothing changes except which variables must be in Sortie's environment. Do not add a preflight that checks for one provider's variable; the CLI has several ways to authenticate and the adapter checks none of them.
 
 ## Turn boundaries and ours
 
@@ -32,7 +36,7 @@ Classification of any such request goes through `agentcore.DecideHumanRequest`. 
 
 ## Usage accounting
 
-This is where the day goes. Three things are true at once and none of them is obvious.
+This is where the day goes.
 
 The registered kind declares `incremental` arrival and `per_model` attribution: `ParseLine` emits one `token_usage` event per first-seen assistant message id, each carrying `Model: state.lastModel`.
 
@@ -46,7 +50,9 @@ The adapter reports no cost figure at all, even though the stream carries one. I
 
 ## Deciding how a turn ended
 
-The adapter never decides a disposition. It fills in evidence and hands it to the shared `agentcore.FinalizeTurn`, which owns the mapping from evidence to outcome and error kind. Cancellation and a stdout scan failure are decided by the skeleton before the adapter's finalize hook runs at all. A missing binary and death by signal are decided there too, but only once the runtime has written a line the decoder decodes as an event; a runtime that exits on its own before any such line reaches the finalize hook instead, carrying the shared early-exit report whatever its exit status.
+The adapter never decides a disposition. It fills in evidence and hands it to the shared `agentcore.FinalizeTurn`. Cancellation and a stdout scan failure are decided by the skeleton before the adapter's finalize hook runs.
+
+A runtime that exits on its own before writing any line the decoder reads as an event gets the shared early-exit report, whatever its exit status. A death by a signal Sortie did not send reaches the finalize hook as a non-zero exit whose error names the signal.
 
 One trap sits in that evidence. Work evidence comes from the shared per-turn observer, never the run-cumulative usage figure, which is non-zero on every turn after the first: a `text` content block with non-empty text is assistant output, and a `tool_use` or `tool_result` block is tool activity. Feed it the cumulative snapshot and the zero-work safety row, the one that turns a process which exited cleanly having produced nothing into a failure rather than a silent success, stops firing for the rest of the run.
 
@@ -72,4 +78,8 @@ Whether Sortie's tools reach an agent at all is a per-adapter property, not a gu
 
 ## Verifying a change
 
-Unit tests cover argument construction, line parsing, and disposition. The tests that exercise the real binary are env-gated: they run only with `SORTIE_CLAUDE_TEST=1` and skip cleanly without it, and they must keep skipping cleanly rather than failing. `SORTIE_CLAUDE_COMMAND` points at a specific binary and `SORTIE_CLAUDE_MODEL` overrides the model; the suite disables session persistence so repeated runs do not accumulate transcripts in the home directory. The binary still needs working credentials in the environment for the working-credential case, so a machine without them will fail that case rather than skip it. `SORTIE_CLAUDE_CREDENTIAL_ENV` names the variables the suite's refused-credential case overrides; its absence skips only that one case, cleanly, with a logged reason, and the case accepts either `credential_unverified` or the early-exit report as the outcome. The gated suite also runs the configured command with `--sortie-unknown-switch` appended on a verification request and on a working session, proving each ends with the early-exit report; a runtime that accepts the switch skips the case with a logged reason naming it.
+The live tests in `integration_test.go` are gated on `SORTIE_CLAUDE_TEST=1` and skip cleanly without it. The other `SORTIE_CLAUDE_*` variables they read are described in that file. Traps:
+
+- The working-credential case needs real credentials in the environment. Without them it fails; it does not skip.
+- The scripted-model case points the runtime at a loopback endpoint with `ANTHROPIC_BASE_URL`. Unless a proxy variable is set, the runtime first sends a `HEAD` request to that address, which the endpoint does not expect. The case sets an https proxy to a dead address to stop it; the plain-http loopback requests stay direct.
+- The scripted-model case isolates `HOME` and the XDG directories, so a version-manager shim that reads `HOME` fails to start. Name the binary by an absolute path.

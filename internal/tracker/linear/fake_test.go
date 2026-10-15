@@ -122,6 +122,15 @@ func seedPreflight(f *fakeGraphQLClient, t *testing.T) {
 	f.queueBody("query TeamStates", loadFixture(t, "team_states.json"))
 }
 
+var (
+	testActiveStates   = []string{"Backlog", "Todo", "In Progress"}
+	testTerminalStates = []string{"Done", "Canceled", "Duplicate"}
+)
+
+func testStates(active []string, handoff string) domain.TrackerStates {
+	return domain.TrackerStates{Active: active, Terminal: testTerminalStates, Handoff: handoff}
+}
+
 // newTestAdapter constructs a [LinearAdapter] through the offline seam with the
 // default team-SOR config, no operator filter, and a nil logger, failing the
 // test on a construction error.
@@ -136,7 +145,7 @@ func newTestAdapter(t *testing.T, f *fakeGraphQLClient) *LinearAdapter {
 // reproduces the unset passthrough behavior.
 func newTestAdapterWithFilter(t *testing.T, f *fakeGraphQLClient, queryFilter map[string]any) *LinearAdapter {
 	t.Helper()
-	a, err := newAdapter(f, "SOR", defaultActiveStates, defaultTerminalStates, "In Review", queryFilter, nil)
+	a, err := newAdapter(f, "SOR", testStates(testActiveStates, "In Review"), queryFilter, nil)
 	if err != nil {
 		t.Fatalf("newAdapter: %v", err)
 	}

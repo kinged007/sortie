@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -25,11 +27,16 @@ import (
 )
 
 type mockExitStore struct {
+	noopOutcomeRecorder
+	noEscalationRecords
 	runHistories    []persistence.RunHistory
 	metrics         []persistence.AggregateMetrics
 	sessionMetadata []persistence.SessionMetadata
 	retryEntries    []persistence.RetryEntry
 	deletedRetryIDs []string
+
+	recordedStageHops []persistence.StageHop
+	stageResults      []recordedStageResult
 
 	// absenceResetAt maps an issue ID to the run-history watermark at
 	// which its absence sequence was last reset.
@@ -50,6 +57,12 @@ type mockExitStore struct {
 	deleteRetryEntryErr       error
 	absenceCountErr           error
 	absenceResetErr           error
+}
+
+type recordedStageResult struct {
+	runID      int64
+	targetRule string
+	result     string
 }
 
 var _ WorkerExitStore = (*mockExitStore)(nil)
@@ -294,6 +307,7 @@ func TestHandleWorkerExit_NormalExit(t *testing.T) {
 
 	store := &mockExitStore{}
 	state := exitState(t, "ISSUE-1", nil)
+	state.Running["ISSUE-1"].FirstAfterHop = true
 	params := defaultExitParams(t, store)
 
 	HandleWorkerExit(state, WorkerResult{
@@ -339,6 +353,9 @@ func TestHandleWorkerExit_NormalExit(t *testing.T) {
 	}
 	if store.runHistories[0].Error != nil {
 		t.Errorf("RunHistory.Error = %v, want nil", store.runHistories[0].Error)
+	}
+	if !store.runHistories[0].FirstAfterHop {
+		t.Error("RunHistory.FirstAfterHop = false, want true: the exit must carry the entry's flag")
 	}
 
 	if len(store.metrics) != 1 {
@@ -1996,6 +2013,63 @@ func TestHandleWorkerExit_RunHistoryFields(t *testing.T) {
 	}
 }
 
+func triggerText(trigger *string) string {
+	if trigger == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%q", *trigger)
+}
+
+func TestHandleWorkerExit_RunHistoryOrigin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		retryAttempt *int
+		trigger      string
+		reactionKind string
+		sshHost      string
+		sessionID    string
+		wantTrigger  *string
+	}{
+		{name: "poll-tick dispatch records an empty trigger", wantTrigger: new("")},
+		{name: "retry dispatch records the trigger it carries", retryAttempt: new(1), trigger: "stall", wantTrigger: new("stall")},
+		{name: "retry dispatch holding nothing records an unknown origin", retryAttempt: new(1)},
+		{name: "retry dispatch holding only a reaction kind records an empty trigger", retryAttempt: new(1), reactionKind: "review", wantTrigger: new("")},
+		{name: "remote run records its host and session", sshHost: "worker-1", sessionID: "s-1", wantTrigger: new("")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &mockExitStore{}
+			state := exitState(t, "ORIGIN-1", tt.retryAttempt)
+			entry := state.Running["ORIGIN-1"]
+			entry.Trigger, entry.ReactionKind, entry.SSHHost, entry.SessionID = tt.trigger, tt.reactionKind, tt.sshHost, tt.sessionID
+
+			HandleWorkerExit(state, WorkerResult{
+				IssueID:      "ORIGIN-1",
+				Identifier:   "ORIGIN-1-ident",
+				ExitKind:     WorkerExitNormal,
+				AgentAdapter: "mock",
+			}, defaultExitParams(t, store))
+
+			if len(store.runHistories) != 1 {
+				t.Fatalf("AppendRunHistory called %d times, want 1", len(store.runHistories))
+			}
+			rh := store.runHistories[0]
+			if got, want := triggerText(rh.Trigger), triggerText(tt.wantTrigger); got != want {
+				t.Errorf("RunHistory.Trigger = %s, want %s", got, want)
+			}
+			if rh.ReactionKind != tt.reactionKind || rh.SSHHost != tt.sshHost || rh.SessionID != tt.sessionID {
+				t.Errorf("RunHistory reaction kind, host, session = %q, %q, %q, want %q, %q, %q",
+					rh.ReactionKind, rh.SSHHost, rh.SessionID, tt.reactionKind, tt.sshHost, tt.sessionID)
+			}
+		})
+	}
+}
+
 func TestHandleWorkerExit_RunHistoryCompletedAtIsUTC(t *testing.T) {
 	t.Parallel()
 
@@ -2232,7 +2306,7 @@ func TestHandleWorkerExit_SessionIDPrefersResult(t *testing.T) {
 		params := defaultExitParams(t, store)
 		params.TrackerAdapter = tracker
 		params.ActiveStates = []string{"In Progress"}
-		params.CommentsConfig.OnCompletion = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnCompletion: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:      "SID-3",
@@ -2498,7 +2572,7 @@ func TestHandleWorkerExit_HandoffEvidenceObservedAbsenceWithholds(t *testing.T) 
 	state := exitStateWithIssue(t, issueID, "In Progress")
 	state.Running[issueID].ContinuationContext = map[string]any{"review_comments": "preserved"}
 	params := handoffEvidenceExitParams(t, store, tracker, spy)
-	params.CommentsConfig.OnCompletion = true
+	params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnCompletion: true})
 	var logs bytes.Buffer
 	params.Logger = debugLogger(t, &logs)
 
@@ -2602,7 +2676,7 @@ func newSuppressedShapeFixture(t *testing.T, issueID string) suppressedShapeFixt
 	spy := &spyMetrics{}
 	state := exitStateWithIssue(t, issueID, "In Progress")
 	params := handoffEvidenceExitParams(t, store, tracker, spy)
-	params.CommentsConfig.OnFailure = true
+	params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 	var logs bytes.Buffer
 	params.Logger = debugLogger(t, &logs)
 	return suppressedShapeFixture{
@@ -2801,7 +2875,7 @@ func TestHandleWorkerExit_WithheldReadGating(t *testing.T) {
 		spy := &spyMetrics{}
 		state := exitStateWithIssue(t, issueID, "In Progress")
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:                 issueID,
@@ -3022,7 +3096,7 @@ func TestHandleWorkerExit_WithheldReadFailOpen(t *testing.T) {
 		spy := newCommentAwareMetrics()
 		state := exitStateWithIssue(t, issueID, "In Progress")
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 		var logs bytes.Buffer
 		params.Logger = debugLogger(t, &logs)
 
@@ -3214,8 +3288,7 @@ func TestHandleWorkerExit_RetryPromiseInvariantAcrossWithheldFamily(t *testing.T
 		spy := newCommentAwareMetrics()
 		state := exitStateWithIssue(t, issueID, "In Progress")
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
-		params.CommentsConfig.OnCompletion = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true, OnCompletion: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:                 issueID,
@@ -3255,7 +3328,7 @@ func TestHandleWorkerExit_RetryPromiseInvariantAcrossWithheldFamily(t *testing.T
 		spy := newCommentAwareMetrics()
 		state := exitStateWithIssue(t, issueID, "In Progress")
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:                 issueID,
@@ -3297,7 +3370,7 @@ func TestHandleWorkerExit_RetryPromiseInvariantAcrossWithheldFamily(t *testing.T
 		spy := newCommentAwareMetrics()
 		state := exitStateWithIssue(t, issueID, "In Progress")
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:                 issueID,
@@ -3347,7 +3420,7 @@ func TestHandleWorkerExit_RetryPromiseInvariantAcrossWithheldFamily(t *testing.T
 			ReactionKind: ReactionKindCI,
 		}
 		params := handoffEvidenceExitParams(t, store, tracker, spy)
-		params.CommentsConfig.OnFailure = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:                 issueID,
@@ -3417,8 +3490,7 @@ func TestHandleWorkerExit_SuppressedExitPostsCompletionCommentNotFailure(t *test
 			spy := newCommentAwareMetrics()
 			state := exitStateWithIssue(t, tt.issueID, "In Progress")
 			params := handoffEvidenceExitParams(t, store, tracker, spy)
-			params.CommentsConfig.OnFailure = true
-			params.CommentsConfig.OnCompletion = true
+			params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnFailure: true, OnCompletion: true})
 
 			HandleWorkerExit(state, WorkerResult{
 				IssueID:                 tt.issueID,
@@ -4484,11 +4556,13 @@ func TestHandleWorkerExit_HandoffTransitionSucceeds_PopulatesReviewPendingReacti
 	store := &mockExitStore{}
 	tracker := &mockTrackerAdapter{}
 	state := exitStateWithIssue(t, "HO-R1", "In Progress")
+	state.Running["HO-R1"].RuleSettingsApplied = true
 	params := defaultExitParams(t, store)
 	params.TrackerAdapter = tracker
 	params.HandoffState = "In Review"
 	params.ActiveStates = []string{"In Progress"}
 	params.SCMAdapter = &scmAdapterStubExit{}
+	params.ReviewReactionConfigured = true
 
 	HandleWorkerExit(state, WorkerResult{
 		IssueID:       "HO-R1",
@@ -4515,6 +4589,7 @@ func TestHandleWorkerExit_HandoffTransitionSucceeds_PopulatesReviewPendingReacti
 	if !ok {
 		t.Fatal("PendingReactions[HO-R1:review] missing after successful handoff with PR metadata")
 	}
+	requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 	reviewData, ok := pr.KindData.(*ReviewReactionData)
 	if !ok {
 		t.Fatalf("KindData type = %T, want *ReviewReactionData", pr.KindData)
@@ -4554,6 +4629,7 @@ func TestHandleWorkerExit_HandoffTransitionFails_PopulatesReviewPendingReaction(
 	params.HandoffState = "In Review"
 	params.ActiveStates = []string{"In Progress"}
 	params.SCMAdapter = &scmAdapterStubExit{}
+	params.ReviewReactionConfigured = true
 
 	HandleWorkerExit(state, WorkerResult{
 		IssueID:       "HO-R2",
@@ -4647,6 +4723,9 @@ func TestHandleWorkerExit_HandoffTransitionSucceeds_PopulatesCIPendingReaction(t
 	if ciData.SHA != "cafebabe" {
 		t.Errorf("CIReactionData.SHA = %q, want %q", ciData.SHA, "cafebabe")
 	}
+	if ci.IssueIdentity.State != "In Review" {
+		t.Errorf("PendingReactions[HO-C1:ci].IssueIdentity.State = %q, want the handoff target %q", ci.IssueIdentity.State, "In Review")
+	}
 }
 
 func TestHandleWorkerExit_HandoffTransitionFails_PopulatesCIPendingReaction(t *testing.T) {
@@ -4704,6 +4783,9 @@ func TestHandleWorkerExit_HandoffTransitionFails_PopulatesCIPendingReaction(t *t
 	}
 	if ciData.SHA != "cafebabe" {
 		t.Errorf("CIReactionData.SHA = %q, want %q", ciData.SHA, "cafebabe")
+	}
+	if ci.IssueIdentity.State != "In Progress" {
+		t.Errorf("PendingReactions[HO-C2:ci].IssueIdentity.State = %q, want the run's read %q", ci.IssueIdentity.State, "In Progress")
 	}
 }
 
@@ -5129,12 +5211,20 @@ func TestBuildFailureComment_NeverCarriesErrorTextOrSessionIdentifier(t *testing
 	}
 }
 
+func routerWithComments(tracker domain.TrackerAdapter, comments config.TrackerCommentsConfig) *route.Router {
+	router := route.NewRouter(tracker, nil)
+	if err := router.Update(route.Inputs{Comments: comments}); err != nil {
+		panic(err)
+	}
+	return router
+}
+
 func exitParamsWithComments(t *testing.T, store *mockExitStore, tracker *mockTrackerAdapter, comments config.TrackerCommentsConfig) HandleWorkerExitParams {
 	t.Helper()
 	p := defaultExitParams(t, store)
 	p.TrackerAdapter = tracker
 	p.ActiveStates = []string{"In Progress"}
-	p.CommentsConfig = comments
+	p.Router = routerWithComments(p.TrackerAdapter, comments)
 	return p
 }
 
@@ -5362,7 +5452,7 @@ func TestHandleWorkerExit_CommentNilTrackerAdapterSafe(t *testing.T) {
 	state := exitState(t, "CMT-7", nil)
 	params := defaultExitParams(t, store)
 	params.TrackerAdapter = nil
-	params.CommentsConfig = config.TrackerCommentsConfig{OnCompletion: true, OnFailure: true}
+	params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnCompletion: true, OnFailure: true})
 
 	HandleWorkerExit(state, WorkerResult{
 		IssueID:      "CMT-7",
@@ -6313,6 +6403,7 @@ func TestHandleWorkerExit_CIProvider_PopulatesPendingReaction(t *testing.T) {
 
 	store := &mockExitStore{}
 	state := exitState(t, "CI-ISS-1", nil)
+	state.Running["CI-ISS-1"].RuleSettingsApplied = true
 	params := defaultExitParams(t, store)
 	params.CIProvider = &ciProviderStubExit{}
 	params.SCMAdapter = &scmAdapterStubExit{}
@@ -6330,6 +6421,7 @@ func TestHandleWorkerExit_CIProvider_PopulatesPendingReaction(t *testing.T) {
 	if !ok {
 		t.Fatal("PendingReactions[CI-ISS-1:ci] missing; want entry after normal exit with pull request identity")
 	}
+	requireRuleFlagCarried(t, entry.RuleSettingsApplied)
 	ciData, ok := entry.KindData.(*CIReactionData)
 	if !ok {
 		t.Fatal("KindData is not *CIReactionData")
@@ -6351,6 +6443,36 @@ func TestHandleWorkerExit_CIProvider_PopulatesPendingReaction(t *testing.T) {
 	}
 	if entry.IssueID != "CI-ISS-1" {
 		t.Errorf("PendingReaction.IssueID = %q, want %q", entry.IssueID, "CI-ISS-1")
+	}
+	if _, ok := state.PendingReactions[ReactionKey("CI-ISS-1", ReactionKindReview)]; ok {
+		t.Error("PendingReactions[CI-ISS-1:review] present, want absent without the review reaction configured")
+	}
+}
+
+func TestHandleWorkerExit_CIProvider_ReseedKeepsStandingEscalation(t *testing.T) {
+	t.Parallel()
+
+	wsPath := t.TempDir()
+	writePRSCMMetadata(t, wsPath, 77, "acme", "widgets", "feature/ci-test", "abc123")
+	store := &mockExitStore{}
+	state := exitState(t, "CI-ISS-ESC", nil)
+	escalatedAt := time.Date(2026, 5, 1, 9, 0, 0, 123, time.UTC)
+	rkey := ReactionKey("CI-ISS-ESC", ReactionKindCI)
+	state.PendingReactions[rkey] = &PendingReaction{
+		IssueID: "CI-ISS-ESC", Kind: ReactionKindCI,
+		EscalatedAt: escalatedAt, EscalationTrigger: EscalationTriggerTriage, EscalationSubject: "abc123",
+	}
+	params := defaultExitParams(t, store)
+	params.CIProvider = &ciProviderStubExit{}
+	params.SCMAdapter = &scmAdapterStubExit{}
+
+	HandleWorkerExit(state, WorkerResult{
+		IssueID: "CI-ISS-ESC", Identifier: "CI-ISS-ESC-ident", ExitKind: WorkerExitNormal, AgentAdapter: "mock", WorkspacePath: wsPath,
+	}, params)
+
+	entry := state.PendingReactions[rkey]
+	if entry == nil || !entry.EscalatedAt.Equal(escalatedAt) || entry.EscalationTrigger != EscalationTriggerTriage || entry.EscalationSubject != "abc123" {
+		t.Errorf("PendingReactions[ci] after a reseeding exit = %+v, want the escalation at %v by %q about %q kept", entry, escalatedAt, EscalationTriggerTriage, "abc123")
 	}
 }
 
@@ -6837,6 +6959,7 @@ func TestHandleWorkerExit_AutoMergeEnqueue_PopulatesPendingReaction(t *testing.T
 
 	store := &mockExitStore{}
 	state := exitState(t, "AM-1", nil)
+	state.Running["AM-1"].RuleSettingsApplied = true
 	params := defaultExitParams(t, store)
 	params.SCMAdapter = &scmAdapterStubExit{}
 	params.AutoMergeReactionConfigured = true
@@ -6854,6 +6977,7 @@ func TestHandleWorkerExit_AutoMergeEnqueue_PopulatesPendingReaction(t *testing.T
 	if !ok {
 		t.Fatal("PendingReactions[AM-1:merge] missing after normal exit with PR metadata")
 	}
+	requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 	mergeData, ok := pr.KindData.(*AutoMergeReactionData)
 	if !ok {
 		t.Fatalf("KindData type = %T, want *AutoMergeReactionData", pr.KindData)
@@ -7084,6 +7208,7 @@ func TestHandleWorkerExit_BotReviewEnqueue_PopulatesPendingReaction(t *testing.T
 
 	store := &mockExitStore{}
 	state := exitState(t, "BR-1", nil)
+	state.Running["BR-1"].RuleSettingsApplied = true
 	params := defaultExitParams(t, store)
 	params.SCMAdapter = &scmAdapterStubExit{}
 	params.BotReviewReactionConfigured = true
@@ -7101,6 +7226,7 @@ func TestHandleWorkerExit_BotReviewEnqueue_PopulatesPendingReaction(t *testing.T
 	if !ok {
 		t.Fatal("PendingReactions[BR-1:bot-review] missing after normal exit with PR metadata")
 	}
+	requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 	if pr.Kind != ReactionKindBotReview {
 		t.Errorf("PendingReaction.Kind = %q, want %q", pr.Kind, ReactionKindBotReview)
 	}
@@ -7362,6 +7488,7 @@ func TestHandleWorkerExit_MergeConflictEnqueue_PopulatesPendingReaction(t *testi
 
 	store := &mockExitStore{}
 	state := exitState(t, "MC-1", nil)
+	state.Running["MC-1"].RuleSettingsApplied = true
 	params := defaultExitParams(t, store)
 	params.SCMAdapter = &scmAdapterStubExit{}
 	params.MergeConflictReactionConfigured = true
@@ -7379,6 +7506,7 @@ func TestHandleWorkerExit_MergeConflictEnqueue_PopulatesPendingReaction(t *testi
 	if !ok {
 		t.Fatal("PendingReactions[MC-1:merge-conflict] missing after normal exit with PR metadata")
 	}
+	requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 	if pr.Kind != ReactionKindMergeConflict {
 		t.Errorf("PendingReaction.Kind = %q, want %q", pr.Kind, ReactionKindMergeConflict)
 	}
@@ -7581,6 +7709,7 @@ func TestHandleWorkerExit_LabelReviewEnqueue(t *testing.T) {
 
 		store := &mockExitStore{}
 		state := exitState(t, "LR-1", nil)
+		state.Running["LR-1"].RuleSettingsApplied = true
 		params := defaultExitParams(t, store)
 		params.SCMAdapter = &scmAdapterStubExit{}
 		params.LabelReviewReactionConfigured = true
@@ -7598,6 +7727,7 @@ func TestHandleWorkerExit_LabelReviewEnqueue(t *testing.T) {
 		if !ok {
 			t.Fatal("PendingReactions[LR-1:label-review] missing after normal exit with PR metadata")
 		}
+		requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 		if pr.Kind != ReactionKindLabelReview {
 			t.Errorf("PendingReaction.Kind = %q, want %q", pr.Kind, ReactionKindLabelReview)
 		}
@@ -7825,6 +7955,7 @@ func TestHandleWorkerExit_LabelFixEnqueue(t *testing.T) {
 
 		store := &mockExitStore{}
 		state := exitState(t, "LF-1", nil)
+		state.Running["LF-1"].RuleSettingsApplied = true
 		state.Running["LF-1"].AgentKind = "mock"
 		state.Running["LF-1"].RuleName = "default"
 		state.Running["LF-1"].TemplateID = "tmpl-1"
@@ -7845,6 +7976,7 @@ func TestHandleWorkerExit_LabelFixEnqueue(t *testing.T) {
 		if !ok {
 			t.Fatal("PendingReactions[LF-1:label-fix] missing after normal exit with branch-bearing PR metadata")
 		}
+		requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 		if pr.Kind != ReactionKindLabelFix {
 			t.Errorf("PendingReaction.Kind = %q, want %q", pr.Kind, ReactionKindLabelFix)
 		}
@@ -8124,6 +8256,7 @@ func TestHandleWorkerExit_MergeCompletionEnqueue(t *testing.T) {
 
 		store := &mockExitStore{}
 		state := exitState(t, "MGC-1", nil)
+		state.Running["MGC-1"].RuleSettingsApplied = true
 		params := defaultExitParams(t, store)
 		params.SCMAdapter = &scmAdapterStubExit{}
 		params.MergeCompletionReactionConfigured = true
@@ -8141,6 +8274,7 @@ func TestHandleWorkerExit_MergeCompletionEnqueue(t *testing.T) {
 		if !ok {
 			t.Fatal("PendingReactions[MGC-1:merge-completion] missing after normal exit with PR metadata")
 		}
+		requireRuleFlagCarried(t, pr.RuleSettingsApplied)
 		if pr.Kind != ReactionKindMergeCompletion {
 			t.Errorf("PendingReaction.Kind = %q, want %q", pr.Kind, ReactionKindMergeCompletion)
 		}
@@ -9106,7 +9240,7 @@ func TestHandleWorkerExit_DeclaredRunCompletionComment(t *testing.T) {
 		params.HandoffState = "Human Review"
 		params.NoChangeState = "Done"
 		params.ActiveStates = []string{"In Progress"}
-		params.CommentsConfig.OnCompletion = true
+		params.Router = routerWithComments(params.TrackerAdapter, config.TrackerCommentsConfig{OnCompletion: true})
 
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:        "NC-CMT-ON",
@@ -9645,7 +9779,7 @@ func TestHandleWorkerExit_DeclaredRunSeedsReactionsReleasedOnTerminalReconcile(t
 	}
 
 	releaseStore := &mockReconcileStore{}
-	releaseTerminalIssueState(context.Background(), state, releaseStore, issueID, discardLogger())
+	releaseIssueRuntimeState(context.Background(), state, releaseStore, issueID, discardLogger())
 
 	if _, ok := state.PendingReactions[rkey]; ok {
 		t.Error("PendingReactions present after the terminal-issue release, want removed")
@@ -9850,5 +9984,460 @@ func TestHandleWorkerExit_UnreachableFromRuntimeSnapshot(t *testing.T) {
 	}
 	if len(snap.Running) != 0 {
 		t.Errorf("len(snap.Running) = %d, want 0 after HandleWorkerExit", len(snap.Running))
+	}
+}
+
+func requireRuleFlagCarried(t *testing.T, got bool) {
+	t.Helper()
+	if !got {
+		t.Error("PendingReaction.RuleSettingsApplied = false, want the exiting entry's flag carried")
+	}
+}
+
+func TestHandleWorkerExit_RecordsConfiguredAndReportedSettings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		entryModel   string
+		workerModel  string
+		wantReported string
+	}{
+		{name: "runtime reported a different model", entryModel: "reported-on-event", wantReported: "reported-on-event"},
+		{name: "worker mirror carries the last reported model", workerModel: "reported-by-worker", wantReported: "reported-by-worker"},
+		{name: "runtime reported none"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &mockExitStore{}
+			state := exitState(t, "REC-1", nil)
+			entry := state.Running["REC-1"]
+			entry.RuleName, entry.ConfiguredModel, entry.ConfiguredEffort, entry.ModelName = "cheap", "configured-model", "low", tt.entryModel
+
+			HandleWorkerExit(state, WorkerResult{IssueID: "REC-1", Identifier: "REC-1-ident", ExitKind: WorkerExitNormal, AgentAdapter: "mock", ModelName: tt.workerModel}, defaultExitParams(t, store))
+
+			if len(store.runHistories) != 1 {
+				t.Fatalf("AppendRunHistory called %d times, want 1", len(store.runHistories))
+			}
+			row := store.runHistories[0]
+			if row.ConfiguredModel != "configured-model" || row.ConfiguredEffort != "low" || row.RuleName != "cheap" || row.ReportedModel != tt.wantReported {
+				t.Errorf("run_history configured model, effort, rule, reported model = %q, %q, %q, %q, want %q, %q, %q, %q: a reported model never overwrites a configured one",
+					row.ConfiguredModel, row.ConfiguredEffort, row.RuleName, row.ReportedModel, "configured-model", "low", "cheap", tt.wantReported)
+			}
+			if retry := state.RetryAttempts["REC-1"]; retry != nil && retry.TimerHandle != nil {
+				retry.TimerHandle.Stop()
+			}
+		})
+	}
+}
+
+func TestHandleWorkerExit_CarriesTheRuleSettingsFlagThroughRetries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		result WorkerResult
+	}{
+		{name: "error retry", result: WorkerResult{ExitKind: WorkerExitError, Error: fmt.Errorf("something transient")}},
+		{name: "continuation retry", result: WorkerResult{ExitKind: WorkerExitNormal, SessionID: "sess-1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := exitState(t, "FLAG-1", nil)
+			state.Running["FLAG-1"].RuleName, state.Running["FLAG-1"].RuleSettingsApplied = "cheap", true
+			tt.result.IssueID, tt.result.Identifier, tt.result.AgentAdapter = "FLAG-1", "FLAG-1-ident", "mock"
+
+			HandleWorkerExit(state, tt.result, defaultExitParams(t, &mockExitStore{}))
+
+			retry, ok := state.RetryAttempts["FLAG-1"]
+			if !ok {
+				t.Fatal("RetryAttempts[FLAG-1] missing, want a scheduled retry")
+			}
+			defer retry.TimerHandle.Stop()
+			if !retry.RuleSettingsApplied || retry.RuleName != "cheap" {
+				t.Errorf("RetryEntry rule, flag = %q, %v, want %q, true", retry.RuleName, retry.RuleSettingsApplied, "cheap")
+			}
+		})
+	}
+}
+
+func (m *mockExitStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
+
+func TestHandleWorkerExit_RecordsPresentedCommentsOnlyOnNormalExit(t *testing.T) {
+	t.Parallel()
+
+	presented := map[string][]string{
+		ReactionKindReview:    {"a", "b"},
+		ReactionKindBotReview: {"x"},
+	}
+	tests := []struct {
+		name          string
+		exitKind      WorkerExitKind
+		err           error
+		presented     map[string][]string
+		wantReview    []string
+		wantBotReview []string
+	}{
+		{"normal exit records exactly what the run presented", WorkerExitNormal, nil, presented, []string{"a", "b"}, []string{"x"}},
+		{"normal exit records only the presented kind", WorkerExitNormal, nil, map[string][]string{ReactionKindBotReview: {"x"}}, nil, []string{"x"}},
+		{"normal exit presenting nothing records nothing", WorkerExitNormal, nil, nil, nil, nil},
+		{"error exit records nothing", WorkerExitError, errors.New("agent crashed"), presented, nil, nil},
+		{"cancelled exit records nothing", WorkerExitCancelled, nil, presented, nil, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const issueID = "ISS-RECORD"
+			state := exitState(t, issueID, nil)
+			store := newFingerprintModelStore()
+
+			HandleWorkerExit(state, WorkerResult{
+				IssueID:           issueID,
+				Identifier:        issueID + "-ident",
+				ExitKind:          tt.exitKind,
+				Error:             tt.err,
+				HandedOffComments: tt.presented,
+			}, workerExitParams(store))
+
+			assertStoredHandedOff(t, store, issueID, ReactionKindReview, tt.wantReview...)
+			assertStoredHandedOff(t, store, issueID, ReactionKindBotReview, tt.wantBotReview...)
+		})
+	}
+}
+
+func (m *mockExitStore) DeleteStageHop(context.Context, string) error { return nil }
+
+func (m *mockExitStore) RecordRunStageResult(_ context.Context, runID int64, targetRule, result string) error {
+	m.stageResults = append(m.stageResults, recordedStageResult{runID: runID, targetRule: targetRule, result: result})
+	return nil
+}
+
+func (m *mockExitStore) RecordStageHop(_ context.Context, hop persistence.StageHop) error {
+	m.recordedStageHops = append(m.recordedStageHops, hop)
+	return nil
+}
+
+const (
+	hopExitIssueID     = "HOP-1"
+	hopExitHandoff     = "Human Review"
+	hopExitSourceLabel = "stage-specify"
+	hopExitTargetLabel = "stage-implement"
+	hopExitChain       = "chain-1"
+)
+
+var hopExitPassAt = time.Date(2026, 3, 19, 9, 0, 0, 0, time.UTC)
+
+type hopExitTracker struct {
+	*mockTrackerAdapter
+	added     []string
+	removed   []string
+	addErr    error
+	removeErr error
+}
+
+func (h *hopExitTracker) AddLabel(_ context.Context, _, label string) error {
+	h.added = append(h.added, label)
+	return h.addErr
+}
+
+func (h *hopExitTracker) RemoveLabel(_ context.Context, _, label string) error {
+	h.removed = append(h.removed, label)
+	return h.removeErr
+}
+
+type hopExitFixture struct {
+	state   *State
+	store   *mockExitStore
+	tracker *hopExitTracker
+	params  HandleWorkerExitParams
+	result  WorkerResult
+	slack   *notifierSpy
+
+	resultsAtHandoff int
+}
+
+type routedStage struct {
+	eventType domain.EventType
+	stage     domain.StageTransition
+}
+
+func newHopExitFixture(t *testing.T) *hopExitFixture {
+	t.Helper()
+
+	store := &mockExitStore{}
+	tracker := &hopExitTracker{mockTrackerAdapter: &mockTrackerAdapter{}}
+
+	state := exitStateWithIssue(t, hopExitIssueID, "In Progress")
+	entry := state.Running[hopExitIssueID]
+	entry.RuleName = "specify"
+	entry.StageLineage = StageLineage{ChainID: hopExitChain, DispatchedAt: hopExitPassAt}
+	entry.Issue.Labels = []string{"feature", hopExitSourceLabel}
+	entry.Issue.DisplayID, entry.Issue.Title, entry.Issue.URL = "acme/web#1", "Add search", "https://example.test/acme/web/issues/1"
+	t.Cleanup(func() { stopRetryTimer(state, hopExitIssueID) })
+
+	params := defaultExitParams(t, store)
+	params.TrackerAdapter = tracker
+	params.HandoffState = hopExitHandoff
+	params.ActiveStates = []string{"In Progress"}
+	params.TerminalStates = []string{"Done"}
+	params.Dispatch = config.DispatchConfig{
+		Rules: []config.DispatchRule{
+			{Name: "specify", Stage: hopExitSourceLabel, Next: "implement"},
+			{Name: "implement", Stage: hopExitTargetLabel},
+		},
+		MaxConsecutiveHops: 3,
+	}
+	slack := &notifierSpy{}
+	params.Router = mustRouter(t, tracker, spyLookup(slack), route.Inputs{
+		Entries: []config.NotificationBackend{subscribe("slack", domain.EventStageAdvanced, domain.EventStageNotAdvanced)},
+	})
+
+	f := &hopExitFixture{
+		state:   state,
+		store:   store,
+		tracker: tracker,
+		params:  params,
+		result:  WorkerResult{IssueID: hopExitIssueID, Identifier: "HOP-1-ident", ExitKind: WorkerExitNormal, AgentAdapter: "mock"},
+		slack:   slack,
+	}
+	tracker.transitionIssueFn = func(context.Context, string, string) error {
+		f.resultsAtHandoff = len(store.stageResults)
+		return nil
+	}
+	return f
+}
+
+func (f *hopExitFixture) assertDecision(t *testing.T, wantResults []recordedStageResult, wantRouted []routedStage) {
+	t.Helper()
+
+	if !slices.Equal(f.store.stageResults, wantResults) {
+		t.Errorf("RecordRunStageResult calls = %+v, want %+v", f.store.stageResults, wantResults)
+	}
+	var routed []routedStage
+	for _, n := range f.slack.notifications() {
+		routed = append(routed, routedStage{n.Envelope.EventType, n.Envelope.Stage})
+	}
+	if !slices.Equal(routed, wantRouted) {
+		t.Errorf("routed stage events = %+v, want %+v", routed, wantRouted)
+	}
+}
+
+func (f *hopExitFixture) exit() {
+	HandleWorkerExit(f.state, f.result, f.params)
+	f.state.TrackerOpsWg.Wait()
+}
+
+func TestHandleWorkerExit_StageHopOnlyForSuccessfulRun(t *testing.T) {
+	t.Parallel()
+
+	advanced := routedStage{domain.EventStageAdvanced, domain.StageTransition{SourceRule: "specify", TargetRule: "implement", ChainID: hopExitChain, HopCount: 1}}
+	tests := []struct {
+		name        string
+		setup       func(f *hopExitFixture)
+		wantHop     bool
+		wantResults []recordedStageResult
+		wantRouted  []routedStage
+	}{
+		{
+			name: "successful run", wantHop: true,
+			wantResults: []recordedStageResult{{1, "implement", "advanced"}}, wantRouted: []routedStage{advanced},
+		},
+		{
+			name: "successful run whose label removal fails", wantHop: true,
+			setup:       func(f *hopExitFixture) { f.tracker.removeErr = errors.New("remove refused") },
+			wantResults: []recordedStageResult{{1, "implement", "partial"}}, wantRouted: []routedStage{advanced},
+		},
+		{
+			name: "successful run whose history append fails", wantHop: true,
+			setup:      func(f *hopExitFixture) { f.store.appendRunHistoryErr = errors.New("disk full") },
+			wantRouted: []routedStage{advanced},
+		},
+		{name: "failed run", setup: func(f *hopExitFixture) {
+			f.result.ExitKind = WorkerExitError
+			f.result.Error = errors.New("agent crashed")
+		}},
+		{name: "cancelled run", setup: func(f *hopExitFixture) { f.result.ExitKind = WorkerExitCancelled }},
+		{name: "blocked run", setup: func(f *hopExitFixture) {
+			f.result.SoftStop = true
+			f.result.SoftStopReason = string(workspace.StatusBlocked)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newHopExitFixture(t)
+			if tt.setup != nil {
+				tt.setup(f)
+			}
+
+			f.exit()
+
+			f.assertDecision(t, tt.wantResults, tt.wantRouted)
+			if len(f.store.runHistories) != 1 || f.store.runHistories[0].ChainID != hopExitChain {
+				t.Errorf("AppendRunHistory rows = %+v, want one carrying ChainID %q", f.store.runHistories, hopExitChain)
+			}
+			if !tt.wantHop {
+				if len(f.tracker.added) != 0 || len(f.tracker.removed) != 0 || len(f.state.StageHops) != 0 {
+					t.Errorf("AddLabel, RemoveLabel, StageHops = %q, %q, %v, want no hop", f.tracker.added, f.tracker.removed, f.state.StageHops)
+				}
+				return
+			}
+			if !slices.Equal(f.tracker.added, []string{hopExitTargetLabel}) {
+				t.Errorf("AddLabel labels = %q, want [%q]", f.tracker.added, hopExitTargetLabel)
+			}
+			if !slices.Equal(f.tracker.removed, []string{hopExitSourceLabel}) {
+				t.Errorf("RemoveLabel labels = %q, want [%q]", f.tracker.removed, hopExitSourceLabel)
+			}
+			if len(f.tracker.transitionCalls) != 0 {
+				t.Errorf("TransitionIssue calls = %+v, want none after a made hop", f.tracker.transitionCalls)
+			}
+			if hop := f.state.StageHops[hopExitIssueID]; hop == nil || hop.Count != 1 || hop.ChainID != hopExitChain {
+				t.Errorf("StageHops[%q] = %+v, want Count 1 and ChainID %q", hopExitIssueID, hop, hopExitChain)
+			}
+			if len(f.store.recordedStageHops) != 1 || f.store.recordedStageHops[0].HopCount != 1 || f.store.recordedStageHops[0].ChainID != hopExitChain {
+				t.Errorf("RecordStageHop rows = %+v, want one with HopCount 1 and ChainID %q", f.store.recordedStageHops, hopExitChain)
+			}
+			row := f.store.recordedStageHops[0]
+			if row.DisplayID != "acme/web#1" || row.IssueTitle != "Add search" || row.IssueURL != "https://example.test/acme/web/issues/1" || row.DispatchedAt != "2026-03-19T09:00:00Z" || row.RunDispatched {
+				t.Errorf("RecordStageHop row display id, title, url, dispatched at, run dispatched = %q, %q, %q, %q, %v, want the hopping run's identity, its pass time, and false",
+					row.DisplayID, row.IssueTitle, row.IssueURL, row.DispatchedAt, row.RunDispatched)
+			}
+			between := RuntimeSnapshot(f.state, time.Now()).BetweenStages
+			if len(between) != 1 {
+				t.Fatalf("len(BetweenStages) = %d after a made hop, want 1", len(between))
+			}
+			want := SnapshotStageHop{
+				IssueID: hopExitIssueID, Identifier: "HOP-1-ident", DisplayID: "acme/web#1", IssueTitle: "Add search", IssueURL: "https://example.test/acme/web/issues/1",
+				IssueLabels: []string{"feature", hopExitTargetLabel}, State: "In Progress", RuleName: "implement",
+				SourceRule: "specify", TargetRule: "implement", TargetLabel: hopExitTargetLabel, HoppedAt: between[0].HoppedAt, DispatchedAt: hopExitPassAt,
+			}
+			if !reflect.DeepEqual(between[0], want) || between[0].HoppedAt.IsZero() {
+				t.Errorf("BetweenStages[0] = %+v, want %+v with a hop time", between[0], want)
+			}
+		})
+	}
+}
+
+func TestHandleWorkerExit_StageHopFallsBackToHandoff(t *testing.T) {
+	t.Parallel()
+
+	restoredRow := persistence.StageHop{
+		IssueID: hopExitIssueID, HopCount: 3, SourceRule: "specify", TargetRule: "implement", TargetLabel: hopExitTargetLabel,
+		HoppedAt: "2026-03-15T12:00:00Z",
+	}
+
+	notAdvanced := func(hopCount int, reason string) []routedStage {
+		return []routedStage{{domain.EventStageNotAdvanced, domain.StageTransition{SourceRule: "specify", TargetRule: "implement", ChainID: hopExitChain, HopCount: hopCount, Reason: reason}}}
+	}
+	ceiling := []recordedStageResult{{1, "implement", "ceiling"}}
+	tests := []struct {
+		name        string
+		setup       func(f *hopExitFixture)
+		wantResults []recordedStageResult
+		wantRouted  []routedStage
+	}{
+		{"count at the ceiling", func(f *hopExitFixture) {
+			f.state.StageHops[hopExitIssueID] = &StageHopEntry{Count: 3, SourceRule: "specify", TargetRule: "implement", TargetLabel: hopExitTargetLabel}
+		}, ceiling, notAdvanced(3, "ceiling")},
+		{"count restored from the store at the ceiling", func(f *hopExitFixture) {
+			PopulateStageHops(f.state, []persistence.StageHop{restoredRow}, discardLogger())
+		}, ceiling, notAdvanced(3, "ceiling")},
+		{"label add fails", func(f *hopExitFixture) { f.tracker.addErr = errors.New("add refused") },
+			[]recordedStageResult{{1, "implement", "failed"}}, notAdvanced(0, "failed")},
+		{"reload removed the run's next", func(f *hopExitFixture) { f.params.Dispatch.Rules[0].Next = "" }, nil, nil},
+		{"reload removed the target's stage", func(f *hopExitFixture) { f.params.Dispatch.Rules[1].Stage = "" }, nil, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newHopExitFixture(t)
+			tt.setup(f)
+
+			f.exit()
+
+			f.assertDecision(t, tt.wantResults, tt.wantRouted)
+			if f.resultsAtHandoff != len(tt.wantResults) {
+				t.Errorf("RecordRunStageResult calls before the handoff transition = %d, want %d", f.resultsAtHandoff, len(tt.wantResults))
+			}
+			if len(f.tracker.transitionCalls) != 1 || f.tracker.transitionCalls[0].TargetState != hopExitHandoff {
+				t.Errorf("TransitionIssue calls = %+v, want one to %q", f.tracker.transitionCalls, hopExitHandoff)
+			}
+			if len(f.tracker.removed) != 0 || len(f.store.recordedStageHops) != 0 {
+				t.Errorf("RemoveLabel, RecordStageHop = %q, %+v, want no hop writes", f.tracker.removed, f.store.recordedStageHops)
+			}
+			if len(f.state.StageHops) != 0 {
+				t.Errorf("StageHops = %v, want the record reset by the handoff write", f.state.StageHops)
+			}
+		})
+	}
+}
+
+func TestHandleWorkerExit_StageHopCancelsPendingReactionsAndRetry(t *testing.T) {
+	t.Parallel()
+
+	kinds := []string{
+		ReactionKindCI, ReactionKindReview, ReactionKindBotReview, ReactionKindAutoMerge,
+		ReactionKindMergeConflict, ReactionKindLabelReview, ReactionKindLabelFix, ReactionKindMergeCompletion,
+	}
+
+	f := newHopExitFixture(t)
+	wsPath := t.TempDir()
+	writePRSCMMetadata(t, wsPath, 42, "acme", "myrepo", "feature/HOP-1", "deadbeef")
+	f.result.WorkspacePath = wsPath
+	f.params.SCMAdapter = &scmAdapterStubExit{}
+	f.params.CIProvider = &ciProviderStubExit{}
+	f.params.AutoMergeReactionConfigured = true
+	f.params.BotReviewReactionConfigured = true
+	f.params.MergeConflictReactionConfigured = true
+	f.params.LabelReviewReactionConfigured = true
+	f.params.LabelFixReactionConfigured = true
+	f.params.MergeCompletionReactionConfigured = true
+	for _, kind := range kinds {
+		key := ReactionKey(hopExitIssueID, kind)
+		f.state.PendingReactions[key] = &PendingReaction{IssueID: hopExitIssueID, Identifier: f.result.Identifier, Kind: kind, Attempt: 7}
+		f.state.ReactionAttempts[key] = 2
+	}
+	ScheduleRetry(f.state, ScheduleRetryParams{
+		IssueID:      hopExitIssueID,
+		Identifier:   f.result.Identifier,
+		Attempt:      4,
+		DelayMS:      3_600_000,
+		ReactionKind: ReactionKindReview,
+		RuleName:     "specify",
+		Logger:       discardLogger(),
+	}, noopRetryFire)
+	incumbent := f.state.RetryAttempts[hopExitIssueID]
+	t.Cleanup(func() { incumbent.TimerHandle.Stop() })
+
+	f.exit()
+
+	if !slices.Equal(f.tracker.added, []string{hopExitTargetLabel}) {
+		t.Fatalf("AddLabel labels = %q, want [%q]: the exit must hop for the cancellation to apply", f.tracker.added, hopExitTargetLabel)
+	}
+	if len(f.state.PendingReactions) != 0 || len(f.state.ReactionAttempts) != 0 {
+		t.Errorf("PendingReactions, ReactionAttempts = %v, %v, want none: a hop releases the pending reactions and seeds no new one", f.state.PendingReactions, f.state.ReactionAttempts)
+	}
+	if _, ok := f.state.RetryAttempts[hopExitIssueID]; ok {
+		t.Error("RetryAttempts holds the queued incumbent after a made hop, want it cancelled")
+	}
+	if incumbent.TimerHandle.Stop() {
+		t.Error("incumbent retry timer still pending after a made hop, want it stopped")
+	}
+	if !slices.Contains(f.store.deletedRetryIDs, hopExitIssueID) {
+		t.Errorf("DeleteRetryEntry ids = %v, want %q: the persisted retry row goes with the hop", f.store.deletedRetryIDs, hopExitIssueID)
 	}
 }

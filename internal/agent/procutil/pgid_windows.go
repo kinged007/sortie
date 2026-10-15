@@ -10,52 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
-
-type jobEntry struct {
-	mu   sync.Mutex
-	job  windows.Handle
-	proc *os.Process
-}
-
-var jobs sync.Map // map[int]*jobEntry
-
-func (e *jobEntry) closeJob() {
-	e.mu.Lock()
-	job := e.job
-	e.job = 0
-	e.mu.Unlock()
-	if job != 0 {
-		_ = windows.CloseHandle(job)
-	}
-}
-
-func duplicateJobHandle(pid int) (windows.Handle, bool) {
-	v, ok := jobs.Load(pid)
-	if !ok {
-		return 0, false
-	}
-	entry := v.(*jobEntry)
-
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-	if entry.job == 0 {
-		return 0, false
-	}
-
-	self := windows.CurrentProcess()
-	var dup windows.Handle
-	if err := windows.DuplicateHandle(self, entry.job, self, &dup, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
-		return 0, false
-	}
-	return dup, true
-}
 
 // SetProcessGroup configures cmd to start in a new console process group.
 // It must be called before [exec.Cmd.Start].
@@ -73,42 +33,16 @@ func dwordPID(pid int) (uint32, error) {
 	return uint32(pid), nil
 }
 
-// SignalProcessGroup sends sig to the process group led by pid.
-func SignalProcessGroup(pid int, sig syscall.Signal) error {
-	switch sig {
-	case syscall.SIGTERM, syscall.SIGINT:
-		group, err := dwordPID(pid)
-		if err != nil {
-			return err
-		}
-		return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, group)
-	case syscall.SIGKILL:
-		return KillProcessGroup(pid)
-	default:
-		return fmt.Errorf("unsupported signal %d on windows", sig)
-	}
-}
-
-// SignalGraceful requests graceful shutdown of the process group led by pid.
-func SignalGraceful(pid int) error {
-	return SignalProcessGroup(pid, syscall.SIGTERM)
-}
-
-// STATUS_CONTROL_C_EXIT (0xC000013A) is used so that [WasSignaled]
-// can distinguish termination from normal non-zero exits.
+// STATUS_CONTROL_C_EXIT (0xC000013A) is the exit status a Job Object
+// termination gives its members, which is how a launch's own wait
+// status tells a termination apart from an ordinary non-zero exit.
 const jobTerminateExitCode uint32 = 0xC000013A
 
-// KillProcessGroup terminates all processes in pid's Job Object.
-func KillProcessGroup(pid int) error {
-	_, err := killProcessGroupReportingLeftover(pid)
-	return err
-}
-
-// Kill answers for the two states a waited-for process is left in.
-// os/exec marks it done on Unix, which reports [os.ErrProcessDone], and
-// releases the handle on Windows, where a successful Wait deliberately
-// releases rather than marks done, which reports [syscall.EINVAL] on
-// its own. A kill that reached a live process and failed reports an
+// processAlreadyGone answers for the two states a waited-for process is
+// left in. os/exec marks it done on Unix, which reports
+// [os.ErrProcessDone], and releases the handle on Windows, where a
+// successful Wait deliberately releases rather than marks done, which
+// reports [syscall.EINVAL] on its own. A kill that reached a live process and failed reports an
 // [os.SyscallError] naming the call it made instead, so no such failure
 // is read as the process having been gone.
 func processAlreadyGone(err error) bool {
@@ -119,33 +53,6 @@ func processAlreadyGone(err error) bool {
 		return false
 	}
 	return errors.Is(err, syscall.EINVAL)
-}
-
-func killProcessGroupReportingLeftover(pid int) (leftover bool, err error) {
-	v, ok := jobs.LoadAndDelete(pid)
-	if !ok {
-		return false, nil
-	}
-	entry := v.(*jobEntry)
-
-	entry.mu.Lock()
-	job := entry.job
-	entry.mu.Unlock()
-
-	if job == 0 {
-		if entry.proc == nil {
-			return false, nil
-		}
-		if killErr := entry.proc.Kill(); killErr != nil && !processAlreadyGone(killErr) {
-			return false, killErr
-		}
-		return false, nil
-	}
-
-	leftover, _ = jobHasRunningMember(job)
-	err = drainJobObject(pid, job)
-	entry.closeJob()
-	return leftover, err
 }
 
 func drainJobObject(pid int, job windows.Handle) error {
@@ -220,19 +127,6 @@ func assignToJobObject(pid int, keepHandle bool) (job, dup windows.Handle, err e
 	return job, dup, nil
 }
 
-func registerJobAssignment(pid int, proc *os.Process, job windows.Handle) {
-	jobs.Store(pid, &jobEntry{job: job, proc: proc})
-}
-
-// CleanupProcess releases the Job Object handle associated with pid.
-func CleanupProcess(pid int) {
-	v, ok := jobs.LoadAndDelete(pid)
-	if ok {
-		entry := v.(*jobEntry)
-		entry.closeJob()
-	}
-}
-
 // x/sys/windows defines the information class constant but not the
 // JOBOBJECT_BASIC_PROCESS_ID_LIST structure.
 type jobObjectBasicProcessIDList struct {
@@ -296,63 +190,78 @@ func queryImageBaseName(process windows.Handle) (string, error) {
 	return filepath.Base(windows.UTF16ToString(buf[:n])), nil
 }
 
+// jobHasRunningMember reports whether any member of job is still running.
+// A member whose state could not be read does not count as gone: when no
+// member is running, the first such member's error is returned with its
+// identifier, so a nil error means every member was confirmed exited.
 func jobHasRunningMember(job windows.Handle) (bool, error) {
 	pids, err := jobMemberPIDs(job)
 	if err != nil {
 		return false, err
 	}
+	var firstMemberErr error
 	for _, pid := range pids {
-		if memberIsRunning(job, pid) {
+		running, memberErr := memberIsRunning(job, pid)
+		if running {
 			return true, nil
 		}
+		if memberErr != nil && firstMemberErr == nil {
+			firstMemberErr = fmt.Errorf("job member %d: %w", pid, memberErr)
+		}
 	}
-	return false, nil
+	return false, firstMemberErr
 }
 
 func isConsoleHostImage(name string) bool {
 	return strings.EqualFold(name, "conhost.exe")
 }
 
-func memberIsRunning(job windows.Handle, pid uint32) bool {
-	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+// openProcessFunc is processRunning's open call. Only a test replaces it,
+// to inject an open failure for a chosen process.
+var openProcessFunc = windows.OpenProcess
+
+// processRunning reports whether pid names a process that is still
+// running and that admit accepts. Opening an identifier does not settle
+// it: a process object stays openable after the process exits for as long
+// as anything holds a handle to it, so only a zero-timeout wait that times
+// out means the process is running. Only ERROR_INVALID_PARAMETER from the
+// open means no process holds pid; every other failure, like a failing
+// admit or wait, returns a non-nil error that MUST NOT be read as an exit.
+func processRunning(pid uint32, admit func(windows.Handle) (bool, error)) (bool, error) {
+	handle, err := openProcessFunc(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return false, nil
+	}
 	if err != nil {
-		return false
+		return false, fmt.Errorf("OpenProcess: %w", err)
 	}
 	defer func() { _ = windows.CloseHandle(handle) }()
 
-	if inJob, err := isProcessInJob(handle, job); err != nil || !inJob {
-		return false
-	}
-
-	if image, err := queryImageBaseName(handle); err == nil && isConsoleHostImage(image) {
-		return false
+	admitted, err := admit(handle)
+	if err != nil || !admitted {
+		return false, err
 	}
 
 	event, err := windows.WaitForSingleObject(handle, 0)
-	return err == nil && event == uint32(windows.WAIT_TIMEOUT)
-}
-
-type groupEscalationTarget struct {
-	pid int
-	job windows.Handle
-}
-
-func captureGroupEscalation(pid int) (groupEscalationTarget, bool) {
-	job, ok := duplicateJobHandle(pid)
-	if !ok {
-		return groupEscalationTarget{}, false
+	if err != nil {
+		return false, fmt.Errorf("WaitForSingleObject: %w", err)
 	}
-	return groupEscalationTarget{pid: pid, job: job}, true
+	return event == uint32(windows.WAIT_TIMEOUT), nil
 }
 
-func (t groupEscalationTarget) hasRunningMember() (bool, error) {
-	return jobHasRunningMember(t.job)
-}
-
-func (t groupEscalationTarget) terminateAll() error {
-	return drainJobObject(t.pid, t.job)
-}
-
-func (t groupEscalationTarget) close() {
-	_ = windows.CloseHandle(t.job)
+// memberIsRunning reports whether pid is a running member of job. A
+// console host is not counted. A non-nil error means the member could not
+// be read, not that it exited.
+func memberIsRunning(job windows.Handle, pid uint32) (bool, error) {
+	return processRunning(pid, func(handle windows.Handle) (bool, error) {
+		inJob, err := isProcessInJob(handle, job)
+		if err != nil {
+			return false, fmt.Errorf("IsProcessInJob: %w", err)
+		}
+		if !inJob {
+			return false, nil
+		}
+		image, err := queryImageBaseName(handle)
+		return err != nil || !isConsoleHostImage(image), nil
+	})
 }

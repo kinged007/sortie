@@ -285,7 +285,7 @@ func TestValidateReactionConfigs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := ValidateReactionConfigs(tt.cfg, registry.TrackerMeta{})
+			got := ValidateReactionConfigs(tt.cfg)
 
 			if len(got) != len(tt.wantChecks) {
 				t.Fatalf("ValidateReactionConfigs(cfg) = %v, want %d diag(s) with checks %v", got, len(tt.wantChecks), tt.wantChecks)
@@ -314,7 +314,7 @@ func TestValidateReactionConfigs(t *testing.T) {
 			},
 		}
 
-		got := ValidateReactionConfigs(cfg, registry.TrackerMeta{})
+		got := ValidateReactionConfigs(cfg)
 
 		if len(got) != 2 {
 			t.Fatalf("ValidateReactionConfigs(cfg) = %v, want 2 diags", got)

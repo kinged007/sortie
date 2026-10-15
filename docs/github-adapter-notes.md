@@ -2,7 +2,7 @@
 
 What to know before you change `internal/scm/github`: the design decisions behind it, the places GitHub's model does not line up with ours, and the traps that cost someone a day.
 
-Last updated: 2026-08-23
+Last updated: 2026-10-10
 
 ## Shape of the package
 
@@ -16,15 +16,15 @@ Two HTTP clients live side by side: one for REST, one for GraphQL. The GraphQL b
 
 The adapter sets a REST API version header on every request, in one place in the client constructor, and no configuration key overrides it. That pin is deliberate: it makes the payload shapes the normalizers depend on stable, and it makes a payload change an explicit decision rather than something that arrives one morning.
 
-The corollary is that **bumping the pin is a payload-shape change, not a version bump**. A version has already removed a field the adapter used to read. Do not assume a removal announced for one payload is confined to it.
+The corollary is that **bumping the pin is a payload-shape change, not a version bump**. A new version can remove a field the adapter reads, and a removal announced for one payload is not always confined to it.
 
-The method for finding out is worth keeping even though its results are not. Because the pin lives in one place, the probe is a single header change: issue the same request twice against the same live resource, varying only the version header between the outgoing value and the incoming one, and **diff the JSON key sets rather than the values**. A removal surfaces as a missing key and never as an error, so a comparison that looks at values will not see it. Run that across every route the adapter reads, not only the one a release note mentions, and against a resource in each state the adapter cares about: a field can be present-but-null in one state and absent in another, so a merged pull request and an open one are two separate probes, as are an issue with a parent and one without.
+To find out, probe. Because the pin lives in one place, the probe is a single header change: issue the same request twice against the same live resource, varying only the version header between the outgoing value and the incoming one, and **diff the JSON key sets rather than the values**. A removal surfaces as a missing key and never as an error, so a comparison that looks at values will not see it. Run that across every route the adapter reads, not only the one a release note mentions, and against a resource in each state the adapter cares about: a field can be present-but-null in one state and absent in another, so a merged pull request and an open one are two separate probes, as are an issue with a parent and one without.
 
-One consequence is load-bearing today: the pull request payload under the current pin carries no merge commit identifier, so `GetMergeability` sources it from a second, gated GraphQL call when the REST read reports the pull request merged. Two details of that call matter. It asks only for the real merge commit and never for the potential (test) merge commit, so GitHub's speculative merge commit is structurally unreachable through this path. And the merged gate bounds the cost: an open, draft, or closed-unmerged pull request costs no GraphQL call at all.
+One consequence: the pull request payload under the current pin carries no merge commit identifier, so `GetMergeability` sources it from a second, gated GraphQL call when the REST read reports the pull request merged. Two details of that call matter. It asks only for the real merge commit and never for the potential (test) merge commit, so GitHub's speculative merge commit is structurally unreachable through this path. And the merged gate bounds the cost: an open, draft, or closed-unmerged pull request costs no GraphQL call at all.
 
 ## Where GitHub's model does not match ours
 
-**No workflow states.** A GitHub issue is open or closed. The adapter derives workflow state from repository labels and couples that to the native flag: a terminal target closes the issue, an active target on a closed issue reopens it. Native open with no state label reads as the first configured active state, native closed with no terminal label as the first terminal state. This is the same convention the Gitea adapter uses, deliberately, so operator configuration is uniform across the open/closed trackers.
+**No workflow states.** A GitHub issue is open or closed. The adapter derives workflow state from repository labels and couples that to the native flag: a terminal target closes the issue, an active target on a closed issue reopens it. An open issue with no state label is in no state and is never dispatched: labeling an issue is how an operator hands it to Sortie. A closed issue reads terminal whatever its labels, as the terminal label it carries or else as the first configured terminal state, so a workflow names at least one terminal state. This is the same convention the Gitea adapter uses, deliberately, so operator configuration is uniform across the open/closed trackers.
 
 **The adapter creates no labels.** The repository is expected to carry the state labels before Sortie starts. Creating them would need broader permissions and would write into a namespace the repository's own conventions own. This is the opposite of the Gitea adapter's choice, and the difference is not arbitrary: GitHub's label-add route fails loudly on a name it will not accept, so an operator sees the failure. Gitea's does not, which is why that adapter creates on demand instead.
 
@@ -72,9 +72,39 @@ Anything unrecognized, including the empty string, folds to pending rather than 
 
 The empty string is the gate's "no required checks exist" answer, and the auto-merge loop treats it as a satisfied CI precondition when CI is not explicitly required. It is not the same as "everything passed".
 
-The CI status provider reads the same check-runs route through the same normalization helpers but reduces it with the plain aggregate rather than the merge gate, and additionally pulls a log tail for the first failing GitHub Actions check. That log read works because GitHub Actions creates check runs one-to-one with workflow jobs, so the check run id doubles as the job id. That coupling is a GitHub Actions property, not a check-runs property: a third-party check has no job log behind it.
+The CI status provider reads the same check-runs route through the same normalization helpers but reduces it with the plain aggregate rather than the merge gate, and additionally locates the failing step of the first failing GitHub Actions check and cuts its output out of the job log, falling back to the end of the log when it cannot. That log read works because GitHub Actions creates check runs one-to-one with workflow jobs, so the check run id doubles as the job id. That coupling is a GitHub Actions property, not a check-runs property: a third-party check has no job log behind it.
 
 Neither reader sends the filter parameter on the check-runs route, so GitHub's default decides whether a superseded run still contributes. If you touch that reader, settle what the default is against a commit whose checks were re-run before assuming.
+
+## Locating the failing step in a job log
+
+The job log is one stream. Nothing in a line names its step, so the step has to be cut out by time and by the runner's own marker lines. The job object lists each step with a start and a completion time, and those are the only locator.
+
+**Step times are whole seconds, log stamps are not.** Every log line carries a 100 ns timestamp, and consecutive steps share their boundary second. The window therefore runs from the step's start to one second past its completion, and the runner's header and error lines decide the edges inside the shared seconds.
+
+**A `##[group]Run` header is not the step name.** The text after it is the action reference or the first script line, so it never matches the name of a named `run:` step. Count headers instead: when the failing step is not concurrent, the steps that started in its start second finished in it, so their headers come first and the failing step's own header follows. The job's first executed step prints no header, and the setup step prints none either.
+
+**Headers come in more than one shape.** A post step opens with `Post job cleanup.`, and the control steps that wait for or cancel background steps print one of three single-line forms. A count of `##[group]Run` lines alone opens the step one header late when a wait step started in the same second, and falls back on a recorded job where that happens.
+
+**The closing `##[error]` line ends the step.** A failing or cancelled step ends with a runner error line. Ending the output at the last one drops the next steps' lines that share the completion second, which in practice are the `if: failure()` upload and the post-job cleanup.
+
+**Background and `parallel:` steps interleave.** They write through the same logger as everything else, so their lines are mixed in line by line, and their headers print out of step order, because a background step waits for a slot before it starts. A concurrent step therefore opens at its window start, has no head, and says so in the note. The job object also lists the `Parallel group` step and the implicit wait for all background steps as ordinary steps, and a waiting step fails with the step it waits for and carries a larger number, so the first failing step by number is the step that failed.
+
+**A timeout marks the running step cancelled.** A `timed_out` check run can hold no failing step; the cancelled one is where the job spent its time. A `continue-on-error` failure reports success and is never chosen.
+
+**The per-step log route answers 404.** The documented `/actions/jobs/{job_id}/steps/{step_number}/logs` route returned not-found on every job probed, and it is absent from GitHub Enterprise Server, so the time window is the only locator.
+
+**The log can start with a byte order mark, and Windows runners end lines with CRLF.** Strip the mark from the first line only and one trailing carriage return from every line before parsing the timestamp.
+
+## Label writes
+
+**Removal is one delete per stored spelling, after a read.** The issue-label delete route removes one label per call and is addressed by name, so the adapter reads the issue's labels first, selects every spelling that names the requested label regardless of letter case, and deletes each by the spelling it read. It then trusts the label list of the last delete response if that list lacks the label, and otherwise re-reads the issue. The same constructor serves the tracker role and the pull request label command, so a pull request's label removal and an issue's use one request path. The replace route (`PUT` on the labels collection) is never sent: it overwrites the whole set and drops a label a person adds between the read and the write.
+
+**The 404 of the delete route is ambiguous.** It answers 404 both when the label is already gone from the issue and when the issue is missing or the token lost access to the repository, and the body does not separate the two reliably. The adapter never reads the body to decide. A 404 is settled by the re-read: the label gone is a successful removal, and a missing issue makes the re-read itself return not-found.
+
+**Two behaviors are unobserved.** Whether the delete route resolves the name case-insensitively was probed only on the labels collection, which is why the adapter sends the stored spelling and not the caller's. Whether the add and delete responses list every label of an issue or stop at a page like the list route is unknown, so a response that satisfies the check is trusted and one that does not triggers a re-read before any failure is reported.
+
+**The list route is paginated.** The confirming read walks the link header at the route's maximum page size, because an issue carrying more labels than one page would otherwise hide the label from the check.
 
 ## The merge write path
 
@@ -102,7 +132,7 @@ The primary hourly budget, the search per-minute budget, and the GraphQL budget 
 
 - Candidate polling stays off the search route unless an operator filter requires it, because search draws on the smaller budget.
 - The two GraphQL reads are each gated: the review decision is one call per read, and the merge commit is one call only for a pull request already known to be merged.
-- The per-issue state reads used by reconciliation go through a bounded, per-path ETag cache. A not-modified response reuses the previously derived state without re-deriving it, and does not charge the primary budget. This matters precisely because reconciliation polls the same issues over and over. The cache size is an operator-tunable extension key, and zero disables conditional requests entirely.
+- The per-issue state reads used by reconciliation go through a bounded, per-path ETag cache. The cache stores the issue's labels and closed flag rather than a derived state, so a not-modified response is derived again under the state lists in force, and does not charge the primary budget. This matters precisely because reconciliation polls the same issues over and over. The cache size is an operator-tunable extension key, and zero disables conditional requests entirely.
 
 Secondary limits are separate again and are not a quota you can count down; they arrive as a rejection carrying a retry hint. The adapter never sleeps or retries on its own: it classifies, appends the retry hint to the message, and leaves backoff to the orchestrator.
 

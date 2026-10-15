@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -354,8 +353,8 @@ func readerSession(t *testing.T, reader usageReader) (*sessionState, *outboundRe
 // satisfied by the capability notice, which carries the same event type.
 const modelReachedMarker = "model-reached"
 
-// chunkBarrier returns an OnEvent callback and a channel closed once the chunk
-// carrying modelReachedMarker is delivered. The pump records that the turn
+// chunkBarrier returns an OnEvent callback and a channel closed once a message
+// chunk's liveness notification is delivered. The pump records that the turn
 // reached the model before emitting that event, so seeing it means the record
 // is set, not that a reader won a race.
 func chunkBarrier(events *[]domain.AgentEvent) (func(domain.AgentEvent), <-chan struct{}) {
@@ -364,7 +363,7 @@ func chunkBarrier(events *[]domain.AgentEvent) (func(domain.AgentEvent), <-chan 
 	collect := collectEvents(events)
 	return func(ev domain.AgentEvent) {
 		collect(ev)
-		if ev.Type == domain.EventNotification && strings.Contains(ev.Message, modelReachedMarker) {
+		if ev.Type == domain.EventNotification && ev.Message == "" {
 			once.Do(func() { close(reached) })
 		}
 	}, reached

@@ -5,12 +5,14 @@ import (
 	"sync/atomic"
 )
 
-// etagEntry holds the cached ETag value and derived state for a single
-// GitHub issue endpoint response.
+// etagEntry holds the cached ETag value and the label names and closed flag
+// of a single GitHub issue endpoint response. It keeps no derived state, so a
+// 304 is derived under the state vocabulary in force when it arrives.
 type etagEntry struct {
-	etag       string // ETag header value (opaque string from GitHub)
-	state      string // derived Sortie state from the cached response
-	accessedAt uint64 // monotonic counter value at last access (for LRU eviction)
+	etag       string   // ETag header value (opaque string from GitHub)
+	labels     []string // label names from the cached response
+	closed     bool     // whether the cached response was a closed issue
+	accessedAt uint64   // monotonic counter value at last access (for LRU eviction)
 }
 
 // etagCache provides bounded, concurrency-safe ETag caching for
@@ -31,24 +33,24 @@ func newETagCache(maxSize int) *etagCache {
 	}
 }
 
-// lookup returns the cached ETag and state for the given path.
-// Returns ("", "", false) on cache miss.
-func (c *etagCache) lookup(path string) (etag string, state string, ok bool) {
+// lookup returns the cached ETag, label names, and closed flag for the
+// given path. Returns ok false on cache miss.
+func (c *etagCache) lookup(path string) (etag string, labels []string, closed bool, ok bool) {
 	if c.maxSize == 0 {
-		return "", "", false
+		return "", nil, false, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	e, ok := c.entries[path]
 	if !ok {
-		return "", "", false
+		return "", nil, false, false
 	}
-	return e.etag, e.state, true
+	return e.etag, e.labels, e.closed, true
 }
 
 // put inserts or updates a cache entry. If the cache is at capacity,
 // the least-recently-accessed entry is evicted first.
-func (c *etagCache) put(path, etag, state string) {
+func (c *etagCache) put(path, etag string, labels []string, closed bool) {
 	if c.maxSize == 0 {
 		return
 	}
@@ -58,7 +60,7 @@ func (c *etagCache) put(path, etag, state string) {
 	now := c.clock.Add(1)
 
 	if _, exists := c.entries[path]; exists {
-		c.entries[path] = etagEntry{etag: etag, state: state, accessedAt: now}
+		c.entries[path] = etagEntry{etag: etag, labels: labels, closed: closed, accessedAt: now}
 		return
 	}
 
@@ -75,7 +77,7 @@ func (c *etagCache) put(path, etag, state string) {
 		delete(c.entries, oldestKey)
 	}
 
-	c.entries[path] = etagEntry{etag: etag, state: state, accessedAt: now}
+	c.entries[path] = etagEntry{etag: etag, labels: labels, closed: closed, accessedAt: now}
 }
 
 // touch updates the accessedAt timestamp for an existing entry,

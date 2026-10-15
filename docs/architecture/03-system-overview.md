@@ -53,7 +53,7 @@
     - Fetches CI pipeline status for a given git ref.
     - Returns a normalized result including aggregate status, individual check runs, and an optional truncated log excerpt from the first failing check.
     - Read-only, single-method contract (`FetchCIStatus`); does not manage CI pipelines or trigger builds.
-    - Activated by `ci_feedback.kind` or `reactions.ci_failure.provider` presence in workflow front matter.
+    - Activated by `reactions.ci_failure.provider` presence in workflow front matter.
 
 11. `SCM Adapter`
     - Provides read and write access to SCM platform features beyond CI status: human and bot PR review comment fetching, review state queries, merge precondition reads, label-event journal reads, orchestrator-driven PR merge with optional branch deletion, and label removal.
@@ -82,7 +82,7 @@ Sortie is organized into these layers:
 
 5. `Integration Layer` (tracker adapters, agent adapters, CI status providers, and SCM adapters)
    - API calls and normalization for tracker data; session lifecycle for agent runtimes; CI pipeline status queries; PR review comment fetching.
-   - Multiple adapters per dimension: tracker adapters (Jira, GitHub, GitLab, Gitea, Linear, …), agent adapters (Claude Code, Copilot CLI, Codex CLI, OpenCode CLI, Kiro CLI, …), CI status providers (GitHub, Gitea, GitLab, …), and SCM adapters (GitHub, Gitea, GitLab, …).
+   - Multiple adapters per dimension: tracker adapters (Jira, GitHub, GitLab, Gitea, Linear, …), agent adapters (Claude Code, Copilot CLI, Codex CLI, OpenCode CLI, …), CI status providers (GitHub, Gitea, GitLab, …), and SCM adapters (GitHub, Gitea, GitLab, …).
 
 6. `Observability Layer` (logs + status surface)
    - Operator visibility into orchestrator and agent behavior.

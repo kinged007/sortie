@@ -40,5 +40,10 @@
     "pull_request": null,
     "created_at": "2026-01-03T00:00:00Z",
     "updated_at": "2026-01-03T00:00:00Z"
+  },
+  {
+    "id": 8004, "number": 4, "title": "Open issue with no state label", "body": null, "state": "open", "ref": "",
+    "html_url": "https://git.example.com/acme/widgets/issues/4", "labels": [{ "id": 9, "name": "bug", "color": "ee0701" }],
+    "assignees": [], "pull_request": null, "created_at": "2026-01-03T12:00:00Z", "updated_at": "2026-01-03T12:00:00Z"
   }
 ]

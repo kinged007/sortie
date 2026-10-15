@@ -1,7 +1,6 @@
 package github
 
 import (
-	"log/slog"
 	"strconv"
 
 	"github.com/sortie-ai/sortie/internal/domain"
@@ -91,7 +90,7 @@ func githubLabelNames(labels []githubLabel) []string {
 //
 // DisplayID is left empty; callers that know the repository
 // owner and name should set it to "owner/repo#N" after normalization.
-func normalizeIssue(gi githubIssue, activeStates, terminalStates []string, handoffState string, log *slog.Logger) domain.Issue {
+func normalizeIssue(gi githubIssue, model *issuekit.LabelStateModel, states issuekit.LabelStates) domain.Issue {
 	num := strconv.Itoa(gi.Number)
 	labelNames := githubLabelNames(gi.Labels)
 
@@ -110,8 +109,6 @@ func normalizeIssue(gi githubIssue, activeStates, terminalStates []string, hando
 		issueType = gi.Type.Name
 	}
 
-	states := issuekit.LabelStates{Active: activeStates, Terminal: terminalStates, Handoff: handoffState}
-
 	// Only a summary proving the issue has no dependencies at all lets a
 	// candidate claim an authoritative blocker list. TotalBlockedBy counts
 	// every dependency; BlockedBy counts only the ones the forge considers
@@ -124,7 +121,7 @@ func normalizeIssue(gi githubIssue, activeStates, terminalStates []string, hando
 		Identifier:         num,
 		Title:              gi.Title,
 		Description:        desc,
-		State:              issuekit.DeriveLabelState(labelNames, gi.State, "open", "closed", states, num, log),
+		State:              model.Derive(states, num, labelNames, isClosed(gi)),
 		URL:                gi.HTMLURL,
 		Labels:             issuekit.NormalizeLabels(labelNames),
 		Assignee:           assignee,
@@ -156,16 +153,14 @@ func (a *GitHubAdapter) qualifyDisplayID(issue *domain.Issue) {
 // [domain.BlockerRef] values. Returns a non-nil empty slice when
 // input is empty. owner and repo qualify each ref's DisplayID the
 // same way an issue's own DisplayID is qualified.
-func normalizeBlockers(blockers []githubIssue, activeStates, terminalStates []string, handoffState, owner, repo string, log *slog.Logger) []domain.BlockerRef {
-	states := issuekit.LabelStates{Active: activeStates, Terminal: terminalStates, Handoff: handoffState}
-
+func normalizeBlockers(blockers []githubIssue, model *issuekit.LabelStateModel, states issuekit.LabelStates, owner, repo string) []domain.BlockerRef {
 	refs := make([]domain.BlockerRef, 0, len(blockers))
 	for _, b := range blockers {
 		num := strconv.Itoa(b.Number)
 		ref := domain.BlockerRef{
 			ID:         num,
 			Identifier: num,
-			State:      issuekit.DeriveLabelState(githubLabelNames(b.Labels), b.State, "open", "closed", states, num, log),
+			State:      model.Derive(states, num, githubLabelNames(b.Labels), isClosed(b)),
 		}
 		if ref.DisplayID == "" {
 			ref.DisplayID = qualifyIdentifier(owner, repo, num)
@@ -189,6 +184,12 @@ func normalizeComments(comments []githubComment) []domain.Comment {
 		}
 	}
 	return issuekit.NormalizeComments(source)
+}
+
+// isClosed reports whether the issue's native status is closed; every other
+// native value reads as open.
+func isClosed(gi githubIssue) bool {
+	return gi.State == "closed"
 }
 
 // isPullRequest returns true when the GitHub API entry represents a

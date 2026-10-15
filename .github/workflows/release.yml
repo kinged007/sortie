@@ -13,23 +13,10 @@ on:
         required: false
         type: boolean
         default: false
-      # Off by default. The free-trial certificate is self-signed, so a signed
-      # binary is no more trusted on Windows than an unsigned one, and the
-      # trial's yearly artifact-volume quota is spent. Enabling this needs a
-      # certificate chained to a CA in the Microsoft Trusted Root Program, plus
-      # a `!inputs.dry_run` gate on the signing hook: a dry run submits the same
-      # two Windows binaries as a real release and spends half the quota on
-      # artifacts it discards.
-      sign_windows:
-        description: "Authenticode-sign the Windows binaries with SignPath"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
 
-# Only one release pipeline at a time.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -106,11 +93,6 @@ jobs:
           GOOS: ${{ matrix.goos }}
         with:
           version: latest
-          # Skip the action's analysis cache: stale entries cause flaky
-          # staticcheck false positives (golangci-lint#5979) that would otherwise
-          # masquerade as new 'latest' findings, and a cache shared across the
-          # matrix would carry a result over from the wrong GOOS. setup-go's
-          # caches are unaffected.
           skip-cache: true
 
   test-unit:
@@ -344,7 +326,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
@@ -385,7 +367,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
@@ -426,31 +408,28 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
       - name: Install Codex
         run: npm install -g @openai/codex
 
+      - name: Enable Codex sandbox namespaces
+        run: scripts/codex-sandbox-enable.sh
+
+      - name: Check the Codex sandbox starts
+        run: codex sandbox -- /usr/bin/true
+
       - name: Run integration tests
         run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/codex/...
 
   test-integration-opencode:
-    name: "Integration: OpenCode ${{ matrix.major }}.x"
+    name: "Integration: OpenCode"
     needs: [lint, test-unit]
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - major: "1"
-            install: npm install -g --ignore-scripts=false opencode-ai@1
-          - major: "2"
-            install: npm install -g --ignore-scripts=false @opencode/cli@2
     env:
       SORTIE_OPENCODE_TEST: "1"
-      SORTIE_OPENCODE_MAJOR: ${{ matrix.major }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -463,17 +442,17 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
       - name: Install OpenCode CLI
-        run: ${{ matrix.install }}
+        run: npm install -g --ignore-scripts=false @opencode/cli@2
 
       - name: Run integration tests
         run: |
           for attempt in 1 2; do
-            if go test -race -count=1 -v -timeout 180s -run 'Integration' ./internal/agent/opencode/...; then
+            if go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/opencode/...; then
               exit 0
             fi
             if [ "$attempt" -eq 2 ]; then
@@ -512,44 +491,6 @@ jobs:
       - name: Run integration tests
         run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/pi/...
 
-  test-integration-kiro:
-    name: "Integration: Kiro"
-    needs: [lint, test-unit]
-    runs-on: ubuntu-latest
-    env:
-      SORTIE_KIRO_TEST: "1"
-      SORTIE_KIRO_CREDENTIAL_ENV: KIRO_API_KEY
-      KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
-    steps:
-      - name: Verify Kiro secrets
-        run: |
-          missing=()
-          [ -z "$KIRO_API_KEY" ] && missing+=("KIRO_API_KEY")
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::Missing required secrets: ${missing[*]}"
-            echo "Configure these in Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          echo "✓ All Kiro secrets are present"
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Install Kiro CLI
-        run: |
-          set -euo pipefail
-          curl -fsSL https://cli.kiro.dev/install | bash
-          kiro-cli --version
-
-      - name: Run integration tests
-        run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/kiro/...
 
   test-integration-acp-gemini:
     name: "Integration: Gemini - ACP"
@@ -557,8 +498,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SORTIE_CLIENTPROTOCOL_TEST: "1"
-      SORTIE_CLIENTPROTOCOL_COMMAND: gemini --acp
+      SORTIE_CLIENTPROTOCOL_COMMAND: gemini --acp --skip-trust --approval-mode yolo
+      SORTIE_CLIENTPROTOCOL_ASKING_COMMAND: gemini --acp
       SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV: GEMINI_API_KEY
+      SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV: GOOGLE_GEMINI_BASE_URL
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
       - name: Verify Gemini secrets
@@ -583,7 +526,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
@@ -650,17 +593,18 @@ jobs:
       - test-integration-codex
       - test-integration-opencode
       - test-integration-pi
-      - test-integration-kiro
+
       - test-integration-acp-gemini
       - test-integration-acp-kiro
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # The Create and push tag step below runs git push origin to
-          # publish the tag, so this checkout keeps the credential.
           persist-credentials: true
 
       - name: Set up Go
@@ -669,17 +613,21 @@ jobs:
           go-version-file: go.mod
 
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
 
       - name: Verify SignPath config
-        if: ${{ inputs.sign_windows && !inputs.dry_run }}
+        if: ${{ !inputs.dry_run }}
         env:
           SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: |
           missing=()
-          [ -z "$SIGNPATH_ORG_ID" ]    && missing+=("SIGNPATH_ORG_ID (variable)")
-          [ -z "$SIGNPATH_API_TOKEN" ] && missing+=("SIGNPATH_API_TOKEN (secret)")
+          [ -z "$SIGNPATH_ORG_ID" ]       && missing+=("SIGNPATH_ORG_ID (variable)")
+          [ -z "$SIGNPATH_PROJECT_SLUG" ] && missing+=("SIGNPATH_PROJECT_SLUG (variable)")
+          [ -z "$SIGNPATH_POLICY_SLUG" ]  && missing+=("SIGNPATH_POLICY_SLUG (variable)")
+          [ -z "$SIGNPATH_API_TOKEN" ]    && missing+=("SIGNPATH_API_TOKEN (secret)")
           if [ ${#missing[@]} -ne 0 ]; then
             echo "::error::Missing required SignPath config: ${missing[*]}"
             echo "Configure these in Settings → Secrets and variables → Actions"
@@ -687,49 +635,87 @@ jobs:
           fi
           echo "✓ SignPath configuration is present"
 
-      - name: Install SignPath module
-        if: ${{ inputs.sign_windows && vars.SIGNPATH_ORG_ID != '' }}
-        shell: pwsh
-        run: |
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module -Name SignPath -RequiredVersion 4.3.1 -Force -Scope CurrentUser -AcceptLicense
-
       - name: Collect release contributors
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/release-contributors.sh '${{ needs.validate.outputs.tag }}'
 
+      - name: Create tag
+        run: |
+          TAG='${{ needs.validate.outputs.tag }}'
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "${{ inputs.dry_run && 'Dry run' || 'Release' }} ${TAG}"
+
+      - name: Build binaries for signing
+        if: ${{ !inputs.dry_run }}
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --clean
+
+      - name: Stage Windows binaries for signing
+        if: ${{ !inputs.dry_run }}
+        run: |
+          staging="${RUNNER_TEMP}/unsigned"
+          jq -r '.[] | select(.type == "Binary" and .goos == "windows") | "\(.goarch) \(.path)"' dist/artifacts.json |
+            while read -r arch path; do
+              mkdir -p "${staging}/windows_${arch}"
+              cp "$path" "${staging}/windows_${arch}/sortie.exe"
+            done
+          test -f "${staging}/windows_amd64/sortie.exe"
+          test -f "${staging}/windows_arm64/sortie.exe"
+
+      - name: Upload unsigned Windows binaries
+        id: upload-unsigned
+        if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-unsigned
+          path: ${{ runner.temp }}/unsigned
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign Windows binaries
+        if: ${{ !inputs.dry_run }}
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: windows-zip
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: ${{ runner.temp }}/signed
+          parameters: |
+            version: ${{ toJSON(needs.validate.outputs.version) }}
+
+      - name: Verify signed binaries
+        if: ${{ !inputs.dry_run }}
+        run: |
+          test -f "${RUNNER_TEMP}/signed/windows_amd64/sortie.exe"
+          test -f "${RUNNER_TEMP}/signed/windows_arm64/sortie.exe"
+
       - name: Push tag
         if: ${{ !inputs.dry_run }}
         run: |
           TAG='${{ needs.validate.outputs.tag }}'
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Release ${TAG}"
           git push origin "$TAG"
           echo "### Tagged \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create local tag
-        if: ${{ inputs.dry_run }}
-        run: |
-          TAG='${{ needs.validate.outputs.tag }}'
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Dry run ${TAG}"
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release ${{ inputs.dry_run && '--skip=publish --skip=announce' || '' }}
+          args: release --clean ${{ inputs.dry_run && '--skip=publish --skip=announce' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-          SIGNPATH_ORG_ID: ${{ inputs.sign_windows && vars.SIGNPATH_ORG_ID || '' }}
-          SIGNPATH_API_TOKEN: ${{ inputs.sign_windows && secrets.SIGNPATH_API_TOKEN || '' }}
-          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          SIGNED_WINDOWS_DIR: ${{ !inputs.dry_run && format('{0}/signed', runner.temp) || '' }}
 
       - name: Release summary
         if: ${{ !inputs.dry_run }}

@@ -77,10 +77,13 @@ provision_labels() {
 # fetch_run_history lists the last MONITOR_LOOKBACK completed runs of
 # workflow_id on DEFAULT_BRANCH, excluding the current run, then looks
 # up the job named JOB_NAME on each one until it holds MAX_SAMPLES_NEEDED
-# samples for it. It appends "<run_id>\t<run_url>\t<conclusion>" per
-# held sample to out_file, newest first. It returns non-zero when a gh
-# call failed, or when at least one run was examined and none of them
-# carried a job named JOB_NAME.
+# samples for it. A matched job whose conclusion carries no verdict
+# (anything but success, failure or timed_out) is passed over and does
+# not fill a slot, so a skipped or cancelled run cannot hide the prior
+# sample. It appends "<run_id>\t<run_url>\t<conclusion>" per held
+# sample to out_file, newest first. It returns non-zero when a gh call
+# failed, or when at least one run was examined and none of them carried
+# a job named JOB_NAME.
 fetch_run_history() {
 	_frh_workflow_id=$1
 	_frh_out=$2
@@ -113,6 +116,10 @@ fetch_run_history() {
 			continue
 		fi
 		_frh_matched=$((_frh_matched + 1))
+		case "$_frh_conclusion" in
+		success | failure | timed_out) ;;
+		*) continue ;;
+		esac
 		_frh_held=$((_frh_held + 1))
 		printf '%s\t%s\t%s\n' "$_frh_run_id" "$_frh_run_url" "$_frh_conclusion" >>"$_frh_out"
 	done <"$_frh_runs_file"
@@ -138,27 +145,30 @@ history_json_from_file() {
 	' <"$1"
 }
 
-# decide_exit_trap is installed before decide takes any other action.
-# It fires on EXIT, HUP, INT, and TERM; when DECIDE_DONE was never set,
-# no decision was carried out, so it announces the fault on the run
-# page and in the job summary itself, calling neither the monitor nor
-# gh, and forces a clean exit so a monitor or GitHub-API fault never
-# reddens a shard whose own tests passed.
+# Reporting faults must remain visible without failing a shard whose tests passed.
 decide_exit_trap() {
 	if [ "${DECIDE_TRAP_RUNNING:-0}" -eq 1 ] || [ "$DECIDE_DONE" -eq 1 ]; then
 		return
 	fi
 	DECIDE_TRAP_RUNNING=1
 
-	printf '::error::nightly-issue.sh decide for %s terminated before a NITE decision was carried out\n' "${ADAPTER_NAME:-unknown}"
+	_failure='No NITE decision was persisted; see the job log.'
+	if [ "$DECISION_PERSISTED" -eq 1 ]; then
+		_failure='Incident action did not complete; the NITE decision was persisted; see the job log.'
+	fi
+	printf '::error::nightly-issue.sh decide for %s: %s\n' "${ADAPTER_NAME:-unknown}" "$_failure"
 	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-		printf '%s: no NITE decision was executed; see the job log for the failure\n' "${ADAPTER_NAME:-unknown}" >>"$GITHUB_STEP_SUMMARY"
+		printf '%s: %s\n' "${ADAPTER_NAME:-unknown}" "$_failure" >>"$GITHUB_STEP_SUMMARY"
+	fi
+	if [ -n "${NITE_REPORT_DIR:-}" ] && [ -f "${NITE_REPORT_DIR}/summary.md" ]; then
+		printf '\n%s\n' "$_failure" >>"${NITE_REPORT_DIR}/summary.md"
 	fi
 	exit 0
 }
 
 decide() {
 	DECIDE_DONE=0
+	DECISION_PERSISTED=0
 	trap decide_exit_trap EXIT HUP INT TERM
 
 	require_tools gh jq awk date mktemp sort head cut
@@ -194,7 +204,13 @@ decide() {
 	if ! list_labeled_issues "$CI_LABEL_NAME" "$INCIDENTS_FILE"; then
 		INCIDENT_READ=0
 	fi
-	_match_line=$(awk -F'\t' -v t="$TITLE" '$3 == t { print $1"\t"$2 }' "$INCIDENTS_FILE" | sort -t "$(printf '\t')" -k1,1rn | head -n1)
+	# An incident filed under the job's former name stays the incident of
+	# record, so renaming a job does not orphan it; new incidents use TITLE.
+	FORMER_TITLE=""
+	if [ -n "${FORMER_ADAPTER_NAME:-}" ]; then
+		FORMER_TITLE="Nightly integration failure: ${FORMER_ADAPTER_NAME}"
+	fi
+	_match_line=$(awk -F'\t' -v t="$TITLE" -v f="$FORMER_TITLE" '$3 == t || (f != "" && $3 == f) { print $1"\t"$2 }' "$INCIDENTS_FILE" | sort -t "$(printf '\t')" -k1,1rn | head -n1)
 	if [ -n "$_match_line" ]; then
 		INCIDENT_NUMBER=$(printf '%s' "$_match_line" | cut -f1)
 		INCIDENT_STATE=$(printf '%s' "$_match_line" | cut -f2)
@@ -239,6 +255,14 @@ decide() {
 	_body=$(printf '%s' "$_decision_json" | jq -r '.body')
 	_summary=$(printf '%s' "$_decision_json" | jq -r '.summary')
 	_annotation=$(printf '%s' "$_decision_json" | jq -r '.annotation')
+	printf '%s\n' "$_summary"
+	printf '%s\n' "$_summary" >>"$GITHUB_STEP_SUMMARY"
+	if [ -n "${NITE_REPORT_DIR:-}" ]; then
+		mkdir -p "$NITE_REPORT_DIR"
+		printf '%s\n' "$_decision_json" >"${NITE_REPORT_DIR}/decision.json"
+		printf '%s\n' "$_summary" >"${NITE_REPORT_DIR}/summary.md"
+	fi
+	DECISION_PERSISTED=1
 
 	if [ -n "$_annotation" ]; then
 		printf '%s\n' "$_annotation"
@@ -280,8 +304,6 @@ decide() {
 		return 1
 		;;
 	esac
-
-	printf '%s\n' "$_summary" >>"$GITHUB_STEP_SUMMARY"
 
 	DECIDE_DONE=1
 }

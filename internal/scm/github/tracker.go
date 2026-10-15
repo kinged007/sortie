@@ -6,14 +6,11 @@
 // Start with [NewGitHubAdapter] for tracker integration or
 // [NewGitHubCIProvider] for CI status queries.
 //
-// Unlike the Jira adapter, this adapter stores both activeStates and
-// terminalStates. Jira has native workflow states that the adapter
-// reads directly, so it needs only activeStates for candidate
-// filtering. GitHub has no native workflow states, only open and
-// closed, so the adapter must derive Sortie states entirely from
-// labels. This requires knowledge of both active and terminal state
-// sets for the label-state derivation fallback, FetchIssuesByStates
-// open/closed routing, and TransitionIssue close/reopen decisions.
+// GitHub has no native workflow states, only open and closed, so the
+// adapter derives Sortie states from labels through
+// [issuekit.LabelStateModel]. An open issue that carries no configured
+// state label reads no state and is never a candidate; a closed issue
+// reads a terminal state.
 package github
 
 import (
@@ -30,19 +27,17 @@ import (
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
-	"github.com/sortie-ai/sortie/internal/scm/githubapi"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 func init() {
 	registry.Trackers.RegisterWithMeta("github", NewGitHubAdapter, registry.TrackerMeta{
-		RequiresProject:       true,
-		RequiresAPIKey:        true,
-		ValidateTrackerConfig: validateConfig,
-		DefaultActiveStates:   defaultActiveStates,
-		DefaultTerminalStates: defaultTerminalStates,
-		BlockerSource:         registry.BlockersPerIssue,
+		RequiresProject:        true,
+		RequiresAPIKey:         true,
+		RequiresTerminalStates: true,
+		ValidateTrackerConfig:  validateConfig,
+		BlockerSource:          registry.BlockersPerIssue,
 	})
 }
 
@@ -54,25 +49,17 @@ var _ domain.TrackerAdapter = (*GitHubAdapter)(nil)
 // returns what it has.
 const maxPages = 200
 
-// defaultActiveStates is applied when the config omits active_states.
-var defaultActiveStates = issuekit.DefaultActiveLabelStates()
-
-// defaultTerminalStates is applied when the config omits terminal_states.
-var defaultTerminalStates = issuekit.DefaultTerminalLabelStates()
-
 // GitHubAdapter implements [domain.TrackerAdapter] against the GitHub
 // REST API. Safe for concurrent use.
 type GitHubAdapter struct {
-	client         *httpkit.Client
-	owner          string
-	repo           string
-	activeStates   []string
-	terminalStates []string
-	handoffState   string // normalized to lowercase; empty when not configured
-	queryFilter    string
-	metrics        domain.Metrics
-	etagCache      *etagCache
-	log            *slog.Logger
+	*issuekit.StateSource
+	client      *httpkit.Client
+	owner       string
+	repo        string
+	queryFilter string
+	metrics     domain.Metrics
+	etagCache   *etagCache
+	model       *issuekit.LabelStateModel
 }
 
 // NewGitHubAdapter creates a [GitHubAdapter] from adapter configuration.
@@ -82,9 +69,10 @@ type GitHubAdapter struct {
 // http or https URL with a host returns a [*domain.TrackerError] of kind
 // [domain.ErrTrackerPayload]), "active_states", "terminal_states",
 // "handoff_state" (single state name recognized as a valid transition
-// target and state label; normalized to lowercase),
-// "query_filter", "user_agent", "etag_cache_size" (int, default 1000;
-// set to 0 to disable ETag caching).
+// target and state label), "in_progress_state"; these set the initial
+// state vocabulary, with no default, until SetTrackerStates installs the
+// workflow's live one. Also optional: "query_filter", "user_agent",
+// "etag_cache_size" (int, default 1000; set to 0 to disable ETag caching).
 func NewGitHubAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	apiKey, fault := typeutil.StringField(config, "api_key")
 	if fault != nil {
@@ -128,29 +116,11 @@ func NewGitHubAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		}
 	}
 
-	activeRaw := typeutil.ExtractStringSlice(config["active_states"])
-	if len(activeRaw) == 0 {
-		activeRaw = defaultActiveStates
+	states, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
-	activeStates := make([]string, len(activeRaw))
-	for i, s := range activeRaw {
-		activeStates[i] = strings.ToLower(s)
-	}
-
-	terminalRaw := typeutil.ExtractStringSlice(config["terminal_states"])
-	if len(terminalRaw) == 0 {
-		terminalRaw = defaultTerminalStates
-	}
-	terminalStates := make([]string, len(terminalRaw))
-	for i, s := range terminalRaw {
-		terminalStates[i] = strings.ToLower(s)
-	}
-
-	handoffRaw, fault := typeutil.StringField(config, "handoff_state")
-	if fault != nil {
-		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
-	}
-	handoffState := strings.ToLower(strings.TrimSpace(handoffRaw))
+	source := issuekit.NewStateSource(states)
 
 	queryFilter, fault := typeutil.StringField(config, "query_filter")
 	if fault != nil {
@@ -180,49 +150,52 @@ func NewGitHubAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return &GitHubAdapter{
-		client:         githubapi.NewClient(endpoint, apiKey, userAgent),
-		owner:          owner,
-		repo:           repo,
-		activeStates:   activeStates,
-		terminalStates: terminalStates,
-		handoffState:   handoffState,
-		queryFilter:    queryFilter,
-		etagCache:      newETagCache(etagCacheSize),
-		log:            slog.Default(),
+		StateSource: source,
+		client:      newGitHubClient(endpoint, apiKey, userAgent),
+		owner:       owner,
+		repo:        repo,
+		queryFilter: queryFilter,
+		etagCache:   newETagCache(etagCacheSize),
+		model:       issuekit.NewLabelStateModel(source, slog.Default()),
 	}, nil
 }
 
-// FetchCandidateIssues returns issues in configured active states for
-// the configured repository. When queryFilter is empty, uses the
-// issues endpoint with client-side state filtering. When queryFilter
-// is set, routes through the search endpoint for server-side
-// filtering. Comments are set to nil on all returned issues.
+// FetchCandidateIssues returns the open issues that carry a label of a
+// configured active state for the configured repository, and none, with no
+// request, when no active state is configured. When queryFilter is empty,
+// uses the issues endpoint with client-side state filtering. When queryFilter
+// is set, routes through the search endpoint for server-side filtering.
+// Comments are set to nil on all returned issues.
 func (a *GitHubAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
+	states := a.model.Snapshot()
 	issues := make([]domain.Issue, 0)
+	if len(states.Active) == 0 {
+		return issues, nil
+	}
+
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
+		a.model.CheckActiveLabels(ctx, states, func(ctx context.Context) ([]string, error) {
+			return readRepositoryLabelNames(ctx, a.client, a.owner, a.repo)
+		})
+
 		var fetchErr error
 		if a.queryFilter != "" {
-			issues, fetchErr = a.fetchCandidatesViaSearch(ctx)
+			issues, fetchErr = a.fetchCandidatesViaSearch(ctx, states)
 			return fetchErr
 		}
-		issues, fetchErr = a.fetchCandidatesViaIssues(ctx)
+		issues, fetchErr = a.fetchCandidatesViaIssues(ctx, states)
 		return fetchErr
 	})
 	return issues, err
 }
 
-func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context) ([]domain.Issue, error) {
+func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues"
 	params := url.Values{
 		"state":     {"open"},
 		"sort":      {"created"},
 		"direction": {"asc"},
 		"per_page":  {"50"},
-	}
-
-	activeSet := make(map[string]struct{}, len(a.activeStates))
-	for _, s := range a.activeStates {
-		activeSet[s] = struct{}{}
 	}
 
 	paginator := httpkit.NewLinkPaginator(a.client, path, params, func(body []byte) ([]domain.Issue, error) {
@@ -240,11 +213,8 @@ func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context) ([]domain.
 			if isPullRequest(gi) {
 				continue
 			}
-			issue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+			issue := normalizeIssue(gi, a.model, states)
 			a.qualifyDisplayID(&issue)
-			if _, ok := activeSet[issue.State]; !ok {
-				continue
-			}
 			issue.Comments = nil
 			issues = append(issues, issue)
 		}
@@ -258,21 +228,20 @@ func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context) ([]domain.
 		},
 	})
 
-	return paginator.All(ctx)
+	open, err := paginator.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.model.Candidates(states, open), nil
 }
 
-func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domain.Issue, error) {
+func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
 	q := fmt.Sprintf("repo:%s/%s type:issue state:open %s", a.owner, a.repo, a.queryFilter)
 	params := url.Values{
 		"q":        {q},
 		"sort":     {"created"},
 		"order":    {"asc"},
 		"per_page": {"50"},
-	}
-
-	activeSet := make(map[string]struct{}, len(a.activeStates))
-	for _, s := range a.activeStates {
-		activeSet[s] = struct{}{}
 	}
 
 	paginator := httpkit.NewLinkPaginator(a.client, "/search/issues", params, func(body []byte) ([]domain.Issue, error) {
@@ -294,11 +263,8 @@ func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domain.
 			if isPullRequest(gi) {
 				continue
 			}
-			issue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+			issue := normalizeIssue(gi, a.model, states)
 			a.qualifyDisplayID(&issue)
-			if _, ok := activeSet[issue.State]; !ok {
-				continue
-			}
 			issue.Comments = nil
 			issues = append(issues, issue)
 		}
@@ -312,13 +278,18 @@ func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domain.
 		},
 	})
 
-	return paginator.All(ctx)
+	open, err := paginator.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.model.Candidates(states, open), nil
 }
 
 // FetchIssueByID returns a fully populated issue including comments,
 // blockers, and parent. The issueID is the issue number as a string.
 func (a *GitHubAdapter) FetchIssueByID(ctx context.Context, issueID string) (domain.Issue, error) {
 	var issue domain.Issue
+	states := a.model.Snapshot()
 	err := trackermetrics.Track(a.metrics, "fetch_issue", func() error {
 		basePath := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID)
 
@@ -349,10 +320,10 @@ func (a *GitHubAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 			}
 		}
 
-		fetchedIssue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+		fetchedIssue := normalizeIssue(gi, a.model, states)
 		a.qualifyDisplayID(&fetchedIssue)
 
-		fetchedIssue.BlockedBy, err = a.fetchBlockers(ctx, issueID)
+		fetchedIssue.BlockedBy, err = a.fetchBlockers(ctx, issueID, states)
 		if err != nil {
 			return err
 		}
@@ -378,15 +349,16 @@ func (a *GitHubAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 // forge's dependencies route.
 func (a *GitHubAdapter) FetchIssueBlockers(ctx context.Context, issueID string) ([]domain.BlockerRef, error) {
 	blockers := make([]domain.BlockerRef, 0)
+	states := a.model.Snapshot()
 	err := trackermetrics.Track(a.metrics, "fetch_blockers", func() error {
 		var fetchErr error
-		blockers, fetchErr = a.fetchBlockers(ctx, issueID)
+		blockers, fetchErr = a.fetchBlockers(ctx, issueID, states)
 		return fetchErr
 	})
 	return blockers, err
 }
 
-func (a *GitHubAdapter) fetchBlockers(ctx context.Context, issueID string) ([]domain.BlockerRef, error) {
+func (a *GitHubAdapter) fetchBlockers(ctx context.Context, issueID string, states issuekit.LabelStates) ([]domain.BlockerRef, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/dependencies/blocked_by"
 	params := url.Values{"per_page": {"50"}}
 
@@ -414,7 +386,7 @@ func (a *GitHubAdapter) fetchBlockers(ctx context.Context, issueID string) ([]do
 		return nil, err
 	}
 
-	return normalizeBlockers(blockers, a.activeStates, a.terminalStates, a.handoffState, a.owner, a.repo, a.log), nil
+	return normalizeBlockers(blockers, a.model, states, a.owner, a.repo), nil
 }
 
 func (a *GitHubAdapter) fetchParent(ctx context.Context, issueID string) (*domain.ParentRef, error) {
@@ -453,6 +425,7 @@ func (a *GitHubAdapter) FetchIssuesByStates(ctx context.Context, states []string
 		return []domain.Issue{}, nil
 	}
 
+	snapshot := a.model.Snapshot()
 	stateSet := make(map[string]struct{}, len(states))
 	for _, s := range states {
 		stateSet[strings.ToLower(s)] = struct{}{}
@@ -466,7 +439,7 @@ func (a *GitHubAdapter) FetchIssuesByStates(ctx context.Context, states []string
 	var requestedTerminal []string
 	needOpenFetch := false
 	for s := range stateSet {
-		if isTerminalState(s, a.terminalStates) {
+		if isTerminalState(s, snapshot.Terminal) {
 			requestedTerminal = append(requestedTerminal, s)
 		} else {
 			needOpenFetch = true
@@ -480,7 +453,7 @@ func (a *GitHubAdapter) FetchIssuesByStates(ctx context.Context, states []string
 		seen := make(map[string]struct{})
 
 		if needOpenFetch {
-			issues, err := a.fetchOpenIssuesByStates(ctx, stateSet, seen)
+			issues, err := a.fetchOpenIssuesByStates(ctx, stateSet, seen, snapshot)
 			if err != nil {
 				return err
 			}
@@ -492,7 +465,7 @@ func (a *GitHubAdapter) FetchIssuesByStates(ctx context.Context, states []string
 				return ctx.Err()
 			}
 
-			issues, err := a.fetchClosedIssuesByLabel(ctx, label, seen)
+			issues, err := a.fetchClosedIssuesByLabel(ctx, label, seen, snapshot)
 			if err != nil {
 				return err
 			}
@@ -505,7 +478,7 @@ func (a *GitHubAdapter) FetchIssuesByStates(ctx context.Context, states []string
 	return matched, err
 }
 
-func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet map[string]struct{}, seen map[string]struct{}) ([]domain.Issue, error) {
+func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet map[string]struct{}, seen map[string]struct{}, states issuekit.LabelStates) ([]domain.Issue, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues"
 	params := url.Values{
 		"state":     {"open"},
@@ -529,7 +502,7 @@ func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet ma
 			if isPullRequest(gi) {
 				continue
 			}
-			issue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+			issue := normalizeIssue(gi, a.model, states)
 			a.qualifyDisplayID(&issue)
 			if _, ok := stateSet[issue.State]; !ok {
 				continue
@@ -555,7 +528,7 @@ func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet ma
 	return paginator.All(ctx)
 }
 
-func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label string, seen map[string]struct{}) ([]domain.Issue, error) {
+func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label string, seen map[string]struct{}, states issuekit.LabelStates) ([]domain.Issue, error) {
 	q := fmt.Sprintf(`repo:%s/%s type:issue state:closed label:"%s"`, a.owner, a.repo, label)
 	params := url.Values{
 		"q":        {q},
@@ -583,7 +556,7 @@ func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label stri
 			if isPullRequest(gi) {
 				continue
 			}
-			issue := normalizeIssue(gi, a.activeStates, a.terminalStates, a.handoffState, a.log)
+			issue := normalizeIssue(gi, a.model, states)
 			a.qualifyDisplayID(&issue)
 			if _, dup := seen[issue.Identifier]; dup {
 				continue
@@ -643,6 +616,7 @@ func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []stri
 		return map[string]string{}, nil
 	}
 
+	snapshot := a.model.Snapshot()
 	states := make(map[string]string, len(numbers))
 	for _, num := range numbers {
 		if ctx.Err() != nil {
@@ -650,7 +624,7 @@ func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []stri
 		}
 
 		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(num)
-		etag, cachedState, cacheHit := a.etagCache.lookup(path)
+		etag, cachedLabels, cachedClosed, cacheHit := a.etagCache.lookup(path)
 
 		body, responseETag, notModified, err := a.client.GetConditional(ctx, path, etag, nil)
 		if err != nil {
@@ -662,7 +636,7 @@ func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []stri
 
 		if notModified && cacheHit {
 			a.etagCache.touch(path)
-			states[num] = cachedState
+			states[num] = a.model.Derive(snapshot, num, cachedLabels, cachedClosed)
 			continue
 		}
 
@@ -677,14 +651,14 @@ func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []stri
 		if isPullRequest(gi) {
 			continue
 		}
-		state := issuekit.DeriveLabelState(githubLabelNames(gi.Labels), gi.State, "open", "closed",
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState}, num, a.log)
+		labels := githubLabelNames(gi.Labels)
+		closed := isClosed(gi)
 
 		if responseETag != "" {
-			a.etagCache.put(path, responseETag, state)
+			a.etagCache.put(path, responseETag, labels, closed)
 		}
 
-		states[num] = state
+		states[num] = a.model.Derive(snapshot, num, labels, closed)
 	}
 
 	return states, nil
@@ -739,23 +713,14 @@ func (a *GitHubAdapter) fetchAllComments(ctx context.Context, issueNumber string
 	return normalizeComments(allComments), nil
 }
 
-// TransitionIssue moves an issue to the specified target state by
-// swapping the state label and updating the native open/closed status
-// as needed. Up to three sequential API calls: remove old label, add
-// new label, patch native state. Partial failures converge on retry
-// because individual label operations are idempotent.
+// TransitionIssue moves an issue to the specified target state. The target
+// label goes on first, the labels of other configured states come off, and
+// a close follows the label writes, so a failing write leaves the issue in
+// its starting state or the target and never in no state. Returns
+// [domain.ErrTrackerPayload] for a target outside the configured states and
+// for a handoff target on a closed issue.
 func (a *GitHubAdapter) TransitionIssue(ctx context.Context, issueID string, targetState string) error {
-	targetLower := strings.ToLower(targetState)
-
 	return trackermetrics.Track(a.metrics, "transition", func() error {
-		isHandoffTarget := a.handoffState != "" && targetLower == a.handoffState
-		if !isActiveState(targetLower, a.activeStates) && !isTerminalState(targetLower, a.terminalStates) && !isHandoffTarget {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: fmt.Sprintf("invalid target state: %q is not a configured active, terminal, or handoff state", targetState),
-			}
-		}
-
 		basePath := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID)
 
 		body, _, err := a.client.Get(ctx, basePath, nil)
@@ -772,80 +737,59 @@ func (a *GitHubAdapter) TransitionIssue(ctx context.Context, issueID string, tar
 			}
 		}
 
-		currentLabel := issuekit.CurrentLabelState(githubLabelNames(gi.Labels),
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState})
-		currentNative := gi.State
-
-		if currentLabel != "" && currentLabel != targetLower {
-			labelPath := basePath + "/labels/" + url.PathEscape(currentLabel)
-			err := a.client.SendNoBody(ctx, "DELETE", labelPath)
-			if err != nil && !domain.IsNotFound(err) {
-				return err
-			}
+		plan, err := a.model.Snapshot().PlanTransition(targetState, githubLabelNames(gi.Labels), isClosed(gi))
+		if err != nil {
+			return err
 		}
-
-		if currentLabel != targetLower {
-			payload, err := json.Marshal(map[string][]string{"labels": {targetLower}})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal label payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "POST", basePath+"/labels", bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		}
-
-		if isTerminalState(targetLower, a.terminalStates) && currentNative == "open" {
-			payload, err := json.Marshal(map[string]any{"state": "closed", "state_reason": "completed"})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal state payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", basePath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		} else if isActiveState(targetLower, a.activeStates) && currentNative == "closed" {
-			payload, err := json.Marshal(map[string]any{"state": "open"})
-			if err != nil {
-				return &domain.TrackerError{
-					Kind:    domain.ErrTrackerPayload,
-					Message: "failed to marshal state payload",
-					Err:     err,
-				}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", basePath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		}
-
-		return nil
+		return issuekit.ApplyTransition(ctx, plan, issuekit.TransitionOps{
+			Labels: a.labelOps(issueID),
+			SetClosed: func(ctx context.Context, closed bool) error {
+				return a.setIssueClosed(ctx, basePath, closed)
+			},
+		})
 	})
+}
+
+// setIssueClosed closes the issue as completed, or reopens it.
+func (a *GitHubAdapter) setIssueClosed(ctx context.Context, issuePath string, closed bool) error {
+	payload := `{"state":"open"}`
+	if closed {
+		payload = `{"state":"closed","state_reason":"completed"}`
+	}
+	_, err := a.client.Send(ctx, "PATCH", issuePath, strings.NewReader(payload))
+	return err
 }
 
 // CommentIssue posts a Markdown comment on the specified issue.
 // GitHub natively accepts Markdown, so no format conversion is needed.
 func (a *GitHubAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
-
-		payload, err := json.Marshal(map[string]string{"body": text})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal comment payload",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return a.postComment(ctx, issueID, text)
 	})
+}
+
+// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
+// code block, so the tracker shows literal verbatim.
+func (a *GitHubAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *GitHubAdapter) postComment(ctx context.Context, issueID, body string) error {
+	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
+
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal comment payload",
+			Err:     err,
+		}
+	}
+
+	_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
+	return err
 }
 
 // SetMetrics configures the metrics recorder for tracker API call
@@ -857,21 +801,25 @@ func (a *GitHubAdapter) SetMetrics(m domain.Metrics) {
 	a.metrics = m
 }
 
-// AddLabel adds a label to the specified issue via the GitHub Labels API.
+// AddLabel adds a label to the specified issue via the GitHub Labels API and
+// confirms it against the issue's labels. Returns [domain.ErrTrackerPayload]
+// when the label is blank or the issue does not carry it afterwards.
 func (a *GitHubAdapter) AddLabel(ctx context.Context, issueID string, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/labels"
-
-		payload, err := json.Marshal(map[string][]string{"labels": {label}})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal label payload",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
 	})
+}
+
+// RemoveLabel removes every label of the issue that names label, ignoring
+// letter case, and confirms the removal against the issue's labels. An issue
+// that carries none receives no write. Returns [domain.ErrTrackerPayload]
+// when the label is blank or the issue still carries it afterwards.
+func (a *GitHubAdapter) RemoveLabel(ctx context.Context, issueID string, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+func (a *GitHubAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	return githubIssueLabelOps(a.client, a.owner, a.repo, issueID)
 }

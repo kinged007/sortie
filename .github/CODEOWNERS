@@ -1,9 +1,11 @@
 # Default owners for everything
 * @sergeyklay @serghei-dev
 
-# Go dependency files - cicdbot can approve Dependabot PRs
+# Go/npm dependency files - cicdbot can approve Dependabot PRs
 /go.mod @cicdbot
 /go.sum @cicdbot
+/web/package.json
+/web/package-lock.json
 
 # GitHub Actions workflows - bot + human
 /.github/workflows/ @cicdbot @sergeyklay @serghei-dev

@@ -78,8 +78,9 @@ func AddNamed(source, name, value string) {
 }
 
 // AddURLCredentials registers the userinfo of value, a URL, and, when
-// that userinfo holds a colon, the part after its first colon. A value
-// holding no "://" contributes nothing.
+// that userinfo holds a colon, the parts before and after its first
+// colon: Go's URL errors print the username beside a "***" password.
+// A value holding no "://" contributes nothing.
 func AddURLCredentials(source, value string) {
 	if !strings.Contains(value, "://") {
 		return
@@ -93,8 +94,8 @@ func AddURLCredentials(source, value string) {
 		return
 	}
 	pieces := []string{userinfo}
-	if _, password, found := strings.Cut(userinfo, ":"); found {
-		pieces = append(pieces, password)
+	if username, password, found := strings.Cut(userinfo, ":"); found {
+		pieces = append(pieces, username, password)
 	}
 	addPieces(source, pieces, hasNonSpace(userinfo))
 }
@@ -226,6 +227,42 @@ func Mask(s string) string {
 		return s
 	}
 	return string(maskBytes([]byte(s), spans))
+}
+
+// MaskTruncated is [Mask] for an s cut at its end from a longer text.
+// It also removes the longest trailing fragment, of 1 to len-1 bytes,
+// that is a proper prefix of a registered value, because the cut may
+// have split such a value. The fragment is found in s before masking, so
+// a shorter value masked inside it cannot hide it.
+func MaskTruncated(s string) string {
+	values := loadRegistered()
+	if len(values) == 0 {
+		return s
+	}
+
+	cut := 0
+	for _, value := range values {
+		for n := min(len(value)-1, len(s)); n > cut; n-- {
+			if strings.HasSuffix(s, value[:n]) {
+				cut = n
+				break
+			}
+		}
+	}
+
+	// A complete value that starts before the fragment stays masked
+	// whole rather than losing its tail to the cut.
+	data := []byte(s)
+	end := len(data) - cut
+	var kept []matchSpan
+	for _, span := range findSpans(data, values) {
+		if span.start >= end {
+			break
+		}
+		kept = append(kept, span)
+		end = max(end, span.end)
+	}
+	return string(maskBytes(data[:end], kept))
 }
 
 // Truncate returns [Mask](s) when it holds at most maxRunes runes;

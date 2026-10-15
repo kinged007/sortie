@@ -22,6 +22,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
+	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
@@ -31,7 +32,6 @@ func init() {
 	registry.Trackers.RegisterWithMeta("jira", NewJiraAdapter, registry.TrackerMeta{
 		RequiresProject:       true,
 		RequiresAPIKey:        true,
-		DefaultActiveStates:   defaultActiveStates,
 		ValidateTrackerConfig: validateConfig,
 		BlockerSource:         registry.BlockersFromCandidates,
 	})
@@ -43,9 +43,6 @@ var _ domain.TrackerAdapter = (*JiraAdapter)(nil)
 // searchFields is the comma-separated list of Jira fields requested
 // in search and issue-detail operations.
 const searchFields = "summary,status,priority,labels,assignee,issuetype,parent,issuelinks,created,updated,description"
-
-// defaultActiveStates is applied when the config omits active_states.
-var defaultActiveStates = []string{"Backlog", "Selected for Development", "In Progress"}
 
 // maxSearchResults is the page size for cursor-based search pagination.
 const maxSearchResults = "50"
@@ -61,21 +58,20 @@ const batchSize = 40
 // Jira. The selected API version and the base path derived from it are
 // immutable after construction. Safe for concurrent use.
 type JiraAdapter struct {
-	client       *httpkit.Client
-	project      string
-	activeStates []string
-	endpoint     string
-	queryFilter  string
-	apiVersion   string
-	basePath     string
-	metrics      domain.Metrics // nil-safe: check before calling
+	*issuekit.StateSource
+	client      *httpkit.Client
+	project     string
+	endpoint    string
+	queryFilter string
+	apiVersion  string
+	basePath    string
+	metrics     domain.Metrics // nil-safe: check before calling
 }
 
 // NewJiraAdapter creates a [JiraAdapter] from adapter configuration.
 // Required config keys: "endpoint", "api_key", "project". Optional:
-// "active_states" (defaults to Backlog, Selected for Development, In
-// Progress), "query_filter" (raw JQL fragment), "api_version" ("2" or
-// "3", default "3").
+// "active_states" (an empty list dispatches nothing), "query_filter"
+// (raw JQL fragment), "api_version" ("2" or "3", default "3").
 //
 // On version "3" the api_key must be email:token and authenticates
 // with Basic. On version "2" a colon-free api_key is a Personal Access
@@ -138,9 +134,9 @@ func NewJiraAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		}
 	}
 
-	activeStates := typeutil.ExtractStringSlice(config["active_states"])
-	if len(activeStates) == 0 {
-		activeStates = defaultActiveStates
+	states, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	queryFilter, fault := typeutil.StringField(config, "query_filter")
@@ -157,13 +153,13 @@ func NewJiraAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return &JiraAdapter{
-		client:       newJiraClient(endpoint, authHeader, userAgent),
-		project:      project,
-		activeStates: activeStates,
-		endpoint:     endpoint,
-		queryFilter:  queryFilter,
-		apiVersion:   apiVersion,
-		basePath:     basePath(apiVersion),
+		StateSource: issuekit.NewStateSource(states),
+		client:      newJiraClient(endpoint, authHeader, userAgent),
+		project:     project,
+		endpoint:    endpoint,
+		queryFilter: queryFilter,
+		apiVersion:  apiVersion,
+		basePath:    basePath(apiVersion),
 	}, nil
 }
 
@@ -331,12 +327,18 @@ func isLocalEndpoint(host string) bool {
 
 // FetchCandidateIssues returns issues in configured active states
 // for the configured project. Comments are set to nil on all returned
-// issues. Results are ordered by priority then creation time.
+// issues. Results are ordered by priority then creation time. An empty
+// active list returns no issue and sends no request.
 func (a *JiraAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
+	active := a.TrackerStates().Active
+	if len(active) == 0 {
+		return []domain.Issue{}, nil
+	}
+
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
 		var fetchErr error
-		jql := buildCandidateJQL(a.project, a.activeStates, a.queryFilter)
+		jql := buildCandidateJQL(a.project, active, a.queryFilter)
 		issues, fetchErr = a.paginatedSearch(ctx, jql, searchFields)
 		return fetchErr
 	})
@@ -551,21 +553,36 @@ func (a *JiraAdapter) TransitionIssue(ctx context.Context, issueID string, targe
 // version "2" the text is sent verbatim as a raw wiki-markup body.
 func (a *JiraAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		path := a.basePath + "/issue/" + url.PathEscape(issueID) + "/comment"
-
-		body := commentPayload(a.apiVersion, text)
-		payload, err := json.Marshal(body)
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal comment request",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return a.postComment(ctx, issueID, commentPayload(a.apiVersion, text))
 	})
+}
+
+// CommentIssueWithLiteral posts text followed by literal as a literal
+// block. On version "3" the block is an ADF codeBlock node holding one
+// text node. On version "2" it is a {noformat} block whose content has
+// a zero-width space inserted after every brace that starts a
+// case-insensitive "noformat", so the content cannot close the block,
+// and after every bracket that opens a [~user] mention.
+func (a *JiraAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, literalCommentPayload(a.apiVersion, text, literal))
+	})
+}
+
+func (a *JiraAdapter) postComment(ctx context.Context, issueID string, body any) error {
+	path := a.basePath + "/issue/" + url.PathEscape(issueID) + "/comment"
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal comment request",
+			Err:     err,
+		}
+	}
+
+	_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
+	return err
 }
 
 // commentPayload builds the comment-create request body for the given
@@ -579,6 +596,35 @@ func commentPayload(apiVersion, text string) any {
 	return buildADFComment(text)
 }
 
+// literalCommentPayload is [commentPayload] for a comment that ends in a
+// literal block.
+func literalCommentPayload(apiVersion, text, literal string) any {
+	if apiVersion == "2" {
+		return map[string]any{"body": text + "\n\n{noformat}\n" + inertNoformatContent(literal) + "\n{noformat}"}
+	}
+	return buildADFLiteralComment(text, literal)
+}
+
+// inertNoformatContent inserts a zero-width space after every brace that
+// starts the word noformat, in any letter case, so wiki markup inside the
+// block cannot terminate it. It also inserts one after every bracket that
+// opens a [~user] mention, because Jira Server parses mentions inside a
+// {noformat} block and would notify that user.
+func inertNoformatContent(literal string) string {
+	const word = "noformat"
+	var out strings.Builder
+	for i := 0; i < len(literal); i++ {
+		out.WriteByte(literal[i])
+		rest := literal[i+1:]
+		switch {
+		case literal[i] == '{' && len(rest) >= len(word) && strings.EqualFold(rest[:len(word)], word),
+			literal[i] == '[' && strings.HasPrefix(rest, "~"):
+			out.WriteString("\u200b")
+		}
+	}
+	return out.String()
+}
+
 // SetMetrics configures the metrics recorder for tracker API call
 // instrumentation. When not called or called with nil, the adapter
 // operates without recording metrics. Safe to call before any
@@ -588,31 +634,86 @@ func (a *JiraAdapter) SetMetrics(m domain.Metrics) {
 	a.metrics = m
 }
 
-// AddLabel adds a label to the specified issue via the Jira REST API.
-// Returns an error if the request fails; the orchestrator treats AddLabel
-// errors as non-fatal.
+// AddLabel adds a label to the specified issue and confirms it with a
+// read of the issue. Returns [domain.ErrTrackerPayload] when the label is
+// blank or the issue does not carry it afterwards.
 func (a *JiraAdapter) AddLabel(ctx context.Context, issueID string, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		path := a.basePath + "/issue/" + url.PathEscape(issueID)
-
-		payload, err := json.Marshal(map[string]any{
-			"update": map[string]any{
-				"labels": []map[string]any{
-					{"add": label},
-				},
-			},
-		})
-		if err != nil {
-			return &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to marshal label payload",
-				Err:     err,
-			}
-		}
-
-		_, err = a.client.Send(ctx, "PUT", path, bytes.NewReader(payload))
-		return err
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
 	})
+}
+
+// RemoveLabel removes every label of the issue that names label, ignoring
+// letter case, and confirms the removal with a read of the issue. An issue
+// that carries none receives no write. Returns [domain.ErrTrackerPayload]
+// when the label is blank or the issue still carries it afterwards.
+func (a *JiraAdapter) RemoveLabel(ctx context.Context, issueID string, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+// labelOps returns the Jira calls behind the shared label drivers. Jira
+// answers a label edit with an empty body, so neither write reports the
+// label set and every outcome is confirmed by a read.
+func (a *JiraAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	path := a.basePath + "/issue/" + url.PathEscape(issueID)
+	return issuekit.IssueLabelOps{
+		Read: func(ctx context.Context) ([]issuekit.IssueLabel, error) {
+			return a.readLabels(ctx, path)
+		},
+		Add: func(ctx context.Context, label string) (issuekit.LabelWrite, error) {
+			return issuekit.LabelWrite{}, a.editLabels(ctx, path, []map[string]any{{"add": label}})
+		},
+		Remove: func(ctx context.Context, labels []issuekit.IssueLabel) (issuekit.LabelWrite, error) {
+			edits := make([]map[string]any, len(labels))
+			for i, l := range labels {
+				edits[i] = map[string]any{"remove": l.Name}
+			}
+			return issuekit.LabelWrite{}, a.editLabels(ctx, path, edits)
+		},
+	}
+}
+
+func (a *JiraAdapter) readLabels(ctx context.Context, path string) ([]issuekit.IssueLabel, error) {
+	body, _, err := a.client.Get(ctx, path, url.Values{"fields": {"labels"}})
+	if err != nil {
+		return nil, err
+	}
+
+	var ji jiraIssue
+	if err := json.Unmarshal(body, &ji); err != nil {
+		return nil, &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to parse issue labels response",
+			Err:     err,
+		}
+	}
+
+	labels := make([]issuekit.IssueLabel, len(ji.Fields.Labels))
+	for i, name := range ji.Fields.Labels {
+		labels[i] = issuekit.IssueLabel{Name: name}
+	}
+	return labels, nil
+}
+
+// editLabels sends one delta edit of the issue's labels. The replace form
+// fields.labels is never used, because it drops a label a person adds
+// between the read and the write.
+func (a *JiraAdapter) editLabels(ctx context.Context, path string, edits []map[string]any) error {
+	payload, err := json.Marshal(map[string]any{
+		"update": map[string]any{"labels": edits},
+	})
+	if err != nil {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to marshal label payload",
+			Err:     err,
+		}
+	}
+
+	_, err = a.client.Send(ctx, "PUT", path, bytes.NewReader(payload))
+	return err
 }
 
 // paginatedSearch executes a paginated JQL search and returns all

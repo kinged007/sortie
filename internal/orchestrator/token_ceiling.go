@@ -42,14 +42,13 @@ type issueTokenStore interface {
 	TokenUsageByIssue(ctx context.Context, issueID string) (persistence.IssueTokenUsage, error)
 }
 
-// freezeIssueTokenBaseline reads the issue's completed-session token sum
-// onto the running entry so [enforceInFlightTokenCeiling]'s pre-filter has
-// a baseline from the first usage event onward. Must run on the
-// single-writer event loop, after entry.UsageArrival has been assigned.
+// freezeIssueTokenBaseline reads the issue's completed-session usage onto
+// the running entry, so [enforceInFlightTokenCeiling]'s pre-filter has a
+// baseline from the first usage event onward and the entry serves the issue's
+// spend whether or not a ceiling is set. Without a ceiling a failed read
+// emits nothing. Must run on the single-writer event loop, after
+// entry.UsageArrival has been assigned.
 func freezeIssueTokenBaseline(ctx context.Context, state *State, issueID string, store issueTokenStore, logger *slog.Logger) {
-	if state.MaxTokens <= 0 {
-		return
-	}
 	entry, ok := state.Running[issueID]
 	if !ok {
 		return
@@ -57,33 +56,41 @@ func freezeIssueTokenBaseline(ctx context.Context, state *State, issueID string,
 	log := issueTokenCeilingLogger(logger, issueID, entry)
 	usage, err := store.TokenUsageByIssue(ctx, issueID)
 
-	// A run whose arrival reports no figure is unbounded whatever the
-	// baseline read did, so a failed read rides on that record rather than
-	// claiming the ceiling bounds this session.
-	switch {
-	case !entry.UsageArrival.ReportsAnyFigure():
-		attrs := []any{
-			slog.String("agent_kind", entry.AgentKind),
-			slog.String("usage_arrival", string(entry.UsageArrival)),
-			slog.Int("budget_tokens", state.MaxTokens),
-		}
-		if err != nil {
-			attrs = append(attrs, slog.Any("error", err))
-		}
-		log.Warn("token ceiling cannot bound this run", attrs...)
-	case err != nil:
-		log.Warn("prior token spend unknown, token ceiling bounds this session only",
-			slog.Any("error", err),
-			slog.Int("budget_tokens", state.MaxTokens),
-		)
+	if state.MaxTokens > 0 {
+		warnCeilingUnboundAtDispatch(log, state.MaxTokens, entry, err)
 	}
 
 	if err != nil {
 		return
 	}
 	entry.IssueTokensCompleted = usage.TotalTokens
+	entry.IssueUsage = &usage
 	if entry.UsageArrival.ReportsAnyFigure() {
 		reachTokenWarning(state, issueID, entry, logger)
+	}
+}
+
+// warnCeilingUnboundAtDispatch records what the ceiling cannot bound at dispatch. A run
+// whose arrival reports no figure is unbounded whatever the baseline read
+// did, so a failed read rides on that record rather than claiming the
+// ceiling bounds this session.
+func warnCeilingUnboundAtDispatch(log *slog.Logger, budgetTokens int, entry *RunningEntry, readErr error) {
+	switch {
+	case !entry.UsageArrival.ReportsAnyFigure():
+		attrs := []any{
+			slog.String("agent_kind", entry.AgentKind),
+			slog.String("usage_arrival", string(entry.UsageArrival)),
+			slog.Int("budget_tokens", budgetTokens),
+		}
+		if readErr != nil {
+			attrs = append(attrs, slog.Any("error", readErr))
+		}
+		log.Warn("token ceiling cannot bound this run", attrs...)
+	case readErr != nil:
+		log.Warn("prior token spend unknown, token ceiling bounds this session only",
+			slog.Any("error", readErr),
+			slog.Int("budget_tokens", budgetTokens),
+		)
 	}
 }
 
@@ -135,6 +142,7 @@ func enforceInFlightTokenCeiling(ctx context.Context, state *State, issueID stri
 		return
 	}
 	entry.IssueTokensCompleted = usage.TotalTokens
+	entry.IssueUsage = &usage
 	if entry.IssueTokensCompleted+entry.AgentTotalTokens < int64(ceiling) {
 		return
 	}

@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
@@ -821,11 +824,6 @@ func TestValidateErrorAndWarningsTogether(t *testing.T) {
 	}
 }
 
-// dotContextWorkflow returns a workflow whose prompt triggers WarnDotContext:
-// .issue.title referenced inside {{ range }} where dot is the element.
-
-// dotContextWorkflow returns a workflow whose prompt triggers WarnDotContext:
-// .issue.title referenced inside {{ range }} where dot is the element.
 func dotContextWorkflow() []byte {
 	return []byte(`---
 tracker:
@@ -841,11 +839,6 @@ agent:
 `)
 }
 
-// unknownVarWorkflow returns a workflow whose prompt triggers WarnUnknownVar:
-// .config is not in the template data contract.
-
-// unknownVarWorkflow returns a workflow whose prompt triggers WarnUnknownVar:
-// .config is not in the template data contract.
 func unknownVarWorkflow() []byte {
 	return []byte(`---
 tracker:
@@ -861,11 +854,6 @@ agent:
 `)
 }
 
-// unknownFieldWorkflow returns a workflow whose prompt triggers WarnUnknownField:
-// .run.nonexistent is not a valid sub-field of run.
-
-// unknownFieldWorkflow returns a workflow whose prompt triggers WarnUnknownField:
-// .run.nonexistent is not a valid sub-field of run.
 func unknownFieldWorkflow() []byte {
 	return []byte(`---
 tracker:
@@ -904,191 +892,38 @@ agent:
 // TestValidateTemplateDotContextText verifies that a dot-context misuse
 // produces exit 0, empty stdout, and a "dot_context" warning on stderr.
 
-// TestValidateTemplateDotContextText verifies that a dot-context misuse
-// produces exit 0, empty stdout, and a "dot_context" warning on stderr.
-func TestValidateTemplateDotContextText(t *testing.T) {
+func TestValidateTemplateWarnings(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, dotContextWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
-	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty (text mode, warnings only)", stdout.String())
-	}
-	got := stderr.String()
-	if !strings.Contains(got, "warning:") {
-		t.Errorf("stderr = %q, want to contain %q", got, "warning:")
-	}
-	if !strings.Contains(got, "dot_context") {
-		t.Errorf("stderr = %q, want to contain %q", got, "dot_context")
-	}
-}
-
-// TestValidateTemplateDotContextJSON verifies that a dot-context misuse
-// produces valid=true, empty errors, and a warning with check="dot_context"
-// in JSON output.
-
-// TestValidateTemplateDotContextJSON verifies that a dot-context misuse
-// produces valid=true, empty errors, and a warning with check="dot_context"
-// in JSON output.
-func TestValidateTemplateDotContextJSON(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, dotContextWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate --format json) = %d, want 0; stderr: %s", code, stderr.String())
+	tests := []struct {
+		name     string
+		workflow []byte
+		check    string
+	}{
+		{"dot context", dotContextWorkflow(), "dot_context"},
+		{"unknown var", unknownVarWorkflow(), "unknown_var"},
+		{"unknown field", unknownFieldWorkflow(), "unknown_field"},
 	}
 
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
-	}
-	if !out.Valid {
-		t.Errorf("validateOutput.Valid = false, want true")
-	}
-	if len(out.Errors) != 0 {
-		t.Errorf("validateOutput.Errors = %v, want empty", out.Errors)
-	}
-	found := false
-	for _, w := range out.Warnings {
-		if w.Check == "dot_context" {
-			found = true
-			if w.Severity != "warning" {
-				t.Errorf("warnings[dot_context].Severity = %q, want %q", w.Severity, "warning")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			wfPath := writeCustomWorkflowFile(t, t.TempDir(), tt.workflow)
+
+			code, out := runValidateJSON(t, wfPath)
+			textCode, stderr := runValidateWorkflow(t, tt.workflow)
+
+			if code != 0 || !out.Valid || len(out.Errors) != 0 {
+				t.Errorf("validate --format json = exit %d, valid %v, errors %v, want exit 0, valid true, no errors", code, out.Valid, out.Errors)
 			}
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Warnings = %v, want at least one entry with check=%q", out.Warnings, "dot_context")
-	}
-}
-
-// TestValidateTemplateUnknownVarText verifies that an unknown top-level
-// variable produces exit 0 and an "unknown_var" warning on stderr.
-
-// TestValidateTemplateUnknownVarText verifies that an unknown top-level
-// variable produces exit 0 and an "unknown_var" warning on stderr.
-func TestValidateTemplateUnknownVarText(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, unknownVarWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
-	}
-	got := stderr.String()
-	if !strings.Contains(got, "warning:") {
-		t.Errorf("stderr = %q, want to contain %q", got, "warning:")
-	}
-	if !strings.Contains(got, "unknown_var") {
-		t.Errorf("stderr = %q, want to contain %q", got, "unknown_var")
-	}
-}
-
-// TestValidateTemplateUnknownVarJSON verifies that an unknown top-level
-// variable produces valid=true and a warning with check="unknown_var" in JSON.
-
-// TestValidateTemplateUnknownVarJSON verifies that an unknown top-level
-// variable produces valid=true and a warning with check="unknown_var" in JSON.
-func TestValidateTemplateUnknownVarJSON(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, unknownVarWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate --format json) = %d, want 0; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
-	}
-	if !out.Valid {
-		t.Errorf("validateOutput.Valid = false, want true")
-	}
-	found := false
-	for _, w := range out.Warnings {
-		if w.Check == "unknown_var" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Warnings = %v, want at least one entry with check=%q", out.Warnings, "unknown_var")
-	}
-}
-
-// TestValidateTemplateUnknownFieldText verifies that an unknown sub-field
-// produces exit 0 and an "unknown_field" warning on stderr.
-
-// TestValidateTemplateUnknownFieldText verifies that an unknown sub-field
-// produces exit 0 and an "unknown_field" warning on stderr.
-func TestValidateTemplateUnknownFieldText(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, unknownFieldWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
-	}
-	got := stderr.String()
-	if !strings.Contains(got, "warning:") {
-		t.Errorf("stderr = %q, want to contain %q", got, "warning:")
-	}
-	if !strings.Contains(got, "unknown_field") {
-		t.Errorf("stderr = %q, want to contain %q", got, "unknown_field")
-	}
-}
-
-// TestValidateTemplateUnknownFieldJSON verifies that an unknown sub-field
-// produces valid=true and a warning with check="unknown_field" in JSON.
-
-// TestValidateTemplateUnknownFieldJSON verifies that an unknown sub-field
-// produces valid=true and a warning with check="unknown_field" in JSON.
-func TestValidateTemplateUnknownFieldJSON(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, unknownFieldWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run(validate --format json) = %d, want 0; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
-	}
-	if !out.Valid {
-		t.Errorf("validateOutput.Valid = false, want true")
-	}
-	found := false
-	for _, w := range out.Warnings {
-		if w.Check == "unknown_field" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Warnings = %v, want at least one entry with check=%q", out.Warnings, "unknown_field")
+			if !slices.ContainsFunc(out.Warnings, func(d validateDiag) bool { return d.Check == tt.check && d.Severity == "warning" }) {
+				t.Errorf("validateOutput.Warnings = %v, want a warning with check %q", out.Warnings, tt.check)
+			}
+			if textCode != 0 || !strings.Contains(stderr, "warning:") || !strings.Contains(stderr, tt.check) {
+				t.Errorf("validate = exit %d, stderr %q, want exit 0 and a %q warning", textCode, stderr, tt.check)
+			}
+		})
 	}
 }
 
@@ -1196,11 +1031,6 @@ agent:
 `)
 }
 
-// TestValidateTemplateContinuationKeysCleanJSON verifies that sortie
-// validate reports no unknown_var, unknown_field, or dot_context warning
-// for any of the six reaction continuation keys or their documented
-// fields, while an unrelated unrecognized name still produces exactly one
-// unknown_var warning naming the full enumerated set of recognized names.
 func TestValidateTemplateContinuationKeysCleanJSON(t *testing.T) {
 	t.Parallel()
 
@@ -1221,8 +1051,6 @@ func TestValidateTemplateContinuationKeysCleanJSON(t *testing.T) {
 		t.Errorf("validateOutput.Valid = false, want true")
 	}
 
-	const wantMessage = `unknown template variable ".not_a_reaction"; valid top-level variables are: .issue, .attempt, .run, .ci_failure, .review_comments, .bot_review_comments, .merge_conflict, .label_review, .label_fix`
-
 	var unknownVarWarnings []validateDiag
 	for _, w := range out.Warnings {
 		switch w.Check {
@@ -1240,8 +1068,8 @@ func TestValidateTemplateContinuationKeysCleanJSON(t *testing.T) {
 	if !strings.Contains(got.Message, ".not_a_reaction") {
 		t.Errorf("unknown_var warning message = %q, want to contain %q", got.Message, ".not_a_reaction")
 	}
-	if got.Message != wantMessage {
-		t.Errorf("unknown_var warning message = %q, want %q", got.Message, wantMessage)
+	if !strings.HasPrefix(got.Message, wfPath+" (line ") {
+		t.Errorf("unknown_var warning message = %q, want prefix %q", got.Message, wfPath+" (line ")
 	}
 }
 
@@ -1734,76 +1562,6 @@ func TestValidateAgentConfigOfflineVerdict_CopilotToolScoping(t *testing.T) {
 	}
 }
 
-// kiroUntrustedToolsWorkflow returns a workflow selecting the kiro agent
-// with a trust_tools allowlist and no trust_all_tools, which resolves to a
-// trust posture short of full trust, used to trigger the agent-side
-// offline verdict without constructing any adapter.
-func kiroUntrustedToolsWorkflow() []byte {
-	return []byte(`---
-polling:
-  interval_ms: 30000
-tracker:
-  kind: file
-  active_states:
-    - To Do
-  terminal_states:
-    - Done
-agent:
-  kind: kiro
-  command: /usr/bin/true
-kiro:
-  trust_tools:
-    - read
-file:
-  path: issues.json
----
-Do {{ .issue.title }}.
-`)
-}
-
-// TestValidateAgentConfigOfflineVerdict_KiroUntrustedTools drives the
-// offline sortie validate path against a workflow whose kiro configuration
-// resolves to a trust posture short of full trust, asserting valid: false,
-// exit code 1, and the check name kiro.trust_tools.untrusted, without
-// constructing any adapter (the offline path never calls a constructor).
-// This exercises the same verdict channel established for codex,
-// confirming kiro's validator is wired into agent registration and its
-// diagnostic actually reaches sortie validate, not only validateConfig
-// called directly.
-func TestValidateAgentConfigOfflineVerdict_KiroUntrustedTools(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, kiroUntrustedToolsWorkflow())
-
-	var stdout, stderr bytes.Buffer
-	ctx := context.Background()
-
-	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("run(validate --format json) = %d, want 1; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-	}
-	if out.Valid {
-		t.Errorf("validateOutput.Valid = true, want false")
-	}
-
-	foundErr := false
-	for _, e := range out.Errors {
-		if e.Check == "kiro.trust_tools.untrusted" {
-			foundErr = true
-			break
-		}
-	}
-	if !foundErr {
-		t.Errorf("validateOutput.Errors = %v, want entry with check %q", out.Errors, "kiro.trust_tools.untrusted")
-	}
-}
-
 // opencodeToolOverlapWorkflow returns a workflow selecting the opencode
 // agent with allowed_tools and denied_tools naming the same tool, used to
 // trigger the agent-side offline verdict without constructing any
@@ -1874,6 +1632,130 @@ func TestValidateAgentConfigOfflineVerdict_OpenCodeToolOverlap(t *testing.T) {
 	}
 	if !foundErr {
 		t.Errorf("validateOutput.Errors = %v, want entry with check %q", out.Errors, "opencode.allowed_tools.overlap")
+	}
+}
+
+func effortWorkflow(kind, effortBlock string) []byte {
+	agentBlock := "agent:\n  kind: " + kind + "\n"
+	if kind != "mock" {
+		agentBlock += "  command: /usr/bin/true\n"
+	}
+	return []byte("---\n" +
+		"polling:\n  interval_ms: 30000\n" +
+		"tracker:\n  kind: file\n  active_states:\n    - To Do\n  terminal_states:\n    - Done\n" +
+		agentBlock +
+		effortBlock +
+		"file:\n  path: issues.json\n" +
+		"---\nDo {{ .issue.title }}.\n")
+}
+
+func validateEffortJSON(t *testing.T, content []byte) (int, validateOutput) {
+	t.Helper()
+
+	wfPath := writeCustomWorkflowFile(t, t.TempDir(), content)
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
+
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v; stderr: %s", stdout.String(), err, stderr.String())
+	}
+	return code, out
+}
+
+func TestValidateEffortNotForwarded(t *testing.T) {
+	t.Parallel()
+
+	const wantCheck = "agent.effort.not_forwarded"
+
+	tests := []struct {
+		name        string
+		kind        string
+		effortBlock string
+		wantWarning bool
+	}{
+		{name: "agent-client-protocol with effort", kind: "agent-client-protocol", effortBlock: "agent-client-protocol:\n  " + registry.EffortKey + ": high\n", wantWarning: true},
+		{name: "mock with effort", kind: "mock", effortBlock: "mock:\n  " + registry.EffortKey + ": high\n", wantWarning: true},
+		{name: "claude-code with effort forwards it", kind: "claude-code", effortBlock: "claude-code:\n  " + registry.EffortKey + ": high\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			wantCode, _ := validateEffortJSON(t, effortWorkflow(tt.kind, ""))
+
+			code, out := validateEffortJSON(t, effortWorkflow(tt.kind, tt.effortBlock))
+
+			if code != wantCode {
+				t.Errorf("run(validate) with effort = %d, want %d, the code without the key", code, wantCode)
+			}
+			var got *validateDiag
+			for i := range out.Warnings {
+				if out.Warnings[i].Check == wantCheck {
+					got = &out.Warnings[i]
+				}
+			}
+			if !tt.wantWarning {
+				if got != nil {
+					t.Errorf("validateOutput.Warnings = %+v, want no %q", out.Warnings, wantCheck)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("validateOutput.Warnings = %+v, want a warning under %q", out.Warnings, wantCheck)
+			}
+			if got.Severity != "warning" {
+				t.Errorf("warning Severity = %q, want %q", got.Severity, "warning")
+			}
+		})
+	}
+}
+
+func TestValidateEffortNotForwardedText(t *testing.T) {
+	t.Parallel()
+
+	wfPath := writeCustomWorkflowFile(t, t.TempDir(), effortWorkflow("agent-client-protocol", "agent-client-protocol:\n  "+registry.EffortKey+": high\n"))
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "warning:") || !strings.Contains(stderr.String(), "agent.effort.not_forwarded") {
+		t.Errorf("stderr = %q, want a warning naming %q", stderr.String(), "agent.effort.not_forwarded")
+	}
+}
+
+var registerDeprecatedOrderFixture = sync.OnceFunc(func() {
+	registry.Agents.RegisterWithMeta("deprecated-order-fixture",
+		func() (domain.AgentAdapter, error) {
+			return nil, errors.New("fixture kind is never constructed")
+		},
+		registry.AgentMeta{Deprecation: &registry.AgentDeprecation{Replacement: "mock"}})
+})
+
+func TestWorkflowAdvisories_EffortAdvisoryBetweenDeprecationsAndTokenRates(t *testing.T) {
+	t.Parallel()
+
+	registerDeprecatedOrderFixture()
+	cfg := config.ServiceConfig{
+		Agent:    config.AgentConfig{Kind: "deprecated-order-fixture"},
+		Dispatch: config.DispatchConfig{Default: config.DispatchSelection{AgentKind: "mock"}},
+	}
+	cfg.SetExtensionSection("mock", map[string]any{registry.EffortKey: "high"})
+	cfg.SetExtensionSection("token_rates", map[string]any{"claude-code": map[string]any{"output_per_mtok": 15}})
+
+	var got []string
+	for _, advisory := range workflowAdvisories(cfg) {
+		got = append(got, advisory.Check)
+	}
+
+	want := []string{"agent.kind.deprecated", "agent.effort.not_forwarded", "token_rates"}
+	if !slices.Equal(got, want) {
+		t.Errorf("workflowAdvisories(...) checks = %v, want %v", got, want)
 	}
 }
 
@@ -1950,7 +1832,7 @@ func TestValidateAgentConfigOfflineVerdict_ClaudeCodePermissionMode(t *testing.T
 // diagnostic must match exactly for kind "claude-code" and key
 // "session_persistence".
 const wantSessionResumeMessage = "claude-code.session_persistence stops this agent kind from resuming a session across separate agent launches, " +
-	"but Sortie re-dispatches an issue with its earlier session after a retry, a continuation, a stall, or a restart, " +
+	"but Sortie resumes an issue's earlier session on a continuation, including one queued before a restart, and on the retry after a stall while Sortie keeps running, " +
 	"and every such turn fails. Change claude-code.session_persistence, or use an agent kind that can resume a session."
 
 // claudeCodeSessionResumeWorkflow returns a workflow selecting the
@@ -2336,157 +2218,71 @@ func TestValidateDispatch_UnreachableRule(t *testing.T) {
 	}
 }
 
-func TestValidateDispatch_AbsoluteTemplatePath(t *testing.T) {
+func TestValidateTemplateAndPartialFaults(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	wfPath := makeDispatchWorkflow(t, dir, `dispatch:
-  rules:
-    - name: abs-rule
-      match:
-        labels: ["bug"]
-      template: /etc/hosts
-`)
-
-	var stdout, stderr bytes.Buffer
-	ctx := context.Background()
-
-	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
+	rule := func(template string) string {
+		return "  rules:\n    - name: r\n      match:\n        labels: [\"bug\"]\n      template: " + template + "\n"
+	}
+	partials := "  partials: [\"p/*.md\"]\n"
+	tests := []struct {
+		name      string
+		dispatch  string
+		files     map[string]string
+		wantCheck string
+		wantWarn  map[string]string
+	}{
+		{"rule template absolute path", rule("/etc/hosts"), nil, "config.dispatch.rules[0].template", nil},
+		{"rule template tilde path", rule("~/templates/custom.md"), nil, "config.dispatch.rules[0].template", nil},
+		{"rule template missing file", rule("nonexistent/file.md"), nil, "config.dispatch.rules[0].template", nil},
+		{"rule template front matter", rule("r.md"), map[string]string{"r.md": "---\nkey: value\n---\nBody."}, "template_parse", nil},
+		{"rule template undefined call", rule("r.md"), map[string]string{"r.md": `{{ template "nope" . }}`}, "template_parse", nil},
+		{"partial absolute path", "  partials: [\"/etc/hosts\"]\n", nil, "config.dispatch.partials[0]", nil},
+		{"partial syntax error", partials, map[string]string{"p/a.md": `{{ define "a" }}{{ if }}{{ end }}`}, "template_parse", nil},
+		{"partial name defined twice", partials, map[string]string{"p/a.md": `{{ define "x" }}a{{ end }}`, "p/b.md": `{{ define "x" }}b{{ end }}`}, "template_parse", nil},
+		{
+			"clean workflow warns inside partial", partials + rule("r.md"),
+			map[string]string{"r.md": `{{ template "intro" . }}`, "p/a.md": "{{ define \"intro\" }}x\n{{ .nope }}{{ end }}\n{{ define \"spare\" }}x{{ end }}\n"},
+			"", map[string]string{"unknown_var": "p/a.md (line 2): ", "unused_partial": "p/a.md (line 3): "},
+		},
 	}
 
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-	}
-	if out.Valid {
-		t.Errorf("validateOutput.Valid = true, want false")
-	}
-	found := false
-	for _, d := range out.Errors {
-		if strings.Contains(d.Message, "relative") || strings.Contains(d.Check, "dispatch.rules") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Errors = %v, want a diagnostic about relative template path", out.Errors)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-func TestValidateDispatch_TildeTemplatePath(t *testing.T) {
-	t.Parallel()
+			// Diagnostics carry symlink-resolved paths; on Windows that also
+			// expands 8.3 short names such as RUNNER~1.
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatalf("EvalSymlinks(t.TempDir()): %v", err)
+			}
+			for name, content := range tt.files {
+				path := filepath.Join(dir, name)
+				if err := errors.Join(os.MkdirAll(filepath.Dir(path), 0o755), os.WriteFile(path, []byte(content), 0o644)); err != nil {
+					t.Fatalf("writing %q: %v", path, err)
+				}
+			}
 
-	dir := t.TempDir()
-	wfPath := makeDispatchWorkflow(t, dir, `dispatch:
-  rules:
-    - name: tilde-rule
-      match:
-        labels: ["bug"]
-      template: ~/templates/custom.md
-`)
+			code, out := runValidateJSON(t, makeDispatchWorkflow(t, dir, "dispatch:\n"+tt.dispatch))
 
-	var stdout, stderr bytes.Buffer
-	ctx := context.Background()
-
-	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-	}
-	if out.Valid {
-		t.Errorf("validateOutput.Valid = true, want false")
-	}
-}
-
-func TestValidateDispatch_MissingTemplateFile(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	wfPath := makeDispatchWorkflow(t, dir, `dispatch:
-  rules:
-    - name: missing-tmpl
-      match:
-        labels: ["bug"]
-      template: nonexistent/file.md
-`)
-
-	var stdout, stderr bytes.Buffer
-	ctx := context.Background()
-
-	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-	}
-	if out.Valid {
-		t.Errorf("validateOutput.Valid = true, want false")
-	}
-	found := false
-	for _, d := range out.Errors {
-		if strings.Contains(d.Message, "cannot read template") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Errors = %v, want a diagnostic with 'cannot read template'", out.Errors)
-	}
-}
-
-func TestValidateDispatch_FrontMatterInTemplate(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	tmplDir := filepath.Join(dir, "prompts")
-	if err := os.MkdirAll(tmplDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmplDir, "fm.md"), []byte("---\nkey: value\n---\nBody."), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	wfPath := makeDispatchWorkflow(t, dir, `dispatch:
-  rules:
-    - name: fm-rule
-      match:
-        labels: ["bug"]
-      template: prompts/fm.md
-`)
-
-	var stdout, stderr bytes.Buffer
-	ctx := context.Background()
-
-	code := run(ctx, []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
-	}
-
-	var out validateOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-	}
-	if out.Valid {
-		t.Errorf("validateOutput.Valid = true, want false")
-	}
-
-	found := false
-	for _, d := range out.Errors {
-		if d.Check == "template_parse" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("validateOutput.Errors = %v, want a diagnostic with check %q", out.Errors, "template_parse")
+			wantCode := 0
+			if tt.wantCheck != "" {
+				wantCode = 1
+			}
+			if code != wantCode || out.Valid != (wantCode == 0) {
+				t.Fatalf("validate = exit %d, valid %v, errors %v, want exit %d", code, out.Valid, out.Errors, wantCode)
+			}
+			if tt.wantCheck != "" && !slices.Contains(diagChecks(out.Errors), tt.wantCheck) {
+				t.Errorf("validate error checks = %v, want to contain %q", diagChecks(out.Errors), tt.wantCheck)
+			}
+			for check, at := range tt.wantWarn {
+				prefix := filepath.Join(dir, at)
+				if !slices.ContainsFunc(out.Warnings, func(d validateDiag) bool { return d.Check == check && strings.HasPrefix(d.Message, prefix) }) {
+					t.Errorf("validate warnings = %v, want a %q warning starting with %q", out.Warnings, check, prefix)
+				}
+			}
+		})
 	}
 }
 
@@ -2822,6 +2618,312 @@ func TestValidateDispatch_ConfigErrorRouting(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("validateOutput.Errors = %v, want a diagnostic with check prefixed 'config.dispatch'", out.Errors)
+	}
+}
+
+func titleRuleDispatch(matchBody string) string {
+	return "dispatch:\n  rules:\n    - name: titled\n      match:\n" + matchBody + "      agent: mock\n"
+}
+
+func validateJSON(t *testing.T, wfPath string) (int, validateOutput) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v; stderr: %s", stdout.String(), err, stderr.String())
+	}
+	return code, out
+}
+
+func TestValidateDispatch_TitleFaults(t *testing.T) {
+	t.Parallel()
+
+	const (
+		needsPhrase = "needs at least one phrase; remove the key to leave the title out of the match"
+		blankPhrase = "a phrase needs a character other than white space"
+		hintList    = `; quote a phrase that starts with "[", as in "[infra]"`
+		hintMap     = `; quote a phrase that contains ": ", as in "fix: typo"`
+		hintQuote   = "; quote the phrase"
+		titleCheck  = "config.dispatch.rules[0].match.title"
+	)
+	tests := []struct {
+		name      string
+		matchBody string
+		wantCheck string
+		wantMsg   string
+	}{
+		{name: "T-1 bare key", matchBody: "        title:\n", wantCheck: titleCheck, wantMsg: needsPhrase},
+		{name: "T-1 null", matchBody: "        title: null\n", wantCheck: titleCheck, wantMsg: needsPhrase},
+		{name: "T-1 empty list", matchBody: "        title: []\n", wantCheck: titleCheck, wantMsg: needsPhrase},
+
+		{name: "T-2 number", matchBody: "        title: 404\n", wantCheck: titleCheck, wantMsg: "expected a phrase or a list of phrases, got a number" + hintQuote},
+		{name: "T-2 true/false value", matchBody: "        title: true\n", wantCheck: titleCheck, wantMsg: "expected a phrase or a list of phrases, got a true/false value" + hintQuote},
+		{name: "T-2 map", matchBody: "        title: {fix: typo}\n", wantCheck: titleCheck, wantMsg: "expected a phrase or a list of phrases, got a map" + hintMap},
+		{name: "T-2 timestamp", matchBody: "        title: 2026-10-01\n", wantCheck: titleCheck, wantMsg: "expected a phrase or a list of phrases, got a value of an unexpected type" + hintQuote},
+
+		{name: "T-3 unquoted bracket phrase", matchBody: "        title:\n          - fix\n          - [infra]\n", wantCheck: titleCheck + "[1]", wantMsg: "expected a phrase, got a list" + hintList},
+		{name: "T-3 unquoted colon phrase", matchBody: "        title:\n          - fix: typo\n", wantCheck: titleCheck + "[0]", wantMsg: "expected a phrase, got a map" + hintMap},
+		{name: "T-3 number element", matchBody: "        title:\n          - fix\n          - 404\n", wantCheck: titleCheck + "[1]", wantMsg: "expected a phrase, got a number" + hintQuote},
+		{name: "T-3 true/false element", matchBody: "        title:\n          - true\n", wantCheck: titleCheck + "[0]", wantMsg: "expected a phrase, got a true/false value" + hintQuote},
+		{name: "T-3 timestamp element", matchBody: "        title:\n          - 2026-10-01\n", wantCheck: titleCheck + "[0]", wantMsg: "expected a phrase, got a value of an unexpected type" + hintQuote},
+		{name: "T-3 null element carries no hint", matchBody: "        title:\n          - fix\n          -\n", wantCheck: titleCheck + "[1]", wantMsg: "expected a phrase, got no value"},
+
+		{name: "T-4 empty scalar", matchBody: "        title: \"\"\n", wantCheck: titleCheck + "[0]", wantMsg: blankPhrase},
+		{name: "T-4 spaces scalar", matchBody: "        title: \"   \"\n", wantCheck: titleCheck + "[0]", wantMsg: blankPhrase},
+		{name: "T-4 no-break space", matchBody: "        title: \"\\u00a0\"\n", wantCheck: titleCheck + "[0]", wantMsg: blankPhrase},
+		{name: "T-4 ideographic space in a list", matchBody: "        title: [\"fix\", \"\\u3000\"]\n", wantCheck: titleCheck + "[1]", wantMsg: blankPhrase},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, out := validateJSON(t, makeDispatchWorkflow(t, t.TempDir(), titleRuleDispatch(tt.matchBody)))
+
+			if code != 1 {
+				t.Errorf("run(validate) = %d, want 1", code)
+			}
+			if out.Valid {
+				t.Errorf("validateOutput.Valid = true, want false")
+			}
+			if !slices.ContainsFunc(out.Errors, func(d validateDiag) bool { return d.Check == tt.wantCheck && d.Message == tt.wantMsg }) {
+				t.Errorf("validateOutput.Errors = %+v, want one with check %q and message %q", out.Errors, tt.wantCheck, tt.wantMsg)
+			}
+		})
+	}
+
+	t.Run("text rendering names the phrase index and carries the hint", func(t *testing.T) {
+		t.Parallel()
+
+		wfPath := makeDispatchWorkflow(t, t.TempDir(), titleRuleDispatch("        title:\n          - fix\n          - [infra]\n"))
+		var stdout, stderr bytes.Buffer
+
+		code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
+		}
+		for _, want := range []string{"config.dispatch.rules[0].match.title[1]", `expected a phrase, got a list; quote a phrase that starts with "[", as in "[infra]"`} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Errorf("stderr = %q, want to contain %q", stderr.String(), want)
+			}
+		}
+	})
+}
+
+func TestValidateDispatch_TitleAccepted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		dispatch string
+	}{
+		{name: "scalar phrase", dispatch: titleRuleDispatch("        title: \"[docs]\"\n")},
+		{name: "quoted list", dispatch: titleRuleDispatch("        title: [\"[infra]\", \"WIP:\"]\n")},
+		{name: "unquoted bracket scalar reads as the bare word", dispatch: titleRuleDispatch("        title: [infra]\n")},
+		{name: "asterisk phrase is ordinary text", dispatch: titleRuleDispatch("        title: \"*infra*\"\n")},
+		{name: "title beside labels", dispatch: titleRuleDispatch("        title: [\"[docs]\", \"low-cost\", \"*infra*\"]\n        labels: [\"bug\"]\n")},
+		{name: "title-only rule before a later rule", dispatch: "dispatch:\n  rules:\n    - name: by-title\n      match:\n        title: \"[infra]\"\n      agent: mock\n    - name: by-label\n      match:\n        labels: [\"bug\"]\n      agent: mock\n    - name: rest\n      agent: mock\n"},
+		{name: "workflow without title", dispatch: "dispatch:\n  rules:\n    - name: by-label\n      match:\n        labels: [\"bug\"]\n      agent: mock\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, out := validateJSON(t, makeDispatchWorkflow(t, t.TempDir(), tt.dispatch))
+
+			if code != 0 {
+				t.Errorf("run(validate) = %d, want 0; errors: %+v", code, out.Errors)
+			}
+			if !out.Valid || len(out.Errors) != 0 {
+				t.Errorf("validateOutput = {Valid:%v Errors:%+v}, want valid with no errors", out.Valid, out.Errors)
+			}
+			if len(out.Warnings) != 1 || out.Warnings[0].Check != "agent.kind.no_tool_channel" {
+				t.Errorf("validateOutput.Warnings = %+v, want only agent.kind.no_tool_channel", out.Warnings)
+			}
+		})
+	}
+}
+
+const stageWorkflowRules = `dispatch:
+  rules:
+    - name: everything
+      agent: mock
+    - name: plan
+      stage: Stage-Plan
+      agent: mock
+    - name: implement
+      stage: stage-implement
+      agent: mock
+`
+
+func makeStageCollisionWorkflow(t *testing.T, trackerExtra, rulesYAML string) string {
+	t.Helper()
+	content := []byte("---\n" +
+		"polling:\n  interval_ms: 30000\n" +
+		"tracker:\n  kind: file\n" + trackerExtra +
+		"agent:\n  kind: mock\n" +
+		"file:\n  path: issues.json\n" +
+		rulesYAML +
+		"---\nDo {{ .issue.title }}.\n")
+	return writeCustomWorkflowFile(t, t.TempDir(), content)
+}
+
+func TestValidateDispatch_StageLabelsAccepted(t *testing.T) {
+	t.Parallel()
+
+	code, out := validateJSON(t, makeDispatchWorkflow(t, t.TempDir(), stageWorkflowRules))
+
+	if code != 0 {
+		t.Errorf("run(validate) = %d, want 0; errors: %+v", code, out.Errors)
+	}
+	if !out.Valid || len(out.Errors) != 0 {
+		t.Errorf("validateOutput = {Valid:%v Errors:%+v}, want valid with no errors", out.Valid, out.Errors)
+	}
+	if len(out.Warnings) != 1 || out.Warnings[0].Check != "agent.kind.no_tool_channel" {
+		t.Errorf("validateOutput.Warnings = %+v, want only agent.kind.no_tool_channel and no unknown_sub_key for stage", out.Warnings)
+	}
+}
+
+func TestValidateDispatch_StageFaults(t *testing.T) {
+	t.Parallel()
+
+	const (
+		needsLabel = "needs a label with a character other than white space"
+		withMatch  = "a rule with a stage label is selected by that label and cannot also carry match"
+	)
+	tests := []struct {
+		name      string
+		dispatch  string
+		wantCheck string
+		wantMsg   string
+	}{
+		{
+			name:      "duplicate label differing in case",
+			dispatch:  stageWorkflowRules + "    - name: plan2\n      stage: STAGE-PLAN\n      agent: mock\n",
+			wantCheck: "config.dispatch.rules[3].stage",
+			wantMsg:   `duplicate stage label "STAGE-PLAN" (first at index 1)`,
+		},
+		{
+			name:      "rule without a stage after the catch-all",
+			dispatch:  stageWorkflowRules + "    - name: tail\n      agent: mock\n",
+			wantCheck: "config.dispatch.rules[0]",
+			wantMsg:   "unreachable_rules: catch-all rule at index 0 precedes rule at index 3",
+		},
+		{
+			name:      "match beside stage",
+			dispatch:  strings.Replace(stageWorkflowRules, "      stage: Stage-Plan\n", "      stage: Stage-Plan\n      match:\n        labels: [p]\n", 1),
+			wantCheck: "config.dispatch.rules[1]",
+			wantMsg:   withMatch,
+		},
+		{
+			name:      "empty stage",
+			dispatch:  strings.Replace(stageWorkflowRules, "stage: Stage-Plan", `stage: ""`, 1),
+			wantCheck: "config.dispatch.rules[1].stage",
+			wantMsg:   needsLabel,
+		},
+		{
+			name:      "stage that is a number",
+			dispatch:  strings.Replace(stageWorkflowRules, "stage: Stage-Plan", "stage: 5", 1),
+			wantCheck: "config.dispatch.rules[1].stage",
+			wantMsg:   "expected a label, got a number",
+		},
+		{
+			name:      "staged rule without a name",
+			dispatch:  strings.Replace(stageWorkflowRules, "    - name: plan\n", "    -\n", 1),
+			wantCheck: "config.dispatch.rules[1]",
+			wantMsg:   "a rule that carries a stage label must have a name",
+		},
+		{
+			name:      "stage under dispatch.default",
+			dispatch:  "dispatch:\n  default:\n    stage: stage-plan\n",
+			wantCheck: "config.dispatch.default.stage",
+			wantMsg:   "unknown key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, out := validateJSON(t, makeDispatchWorkflow(t, t.TempDir(), tt.dispatch))
+
+			if code != 1 {
+				t.Errorf("run(validate) = %d, want 1", code)
+			}
+			if out.Valid {
+				t.Errorf("validateOutput.Valid = true, want false")
+			}
+			if !slices.ContainsFunc(out.Errors, func(d validateDiag) bool {
+				return d.Check == tt.wantCheck && d.Message == tt.wantMsg
+			}) {
+				t.Errorf("validateOutput.Errors = %+v, want one with check %q and message %q", out.Errors, tt.wantCheck, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestValidateDispatch_StageCollisions(t *testing.T) {
+	t.Parallel()
+
+	const (
+		suffix        = "; a stage label must not equal a tracker state or a label Sortie applies to issues"
+		plainTracker  = "  active_states: [\"To Do\"]\n  terminal_states: [\"Done\"]\n"
+		parkingRules  = "dispatch:\n  rules:\n    - name: everything\n      agent: mock\n    - name: implement\n      stage: Needs-Human\n      agent: mock\n"
+		collisionName = "dispatch.stage.collision"
+	)
+	tests := []struct {
+		name         string
+		trackerExtra string
+		rules        string
+		want         []validateDiag
+	}{
+		{
+			name:         "stage label equal to an active state",
+			trackerExtra: "  active_states: [\"To Do\", \"stage-plan\"]\n  terminal_states: [\"Done\"]\n",
+			rules:        stageWorkflowRules,
+			want: []validateDiag{
+				{Severity: "error", Check: collisionName, Message: `dispatch rule "plan" (dispatch.rules[1].stage): stage label "Stage-Plan" collides with active state "stage-plan"` + suffix},
+			},
+		},
+		{
+			name:         "stage label equal to the parking label with no reactions block",
+			trackerExtra: plainTracker,
+			rules:        parkingRules,
+			want: []validateDiag{
+				{Severity: "error", Check: collisionName, Message: `dispatch rule "implement" (dispatch.rules[1].stage): stage label "Needs-Human" collides with the parking label "needs-human"` + suffix},
+			},
+		},
+		{
+			name:         "one line per staged rule and source in rule order",
+			trackerExtra: "  active_states: [\"To Do\"]\n  terminal_states: [\"STAGE-IMPLEMENT\"]\n  handoff_state: Stage-Plan\n",
+			rules:        stageWorkflowRules,
+			want: []validateDiag{
+				{Severity: "error", Check: collisionName, Message: `dispatch rule "plan" (dispatch.rules[1].stage): stage label "Stage-Plan" collides with tracker.handoff_state "Stage-Plan"` + suffix},
+				{Severity: "error", Check: collisionName, Message: `dispatch rule "implement" (dispatch.rules[2].stage): stage label "stage-implement" collides with terminal state "STAGE-IMPLEMENT"` + suffix},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, out := validateJSON(t, makeStageCollisionWorkflow(t, tt.trackerExtra, tt.rules))
+
+			if code != 1 {
+				t.Errorf("run(validate) = %d, want 1", code)
+			}
+			if out.Valid {
+				t.Errorf("validateOutput.Valid = true, want false")
+			}
+			got := slices.DeleteFunc(slices.Clone(out.Errors), func(d validateDiag) bool { return d.Check != collisionName })
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("validateOutput.Errors %s = %+v, want %+v", collisionName, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -3170,10 +3272,6 @@ var forgeCheckKeys = []string{
 	"reactions.scm_provider_conflict",
 }
 
-// giteaForgeWorkflow returns a WORKFLOW.md whose front matter sets a
-// fully valid gitea tracker and agent so preflight passes cleanly;
-// extraYAML is appended before the closing front-matter delimiter to
-// vary the reactions/ci_feedback block under test.
 func giteaForgeWorkflow(extraYAML string) []byte {
 	return []byte(`---
 tracker:
@@ -3609,9 +3707,6 @@ func TestValidateWatchWindowMSAcrossKinds(t *testing.T) {
 	}
 }
 
-// TestValidateGiteaForge exercises the fold point end-to-end through
-// runValidate for a tracker.kind: gitea workflow, varying the reactions
-// and ci_feedback blocks to isolate one forge fault per case.
 func TestValidateGiteaForge(t *testing.T) {
 	t.Parallel()
 
@@ -3653,8 +3748,9 @@ func TestValidateGiteaForge(t *testing.T) {
 		},
 		{
 			name: "unregistered CI provider",
-			extraYAML: `ci_feedback:
-  kind: gitea-ci
+			extraYAML: `reactions:
+  ci_failure:
+    provider: gitea-ci
 `,
 			wantChecks: []string{"scm_adapter", "ci_provider"},
 			wantMessageContains: map[string]string{
@@ -3688,20 +3784,6 @@ func TestValidateGiteaForge(t *testing.T) {
 			wantCode: 1,
 		},
 		{
-			name: "modern ci_failure key joins the clean provider set",
-			extraYAML: `reactions:
-  bot_review:
-    provider: gitea
-  auto_merge:
-    provider: gitea
-    strategy: squash
-  ci_failure:
-    provider: gitea
-`,
-			wantChecks: nil,
-			wantCode:   0,
-		},
-		{
 			name: "fully valid gitea forge configuration",
 			extraYAML: `reactions:
   bot_review:
@@ -3711,8 +3793,8 @@ func TestValidateGiteaForge(t *testing.T) {
   auto_merge:
     provider: gitea
     strategy: squash
-ci_feedback:
-  kind: gitea
+  ci_failure:
+    provider: gitea
 `,
 			wantChecks: nil,
 			wantCode:   0,
@@ -4079,56 +4161,6 @@ func TestValidateHandoffStateCollisionEveryTrackerKind(t *testing.T) {
 	}
 }
 
-// sentinelState is written into the one state list a defaulted-state
-// fixture keeps, so that list carries no element of the tracker kind's own
-// fallback lists and every collision the fixture asserts comes from the
-// omitted list.
-const sentinelState = "Sentinel Written State"
-
-// defaultedStateWorkflow renders a minimal workflow for the given tracker
-// kind. An empty active or terminal slice omits that front-matter key,
-// which is what leaves the tracker adapter's own fallback list as the
-// effective one; an empty handoff or inProgress omits that field.
-// Credentials and project are omitted deliberately: the dispatch preflight
-// collects every diagnostic rather than short-circuiting, so a kind that
-// also reports tracker.api_key still reports the state collision.
-func defaultedStateWorkflow(kind string, active, terminal []string, handoff, inProgress string) []byte {
-	wf := fmt.Appendf(nil, `---
-polling:
-  interval_ms: 30000
-tracker:
-  kind: %s
-`, kind)
-	wf = appendStateList(wf, "active_states", active)
-	wf = appendStateList(wf, "terminal_states", terminal)
-	if handoff != "" {
-		wf = fmt.Appendf(wf, "  handoff_state: %q\n", handoff)
-	}
-	if inProgress != "" {
-		wf = fmt.Appendf(wf, "  in_progress_state: %q\n", inProgress)
-	}
-	return append(wf, `agent:
-  kind: mock
----
-Do {{ .issue.title }}.
-`...)
-}
-
-// appendStateList appends a YAML sequence for key, or nothing when states
-// is empty so the key is absent from the rendered front matter.
-func appendStateList(wf []byte, key string, states []string) []byte {
-	if len(states) == 0 {
-		return wf
-	}
-	wf = fmt.Appendf(wf, "  %s:\n", key)
-	for _, s := range states {
-		wf = fmt.Appendf(wf, "    - %q\n", s)
-	}
-	return wf
-}
-
-// runValidateWorkflow writes content to a fresh temp directory and runs
-// the validate command against it, returning the exit code and stderr.
 func runValidateWorkflow(t *testing.T, content []byte) (int, string) {
 	t.Helper()
 	wfPath := writeCustomWorkflowFile(t, t.TempDir(), content)
@@ -4136,196 +4168,6 @@ func runValidateWorkflow(t *testing.T, content []byte) (int, string) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"validate", wfPath}, &stdout, &stderr)
 	return code, stderr.String()
-}
-
-// requireStateAbsent fails the test when state appears in either of the
-// kind's declared fallback lists. A fixture whose written list or handoff
-// value overlaps a fallback list asserts a collision it did not construct,
-// so this guard fails loudly instead of passing vacuously.
-func requireStateAbsent(t *testing.T, kind string, meta registry.TrackerMeta, state string) {
-	t.Helper()
-	for _, list := range [][]string{meta.DefaultActiveStates, meta.DefaultTerminalStates} {
-		for _, declared := range list {
-			if strings.EqualFold(declared, state) {
-				t.Fatalf("state %q is declared by tracker kind %q (active %v, terminal %v); pick a value outside both fallback lists",
-					state, kind, meta.DefaultActiveStates, meta.DefaultTerminalStates)
-			}
-		}
-	}
-}
-
-// TestValidateDefaultedTrackerStatesEveryTrackerKind verifies end to end
-// that a handoff_state or in_progress_state colliding with a tracker
-// adapter's own fallback state list is a hard error whenever the matching
-// workflow list is empty. Both the kind list and every state value come
-// from the registry, so a newly registered adapter that declares fallback
-// lists is covered without editing this test.
-func TestValidateDefaultedTrackerStatesEveryTrackerKind(t *testing.T) {
-	t.Parallel()
-
-	kinds := registry.Trackers.Kinds()
-	if len(kinds) == 0 {
-		t.Fatal("registry.Trackers.Kinds() is empty; the subtests below would assert nothing")
-	}
-
-	for _, kind := range kinds {
-		meta, ok := registry.Trackers.Meta(kind)
-		if !ok {
-			t.Fatalf("Trackers.Meta(%q) reported not registered", kind)
-		}
-
-		if len(meta.DefaultActiveStates) == 0 && len(meta.DefaultTerminalStates) == 0 {
-			t.Run(kind+"/no declared fallback lists", func(t *testing.T) {
-				t.Parallel()
-
-				_, stderr := runValidateWorkflow(t, defaultedStateWorkflow(kind, nil, []string{sentinelState}, "Awaiting Human", ""))
-
-				// The exit code is unconstrained: a kind that requires an
-				// api_key or project still fails preflight on this minimal
-				// workflow. What must not appear is a state collision.
-				for _, unwanted := range []string{"error: tracker.handoff_state: ", "error: tracker.in_progress_state: "} {
-					if strings.Contains(stderr, unwanted) {
-						t.Errorf("stderr = %q, want no %q diagnostic for a kind that declares no fallback state lists", stderr, unwanted)
-					}
-				}
-			})
-			continue
-		}
-
-		if len(meta.DefaultActiveStates) > 0 {
-			t.Run(kind+"/handoff state inside the defaulted active list", func(t *testing.T) {
-				t.Parallel()
-
-				requireStateAbsent(t, kind, meta, sentinelState)
-				handoff := meta.DefaultActiveStates[0]
-
-				code, stderr := runValidateWorkflow(t, defaultedStateWorkflow(kind, nil, []string{sentinelState}, handoff, ""))
-
-				want := fmt.Sprintf(`error: tracker.handoff_state: %q collides with active state %q; tracker.active_states is empty, so the %q adapter falls back to its own active states`,
-					handoff, handoff, kind)
-				if code != 1 {
-					t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr)
-				}
-				if !strings.Contains(stderr, want) {
-					t.Errorf("stderr = %q, want to contain %q", stderr, want)
-				}
-			})
-		}
-
-		if len(meta.DefaultTerminalStates) == 0 {
-			continue
-		}
-
-		t.Run(kind+"/handoff state inside the defaulted terminal list", func(t *testing.T) {
-			t.Parallel()
-
-			requireStateAbsent(t, kind, meta, sentinelState)
-			handoff := meta.DefaultTerminalStates[0]
-
-			code, stderr := runValidateWorkflow(t, defaultedStateWorkflow(kind, []string{sentinelState}, nil, handoff, ""))
-
-			want := fmt.Sprintf(`error: tracker.handoff_state: %q collides with terminal state %q; tracker.terminal_states is empty, so the %q adapter falls back to its own terminal states`,
-				handoff, handoff, kind)
-			if code != 1 {
-				t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr)
-			}
-			if !strings.Contains(stderr, want) {
-				t.Errorf("stderr = %q, want to contain %q", stderr, want)
-			}
-		})
-
-		// handoff_state stays absent here: a handoff inside the written
-		// active_states is rejected by the config loader before the
-		// preflight runs, so the in_progress diagnostic would never appear.
-		t.Run(kind+"/in progress state inside the defaulted terminal list", func(t *testing.T) {
-			t.Parallel()
-
-			inProgress := meta.DefaultTerminalStates[0]
-
-			code, stderr := runValidateWorkflow(t, defaultedStateWorkflow(kind, []string{inProgress}, nil, "", inProgress))
-
-			want := fmt.Sprintf(`error: tracker.in_progress_state: %q collides with terminal state %q; tracker.terminal_states is empty, so the %q adapter falls back to its own terminal states`,
-				inProgress, inProgress, kind)
-			if code != 1 {
-				t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr)
-			}
-			if !strings.Contains(stderr, want) {
-				t.Errorf("stderr = %q, want to contain %q", stderr, want)
-			}
-		})
-	}
-}
-
-// TestValidateHandoffStateDefaultParityEveryTrackerKind proves that
-// omitting active_states no longer changes whether the collision rule
-// fires. The written form is rejected by the config loader under
-// config.tracker.handoff_state and the omitted form by the dispatch
-// preflight under tracker.handoff_state; the negative assertion is what
-// makes the two paths distinguishable, because the loader's check key
-// contains the preflight's as a substring.
-func TestValidateHandoffStateDefaultParityEveryTrackerKind(t *testing.T) {
-	t.Parallel()
-
-	kinds := registry.Trackers.Kinds()
-	if len(kinds) == 0 {
-		t.Fatal("registry.Trackers.Kinds() is empty; the subtests below would assert nothing")
-	}
-
-	for _, kind := range kinds {
-		meta, ok := registry.Trackers.Meta(kind)
-		if !ok {
-			t.Fatalf("Trackers.Meta(%q) reported not registered", kind)
-		}
-		if len(meta.DefaultActiveStates) == 0 {
-			continue
-		}
-
-		t.Run(kind, func(t *testing.T) {
-			t.Parallel()
-
-			requireStateAbsent(t, kind, meta, sentinelState)
-			handoff := meta.DefaultActiveStates[0]
-
-			// The written terminal list must not carry the handoff state:
-			// otherwise the config loader rejects the omitted form too and the
-			// negative assertion below would fail for the wrong reason.
-			terminal := meta.DefaultTerminalStates
-			if len(terminal) == 0 {
-				terminal = []string{sentinelState}
-			}
-			for _, s := range terminal {
-				if strings.EqualFold(s, handoff) {
-					t.Fatalf("tracker kind %q declares %q in both fallback lists (active %v, terminal %v); the written and omitted forms are not comparable",
-						kind, handoff, meta.DefaultActiveStates, meta.DefaultTerminalStates)
-				}
-			}
-
-			collision := fmt.Sprintf("%q collides with active state %q", handoff, handoff)
-
-			writtenCode, writtenStderr := runValidateWorkflow(t,
-				defaultedStateWorkflow(kind, meta.DefaultActiveStates, terminal, handoff, ""))
-			if writtenCode != 1 {
-				t.Fatalf("run(validate) with active_states written = %d, want 1; stderr: %s", writtenCode, writtenStderr)
-			}
-			if want := "error: config.tracker.handoff_state: " + collision; !strings.Contains(writtenStderr, want) {
-				t.Errorf("stderr with active_states written = %q, want to contain %q", writtenStderr, want)
-			}
-
-			omittedCode, omittedStderr := runValidateWorkflow(t,
-				defaultedStateWorkflow(kind, nil, terminal, handoff, ""))
-			if omittedCode != 1 {
-				t.Fatalf("run(validate) with active_states omitted = %d, want 1; stderr: %s", omittedCode, omittedStderr)
-			}
-			want := fmt.Sprintf("error: tracker.handoff_state: %s; tracker.active_states is empty, so the %q adapter falls back to its own active states",
-				collision, kind)
-			if !strings.Contains(omittedStderr, want) {
-				t.Errorf("stderr with active_states omitted = %q, want to contain %q", omittedStderr, want)
-			}
-			if strings.Contains(omittedStderr, "config.tracker.handoff_state") {
-				t.Errorf("stderr with active_states omitted = %q, want no config.tracker.handoff_state diagnostic: the config loader cannot see the fallback list", omittedStderr)
-			}
-		})
-	}
 }
 
 // TestValidateNoChangeStateRejectionsAreOffline verifies that every
@@ -4660,10 +4502,221 @@ func TestValidateTriageConfigErrors(t *testing.T) {
 	}
 }
 
-// advisoryWorkflow returns a minimal file-tracker workflow with
-// agentFrontMatter spliced in as its agent selection and any adapter
-// blocks it needs.
-func advisoryWorkflow(agentFrontMatter string) []byte {
+const retiredValidateKind = "fixture-legacy-agent"
+
+func init() {
+	registry.RetiredAgents.Register(retiredValidateKind, registry.RetiredAgent{
+		Replacement:   "mock",
+		CredentialEnv: registry.DeclareCredentialEnv(),
+		Convert: func(in registry.AgentConversionInput) (registry.AgentConversion, *registry.AgentConversionFault) {
+			if _, refused := in.Settings["bad"]; refused {
+				return registry.AgentConversion{}, &registry.AgentConversionFault{Key: "bad", Message: "bad is refused"}
+			}
+			return registry.AgentConversion{
+				Command:        domain.AgentCommand{Line: "fixture-cli serve"},
+				Args:           []string{"serve"},
+				DefaultCommand: "fixture-cli",
+			}, nil
+		},
+	})
+}
+
+func agentKindWorkflow(agentBlock, extraBlocks string) []byte {
+	return fmt.Appendf(nil, `---
+polling:
+  interval_ms: 30000
+tracker:
+  kind: file
+  active_states:
+    - To Do
+  terminal_states:
+    - Done
+agent:
+%s
+file:
+  path: issues.json
+%s---
+Do {{ .issue.title }}.
+`, agentBlock, extraBlocks)
+}
+
+func runValidateJSON(t *testing.T, wfPath string) (int, validateOutput) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v; stderr: %s", stdout.String(), err, stderr.String())
+	}
+	return code, out
+}
+
+func diagChecks(diags []validateDiag) []string {
+	checks := make([]string, len(diags))
+	for i, d := range diags {
+		checks[i] = d.Check
+	}
+	slices.Sort(checks)
+	return checks
+}
+
+func TestValidateRetiredKind_MatchesItsHandConvertedForm(t *testing.T) {
+	dir := filepath.Dir(setupRunDir(t))
+	retiredPath := writeCustomWorkflowFile(t, dir, agentKindWorkflow("  kind: "+retiredValidateKind, ""))
+	convertedPath := filepath.Join(dir, "CONVERTED.md")
+	if err := os.WriteFile(convertedPath, agentKindWorkflow("  kind: mock", ""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("json", func(t *testing.T) {
+		retiredCode, retired := runValidateJSON(t, retiredPath)
+		convertedCode, converted := runValidateJSON(t, convertedPath)
+
+		if retiredCode != convertedCode || retired.Valid != converted.Valid {
+			t.Errorf("retired form exit code %d, valid %v; converted form exit code %d, valid %v; want the same",
+				retiredCode, retired.Valid, convertedCode, converted.Valid)
+		}
+		wantChecks := append(diagChecks(converted.Warnings), "agent.kind.retired")
+		slices.Sort(wantChecks)
+		if got := diagChecks(retired.Warnings); !slices.Equal(got, wantChecks) {
+			t.Errorf("retired form warnings = %v, want the converted form's plus one agent.kind.retired: %v", got, wantChecks)
+		}
+		if slices.Contains(diagChecks(retired.Warnings), "agent.kind.deprecated") {
+			t.Errorf("retired form warnings = %v, want no agent.kind.deprecated", retired.Warnings)
+		}
+	})
+
+	t.Run("text", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+
+		code := run(context.Background(), []string{"validate", retiredPath}, &stdout, &stderr)
+
+		if code != 0 {
+			t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
+		}
+		if got := strings.Count(stderr.String(), "warning: agent.kind.retired: "); got != 1 {
+			t.Errorf("stderr holds %d agent.kind.retired warnings, want exactly 1: %s", got, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "agent.kind.deprecated") {
+			t.Errorf("stderr = %q, want no agent.kind.deprecated", stderr.String())
+		}
+	})
+}
+
+func TestValidateAgentCommandForms(t *testing.T) {
+	dir := filepath.Dir(setupRunDir(t))
+
+	tests := []struct {
+		name      string
+		command   string
+		wantCheck string
+	}{
+		{name: "list of strings passes", command: `  command: ["/usr/bin/true", "a b"]`},
+		{name: "string passes", command: `  command: /usr/bin/true --flag`},
+		{name: "empty list", command: `  command: []`, wantCheck: "config.agent.command"},
+		{name: "mapping", command: `  command: {run: agent}`, wantCheck: "config.agent.command"},
+		{name: "number", command: `  command: 7`, wantCheck: "config.agent.command"},
+		{name: "empty element zero", command: `  command: ["", "x"]`, wantCheck: "config.agent.command[0]"},
+		{name: "whitespace-only element zero", command: `  command: [" ", "x"]`, wantCheck: "config.agent.command[0]"},
+		{name: "non-string element", command: `  command: ["agent", 5]`, wantCheck: "config.agent.command[1]"},
+		{name: "empty later element", command: `  command: ["agent", ""]`, wantCheck: "config.agent.command[1]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wfPath := writeCustomWorkflowFile(t, dir, agentKindWorkflow("  kind: mock\n"+tt.command, ""))
+
+			code, out := runValidateJSON(t, wfPath)
+
+			if tt.wantCheck == "" {
+				if code != 0 || !out.Valid {
+					t.Fatalf("run(validate) = %d, valid %v, errors %v, want a valid workflow", code, out.Valid, out.Errors)
+				}
+				if slices.Contains(diagChecks(out.Warnings), "type_mismatch") {
+					t.Errorf("warnings = %v, want no type_mismatch", out.Warnings)
+				}
+				return
+			}
+			if code != 1 || out.Valid {
+				t.Fatalf("run(validate) = %d, valid %v, want exit 1 and invalid", code, out.Valid)
+			}
+			if got := diagChecks(out.Errors); !slices.Equal(got, []string{tt.wantCheck}) {
+				t.Errorf("errors = %v, want exactly [%s]", got, tt.wantCheck)
+			}
+		})
+	}
+}
+
+func TestValidateRetiredKind_ConversionFaultReportsTheRetiredKey(t *testing.T) {
+	dir := filepath.Dir(setupRunDir(t))
+	wfPath := writeCustomWorkflowFile(t, dir, agentKindWorkflow("  kind: "+retiredValidateKind, retiredValidateKind+":\n  bad: true\n"))
+
+	code, out := runValidateJSON(t, wfPath)
+
+	if code != 1 || out.Valid {
+		t.Fatalf("run(validate) = %d, valid %v, want exit 1 and invalid", code, out.Valid)
+	}
+	if got, want := diagChecks(out.Errors), []string{"config." + retiredValidateKind + ".bad"}; !slices.Equal(got, want) {
+		t.Errorf("errors = %v, want %v", got, want)
+	}
+}
+
+func ruleBlockValidateWorkflow(extraRule string) []byte {
+	return fmt.Appendf(nil, `---
+tracker:
+  kind: file
+  active_states: [To Do]
+  terminal_states: [Done]
+agent: {kind: opencode, command: /usr/bin/true}
+opencode: {model: provider/strong, effort: high}
+dispatch:
+  rules:
+    - {name: low-cost, match: {labels: [cheap]}, opencode: {model: $SORTIE_TEST_1191_MODEL}}
+%sfile: {path: issues.json}
+---
+Do {{ .issue.title }}.
+`, extraRule)
+}
+
+func TestValidateRuleSettingsBlocks(t *testing.T) {
+	t.Setenv("SORTIE_TEST_1191_MODEL", "")
+
+	const wrongTypedRule = "    - {name: bad, match: {labels: [bad]}, opencode: {effort: 5}}\n"
+	tests := []struct {
+		name      string
+		extraRule string
+		wantCode  int
+		wantError bool
+	}{
+		{name: "a rule's wrong-typed key draws its diagnostic and exits 1", extraRule: wrongTypedRule, wantCode: 1, wantError: true},
+		{name: "a clean rule block exits 0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, out := validateEffortJSON(t, ruleBlockValidateWorkflow(tt.extraRule))
+
+			if code != tt.wantCode || out.Valid == tt.wantError {
+				t.Errorf("validate exit code, valid = %d, %v, want %d, %v; errors: %+v", code, out.Valid, tt.wantCode, !tt.wantError, out.Errors)
+			}
+			wrongType := slices.ContainsFunc(out.Errors, func(d validateDiag) bool {
+				return d.Check == "opencode.effort.wrong_type" && strings.HasPrefix(d.Message, `dispatch rule "bad" (dispatch.rules[1].opencode): `)
+			})
+			if wrongType != tt.wantError {
+				t.Errorf("errors = %+v, want opencode.effort.wrong_type prefixed with the second rule: %v", out.Errors, tt.wantError)
+			}
+			unresolved := slices.ContainsFunc(out.Warnings, func(d validateDiag) bool {
+				return d.Check == "unresolved_extension_var" && strings.HasPrefix(d.Message, "dispatch.rules[0].opencode.model: ")
+			})
+			inherited := slices.ContainsFunc(out.Warnings, func(d validateDiag) bool { return d.Check == "agent.effort.inherited" })
+			if !unresolved || !inherited {
+				t.Errorf("warnings = %+v, want unresolved_extension_var on dispatch.rules[0].opencode.model and agent.effort.inherited", out.Warnings)
+			}
+		})
+	}
+}
+
+func deprecatedNotificationsWorkflow() []byte {
 	return []byte(`---
 tracker:
   kind: file
@@ -4671,135 +4724,89 @@ tracker:
     - To Do
   terminal_states:
     - Done
-` + agentFrontMatter + `file:
-  path: issues.json
+  comments:
+    on_dispatch: true
+agent:
+  kind: mock
+notifications:
+  - kind: webhook
+    url: $SORTIE_TEST_WEBHOOK_URL
 ---
 Do {{ .issue.title }}.
 `)
 }
 
-// ciFeedbackDeprecatedAdvisoryWorkflow carries both the deprecated
-// ci_feedback section and its reactions.ci_failure replacement, so
-// NewServiceConfig records the ci_feedback.deprecated advisory.
-func ciFeedbackDeprecatedAdvisoryWorkflow() []byte {
-	return advisoryWorkflow(`agent:
-  kind: mock
-ci_feedback:
-  kind: github
-reactions:
-  ci_failure:
-    provider: github
-`)
-}
+func TestValidateDeprecatedNotificationSettingsAreWarnings(t *testing.T) {
+	t.Setenv("SORTIE_TEST_WEBHOOK_URL", "https://example.com/hook")
+	dir := t.TempDir()
+	wfPath := writeCustomWorkflowFile(t, dir, deprecatedNotificationsWorkflow())
 
-// kiroAgentKindWorkflow selects the deprecated kiro kind, with
-// trust_all_tools set so it passes kiro's own offline trust-posture
-// check and the only warning is the deprecation advisory.
-func kiroAgentKindWorkflow() []byte {
-	return advisoryWorkflow(`agent:
-  kind: kiro
-  command: /usr/bin/true
-kiro:
-  trust_all_tools: true
-`)
-}
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
 
-// agentClientProtocolWithLeftoverKiroBlockWorkflow selects the
-// agent-client-protocol kind while a kiro: block sits unused in the
-// front matter, named by no selector.
-func agentClientProtocolWithLeftoverKiroBlockWorkflow() []byte {
-	return advisoryWorkflow(`agent:
-  kind: agent-client-protocol
-  command: /usr/bin/true
-kiro:
-  trust_all_tools: true
-`)
-}
-
-// TestRunValidate_ConfigurationAdvisories asserts that sortie validate
-// renders exactly one warning per configuration advisory, with valid
-// and the exit code unaffected, and that the agent-client-protocol
-// route draws no agent.kind.deprecated warning even with a leftover
-// kiro: block no selector names. Text-format rendering of a warning is
-// generic, pre-existing behavior exercised elsewhere in this file; this
-// covers only the two distinct wiring points that feed validate's
-// advisory loop: a config-sourced advisory (ci_feedback, built inside
-// NewServiceConfig) and a manager-sourced one (the kiro deprecation,
-// added through [workflow.WithAdvisoryFunc]). Every other advisory
-// producer shares one of these two wiring points and is proven at the
-// unit level where it is built.
-func TestRunValidate_ConfigurationAdvisories(t *testing.T) {
-	tests := []struct {
-		name        string
-		workflow    []byte
-		wantCheck   string
-		wantTextSub string
-		wantAbsent  bool
-	}{
-		{
-			name:        "ci_feedback deprecated in favor of reactions.ci_failure",
-			workflow:    ciFeedbackDeprecatedAdvisoryWorkflow(),
-			wantCheck:   "ci_feedback.deprecated",
-			wantTextSub: "ci_feedback is deprecated and ignored because reactions.ci_failure is set",
-		},
-		{
-			name:        "kiro agent kind deprecated in favor of agent-client-protocol",
-			workflow:    kiroAgentKindWorkflow(),
-			wantCheck:   "agent.kind.deprecated",
-			wantTextSub: `agent kind "kiro" is deprecated and will be removed in a later release; use agent kind "agent-client-protocol" instead`,
-		},
-		{
-			name:       "agent-client-protocol route with a leftover kiro block draws no deprecation warning",
-			workflow:   agentClientProtocolWithLeftoverKiroBlockWorkflow(),
-			wantCheck:  "agent.kind.deprecated",
-			wantAbsent: true,
-		},
+	if code != 0 {
+		t.Fatalf("run(validate) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
+	}
+	if !out.Valid {
+		t.Errorf("validateOutput.Valid = false, want true: deprecated settings are warnings only")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	want := map[string]string{
+		"tracker.comments.on_dispatch.deprecated": "tracker.comments.on_dispatch is deprecated and keeps posting until it is removed; list session.started in the events of a notifications entry of kind tracker_comment, then remove the key",
+		"notifications[0].events.missing":         "notifications[0] has no events and receives agent.message only, which is deprecated; add events: [agent.message] to keep its current behavior",
+	}
+	for _, w := range out.Warnings {
+		if wantMessage, ok := want[w.Check]; ok {
+			if w.Message != wantMessage || w.Severity != "warning" {
+				t.Errorf("warning %q = {%q %q}, want severity warning and message %q", w.Check, w.Severity, w.Message, wantMessage)
+			}
+			delete(want, w.Check)
+		}
+	}
+	for check := range want {
+		t.Errorf("validateOutput.Warnings = %v, want a warning under check %q", out.Warnings, check)
+	}
+}
 
-			dir := t.TempDir()
-			writeIssuesFixture(t, dir)
-			wfPath := writeCustomWorkflowFile(t, dir, tt.workflow)
+func TestValidateRejectsUnconstructibleDestination(t *testing.T) {
+	t.Parallel()
 
-			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
-			if code != 0 {
-				t.Fatalf("run(validate --format json) = %d, want 0; stderr: %s", code, stderr.String())
-			}
+	dir := t.TempDir()
+	wfPath := writeCustomWorkflowFile(t, dir, []byte(`---
+tracker:
+  kind: file
+  active_states:
+    - To Do
+  terminal_states:
+    - Done
+agent:
+  kind: mock
+notifications:
+  - kind: webhook
+    url: ""
+    events: [budget.held]
+---
+Do {{ .issue.title }}.
+`))
 
-			var out validateOutput
-			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-				t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
-			}
-			if !out.Valid {
-				t.Errorf("validateOutput.Valid = false, want true")
-			}
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"validate", "--format", "json", wfPath}, &stdout, &stderr)
 
-			var matches []validateDiag
-			for _, w := range out.Warnings {
-				if w.Check == tt.wantCheck {
-					matches = append(matches, w)
-				}
-			}
-
-			if tt.wantAbsent {
-				if len(matches) != 0 {
-					t.Errorf("validateOutput.Warnings with check %q = %v, want none", tt.wantCheck, matches)
-				}
-				return
-			}
-			if len(matches) != 1 {
-				t.Fatalf("validateOutput.Warnings with check %q = %v, want exactly 1", tt.wantCheck, matches)
-			}
-			if matches[0].Severity != "warning" {
-				t.Errorf("warning Severity = %q, want %q", matches[0].Severity, "warning")
-			}
-			if !strings.Contains(matches[0].Message, tt.wantTextSub) {
-				t.Errorf("warning Message = %q, want to contain %q", matches[0].Message, tt.wantTextSub)
-			}
-		})
+	if code != 1 {
+		t.Fatalf("run(validate) = %d, want 1; stderr: %s", code, stderr.String())
+	}
+	var out validateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error: %v", stdout.String(), err)
+	}
+	if out.Valid {
+		t.Error("validateOutput.Valid = true, want false for a destination that cannot be constructed")
+	}
+	if !slices.ContainsFunc(out.Errors, func(d validateDiag) bool { return d.Check == "config.notifications[0]" }) {
+		t.Errorf("validateOutput.Errors = %v, want a diagnostic with check %q", out.Errors, "config.notifications[0]")
 	}
 }

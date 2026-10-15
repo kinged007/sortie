@@ -14,11 +14,11 @@ Sortie follows [Semantic Versioning](https://semver.org/). Security fixes are ap
 
 | Version | Supported |
 |---------|-----------|
-| 1.25.x | Yes (1.25.0 recommended) |
-| 1.24.x | Security patches until 27 Dec 2026 |
-| < 1.24 | No |
+| 1.27.x | Yes (1.27.0 recommended) |
+| 1.26.x | Security patches until 11 Jan 2027 |
+| < 1.26 | No |
 
-When a new minor version ships (e.g., 1.25.0), the immediately preceding minor (e.g., 1.24.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
+When a new minor version ships (e.g., 1.27.0), the immediately preceding minor (e.g., 1.26.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
 
 ## Reporting a Vulnerability
 
@@ -98,7 +98,9 @@ across multiple projects. Extensions require reporter agreement.
 - SQLite persistence layer vulnerabilities (injection, corruption, unauthorized access).
 - Configuration injection via environment variable handling or YAML parsing.
 - Denial of service against the orchestrator (crash, resource exhaustion, deadlock).
-- Vulnerabilities in direct dependencies (see [go.mod](go.mod)).
+- Vulnerabilities in direct dependencies of code that ships in the binary: Go
+  modules (see [go.mod](go.mod)) and any third-party code bundled into the
+  embedded dashboard.
 
 ### Out of Scope
 
@@ -132,8 +134,9 @@ Sortie's security model is documented in the
 - **Secret handling**: API tokens and secret values support `$VAR` indirection
   and are never logged or expanded beyond a single level.
 - **Minimal dependency surface**: the binary is statically linked with zero
-  runtime dependencies. No CGo. Uses a small set of direct dependencies, with
-  Prometheus metrics support remaining optional.
+  runtime dependencies. No CGo. The Go code uses a small set of direct
+  dependencies, with Prometheus metrics support remaining optional. Tooling
+  used only to develop or build Sortie never ships in the binary.
 
 ## Security Announcements
 

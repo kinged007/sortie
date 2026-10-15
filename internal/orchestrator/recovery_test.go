@@ -13,7 +13,6 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
-	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 func TestPopulateRetries(t *testing.T) {
@@ -34,6 +33,8 @@ func TestPopulateRetries(t *testing.T) {
 					Attempt:    2,
 					DueAtMs:    10000,
 					Error:      &errMsg,
+
+					StagePrevious: "specify", StagePreviousOutcome: "succeeded", ChainID: "chain-1",
 				},
 				RemainingMs: 5000,
 			},
@@ -86,6 +87,9 @@ func TestPopulateRetries(t *testing.T) {
 			}
 			if got.DueAtMS != e.DueAtMs {
 				t.Errorf("DueAtMS = %d, want %d", got.DueAtMS, e.DueAtMs)
+			}
+			if want := (StageLineage{PreviousRule: e.StagePrevious, PreviousOutcome: e.StagePreviousOutcome, ChainID: e.ChainID}); got.StageLineage != want {
+				t.Errorf("StageLineage of %q = %+v, want %+v", e.IssueID, got.StageLineage, want)
 			}
 			if got.TimerHandle != nil {
 				t.Errorf("TimerHandle should be nil for %q", e.IssueID)
@@ -387,7 +391,7 @@ func TestActivateReconstructedRetries(t *testing.T) {
 		params.MaxTokens = 0
 
 		workerCalled := make(chan struct{}, 1)
-		params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ registry.UsageArrival) WorkerFunc {
+		params.MakeWorkerFn = func(_, _, _, _, _ string, _ domain.AgentAdapter, _ AttemptSettings) WorkerFunc {
 			return func(_ context.Context, _ domain.Issue, _ *int) { workerCalled <- struct{}{} }
 		}
 
@@ -547,64 +551,119 @@ func TestPopulateRetries_SessionID(t *testing.T) {
 	t.Parallel()
 
 	sessID := "sess-abc"
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	entries := []persistence.PendingRetry{
-		{
-			Entry: persistence.RetryEntry{
-				IssueID:    "id-sess",
-				Identifier: "PROJ-SESS",
-				Attempt:    1,
-				DueAtMs:    10000,
-				SessionID:  &sessID,
-			},
-			RemainingMs: 5000,
-		},
+	tests := []struct {
+		name      string
+		sessionID *string
+		want      string
+	}{
+		{"session id restored", &sessID, sessID},
+		{"nil session id restored empty", nil, ""},
 	}
 
-	PopulateRetries(state, entries, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	got, ok := state.RetryAttempts["id-sess"]
-	if !ok {
-		t.Fatal("RetryAttempts[id-sess] missing after PopulateRetries")
-	}
-	if got.SessionID != sessID {
-		t.Errorf("PopulateRetries_SessionID: SessionID = %q, want %q", got.SessionID, sessID)
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			entries := []persistence.PendingRetry{{
+				Entry:       persistence.RetryEntry{IssueID: "id-sess", Identifier: "PROJ-SESS", Attempt: 1, DueAtMs: 10000, SessionID: tt.sessionID},
+				RemainingMs: 5000,
+			}}
+
+			PopulateRetries(state, entries, nil)
+
+			got, ok := state.RetryAttempts["id-sess"]
+			if !ok {
+				t.Fatal("RetryAttempts[id-sess] missing after PopulateRetries")
+			}
+			if got.SessionID != tt.want {
+				t.Errorf("PopulateRetries SessionID = %q, want %q", got.SessionID, tt.want)
+			}
+		})
 	}
 }
 
-func TestPopulateRetries_SessionID_Nil(t *testing.T) {
+func TestPopulateRetries_RestoredClaimStartsWithoutTheRuleSettingsFlag(t *testing.T) {
 	t.Parallel()
 
 	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	entries := []persistence.PendingRetry{
-		{
-			Entry: persistence.RetryEntry{
-				IssueID:    "id-nosess",
-				Identifier: "PROJ-NOSESS",
-				Attempt:    1,
-				DueAtMs:    10000,
-				SessionID:  nil,
-			},
-			RemainingMs: 0,
-		},
-	}
+	entries := []persistence.PendingRetry{{
+		Entry:       persistence.RetryEntry{IssueID: "id-flag", Identifier: "PROJ-FLAG", Attempt: 1, DueAtMs: 10000, RuleName: "cheap", AgentKind: "kind-b"},
+		RemainingMs: 5000,
+	}}
 
 	PopulateRetries(state, entries, nil)
 
-	got, ok := state.RetryAttempts["id-nosess"]
-	if !ok {
-		t.Fatal("RetryAttempts[id-nosess] missing after PopulateRetries")
-	}
-	if got.SessionID != "" {
-		t.Errorf("PopulateRetries_SessionID_Nil: SessionID = %q, want empty", got.SessionID)
+	if got := state.RetryAttempts["id-flag"]; got == nil || got.RuleName != "cheap" || got.RuleSettingsApplied {
+		t.Errorf("restored RetryEntry = %+v, want rule %q and no settings flag", got, "cheap")
 	}
 }
 
-// recoveryNow is a fixed instant used as the NowFunc reference for recovery tests.
+func TestPopulateRetries_RestartKeepsIssueIdentity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels []string
+	}{
+		{"labels read", []string{"backend", "urgent"}},
+		{"read with no labels", []string{}},
+		{"labels never read", nil},
+	}
+	passAt := time.Date(2026, 3, 19, 9, 0, 0, 123456789, time.UTC)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			store := openInMemoryStore(t)
+			before := NewState(5000, 4, 0, nil, AgentTotals{})
+			before.RetryAttempts["iss-1"] = &RetryEntry{IssueID: "iss-1", Identifier: "PROJ-1", Attempt: 1, DueAtMS: 10000}
+			persistRetryEntry(ctx, discardLogger(), store, before, "iss-1")
+			entry := before.RetryAttempts["iss-1"]
+			entry.DisplayID = "acme/web#1"
+			entry.IssueIdentity = IssueIdentity{
+				Title: "Fix the login redirect", URL: "https://example.test/acme/web/issues/1",
+				IssueType: "Bug", Labels: tt.labels, State: "In Review",
+			}
+			entry.Trigger, entry.OriginTrigger = triggerTimer, "error"
+			entry.ConfiguredModel = "model-x"
+			entry.StageLineage = StageLineage{DispatchedAt: passAt}
+			persistRetryEntry(ctx, discardLogger(), store, before, "iss-1")
+
+			pending, err := store.LoadRetryEntriesForRecovery(ctx, 0)
+			if err != nil {
+				t.Fatalf("LoadRetryEntriesForRecovery: %v", err)
+			}
+			after := NewState(5000, 4, 0, nil, AgentTotals{})
+			PopulateRetries(after, pending, nil)
+
+			retrying := RuntimeSnapshot(after, recoveryNow).Retrying
+			if len(retrying) != 1 {
+				t.Fatalf("len(Retrying) = %d, want 1", len(retrying))
+			}
+			if got := after.RetryAttempts["iss-1"].OriginTrigger; got != "error" {
+				t.Errorf("RetryAttempts[iss-1].OriginTrigger after restart = %q, want %q", got, "error")
+			}
+			got := retrying[0]
+			gotFacts := [6]string{got.DisplayID, got.IssueTitle, got.IssueURL, got.Trigger, got.IssueType, got.State}
+			wantFacts := [6]string{"acme/web#1", "Fix the login redirect", "https://example.test/acme/web/issues/1", "timer", "Bug", "In Review"}
+			if gotFacts != wantFacts {
+				t.Errorf("Retrying[0] display id, title, url, trigger, type, state = %q, want %q", gotFacts, wantFacts)
+			}
+			if !slices.Equal(got.IssueLabels, tt.labels) || (got.IssueLabels == nil) != (tt.labels == nil) {
+				t.Errorf("Retrying[0].IssueLabels = %#v, want %#v", got.IssueLabels, tt.labels)
+			}
+			if got.ConfiguredModel != "model-x" || !got.StageLineage.DispatchedAt.Equal(passAt) {
+				t.Errorf("Retrying[0] model, dispatched at = %q, %v, want %q, %v", got.ConfiguredModel, got.StageLineage.DispatchedAt, "model-x", passAt)
+			}
+		})
+	}
+}
+
 var recoveryNow = time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 
-// writeRecoverySCM writes meta as .sortie/scm.json inside <wsRoot>/<key>.
-// The directory is created if absent. key is the sanitized identifier (e.g. "PROJ-1").
 func writeRecoverySCM(t *testing.T, wsRoot, key string, meta domain.SCMMetadata) {
 	t.Helper()
 	dir := filepath.Join(wsRoot, key, ".sortie")
@@ -620,12 +679,10 @@ func writeRecoverySCM(t *testing.T, wsRoot, key string, meta domain.SCMMetadata)
 	}
 }
 
-// freshSCMTime returns an RFC3339 timestamp that is within the 30-day lookback.
 func freshSCMTime(daysAgo int) string {
 	return recoveryNow.Add(-time.Duration(daysAgo) * 24 * time.Hour).UTC().Format(time.RFC3339)
 }
 
-// freshRun builds a persistence.RunHistory for recovery tests.
 func freshRun(issueID, identifier, displayID string, attempt int) persistence.RunHistory {
 	return persistence.RunHistory{
 		IssueID:      issueID,
@@ -640,7 +697,6 @@ func freshRun(issueID, identifier, displayID string, attempt int) persistence.Ru
 	}
 }
 
-// recoveryTrackerStub satisfies domain.TrackerAdapter; returns a configurable state map.
 type recoveryTrackerStub struct {
 	states     map[string]string
 	err        error
@@ -655,6 +711,8 @@ func (s *recoveryTrackerStub) FetchIssuesByStates(_ context.Context, _ []string)
 func (s *recoveryTrackerStub) FetchCandidateIssues(_ context.Context) ([]domain.Issue, error) {
 	return nil, nil
 }
+
+func (s *recoveryTrackerStub) SetTrackerStates(func() domain.TrackerStates) {}
 func (s *recoveryTrackerStub) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
@@ -683,9 +741,14 @@ func (s *recoveryTrackerStub) TransitionIssue(_ context.Context, _ string, _ str
 func (s *recoveryTrackerStub) CommentIssue(_ context.Context, _ string, _ string) error {
 	return nil
 }
+func (s *recoveryTrackerStub) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
 func (s *recoveryTrackerStub) AddLabel(_ context.Context, _ string, _ string) error {
 	return nil
 }
+
+func (s *recoveryTrackerStub) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 // panicSCMAdapter panics if any method is called, asserting recovery makes no SCM calls.
 type panicSCMAdapter struct{}
@@ -801,6 +864,8 @@ func defaultRecoveryParams(wsRoot string, tracker domain.TrackerAdapter) Pending
 		MaxCandidates:    PendingReactionRecoveryMaxCandidates,
 		NowFunc:          func() time.Time { return recoveryNow },
 		Logger:           discardLogger(),
+
+		ReviewReactionConfigured: true,
 	}
 }
 
@@ -820,6 +885,9 @@ func TestRecoverPendingReactions_RecreatesReviewAfterRestart(t *testing.T) {
 	tracker := &recoveryTrackerStub{states: map[string]string{"ISS-1": "In Review"}}
 	state := NewState(5000, 4, 0, nil, AgentTotals{})
 	run := freshRun("ISS-1", "PROJ-1", "owner/repo#42", 2)
+	run.RuleName = "cheap"
+	run.ConfiguredModel = "model-a"
+	run.StagePrevious, run.StagePreviousOutcome, run.ChainID = "specify", "no_change", "chain-1"
 	params := defaultRecoveryParams(wsRoot, tracker)
 
 	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
@@ -840,6 +908,12 @@ func TestRecoverPendingReactions_RecreatesReviewAfterRestart(t *testing.T) {
 	}
 	if pr.Attempt != 2 {
 		t.Errorf("PendingReaction.Attempt = %d, want 2", pr.Attempt)
+	}
+	if pr.RuleName != "cheap" || pr.RuleSettingsApplied {
+		t.Errorf("PendingReaction rule, flag = %q, %v, want %q, false: a restored claim starts without the flag", pr.RuleName, pr.RuleSettingsApplied, "cheap")
+	}
+	if want := (StageLineage{PreviousRule: "specify", PreviousOutcome: "no_change", ChainID: "chain-1"}); pr.StageLineage != want {
+		t.Errorf("PendingReaction.StageLineage = %+v, want %+v", pr.StageLineage, want)
 	}
 	if pr.DisplayID != "owner/repo#42" {
 		t.Errorf("PendingReaction.DisplayID = %q, want %q", pr.DisplayID, "owner/repo#42")
@@ -886,6 +960,7 @@ func TestRecoverPendingReactions_RecreatesCIAfterRestart(t *testing.T) {
 	state := NewState(5000, 4, 0, nil, AgentTotals{})
 	run := freshRun("ISS-2", "PROJ-2", "", 1)
 	params := defaultRecoveryParams(wsRoot, tracker)
+	params.ReviewReactionConfigured = false
 
 	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
 	if err != nil {
@@ -893,6 +968,12 @@ func TestRecoverPendingReactions_RecreatesCIAfterRestart(t *testing.T) {
 	}
 	if result.CIRecovered != 1 {
 		t.Errorf("CIRecovered = %d, want 1", result.CIRecovered)
+	}
+	if result.ReviewRecovered != 0 {
+		t.Errorf("ReviewRecovered = %d, want 0 without the review reaction configured", result.ReviewRecovered)
+	}
+	if _, ok := state.PendingReactions[ReactionKey("ISS-2", ReactionKindReview)]; ok {
+		t.Error("PendingReactions[ISS-2:review] present, want absent without the review reaction configured")
 	}
 
 	rkey := ReactionKey("ISS-2", ReactionKindCI)
@@ -1712,143 +1793,41 @@ func TestRecoverPendingReactions_BotReviewNotRecoveredWhenFlagFalse(t *testing.T
 	}
 }
 
-// TestRecoverPendingReactions_BotReviewMissingPRNumber verifies that a row missing
-// PRNumber (zero) recovers no bot-review entry even when BotReviewReactionConfigured=true.
-func TestRecoverPendingReactions_BotReviewMissingPRNumber(t *testing.T) {
+func TestRecoverPendingReactions_BotReviewMissingPRIdentity(t *testing.T) {
 	t.Parallel()
 
-	wsRoot := t.TempDir()
-	writeRecoverySCM(t, wsRoot, "PROJ-BRNPR", domain.SCMMetadata{
-		Branch:   "feature/no-pr",
-		SHA:      "abc",
-		PushedAt: freshSCMTime(1),
-		// PRNumber intentionally zero.
-		Owner: "o",
-		Repo:  "r",
-	})
-
-	tracker := &recoveryTrackerStub{states: map[string]string{"ISS-BRNPR": "In Review"}}
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	run := freshRun("ISS-BRNPR", "PROJ-BRNPR", "", 1)
-	params := defaultRecoveryParams(wsRoot, tracker)
-	params.BotReviewReactionConfigured = true
-
-	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
-	if err != nil {
-		t.Fatalf("RecoverPendingReactions: %v", err)
-	}
-	if result.BotReviewRecovered != 0 {
-		t.Errorf("BotReviewRecovered = %d, want 0 for missing PRNumber", result.BotReviewRecovered)
+	tests := []struct {
+		name string
+		meta domain.SCMMetadata
+	}{
+		{name: "PRNumber", meta: domain.SCMMetadata{Branch: "feature/x", SHA: "abc", Owner: "o", Repo: "r"}},
+		{name: "Owner", meta: domain.SCMMetadata{Branch: "feature/x", SHA: "abc", PRNumber: 5, Repo: "r"}},
+		{name: "Repo", meta: domain.SCMMetadata{Branch: "feature/x", SHA: "abc", PRNumber: 5, Owner: "o"}},
+		{name: "Branch", meta: domain.SCMMetadata{SHA: "abc", PRNumber: 5, Owner: "o", Repo: "r"}},
 	}
 
-	rkey := ReactionKey("ISS-BRNPR", ReactionKindBotReview)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("bot-review PendingReactions entry created with zero PRNumber; want absent")
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-// TestRecoverPendingReactions_BotReviewMissingOwner verifies that a row missing
-// Owner recovers no bot-review entry.
-func TestRecoverPendingReactions_BotReviewMissingOwner(t *testing.T) {
-	t.Parallel()
+			wsRoot := t.TempDir()
+			tt.meta.PushedAt = freshSCMTime(1)
+			writeRecoverySCM(t, wsRoot, "PROJ-BRID", tt.meta)
+			tracker := &recoveryTrackerStub{states: map[string]string{"ISS-BRID": "In Review"}}
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			run := freshRun("ISS-BRID", "PROJ-BRID", "", 1)
+			params := defaultRecoveryParams(wsRoot, tracker)
+			params.BotReviewReactionConfigured = true
 
-	wsRoot := t.TempDir()
-	writeRecoverySCM(t, wsRoot, "PROJ-BRNOWN", domain.SCMMetadata{
-		Branch:   "feature/no-owner",
-		SHA:      "abc",
-		PushedAt: freshSCMTime(1),
-		PRNumber: 5,
-		// Owner intentionally empty.
-		Repo: "r",
-	})
+			result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
 
-	tracker := &recoveryTrackerStub{states: map[string]string{"ISS-BRNOWN": "In Review"}}
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	run := freshRun("ISS-BRNOWN", "PROJ-BRNOWN", "", 1)
-	params := defaultRecoveryParams(wsRoot, tracker)
-	params.BotReviewReactionConfigured = true
-
-	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
-	if err != nil {
-		t.Fatalf("RecoverPendingReactions: %v", err)
-	}
-	if result.BotReviewRecovered != 0 {
-		t.Errorf("BotReviewRecovered = %d, want 0 for missing Owner", result.BotReviewRecovered)
-	}
-
-	rkey := ReactionKey("ISS-BRNOWN", ReactionKindBotReview)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("bot-review PendingReactions entry created with empty Owner; want absent")
-	}
-}
-
-// TestRecoverPendingReactions_BotReviewMissingRepo verifies that a row missing
-// Repo recovers no bot-review entry.
-func TestRecoverPendingReactions_BotReviewMissingRepo(t *testing.T) {
-	t.Parallel()
-
-	wsRoot := t.TempDir()
-	writeRecoverySCM(t, wsRoot, "PROJ-BRNREP", domain.SCMMetadata{
-		Branch:   "feature/no-repo",
-		SHA:      "abc",
-		PushedAt: freshSCMTime(1),
-		PRNumber: 5,
-		Owner:    "o",
-		// Repo intentionally empty.
-	})
-
-	tracker := &recoveryTrackerStub{states: map[string]string{"ISS-BRNREP": "In Review"}}
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	run := freshRun("ISS-BRNREP", "PROJ-BRNREP", "", 1)
-	params := defaultRecoveryParams(wsRoot, tracker)
-	params.BotReviewReactionConfigured = true
-
-	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
-	if err != nil {
-		t.Fatalf("RecoverPendingReactions: %v", err)
-	}
-	if result.BotReviewRecovered != 0 {
-		t.Errorf("BotReviewRecovered = %d, want 0 for missing Repo", result.BotReviewRecovered)
-	}
-
-	rkey := ReactionKey("ISS-BRNREP", ReactionKindBotReview)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("bot-review PendingReactions entry created with empty Repo; want absent")
-	}
-}
-
-// TestRecoverPendingReactions_BotReviewMissingBranch verifies that a row missing
-// Branch recovers no bot-review entry.
-func TestRecoverPendingReactions_BotReviewMissingBranch(t *testing.T) {
-	t.Parallel()
-
-	wsRoot := t.TempDir()
-	writeRecoverySCM(t, wsRoot, "PROJ-BRNBRA", domain.SCMMetadata{
-		// Branch intentionally empty.
-		SHA:      "abc",
-		PushedAt: freshSCMTime(1),
-		PRNumber: 5,
-		Owner:    "o",
-		Repo:     "r",
-	})
-
-	tracker := &recoveryTrackerStub{states: map[string]string{"ISS-BRNBRA": "In Review"}}
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	run := freshRun("ISS-BRNBRA", "PROJ-BRNBRA", "", 1)
-	params := defaultRecoveryParams(wsRoot, tracker)
-	params.BotReviewReactionConfigured = true
-
-	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, params)
-	if err != nil {
-		t.Fatalf("RecoverPendingReactions: %v", err)
-	}
-	if result.BotReviewRecovered != 0 {
-		t.Errorf("BotReviewRecovered = %d, want 0 for missing Branch", result.BotReviewRecovered)
-	}
-
-	rkey := ReactionKey("ISS-BRNBRA", ReactionKindBotReview)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("bot-review PendingReactions entry created with empty Branch; want absent")
+			if err != nil {
+				t.Fatalf("RecoverPendingReactions: %v", err)
+			}
+			if _, ok := state.PendingReactions[ReactionKey("ISS-BRID", ReactionKindBotReview)]; ok || result.BotReviewRecovered != 0 {
+				t.Errorf("RecoverPendingReactions(missing %s) recovered %d bot-review entries, want none", tt.name, result.BotReviewRecovered)
+			}
+		})
 	}
 }
 
@@ -2424,5 +2403,152 @@ func TestRecoverPendingReactions_MergeCompletionSkipsWhenHandoffStateUnset(t *te
 	rkey := ReactionKey("ISS-MGC3", ReactionKindMergeCompletion)
 	if _, ok := state.PendingReactions[rkey]; ok {
 		t.Error("merge-completion PendingReactions entry created despite unset tracker.handoff_state")
+	}
+}
+
+func TestRestoreReactionEscalations(t *testing.T) {
+	t.Parallel()
+
+	rigs := escRigs()
+	newHead := func(w *escWorld) { w.scm.result.HeadSHA = "head-2" }
+	tests := []struct {
+		name         string
+		kind         string
+		trigger      ReactionEscalationTrigger
+		recovered    bool
+		unconfigured bool
+		noRunRow     bool
+		change       func(*escWorld)
+		tick         bool
+		wantApplied  int
+		wantRebuilt  int
+		wantEnded    int
+		verify       func(*testing.T, *escWorld)
+	}{
+		{
+			name: "budget escalation of a red head survives recovery and schedules no fix", kind: ReactionKindCI, trigger: EscalationTriggerBudget,
+			recovered: true, wantApplied: 1,
+			verify: func(t *testing.T, w *escWorld) {
+				if !w.escalationStands(t) || len(w.state.RetryAttempts) != 0 || w.tracker.actions() != 0 {
+					t.Errorf("after a failing pass: stands = %t, retries = %d, tracker actions = %d, want a standing escalation with no fix and no action", w.escalationStands(t), len(w.state.RetryAttempts), w.tracker.actions())
+				}
+			},
+		},
+		{
+			name: "triage escalation of a skipped issue is rebuilt and ends on a passing verdict", kind: ReactionKindCI, trigger: EscalationTriggerTriage,
+			wantRebuilt: 1, change: func(w *escWorld) { w.ci.result = domain.CIResult{Status: domain.CIStatusPassing} },
+			verify: func(t *testing.T, w *escWorld) {
+				if w.escalationStands(t) {
+					t.Error("escalation after a passing verdict stands, want ended")
+				}
+			},
+		},
+		{
+			name: "refused merge completion makes one transition call and ends on success", kind: ReactionKindMergeCompletion, trigger: EscalationTriggerRefused,
+			wantRebuilt: 1,
+			verify: func(t *testing.T, w *escWorld) {
+				if calls := len(w.tracker.transitionCalls); calls != 1 || w.escalationStands(t) {
+					t.Errorf("transition calls = %d, stands = %t, want 1 call and an ended escalation", calls, w.escalationStands(t))
+				}
+			},
+		},
+		{
+			name: "issue read outside the handoff state ends before any pass", kind: ReactionKindCI, trigger: EscalationTriggerBudget,
+			wantRebuilt: 1, tick: true,
+			change: func(w *escWorld) {
+				w.tracker.fetchStatesFn = func(context.Context, []string) (map[string]string, error) {
+					return map[string]string{escIssue: "In Progress"}, nil
+				}
+				w.tracker.fetchIssueByIDFn = func(context.Context, string) (domain.Issue, error) {
+					return domain.Issue{ID: escIssue, State: "In Progress"}, nil
+				}
+			},
+			verify: func(t *testing.T, w *escWorld) {
+				if w.ci.calls != 0 || len(w.state.PendingReactions) != 0 || w.escalationStands(t) {
+					t.Errorf("CI reads = %d, entries = %d, stands = %t, want no pass over an ended escalation", w.ci.calls, len(w.state.PendingReactions), w.escalationStands(t))
+				}
+			},
+		},
+		{name: "kind no longer configured ends the record", kind: ReactionKindReview, trigger: EscalationTriggerBudget, unconfigured: true, wantEnded: 1},
+		{name: "issue without a successful run ends the record", kind: ReactionKindCI, trigger: EscalationTriggerBudget, noRunRow: true, wantEnded: 1},
+		{
+			name: "new head on a restored ci escalation resets the counter and fixes", kind: ReactionKindCI, trigger: EscalationTriggerBudget,
+			wantRebuilt: 1, change: newHead,
+			verify: func(t *testing.T, w *escWorld) {
+				if _, scheduled := w.state.RetryAttempts[escIssue]; !scheduled || w.tracker.actions() != 0 {
+					t.Errorf("fix scheduled = %t, tracker actions = %d, want a scheduled fix and no escalation action", scheduled, w.tracker.actions())
+				}
+			},
+		},
+		{
+			name: "new head on a restored merge-conflict escalation resets the counter and rebases", kind: ReactionKindMergeConflict, trigger: EscalationTriggerBudget,
+			wantRebuilt: 1, change: newHead,
+			verify: func(t *testing.T, w *escWorld) {
+				if _, scheduled := w.state.RetryAttempts[escIssue]; !scheduled || w.tracker.actions() != 0 {
+					t.Errorf("rebase scheduled = %t, tracker actions = %d, want a scheduled rebase and no escalation action", scheduled, w.tracker.actions())
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			rig := rigs[tt.kind]
+			w := newEscWorld(t, tt.kind, rig, tt.trigger)
+			w.state = NewState(5000, 4, 0, nil, AgentTotals{})
+			run := freshRun(escIssue, "PROJ-1", "", 1)
+			if !tt.noRunRow {
+				if _, err := w.store.AppendRunHistory(ctx, run); err != nil {
+					t.Fatalf("AppendRunHistory: %v", err)
+				}
+			}
+			wsRoot := t.TempDir()
+			params := defaultRecoveryParams(wsRoot, &recoveryTrackerStub{states: map[string]string{escIssue: escHandoff}})
+			params.NowFunc = func() time.Time { return w.now }
+			params.ReviewReactionConfigured = !tt.unconfigured
+			params.AutoMergeReactionConfigured, params.BotReviewReactionConfigured = true, true
+			params.MergeConflictReactionConfigured, params.MergeCompletionReactionConfigured = true, true
+			if tt.recovered {
+				writeRecoverySCM(t, wsRoot, "PROJ-1", domain.SCMMetadata{
+					Branch: "feat", SHA: "head-1", PushedAt: w.now.Add(-time.Hour).Format(time.RFC3339), PRNumber: 99, Owner: "acme", Repo: "widgets",
+				})
+				if _, err := RecoverPendingReactions(ctx, w.state, []persistence.RunHistory{run}, params); err != nil {
+					t.Fatalf("RecoverPendingReactions: %v", err)
+				}
+			}
+
+			got, err := RestoreReactionEscalations(ctx, w.state, w.store, params)
+
+			if err != nil {
+				t.Fatalf("RestoreReactionEscalations: %v", err)
+			}
+			if want := (ReactionEscalationRestoreResult{Applied: tt.wantApplied, Rebuilt: tt.wantRebuilt, Ended: tt.wantEnded}); got != want {
+				t.Fatalf("RestoreReactionEscalations() = %+v, want %+v", got, want)
+			}
+			entry := w.state.PendingReactions[w.key]
+			if tt.wantEnded != 0 {
+				if entry != nil || w.escalationStands(t) {
+					t.Errorf("entry = %v, record stands = %t, want neither", entry, w.escalationStands(t))
+				}
+				return
+			}
+			if entry == nil || !entry.EscalatedAt.Equal(w.at) || entry.EscalationTrigger != tt.trigger || w.state.ReactionAttempts[w.key] != rig.counters[tt.trigger] {
+				t.Fatalf("restored entry = %+v, counter = %d, want escalated at %v by %q with counter %d", entry, w.state.ReactionAttempts[w.key], w.at, tt.trigger, rig.counters[tt.trigger])
+			}
+
+			if tt.change != nil {
+				tt.change(w)
+			}
+			if tt.tick {
+				ReconcileRunningIssues(w.state, w.params)
+			} else {
+				w.runPasses(rig, 1)
+			}
+
+			tt.verify(t, w)
+		})
 	}
 }

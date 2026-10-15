@@ -9,6 +9,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
@@ -24,6 +25,8 @@ type ReconcileStore interface {
 	GetReactionFingerprint(ctx context.Context, issueID, kind string) (fingerprint string, dispatched bool, err error)
 	MarkReactionDispatched(ctx context.Context, issueID, kind string) error
 	DeleteReactionFingerprint(ctx context.Context, issueID, kind string) error
+	AddReactionHandedOffComments(ctx context.Context, issueID, kind string, commentIDs []string) error
+	ListReactionHandedOffComments(ctx context.Context, issueID, kind string) ([]string, error)
 	UpsertReactionObservation(
 		ctx context.Context,
 		issueID, kind, fingerprint string,
@@ -31,6 +34,12 @@ type ReconcileStore interface {
 	) (persistence.ReactionObservation, error)
 	MarkReactionObservationDispatched(ctx context.Context, issueID, kind, fingerprint string) error
 	CountWorkerRunsCompletedSince(ctx context.Context, issueID string, since time.Time) (int, error)
+	DeleteStageHop(ctx context.Context, issueID string) error
+	RecordIssueOutcome(ctx context.Context, outcome persistence.IssueOutcome) error
+	GetReactionEscalation(ctx context.Context, issueID, kind string) (persistence.ReactionEscalation, bool, error)
+	SaveReactionEscalation(ctx context.Context, rec persistence.ReactionEscalation) error
+	EndReactionEscalation(ctx context.Context, issueID, kind string) error
+	DeleteReactionEscalations(ctx context.Context, issueID string) error
 }
 
 var _ ReconcileStore = (*persistence.Store)(nil)
@@ -41,6 +50,10 @@ var _ ReconcileStore = (*persistence.Store)(nil)
 type ReconcileParams struct {
 	// TrackerAdapter fetches current issue states for running issues.
 	TrackerAdapter domain.TrackerAdapter
+
+	// Router selects the destinations of the events the reaction
+	// escalations publish. Nil routes nothing.
+	Router *route.Router
 
 	// ActiveStates is the current list of configured active issue states.
 	ActiveStates []string
@@ -247,7 +260,7 @@ func ReconcileRunningIssues(state *State, params ReconcileParams) {
 
 	// Refresh issue states from the tracker and stop workers for
 	// terminal or non-active issues.
-	reconcileTrackerState(state, params, log, ctx, metrics)
+	reconcileTrackerState(state, params, log, ctx, now, metrics)
 
 	// Poll CI status for issues with pending CI checks.
 	reconcileCIStatus(state, params, log, ctx, metrics)
@@ -319,6 +332,7 @@ func reconcileOverdueRetries(state *State, params ReconcileParams, log *slog.Log
 
 		overdueMS := now.UnixMilli() - entry.DueAtMS
 		pausedSinceMS := entry.pausedSinceMS
+		dueBeforeRequestMS := entry.dueBeforeRequestMS
 		entryLog := logging.WithIssue(log, issueID, entry.Identifier)
 
 		CancelRetry(state, issueID)
@@ -326,20 +340,28 @@ func reconcileOverdueRetries(state *State, params ReconcileParams, log *slog.Log
 			IssueID:             issueID,
 			Identifier:          entry.Identifier,
 			DisplayID:           entry.DisplayID,
+			IssueIdentity:       entry.IssueIdentity,
 			Attempt:             entry.Attempt,
 			Error:               entry.Error,
 			LastSSHHost:         entry.LastSSHHost,
 			SessionID:           entry.SessionID,
 			ContinuationContext: entry.ContinuationContext,
 			ReactionKind:        entry.ReactionKind,
+			Continuation:        entry.Continuation,
 			AgentKind:           entry.AgentKind,
+			ConfiguredModel:     entry.ConfiguredModel,
 			RuleName:            entry.RuleName,
+			StageLineage:        entry.StageLineage,
+			RuleSettingsApplied: entry.RuleSettingsApplied,
 			TemplateID:          entry.TemplateID,
 			Logger:              entryLog,
+			Trigger:             entry.Trigger,
+			OriginTrigger:       entry.OriginTrigger,
 		}, params.OnRetryFire)
 
 		if rearmed, ok := state.RetryAttempts[issueID]; ok {
 			rearmed.pausedSinceMS = pausedSinceMS
+			rearmed.dueBeforeRequestMS = dueBeforeRequestMS
 		}
 
 		entryLog.Warn("overdue retry re-armed",
@@ -393,6 +415,7 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 			IssueID:             issueID,
 			Identifier:          entry.Identifier,
 			DisplayID:           entry.Issue.DisplayID,
+			IssueIdentity:       issueIdentityOf(entry.Issue),
 			Attempt:             nextAttempt,
 			DelayMS:             delayMS,
 			Error:               "stall timeout exceeded",
@@ -400,10 +423,15 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 			SessionID:           entry.SessionID,
 			ContinuationContext: entry.ContinuationContext,
 			ReactionKind:        entry.ReactionKind,
+			Continuation:        entry.Continuation,
 			AgentKind:           entry.AgentKind,
+			ConfiguredModel:     entry.ConfiguredModel,
 			RuleName:            entry.RuleName,
+			StageLineage:        entry.StageLineage,
+			RuleSettingsApplied: entry.RuleSettingsApplied,
 			TemplateID:          entry.TemplateID,
 			Logger:              entryLog,
+			Trigger:             triggerStall,
 		}, params.OnRetryFire)
 		metrics.IncRetries(triggerStall)
 
@@ -417,16 +445,8 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 				continue
 			}
 
-			pEntry := persistence.RetryEntry{
-				IssueID:    retryEntry.IssueID,
-				Identifier: retryEntry.Identifier,
-				Attempt:    retryEntry.Attempt,
-				DueAtMs:    retryEntry.DueAtMS,
-				Error:      stringPtr(retryEntry.Error),
-				RuleName:   retryEntry.RuleName,
-				TemplateID: retryEntry.TemplateID,
-				AgentKind:  retryEntry.AgentKind,
-			}
+			pEntry := retryEntryRow(retryEntry)
+			pEntry.SessionID = nil
 			if err := params.Store.SaveRetryEntry(ctx, pEntry); err != nil {
 				entryLog.Error("failed to persist stall retry entry",
 					slog.Any("error", err),
@@ -437,18 +457,22 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 }
 
 // trackerObservationIDs returns the deduplicated issue ids whose tracker
-// state [reconcileTrackerState] must refresh: every id in state.Running
-// plus every issue id carried by an entry in state.PendingReactions.
+// state [reconcileTrackerState] must refresh: every id in state.Running,
+// every issue id carried by an entry in state.PendingReactions, and every
+// id holding a stage hop record.
 //
-// Returns an empty slice when both inputs are empty; callers must treat
+// Returns an empty slice when all inputs are empty; callers must treat
 // that as "make no tracker call".
 func trackerObservationIDs(state *State) []string {
-	seen := make(map[string]struct{}, len(state.Running)+len(state.PendingReactions))
+	seen := make(map[string]struct{}, len(state.Running)+len(state.PendingReactions)+len(state.StageHops))
 	for id := range state.Running {
 		seen[id] = struct{}{}
 	}
 	for _, entry := range state.PendingReactions {
 		seen[entry.IssueID] = struct{}{}
+	}
+	for id := range state.StageHops {
+		seen[id] = struct{}{}
 	}
 
 	ids := make([]string, 0, len(seen))
@@ -471,30 +495,39 @@ func pendingReactionIdentifier(state *State, issueID string) string {
 	return ""
 }
 
-// terminalReleaseCounts reports one [releaseTerminalIssueState] call's
+// issueReleaseCounts reports one [releaseIssueRuntimeState] call's
 // outcome, so the caller can log a single record and suppress it when
 // nothing was released.
-type terminalReleaseCounts struct {
+type issueReleaseCounts struct {
 	PendingReleased  int
 	AttemptsReleased int
 	ClaimReleased    bool
 	RetryCancelled   bool
 }
 
-// releaseTerminalIssueState drops one issue's runtime reaction bookkeeping
+// retryEntryDeleter is the pair of store methods [releaseIssueRuntimeState]
+// needs: the issue's persisted retry and its escalation records.
+type retryEntryDeleter interface {
+	DeleteRetryEntry(ctx context.Context, issueID string) error
+	DeleteReactionEscalations(ctx context.Context, issueID string) error
+}
+
+// releaseIssueRuntimeState drops one issue's runtime reaction bookkeeping
 // and its dispatch claim: every pending reaction entry, every reaction
-// attempt counter, the pending retry, and the claim. It performs no
-// tracker call, no source-control call, no reaction-fingerprint read or
-// write, and no workspace removal.
+// attempt counter, every cached handed-off and reported comment set, the
+// pending retry, the escalation records, and the claim. The stored
+// handed-off rows stay. It
+// performs no tracker call, no source-control call, no reaction-fingerprint
+// read or write, and no workspace removal.
 //
 // entryLog must already carry issue_id and issue_identifier, derived by
 // the caller before this function deletes the entries that hold the
-// identifier. Calling releaseTerminalIssueState twice for the same issue
-// is safe: the second call returns a zero-valued [terminalReleaseCounts].
-func releaseTerminalIssueState(ctx context.Context, state *State, store ReconcileStore, issueID string, entryLog *slog.Logger) terminalReleaseCounts {
+// identifier. Calling releaseIssueRuntimeState twice for the same issue
+// is safe: the second call returns a zero-valued [issueReleaseCounts].
+func releaseIssueRuntimeState(ctx context.Context, state *State, store retryEntryDeleter, issueID string, entryLog *slog.Logger) issueReleaseCounts {
 	prefix := issueID + ":"
 
-	var counts terminalReleaseCounts
+	var counts issueReleaseCounts
 	for key, entry := range state.PendingReactions {
 		if !strings.HasPrefix(key, prefix) {
 			continue
@@ -511,6 +544,16 @@ func releaseTerminalIssueState(ctx context.Context, state *State, store Reconcil
 			counts.AttemptsReleased++
 		}
 	}
+	for key := range state.ReactionHandedOffComments {
+		if strings.HasPrefix(key, prefix) {
+			delete(state.ReactionHandedOffComments, key)
+		}
+	}
+	for key := range state.ReactionReportedComments {
+		if strings.HasPrefix(key, prefix) {
+			delete(state.ReactionReportedComments, key)
+		}
+	}
 
 	if _, exists := state.RetryAttempts[issueID]; exists {
 		CancelRetry(state, issueID)
@@ -519,7 +562,14 @@ func releaseTerminalIssueState(ctx context.Context, state *State, store Reconcil
 	// Deleted unconditionally: a persisted row can outlive its in-memory
 	// entry across a restart.
 	if err := store.DeleteRetryEntry(ctx, issueID); err != nil {
-		entryLog.Error("failed to delete retry entry for terminal issue",
+		entryLog.Error("failed to delete retry entry from store",
+			slog.Any("error", err),
+		)
+	}
+	// Deleted unconditionally, like the retry row: a record can outlive its
+	// entry across a restart.
+	if err := store.DeleteReactionEscalations(ctx, issueID); err != nil {
+		entryLog.Warn("failed to delete reaction escalation records",
 			slog.Any("error", err),
 		)
 	}
@@ -532,11 +582,22 @@ func releaseTerminalIssueState(ctx context.Context, state *State, store Reconcil
 }
 
 // reconcileTrackerState fetches current issue states for every running
-// issue and every issue holding a pending reaction entry, cancels workers
-// whose issues are terminal or no longer active, and releases the runtime
-// reaction bookkeeping of any issue the tracker reports terminal, whether
-// or not that issue has a running worker.
-func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logger, ctx context.Context, metrics domain.Metrics) {
+// issue, every issue holding a pending reaction entry, and every issue
+// holding a stage hop record, cancels workers whose issues are terminal or
+// no longer active, and releases the runtime reaction bookkeeping of any
+// issue the tracker reports terminal, whether or not that issue has a
+// running worker. An issue the tracker reports outside the active states
+// loses its stage hop record.
+//
+// An issue reported in no state (an empty state name) is acted on only at
+// its second consecutive such reading, because a person's label edit can
+// pass through zero state labels for a moment.
+//
+// An issue with no worker that the tracker reports outside the handoff
+// state, and that holds a standing escalation, is not left untouched: a
+// person's move has answered the escalation, and [endOutsideHandoff] ends it
+// once a direct read confirms the reading.
+func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logger, ctx context.Context, now time.Time, metrics domain.Metrics) {
 	if params.TrackerAdapter == nil {
 		return
 	}
@@ -559,10 +620,32 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 
 	for issueID, stateName := range refreshed {
 		entry := state.Running[issueID]
+		hop := state.StageHops[issueID]
+
+		hasNoState := stateName == ""
+		if !hasNoState {
+			clearNoStateObserved(entry, hop)
+		}
 
 		normalized := strings.ToLower(stateName)
+		_, isTerminal := terminalSet[normalized]
+		_, isActive := activeSet[normalized]
 
-		if _, terminal := terminalSet[normalized]; terminal {
+		if hop != nil {
+			hopLog := logging.WithIssue(log, issueID, hop.Identifier)
+			switch {
+			case isTerminal:
+				resetStageHop(ctx, state, params.Store, issueID, stageResetTerminal, hopLog)
+			case hasNoState:
+				if confirmNoState(&hop.NoStateObserved) {
+					resetStageHop(ctx, state, params.Store, issueID, stageResetNotActive, hopLog)
+				}
+			case !isActive:
+				resetStageHop(ctx, state, params.Store, issueID, stageResetNotActive, hopLog)
+			}
+		}
+
+		if isTerminal {
 			identifier := pendingReactionIdentifier(state, issueID)
 			if entry != nil {
 				identifier = entry.Identifier
@@ -573,12 +656,15 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 				continue
 			}
 
-			var counts terminalReleaseCounts
+			watch, _ := pendingMergeWatch(state, issueID)
+			recordIssueOutcome(ctx, params.Store, releaseReadOutcome(ctx, params.SCMAdapter, watch, issueID, stateName, now, entryLog), entryLog)
+
+			var counts issueReleaseCounts
 			if entry != nil {
 				if entry.CancelFunc != nil {
 					entry.CancelFunc()
 				}
-				counts = releaseTerminalIssueState(ctx, state, params.Store, issueID, entryLog)
+				counts = releaseIssueRuntimeState(ctx, state, params.Store, issueID, entryLog)
 				entry.PendingCleanup = true
 				entry.ObservedTerminalState = stateName
 				metrics.IncReconciliationActions(actionCleanup)
@@ -586,7 +672,7 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 					slog.String("state", stateName),
 				)
 			} else {
-				counts = releaseTerminalIssueState(ctx, state, params.Store, issueID, entryLog)
+				counts = releaseIssueRuntimeState(ctx, state, params.Store, issueID, entryLog)
 			}
 
 			if counts.PendingReleased > 0 || counts.AttemptsReleased > 0 || counts.ClaimReleased || counts.RetryCancelled {
@@ -601,13 +687,21 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 			continue
 		}
 
+		endOutsideHandoff(ctx, state, params.Store, params.TrackerAdapter, issueID, stateName, params.HandoffState, params.TerminalStates, log)
+
 		if entry == nil {
 			continue
 		}
 
 		entryLog := logging.WithIssue(log, issueID, entry.Identifier)
 
-		if _, active := activeSet[normalized]; active {
+		if hasNoState && !confirmNoState(&entry.NoStateObserved) {
+			metrics.IncReconciliationActions(actionKeep)
+			entryLog.Info("deferred stop for issue without a state label")
+			continue
+		}
+
+		if isActive {
 			entry.Issue.State = stateName
 			metrics.IncReconciliationActions(actionKeep)
 			entryLog.Debug("refreshed issue state",
@@ -648,6 +742,28 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 		entryLog.Info("stopping worker for non-active issue",
 			slog.String("state", stateName),
 		)
+	}
+}
+
+// confirmNoState records a no-state reading in flag and reports whether
+// the previous reading of the same record was also a no-state one. The
+// first reading sets the flag and returns false.
+func confirmNoState(flag *bool) bool {
+	if *flag {
+		return true
+	}
+	*flag = true
+	return false
+}
+
+// clearNoStateObserved resets the no-state flags of the records an issue
+// holds, after a reading in a state. Either record may be nil.
+func clearNoStateObserved(entry *RunningEntry, hop *StageHopEntry) {
+	if entry != nil {
+		entry.NoStateObserved = false
+	}
+	if hop != nil {
+		hop.NoStateObserved = false
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
@@ -32,8 +33,6 @@ func init() {
 		RequiresProject:       true,
 		RequiresAPIKey:        true,
 		ValidateTrackerConfig: validateConfig,
-		DefaultActiveStates:   defaultActiveStates,
-		DefaultTerminalStates: defaultTerminalStates,
 		BlockerSource:         registry.BlockersFromCandidates,
 	})
 }
@@ -51,25 +50,17 @@ const topLevelPageSize = 50
 // request.
 const stateBatchChunkSize = 50
 
-// defaultActiveStates is applied when the config omits active_states.
-var defaultActiveStates = []string{"Backlog", "Todo", "In Progress"}
-
-// defaultTerminalStates is applied when the config omits terminal_states.
-var defaultTerminalStates = []string{"Done", "Canceled", "Duplicate"}
-
 // LinearAdapter implements [domain.TrackerAdapter] against Linear. All fields
-// except metrics are set once at construction and never mutated, so the adapter
-// is safe for concurrent use.
+// except metrics and the state source are set once at construction and never
+// mutated, so the adapter is safe for concurrent use.
 type LinearAdapter struct {
-	client         graphQLClient
-	project        string
-	activeStates   []string
-	terminalStates []string
-	handoffState   string
-	queryFilter    map[string]any
-	casingCache    map[string]string
-	log            *slog.Logger
-	metrics        domain.Metrics
+	*issuekit.StateSource
+	client      graphQLClient
+	project     string
+	queryFilter map[string]any
+	casingCache map[string]string
+	log         *slog.Logger
+	metrics     domain.Metrics
 }
 
 // NewLinearAdapter creates a [LinearAdapter] from adapter configuration.
@@ -117,17 +108,9 @@ func NewLinearAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		}
 	}
 
-	activeStates := typeutil.ExtractStringSlice(config["active_states"])
-	if len(activeStates) == 0 {
-		activeStates = defaultActiveStates
-	}
-	terminalStates := typeutil.ExtractStringSlice(config["terminal_states"])
-	if len(terminalStates) == 0 {
-		terminalStates = defaultTerminalStates
-	}
-	handoffState, fault := typeutil.StringField(config, "handoff_state")
-	if fault != nil {
-		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
+	states, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	rawQueryFilter, fault := typeutil.StringField(config, "query_filter")
@@ -148,27 +131,25 @@ func NewLinearAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	client := newLinearClient(endpoint, apiKey, userAgent)
-	return newAdapter(client, project, activeStates, terminalStates, handoffState, queryFilter, slog.Default())
+	return newAdapter(client, project, states, queryFilter, slog.Default())
 }
 
 // newAdapter runs the preflight through client and assembles the adapter with
-// canonical-cased state lists. It is the seam shared by the production
+// the team-state casing cache. It is the seam shared by the production
 // constructor and offline tests.
-func newAdapter(client graphQLClient, project string, active, terminal []string, handoff string, queryFilter map[string]any, log *slog.Logger) (domain.TrackerAdapter, error) {
-	casingCache, err := runPreflight(context.Background(), client, project, active, terminal, handoff, log)
+func newAdapter(client graphQLClient, project string, states domain.TrackerStates, queryFilter map[string]any, log *slog.Logger) (domain.TrackerAdapter, error) {
+	casingCache, err := runPreflight(context.Background(), client, project, states.Active, states.Terminal, states.Handoff, log)
 	if err != nil {
 		return nil, err
 	}
 
 	return &LinearAdapter{
-		client:         client,
-		project:        project,
-		activeStates:   canonicalize(active, casingCache),
-		terminalStates: canonicalize(terminal, casingCache),
-		handoffState:   canonicalOne(handoff, casingCache),
-		queryFilter:    queryFilter,
-		casingCache:    casingCache,
-		log:            log,
+		StateSource: issuekit.NewStateSource(states),
+		client:      client,
+		project:     project,
+		queryFilter: queryFilter,
+		casingCache: casingCache,
+		log:         log,
 	}, nil
 }
 
@@ -247,11 +228,17 @@ func (a *LinearAdapter) SetMetrics(m domain.Metrics) {
 
 // FetchCandidateIssues returns issues in the configured active states for the
 // configured team, paginated to exhaustion and sorted client-side by normalized
-// priority then creation time. Comments are nil on every returned issue.
+// priority then creation time. Comments are nil on every returned issue. An
+// empty active list returns no issue and sends no request.
 func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
+	active := a.TrackerStates().Active
+	if len(active) == 0 {
+		return []domain.Issue{}, nil
+	}
+
 	issues := make([]domain.Issue, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
-		fetched, fetchErr := a.fetchIssues(ctx, queryCandidateIssues, a.activeStates)
+		fetched, fetchErr := a.fetchIssues(ctx, queryCandidateIssues, canonicalize(active, a.casingCache))
 		if fetchErr != nil {
 			return fetchErr
 		}
@@ -314,8 +301,11 @@ func (a *LinearAdapter) fetchIssues(ctx context.Context, query string, states []
 	}
 
 	issues := make([]domain.Issue, 0, len(nodes))
-	for _, node := range nodes {
-		issue := normalizeIssue(node, a.log)
+	for i := range nodes {
+		if err := a.completeLabels(ctx, &nodes[i]); err != nil {
+			return nil, err
+		}
+		issue := normalizeIssue(nodes[i], a.log)
 		issue.Comments = nil
 		issues = append(issues, issue)
 	}
@@ -348,6 +338,9 @@ func (a *LinearAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 			}
 		}
 
+		if labelErr := a.completeLabels(ctx, resp.Data.Issue); labelErr != nil {
+			return labelErr
+		}
 		fetched := normalizeIssue(*resp.Data.Issue, a.log)
 		comments, commentErr := a.collectComments(ctx, issueID, resp.Data.Issue.Comments)
 		if commentErr != nil {
@@ -358,6 +351,38 @@ func (a *LinearAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 		return nil
 	})
 	return issue, err
+}
+
+// completeLabels fetches the labels of node beyond the nested first page, so
+// the issue carries every label the tracker holds. A next page reported
+// without an end cursor returns [domain.ErrTrackerMissingCursor] and sends no
+// request.
+func (a *LinearAdapter) completeLabels(ctx context.Context, node *linearIssue) error {
+	conn := &node.Labels
+	if !conn.PageInfo.HasNextPage {
+		return nil
+	}
+	if conn.PageInfo.EndCursor == "" {
+		return &domain.TrackerError{
+			Kind:    domain.ErrTrackerMissingCursor,
+			Message: "linear graphql: next label page reported without an end cursor",
+		}
+	}
+
+	variables := map[string]any{
+		"id":    node.ID,
+		"first": topLevelPageSize,
+		"after": conn.PageInfo.EndCursor,
+	}
+	rest, err := paginate(ctx, a.client, queryIssueLabels, variables, decodeIssueLabelsPage, a.log)
+	if err != nil {
+		return err
+	}
+	for _, label := range rest {
+		conn.Nodes = append(conn.Nodes, linearLabel{Name: label.Name})
+	}
+	conn.PageInfo = linearPageInfo{}
+	return nil
 }
 
 // collectComments merges the inline first comment page with all continuation
@@ -544,9 +569,8 @@ func runMutation(ctx context.Context, client graphQLClient, log *slog.Logger, qu
 	return nil
 }
 
-// decodeIssueUpdateSuccess decodes an issueUpdate mutation response. It is
-// shared by the transition mutation and the label-attach mutation because both
-// return IssuePayload.success.
+// decodeIssueUpdateSuccess decodes the transition issueUpdate mutation
+// response.
 func decodeIssueUpdateSuccess(body []byte) ([]graphQLError, bool, error) {
 	var resp graphQLResponse[issueUpdateData]
 	if err := unmarshal(body, &resp); err != nil {
@@ -607,96 +631,272 @@ func (a *LinearAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 // idempotent and the orchestrator owns retry policy.
 func (a *LinearAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return runMutation(ctx, a.client, a.log, queryCommentCreate, map[string]any{
-			"issueId": issueID,
-			"body":    text,
-		}, decodeCommentCreateSuccess)
+		return a.postComment(ctx, issueID, text)
 	})
 }
 
+// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
+// code block, so the tracker shows literal verbatim.
+func (a *LinearAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *LinearAdapter) postComment(ctx context.Context, issueID, body string) error {
+	return runMutation(ctx, a.client, a.log, queryCommentCreate, map[string]any{
+		"issueId": issueID,
+		"body":    body,
+	}, decodeCommentCreateSuccess)
+}
+
 // AddLabel attaches the named label to the issue, creating the label
-// team-scoped when it does not yet exist. The label is appended through
-// addedLabelIds, so the issue's other labels are preserved; label and issueID
-// are passed verbatim.
+// team-scoped when it does not yet exist, and confirms it against the issue's
+// labels. The label is appended through addedLabelIds, so the issue's other
+// labels are preserved, except that a label in a single-select label group
+// replaces the group's other label on the issue; label and issueID are passed
+// verbatim.
 //
 // A label-create forbidden for the key returns [domain.ErrTrackerAuth]. On any
 // payload-class create error the method re-resolves once, using a label that a
 // concurrent create produced; only a re-resolve that still finds nothing
-// surfaces the original create error.
+// surfaces the original create error. A blank label, or a label the issue does
+// not carry after the write, returns [domain.ErrTrackerPayload].
 func (a *LinearAdapter) AddLabel(ctx context.Context, issueID, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		labelID, found, err := a.resolveLabelID(ctx, label)
-		if err != nil {
-			return err
-		}
-
-		if !found {
-			teamID, teamErr := a.resolveTeamID(ctx, issueID)
-			if teamErr != nil {
-				return teamErr
-			}
-
-			created, createErr := a.createLabel(ctx, teamID, label)
-			switch {
-			case createErr == nil:
-				labelID = created
-			case isPayloadError(createErr):
-				labelID, found, err = a.resolveLabelID(ctx, label)
-				if err != nil {
-					return err
-				}
-				if !found {
-					return createErr
-				}
-			default:
-				return createErr
-			}
-		}
-
-		return runMutation(ctx, a.client, a.log, queryIssueAddLabel, map[string]any{
-			"id":       issueID,
-			"labelIds": []string{labelID},
-		}, decodeIssueUpdateSuccess)
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
 	})
 }
 
+// RemoveLabel detaches every label of the issue that names label, ignoring
+// letter case, and confirms the removal against the issue's labels. The
+// labels are removed by the ids the issue reports, through removedLabelIds, so
+// a team label and a workspace label of one name are both removed and the
+// issue's other labels are untouched. An issue that carries none receives no
+// write. A blank label, or a label the issue still carries after the write,
+// returns [domain.ErrTrackerPayload].
+func (a *LinearAdapter) RemoveLabel(ctx context.Context, issueID, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+// labelOps returns the Linear calls behind the shared label drivers.
+func (a *LinearAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	return issuekit.IssueLabelOps{
+		Read: func(ctx context.Context) ([]issuekit.IssueLabel, error) {
+			labels, err := a.readIssueLabels(ctx, issueID)
+			if err != nil {
+				return nil, err
+			}
+			stored := make([]issuekit.IssueLabel, len(labels))
+			for i, l := range labels {
+				stored[i] = issuekit.IssueLabel{Name: l.Name, ID: l.ID}
+			}
+			return stored, nil
+		},
+		Add: func(ctx context.Context, label string) (issuekit.LabelWrite, error) {
+			return a.addLabel(ctx, issueID, label)
+		},
+		Remove: func(ctx context.Context, labels []issuekit.IssueLabel) (issuekit.LabelWrite, error) {
+			ids := make([]string, len(labels))
+			for i, l := range labels {
+				ids[i] = l.ID
+			}
+			return a.updateLabels(ctx, queryIssueRemoveLabels, issueID, ids)
+		},
+	}
+}
+
+// labelTarget is a resolved label: its id and, when it sits in a
+// single-select label group, the group's id.
+type labelTarget struct {
+	id       string
+	parentID string
+	grouped  bool
+}
+
+// addLabel resolves or creates the label and attaches it. When the label sits
+// in a single-select group and the plain add leaves it off the issue, whatever
+// the outcome of that add, the group's other labels on the issue are removed
+// and the label is added again: Linear's handling of a sibling is undocumented,
+// so replacement, rejection and silent dropping all end with the label attached.
+// A request failing between the removal and the second add leaves the issue
+// without the siblings and without the label.
+func (a *LinearAdapter) addLabel(ctx context.Context, issueID, label string) (issuekit.LabelWrite, error) {
+	target, err := a.resolveOrCreateLabel(ctx, issueID, label)
+	if err != nil {
+		return issuekit.LabelWrite{}, err
+	}
+
+	first, firstErr := a.updateLabels(ctx, queryIssueAddLabel, issueID, []string{target.id})
+	if !target.grouped || ctx.Err() != nil {
+		return first, firstErr
+	}
+	if firstErr == nil && first.Reported && carriesLabel(first.After, label) {
+		return first, nil
+	}
+
+	current, err := a.readIssueLabels(ctx, issueID)
+	if err != nil {
+		return issuekit.LabelWrite{}, err
+	}
+	if names := labelNames(current); carriesLabel(names, label) {
+		return issuekit.LabelWrite{After: names, Reported: true}, nil
+	}
+
+	var siblingIDs []string
+	for _, l := range current {
+		if l.Parent != nil && l.Parent.ID == target.parentID {
+			siblingIDs = append(siblingIDs, l.ID)
+		}
+	}
+	if len(siblingIDs) == 0 {
+		return first, firstErr
+	}
+
+	if _, err := a.updateLabels(ctx, queryIssueRemoveLabels, issueID, siblingIDs); err != nil && !isRejection(err) {
+		return issuekit.LabelWrite{}, err
+	}
+	return a.updateLabels(ctx, queryIssueAddLabel, issueID, []string{target.id})
+}
+
+// resolveOrCreateLabel resolves the label by name and creates it team-scoped
+// when none exists. A created label has no parent and is never grouped.
+func (a *LinearAdapter) resolveOrCreateLabel(ctx context.Context, issueID, label string) (labelTarget, error) {
+	target, found, err := a.resolveLabelID(ctx, label)
+	if err != nil {
+		return labelTarget{}, err
+	}
+	if found {
+		return target, nil
+	}
+
+	teamID, err := a.resolveTeamID(ctx, issueID)
+	if err != nil {
+		return labelTarget{}, err
+	}
+
+	created, createErr := a.createLabel(ctx, teamID, label)
+	switch {
+	case createErr == nil:
+		return labelTarget{id: created}, nil
+	case isPayloadError(createErr):
+		target, found, err = a.resolveLabelID(ctx, label)
+		if err != nil {
+			return labelTarget{}, err
+		}
+		if !found {
+			return labelTarget{}, createErr
+		}
+		return target, nil
+	default:
+		return labelTarget{}, createErr
+	}
+}
+
+// updateLabels runs a label issueUpdate mutation with the given label ids and
+// reports the issue's label set when the payload carries all of it.
+func (a *LinearAdapter) updateLabels(ctx context.Context, query, issueID string, ids []string) (issuekit.LabelWrite, error) {
+	var write issuekit.LabelWrite
+	decode := func(body []byte) ([]graphQLError, bool, error) {
+		var resp graphQLResponse[issueUpdateLabelsData]
+		if err := unmarshal(body, &resp); err != nil {
+			return nil, false, err
+		}
+		if issue := resp.Data.IssueUpdate.Issue; issue != nil {
+			write = reportedLabels(issue.Labels)
+		}
+		return resp.Errors, resp.Data.IssueUpdate.Success, nil
+	}
+
+	if err := runMutation(ctx, a.client, a.log, query, map[string]any{
+		"id":       issueID,
+		"labelIds": ids,
+	}, decode); err != nil {
+		return issuekit.LabelWrite{}, err
+	}
+	return write, nil
+}
+
+// reportedLabels turns a mutation payload's label connection into a reported
+// label set. A payload that holds no label list, that does not decode, or that
+// reports another page leaves the write unreported.
+func reportedLabels(raw json.RawMessage) issuekit.LabelWrite {
+	var set labelSetPayload
+	if err := json.Unmarshal(raw, &set); err != nil || set.Nodes == nil || set.PageInfo.HasNextPage {
+		return issuekit.LabelWrite{}
+	}
+	names := make([]string, len(set.Nodes))
+	for i, l := range set.Nodes {
+		names[i] = l.Name
+	}
+	return issuekit.LabelWrite{After: names, Reported: true}
+}
+
+// readIssueLabels returns every label the issue carries, with the ids and
+// group parents a removal and a group swap need.
+func (a *LinearAdapter) readIssueLabels(ctx context.Context, issueID string) ([]linearIssueLabel, error) {
+	variables := map[string]any{
+		"id":    issueID,
+		"first": topLevelPageSize,
+	}
+	return paginate(ctx, a.client, queryIssueLabels, variables, decodeIssueLabelsPage, a.log)
+}
+
+func labelNames(labels []linearIssueLabel) []string {
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Name
+	}
+	return names
+}
+
+func carriesLabel(names []string, label string) bool {
+	return len(issuekit.LabelVariants(names, label)) > 0
+}
+
 // resolveLabelID resolves a label name to its UUID, preferring a label scoped
-// to the configured team over a workspace-scoped label. It reports found false
-// with a nil error when no label matches. The name is matched case-insensitively
-// and sent verbatim.
-func (a *LinearAdapter) resolveLabelID(ctx context.Context, name string) (string, bool, error) {
+// to the configured team over a workspace-scoped label, and reports the group
+// the label belongs to. It reports found false with a nil error when no label
+// matches. The name is matched case-insensitively and sent verbatim. A label is
+// grouped when its parent does not declare multi-select behavior; Linear gives
+// a group without a type single-select behavior.
+func (a *LinearAdapter) resolveLabelID(ctx context.Context, name string) (labelTarget, bool, error) {
 	body, headers, err := a.client.Execute(ctx, queryResolveLabel, map[string]any{"name": name})
 	if err != nil {
-		return "", false, err
+		return labelTarget{}, false, err
 	}
 	recordRateLimit(headers, a.log)
 
 	var resp graphQLResponse[labelResolveData]
 	if err := unmarshal(body, &resp); err != nil {
-		return "", false, err
+		return labelTarget{}, false, err
 	}
 	if classified := classifyGraphQLErrors(resp.Errors); classified != nil {
-		return "", false, classified
+		return labelTarget{}, false, classified
 	}
 
-	var workspaceID string
+	var workspace labelTarget
 	var hasWorkspace bool
 	for _, node := range resp.Data.IssueLabels.Nodes {
+		target := labelTarget{id: node.ID}
+		if node.Parent != nil {
+			target.parentID = node.Parent.ID
+			target.grouped = node.Parent.GroupType != "multiSelect"
+		}
 		if node.Team != nil {
 			if node.Team.Key == a.project {
-				return node.ID, true, nil
+				return target, true, nil
 			}
 			continue
 		}
 		if !hasWorkspace {
-			workspaceID = node.ID
+			workspace = target
 			hasWorkspace = true
 		}
 	}
-	if hasWorkspace {
-		return workspaceID, true, nil
-	}
-	return "", false, nil
+	return workspace, hasWorkspace, nil
 }
 
 // resolveTeamID resolves the UUID of the team that owns the issue. A missing
@@ -763,6 +963,12 @@ func decodeCommentCreateSuccess(body []byte) ([]graphQLError, bool, error) {
 		return nil, false, err
 	}
 	return resp.Errors, resp.Data.CommentCreate.Success, nil
+}
+
+// isRejection reports whether err is the tracker refusing a write as not found
+// or invalid, the two kinds a label write's confirming read can settle.
+func isRejection(err error) bool {
+	return domain.IsNotFound(err) || isPayloadError(err)
 }
 
 // isPayloadError reports whether err is a [*domain.TrackerError] of kind

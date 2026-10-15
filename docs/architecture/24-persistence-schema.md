@@ -2,7 +2,7 @@
 
 ### 19.1 Overview
 
-Sortie uses an embedded SQLite database for durable state. The database file path defaults to `.sortie.db` in the same directory as `WORKFLOW.md` and can be overridden with the `db_path` front matter field (see Section 5.3.7). On startup, Sortie opens or creates the database and runs all pending schema migrations before beginning normal operation.
+Sortie uses an embedded SQLite database for durable state. The database file path defaults to `.sortie.db` in the same directory as `WORKFLOW.md` and can be overridden with the `db_path` front matter field (see Section 5.3.6). On startup, Sortie opens or creates the database and runs all pending schema migrations before beginning normal operation.
 
 ### 19.2 Tables
 
@@ -15,10 +15,23 @@ Sortie uses an embedded SQLite database for durable state. The database file pat
 | `attempt`    | INTEGER | Retry attempt number (1-based)                     |
 | `due_at_ms`  | INTEGER | Unix epoch milliseconds; used to reconstruct timer |
 | `error`      | TEXT    | Last error message, may be null                    |
-| `session_id` | TEXT    | Adapter-assigned session ID from previous attempt, may be null (migration 009) |
-| `rule_name`   | TEXT   | Dispatch rule that routed the original dispatch; empty when none matched (migration 010) |
-| `template_id` | TEXT   | Prompt template the rule selected (migration 010) |
-| `agent_kind`  | TEXT   | Agent adapter the rule selected; empty on a pre-migration entry (migration 010) |
+| `session_id` | TEXT    | Adapter-assigned session ID from previous attempt, may be null |
+| `rule_name`   | TEXT   | Dispatch rule that routed the original dispatch; empty when none matched |
+| `template_id` | TEXT   | Prompt template the rule selected |
+| `agent_kind`  | TEXT   | Agent adapter the rule selected; empty on a pre-migration entry |
+| `stage_previous` | TEXT | Source rule of the stage hop the frozen selection carries into its `stage.previous`; empty when none |
+| `stage_previous_outcome` | TEXT | Outcome of that hop, `succeeded` or `no_change`; empty when `stage_previous` is empty |
+| `chain_id` | TEXT | Stage chain identifier frozen with the selection; empty on an entry written before the column existed |
+| `display_identifier` | TEXT | Qualified form of `identifier` (for example `owner/repo#9`); empty when `identifier` suffices, and on an entry written before the column existed |
+| `issue_title` | TEXT | The tracker's title of the issue as read when the retry was scheduled; empty on an entry written before the column existed, and while the retry holds no read of its issue |
+| `issue_url` | TEXT | The tracker's web link of the issue as read then, under the same rule as `issue_title` |
+| `trigger` | TEXT | The `sortie_retries_total` label of the schedule that created the entry (`error`, `continuation`, `timer`, `stall`, or `ci_fix`); empty when that schedule records none, and `''` on an entry written before the column existed until the entry is next written |
+| `configured_model` | TEXT | The `model` the dispatch's resolved settings block carried, frozen with the selection; empty when unset. Its migration fills an older entry from the `configured_model` of the newest agent run of the issue in `run_history` that shares the entry's `chain_id`; empty when no such run exists |
+| `issue_type` | TEXT | The tracker's issue type as read when the retry was scheduled; empty on an entry written before the column existed, and while the retry holds no read of its issue |
+| `issue_labels` | TEXT | The issue's labels as read then, as a JSON array of strings; `[]` for a read that found none, and `''` for no read, on an entry written before the column existed, and for a value that does not decode as an array of strings |
+| `issue_state` | TEXT | The tracker state of the issue as read then, under the same rule as `issue_type` |
+| `dispatched_at` | TEXT | RFC 3339 timestamp, in UTC with nanosecond precision, of the start of the first run of the pass the entry's `chain_id` names. Its migration fills an older entry with the earliest `started_at`, compared as an instant, among the issue's agent runs in `run_history` that share the entry's non-empty `chain_id`; an agent run is a row with a non-empty `agent_adapter`, so the synthetic `ci_failed` row is not one. Empty when `chain_id` is empty or no agent run shares it |
+| `origin_trigger` | TEXT NOT NULL | What started the retry: the `sortie_retries_total` label of the schedule that created it (`error`, `continuation`, `stall`, or `ci_fix`), kept through every put-back by the retry timer, whose `timer` label stays in `trigger`. Empty for a retry no label started, such as a reaction continuation. Its migration fills an older entry from `trigger` when `trigger` is neither `timer` nor empty, and leaves the rest empty, because those entries never stored what started them |
 
 Note: `timer_handle` is runtime-only and is not stored.
 
@@ -36,19 +49,42 @@ Note: `timer_handle` is runtime-only and is not stored.
 | `completed_at`  | TEXT    | ISO-8601 timestamp                        |
 | `status`          | TEXT    | Run disposition (`succeeded`, `failed`, `cancelled`, `ci_failed`, `needs_person`, or `budget_stopped`) |
 | `error`           | TEXT    | Error message if failed, may be null      |
-| `workflow_file`   | TEXT    | Workflow file name the run was driven by, may be null (migration 003) |
-| `turns_completed`   | INTEGER | Agent turns the attempt completed (migration 005) |
-| `display_identifier` | TEXT | Display identifier carried through dispatch, may be null (migration 006) |
-| `review_metadata` | TEXT    | JSON-encoded self-review metadata, may be null (migration 007) |
-| `rule_name`       | TEXT    | Dispatch rule that routed the run; empty when none matched (migration 010) |
-| `template_id`     | TEXT    | Prompt template the rule selected (migration 010) |
-| `input_tokens`      | INTEGER | Accumulated input tokens, 0 for pre-migration rows (migration 011) |
-| `output_tokens`     | INTEGER | Accumulated output tokens, 0 for pre-migration rows (migration 011) |
-| `total_tokens`      | INTEGER | Accumulated total tokens, 0 for pre-migration rows (migration 011) |
-| `cache_read_tokens` | INTEGER | Accumulated cache-read tokens, 0 for pre-migration rows (migration 011) |
-| `cache_write_tokens` | INTEGER | Accumulated cache-write tokens, 0 for pre-migration rows (migration 020) |
-| `tokens_measured`   | INTEGER | `1` when the five token columns above carry a figure the coding agent's runtime reported; `0` when the run's spend is unknown and all five are zero (migration 012) |
-| `unaccounted_turns` | INTEGER | Turns that issued a model request no token figure was proven to account for; a non-zero count makes `total_tokens` a lower bound (migration 019) |
+| `workflow_file`   | TEXT    | Workflow file name the run was driven by, may be null |
+| `turns_completed`   | INTEGER | Agent turns the attempt completed |
+| `display_identifier` | TEXT | Display identifier carried through dispatch, may be null |
+| `review_metadata` | TEXT    | JSON-encoded self-review metadata, may be null |
+| `rule_name`       | TEXT    | Dispatch rule that routed the run; empty when none matched |
+| `template_id`     | TEXT    | Prompt template the rule selected |
+| `input_tokens`      | INTEGER | Accumulated input tokens, 0 for pre-migration rows |
+| `output_tokens`     | INTEGER | Accumulated output tokens, 0 for pre-migration rows |
+| `total_tokens`      | INTEGER | Accumulated total tokens, 0 for pre-migration rows |
+| `cache_read_tokens` | INTEGER | Accumulated cache-read tokens, 0 for pre-migration rows |
+| `cache_write_tokens` | INTEGER | Accumulated cache-write tokens, 0 for pre-migration rows |
+| `tokens_measured`   | INTEGER | `1` when the five token columns above carry a figure the coding agent's runtime reported; `0` when the run's spend is unknown and all five are zero |
+| `unaccounted_turns` | INTEGER | Turns that issued a model request no token figure was proven to account for; a non-zero count makes `total_tokens` a lower bound |
+| `configured_model`  | TEXT    | The `model` the attempt's resolved settings block carried; empty when unset, which leaves the runtime's own default, and on a row written before the column existed |
+| `configured_effort` | TEXT    | The `effort` the attempt's resolved settings block carried, empty by the same rule |
+| `reported_model`    | TEXT    | The model the runtime reported running, from the last token-usage event that named one; empty when it reported none. The `ci_failed` row leaves all three columns empty |
+| `stage_previous`    | TEXT    | Source rule of the stage hop the run's selection carried into its `stage.previous`; empty when none. Reaction recovery restores it |
+| `stage_previous_outcome` | TEXT | Outcome of that hop, `succeeded` or `no_change`; empty when `stage_previous` is empty |
+| `chain_id` | TEXT | Stage chain identifier of the run; empty on a row written before the column existed, or on a `ci_failed` row whose pending reaction was recovered from such a row |
+| `stage_target` | TEXT | Dispatch rule the run's hop decision targeted; empty when the run reached no hop decision |
+| `stage_result` | TEXT | Result of that decision: `advanced`, `partial`, `failed`, or `ceiling`; empty exactly when `stage_target` is empty |
+| `issue_title` | TEXT | The tracker's title of the issue as read when the run was dispatched. Reaction recovery restores it; empty on a row written before the column existed, or on a `ci_failed` row whose pending reaction was recovered from such a row |
+| `issue_url` | TEXT | The tracker's web link of the issue as read then, restored and emptied under the same rule as `issue_title` |
+| `dispatched_at` | TEXT | RFC 3339 timestamp, in UTC with nanosecond precision, of the start of the first run of the pass the row's `chain_id` names. Reaction recovery restores it. Its migration fills an older row under the rule of `retry_entries.dispatched_at`; empty when `chain_id` is empty or no agent run shares it |
+| `trigger` | TEXT | What started the retry whose fire dispatched the run, as `retry_entries.origin_trigger` holds it: `error`, `continuation`, `stall`, or `ci_fix`. Empty for a dispatch from the poll tick and for a retry a reaction other than the CI fix started; the CI fix records `ci_fix`. `NULL` on a row written before the column existed, and on a run whose retry never stored what started it, which means "not recorded" |
+| `reaction_kind` | TEXT | The reaction kind of the retry that dispatched the run; empty when none. `NULL` on a row written before the column existed |
+| `session_id` | TEXT | The agent session the run used, the value the session-metadata write at the same exit takes; empty when the run started no session. `NULL` on a row written before the column existed, which makes it the column that tells a recorded origin from an unrecorded one |
+| `ssh_host` | TEXT | The SSH worker the run executed on; empty for a local run. `NULL` on a row written before the column existed |
+| `first_after_hop` | INTEGER | `1` on the first run dispatched after the stage hop `stage_previous` names, `0` on every other run, a later dispatch into that stage while the `stage_hops` row stands included. Its migration fills an older row with `1` when `stage_previous` and `chain_id` are non-empty and no row with a lower `id` shares its `issue_id`, `chain_id`, `rule_name`, and `stage_previous`, and with `0` otherwise; the rule reads neither `trigger` nor `reaction_kind` |
+| `dispatch_id` | TEXT | The dispatch ID of the run, the key of its rows in `run_events`. The empty string on the `ci_failed` row, which no dispatch produced and which has no events. `NULL` on a row written before the column existed, which is not backfilled and has no events |
+
+The origin columns hold `NULL` for "not recorded" and the empty string for "recorded, none", so an upgrade never reports an earlier run as a local poll-tick dispatch. Every writer binds text; the `trigger` of a run dispatched by a retry whose row never stored what started it is the only value a writer leaves `NULL`. The `ci_failed` row records the empty string in each origin column, because it records a CI verdict and nothing started it. `sortie stats` and `/api/v1/stats` group runs by `trigger` when the database carries the `trigger` column, the empty string as `<none>` and `NULL` as `<unknown>`, and otherwise report no such breakdown. They also group runs by origin from `trigger`, `reaction_kind`, `status`, and `first_after_hop`, and the first rule that matches decides a run's group: a `NULL` `trigger` is `<unknown>`, a non-empty `trigger` names the group, a non-empty `reaction_kind` names it otherwise, a `ci_failed` row is `<none>`, a row with `first_after_hop` set is `stage_hop`, and every other run is `poll_tick`. A database without the `trigger` column gets neither grouping, and one without `first_after_hop` no grouping by origin. An index on `identifier` serves the identifier-filtered reads of the run history API, as the index on `issue_id` serves the reads by issue ID. An index on `display_identifier` serves the issue key of run history by issue, which matches the qualified form (for example `owner/repo#9`) a tracker records beside the bare identifier.
+
+A stage chain is the set of runs that share a `chain_id`. Every dispatch freezes a chain identifier with its selection, beside the previous-stage pair. A dispatch that no hop reached starts a chain with a fresh random value that is never a dispatch or session identifier, so a public comment cannot expose session identity. A dispatch a hop reached inherits the chain of the hop record, and a retry or reaction continuation that keeps its rule carries the chain of the run it continues, across restarts. The dispatch also freezes the pass dispatch time (`dispatched_at`) with the chain identifier: a dispatch that carries no time records its own start, so the first run of a pass dates the pass, and every carrier keeps the value. A dispatch a hop reached inherits the hop record's time beside its chain, a retry or reaction continuation that keeps its rule carries the time of the run it continues, and a retry routed afresh to a rule no hop targets starts a pass dated by its own start. The run's row, the retry entry, and the hop record each persist the time, so it survives a restart. An empty carried chain, from a row written before chain identifiers were stored, is replaced by a fresh identifier at dispatch. After its hop decision, the exit writes the decision's target rule and result onto the row of the run that reached it. Rows written before these columns existed keep `''` in them and are not backfilled. `sortie stats` groups runs by `chain_id`, leaves out rows without a chain, and lists only chains in which a hop was due or made.
+
+The configured and reported model columns record what the operator asked for beside what ran, which differ under routing aliases and runtime-side fallbacks. A reported value never overwrites a configured one and nothing compares them. `sortie stats` groups runs by `configured_model` when the database carries the migration and otherwise reports no such breakdown. No metric carries a model or effort label, because the cardinality of model names is unbounded.
 
 `status` is no longer a pure mapping from the worker's exit kind. A normal exit that reaches an otherwise-eligible handoff and is withheld by the handoff-evidence policy records `failed`, with its `error` value naming the evidence verdict as the cause, only when a verification read taken immediately before that recording does not find the issue in a terminal tracker state (§11.5, §14.2). When that read does find the issue terminal, the exit takes the terminal disposition instead and records `succeeded` with no error, exactly as an exit whose observation was terminal earlier already does. For an otherwise-normal exit on that handoff path, `succeeded` means the policy did not withhold it, or withheld it but the verification read then found the issue terminal. It does not assert that work was positively observed: an undeterminable verdict under `observed`, every normal exit under `off`, and a withheld verdict suppressed by that verification read may all still record `succeeded`.
 
@@ -58,13 +94,13 @@ No column stores the handoff-evidence verdict. The verdict is logged and counted
 
 `budget_stopped` records a run the per-issue token ceiling stopped while it was in flight, distinct from `cancelled`, which still covers a run stopped by stall detection, a terminal tracker state, or shutdown. The distinction lets a consumer attribute a stop to the budget ceiling from the durable record alone, without parsing `error` text. A run that stall detection, a tracker state, or shutdown cancelled before the ceiling decided its stop, or that ended on its own before the ceiling's cancellation reached it, records the disposition it would record without the ceiling, never `budget_stopped`. A run whose self-review phase the ceiling cut short or kept from starting records `budget_stopped`.
 
-A row with `tokens_measured = 0` always carries zero in all five token columns, `cache_write_tokens` included; the invariant runs in one direction only, because a measured run can legitimately report a zero spend. Every writer sets `tokens_measured` explicitly rather than relying on the column's default: the SQL default is `1`, but the Go zero value of the corresponding struct field is `false`, so a writer that omits the field records an unmeasured run rather than inheriting the default. The column default of `1` exists solely to answer for rows written before migration 012, whose provenance is not recoverable and are treated as measured.
+A row with `tokens_measured = 0` always carries zero in all five token columns, `cache_write_tokens` included; the invariant runs in one direction only, because a measured run can legitimately report a zero spend. Every writer sets `tokens_measured` explicitly rather than relying on the column's default: the SQL default is `1`, but the Go zero value of the corresponding struct field is `false`, so a writer that omits the field records an unmeasured run rather than inheriting the default. The column default of `1` exists solely to answer for rows written before the column existed, whose provenance is not recoverable and are treated as measured.
 
-The token columns mirror those on `session_metadata`. The per-issue token budget (`agent.max_tokens`) sums `total_tokens` here; `sortie stats` prices spend from the other four. The in-flight lane that stops a run mid-turn adds the running session's own live in-memory total to that sum, rather than waiting for the session's own row to land. The `session_metadata` write cadence changed to throttled-incremental during a running session (at most one write per issue per two seconds, on the orchestrator event loop) so the `cost_budget` tool can read in-flight spend before the session's `run_history` row exists. One write per run is exempt from that bound: the write that carries the usage figure reaching the configured token warning threshold lands immediately, so the tool's reading of the warning condition is never held back by the throttle.
+The token columns mirror those on `session_metadata`. The per-issue token budget (`agent.max_tokens`) sums `total_tokens` here; `sortie stats` prices spend from the other four. The in-flight lane that stops a run mid-turn adds the running session's own live in-memory total to that sum, rather than waiting for the session's own row to land. The `session_metadata` write cadence changed to throttled-incremental during a running session (at most one write per issue per two seconds, on the orchestrator event loop) so the `cost_budget` tool can read in-flight spend before the session's `run_history` row exists. Some writes are exempt from that bound. The write that carries the usage figure reaching the configured token warning threshold lands immediately, so the tool's reading of the warning condition is never held back by the throttle. A change in the running session's unaccounted-turn count is likewise written immediately, into the session's existing row only.
 
-`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The throttled in-flight write is gated on a usage-bearing event, so while a session runs its row comes into existence exactly when that session has reported a measurement the orchestrator records, which a session resolving `none` never has, and the presence of a row whose `dispatch_id` matches the running session's dispatch ID is itself the measurement signal the `cost_budget` tool reads. A running session with no matching row is what makes that tool's `used_tokens_complete` false, on the same footing as a completed run with `tokens_measured = 0`. The unconditional write at session exit is outside that window: it stores an empty `dispatch_id` and runs before the run's `run_history` row is written.
+`tokens_measured` is not mirrored onto `session_metadata`, and does not need to be. The throttled in-flight write is gated on a usage-bearing event, so while a session runs its row comes into existence exactly when that session has reported a measurement the orchestrator records, which a session resolving `none` never has, and the presence of a row whose `dispatch_id` matches the running session's dispatch ID is itself the measurement signal the `cost_budget` tool reads. A running session with no matching row is what makes that tool's `used_tokens_complete` false, on the same footing as a completed run with `tokens_measured = 0`. A matched row whose `unaccounted_turns` is above zero also makes the tool's `used_tokens_complete` false. The unconditional write at session exit is outside that window: it stores an empty `dispatch_id` and runs before the run's `run_history` row is written.
 
-The request count needs a column of its own for the reason the token measurement does not. The argument above rests on the in-flight write being gated on a usage-bearing event, so the row's existence is itself the token measurement signal. That gate fires for a kind that reports usage only when a turn ends too, and such a kind counts turns rather than requests, so the row's existence says nothing about whether the request-counting path ran. `api_requests_measured` is what says it. A row written before migration 016 reads `0`, because its count was written by the unconditional rule that column exists to qualify; the row self-heals on that issue's next session.
+The request count needs a column of its own for the reason the token measurement does not. The argument above rests on the in-flight write being gated on a usage-bearing event, so the row's existence is itself the token measurement signal. That gate fires for a kind that reports usage only when a turn ends too, and such a kind counts turns rather than requests, so the row's existence says nothing about whether the request-counting path ran. `api_requests_measured` is what says it. A row written before the column existed reads `0`, because its count was written by the unconditional rule that column exists to qualify; the row self-heals on that issue's next session.
 
 **`session_metadata`**: last known session metadata per issue (for observability and debug)
 
@@ -76,12 +112,13 @@ The request count needs a column of its own for the reason the token measurement
 | `input_tokens`      | INTEGER | Accumulated input tokens          |
 | `output_tokens`     | INTEGER | Accumulated output tokens         |
 | `total_tokens`      | INTEGER | Accumulated total tokens          |
-| `cache_read_tokens` | INTEGER | Accumulated cache-read tokens (migration 002) |
-| `cache_write_tokens` | INTEGER | Accumulated cache-write tokens, 0 for pre-migration rows (migration 020) |
-| `model_name`        | TEXT    | Last reported LLM model identifier (migration 002) |
-| `api_request_count` | INTEGER | Measured model API requests; a current writer stores zero when `api_requests_measured` is `0` (migration 002) |
-| `api_requests_measured` | INTEGER | `1` when `api_request_count` is a measurement; `0` when it is not. A row predating migration 016 reads `0` here while keeping the count it already had, until that issue's next session write (migration 016) |
-| `dispatch_id`       | TEXT    | The dispatch ID of the running session whose in-flight write last stored the row; empty after the session-exit write and on a row written before migration 017 (migration 017) |
+| `cache_read_tokens` | INTEGER | Accumulated cache-read tokens |
+| `cache_write_tokens` | INTEGER | Accumulated cache-write tokens, 0 for pre-migration rows |
+| `model_name`        | TEXT    | Last reported LLM model identifier |
+| `api_request_count` | INTEGER | Measured model API requests; a current writer stores zero when `api_requests_measured` is `0` |
+| `api_requests_measured` | INTEGER | `1` when `api_request_count` is a measurement; `0` when it is not. A row predating the column reads `0` here while keeping the count it already had, until that issue's next session write |
+| `dispatch_id`       | TEXT    | The dispatch ID of the running session whose in-flight write last stored the row; empty after the session-exit write and on a row written before the column existed |
+| `unaccounted_turns` | INTEGER | The running session's count of turns that spent tokens no figure was proven to account for, as of the last in-flight write; `0` after the session-exit write and on a row written before the column existed |
 | `updated_at`        | TEXT    | ISO-8601 timestamp of last update |
 
 **`aggregate_metrics`**: global token and runtime totals
@@ -92,15 +129,15 @@ The request count needs a column of its own for the reason the token measurement
 | `input_tokens`      | INTEGER |                                   |
 | `output_tokens`     | INTEGER |                                   |
 | `total_tokens`      | INTEGER |                                   |
-| `cache_read_tokens` | INTEGER | Cumulative cache-read tokens (migration 002) |
-| `cache_write_tokens` | INTEGER | Cumulative cache-write tokens, 0 for pre-migration rows (migration 020) |
+| `cache_read_tokens` | INTEGER | Cumulative cache-read tokens |
+| `cache_write_tokens` | INTEGER | Cumulative cache-write tokens, 0 for pre-migration rows |
 | `seconds_running`   | REAL    | Cumulative runtime seconds        |
-| `unmeasured_sessions` | INTEGER | Cumulative count of ended sessions whose usage was never recorded. The migration sets an existing `agent_totals` row to the number of `run_history` rows with `tokens_measured = 0`; a `run_history` row written before migration 012 reads `1` there and is not counted (migration 018) |
+| `unmeasured_sessions` | INTEGER | Cumulative count of ended sessions whose usage was never recorded. The migration sets an existing `agent_totals` row to the number of `run_history` rows with `tokens_measured = 0`; a `run_history` row written before `tokens_measured` existed reads `1` there and is not counted |
 | `updated_at`        | TEXT    | ISO-8601 timestamp                |
 
 `unmeasured_sessions` names what the five token columns above already exclude: a session whose worker entered an agent turn and never got a usage figure, whatever the reason. It is incremented once per such session at the same write that updates the token columns, so a restart restores both together and neither can drift ahead of the other.
 
-**`reaction_fingerprints`**: cross-restart reaction deduplication (migration 008)
+**`reaction_fingerprints`**: cross-restart reaction deduplication
 
 | Column        | Type    | Notes                                                         |
 | ------------- | ------- | ------------------------------------------------------------- |
@@ -118,11 +155,40 @@ The `ci` row holds the pull request head this process last evaluated, not a ref 
 
 `dispatched` likewise means "the action this kind performs has been performed for this fingerprint", and the row's lifecycle after that point is the owning kind's to define. Most kinds treat the row as spent. The merge-completion kind (§11G.4) instead retains a dispatched row rather than deleting it, because deleting it would let the next poll observe the same merge as new.
 
-The internal `merge-completion-missing-sha` observation kind reuses this table without changing the normal `merge-completion` fingerprint. Its `fingerprint` is normalized `owner/repo#number`, `updated_at` is the first time that PR identity was reported merged without a commit identifier, and `dispatched` means the bounded-wait escalation was successfully delivered. Its observation upsert has stricter timestamp semantics than an ordinary fingerprint upsert: the same identity preserves `updated_at`, while a different identity replaces it and resets `dispatched`. Marking this observation dispatched happens only after the configured tracker write succeeds, only if the row still carries the same PR identity, and also preserves `updated_at`, so a restart cannot reset or obscure the thirty-minute grace-period origin. A failed tracker write leaves the expired observation undispatched; the current pending entry remains dropped, while a later fresh entry can retry only that delivery.
+The internal `merge-completion-missing-sha` observation kind reuses this table without changing the normal `merge-completion` fingerprint. Its `fingerprint` is normalized `owner/repo#number`, `updated_at` is the first time that PR identity was reported merged without a commit identifier, and `dispatched` means the bounded-wait escalation was successfully delivered. Its observation upsert has stricter timestamp semantics than an ordinary fingerprint upsert: the same identity preserves `updated_at`, while a different identity replaces it and resets `dispatched`. Marking this observation dispatched happens only after the configured tracker write succeeds, only if the row still carries the same PR identity, and also preserves `updated_at`, so a restart cannot reset or obscure the thirty-minute grace-period origin. A failed tracker write leaves the expired observation undispatched; the current pending entry stays pending under its escalation, while the first pass after a restart or a later fresh entry can retry only that delivery.
 
-Cleanup is owned by an active merge-completion pass. Such a pass deletes the observation when it sees a different pull request identity, a missing pull request, an issue missing from the tracker response, an issue outside the handoff state, or a real commit identifier whose normal merge latch has completed. Generic terminal-state release deliberately leaves every `reaction_fingerprints` row intact. Consequently, after the bounded stop has removed the last pending entry, a later human transition by itself is not observed and this internal row may remain indefinitely. The residue is inert: the same delivered identity stops, a different identity resets it, and a later fresh entry with a real identifier clears it after the normal latch completes. Because `updated_at` is frozen at first observation, any future retention job MUST handle this kind explicitly; it MUST NOT infer safe expiry from `updated_at` alone or it would re-arm a one-shot escalation.
+Cleanup is owned by an active merge-completion pass. Such a pass deletes the observation when it sees a different pull request identity, a missing pull request, an issue missing from the tracker response, an issue outside the handoff state, or a real commit identifier whose normal merge latch has completed. Generic terminal-state release deliberately leaves every `reaction_fingerprints` row intact. Consequently, after generic terminal-state release has removed the last pending entry, this internal row may remain indefinitely. The residue is inert: the same delivered identity stops, a different identity resets it, and a later fresh entry with a real identifier clears it after the normal latch completes. Because `updated_at` is frozen at first observation, any future retention job MUST handle this kind explicitly; it MUST NOT infer safe expiry from `updated_at` alone or it would re-arm a one-shot escalation.
 
-**`handoff_absence_resets`**: end of a consecutive handoff-absence sequence (migration 013)
+**`reaction_escalations`**: the escalation of each reaction kind, standing or past
+
+| Column               | Type    | Notes                                                                                                       |
+| -------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `issue_id`           | TEXT    | Tracker-internal issue ID (composite PK with `kind`)                                                        |
+| `kind`               | TEXT    | Reaction kind that escalated; one row per issue per kind                                                    |
+| `subject`            | TEXT    | What the latest escalation judged: the pull request head, the comment set fingerprint, the merge fingerprint, the merge commit, or the pull request identity; empty when it has none. Defaults to empty |
+| `escalated_at`       | TEXT    | RFC 3339 with nanoseconds; NULL once the escalation ended                                                   |
+| `escalation_trigger` | TEXT    | `budget_exhausted`, `triage`, `refused`, or `missing_merge_commit`                                          |
+| `attempts`           | INTEGER | The kind's attempt counter at the escalation. Defaults to `0`                                               |
+| `pr_number`          | INTEGER | Pull request number                                                                                         |
+| `pr_owner`           | TEXT    | Pull request owner                                                                                          |
+| `pr_repo`            | TEXT    | Pull request repository                                                                                     |
+| `pr_branch`          | TEXT    | Pull request head branch; empty for a kind that keeps none. Defaults to empty                               |
+
+Primary key: `(issue_id, kind)`. Every kind that escalates writes its row when an escalation begins. Ending an escalation sets `escalated_at` to NULL and keeps the row, because its `subject` latches the escalation action to once per subject: an escalation whose subject equals the stored one records its time and trigger and applies no action. The release of the issue (a terminal state, or a stage hop) deletes every row of the issue.
+
+A row with a non-NULL `escalated_at` is a standing escalation, and the startup restore turns it back into a pending entry. The pull request columns let the restore build the entry without the workspace; it reads the issue's newest successful run for the rest and ends a row whose kind is not configured or whose issue has no such run. The time is stored at nanosecond precision so the identifier and start time of the attention item built from the escalation survive a restart. The table starts empty on upgrade, so an escalation standing at the upgrade's restart is not restored, and the next escalation of its kind records one.
+
+**`reaction_handoffs`**: review comments each issue's runs were given
+
+| Column       | Type | Notes                                                                |
+| ------------ | ---- | -------------------------------------------------------------------- |
+| `issue_id`   | TEXT | Tracker-internal issue ID (composite PK with `kind` and `comment_id`) |
+| `kind`       | TEXT | `review` or `bot-review`                                             |
+| `comment_id` | TEXT | SCM-platform review comment ID                                       |
+
+Primary key: `(issue_id, kind, comment_id)`. One row per comment a run's first prompt presented under the kind's prompt variable (`review_comments` or `bot_review_comments`) when the run exited normally. The orchestrator's worker-exit handler is the only writer: it inserts the absent IDs in one transaction and ignores stored ones. Nothing deletes a row: the set outlives watch windows, escalations, the terminal release, and restarts, so a comment an agent already received is never handed over as new a second time. The orchestrator loads a key's rows on first use and keeps them as a cache, so a failed load defers the review pass instead of dispatching an empty turn. The table starts empty on upgrade, so a comment given before the upgrade counts as new once. The runtime-only reported set of `bot-review` never reaches this table.
+
+**`handoff_absence_resets`**: end of a consecutive handoff-absence sequence
 
 | Column         | Type    | Notes                                                              |
 | -------------- | ------- | ------------------------------------------------------------------ |
@@ -134,7 +200,7 @@ One row per issue, written only when a run's evidence verdict is `work observed`
 
 The reset point is read from `run_history` inside the write, so a work-observed run whose own history row could not be persisted still clears the absences recorded before it. This table holds no verdict history: it is a per-issue position that is overwritten, and deleting a row only restores the issue's full recorded absence sequence. A work-observed run is no longer the table's only writer: releasing a parked issue, whatever reason the park carries, also writes a reset here, so the loop does not immediately re-derive the exhausted count and park the issue again on the tick that released it.
 
-**`parked_issues`**: issues held out of primary dispatch until a human acts (migration 014)
+**`parked_issues`**: issues held out of primary dispatch until a human acts
 
 | Column          | Type    | Notes                                                              |
 | --------------- | ------- | ------------------------------------------------------------------ |
@@ -146,10 +212,21 @@ The reset point is read from `run_history` inside the write, so a work-observed 
 | `label`         | TEXT    | Parking label the orchestrator applied                             |
 | `label_applied` | INTEGER | `1` once the orchestrator has confirmed the label reached the tracker |
 | `parked_at`     | TEXT    | ISO-8601 timestamp                                                  |
+| `issue_title`   | TEXT    | The tracker's title of the issue as read when the park was recorded, or at the first read after a park recorded or restored without one; `''` on a row written before the column existed until the row is next written |
+| `issue_url`     | TEXT    | The tracker's web link of the issue as read then, under the same rule as `issue_title` |
+| `rule_name` | TEXT | Dispatch rule of the run the park follows; empty when none matched, and while the park records no run. Its migration fills an older row from the `rule_name` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `agent_kind` | TEXT | Agent adapter of the run the park follows; empty while the park records no run, and a park records a run exactly when it is non-empty. Its migration fills an older row from the `agent_adapter` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `configured_model` | TEXT | The `model` the run's resolved settings block carried; empty when unset. Its migration fills an older row from the `configured_model` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `stage_previous` | TEXT | Source rule of the stage hop the run's selection carried into its `stage.previous`; empty when none. Its migration fills an older row from the `stage_previous` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `stage_previous_outcome` | TEXT | Outcome of that hop, `succeeded` or `no_change`; empty when `stage_previous` is empty. Its migration fills an older row from the `stage_previous_outcome` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `chain_id` | TEXT | Stage chain identifier of the run the park follows. Its migration fills an older row from the `chain_id` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `dispatched_at` | TEXT | RFC 3339 timestamp, in UTC with nanosecond precision, of the start of the first run of the pass the run belongs to, never the park time. Its migration fills an older row from the `dispatched_at` of the park's run: the issue's `run_history` row with the greatest `id` among rows whose `agent_adapter` is non-empty and whose `started_at`, compared as an instant, is at or before the row's `parked_at`; the synthetic `ci_failed` row is not an agent run. Empty when no row qualifies or a time does not parse |
+| `issue_type` | TEXT | The tracker's issue type as read for the park; empty while the park holds no read of it, and on a row written before the column existed, which no table can fill. A park holding a title or link and no labels takes the type of the next poll tick's candidate |
+| `issue_labels` | TEXT | The issue's labels as read for the park, less the park's own parking label, as a JSON array of strings; `[]` for a read that found none, and `''` for no read, on a row written before the column existed, and for a value that does not decode as an array of strings |
 
-One row per parked issue, holding current state rather than history: the row is deleted the moment the park is lifted, not retained as a record of a past park. `parked_state` is nullable in meaning though not in type: an empty string means no tracker state was observed at park time, which only a park taken from the retry lane produces, since that lane parks ahead of its own tracker fetch by design (§14.2). `label_applied` has exactly one writer: the orchestrator's release-rule observation of the label on a later fetch of the issue, never the outcome of the label write itself.
+One row per parked issue, holding current state rather than history: the row is deleted the moment the park is lifted, not retained as a record of a past park. `parked_state` is nullable in meaning though not in type: an empty string means no tracker state was observed at park time, which only a park taken from the retry lane produces, since that lane parks ahead of its own tracker fetch by design (§14.2). `label_applied` has exactly one writer: the orchestrator's release-rule observation of the label on a later fetch of the issue, never the outcome of the label write itself. A park the poll tick records reads its run from `run_history` and writes it with the row; a failed read writes the row with the run columns empty, and they stay empty until the park is released.
 
-**`budget_hold_notices`**: cross-restart dedup for the tracker comment posted on an issue held by a per-issue budget ceiling (migration 015)
+**`budget_hold_notices`**: cross-restart dedup for the `budget.held` notice delivered for an issue held by a per-issue budget ceiling
 
 | Column       | Type    | Notes                                                       |
 | ------------ | ------- | ------------------------------------------------------------ |
@@ -157,7 +234,70 @@ One row per parked issue, holding current state rather than history: the row is 
 | `reason`     | TEXT    | `session_budget` or `token_budget`                            |
 | `noticed_at` | TEXT    | ISO-8601 timestamp the posted notice reported                 |
 
-One row per issue whose current budget hold has been announced on the tracker, holding current state rather than history: the row is deleted when the hold clears, on the same evidence rule that prunes the in-memory announcement latch, or when both budgets are disabled. An issue held by a ceiling and then closed, or otherwise never observed as a candidate again, never has its row deleted, so the row persists for the rest of the deployment's lifetime. `noticed_at` exists so an operator reading the database can align a row with the comment on the issue; no runtime decision reads it.
+One row per issue whose current budget hold has been announced to at least one destination. A row records that the notice had a destination: a hold whose `budget.held` event reached none writes no row, and the issue is routed again on a later pass, so a destination subscribed afterward still receives the notice. The row is written before the delivery and survives a failed delivery. The table holds current state rather than history: the row is deleted when the hold clears, on the same evidence rule that prunes the in-memory announcement latch, or when both budgets are disabled. An issue held by a ceiling and then closed, or otherwise never observed as a candidate again, never has its row deleted, so the row persists for the rest of the deployment's lifetime. `noticed_at` exists so an operator reading the database can align a row with the notice, which is the comment on the issue when the `tracker_comment` destination received it; no runtime decision reads it.
+
+**`stage_hops`**: current stage hop record per issue
+
+| Column               | Type    | Notes                                                              |
+| -------------------- | ------- | ------------------------------------------------------------------ |
+| `issue_id`           | TEXT PK | Tracker-internal issue ID                                          |
+| `identifier`         | TEXT    | Human-readable ticket key                                          |
+| `hop_count`          | INTEGER | Consecutive automatic hops since the last reset, the latest included |
+| `source_rule`        | TEXT    | Dispatch rule whose run made the latest hop                        |
+| `target_rule`        | TEXT    | Dispatch rule the latest hop advanced the issue to                 |
+| `target_label`       | TEXT    | Stage label the latest hop added                                   |
+| `previous_outcome`   | TEXT    | `succeeded`, or `no_change` when the source run declared that no change was needed |
+| `source_dispatch_id` | TEXT    | Dispatch ID of the run that made the latest hop                    |
+| `target_observed`    | INTEGER | `1` once a read has shown `target_label` on the issue; `0` while the hold is open |
+| `hopped_at`          | TEXT    | RFC 3339 timestamp of the latest hop                               |
+| `chain_id`           | TEXT    | Stage chain identifier of the run whose exit made the latest hop; empty on a row written before the column existed |
+| `display_identifier` | TEXT    | Qualified form of `identifier` at the latest hop; empty when `identifier` suffices. Its migration fills an older row from the newest `run_history` row of the issue that holds a title or link; empty when none does |
+| `issue_title`        | TEXT    | The tracker's title of the issue as read at the latest hop, filled by its migration from the same `run_history` row as `display_identifier`; empty when the hop was recorded without a read |
+| `issue_url`          | TEXT    | The tracker's web link of the issue as read then, under the same rule as `issue_title` |
+| `dispatched_at`      | TEXT    | RFC 3339 timestamp, in UTC with nanosecond precision, of the start of the first run of the pass the hop's `chain_id` names. Its migration fills an older row under the rule of `retry_entries.dispatched_at`; empty when `chain_id` is empty or no agent run shares it |
+| `run_dispatched`     | INTEGER | `1` once a run of the issue was dispatched after the hop, which ends the issue's listing between stages; `0` while none was. Its migration sets `1` on an older row when an agent run of the issue started at or after `hopped_at`, and `0` otherwise |
+| `issue_type` | TEXT | The tracker's issue type as the hopping run read it; empty when the hop was recorded without a read, and on a row written before the column existed |
+| `issue_labels` | TEXT | The issue's labels as the hop leaves them: the run's read without the stage labels the hop removes, followed by the stage label it adds, as a JSON array of strings; `[]` for a read that found none, and `''` for no read, on a row written before the column existed, and for a value that does not decode as an array of strings |
+| `issue_state` | TEXT | The tracker state of the issue as the hopping run read it, under the same rule as `issue_type` |
+
+One row per issue, holding current state since the last reset rather than history: the row is deleted when the count resets (a handoff write succeeds, the issue turns terminal or non-active, or the issue is parked or released from a park). A reading of no configured state deletes the row only when it repeats on the next reading of that issue, because a healthy label edit can show an issue with no state label for a moment; the flag that tracks the first reading is runtime-only and the table gains no column for it, so after a restart the next no-state reading counts as the first. The row serves the per-issue ceiling on consecutive hops, the hold that keeps a lagging candidate listing from sending the issue back to the stage it left, the `stage.previous` pair of the target's dispatch, whether that dispatch is the first run after the hop, and the issue's listing between stages, which lasts until a dispatch of the issue sets `run_dispatched`. Setting the flag updates that column alone and does nothing for an issue without a row. Recording a hop upserts the row and deletes the issue's `retry_entries` row in one transaction, so a restart cannot restore the retry of the stage the hop left. Recording a second hop with the `source_dispatch_id` already stored keeps the stored `hop_count`, so one source run is counted once. A row written before these columns existed holds no issue type, labels, or state, and they stay empty until a hop replaces the row or the row is deleted. Startup loads every row before the event loop starts, after `parked_issues`.
+
+**`issue_outcomes`**: how each issue's latest work ended, as the orchestrator observed it
+
+| Column                | Type                 | Notes                                                                 |
+| --------------------- | -------------------- | --------------------------------------------------------------------- |
+| `issue_id`            | TEXT PK              | Tracker-internal issue ID                                             |
+| `kind`                | TEXT NOT NULL        | `handed_off`, `merged`, or `terminal`                                 |
+| `observed_at`         | TEXT NOT NULL        | RFC 3339 timestamp in UTC at second precision, the format of `run_history.completed_at`; when the orchestrator made or observed the ending |
+| `state`               | TEXT NOT NULL        | `handed_off`: the state the handoff wrote. `terminal`: the terminal state read, or written by a handoff. `merged`: empty |
+| `merge_reaction_kind` | TEXT NOT NULL        | `merged`: the reaction kind that observed the merge, `merge` or `merge-completion`. Empty otherwise |
+| `pr_number`           | INTEGER NOT NULL     | `merged`: the pull request number. `0` otherwise                       |
+| `pr_repository`       | TEXT NOT NULL        | `merged`: the pull request's `owner/repo`. Empty otherwise             |
+
+One row per issue, holding current state rather than history. The orchestrator writes the row on its event loop at the observation sites and applies the record rule in one statement, so a stored merge survives a later terminal read; the poll tick's dispatch deletes the row when it picks the issue up again (Section 4.1.8). The row is its own table, not a column of `run_history`, because an ending can be observed while a run is in flight, before that run's row exists, and a handoff or a merge belongs to the issue rather than to one run. The table has no index beyond its primary key and no backfill: an issue that ended before the table existed has no row and reports no outcome. `GET /api/v1/runs` selects runs by this table's `observed_at` through the ending bounds (Section 13.7.2).
+
+**`attention_acknowledgements`**: attention items a person has seen
+
+| Column            | Type             | Notes                                                                                   |
+| ----------------- | ---------------- | --------------------------------------------------------------------------------------- |
+| `item_id`         | TEXT PRIMARY KEY | The `id` of the attention item (§13.7.2)                                                |
+| `acknowledged_at` | TEXT NOT NULL    | RFC 3339 with nanoseconds, in UTC; when the item was first acknowledged                 |
+
+One row per acknowledged item, holding current state rather than history. The orchestrator writes the row on its event loop when it records an acknowledgement, inserting the row or replacing the row with the same `item_id`; it saves the row before it changes the in-memory map, so every acknowledgement a client was told about survives a restart. A repeat request writes nothing, which keeps the first time. The poll tick deletes the rows of every item the state no longer derives, in one statement, and only on a tick whose candidate fetch succeeded (Section 8.1). The startup load reads every row before the event loop starts, and a row with an empty `item_id` or a time that does not parse is skipped. The table references no other table, because a budget hold exists only in memory until the first tick that reads the candidate issues rebuilds it.
+
+**`run_events`**: the retained agent events of finished runs
+
+| Column        | Type             | Notes                                                                                                  |
+| ------------- | ---------------- | ------------------------------------------------------------------------------------------------------ |
+| `dispatch_id` | TEXT NOT NULL    | The run's dispatch ID, as `run_history.dispatch_id` holds it                                            |
+| `seq`         | INTEGER NOT NULL | The event's number within the run (§13.9); the primary key is (`dispatch_id`, `seq`)                    |
+| `at`          | TEXT NOT NULL    | RFC 3339 timestamp with nanoseconds, in UTC, of the event                                              |
+| `event`       | TEXT NOT NULL    | The normalized event type                                                                              |
+| `payload`     | TEXT NOT NULL    | The event's retained members other than the three above, as a JSON object: the masked and cut `message`, and the type's own members (§13.9). `text` is never stored |
+| `completed_at`| TEXT NOT NULL    | The run's `run_history.completed_at`, repeated on each row so pruning reads no other table            |
+| `size`        | INTEGER NOT NULL | Encoded size of the event in bytes, the measure of the 64 MiB bound                                     |
+
+The rows of a run are written once, at worker exit, in the transaction that appends the run's `run_history` row, so a run's events and its history row are stored together or not at all; a running run's events live only in memory. Each write first deletes the rows of runs whose `completed_at` is more than 7 days old, then deletes the rows of whole runs, oldest `completed_at` first, until the sum of `size` is at most 64 MiB. Pruning runs only on these writes, so 7 days is the least a finished run's events stay readable, not an expiry. A run with no rows is not retained (§13.9): a pruned run, a run lost in a crash, a run whose history row predates the `dispatch_id` column, the `ci_failed` row, and a run that retained no event. An index on `completed_at` serves pruning. Reads go through the store's single connection on the request goroutine, as history reads do.
 
 ### 19.3 Migration Strategy
 

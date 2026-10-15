@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -15,9 +14,10 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
+	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/prompt"
-	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
 // WorkflowManager provides the current workflow config and prompt template.
@@ -28,11 +28,13 @@ type WorkflowManager interface {
 	PromptTemplateByID(id string) *prompt.Template
 	Reload() error
 	WorkflowAbsPath() string
+	LoadStatus() workflow.LoadStatus
 }
 
 // OrchestratorStore is the persistence interface required by the event
 // loop. Satisfied by [persistence.Store].
 type OrchestratorStore interface {
+	Ping(ctx context.Context) error
 	AppendRunHistory(ctx context.Context, run persistence.RunHistory) (persistence.RunHistory, error)
 	UpsertAggregateMetrics(ctx context.Context, metrics persistence.AggregateMetrics) error
 	UpsertSessionMetadata(ctx context.Context, meta persistence.SessionMetadata) error
@@ -44,10 +46,13 @@ type OrchestratorStore interface {
 	TokenUsageByIssue(ctx context.Context, issueID string) (persistence.IssueTokenUsage, error)
 	QueryBudgetExhaustedIssues(ctx context.Context, candidateIDs []string, maxSessions int) (map[string]int, error)
 	QueryTokenBudgetUsage(ctx context.Context, candidateIDs []string) (map[string]persistence.IssueTokenUsage, error)
+	LatestAgentRuns(ctx context.Context, issueIDs []string) (map[string]persistence.RunHistory, error)
 	UpsertReactionFingerprint(ctx context.Context, issueID, kind, fingerprint string) error
 	GetReactionFingerprint(ctx context.Context, issueID, kind string) (fingerprint string, dispatched bool, err error)
 	MarkReactionDispatched(ctx context.Context, issueID, kind string) error
 	DeleteReactionFingerprint(ctx context.Context, issueID, kind string) error
+	AddReactionHandedOffComments(ctx context.Context, issueID, kind string, commentIDs []string) error
+	ListReactionHandedOffComments(ctx context.Context, issueID, kind string) ([]string, error)
 	UpsertReactionObservation(
 		ctx context.Context,
 		issueID, kind, fingerprint string,
@@ -64,6 +69,20 @@ type OrchestratorStore interface {
 	DeleteBudgetHoldNotice(ctx context.Context, issueID string) error
 	DeleteAllBudgetHoldNotices(ctx context.Context) error
 	ListBudgetHoldNotices(ctx context.Context) ([]persistence.BudgetHoldNotice, error)
+	RecordStageHop(ctx context.Context, hop persistence.StageHop) error
+	MarkStageHopObserved(ctx context.Context, issueID string) error
+	MarkStageHopDispatched(ctx context.Context, issueID string) error
+	DeleteStageHop(ctx context.Context, issueID string) error
+	ListStageHops(ctx context.Context) ([]persistence.StageHop, error)
+	RecordRunStageResult(ctx context.Context, runID int64, targetRule, result string) error
+	RecordIssueOutcome(ctx context.Context, outcome persistence.IssueOutcome) error
+	DeleteIssueOutcome(ctx context.Context, issueID string) error
+	GetReactionEscalation(ctx context.Context, issueID, kind string) (persistence.ReactionEscalation, bool, error)
+	SaveReactionEscalation(ctx context.Context, rec persistence.ReactionEscalation) error
+	EndReactionEscalation(ctx context.Context, issueID, kind string) error
+	DeleteReactionEscalations(ctx context.Context, issueID string) error
+	SaveAttentionAcknowledgement(ctx context.Context, ack persistence.AttentionAcknowledgement) error
+	DeleteAttentionAcknowledgements(ctx context.Context, itemIDs []string) error
 }
 
 var _ OrchestratorStore = (*persistence.Store)(nil)
@@ -71,8 +90,12 @@ var _ OrchestratorStore = (*persistence.Store)(nil)
 // Observer receives notifications when orchestrator state changes.
 // Implementations must not block and must not mutate state.
 type Observer interface {
-	// OnStateChange is called after each event loop iteration that modifies
-	// state (tick completion, worker exit, retry fire).
+	// OnStateChange is called on the event loop goroutine after tick
+	// completion, worker exit, retry fire, each agent-lane message (agent
+	// event, turn start, self-review progress, unaccounted turns), an
+	// operator request the loop applies that changes what the API serves (a
+	// retry made due now, an attention item acknowledged), and the start of
+	// shutdown. It can run many times a second while sessions are active.
 	OnStateChange()
 }
 
@@ -81,6 +104,29 @@ type Observer interface {
 type snapshotRequest struct {
 	ReplyCh chan<- RuntimeSnapshotResult
 }
+
+// loopAction is work a caller asks the event loop to run. state decides who
+// owns the action: the loop takes it or the caller withdraws it, never both.
+type loopAction struct {
+	apply func(ctx context.Context)
+	state atomic.Int32
+	done  chan struct{}
+}
+
+const (
+	loopActionPending int32 = iota
+	loopActionTaken
+	loopActionWithdrawn
+)
+
+// loopOutcome is what [Orchestrator.runOnLoop] did with a request.
+type loopOutcome int
+
+const (
+	loopRan loopOutcome = iota + 1
+	loopDraining
+	loopWithdrawn
+)
 
 // agentEventMsg pairs an issue ID with an agent event for delivery through
 // agentEventCh.
@@ -94,6 +140,14 @@ type agentEventMsg struct {
 type turnStartedMsg struct {
 	IssueID      string
 	TurnsStarted int
+}
+
+// unaccountedTurnsMsg pairs an issue ID with its worker's cumulative
+// unaccounted-turn count for delivery through unaccountedTurnsCh. The count
+// is cumulative, so a later message supersedes an earlier one.
+type unaccountedTurnsMsg struct {
+	IssueID          string
+	UnaccountedTurns int
 }
 
 // OrchestratorParams holds the construction-time dependencies for
@@ -110,6 +164,10 @@ type OrchestratorParams struct {
 	Metrics         domain.Metrics       // may be nil; defaults to NoopMetrics
 	ToolRegistry    *domain.ToolRegistry // may be nil
 	HostPool        *HostPool            // may be nil; defaults to local-mode pool
+
+	// Router selects the destinations of every outbound event. Nil
+	// routes nothing, so no event reaches a tracker or a notifier.
+	Router *route.Router
 
 	// SessionToolRegistryFunc builds the per-session tool registry so the
 	// first-turn advertisement matches the MCP sidecar's set. May be nil,
@@ -139,9 +197,16 @@ type OrchestratorParams struct {
 	// review comment routing is not configured.
 	SCMAdapter domain.SCMAdapter
 
+	// SCMProvider is the provider kind SCMAdapter and CIProvider were built
+	// for; empty when both are nil.
+	SCMProvider string
+
 	// ReviewConfig holds validated review reaction configuration. Zero when
 	// SCMAdapter is nil.
 	ReviewConfig ReviewReactionConfig
+
+	// ReviewConfigured is true when reactions.review_comments is active.
+	ReviewConfigured bool
 
 	// AutoMergeConfig holds validated auto-merge configuration. Zero when
 	// AutoMergeReactionConfigured is false.
@@ -209,6 +274,7 @@ type Orchestrator struct {
 	logger *slog.Logger
 
 	trackerAdapter     domain.TrackerAdapter
+	router             *route.Router
 	agentAdapter       domain.AgentAdapter
 	agentAdapterByKind func(kind string) (domain.AgentAdapter, error)
 	workflowManager    WorkflowManager
@@ -217,13 +283,19 @@ type Orchestrator struct {
 	blockerResolver    BlockerResolver
 	abandonCh          <-chan struct{}
 
-	workerExitCh  chan WorkerResult
-	retryTimerCh  chan string
-	agentEventCh  chan agentEventMsg
-	selfReviewCh  chan selfReviewProgressMsg
-	turnStartedCh chan turnStartedMsg
-	snapshotCh    chan snapshotRequest
-	refreshCh     chan struct{}
+	workerExitCh       chan WorkerResult
+	retryTimerCh       chan string
+	agentEventCh       chan agentEventMsg
+	selfReviewCh       chan selfReviewProgressMsg
+	turnStartedCh      chan turnStartedMsg
+	unaccountedTurnsCh chan unaccountedTurnsMsg
+	snapshotCh         chan snapshotRequest
+	refreshCh          chan struct{}
+
+	// actionCh carries work for the event loop; only Run reads it. stopping
+	// closes once, when shutdown begins and before workers drain.
+	actionCh chan *loopAction
+	stopping chan struct{}
 
 	preflightParams PreflightParams
 	observers       []Observer
@@ -235,6 +307,11 @@ type Orchestrator struct {
 	toolRegistry                      *domain.ToolRegistry
 	sessionToolRegistryFunc           SessionToolRegistryFunc
 	preflightOK                       atomic.Bool
+	databaseHealth                    *healthRecord
+	preflightHealth                   *healthRecord
+	pollHealth                        *pollRecord
+	scmHealth                         *healthRecord // nil when no reaction uses a source-control provider
+	scmProvider                       string
 	draining                          atomic.Bool
 	hostPool                          *HostPool
 	workflowFileFunc                  func() string
@@ -243,6 +320,7 @@ type Orchestrator struct {
 	ciProvider                        domain.CIStatusProvider
 	scmAdapter                        domain.SCMAdapter
 	reviewConfig                      ReviewReactionConfig
+	reviewReactionConfigured          bool
 	autoMergeConfig                   AutoMergeReactionConfig
 	autoMergeReactionConfigured       bool
 	botReviewConfig                   BotReviewReactionConfig
@@ -364,6 +442,7 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 		state:                             params.State,
 		logger:                            logger,
 		trackerAdapter:                    params.TrackerAdapter,
+		router:                            params.Router,
 		agentAdapter:                      params.AgentAdapter,
 		agentAdapterByKind:                agentAdapterByKind,
 		workflowManager:                   params.WorkflowManager,
@@ -374,8 +453,11 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 		agentEventCh:                      make(chan agentEventMsg, eventBuf),
 		selfReviewCh:                      make(chan selfReviewProgressMsg, eventBuf),
 		turnStartedCh:                     make(chan turnStartedMsg, eventBuf),
+		unaccountedTurnsCh:                make(chan unaccountedTurnsMsg, eventBuf),
 		snapshotCh:                        make(chan snapshotRequest, 4),
 		refreshCh:                         make(chan struct{}, 1),
+		actionCh:                          make(chan *loopAction, 4),
+		stopping:                          make(chan struct{}),
 		preflightParams:                   params.PreflightParams,
 		observers:                         observers,
 		toolRegistry:                      params.ToolRegistry,
@@ -386,7 +468,11 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 		mcpServerBinary:                   params.MCPServerBinary,
 		ciProvider:                        params.CIProvider,
 		scmAdapter:                        params.SCMAdapter,
+		databaseHealth:                    &healthRecord{},
+		preflightHealth:                   &healthRecord{},
+		pollHealth:                        &pollRecord{},
 		reviewConfig:                      params.ReviewConfig,
+		reviewReactionConfigured:          params.ReviewConfigured,
 		autoMergeConfig:                   params.AutoMergeConfig,
 		autoMergeReactionConfigured:       params.AutoMergeReactionConfigured,
 		botReviewConfig:                   params.BotReviewConfig,
@@ -403,6 +489,19 @@ func NewOrchestrator(params OrchestratorParams) *Orchestrator {
 		ciTriage:                          ciTriage,
 		blockerResolver:                   params.BlockerResolver,
 		abandonCh:                         params.AbandonCh,
+	}
+	if params.SCMAdapter != nil || params.CIProvider != nil {
+		o.scmHealth = &healthRecord{}
+		o.scmProvider = params.SCMProvider
+	}
+	if params.SCMAdapter != nil {
+		o.scmAdapter = observeSCM(params.SCMAdapter, o.scmHealth)
+	}
+	if params.CIProvider != nil {
+		o.ciProvider = observeCI(params.CIProvider, o.scmHealth)
+	}
+	if params.WorkflowManager != nil {
+		o.updateRouter(params.WorkflowManager.Config())
 	}
 	// Startup preflight must have passed for construction to reach here.
 	o.preflightOK.Store(true)
@@ -459,6 +558,24 @@ func (o *Orchestrator) applyTurnStarted(msg turnStartedMsg) {
 	entry.TurnCount = msg.TurnsStarted
 }
 
+// applyUnaccountedTurns records a relayed unaccounted-turn count on the
+// issue's running entry and, once the session's in-flight row exists, writes
+// it at once so the read-only tool server sees the count without waiting for
+// the throttle or the worker exit. Before that row exists the count waits
+// for the first write, which keeps a row existing exactly when the session
+// reported a measurement. A no-op for an unknown issue.
+func (o *Orchestrator) applyUnaccountedTurns(ctx context.Context, msg unaccountedTurnsMsg) {
+	entry, ok := o.state.Running[msg.IssueID]
+	if !ok {
+		return
+	}
+	entry.UnaccountedTurns = msg.UnaccountedTurns
+	if entry.LastMetadataWrite.IsZero() {
+		return
+	}
+	o.writeIncrementalMetadata(ctx, msg.IssueID, entry, time.Now().UTC())
+}
+
 // applyQueuedAheadOfExit applies the messages queued ahead of the
 // WorkerResults of exitingIssueIDs, evaluating the token ceiling for every
 // applied event except those of an exiting issue: that run has ended, so a
@@ -470,6 +587,9 @@ func (o *Orchestrator) applyQueuedAheadOfExit(ctx context.Context, exitingIssueI
 	})
 	applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
 	applyQueued(o.turnStartedCh, o.applyTurnStarted)
+	applyQueued(o.unaccountedTurnsCh, func(msg unaccountedTurnsMsg) {
+		o.applyUnaccountedTurns(ctx, msg)
+	})
 }
 
 // handleWorkerExit takes workerExit and every WorkerResult already waiting
@@ -488,6 +608,7 @@ func (o *Orchestrator) handleWorkerExit(ctx context.Context, workerExit WorkerRe
 	o.applyQueuedAheadOfExit(ctx, exitingIssueIDs)
 
 	cfg := o.workflowManager.Config()
+	o.updateRouter(cfg)
 	for _, result := range exits {
 		HandleWorkerExit(o.state, result, HandleWorkerExitParams{
 			Store:                             o.store,
@@ -502,14 +623,16 @@ func (o *Orchestrator) handleWorkerExit(ctx context.Context, workerExit WorkerRe
 			TrackerAdapter:                    o.trackerAdapter,
 			HandoffState:                      cfg.Tracker.HandoffState,
 			NoChangeState:                     cfg.Tracker.NoChangeState,
+			Dispatch:                          cfg.Dispatch,
 			ActiveStates:                      cfg.Tracker.ActiveStates,
 			TerminalStates:                    cfg.Tracker.TerminalStates,
 			Metrics:                           o.metrics,
 			HostPool:                          o.hostPool,
-			CommentsConfig:                    cfg.Tracker.Comments,
+			Router:                            o.router,
 			CIProvider:                        o.ciProvider,
 			SCMAdapter:                        o.scmAdapter,
 			AutoMergeReactionConfigured:       o.autoMergeReactionConfigured,
+			ReviewReactionConfigured:          o.reviewReactionConfigured,
 			BotReviewReactionConfigured:       o.botReviewReactionConfigured,
 			MergeConflictReactionConfigured:   o.mergeConflictReactionConfigured,
 			LabelReviewReactionConfigured:     o.labelReviewReactionConfigured,
@@ -530,17 +653,27 @@ func (o *Orchestrator) Run(ctx context.Context) {
 	// A past-due recovered retry can dispatch on the first pass, ahead of
 	// the first tick, so the worker settings it launches under must be in
 	// force before it is activated.
-	o.applyWorkerConfig(o.workflowManager.Config())
+	startCfg := o.workflowManager.Config()
+	o.applyWorkerConfig(startCfg)
+	o.state.ReactionMaxAttempts = o.reactionMaxAttempts(startCfg)
+	o.state.ReactionWatchWindows = o.reactionWatchWindows(startCfg)
+	o.state.StageChains = startCfg.Dispatch.Chains()
+	o.state.RuleAgents = o.ruleAgents(startCfg)
+	o.state.HopCeiling = startCfg.Dispatch.HopCeiling()
 	o.activateReconstructedRetries()
 
 	tickTimer := time.NewTimer(0)
 	defer tickTimer.Stop()
+	o.pollHealth.schedule(time.Now())
 
 	for {
 		select {
 		case <-ctx.Done():
 			o.draining.Store(true)
+			close(o.stopping)
 			tickTimer.Stop()
+			o.pollHealth.schedule(time.Time{})
+			o.notifyObservers()
 			o.drainRunningWorkers()
 			o.drainTriageRuns()
 			o.drainTrackerOps()
@@ -549,56 +682,124 @@ func (o *Orchestrator) Run(ctx context.Context) {
 
 		case <-tickTimer.C:
 			o.handleTick(ctx)
-			tickTimer.Reset(time.Duration(o.state.PollIntervalMS) * time.Millisecond)
+			interval := time.Duration(o.state.PollIntervalMS) * time.Millisecond
+			tickTimer.Reset(interval)
+			o.pollHealth.schedule(time.Now().Add(interval))
 
 		case workerExit := <-o.workerExitCh:
 			o.handleWorkerExit(ctx, workerExit)
 
 		case issueID := <-o.retryTimerCh:
 			cfg := o.workflowManager.Config()
+			templateHeld := func(id string) bool { return o.workflowManager.PromptTemplateByID(id) != nil }
+			resolveSelection := func(frozen DispatchResolution, issue domain.Issue) DispatchResolution {
+				selection, routedAfresh := retrySelection(cfg, templateHeld, frozen, issue, hopRouteOf(o.state, issue.ID))
+				if routedAfresh {
+					warnSeveralStageLabels(o.logger, issue, cfg.Dispatch, selection.RuleName)
+				}
+				return selection
+			}
+			resolveAttemptSettings := func(selection DispatchResolution, sshHost string) AttemptSettings {
+				return o.resolveAttemptSettings(cfg, selection, sshHost)
+			}
 			HandleRetryTimer(o.state, issueID, HandleRetryTimerParams{
-				Store:                   o.store,
-				TrackerAdapter:          o.trackerAdapter,
-				ActiveStates:            cfg.Tracker.ActiveStates,
-				TerminalStates:          cfg.Tracker.TerminalStates,
-				HandoffState:            cfg.Tracker.HandoffState,
-				MaxRetryBackoffMS:       cfg.Agent.MaxRetryBackoffMS,
-				MakeWorkerFn:            o.makeWorkerFn,
-				AgentAdapterByKind:      o.agentAdapterByKind,
-				ResolveUsageDisposition: o.resolveUsageDisposition,
-				DefaultAgentKind:        cfg.Agent.Kind,
-				OnRetryFire:             o.onRetryFire,
-				Ctx:                     ctx,
-				Logger:                  o.logger,
-				MaxSessions:             cfg.Agent.MaxSessions,
-				MaxConsecutiveAbsences:  cfg.Agent.MaxConsecutiveAbsences,
-				HandoffParkingLabel:     o.handoffParkingLabel,
-				HandoffEvidencePolicy:   cfg.Tracker.HandoffEvidence,
-				MaxTokens:               cfg.Agent.MaxTokens,
-				Metrics:                 o.metrics,
-				HostPool:                o.hostPool,
-				WorkflowFile:            o.workflowFile(),
+				Store:                  o.store,
+				TrackerAdapter:         o.trackerAdapter,
+				Router:                 o.router,
+				ActiveStates:           cfg.Tracker.ActiveStates,
+				TerminalStates:         cfg.Tracker.TerminalStates,
+				Dispatch:               cfg.Dispatch,
+				HandoffState:           cfg.Tracker.HandoffState,
+				MaxRetryBackoffMS:      cfg.Agent.MaxRetryBackoffMS,
+				MakeWorkerFn:           o.makeWorkerFn,
+				AgentAdapterByKind:     o.agentAdapterByKind,
+				ResolveSelection:       resolveSelection,
+				ResolveAttemptSettings: resolveAttemptSettings,
+				DefaultAgentKind:       cfg.Agent.Kind,
+				OnRetryFire:            o.onRetryFire,
+				Ctx:                    ctx,
+				Logger:                 o.logger,
+				MaxSessions:            cfg.Agent.MaxSessions,
+				MaxConsecutiveAbsences: cfg.Agent.MaxConsecutiveAbsences,
+				HandoffParkingLabel:    o.handoffParkingLabel,
+				HandoffEvidencePolicy:  cfg.Tracker.HandoffEvidence,
+				MaxTokens:              cfg.Agent.MaxTokens,
+				Metrics:                o.metrics,
+				HostPool:               o.hostPool,
+				WorkflowFile:           o.workflowFile(),
 			})
 			o.updateGauges(time.Now())
 			o.notifyObservers()
 
 		case msg := <-o.agentEventCh:
 			o.applyAgentEvent(ctx, msg, true)
+			o.notifyObservers()
 
 		case msg := <-o.selfReviewCh:
 			o.applySelfReviewProgress(msg)
+			o.notifyObservers()
 
 		case msg := <-o.turnStartedCh:
 			o.applyTurnStarted(msg)
+			o.notifyObservers()
+
+		case msg := <-o.unaccountedTurnsCh:
+			o.applyUnaccountedTurns(ctx, msg)
+			o.notifyObservers()
 
 		case req := <-o.snapshotCh:
+			refreshActiveOrder(o.state)
 			snap := RuntimeSnapshot(o.state, time.Now())
 			req.ReplyCh <- snap
+
+		case action := <-o.actionCh:
+			if action.state.CompareAndSwap(loopActionPending, loopActionTaken) {
+				action.apply(ctx)
+				close(action.done)
+			}
 
 		case <-o.refreshCh:
 			o.handleTick(ctx)
 		}
 	}
+}
+
+// runOnLoop runs apply on the event loop and waits for it. It reports
+// loopDraining when shutdown began first and loopWithdrawn when ctx ended
+// first; in both cases apply never ran. The wait has no fixed bound.
+func (o *Orchestrator) runOnLoop(ctx context.Context, apply func(loopCtx context.Context)) loopOutcome {
+	select {
+	case <-o.stopping:
+		return loopDraining
+	default:
+	}
+
+	action := &loopAction{apply: apply, done: make(chan struct{})}
+	select {
+	case o.actionCh <- action:
+	case <-ctx.Done():
+		return loopWithdrawn
+	case <-o.stopping:
+		return loopDraining
+	}
+
+	select {
+	case <-action.done:
+		return loopRan
+	case <-ctx.Done():
+	case <-o.stopping:
+	}
+
+	if action.state.CompareAndSwap(loopActionPending, loopActionWithdrawn) {
+		select {
+		case <-o.stopping:
+			return loopDraining
+		default:
+			return loopWithdrawn
+		}
+	}
+	<-action.done
+	return loopRan
 }
 
 // updateGauges recomputes point-in-time gauges from current state and
@@ -642,6 +843,41 @@ func (o *Orchestrator) applyWorkerConfig(cfg config.ServiceConfig) []config.Advi
 	return wc.Warnings
 }
 
+// reactionMaxAttempts returns the ceiling each counting reaction kind's pass
+// applies under cfg; a kind with none is absent.
+func (o *Orchestrator) reactionMaxAttempts(cfg config.ServiceConfig) map[string]int {
+	ceilings := map[string]int{
+		ReactionKindCI:              cfg.CIFeedback.MaxRetries,
+		ReactionKindReview:          o.reviewConfig.MaxContinuationTurns,
+		ReactionKindBotReview:       o.botReviewConfig.MaxContinuationTurns,
+		ReactionKindMergeConflict:   o.mergeConflictConfig.MaxRetries,
+		ReactionKindMergeCompletion: o.mergeCompletionConfig.MaxRetries,
+	}
+	if o.autoMergeConfig.MaxRetries > 0 {
+		ceilings[ReactionKindAutoMerge] = o.autoMergeConfig.MaxRetries
+	}
+	return ceilings
+}
+
+// reactionWatchWindows returns the watch window each watched reaction kind's
+// pass applies under cfg; a kind with none, or with a window of 0, is absent.
+func (o *Orchestrator) reactionWatchWindows(cfg config.ServiceConfig) map[string]time.Duration {
+	windowsMS := map[string]int{
+		ReactionKindCI:            cfg.CIFeedback.WatchWindowMS,
+		ReactionKindReview:        o.reviewConfig.WatchWindowMS,
+		ReactionKindBotReview:     o.botReviewConfig.WatchWindowMS,
+		ReactionKindMergeConflict: o.mergeConflictConfig.WatchWindowMS,
+		ReactionKindAutoMerge:     o.autoMergeConfig.WatchWindowMS,
+	}
+	windows := make(map[string]time.Duration, len(windowsMS))
+	for kind, ms := range windowsMS {
+		if ms > 0 {
+			windows[kind] = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return windows
+}
+
 // handleTick executes a single poll-and-dispatch cycle: preflight, config
 // read, reconcile, fetch, sort, dispatch.
 //
@@ -662,14 +898,22 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 	// reflects the latest disk state.
 	validation := ValidateDispatchConfig(o.preflightParams)
 	o.preflightOK.Store(validation.OK())
+	o.recordPreflight(validation)
 
 	// On reload failure the workflow manager retains last-known-good config.
 	cfg := o.workflowManager.Config()
+	o.updateRouter(cfg)
 
 	// Applied unconditionally, not gated on preflight success.
 	o.state.PollIntervalMS = cfg.Polling.IntervalMS
 	o.state.MaxConcurrentAgents = cfg.Agent.MaxConcurrentAgents
 	o.state.MaxTokens = cfg.Agent.MaxTokens
+	o.state.MaxSessions = cfg.Agent.MaxSessions
+	o.state.StageChains = cfg.Dispatch.Chains()
+	o.state.RuleAgents = o.ruleAgents(cfg)
+	o.state.HopCeiling = cfg.Dispatch.HopCeiling()
+	o.state.ReactionMaxAttempts = o.reactionMaxAttempts(cfg)
+	o.state.ReactionWatchWindows = o.reactionWatchWindows(cfg)
 	o.state.TokenWarningThreshold = cfg.Agent.TokenWarningThreshold()
 	o.state.MaxConcurrentByState = cfg.Agent.MaxConcurrentByState
 
@@ -677,10 +921,15 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 	LogAdvisories(ctx, o.logger, newAdvisories(current, o.reportedAdvisories))
 	o.reportedAdvisories = current
 
+	if err := o.store.Ping(ctx); !canceled(ctx, err) {
+		o.databaseHealth.record(time.Now(), err)
+	}
+
 	// Reconcile unconditionally so in-flight workers are monitored even when
 	// dispatch is skipped.
 	ReconcileRunningIssues(o.state, ReconcileParams{
 		TrackerAdapter:                    o.trackerAdapter,
+		Router:                            o.router,
 		ActiveStates:                      cfg.Tracker.ActiveStates,
 		TerminalStates:                    cfg.Tracker.TerminalStates,
 		HandoffState:                      cfg.Tracker.HandoffState,
@@ -738,6 +987,7 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 	// On preflight failure, skip dispatch but still notify observers.
 	if !validation.OK() {
 		pollResult = outcomeError
+		o.pollHealth.record(time.Now(), pollOutcomePreflightFailed, nil)
 		o.logger.Error("dispatch preflight failed",
 			slog.Any("error", validation),
 		)
@@ -748,6 +998,9 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 	issues, err := o.trackerAdapter.FetchCandidateIssues(ctx)
 	if err != nil {
 		pollResult = outcomeError
+		if !canceled(ctx, err) {
+			o.pollHealth.record(time.Now(), pollOutcomeTrackerFailed, err)
+		}
 		o.logger.Error("failed to fetch candidate issues",
 			slog.Any("error", err),
 		)
@@ -755,10 +1008,13 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		return
 	}
 
+	o.pollHealth.record(time.Now(), pollOutcomeSucceeded, nil)
+
 	sorted := SortForDispatch(issues)
 
 	o.rebuildBudgetExhausted(ctx, cfg, sorted)
-	o.refreshParkedIssues(ctx, sorted)
+	o.fillRetryIdentity(sorted)
+	o.refreshParkedIssues(ctx, sorted, cfg.Tracker.TerminalStates)
 	o.parkExhaustedAbsences(ctx, cfg, sorted)
 
 	activeSet := stateSet(cfg.Tracker.ActiveStates)
@@ -800,9 +1056,13 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 			}
 			continue
 		}
-		issue = decision.Issue
+		issue, dispatchable := o.holdForStageHop(ctx, decision.Issue, activeSet, terminalSet)
+		if !dispatchable {
+			continue
+		}
 
-		resolution := ResolveRule(issue, cfg.Dispatch, cfg.Agent.Kind, "")
+		resolution := ResolveRule(issue, cfg.Dispatch, hopRouteOf(o.state, issue.ID), cfg.Agent.Kind, "")
+		warnSeveralStageLabels(o.logger, issue, cfg.Dispatch, resolution.RuleName)
 		adapter, adapterErr := o.agentAdapterByKind(resolution.AgentKind)
 		if adapterErr != nil {
 			o.logger.Error("agent kind unavailable",
@@ -829,16 +1089,70 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		if !ok {
 			break
 		}
-		arrival, attribution := o.resolveUsageDisposition(resolution.AgentKind, host)
-		DispatchIssue(ctx, o.state, issue, nil, host, o.makeWorkerFn("", host, resolution.AgentKind, resolution.TemplateID, "", adapter, arrival))
+		attemptSettings := o.resolveAttemptSettings(cfg, resolution, host)
+		if len(attemptSettings.Refusals) > 0 {
+			o.hostPool.ReleaseHost(issue.ID)
+			o.logger.Error("agent settings refused",
+				slog.Any("error", PreflightResult{Errors: attemptSettings.Refusals}),
+				slog.String("rule_name", resolution.RuleName),
+				slog.String("agent_kind", resolution.AgentKind),
+				slog.String("check", attemptSettings.Refusals[0].Check),
+				slog.String("diagnostic", attemptSettings.Refusals[0].Message),
+			)
+			o.metrics.IncDispatches(outcomeError)
+			o.metrics.IncDispatchRuleMatch(resolution.MatchedAt.String(), normalizeDispatchRuleName(resolution.RuleName))
+			continue
+		}
+		dispatchCtx := ctx
+		seed := freshRunSeed(ctx, o.state, freshRunSeedParams{
+			SCMAdapter:          o.scmAdapter,
+			Store:               o.store,
+			WorkspaceRoot:       cfg.Workspace.Root,
+			ReviewConfigured:    o.reviewReactionConfigured,
+			ReviewConfig:        o.reviewConfig,
+			BotReviewConfigured: o.botReviewReactionConfigured,
+			BotReviewConfig:     o.botReviewConfig,
+		}, issue, o.logger)
+		if seed != nil {
+			dispatchCtx = WithContinuationContext(ctx, seed)
+		}
+		lineage := withChainID(freshLineage(o.state, issue.ID, resolution.RuleName))
+		dispatchCtx = withStageRender(dispatchCtx, prompt.StageContext{
+			Current:         stageCurrent(cfg.Dispatch, resolution.RuleName),
+			Previous:        lineage.PreviousRule,
+			PreviousOutcome: lineage.PreviousOutcome,
+		})
+		// A park released on this tick reaches the dispatch with no refresh
+		// in between, so a person's answer to a standing escalation is
+		// recognized here, before the claim makes the issue Sortie's own.
+		endOutsideHandoff(ctx, o.state, o.store, o.trackerAdapter, issue.ID, issue.State, cfg.Tracker.HandoffState, cfg.Tracker.TerminalStates, o.logger)
+		DispatchIssue(dispatchCtx, o.state, issue, nil, host, o.makeWorkerFn("", host, resolution.AgentKind, resolution.TemplateID, "", adapter, attemptSettings))
 		if entry := o.state.Running[issue.ID]; entry != nil {
+			entry.ContinuationContext = seed
 			entry.WorkflowFile = o.workflowFile()
 			entry.AgentKind = resolution.AgentKind
 			entry.RuleName = resolution.RuleName
+			entry.StageLineage = lineage
+			startPass(entry)
+			issueLog := logging.WithIssue(o.logger, issue.ID, issue.Identifier)
+			// Read before the mark below flips RunDispatched.
+			hop := o.state.StageHops[issue.ID]
+			entry.FirstAfterHop = hop != nil && hop.TargetRule == resolution.RuleName && !hop.RunDispatched
+			markStageHopDispatched(ctx, o.state, o.store, issue.ID, issueLog)
+			clearIssueOutcome(ctx, o.store, issue.ID, issueLog)
+			entry.RuleSettingsApplied = attemptSettings.Settings.RuleName != ""
+			entry.ConfiguredModel = attemptSettings.Settings.Model
+			entry.ConfiguredEffort = attemptSettings.Settings.Effort
 			entry.TemplateID = resolution.TemplateID
-			entry.UsageArrival, entry.UsageAttribution = arrival, attribution
+			entry.UsageArrival, entry.UsageAttribution = attemptSettings.UsageArrival, attemptSettings.UsageAttribution
 			freezeIssueTokenBaseline(ctx, o.state, issue.ID, o.store, o.logger)
 		}
+		logging.WithIssue(o.logger, issue.ID, issue.Identifier).Info("issue dispatched",
+			slog.String("agent_kind", resolution.AgentKind),
+			slog.String("rule_name", resolution.RuleName),
+			slog.String("model", attemptSettings.Settings.Model),
+			slog.String("effort", attemptSettings.Settings.Effort),
+		)
 		o.metrics.IncDispatches(outcomeSuccess)
 		o.metrics.IncDispatchRuleMatch(resolution.MatchedAt.String(), normalizeDispatchRuleName(resolution.RuleName))
 		switch resolution.MatchedAt {
@@ -883,6 +1197,7 @@ func (o *Orchestrator) handleTick(ctx context.Context) {
 		slog.Int("budget_exhausted", len(o.state.BudgetExhausted)),
 	)
 
+	o.pruneAttentionAcknowledgements(ctx)
 	o.notifyObservers()
 }
 
@@ -927,11 +1242,13 @@ func (o *Orchestrator) recordCandidateHold(decision CandidateDecision, pass *Tic
 
 // makeWorkerFn returns a [WorkerFunc] closure running [RunWorkerAttempt]
 // with the orchestrator's shared dependencies. agentKind, templateID, and
-// adapter carry the rule-resolved selection from the caller; usageArrival
-// must be the value the caller freezes onto the running entry; reactionKind
-// selects the worker posture. resumeSessionID must be read by the caller on
-// the event loop before the goroutine starts, to avoid a Running-map race.
-func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter, usageArrival registry.UsageArrival) WorkerFunc {
+// adapter carry the rule-resolved selection from the caller;
+// attemptSettings carries the settings resolved for this attempt, whose
+// usage arrival must be the value the caller freezes onto the running
+// entry; reactionKind selects the worker posture. resumeSessionID must be
+// read by the caller on the event loop before the goroutine starts, to
+// avoid a Running-map race.
+func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templateID, reactionKind string, adapter domain.AgentAdapter, attemptSettings AttemptSettings) WorkerFunc {
 	strictHostKeyChecking := o.sshStrictHostKeyChecking
 	sshPassEnv := o.sshPassEnv
 	sshDisallowPassEnv := o.sshDisallowPassEnv
@@ -942,18 +1259,22 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 	if agentKind == "" {
 		agentKind = o.workflowManager.Config().Agent.Kind
 	}
+	convertedCredentialEnv := o.convertedCredentialEnv(agentKind)
 	return func(ctx context.Context, issue domain.Issue, attempt *int) {
 
 		logger := logging.WithIssue(o.logger, issue.ID, issue.Identifier)
 
 		deps := WorkerDeps{
 			TrackerAdapter:         o.trackerAdapter,
+			Router:                 o.router,
+			TrackerOpsWg:           &o.state.TrackerOpsWg,
 			AgentAdapter:           adapter,
 			ConfigFunc:             o.workflowManager.Config,
 			PromptTemplateByIDFunc: o.workflowManager.PromptTemplateByID,
 			TemplateID:             templateID,
 			AgentKind:              agentKind,
-			UsageArrival:           usageArrival,
+			UsageArrival:           attemptSettings.UsageArrival,
+			AgentSettings:          attemptSettings.Settings,
 			OnEvent: func(issueID string, event domain.AgentEvent) {
 				select {
 				case o.agentEventCh <- agentEventMsg{IssueID: issueID, Event: event}:
@@ -970,6 +1291,21 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 				select {
 				case o.turnStartedCh <- turnStartedMsg{IssueID: issueID, TurnsStarted: turnsStarted}:
 				case <-ctx.Done():
+				}
+			},
+			OnUnaccountedTurns: func(issueID string, unaccountedTurns int) {
+				msg := unaccountedTurnsMsg{IssueID: issueID, UnaccountedTurns: unaccountedTurns}
+				select {
+				case o.unaccountedTurnsCh <- msg:
+					return
+				default:
+				}
+				// The run context outlives a ceiling stop, which cancels only
+				// the worker context, so a stopped run's final count still
+				// lands while the channel is full.
+				select {
+				case o.unaccountedTurnsCh <- msg:
+				case <-runContextFrom(ctx).Done():
 				}
 			},
 			OnProgress: func(msg selfReviewProgressMsg) {
@@ -994,17 +1330,33 @@ func (o *Orchestrator) makeWorkerFn(resumeSessionID, sshHost, agentKind, templat
 			SSHStrictHostKeyChecking: strictHostKeyChecking,
 			SSHEnvNamesFunc: func(kind string) []string {
 				meta, _ := o.preflightParams.AgentRegistry.Meta(kind)
-				return carriedEnvNames(meta.CredentialEnv.Names(), sshPassEnv, sshDisallowPassEnv)
+				declared := append(meta.CredentialEnv.Names(), convertedCredentialEnv...)
+				return carriedEnvNames(declared, sshPassEnv, sshDisallowPassEnv)
 			},
 			Metrics:         o.metrics,
 			WorkflowPath:    o.workflowManager.WorkflowAbsPath(),
 			DBPath:          o.dbPath,
 			MCPServerBinary: o.mcpServerBinary,
+			ReactionKind:    reactionKind,
 			Posture:         posture,
 		}
 
 		RunWorkerAttempt(ctx, issue, attempt, deps)
 	}
+}
+
+// convertedCredentialEnv returns the credential variable names carried by
+// the conversions that landed on kind under the configuration in force, in
+// conversion order. A session captures them at dispatch so it keeps the
+// names it started with across a reload.
+func (o *Orchestrator) convertedCredentialEnv(kind string) []string {
+	var names []string
+	for _, conversion := range o.workflowManager.Config().AgentKindConversions() {
+		if conversion.Replacement == kind {
+			names = append(names, conversion.CredentialEnv...)
+		}
+	}
+	return names
 }
 
 // workflowFile returns the base filename of the active workflow file, or
@@ -1014,19 +1366,6 @@ func (o *Orchestrator) workflowFile() string {
 		return o.workflowFileFunc()
 	}
 	return ""
-}
-
-// resolveUsageDisposition resolves the usage-reporting disposition for a
-// session of the given kind and SSH host (empty for local), reading the
-// registered kind's declaration and the passthrough config in force. An
-// unknown kind returns the undeclared pair.
-func (o *Orchestrator) resolveUsageDisposition(kind, sshHost string) (registry.UsageArrival, registry.UsageAttribution) {
-	meta, registered := o.preflightParams.AgentRegistry.Meta(kind)
-	if !registered {
-		return registry.UsageArrivalUndeclared, registry.UsageAttributionUndeclared
-	}
-	settings := config.ResolveAgentSettings(o.workflowManager.Config(), kind, filepath.Dir(o.workflowManager.WorkflowAbsPath()))
-	return meta.UsageDisposition(settings.Passthrough, sshHost != "")
 }
 
 // onRetryFire delivers a retry timer event to the event loop channel, using
@@ -1074,7 +1413,8 @@ const drainExitMargin = 30 * time.Second
 // incremental write per issue per interval, so the advisory cost reading
 // trails live spend by at most one interval plus whatever accrued since
 // the last token_usage event. A pending write, set when a usage figure
-// reaches [State.TokenWarningThreshold], bypasses this bound.
+// reaches [State.TokenWarningThreshold], and the write a relayed
+// unaccounted-turn count triggers bypass this bound.
 const sessionMetadataWriteInterval = 2 * time.Second
 
 // maybeWriteIncrementalMetadata persists a running session's token totals
@@ -1100,7 +1440,14 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 	if !entry.MetadataWritePending && !entry.LastMetadataWrite.IsZero() && now.Sub(entry.LastMetadataWrite) < sessionMetadataWriteInterval {
 		return
 	}
+	o.writeIncrementalMetadata(ctx, issueID, entry, now)
+}
 
+// writeIncrementalMetadata upserts a running session's token totals and
+// unaccounted-turn count under its dispatch ID, then restarts the throttle
+// and clears any owed write. A failed upsert is logged and leaves both
+// untouched. Must run on the single-writer event loop.
+func (o *Orchestrator) writeIncrementalMetadata(ctx context.Context, issueID string, entry *RunningEntry, now time.Time) {
 	// An unmeasured count is stored as zero so a reader cannot find a figure
 	// contradicting the qualifier beside it.
 	requestsMeasured := apiRequestsMeasured(entry.UsageArrival, entry.TurnCount, entry.APIRequestCount)
@@ -1120,6 +1467,7 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 		ModelName:           entry.ModelName,
 		APIRequestCount:     requestCount,
 		APIRequestsMeasured: requestsMeasured,
+		UnaccountedTurns:    entry.UnaccountedTurns,
 		UpdatedAt:           now.Format(time.RFC3339),
 	}
 	if entry.AgentPID != "" {
@@ -1135,11 +1483,41 @@ func (o *Orchestrator) maybeWriteIncrementalMetadata(ctx context.Context, issueI
 	entry.MetadataWritePending = false
 }
 
+// fillRetryIdentity gives each queued retry that holds no read of its issue
+// the read this tick's candidates carry, and a retry that holds only a title
+// or link the candidate's type, labels, and state. A retry that holds a
+// complete read, or that no candidate matches, keeps its values. Must run on
+// the event loop.
+func (o *Orchestrator) fillRetryIdentity(candidates []domain.Issue) {
+	if len(o.state.RetryAttempts) == 0 {
+		return
+	}
+
+	candidateByID := make(map[string]domain.Issue, len(candidates))
+	for _, issue := range candidates {
+		candidateByID[issue.ID] = issue
+	}
+	for id, entry := range o.state.RetryAttempts {
+		candidate, ok := candidateByID[id]
+		if !ok {
+			continue
+		}
+		if entry.IssueIdentity.isZero() {
+			entry.DisplayID = candidate.DisplayID
+		}
+		entry.IssueIdentity = entry.IssueIdentity.filledFrom(issueIdentityOf(candidate))
+	}
+}
+
 // refreshParkedIssues evaluates the release rule against this tick's
 // candidates, then against every parked issue the candidate slice omits,
-// read through one batched, comment-free tracker call. Must run on the
+// read through one batched, comment-free tracker call. A park that still
+// holds no read of its issue takes the candidate's, or, when the candidates
+// omit the issue and the batched read finds it, one single-issue read. A
+// park that holds a title or link and no labels takes the candidate's issue
+// type and labels only; the batched read never completes it. Must run on the
 // event loop after the budget rebuild and before the dispatch loop.
-func (o *Orchestrator) refreshParkedIssues(ctx context.Context, candidates []domain.Issue) {
+func (o *Orchestrator) refreshParkedIssues(ctx context.Context, candidates []domain.Issue, terminalStates []string) {
 	if len(o.state.Parked) == 0 {
 		return
 	}
@@ -1152,9 +1530,11 @@ func (o *Orchestrator) refreshParkedIssues(ctx context.Context, candidates []dom
 		}
 		seen[issue.ID] = struct{}{}
 		if !observeParkedState(ctx, o.state, o.store, o.logger, entry, issue.ID, issue.State) {
+			o.recordParkReleaseOutcome(ctx, issue.ID, entry.Identifier, issue.State, terminalStates)
 			continue
 		}
 		observeParkedLabels(ctx, o.state, o.store, o.logger, entry, issue.ID, issue.Labels)
+		o.backfillParkedIdentity(ctx, issue.ID, entry, issue)
 	}
 
 	missing := make([]string, 0, len(o.state.Parked))
@@ -1185,7 +1565,59 @@ func (o *Orchestrator) refreshParkedIssues(ctx context.Context, candidates []dom
 		if !found {
 			continue
 		}
-		observeParkedState(ctx, o.state, o.store, o.logger, entry, id, observed)
+		if !observeParkedState(ctx, o.state, o.store, o.logger, entry, id, observed) {
+			o.recordParkReleaseOutcome(ctx, id, entry.Identifier, observed, terminalStates)
+			continue
+		}
+		if !entry.IssueIdentity.isZero() {
+			continue
+		}
+		issue, err := o.trackerAdapter.FetchIssueByID(ctx, id)
+		if err != nil {
+			logging.WithIssue(o.logger, id, entry.Identifier).Warn(
+				"parked issue identity read failed, retrying next tick",
+				slog.Any("error", err),
+			)
+			continue
+		}
+		o.backfillParkedIdentity(ctx, id, entry, issue)
+	}
+}
+
+// recordParkReleaseOutcome records the terminal outcome of an issue whose
+// park a state change just released, when the state that released it is
+// terminal.
+func (o *Orchestrator) recordParkReleaseOutcome(ctx context.Context, issueID, identifier, observed string, terminalStates []string) {
+	if !isTerminalState(observed, terminalStates) {
+		return
+	}
+	recordIssueOutcome(ctx, o.store, terminalOutcome(issueID, observed, time.Now()), logging.WithIssue(o.logger, issueID, identifier))
+}
+
+// backfillParkedIdentity completes the identity of a park that is still
+// parked and holds no read or a partial one, from issue. A read that names
+// neither a title nor a link leaves the park as it was. The stored labels
+// leave out the park's own parking label, which a read taken after the label
+// write carries.
+func (o *Orchestrator) backfillParkedIdentity(ctx context.Context, id string, entry *ParkedEntry, issue domain.Issue) {
+	if o.state.Parked[id] != entry {
+		return
+	}
+	if !entry.IssueIdentity.isZero() && !entry.IssueIdentity.holdsPartialRead() {
+		return
+	}
+	read := issueIdentityOf(issue)
+	if read.Title == "" && read.URL == "" {
+		return
+	}
+	identity := entry.IssueIdentity.filledFrom(read)
+	identity.Labels = labelsWithout(identity.Labels, entry.Label)
+	entry.IssueIdentity = identity
+	if err := o.store.UpsertParkedIssue(ctx, parkedIssueRow(id, entry)); err != nil {
+		logging.WithIssue(o.logger, id, entry.Identifier).Error(
+			"failed to persist park identity backfill",
+			slog.Any("error", err),
+		)
 	}
 }
 
@@ -1213,13 +1645,28 @@ func (o *Orchestrator) parkExhaustedAbsences(ctx context.Context, cfg config.Ser
 		return
 	}
 
+	var exhausted []domain.Issue
 	for _, issue := range candidates {
-		count := counts[issue.ID]
-		if count < ceiling {
+		if counts[issue.ID] < ceiling {
 			continue
 		}
 		if _, parked := o.state.Parked[issue.ID]; parked {
 			continue
+		}
+		if slices.ContainsFunc(exhausted, func(held domain.Issue) bool { return held.ID == issue.ID }) {
+			continue
+		}
+		exhausted = append(exhausted, issue)
+	}
+	if len(exhausted) == 0 {
+		return
+	}
+
+	runs := o.latestRunsOfExhausted(ctx, exhausted)
+	for _, issue := range exhausted {
+		var run parkedRun
+		if row, ok := runs[issue.ID]; ok {
+			run = parkedRunOf(row)
 		}
 		issueLog := logging.WithIssue(o.logger, issue.ID, issue.Identifier)
 		parkHandoffAbsence(
@@ -1231,13 +1678,34 @@ func (o *Orchestrator) parkExhaustedAbsences(ctx context.Context, cfg config.Ser
 			issue.ID,
 			issue.Identifier,
 			issue.DisplayID,
+			issueIdentityOf(issue),
+			run,
 			issue.State,
-			count,
+			counts[issue.ID],
 			ceiling,
 			o.handoffParkingLabel,
 			issueLog,
 		)
 	}
+}
+
+// latestRunsOfExhausted reads the newest agent run of each issue in one call.
+// A failed read yields no runs: the caller parks every issue regardless, so
+// a store fault never lets an issue whose runs produce no work keep
+// dispatching.
+func (o *Orchestrator) latestRunsOfExhausted(ctx context.Context, issues []domain.Issue) map[string]persistence.RunHistory {
+	ids := make([]string, len(issues))
+	for i, issue := range issues {
+		ids[i] = issue.ID
+	}
+	slices.Sort(ids)
+
+	runs, err := o.store.LatestAgentRuns(ctx, ids)
+	if err != nil {
+		o.logger.Warn("park dispatch context read failed", slog.Any("error", err))
+		return nil
+	}
+	return runs
 }
 
 // ceilingSettingByBudgetReason maps a budget-hold reason to the dotted
@@ -1267,10 +1735,12 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 	candidateIDs := make([]string, len(sorted))
 	identifierByID := make(map[string]string, len(sorted))
 	displayIDByID := make(map[string]string, len(sorted))
+	identityByID := make(map[string]IssueIdentity, len(sorted))
 	for i, issue := range sorted {
 		candidateIDs[i] = issue.ID
 		identifierByID[issue.ID] = issue.Identifier
 		displayIDByID[issue.ID] = issue.DisplayID
+		identityByID[issue.ID] = issueIdentityOf(issue)
 	}
 
 	prior := o.state.BudgetExhausted
@@ -1309,6 +1779,7 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 				fresh[id] = &BudgetExhaustedEntry{
 					Identifier:     identifierByID[id],
 					DisplayID:      displayIDByID[id],
+					IssueIdentity:  identityByID[id],
 					Reason:         budgetReasonSession,
 					UsedSessions:   count,
 					BudgetSessions: cfg.Agent.MaxSessions,
@@ -1337,23 +1808,21 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 			for _, id := range candidateIDs {
 				usage := usageByIssue[id]
 				if usage.TotalTokens >= int64(cfg.Agent.MaxTokens) {
-					fresh[id] = &BudgetExhaustedEntry{
-						Identifier:         identifierByID[id],
-						DisplayID:          displayIDByID[id],
-						Reason:             budgetReasonToken,
-						UsedSessions:       usage.Sessions,
-						BudgetSessions:     cfg.Agent.MaxSessions,
-						UsedTokens:         &usage.TotalTokens,
-						BudgetTokens:       int64(cfg.Agent.MaxTokens),
-						UnmeasuredSessions: &usage.UnmeasuredSessions,
-						StoppedInFlight:    &usage.StoppedInFlight,
+					entry := &BudgetExhaustedEntry{
+						Identifier:     identifierByID[id],
+						DisplayID:      displayIDByID[id],
+						IssueIdentity:  identityByID[id],
+						Reason:         budgetReasonToken,
+						UsedSessions:   usage.Sessions,
+						BudgetSessions: cfg.Agent.MaxSessions,
+						BudgetTokens:   int64(cfg.Agent.MaxTokens),
 					}
+					entry.setTokenUsage(usage)
+					fresh[id] = entry
 					continue
 				}
 				if entry, held := fresh[id]; held {
-					entry.UsedTokens = &usage.TotalTokens
-					entry.UnmeasuredSessions = &usage.UnmeasuredSessions
-					entry.StoppedInFlight = &usage.StoppedInFlight
+					entry.setTokenUsage(usage)
 				}
 				if !usage.SpendIncomplete() {
 					continue
@@ -1368,6 +1837,8 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 		}
 	}
 	o.state.TokenBudgetIncomplete = freshIncomplete
+
+	o.describeBudgetHolds(ctx, cfg, prior, fresh)
 
 	for id, entry := range fresh {
 		told, wasTold := o.state.BudgetAnnounced[id]
@@ -1396,38 +1867,40 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 		o.metrics.IncBudgetExhaustions(entry.Reason)
 	}
 
-	if o.trackerAdapter != nil {
-		noticeIDs := make([]string, 0, len(fresh))
-		for id := range fresh {
-			noticeIDs = append(noticeIDs, id)
+	noticeIDs := make([]string, 0, len(fresh))
+	for id := range fresh {
+		noticeIDs = append(noticeIDs, id)
+	}
+	slices.SortFunc(noticeIDs, func(a, b string) int {
+		if c := cmp.Compare(fresh[a].Identifier, fresh[b].Identifier); c != 0 {
+			return c
 		}
-		slices.SortFunc(noticeIDs, func(a, b string) int {
-			if c := cmp.Compare(fresh[a].Identifier, fresh[b].Identifier); c != 0 {
-				return c
-			}
-			return cmp.Compare(a, b)
-		})
+		return cmp.Compare(a, b)
+	})
 
-		for _, id := range noticeIDs {
-			if _, folded := foldedForward[id]; folded {
-				continue
-			}
-			if o.state.BudgetHoldNoticed[id] == fresh[id].Reason {
-				continue
-			}
-			if !budgetHoldNoticeAllowed(o.state, now) {
-				break
-			}
-			postBudgetHoldNotice(o.state, budgetHoldNoticeParams{
-				IssueID:        id,
-				Entry:          fresh[id],
-				Store:          o.store,
-				TrackerAdapter: o.trackerAdapter,
-				Metrics:        o.metrics,
-				Logger:         logging.WithIssue(o.logger, id, fresh[id].Identifier),
-				Ctx:            ctx,
-			})
+	for _, id := range noticeIDs {
+		if _, folded := foldedForward[id]; folded {
+			continue
 		}
+		if o.state.BudgetHoldNoticed[id] == fresh[id].Reason {
+			continue
+		}
+		delivery := o.router.Route(budgetHeldNotification(id, fresh[id]))
+		if delivery.Empty() {
+			continue
+		}
+		if !budgetHoldNoticeAllowed(o.state, now) {
+			break
+		}
+		postBudgetHoldNotice(o.state, budgetHoldNoticeParams{
+			IssueID:  id,
+			Entry:    fresh[id],
+			Store:    o.store,
+			Delivery: delivery,
+			Metrics:  o.metrics,
+			Logger:   logging.WithIssue(o.logger, id, fresh[id].Identifier),
+			Ctx:      ctx,
+		})
 	}
 
 	for _, id := range candidateIDs {
@@ -1440,6 +1913,89 @@ func (o *Orchestrator) rebuildBudgetExhausted(ctx context.Context, cfg config.Se
 	}
 
 	o.state.BudgetExhausted = fresh
+}
+
+// describeBudgetHolds gives each record in fresh the context of the dispatch
+// its hold blocks. A record keeps the context of its prior record; one still
+// without takes a waiting hop's target, resolved from cfg, and otherwise the
+// issue's latest agent run, read for all such issues in one call. A failed
+// read leaves those records without a context until the next tick.
+func (o *Orchestrator) describeBudgetHolds(ctx context.Context, cfg config.ServiceConfig, prior, fresh map[string]*BudgetExhaustedEntry) {
+	var needRun []string
+	for id, entry := range fresh {
+		if entry.AgentKind != "" {
+			continue
+		}
+		if held := prior[id]; held != nil && held.AgentKind != "" {
+			entry.RuleName, entry.StageLineage, entry.AgentKind, entry.ConfiguredModel =
+				held.RuleName, held.StageLineage, held.AgentKind, held.ConfiguredModel
+			continue
+		}
+		if o.describeFromWaitingHop(cfg, id, entry) {
+			continue
+		}
+		needRun = append(needRun, id)
+	}
+	if len(needRun) == 0 {
+		return
+	}
+
+	slices.Sort(needRun)
+	runs, err := o.store.LatestAgentRuns(ctx, needRun)
+	if err != nil {
+		o.logger.Warn("budget hold dispatch context read failed", slog.Any("error", err))
+		return
+	}
+	for id, run := range runs {
+		entry := fresh[id]
+		entry.RuleName = run.RuleName
+		entry.StageLineage = stageLineageOf(run)
+		entry.AgentKind = run.AgentAdapter
+		entry.ConfiguredModel = run.ConfiguredModel
+	}
+}
+
+// describeFromWaitingHop sets entry's dispatch context from the target of the
+// issue's hop when no run was dispatched since and cfg still names the target
+// rule. It reports whether it did.
+func (o *Orchestrator) describeFromWaitingHop(cfg config.ServiceConfig, issueID string, entry *BudgetExhaustedEntry) bool {
+	hop := o.state.StageHops[issueID]
+	if hop == nil || hop.RunDispatched {
+		return false
+	}
+	rule, ok := cfg.Dispatch.RuleByName(hop.TargetRule)
+	if !ok {
+		return false
+	}
+	agent := o.ruleAgentOf(cfg, rule)
+	entry.RuleName = rule.Name
+	entry.StageLineage = freshLineage(o.state, issueID, rule.Name)
+	entry.AgentKind = agent.AgentKind
+	entry.ConfiguredModel = agent.ConfiguredModel
+	return true
+}
+
+// ruleAgentOf returns the agent kind and model a dispatch of rule resolves to
+// under cfg.
+func (o *Orchestrator) ruleAgentOf(cfg config.ServiceConfig, rule config.DispatchRule) RuleAgent {
+	resolution := ruleResolution(rule, cfg.Dispatch, cfg.Agent.Kind, "")
+	return RuleAgent{
+		AgentKind:       resolution.AgentKind,
+		ConfiguredModel: o.resolveAttemptSettings(cfg, resolution, "").Settings.Model,
+	}
+}
+
+// ruleAgents maps each named rule of cfg that carries a stage label, the rules
+// a stage hop can target, to its [Orchestrator.ruleAgentOf].
+func (o *Orchestrator) ruleAgents(cfg config.ServiceConfig) map[string]RuleAgent {
+	agents := make(map[string]RuleAgent, len(cfg.Dispatch.Rules))
+	for _, rule := range cfg.Dispatch.Rules {
+		if rule.Name == "" || rule.Stage == "" {
+			continue
+		}
+		agents[rule.Name] = o.ruleAgentOf(cfg, rule)
+	}
+	return agents
 }
 
 // drainRunningWorkers cancels all running worker contexts and waits for
@@ -1482,7 +2038,11 @@ func (o *Orchestrator) drainRunningWorkers() {
 			})
 			applyQueued(o.selfReviewCh, o.applySelfReviewProgress)
 			applyQueued(o.turnStartedCh, o.applyTurnStarted)
+			applyQueued(o.unaccountedTurnsCh, func(msg unaccountedTurnsMsg) {
+				o.applyUnaccountedTurns(drainCtx, msg)
+			})
 			cfg := o.workflowManager.Config()
+			o.updateRouter(cfg)
 			HandleWorkerExit(o.state, workerExit, HandleWorkerExitParams{
 				Store:                             o.store,
 				MaxRetryBackoffMS:                 cfg.Agent.MaxRetryBackoffMS,
@@ -1495,14 +2055,16 @@ func (o *Orchestrator) drainRunningWorkers() {
 				TrackerAdapter:                    o.trackerAdapter,
 				HandoffState:                      cfg.Tracker.HandoffState,
 				NoChangeState:                     cfg.Tracker.NoChangeState,
+				Dispatch:                          cfg.Dispatch,
 				ActiveStates:                      cfg.Tracker.ActiveStates,
 				TerminalStates:                    cfg.Tracker.TerminalStates,
 				Metrics:                           o.metrics,
 				HostPool:                          o.hostPool,
-				CommentsConfig:                    cfg.Tracker.Comments,
+				Router:                            o.router,
 				CIProvider:                        o.ciProvider,
 				SCMAdapter:                        o.scmAdapter,
 				AutoMergeReactionConfigured:       o.autoMergeReactionConfigured,
+				ReviewReactionConfigured:          o.reviewReactionConfigured,
 				BotReviewReactionConfigured:       o.botReviewReactionConfigured,
 				MergeConflictReactionConfigured:   o.mergeConflictReactionConfigured,
 				LabelReviewReactionConfigured:     o.labelReviewReactionConfigured,
@@ -1514,14 +2076,22 @@ func (o *Orchestrator) drainRunningWorkers() {
 
 		case msg := <-o.agentEventCh:
 			o.applyAgentEvent(drainCtx, msg, false)
+			o.notifyObservers()
 
 		case msg := <-o.selfReviewCh:
 			o.applySelfReviewProgress(msg)
+			o.notifyObservers()
 
 		case msg := <-o.turnStartedCh:
 			o.applyTurnStarted(msg)
+			o.notifyObservers()
+
+		case msg := <-o.unaccountedTurnsCh:
+			o.applyUnaccountedTurns(drainCtx, msg)
+			o.notifyObservers()
 
 		case req := <-o.snapshotCh:
+			refreshActiveOrder(o.state)
 			snap := RuntimeSnapshot(o.state, time.Now())
 			req.ReplyCh <- snap
 
@@ -1599,8 +2169,9 @@ func (o *Orchestrator) cancelRetryTimers() {
 }
 
 // notifyObservers calls [Observer.OnStateChange] on each observer. Called
-// after tick, worker exit, and retry timer handling, not after agent events.
+// from the event loop goroutine only, after the change is applied.
 func (o *Orchestrator) notifyObservers() {
+	refreshActiveOrder(o.state)
 	for _, obs := range o.observers {
 		obs.OnStateChange()
 	}

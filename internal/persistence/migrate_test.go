@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -183,6 +184,19 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"rule_name", "TEXT", true, 0},
 				{"template_id", "TEXT", true, 0},
 				{"agent_kind", "TEXT", true, 0},
+				{"stage_previous", "TEXT", true, 0},
+				{"stage_previous_outcome", "TEXT", true, 0},
+				{"chain_id", "TEXT", true, 0},
+				{"display_identifier", "TEXT", true, 0},
+				{"issue_title", "TEXT", true, 0},
+				{"issue_url", "TEXT", true, 0},
+				{"trigger", "TEXT", true, 0},
+				{"configured_model", "TEXT", true, 0},
+				{"issue_type", "TEXT", true, 0},
+				{"issue_labels", "TEXT", true, 0},
+				{"issue_state", "TEXT", true, 0},
+				{"dispatched_at", "TEXT", true, 0},
+				{"origin_trigger", "TEXT", true, 0},
 			},
 		},
 		{
@@ -211,6 +225,70 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"tokens_measured", "INTEGER", true, 0},
 				{"unaccounted_turns", "INTEGER", true, 0},
 				{"cache_write_tokens", "INTEGER", true, 0},
+				{"configured_model", "TEXT", true, 0},
+				{"configured_effort", "TEXT", true, 0},
+				{"reported_model", "TEXT", true, 0},
+				{"stage_previous", "TEXT", true, 0},
+				{"stage_previous_outcome", "TEXT", true, 0},
+				{"chain_id", "TEXT", true, 0},
+				{"stage_target", "TEXT", true, 0},
+				{"stage_result", "TEXT", true, 0},
+				{"issue_title", "TEXT", true, 0},
+				{"issue_url", "TEXT", true, 0},
+				{"dispatched_at", "TEXT", true, 0},
+				{"trigger", "TEXT", false, 0},
+				{"reaction_kind", "TEXT", false, 0},
+				{"session_id", "TEXT", false, 0},
+				{"ssh_host", "TEXT", false, 0},
+				{"first_after_hop", "INTEGER", true, 0},
+			},
+		},
+		{
+			table: "stage_hops",
+			cols: []colSpec{
+				{"issue_id", "TEXT", false, 1},
+				{"identifier", "TEXT", true, 0},
+				{"hop_count", "INTEGER", true, 0},
+				{"source_rule", "TEXT", true, 0},
+				{"target_rule", "TEXT", true, 0},
+				{"target_label", "TEXT", true, 0},
+				{"previous_outcome", "TEXT", true, 0},
+				{"source_dispatch_id", "TEXT", true, 0},
+				{"target_observed", "INTEGER", true, 0},
+				{"hopped_at", "TEXT", true, 0},
+				{"chain_id", "TEXT", true, 0},
+				{"display_identifier", "TEXT", true, 0},
+				{"issue_title", "TEXT", true, 0},
+				{"issue_url", "TEXT", true, 0},
+				{"dispatched_at", "TEXT", true, 0},
+				{"run_dispatched", "INTEGER", true, 0},
+				{"issue_type", "TEXT", true, 0},
+				{"issue_labels", "TEXT", true, 0},
+				{"issue_state", "TEXT", true, 0},
+			},
+		},
+		{
+			table: "parked_issues",
+			cols: []colSpec{
+				{"issue_id", "TEXT", false, 1},
+				{"identifier", "TEXT", true, 0},
+				{"display_id", "TEXT", false, 0},
+				{"reason", "TEXT", true, 0},
+				{"parked_state", "TEXT", true, 0},
+				{"label", "TEXT", true, 0},
+				{"label_applied", "INTEGER", true, 0},
+				{"parked_at", "TEXT", true, 0},
+				{"issue_title", "TEXT", true, 0},
+				{"issue_url", "TEXT", true, 0},
+				{"rule_name", "TEXT", true, 0},
+				{"agent_kind", "TEXT", true, 0},
+				{"configured_model", "TEXT", true, 0},
+				{"stage_previous", "TEXT", true, 0},
+				{"stage_previous_outcome", "TEXT", true, 0},
+				{"chain_id", "TEXT", true, 0},
+				{"dispatched_at", "TEXT", true, 0},
+				{"issue_type", "TEXT", true, 0},
+				{"issue_labels", "TEXT", true, 0},
 			},
 		},
 		{
@@ -229,6 +307,7 @@ func TestMigrate_ColumnCorrectness(t *testing.T) {
 				{"api_requests_measured", "INTEGER", true, 0},
 				{"dispatch_id", "TEXT", true, 0},
 				{"cache_write_tokens", "INTEGER", true, 0},
+				{"unaccounted_turns", "INTEGER", true, 0},
 			},
 		},
 		{
@@ -409,6 +488,261 @@ func TestMigrate_Migration020_CacheWriteTokensDefault(t *testing.T) {
 	}
 }
 
+func insertBareRun(t *testing.T, s *Store, issueID string) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status)
+		 VALUES (?, 'MT-1', 1, 'mock', '/tmp', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'succeeded')`, issueID,
+	); err != nil {
+		t.Fatalf("insert run_history row %s: %v", issueID, err)
+	}
+}
+
+func TestMigrate_Migration024_ExistingRowsKeepValuesAndGetEmptyChainColumns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, insert, query, want string }{
+		{
+			"run_history",
+			`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, stage_previous)
+				VALUES ('i', 'MT-1', 1, 'mock', '/tmp', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'succeeded', 'specify')`,
+			`SELECT stage_previous || '|' || chain_id || '|' || stage_target || '|' || stage_result FROM run_history`, "specify|||",
+		},
+		{
+			"retry_entries",
+			`INSERT INTO retry_entries (issue_id, identifier, attempt, due_at_ms, rule_name, template_id, agent_kind, stage_previous)
+				VALUES ('i', 'MT-1', 2, 1000, 'plan', 'plan', 'mock', 'specify')`,
+			`SELECT stage_previous || '|' || chain_id FROM retry_entries`, "specify|",
+		},
+		{
+			"stage_hops",
+			`INSERT INTO stage_hops (issue_id, identifier, hop_count, source_rule, target_rule, target_label, previous_outcome, source_dispatch_id, hopped_at)
+				VALUES ('i', 'MT-1', 1, 'specify', 'plan', 'plan', 'succeeded', 'd1', '2026-01-01T00:00:00Z')`,
+			`SELECT target_rule || '|' || chain_id FROM stage_hops`, "plan|",
+		},
+	}
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 23)
+	for _, tt := range tests {
+		if _, err := s.db.ExecContext(context.Background(), tt.insert); err != nil {
+			t.Fatalf("insert pre-migration-024 %s row: %v", tt.name, err)
+		}
+	}
+
+	migrateOrFatal(t, s)
+
+	for _, tt := range tests {
+		var got string
+		if err := s.db.QueryRowContext(context.Background(), tt.query).Scan(&got); err != nil || got != tt.want {
+			t.Errorf("%s row after upgrade = %q, %v, want %q, nil", tt.name, got, err, tt.want)
+		}
+	}
+}
+
+func TestMigrate_Migration027_FillsOlderRows(t *testing.T) {
+	t.Parallel()
+
+	// Run B's offset makes it the later instant while its text sorts first, so
+	// a text comparison picks the wrong run as the start of the pass.
+	seed := []string{
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, chain_id, configured_model, display_identifier, issue_title, issue_url)
+			VALUES ('i1', 'MT-1', 1, 'mock', '/tmp', '2026-02-01T10:00:00Z', '2026-02-01T10:01:00Z', 'succeeded', 'c1', 'model-a', 'o/r#1', 'Old title', 'https://example.test/old'),
+				('i1', 'MT-1', 2, 'mock', '/tmp', '2026-02-01T09:30:00-01:00', '2026-02-01T09:31:00-01:00', 'failed', 'c1', 'model-b', 'o/r#1', 'New title', 'https://example.test/new'),
+				('i2', 'MT-2', 1, 'mock', '/tmp', '2026-02-01T08:00:00Z', '2026-02-01T08:01:00Z', 'failed', '', 'model-x', '', '', '')`,
+		`INSERT INTO stage_hops (issue_id, identifier, hop_count, source_rule, target_rule, target_label, previous_outcome, source_dispatch_id, hopped_at, chain_id)
+			VALUES ('i1', 'MT-1', 1, 'specify', 'plan', 'plan', 'succeeded', 'd1', '2026-02-01T10:05:00Z', 'c1')`,
+		`INSERT INTO retry_entries (issue_id, identifier, attempt, due_at_ms, chain_id)
+			VALUES ('i1', 'MT-1', 3, 1000, 'c1'), ('i2', 'MT-2', 2, 1000, '')`,
+	}
+	tests := []struct{ name, query, want string }{
+		{
+			name:  "runs of the chain",
+			query: `SELECT group_concat(dispatched_at, '|') FROM run_history WHERE issue_id = 'i1'`,
+			want:  "2026-02-01T10:00:00Z|2026-02-01T10:00:00Z",
+		},
+		{
+			name:  "retry of the chain",
+			query: `SELECT dispatched_at || '|' || configured_model FROM retry_entries WHERE issue_id = 'i1'`,
+			want:  "2026-02-01T10:00:00Z|model-b",
+		},
+		{
+			name:  "hop",
+			query: `SELECT dispatched_at || '|' || display_identifier || '|' || issue_title || '|' || issue_url || '|' || run_dispatched FROM stage_hops`,
+			want:  "2026-02-01T10:00:00Z|o/r#1|New title|https://example.test/new|1",
+		},
+		{
+			name:  "retry without a chain",
+			query: `SELECT dispatched_at || '|' || configured_model FROM retry_entries WHERE issue_id = 'i2'`,
+			want:  "|",
+		},
+	}
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 26)
+	for _, stmt := range seed {
+		if _, err := s.db.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatalf("seed version 26 store: %v", err)
+		}
+	}
+
+	migrateOrFatal(t, s)
+
+	for _, tt := range tests {
+		var got string
+		if err := s.db.QueryRowContext(context.Background(), tt.query).Scan(&got); err != nil || got != tt.want {
+			t.Errorf("%s after upgrade = %q, %v, want %q, nil", tt.name, got, err, tt.want)
+		}
+	}
+}
+
+func TestMigrate_Migration031_FillsParkedRuns(t *testing.T) {
+	t.Parallel()
+
+	// Attempt 4 sorts before parked_at as text but starts after it.
+	seed := []string{
+		`INSERT INTO parked_issues (issue_id, identifier, reason, label, parked_at)
+			VALUES ('i1', 'MT-1', 'agent_blocked', 'needs-human', '2026-02-01T10:00:00Z'),
+				('i2', 'MT-2', 'agent_blocked', 'needs-human', '2026-02-01T10:00:00Z'),
+				('i3', 'MT-3', 'agent_blocked', 'needs-human', 'not a time')`,
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, rule_name, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at)
+			VALUES ('i1', 'MT-1', 1, 'claude-code', '/tmp', '2026-02-01T09:00:00Z', '2026-02-01T09:01:00Z', 'succeeded', 'plan', 'model-p', '', '', 'c1', '2026-02-01T08:00:00Z'),
+				('i1', 'MT-1', 2, 'claude-code', '/tmp', '2026-02-01T09:30:00Z', '2026-02-01T09:31:00Z', 'succeeded', 'implement', 'model-a', 'plan', 'succeeded', 'c1', '2026-02-01T08:00:00Z'),
+				('i1', 'MT-1', 3, '', '/tmp', '2026-02-01T09:45:00Z', '2026-02-01T09:46:00Z', 'succeeded', 'ci_failed', '', '', '', '', ''),
+				('i1', 'MT-1', 4, 'codex', '/tmp', '2026-02-01T09:30:00-01:00', '2026-02-01T09:31:00-01:00', 'succeeded', 'review', 'model-c', '', '', 'c2', '2026-02-01T10:30:00Z'),
+				('i3', 'MT-3', 1, 'claude-code', '/tmp', '2026-02-01T09:30:00Z', '2026-02-01T09:31:00Z', 'succeeded', 'implement', 'model-a', '', '', 'c3', '2026-02-01T09:30:00Z')`,
+	}
+	tests := []struct{ issueID, want string }{
+		{"i1", "implement|claude-code|model-a|plan|succeeded|c1|2026-02-01T08:00:00Z"},
+		{"i2", "||||||"},
+		{"i3", "||||||"},
+	}
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 30)
+	for _, stmt := range seed {
+		if _, err := s.db.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatalf("seed version 30 store: %v", err)
+		}
+	}
+
+	migrateOrFatal(t, s)
+
+	for _, tt := range tests {
+		var got string
+		err := s.db.QueryRowContext(context.Background(),
+			`SELECT rule_name || '|' || agent_kind || '|' || configured_model || '|' || stage_previous || '|' || stage_previous_outcome || '|' || chain_id || '|' || dispatched_at
+			FROM parked_issues WHERE issue_id = ?`, tt.issueID).Scan(&got)
+		if err != nil || got != tt.want {
+			t.Errorf("park of %s after upgrade = %q, %v, want %q, nil", tt.issueID, got, err, tt.want)
+		}
+	}
+}
+
+func TestMigrate_Migration032_MarksFirstRunAfterHop(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 31)
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at, status, rule_name, chain_id, stage_previous, trigger, reaction_kind)
+			VALUES ('i1', 'MT-1', 1, 'mock', '/tmp', '2026-02-01T10:00:00Z', '2026-02-01T10:01:00Z', 'succeeded', 'plan', 'c1', 'specify', '', ''),
+				('i1', 'MT-1', 2, 'mock', '/tmp', '2026-02-01T11:00:00Z', '2026-02-01T11:01:00Z', 'succeeded', 'plan', 'c1', 'specify', '', ''),
+				('i2', 'MT-2', 1, 'mock', '/tmp', '2026-02-01T10:00:00Z', '2026-02-01T10:01:00Z', 'succeeded', 'plan', 'c2', 'specify', NULL, NULL),
+				('i2', 'MT-2', 2, 'mock', '/tmp', '2026-02-01T11:00:00Z', '2026-02-01T11:01:00Z', 'succeeded', 'plan', 'c2', 'specify', '', '')`,
+	); err != nil {
+		t.Fatalf("seed version 31 store: %v", err)
+	}
+
+	migrateOrFatal(t, s)
+
+	var got string
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT group_concat(first_after_hop, '|') FROM (SELECT first_after_hop FROM run_history ORDER BY id)`).Scan(&got)
+	if want := "1|0|1|0"; err != nil || got != want {
+		t.Errorf("first_after_hop by id after upgrade = %q, %v, want %q, nil", got, err, want)
+	}
+}
+
+func TestMigrate_Migration028_OlderRowsKeepNoOrigin(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := openTestStore(t)
+	migrateToVersion(t, s, 27)
+	insertBareRun(t, s, "old")
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO retry_entries (issue_id, identifier, attempt, due_at_ms, trigger)
+			VALUES ('r-stall', 'MT-1', 2, 1000, 'stall'), ('r-timer', 'MT-2', 2, 1000, 'timer'), ('r-none', 'MT-3', 2, 1000, '')`); err != nil {
+		t.Fatalf("seed version 27 store: %v", err)
+	}
+
+	migrateOrFatal(t, s)
+	appendOrFatal(t, s, newTestRun(1))
+
+	runs := map[string]RunHistory{}
+	for _, r := range queryAllRuns(t, s, 10) {
+		runs[r.IssueID] = r
+	}
+	if r := runs["old"]; r.OriginRecorded || r.Trigger != nil {
+		t.Errorf("run recorded before the upgrade: origin recorded = %v, trigger = %s, want false, <nil>", r.OriginRecorded, triggerText(r.Trigger))
+	}
+	if r := runs["ISS-1"]; !r.OriginRecorded || r.Trigger != nil {
+		t.Errorf("run appended after the upgrade with a nil trigger: origin recorded = %v, trigger = %s, want true, <nil>", r.OriginRecorded, triggerText(r.Trigger))
+	}
+
+	retries, err := s.LoadRetryEntries(ctx)
+	if err != nil {
+		t.Fatalf("LoadRetryEntries: %v", err)
+	}
+	gotOrigin := map[string]string{}
+	for _, e := range retries {
+		gotOrigin[e.IssueID] = e.OriginTrigger
+	}
+	wantOrigin := map[string]string{"r-stall": "stall", "r-timer": "", "r-none": ""}
+	if !reflect.DeepEqual(gotOrigin, wantOrigin) {
+		t.Errorf("OriginTrigger by retry after upgrade = %v, want %v", gotOrigin, wantOrigin)
+	}
+}
+
+func TestMigrate_Migration022_HandedOffCommentsStartEmpty(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateToVersion(t, s, 21)
+	if err := s.UpsertReactionFingerprint(context.Background(), "ISS-PRE022", "review", "fp"); err != nil {
+		t.Fatalf("UpsertReactionFingerprint on a pre-migration-022 store: %v", err)
+	}
+
+	migrateOrFatal(t, s)
+
+	var rows int
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM reaction_handoffs`).Scan(&rows); err != nil {
+		t.Fatalf("count reaction_handoffs: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("reaction_handoffs row count after upgrade = %d, want 0", rows)
+	}
+}
+
+func TestMigrate_Migration022_PrimaryKeyRejectsDuplicateComment(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	const insert = `INSERT INTO reaction_handoffs (issue_id, kind, comment_id) VALUES ('ISS-1', 'review', 'c1')`
+	if _, err := s.db.ExecContext(context.Background(), insert); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+
+	_, err := s.db.ExecContext(context.Background(), insert)
+
+	if err == nil {
+		t.Error("duplicate (issue_id, kind, comment_id) insert = nil error, want a primary key violation")
+	}
+}
+
 func TestMigrate_NullConstraints(t *testing.T) {
 	t.Parallel()
 
@@ -491,8 +825,6 @@ func TestMigrations_Registry(t *testing.T) {
 	}
 }
 
-// migrateToVersion applies every registered migration up to and including
-// version, leaving later migrations unapplied.
 func migrateToVersion(t *testing.T, s *Store, version int) {
 	t.Helper()
 	ctx := context.Background()

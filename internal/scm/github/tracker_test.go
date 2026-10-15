@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +28,9 @@ func validConfig(endpoint string) map[string]any {
 		"endpoint": endpoint,
 		"api_key":  "test-token",
 		"project":  "owner/repo",
+
+		"active_states":   []any{"backlog", "in-progress", "review"},
+		"terminal_states": []any{"done", "wontfix"},
 	}
 }
 
@@ -55,24 +60,11 @@ func loadFixture(t *testing.T, name string) []byte {
 	return data
 }
 
-// loweredStates returns a lowercased copy of states, matching the
-// normalization NewGitHubAdapter applies to every state list element.
-func loweredStates(states []string) []string {
-	out := make([]string, len(states))
-	for i, s := range states {
-		out[i] = strings.ToLower(s)
-	}
-	return out
+func issueJSON(number int, stateLabel string) string {
+	return fmt.Sprintf(`{"id":%d,"number":%d,"title":"Issue %d","body":null,"state":"open","html_url":"https://github.com/owner/repo/issues/%d","labels":[{"name":%q}],"assignees":[],"type":null,"pull_request":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		number*100, number, number, number, stateLabel)
 }
 
-// issueJSON returns a minimal valid GitHub issue JSON with the given number
-// and state label. Used in server handlers that need simple inline responses.
-func issueJSON(number int, stateLabel string, nativeState string) string {
-	return fmt.Sprintf(`{"id":%d,"number":%d,"title":"Issue %d","body":null,"state":%q,"html_url":"https://github.com/owner/repo/issues/%d","labels":[{"name":%q}],"assignees":[],"type":null,"pull_request":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
-		number*100, number, number, nativeState, number, stateLabel)
-}
-
-// spyMetrics records IncTrackerRequests calls for assertions.
 type spyMetrics struct {
 	domain.NoopMetrics
 	calls []string
@@ -269,89 +261,6 @@ func TestNewGitHubAdapter_TypeFaultVsAbsentKey(t *testing.T) {
 	})
 }
 
-func TestNewGitHubAdapter_Defaults(t *testing.T) {
-	t.Parallel()
-
-	a := mustAdapter(t, validConfig("https://api.github.com"))
-
-	// Default active states: lowercased.
-	if len(a.activeStates) != 3 {
-		t.Fatalf("activeStates len = %d, want 3", len(a.activeStates))
-	}
-	if a.activeStates[0] != "backlog" {
-		t.Errorf("activeStates[0] = %q, want %q", a.activeStates[0], "backlog")
-	}
-
-	// Default terminal states.
-	if len(a.terminalStates) != 2 {
-		t.Fatalf("terminalStates len = %d, want 2", len(a.terminalStates))
-	}
-	if a.terminalStates[0] != "done" {
-		t.Errorf("terminalStates[0] = %q, want %q", a.terminalStates[0], "done")
-	}
-
-	// Default query filter is empty.
-	if a.queryFilter != "" {
-		t.Errorf("queryFilter = %q, want empty", a.queryFilter)
-	}
-
-	// Owner and repo split correctly.
-	if a.owner != "owner" {
-		t.Errorf("owner = %q, want %q", a.owner, "owner")
-	}
-	if a.repo != "repo" {
-		t.Errorf("repo = %q, want %q", a.repo, "repo")
-	}
-}
-
-// TestNewGitHubAdapter_DefaultStatesMatchRegisteredMeta pins the applied
-// fallback lists to the ones the registration declares. A constructor that
-// stops reading the declared variables would leave the preflight ruling on
-// state lists the adapter no longer uses.
-func TestNewGitHubAdapter_DefaultStatesMatchRegisteredMeta(t *testing.T) {
-	t.Parallel()
-
-	meta, ok := registry.Trackers.Meta("github")
-	if !ok {
-		t.Fatal(`Trackers.Meta("github") reported not registered`)
-	}
-	if len(meta.DefaultActiveStates) == 0 || len(meta.DefaultTerminalStates) == 0 {
-		t.Fatalf("Trackers.Meta(%q) declares DefaultActiveStates = %v, DefaultTerminalStates = %v, want both non-empty",
-			"github", meta.DefaultActiveStates, meta.DefaultTerminalStates)
-	}
-
-	a := mustAdapter(t, validConfig("https://api.github.com"))
-
-	if want := loweredStates(meta.DefaultActiveStates); !slices.Equal(a.activeStates, want) {
-		t.Errorf("NewGitHubAdapter(config without active_states).activeStates = %v, want %v", a.activeStates, want)
-	}
-	if want := loweredStates(meta.DefaultTerminalStates); !slices.Equal(a.terminalStates, want) {
-		t.Errorf("NewGitHubAdapter(config without terminal_states).terminalStates = %v, want %v", a.terminalStates, want)
-	}
-}
-
-func TestNewGitHubAdapter_CustomStatesLowercased(t *testing.T) {
-	t.Parallel()
-
-	cfg := validConfig("https://api.github.com")
-	cfg["active_states"] = []any{"Todo", "IN-PROGRESS"}
-	cfg["terminal_states"] = []string{"Done", "WONTFIX"}
-	a := mustAdapter(t, cfg)
-
-	if a.activeStates[0] != "todo" {
-		t.Errorf("activeStates[0] = %q, want %q", a.activeStates[0], "todo")
-	}
-	if a.activeStates[1] != "in-progress" {
-		t.Errorf("activeStates[1] = %q, want %q", a.activeStates[1], "in-progress")
-	}
-	if a.terminalStates[0] != "done" {
-		t.Errorf("terminalStates[0] = %q, want %q", a.terminalStates[0], "done")
-	}
-	if a.terminalStates[1] != "wontfix" {
-		t.Errorf("terminalStates[1] = %q, want %q", a.terminalStates[1], "wontfix")
-	}
-}
-
 func TestNewGitHubAdapter_EndpointTrailingSlashStripped(t *testing.T) {
 	t.Parallel()
 
@@ -366,7 +275,7 @@ func TestNewGitHubAdapter_EndpointTrailingSlashStripped(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/owner/repo/issues/123":
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, issueJSON(123, "todo", "open"))
+			_, _ = io.WriteString(w, issueJSON(123, "todo"))
 		case "/repos/owner/repo/issues/123/comments":
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, `[]`)
@@ -423,73 +332,6 @@ func TestNewGitHubAdapter_DoesNotMutateConfigSlices(t *testing.T) {
 	}
 }
 
-func TestNewGitHubAdapter_HandoffStateExtraction(t *testing.T) {
-	t.Parallel()
-
-	// Positive cases: the handoff state must be accepted as a valid transition
-	// target, proving the field was extracted and stored correctly.
-	t.Run("trimmed and lowercased", func(t *testing.T) {
-		t.Parallel()
-
-		// Issue currently has the handoff label, native state open.
-		ts := newTransitionServer(t, 1, "review", "open")
-		cfg := validConfig(ts.srv.URL)
-		cfg["active_states"] = []any{"backlog", "in-progress"}
-		cfg["terminal_states"] = []any{"done"}
-		cfg["handoff_state"] = "  Review  " // whitespace + mixed-case
-		a := mustAdapter(t, cfg)
-
-		// TransitionIssue to the handoff state must not return ErrTrackerPayload.
-		if err := a.TransitionIssue(context.Background(), "1", "review"); err != nil {
-			t.Fatalf("TransitionIssue(review) with handoff_state=\"  Review  \": %v", err)
-		}
-	})
-
-	t.Run("already lowercase", func(t *testing.T) {
-		t.Parallel()
-
-		ts := newTransitionServer(t, 1, "review", "open")
-		cfg := validConfig(ts.srv.URL)
-		cfg["active_states"] = []any{"backlog", "in-progress"}
-		cfg["terminal_states"] = []any{"done"}
-		cfg["handoff_state"] = "review"
-		a := mustAdapter(t, cfg)
-
-		if err := a.TransitionIssue(context.Background(), "1", "review"); err != nil {
-			t.Fatalf("TransitionIssue(review) with handoff_state=\"review\": %v", err)
-		}
-	})
-
-	// Negative cases: when handoffState is empty or absent, calling
-	// TransitionIssue with a value not in active or terminal must still
-	// return ErrTrackerPayload (no unintended bypass).
-	t.Run("empty string preserves rejection", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := validConfig("http://localhost")
-		cfg["active_states"] = []any{"backlog"}
-		cfg["terminal_states"] = []any{"done"}
-		cfg["handoff_state"] = ""
-		a := mustAdapter(t, cfg)
-
-		err := a.TransitionIssue(context.Background(), "1", "review")
-		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
-	})
-
-	t.Run("key absent preserves rejection", func(t *testing.T) {
-		t.Parallel()
-
-		cfg := validConfig("http://localhost")
-		cfg["active_states"] = []any{"backlog"}
-		cfg["terminal_states"] = []any{"done"}
-		// handoff_state key omitted entirely.
-		a := mustAdapter(t, cfg)
-
-		err := a.TransitionIssue(context.Background(), "1", "review")
-		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
-	})
-}
-
 func TestFetchCandidateIssues_FiltersPullRequests(t *testing.T) {
 	t.Parallel()
 
@@ -520,6 +362,61 @@ func TestFetchCandidateIssues_FiltersPullRequests(t *testing.T) {
 	}
 	if ids["4"] {
 		t.Error("issue #4 (done state) should be filtered out (non-active)")
+	}
+}
+
+func TestFetchCandidateIssues_RequiresConfiguredStateLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		labels        []string
+		wantCandidate bool
+	}{
+		{name: "open issue without labels"},
+		{name: "open issue with only unrelated labels", labels: []string{"bug"}},
+		{name: "handoff label outranks an active one", labels: []string{"backlog", "needs-human"}},
+		{name: "active label in another case", labels: []string{"In-Progress"}, wantCandidate: true},
+	}
+
+	for _, route := range []string{"issues", "search"} {
+		for _, tt := range tests {
+			t.Run(route+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				nodes := make([]string, len(tt.labels))
+				for i, l := range tt.labels {
+					nodes[i] = fmt.Sprintf(`{"name":%q}`, l)
+				}
+				issue := `{"id":7,"number":7,"title":"T","state":"open","html_url":"u","labels":[` + strings.Join(nodes, ",") + `]}`
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.URL.Path == "/search/issues":
+						_, _ = io.WriteString(w, `{"items":[`+issue+`]}`)
+					case r.URL.Path == "/repos/owner/repo/issues" && r.URL.Query().Get("state") == "open":
+						_, _ = io.WriteString(w, "["+issue+"]")
+					default:
+						_, _ = io.WriteString(w, "[]")
+					}
+				}))
+				defer srv.Close()
+				cfg := validConfig(srv.URL)
+				cfg["handoff_state"] = "needs-human"
+				if route == "search" {
+					cfg["query_filter"] = "label:bug"
+				}
+				a := mustAdapter(t, cfg)
+
+				issues, err := a.FetchCandidateIssues(context.Background())
+
+				if err != nil {
+					t.Fatalf("FetchCandidateIssues: %v", err)
+				}
+				if got := len(issues) == 1; got != tt.wantCandidate {
+					t.Errorf("FetchCandidateIssues with labels %v returned %d issues, want candidate = %v", tt.labels, len(issues), tt.wantCandidate)
+				}
+			})
+		}
 	}
 }
 
@@ -579,51 +476,12 @@ func TestFetchCandidateIssues_NonNilEmptySlice(t *testing.T) {
 	}
 }
 
-func TestFetchCandidateIssues_MultiLabelWarnCarriesIssueIdentifier(t *testing.T) {
-	t.Parallel()
-
-	// Issue 9 carries both "backlog" and "in-progress", two configured
-	// active-state labels.
-	const twoLabels = `[{"id":900,"number":9,"title":"Two state labels","body":null,"state":"open","html_url":"u",
-		"labels":[{"name":"backlog"},{"name":"in-progress"}],"assignees":[],"type":null,"pull_request":null,
-		"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]`
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(twoLabels)) //nolint:errcheck // test helper
-	}))
-	defer srv.Close()
-
-	a := mustAdapter(t, validConfig(srv.URL))
-	var buf strings.Builder
-	a.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	if _, err := a.FetchCandidateIssues(context.Background()); err != nil {
-		t.Fatalf("FetchCandidateIssues: %v", err)
+func serveLabelCatalog(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/repos/owner/repo/labels" {
+		return false
 	}
-
-	var warnLine string
-	for line := range strings.SplitSeq(buf.String(), "\n") {
-		if strings.Contains(line, "kept first of multiple matching state labels") {
-			warnLine = line
-			break
-		}
-	}
-	if warnLine == "" {
-		t.Fatalf("multi-match WARN not found in captured log: %s", buf.String())
-	}
-	if !strings.Contains(warnLine, "issue_identifier=9") {
-		t.Errorf("multi-match WARN missing issue_identifier=9: %q", warnLine)
-	}
-	if !strings.Contains(warnLine, "backlog") || !strings.Contains(warnLine, "in-progress") {
-		t.Errorf("multi-match WARN does not name both matching labels: %q", warnLine)
-	}
-	if strings.Contains(warnLine, "issue_index=") {
-		t.Errorf("multi-match WARN record carries issue_index: %q", warnLine)
-	}
-	if strings.Contains(warnLine, "iid=") {
-		t.Errorf("multi-match WARN record carries iid: %q", warnLine)
-	}
+	_, _ = io.WriteString(w, "[]")
+	return true
 }
 
 func TestFetchCandidateIssues_Pagination(t *testing.T) {
@@ -635,6 +493,9 @@ func TestFetchCandidateIssues_Pagination(t *testing.T) {
 	var srvURL string
 	var callCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveLabelCatalog(w, r) {
+			return
+		}
 		n := callCount.Add(1)
 		if n == 1 {
 			// First page: set Link header pointing to page 2.
@@ -670,6 +531,9 @@ func TestFetchCandidateIssues_MaxPagesGuard(t *testing.T) {
 	// Server always returns a Link header, forcing the guard to trigger.
 	var callCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveLabelCatalog(w, r) {
+			return
+		}
 		n := callCount.Add(1)
 		nextURL := fmt.Sprintf("http://%s/repos/owner/repo/issues?p=%d", r.Host, n+1)
 		w.Header().Set("Link", fmt.Sprintf(`<%s>; rel="next"`, nextURL))
@@ -1140,7 +1004,7 @@ func TestFetchIssuesByStates_Dedup(t *testing.T) {
 func TestFetchIssueStatesByIDs_Success(t *testing.T) {
 	t.Parallel()
 
-	issueData := issueJSON(42, "in-progress", "open")
+	issueData := issueJSON(42, "in-progress")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1184,7 +1048,7 @@ func TestFetchIssueStatesByIDs_NotFoundOmitted(t *testing.T) {
 		n := callNum.Add(1)
 		if n == 1 {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(1, "backlog", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(1, "backlog"))) //nolint:errcheck // test helper
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -1242,7 +1106,7 @@ func TestFetchIssueStatesByIdentifiers_Success(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(issueJSON(7, "review", "open"))) //nolint:errcheck // test helper
+		w.Write([]byte(issueJSON(7, "review"))) //nolint:errcheck // test helper
 	}))
 	defer srv.Close()
 
@@ -1352,170 +1216,187 @@ func TestFetchIssueComments_NotFound(t *testing.T) {
 	assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 }
 
-// transitionServer sets up an httptest server that simulates GitHub label and
-// state operations for TransitionIssue. It tracks which API calls were made.
-type transitionServer struct {
-	srv            *httptest.Server
-	deleteCount    atomic.Int32
-	postCount      atomic.Int32
-	patchCount     atomic.Int32
-	deleteFailWith int // if non-zero, respond with this status on DELETE
-	postFailWith   int // if non-zero, respond with this status on POST labels
-	patchFailWith  int // if non-zero, respond with this status on PATCH
+const labelFakeNumber = 42
+
+type labelRequest struct {
+	method string
+	path   string
 }
 
-func newTransitionServer(t *testing.T, number int, currentLabel, nativeState string) *transitionServer {
+type issueLabelFake struct {
+	mu           sync.Mutex
+	labels       []string
+	pageSize     int
+	deleteStatus int
+	applyDelete  bool
+	labelsStatus int
+	postStatus   int
+	closed       bool
+	writes       []string
+	requests     []labelRequest
+	srv          *httptest.Server
+}
+
+func newIssueLabelFake(t *testing.T, labels ...string) *issueLabelFake {
 	t.Helper()
-	ts := &transitionServer{}
-	base := fmt.Sprintf("/repos/owner/repo/issues/%d", number)
 
-	mux := http.NewServeMux()
-	// GET issue
-	mux.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "PATCH" {
-			// Open/close call.
-			if ts.patchFailWith != 0 {
-				w.WriteHeader(ts.patchFailWith)
-				return
-			}
-			ts.patchCount.Add(1)
-			w.WriteHeader(http.StatusOK)
-			body, _ := io.ReadAll(r.Body)
-			w.Write(body) //nolint:errcheck // test helper
+	fake := &issueLabelFake{labels: labels}
+	fake.srv = httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(fake.srv.Close)
+	return fake
+}
+
+func (f *issueLabelFake) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = append(f.requests, labelRequest{method: r.Method, path: r.URL.EscapedPath()})
+
+	base := fmt.Sprintf("/repos/owner/repo/issues/%d", labelFakeNumber)
+	path := r.URL.Path
+	switch {
+	case path == base && r.Method == http.MethodGet:
+		nativeState := "open"
+		if f.closed {
+			nativeState = "closed"
+		}
+		body, _ := json.Marshal(map[string]any{
+			"id":         labelFakeNumber * 100,
+			"number":     labelFakeNumber,
+			"title":      "Label fake issue",
+			"state":      nativeState,
+			"html_url":   "https://github.com/owner/repo/issues/42",
+			"labels":     f.labelNodes(f.labels),
+			"assignees":  []any{},
+			"created_at": "2026-01-01T00:00:00Z",
+			"updated_at": "2026-01-01T00:00:00Z",
+		})
+		w.Write(body) //nolint:errcheck // test helper
+	case path == base+"/labels" && r.Method == http.MethodGet:
+		f.serveLabelList(w, r)
+	case path == base && r.Method == http.MethodPatch:
+		f.servePatch(w, r)
+	case path == base+"/labels" && r.Method == http.MethodPost:
+		var req struct {
+			Labels []string `json:"labels"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &req)
+		f.writes = append(f.writes, "add "+strings.Join(req.Labels, ","))
+		if f.postStatus != 0 {
+			w.WriteHeader(f.postStatus)
 			return
 		}
-		// GET
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(issueJSON(number, currentLabel, nativeState))) //nolint:errcheck // test helper
-	})
-	// DELETE label
-	mux.HandleFunc(base+"/labels/", func(w http.ResponseWriter, r *http.Request) {
-		if ts.deleteFailWith != 0 {
-			w.WriteHeader(ts.deleteFailWith)
-			return
+		f.labels = append(f.labels, req.Labels...)
+		w.Write(f.labelList(f.labels)) //nolint:errcheck // test helper
+	case strings.HasPrefix(path, base+"/labels/") && r.Method == http.MethodDelete:
+		f.serveDelete(w, strings.TrimPrefix(path, base+"/labels/"))
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (f *issueLabelFake) servePatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		State       string `json:"state"`
+		StateReason string `json:"state_reason"`
+	}
+	raw, _ := io.ReadAll(r.Body)
+	_ = json.Unmarshal(raw, &req)
+	if req.State == "open" {
+		f.writes = append(f.writes, "reopen")
+	} else {
+		f.writes = append(f.writes, "close "+req.StateReason)
+	}
+	f.closed = req.State == "closed"
+	w.Write([]byte(`{}`)) //nolint:errcheck // test helper
+}
+
+func (f *issueLabelFake) labelNodes(labels []string) []map[string]string {
+	nodes := make([]map[string]string, len(labels))
+	for i, name := range labels {
+		nodes[i] = map[string]string{"name": name}
+	}
+	return nodes
+}
+
+func (f *issueLabelFake) labelList(labels []string) []byte {
+	body, _ := json.Marshal(f.labelNodes(labels))
+	return body
+}
+
+func (f *issueLabelFake) serveLabelList(w http.ResponseWriter, r *http.Request) {
+	if f.labelsStatus != 0 {
+		w.WriteHeader(f.labelsStatus)
+		return
+	}
+	if f.pageSize == 0 || f.pageSize >= len(f.labels) {
+		w.Write(f.labelList(f.labels)) //nolint:errcheck // test helper
+		return
+	}
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	page = max(page, 1)
+	start := (page - 1) * f.pageSize
+	end := min(start+f.pageSize, len(f.labels))
+	if end < len(f.labels) {
+		next := fmt.Sprintf("%s%s?per_page=100&page=%d", f.srv.URL, r.URL.Path, page+1)
+		w.Header().Set("Link", fmt.Sprintf(`<%s>; rel="next"`, next))
+	}
+	w.Write(f.labelList(f.labels[start:end])) //nolint:errcheck // test helper
+}
+
+func (f *issueLabelFake) serveDelete(w http.ResponseWriter, escaped string) {
+	name, err := url.PathUnescape(escaped)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	f.writes = append(f.writes, "remove "+name)
+	remove := func() {
+		f.labels = slices.DeleteFunc(f.labels, func(l string) bool { return l == name })
+	}
+
+	if f.deleteStatus != 0 {
+		if f.applyDelete {
+			remove()
 		}
-		ts.deleteCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-	})
-	// POST labels
-	mux.HandleFunc(base+"/labels", func(w http.ResponseWriter, r *http.Request) {
-		if ts.postFailWith != 0 {
-			w.WriteHeader(ts.postFailWith)
-			return
+		w.WriteHeader(f.deleteStatus)
+		return
+	}
+	if !slices.Contains(f.labels, name) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	remove()
+	w.Write(f.labelList(f.labels)) //nolint:errcheck // test helper
+}
+
+func (f *issueLabelFake) stored() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.labels)
+}
+
+func (f *issueLabelFake) state() (writes, labels []string, closed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.writes), slices.Clone(f.labels), f.closed
+}
+
+func (f *issueLabelFake) requestLog() []labelRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.requests)
+}
+
+func (f *issueLabelFake) paths(method string) []string {
+	var paths []string
+	for _, r := range f.requestLog() {
+		if r.method == method {
+			paths = append(paths, r.path)
 		}
-		ts.postCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[]`)) //nolint:errcheck // test helper
-	})
-
-	ts.srv = httptest.NewServer(mux)
-	t.Cleanup(ts.srv.Close)
-	return ts
-}
-
-func TestTransitionIssue_LabelSwap(t *testing.T) {
-	t.Parallel()
-
-	// Current: "backlog" (active), native: open -> Target: "review" (active).
-	// Expected: DELETE backlog, POST review, no PATCH.
-	ts := newTransitionServer(t, 1, "backlog", "open")
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	if err := a.TransitionIssue(context.Background(), "1", "review"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
 	}
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1", got)
-	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1", got)
-	}
-	if got := ts.patchCount.Load(); got != 0 {
-		t.Errorf("PATCH count = %d, want 0 (no native state change needed)", got)
-	}
-}
-
-func TestTransitionIssue_CloseOnTerminal(t *testing.T) {
-	t.Parallel()
-
-	// Current: "in-progress" (active), native: open -> Target: "done" (terminal).
-	// Expected: DELETE in-progress, POST done, PATCH close.
-	ts := newTransitionServer(t, 5, "in-progress", "open")
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	if err := a.TransitionIssue(context.Background(), "5", "done"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
-	}
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1", got)
-	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1", got)
-	}
-	if got := ts.patchCount.Load(); got != 1 {
-		t.Errorf("PATCH count = %d, want 1 (close issue)", got)
-	}
-}
-
-func TestTransitionIssue_ReopenOnActive(t *testing.T) {
-	t.Parallel()
-
-	// Current: "done" (terminal), native: closed -> Target: "review" (active).
-	// Expected: DELETE done, POST review, PATCH reopen.
-	ts := newTransitionServer(t, 8, "done", "closed")
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	if err := a.TransitionIssue(context.Background(), "8", "review"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
-	}
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1", got)
-	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1", got)
-	}
-	if got := ts.patchCount.Load(); got != 1 {
-		t.Errorf("PATCH count = %d, want 1 (reopen issue)", got)
-	}
-}
-
-func TestTransitionIssue_IdempotentNoOp(t *testing.T) {
-	t.Parallel()
-
-	// Current label already matches target -> no label API calls.
-	ts := newTransitionServer(t, 3, "review", "open")
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	if err := a.TransitionIssue(context.Background(), "3", "review"); err != nil {
-		t.Fatalf("TransitionIssue idempotent: %v", err)
-	}
-
-	if got := ts.deleteCount.Load(); got != 0 {
-		t.Errorf("DELETE count = %d, want 0", got)
-	}
-	if got := ts.postCount.Load(); got != 0 {
-		t.Errorf("POST count = %d, want 0", got)
-	}
-}
-
-func TestTransitionIssue_PartialFailure_AddLabel(t *testing.T) {
-	t.Parallel()
-
-	// DELETE succeeds, POST fails -> error returned.
-	// On retry, DELETE is 404 (already removed) and POST should succeed.
-	ts := newTransitionServer(t, 2, "backlog", "open")
-	ts.postFailWith = http.StatusInternalServerError
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	err := a.TransitionIssue(context.Background(), "2", "review")
-	assertTrackerErrorKind(t, err, domain.ErrTrackerTransport)
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1 (delete succeeded before add failed)", got)
-	}
+	return paths
 }
 
 func TestAddLabel_Additive(t *testing.T) {
@@ -1525,7 +1406,7 @@ func TestAddLabel_Additive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("[]")) //nolint:errcheck // test helper
+		w.Write([]byte(`[{"name":"urgent"}]`)) //nolint:errcheck // test helper
 	}))
 	defer srv.Close()
 
@@ -1552,145 +1433,157 @@ func TestAddLabel_Additive(t *testing.T) {
 	adaptertest.AssertLabelAddIsAdditive(t, before, after, body.Labels[0])
 }
 
-func TestTransitionIssue_InvalidTargetState(t *testing.T) {
+func TestRemoveLabel_DeletesEachStoredSpellingFromEveryPage(t *testing.T) {
 	t.Parallel()
 
-	// "unknown" is not in the default active or terminal state lists.
-	a := mustAdapter(t, validConfig("http://localhost"))
-	err := a.TransitionIssue(context.Background(), "1", "unknown")
-	assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
-}
+	fake := newIssueLabelFake(t, "backlog", "Needs Human", "ui", "needs human")
+	fake.pageSize = 2
+	a := mustAdapter(t, validConfig(fake.srv.URL))
 
-func TestTransitionIssue_HandoffToActive(t *testing.T) {
-	t.Parallel()
+	err := a.RemoveLabel(context.Background(), "42", "NEEDS HUMAN")
 
-	// Issue currently carries the handoff label ("review"), native state open.
-	// TransitionIssue to an active state must DELETE the handoff label and
-	// POST the active label. No PATCH needed (already open).
-	ts := newTransitionServer(t, 10, "review", "open")
-	cfg := validConfig(ts.srv.URL)
-	cfg["active_states"] = []any{"backlog", "in-progress"}
-	cfg["terminal_states"] = []any{"done"}
-	cfg["handoff_state"] = "review"
-	a := mustAdapter(t, cfg)
-
-	if err := a.TransitionIssue(context.Background(), "10", "in-progress"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
+	if err != nil {
+		t.Fatalf("RemoveLabel = %v, want nil", err)
 	}
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1 (stale handoff label must be removed)", got)
+	wantPaths := []string{
+		"/repos/owner/repo/issues/42/labels/Needs%20Human",
+		"/repos/owner/repo/issues/42/labels/needs%20human",
 	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1 (active label must be added)", got)
+	if got := fake.paths(http.MethodDelete); !slices.Equal(got, wantPaths) {
+		t.Errorf("DELETE paths = %v, want %v", got, wantPaths)
 	}
-	if got := ts.patchCount.Load(); got != 0 {
-		t.Errorf("PATCH count = %d, want 0 (issue already open, no native state change)", got)
+	if got := fake.stored(); !slices.Equal(got, []string{"backlog", "ui"}) {
+		t.Errorf("stored labels = %v, want [backlog ui]", got)
 	}
 }
 
-func TestTransitionIssue_HandoffAsTarget(t *testing.T) {
+func TestRemoveLabel_RejectedDeleteIsSettledByRead(t *testing.T) {
 	t.Parallel()
 
-	// Issue currently carries an active label ("in-progress"), native state open.
-	// TransitionIssue to the handoff state must:
-	//   - Be accepted (not rejected as ErrTrackerPayload).
-	//   - DELETE the active label.
-	//   - POST the handoff label.
-	//   - Not PATCH native state (handoff issues stay open).
-	ts := newTransitionServer(t, 11, "in-progress", "open")
-	cfg := validConfig(ts.srv.URL)
-	cfg["active_states"] = []any{"backlog", "in-progress"}
-	cfg["terminal_states"] = []any{"done"}
-	cfg["handoff_state"] = "review"
-	a := mustAdapter(t, cfg)
-
-	if err := a.TransitionIssue(context.Background(), "11", "review"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
+	tests := []struct {
+		name         string
+		deleteStatus int
+		labelsStatus int
+		applied      bool
+		wantKind     domain.TrackerErrorKind
+	}{
+		{"not found but label gone", http.StatusNotFound, 0, true, ""},
+		{"validation failed but label gone", http.StatusUnprocessableEntity, 0, true, ""},
+		{"not found and label kept", http.StatusNotFound, 0, false, domain.ErrTrackerNotFound},
+		{"label read not found", 0, http.StatusNotFound, false, domain.ErrTrackerNotFound},
 	}
 
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1 (active label must be removed)", got)
-	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1 (handoff label must be added)", got)
-	}
-	if got := ts.patchCount.Load(); got != 0 {
-		t.Errorf("PATCH count = %d, want 0 (handoff state never changes native open/closed)", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newIssueLabelFake(t, "backlog", "urgent")
+			fake.deleteStatus = tt.deleteStatus
+			fake.applyDelete = tt.applied
+			fake.labelsStatus = tt.labelsStatus
+			a := mustAdapter(t, validConfig(fake.srv.URL))
+
+			err := a.RemoveLabel(context.Background(), "42", "urgent")
+
+			if tt.wantKind == "" {
+				if err != nil {
+					t.Fatalf("RemoveLabel = %v, want nil", err)
+				}
+				return
+			}
+			assertTrackerErrorKind(t, err, tt.wantKind)
+		})
 	}
 }
 
-func TestTransitionIssue_UnknownStateWithHandoffConfigured(t *testing.T) {
+func TestTransitionIssue_RemovesStateLabelSpellingsAndStillAddsTarget(t *testing.T) {
 	t.Parallel()
 
-	// When handoff_state is configured, states outside the three valid categories
-	// (active, terminal, handoff) must still be rejected.
-	cfg := validConfig("http://localhost")
-	cfg["active_states"] = []any{"backlog"}
-	cfg["terminal_states"] = []any{"done"}
-	cfg["handoff_state"] = "review"
-	a := mustAdapter(t, cfg)
+	tests := []struct {
+		name         string
+		labels       []string
+		deleteStatus int
+		wantDeleted  []string
+	}{
+		{"every case variant", []string{"In-Progress", "in-progress", "UI"}, 0, []string{
+			"/repos/owner/repo/issues/42/labels/In-Progress",
+			"/repos/owner/repo/issues/42/labels/in-progress",
+		}},
+		{"state label already gone", []string{"in-progress"}, http.StatusNotFound, []string{
+			"/repos/owner/repo/issues/42/labels/in-progress",
+		}},
+	}
 
-	err := a.TransitionIssue(context.Background(), "1", "unknown-state")
-	assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newIssueLabelFake(t, tt.labels...)
+			fake.deleteStatus = tt.deleteStatus
+			fake.applyDelete = true
+			a := mustAdapter(t, validConfig(fake.srv.URL))
+
+			err := a.TransitionIssue(context.Background(), "42", "review")
+
+			if err != nil {
+				t.Fatalf("TransitionIssue = %v, want nil", err)
+			}
+			if got := fake.paths(http.MethodDelete); !slices.Equal(got, tt.wantDeleted) {
+				t.Errorf("DELETE paths = %v, want %v", got, tt.wantDeleted)
+			}
+			if got := fake.paths(http.MethodPost); len(got) != 1 {
+				t.Errorf("POST requests = %d, want 1 (the target label is still added)", len(got))
+			}
+		})
+	}
 }
 
-func TestTransitionIssue_PartialFailure_Close(t *testing.T) {
+func TestTransitionIssue_WriteOrder(t *testing.T) {
 	t.Parallel()
 
-	// DELETE and POST succeed, PATCH close fails -> error returned.
-	ts := newTransitionServer(t, 6, "review", "open")
-	ts.patchFailWith = http.StatusInternalServerError
-
-	a := mustAdapter(t, validConfig(ts.srv.URL))
-	err := a.TransitionIssue(context.Background(), "6", "done")
-	assertTrackerErrorKind(t, err, domain.ErrTrackerTransport)
-
-	if got := ts.deleteCount.Load(); got != 1 {
-		t.Errorf("DELETE count = %d, want 1", got)
-	}
-	if got := ts.postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1", got)
-	}
-}
-
-func TestTransitionIssue_LabelURLEncoding(t *testing.T) {
-	t.Parallel()
-
-	// Label with spaces must be URL-path-escaped in DELETE request.
-	var deletedLabelPath string
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/owner/repo/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		// Current label has a space.
-		w.Write([]byte(`{"id":1,"number":1,"title":"T","body":null,"state":"open","html_url":"u","labels":[{"name":"code review"}],"assignees":[],"type":null,"pull_request":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`)) //nolint:errcheck // test helper
-	})
-	mux.HandleFunc("/repos/owner/repo/issues/1/labels/", func(w http.ResponseWriter, r *http.Request) {
-		// EscapedPath() returns the percent-encoded form, confirming the label
-		// was properly URL-encoded before sending (spaces -> %20).
-		deletedLabelPath = r.URL.EscapedPath()
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/repos/owner/repo/issues/1/labels", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("[]")) //nolint:errcheck // test helper
-	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	cfg := validConfig(srv.URL)
-	cfg["active_states"] = []any{"code review", "done-review"}
-	cfg["terminal_states"] = []any{"complete"}
-	a := mustAdapter(t, cfg)
-
-	if err := a.TransitionIssue(context.Background(), "1", "done-review"); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
+	tests := []struct {
+		name       string
+		labels     []string
+		closed     bool
+		target     string
+		postStatus int
+		wantKind   domain.TrackerErrorKind
+		wantWrites []string
+		wantLabels []string
+		wantClosed bool
+	}{
+		{name: "active swap adds the target before removing the old label", labels: []string{"backlog"}, target: "review", wantWrites: []string{"add review", "remove backlog"}, wantLabels: []string{"review"}},
+		{name: "the label that decides the start state is removed last", labels: []string{"backlog", "review"}, target: "in-progress", wantWrites: []string{"add in-progress", "remove review", "remove backlog"}, wantLabels: []string{"in-progress"}},
+		{name: "terminal target closes last", labels: []string{"in-progress"}, target: "done", wantWrites: []string{"add done", "remove in-progress", "close completed"}, wantLabels: []string{"done"}, wantClosed: true},
+		{name: "terminal label reopens first", labels: []string{"done"}, closed: true, target: "review", wantWrites: []string{"reopen", "add review", "remove done"}, wantLabels: []string{"review"}},
+		{name: "target already carried writes nothing", labels: []string{"review"}, target: "review", wantLabels: []string{"review"}},
+		{name: "failed add keeps the old label", labels: []string{"backlog"}, target: "review", postStatus: http.StatusInternalServerError, wantKind: domain.ErrTrackerTransport, wantWrites: []string{"add review"}, wantLabels: []string{"backlog"}},
 	}
 
-	// Verify "code review" was URL-encoded in the DELETE path.
-	if !strings.Contains(deletedLabelPath, "code%20review") {
-		t.Errorf("DELETE path = %q, should contain URL-encoded label 'code%%20review'", deletedLabelPath)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newIssueLabelFake(t, tt.labels...)
+			fake.closed = tt.closed
+			fake.postStatus = tt.postStatus
+			a := mustAdapter(t, validConfig(fake.srv.URL))
+
+			err := a.TransitionIssue(context.Background(), "42", tt.target)
+
+			if tt.wantKind != "" {
+				assertTrackerErrorKind(t, err, tt.wantKind)
+			} else if err != nil {
+				t.Fatalf("TransitionIssue(%q) = %v, want nil", tt.target, err)
+			}
+			writes, labels, closed := fake.state()
+			if !slices.Equal(writes, tt.wantWrites) {
+				t.Errorf("TransitionIssue(%q) writes = %v, want %v", tt.target, writes, tt.wantWrites)
+			}
+			if !slices.Equal(labels, tt.wantLabels) || closed != tt.wantClosed {
+				t.Errorf("TransitionIssue(%q) left labels %v closed %v, want %v closed %v", tt.target, labels, closed, tt.wantLabels, tt.wantClosed)
+			}
+		})
 	}
 }
 
@@ -1716,6 +1609,56 @@ func TestCommentIssue_Success(t *testing.T) {
 
 	if gotBody["body"] != "Hello from Sortie!" {
 		t.Errorf("request body.body = %q, want %q", gotBody["body"], "Hello from Sortie!")
+	}
+}
+
+func TestCommentIssueWithLiteral(t *testing.T) {
+	t.Parallel()
+
+	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
+	tests := []struct {
+		name    string
+		literal string
+		want    string
+	}{
+		{
+			name:    "plain statement sits in a three backtick fence",
+			literal: "Which one should the API expose?",
+			want:    text + "\n\n```\nWhich one should the API expose?\n```",
+		},
+		{
+			name: "adversarial statement sits in a fence longer than its longest backtick run",
+			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
+				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
+			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
+				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			bodies := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var payload map[string]string
+				raw, _ := io.ReadAll(r.Body)
+				json.Unmarshal(raw, &payload) //nolint:errcheck // asserted through the received body
+				bodies <- payload["body"]
+				w.WriteHeader(http.StatusCreated)
+				w.Write([]byte(`{"id":12345}`)) //nolint:errcheck // test helper
+			}))
+			defer srv.Close()
+			a := mustAdapter(t, validConfig(srv.URL))
+
+			if err := a.CommentIssueWithLiteral(context.Background(), "42", text, tt.literal); err != nil {
+				t.Fatalf("CommentIssueWithLiteral: %v", err)
+			}
+
+			if got := <-bodies; got != tt.want {
+				t.Errorf("request body.body = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1776,7 +1719,7 @@ func TestSetMetrics_RecordsAddLabelOperations(t *testing.T) {
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tt.statusCode)
-				w.Write([]byte("[]")) //nolint:errcheck // test helper
+				w.Write([]byte(`[{"name":"urgent"}]`)) //nolint:errcheck // test helper
 			}))
 			defer srv.Close()
 
@@ -1829,6 +1772,9 @@ func TestFetchCandidateIssues_SearchPagination(t *testing.T) {
 	var srvURL string
 	var callCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveLabelCatalog(w, r) {
+			return
+		}
 		n := callCount.Add(1)
 		if n == 1 {
 			w.Header().Set("Link", fmt.Sprintf(`<%s/search/issues?q=...&page=2>; rel="next"`, srvURL))
@@ -2095,8 +2041,6 @@ func TestFetchIssuesByStates_ContextCancelledDuringTerminal(t *testing.T) {
 	a := mustAdapter(t, validConfig(srv.URL))
 	errCh := make(chan error, 1)
 	go func() {
-		// defaultTerminalStates = ["done", "wontfix"]; both are terminal so both
-		// iterate through the ctx.Err() guarded loop in FetchIssuesByStates.
 		_, err := a.FetchIssuesByStates(ctx, []string{"done", "wontfix"})
 		errCh <- err
 	}()
@@ -2175,43 +2119,6 @@ func TestTransitionIssue_GetIssueError(t *testing.T) {
 	assertTrackerErrorKind(t, err, domain.ErrTrackerTransport)
 }
 
-func TestTransitionIssue_DeleteLabelIsNotFound(t *testing.T) {
-	t.Parallel()
-
-	// DELETE existing label returns 404 (already removed) -> treated as no-op; POST still executes.
-	var postCount atomic.Int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/owner/repo/issues/1", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPatch {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(1, "review", "open"))) //nolint:errcheck // test helper
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(issueJSON(1, "backlog", "open"))) //nolint:errcheck // test helper
-	})
-	mux.HandleFunc("/repos/owner/repo/issues/1/labels/backlog", func(w http.ResponseWriter, r *http.Request) {
-		// Label was already removed on a prior attempt.
-		w.WriteHeader(http.StatusNotFound)
-	})
-	mux.HandleFunc("/repos/owner/repo/issues/1/labels", func(w http.ResponseWriter, r *http.Request) {
-		postCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("[]")) //nolint:errcheck // test helper
-	})
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	a := mustAdapter(t, validConfig(srv.URL))
-	if err := a.TransitionIssue(context.Background(), "1", "review"); err != nil {
-		t.Fatalf("TransitionIssue 404-on-delete: %v", err)
-	}
-	if got := postCount.Load(); got != 1 {
-		t.Errorf("POST count = %d, want 1 (add-label must still execute)", got)
-	}
-}
-
 func TestNewGitHubAdapter_ETagCacheSizeDefault(t *testing.T) {
 	t.Parallel()
 
@@ -2286,7 +2193,7 @@ func TestFetchIssueStatesByIDs_ConditionalRequest_304(t *testing.T) {
 		if n == 1 {
 			w.Header().Set("ETag", `"etag-v1"`)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(42, "in-progress", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(42, "in-progress"))) //nolint:errcheck // test helper
 			return
 		}
 		// Second call must include If-None-Match carrying the cached ETag.
@@ -2322,6 +2229,36 @@ func TestFetchIssueStatesByIDs_ConditionalRequest_304(t *testing.T) {
 	}
 }
 
+func TestFetchIssueStatesByIDs_304_DerivedUnderReloadedStates(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = io.WriteString(w, `{"number":1,"state":"closed","labels":[]}`)
+	}))
+	defer srv.Close()
+	a := mustAdapter(t, validConfig(srv.URL))
+	if _, err := a.FetchIssueStatesByIDs(context.Background(), []string{"1"}); err != nil {
+		t.Fatalf("first FetchIssueStatesByIDs: %v", err)
+	}
+	a.SetTrackerStates(func() domain.TrackerStates {
+		return domain.TrackerStates{Active: []string{"backlog"}, Terminal: []string{"shipped", "done"}}
+	})
+
+	got, err := a.FetchIssueStatesByIDs(context.Background(), []string{"1"})
+
+	if err != nil {
+		t.Fatalf("second FetchIssueStatesByIDs: %v", err)
+	}
+	if got["1"] != "shipped" {
+		t.Errorf("FetchIssueStatesByIDs([1]) after a 304 and a reload = %q, want %q", got["1"], "shipped")
+	}
+}
+
 func TestFetchIssueStatesByIDs_ConditionalRequest_200_UpdatesCache(t *testing.T) {
 	t.Parallel()
 
@@ -2332,12 +2269,12 @@ func TestFetchIssueStatesByIDs_ConditionalRequest_200_UpdatesCache(t *testing.T)
 		case 1:
 			w.Header().Set("ETag", `"etag-v1"`)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(5, "in-progress", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(5, "in-progress"))) //nolint:errcheck // test helper
 		case 2:
 			// State changed on server; new ETag and new state label.
 			w.Header().Set("ETag", `"etag-v2"`)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(5, "review", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(5, "review"))) //nolint:errcheck // test helper
 		default:
 			// Third call: cache must carry the new ETag from call 2.
 			if h := r.Header.Get("If-None-Match"); h != `"etag-v2"` {
@@ -2390,7 +2327,7 @@ func TestFetchIssueStatesByIDs_NoETagHeader_NoCacheEntry(t *testing.T) {
 			t.Errorf("call %d: unexpected If-None-Match = %q (no ETag was ever returned)", n, h)
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(issueJSON(10, "backlog", "open"))) //nolint:errcheck // test helper
+		w.Write([]byte(issueJSON(10, "backlog"))) //nolint:errcheck // test helper
 	}))
 	defer srv.Close()
 
@@ -2431,7 +2368,7 @@ func TestFetchIssueStatesByIDs_304_CachedStateUsedAfterEviction(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/issues/2"):
 			w.Header().Set("ETag", `"etag-2"`)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(2, "review", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(2, "review"))) //nolint:errcheck // test helper
 		}
 	}))
 	defer srv.Close()
@@ -2441,7 +2378,7 @@ func TestFetchIssueStatesByIDs_304_CachedStateUsedAfterEviction(t *testing.T) {
 	a := mustAdapter(t, cfg)
 
 	// Pre-populate the cache for issue 1 so lookup returns a hit before the HTTP call.
-	a.etagCache.put("/repos/owner/repo/issues/1", `"etag-1"`, "in-progress")
+	a.etagCache.put("/repos/owner/repo/issues/1", `"etag-1"`, []string{"in-progress"}, false)
 
 	// GA: fetch issue 1; the server blocks until releaseGA is closed.
 	resultCh := make(chan map[string]string, 1)
@@ -2461,7 +2398,7 @@ func TestFetchIssueStatesByIDs_304_CachedStateUsedAfterEviction(t *testing.T) {
 	}
 
 	// Verify issue 1 was evicted (cache size=1; issue 2 now occupies the slot).
-	if _, _, ok := a.etagCache.lookup("/repos/owner/repo/issues/1"); ok {
+	if _, _, _, ok := a.etagCache.lookup("/repos/owner/repo/issues/1"); ok {
 		t.Error("issue 1 should have been evicted after issue 2 was inserted")
 	}
 
@@ -2489,7 +2426,7 @@ func TestFetchIssueStatesByIDs_CacheDisabled_ZeroSize(t *testing.T) {
 		}
 		w.Header().Set("ETag", `"etag-v1"`)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(issueJSON(20, "backlog", "open"))) //nolint:errcheck // test helper
+		w.Write([]byte(issueJSON(20, "backlog"))) //nolint:errcheck // test helper
 	}))
 	defer srv.Close()
 
@@ -2517,7 +2454,7 @@ func TestFetchIssueStatesByIDs_NetworkError_CachePreserved(t *testing.T) {
 		case 1:
 			w.Header().Set("ETag", `"etag-v1"`)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(issueJSON(30, "backlog", "open"))) //nolint:errcheck // test helper
+			w.Write([]byte(issueJSON(30, "backlog"))) //nolint:errcheck // test helper
 		case 2:
 			// Transient server error; must not evict the cache entry.
 			w.WriteHeader(http.StatusInternalServerError)
@@ -2561,9 +2498,9 @@ func TestFetchCandidateIssueByIDEquivalence(t *testing.T) {
 	// - Issue 1 ("backlog" label): active, returned by FetchCandidateIssues, local check accepts.
 	// - Issue 3 ("done" label): non-active, not returned by FetchCandidateIssues, local check rejects.
 	// - Issue 2 (pull request): skipped by FetchCandidateIssues, FetchIssueByID returns ErrTrackerNotFound.
-	issue1Body := issueJSON(1, "backlog", "open")
+	issue1Body := issueJSON(1, "backlog")
 	issue2PRBody := `{"id":200,"number":2,"title":"A PR","body":null,"state":"open","html_url":"https://github.com/owner/repo/pull/2","labels":[{"name":"in-progress"}],"assignees":[],"type":null,"pull_request":{},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`
-	issue3Body := issueJSON(3, "done", "open")
+	issue3Body := issueJSON(3, "done")
 	issueListBody := "[" + issue1Body + "," + issue2PRBody + "," + issue3Body + "]"
 	emptyList := "[]"
 	emptyComments := "[]"
@@ -2638,9 +2575,9 @@ func TestFetchCandidateIssueByIDEquivalence(t *testing.T) {
 		t.Errorf("candidates[0].ID = %q, want 1", candidates[0].ID)
 	}
 
-	activeSet := make(map[string]bool, len(a.activeStates))
-	for _, s := range a.activeStates {
-		activeSet[s] = true // GitHub adapter already lowercases
+	activeSet := make(map[string]bool)
+	for _, s := range a.model.Snapshot().Active {
+		activeSet[s] = true
 	}
 
 	// Active issue: FetchIssueByID succeeds and local check accepts.

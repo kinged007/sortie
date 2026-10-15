@@ -60,6 +60,7 @@ type pullRequestResponse struct {
 	MergeableState string `json:"mergeable_state"`
 	Merged         bool   `json:"merged"`
 	State          string `json:"state"`
+	HTMLURL        string `json:"html_url"`
 	Head           struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
@@ -250,6 +251,7 @@ func (a *GitHubSCMAdapter) GetMergeability(ctx context.Context, prNumber int, ow
 		Merged:         pr.Merged,
 		MergeCommitSHA: mergeCommitSHA,
 		Closed:         strings.EqualFold(pr.State, "closed"),
+		URL:            pr.HTMLURL,
 	}, nil
 }
 

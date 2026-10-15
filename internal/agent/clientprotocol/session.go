@@ -19,6 +19,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 // clientProtocolMaxLineBytes raises the connection's line bound from the shared
@@ -30,10 +31,6 @@ const clientProtocolMaxLineBytes = 10 * 1024 * 1024
 // A handshake reporting any other value ends the session: the protocol defines
 // no error for a version mismatch and leaves the disconnect to the client.
 const pinnedProtocolVersion = 1
-
-// defaultReadTimeout bounds a synchronous wait on the agent when
-// agent.read_timeout_ms is not set.
-const defaultReadTimeout = 30 * time.Second
 
 // errorCodeAuthRequired is the protocol's "Authentication required"
 // code, returned when the runtime refuses its credential.
@@ -65,6 +62,7 @@ type sessionState struct {
 	conn *jsonrpc.Conn
 
 	pid             int
+	group           *procutil.Group
 	stdinCloser     io.Closer
 	pipes           *procutil.OwnedPipes
 	stderrCollector *procutil.StderrCollector
@@ -224,13 +222,6 @@ type turnEnd struct {
 	err    *domain.AgentError
 }
 
-func readTimeout(state *sessionState) time.Duration {
-	if state.agentConfig.ReadTimeoutMS > 0 {
-		return time.Duration(state.agentConfig.ReadTimeoutMS) * time.Millisecond
-	}
-	return defaultReadTimeout
-}
-
 // startSession launches the runtime, performs the initialize handshake, and
 // creates or continues a session. A non-empty ResumeSessionID picks the
 // continuation route the handshake advertises; every other case, and a
@@ -245,6 +236,10 @@ func readTimeout(state *sessionState) time.Duration {
 // handshake supports, up to maxSessionStarts starts in all. Only the final
 // start reaches session/new.
 func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.StartSessionParams, usage *agentcore.TurnEndUsage) (domain.Session, error) {
+	if _, fault := typeutil.StringField(params.Settings, mcpConfigKey); fault != nil {
+		return domain.Session{}, agentcore.SettingsError(fault.Error(), fault)
+	}
+
 	target, agentErr := agentcore.ResolveLaunchTarget(params, "")
 	if agentErr != nil {
 		return domain.Session{}, agentErr
@@ -323,8 +318,11 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		}
 		prefixedStdin := launch.PrefixStdin(stdinPipe)
 
-		pipes, err := procutil.StartWithOwnedPipes(cmd, state.logger)
+		pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, state.logger)
 		if err != nil {
+			if cancelled := agentcore.SessionStartCancelledError(ctx, err); cancelled != nil {
+				return domain.Session{}, cancelled
+			}
 			var startErr *procutil.StartError
 			if !errors.As(err, &startErr) {
 				return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "failed to start subprocess", Err: err}
@@ -344,6 +342,7 @@ func startSession(ctx context.Context, a *ClientProtocolAdapter, params domain.S
 		}
 
 		state.pid = cmd.Process.Pid
+		state.group = group
 		state.stdinCloser = prefixedStdin
 		state.pipes = pipes
 		state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
@@ -524,7 +523,7 @@ func wrapPumpMessage(msg jsonrpc.Message) pumpItem {
 // doInitialize sends the initialize request and validates the pinned protocol
 // version.
 func doInitialize(ctx context.Context, state *sessionState) (*initializeResponse, *domain.AgentError) {
-	callCtx, cancel := context.WithTimeout(ctx, max(readTimeout(state), agentcore.CredentialExchangeBound))
+	callCtx, cancel := context.WithTimeout(ctx, agentcore.FirstResponseTimeout(state.agentConfig))
 	defer cancel()
 
 	no := false
@@ -566,7 +565,7 @@ func doInitialize(ctx context.Context, state *sessionState) (*initializeResponse
 // doNewSession sends session/new with the resolved cwd and filtered server
 // list.
 func doNewSession(ctx context.Context, state *sessionState, cwd string, servers []mcpServer) (*newSessionResponse, *domain.AgentError) {
-	callCtx, cancel := context.WithTimeout(ctx, readTimeout(state))
+	callCtx, cancel := context.WithTimeout(ctx, agentcore.ReadTimeout(state.agentConfig))
 	defer cancel()
 
 	req := newSessionRequest{Cwd: cwd, MCPServers: servers}
@@ -653,7 +652,7 @@ func runTurn(ctx context.Context, session domain.Session, params domain.RunTurnP
 
 	state.inbox.Put(pumpItem{control: &pumpControl{startTurn: ts}})
 
-	replyTimer := time.NewTimer(readTimeout(state))
+	replyTimer := time.NewTimer(agentcore.ReadTimeout(state.agentConfig))
 	var verdict turnVerdict
 	select {
 	case verdict = <-ts.reply:
@@ -898,18 +897,14 @@ func awaitAnswerOpen(graceCtx context.Context, grace time.Duration) func(state *
 }
 
 func killProcessGroup(state *sessionState) {
-	if state.pid > 0 {
-		procutil.KillProcessGroup(state.pid) //nolint:errcheck,gosec // best-effort
-	}
+	state.group.Kill() //nolint:errcheck,gosec // best-effort
 }
 
 // signalGraceful sends the catchable graceful-termination signal to the
 // subprocess's process group. It never waits and never changes teardown's path
 // when the signal cannot be delivered: kill_process_group covers that case.
 func signalGraceful(state *sessionState) {
-	if state.pid > 0 {
-		procutil.SignalGraceful(state.pid) //nolint:errcheck,gosec // best-effort
-	}
+	state.group.SignalGraceful() //nolint:errcheck,gosec // best-effort
 }
 
 // awaitExit returns a teardown step that waits for the subprocess to exit and be

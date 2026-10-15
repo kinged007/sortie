@@ -55,39 +55,51 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 		}
 
 		entryLog := logging.WithIssue(log, pending.IssueID, pending.Identifier)
+		rkey := ReactionKey(pending.IssueID, ReactionKindBotReview)
 
-		// TTL enforcement.
-		if ttl > 0 && now.Sub(pending.CreatedAt) > ttl {
+		// A standing escalation is never aged out; its own facts end it.
+		if ttl > 0 && !pending.escalationStands() && now.Sub(watchWindowStart(pending)) > ttl {
 			cancelReactionTriage(pending)
-			delete(state.ReactionAttempts, ReactionKey(pending.IssueID, ReactionKindBotReview))
+			// A spent counter outlives the drop, as it outlives a budget
+			// escalation, so the next seeded entry cannot reopen the
+			// budget or re-report comments already reported. The
+			// handed-off cache key goes at any counter value because the
+			// stored rows are the record and the next check reloads them.
+			if state.ReactionAttempts[rkey] < params.BotReviewConfig.MaxContinuationTurns {
+				delete(state.ReactionAttempts, rkey)
+				delete(state.ReactionReportedComments, rkey)
+			}
+			delete(state.ReactionHandedOffComments, rkey)
 			entryLog.Warn("bot review watch window elapsed, dropping",
 				slog.Int64("window_ms", int64(ttl/time.Millisecond)),
-				slog.Int64("age_ms", int64(now.Sub(pending.CreatedAt)/time.Millisecond)),
+				slog.Int64("age_ms", int64(now.Sub(watchWindowStart(pending))/time.Millisecond)),
 			)
 			continue
 		}
 
 		// Poll throttle: respect PendingRetryAt.
-		if now.Before(pending.PendingRetryAt) {
+		if reactionWaits(pending, now) {
 			state.PendingReactions[key] = pending
 			continue
 		}
+		retryEscalationSave(ctx, state, params.Store, pending, entryLog)
 
 		// A run in flight makes this pass's fetch redundant, so the
 		// entry waits one tick instead. The backoff counter is
 		// untouched: waiting is not a fetch error.
 		if pending.Triage != nil && !triageRunFinished(pending.Triage) {
 			pending.PendingRetryAt = now
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitTriage)
 			continue
 		}
 
-		// Continuation turn cap check.
-		rkey := ReactionKey(pending.IssueID, ReactionKindBotReview)
-		turnCount := state.ReactionAttempts[rkey]
-		if turnCount >= params.BotReviewConfig.MaxContinuationTurns {
-			escalateBotReviewFailure(state, params, pending, turnCount, EscalationTriggerBudget, botReviewData, entryLog, ctx, metrics)
-			continue
+		if pending.escalationStands() {
+			// The counter is the residual one and outlives the entry.
+			if watchStandingPullRequest(ctx, state, params.Store, params.SCMAdapter, key, pending, false, now, pollInterval, entryLog) {
+				continue
+			}
+		} else {
+			readPullRequestURL(ctx, params.SCMAdapter, pending, entryLog)
 		}
 
 		// Fetch bot review comments from SCM.
@@ -96,7 +108,7 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 			pending.PendingAttempts++
 			delay := max(computeReactionPendingDelay(pending.PendingAttempts), pollInterval)
 			pending.PendingRetryAt = now.Add(delay)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitBackoff)
 			entryLog.Warn("bot review fetch failed, retrying with backoff",
 				slog.Any("error", err),
 				slog.Int("pending_attempts", pending.PendingAttempts),
@@ -106,13 +118,7 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 			continue
 		}
 
-		// Filter outdated comments.
-		var actionable []domain.ReviewComment
-		for _, c := range comments {
-			if !c.Outdated {
-				actionable = append(actionable, c)
-			}
-		}
+		actionable := actionableComments(ReactionKindBotReview, comments, nil)
 
 		// No actionable comments; re-enqueue with poll interval delay.
 		if len(actionable) == 0 {
@@ -121,13 +127,30 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 			// anything. A retained verdict would otherwise be replayed
 			// against the next episode that recomputes the same set.
 			cancelReactionTriage(pending)
+			endEscalation(ctx, params.Store, pending, entryLog)
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			pending.LastCheck = commentReactionCheck(now, 0, 0)
+			requeueReaction(state, key, pending, waitPollInterval)
 			continue
 		}
 
 		// Build fingerprint from sorted actionable comment IDs.
 		fingerprint := buildReviewFingerprint(actionable)
+
+		if pending.escalationStands() {
+			spent := state.ReactionAttempts[rkey] >= params.BotReviewConfig.MaxContinuationTurns
+			switch judgeCommentEscalation(ctx, state, params.Store, pending, actionable, fingerprint, spent, entryLog) {
+			case commentEscalationUnread:
+				pending.PendingRetryAt = now.Add(pollInterval)
+				requeueReaction(state, key, pending, waitBackoff)
+				continue
+			case commentEscalationStands:
+				pending.PendingRetryAt = now.Add(pollInterval)
+				pending.LastCheck = commentReactionCheck(now, len(actionable), 0)
+				requeueReaction(state, key, pending, waitPollInterval)
+				continue
+			}
+		}
 
 		// Dedup check via reaction_fingerprints table.
 		if err := params.Store.UpsertReactionFingerprint(ctx, pending.IssueID, ReactionKindBotReview, fingerprint); err != nil {
@@ -143,16 +166,60 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 		} else if storedFP == fingerprint && dispatched {
 			// Already dispatched for this exact set of comments.
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			pending.LastCheck = commentReactionCheck(now, len(actionable), 0)
+			requeueReaction(state, key, pending, waitPollInterval)
 			entryLog.Debug("bot review comments already dispatched for this fingerprint")
 			continue
 		}
 
+		switch settleHandedOffCommentSet(ctx, state, params.Store, pending.IssueID, ReactionKindBotReview, actionable, entryLog) {
+		case settleLoadFailed:
+			pending.PendingRetryAt = now.Add(pollInterval)
+			requeueReaction(state, key, pending, waitBackoff)
+			continue
+		case settleSettled:
+			pending.PendingRetryAt = now.Add(pollInterval)
+			pending.LastCheck = commentReactionCheck(now, len(actionable), 0)
+			requeueReaction(state, key, pending, waitPollInterval)
+			continue
+		}
+
+		pending.LastCheck = commentReactionCheck(now, len(actionable),
+			newCommentCount(state, pending.IssueID, ReactionKindBotReview, actionable))
+
 		// Arbitrate the retry slot before dispatching.
 		if incumbent := retrySlotIncumbent(state, pending.IssueID); incumbent != nil {
 			logRetrySlotDeferral(entryLog, ReactionKindBotReview, incumbent)
-			pending.CreatedAt = now
-			state.PendingReactions[key] = pending
+			pending.WatchRestartedAt = now
+			requeueReaction(state, key, pending, waitRetrySlot)
+			continue
+		}
+
+		// A summary-only item never escalates, because a bot re-review of
+		// the last turn's push adds one every time and its body cannot be
+		// read for findings.
+		turnCount := state.ReactionAttempts[rkey]
+		if turnCount >= params.BotReviewConfig.MaxContinuationTurns {
+			var inline []domain.ReviewComment
+			for _, c := range actionable {
+				if c.FilePath != "" {
+					inline = append(inline, c)
+				}
+			}
+			escalating := carriesNewComment(state, pending.IssueID, ReactionKindBotReview, inline)
+			recordReportedComments(state, pending.IssueID, actionable)
+			if escalating {
+				escalateBotReviewFailure(state, params, pending, turnCount, EscalationTriggerBudget, botReviewData, fingerprint, now, pollInterval, entryLog, ctx, metrics)
+				continue
+			}
+			pending.PendingRetryAt = now.Add(pollInterval)
+			pending.LastCheck.Comments.New = 0
+			requeueReaction(state, key, pending, waitPollInterval)
+			entryLog.Debug("bot review continuation turns exhausted, no new inline comment, not escalating",
+				slog.Int("turn_count", turnCount),
+				slog.Int("max_continuation_turns", params.BotReviewConfig.MaxContinuationTurns),
+				slog.Int("comment_count", len(actionable)),
+			)
 			continue
 		}
 
@@ -175,12 +242,18 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 		}, entryLog, ctx)
 
 		switch triageVerdict {
-		case triageWait, triageHandled:
+		case triageWait:
 			pending.PendingRetryAt = now.Add(pollInterval)
-			state.PendingReactions[key] = pending
+			requeueReaction(state, key, pending, waitTriage)
+			continue
+		case triageHandled:
+			pending.PendingRetryAt = now.Add(pollInterval)
+			pending.LastCheck.Comments.New = 0
+			requeueReaction(state, key, pending, waitPollInterval)
 			continue
 		case triageEscalate:
-			escalateBotReviewFailure(state, params, pending, turnCount, EscalationTriggerTriage, botReviewData, entryLog, ctx, metrics)
+			recordReportedComments(state, pending.IssueID, actionable)
+			escalateBotReviewFailure(state, params, pending, turnCount, EscalationTriggerTriage, botReviewData, fingerprint, now, pollInterval, entryLog, ctx, metrics)
 			continue
 		}
 
@@ -195,13 +268,19 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 			DelayMS:     continuationDelayMS,
 			LastSSHHost: pending.LastSSHHost,
 			ContinuationContext: map[string]any{
-				"bot_review_comments": botContext,
+				botReviewCommentsKey: botContext,
 			},
-			ReactionKind: ReactionKindBotReview,
-			AgentKind:    pending.AgentKind,
-			RuleName:     pending.RuleName,
-			TemplateID:   pending.TemplateID,
-			Logger:       entryLog,
+			ReactionKind:        ReactionKindBotReview,
+			Continuation:        continuationTargetOf(pending, turnCount+1),
+			AgentKind:           pending.AgentKind,
+			ConfiguredModel:     pending.ConfiguredModel,
+			RuleName:            pending.RuleName,
+			StageLineage:        pending.StageLineage,
+			RuleSettingsApplied: pending.RuleSettingsApplied,
+			TemplateID:          pending.TemplateID,
+			Logger:              entryLog,
+
+			IssueIdentity: pending.IssueIdentity,
 		}, params.OnRetryFire)
 
 		state.ReactionAttempts[rkey]++
@@ -215,13 +294,45 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 }
 
 // escalateBotReviewFailure handles the case where bot review continuation
-// turns are exhausted. It applies the configured escalation action, then
-// removes only the bot-review-kind pending entry and clears the
-// bot-review fingerprint. MUST NOT touch state.Claimed, the retry timer,
-// the persisted retry row, the residual ReactionAttempts counter, or any
+// turns are exhausted or the triage command asked for a person. It begins
+// the escalation on the comment set fingerprint, applies the configured
+// escalation action unless the set was escalated before, and clears the
+// bot-review fingerprint. The entry and the residual counter stay, and the
+// entry re-enqueues at the poll interval, until the escalation ends. MUST
+// NOT touch state.Claimed, the retry timer, the persisted retry row, or any
 // other reaction kind's entries; those are owned by whichever kind holds
 // the claim and are released at terminal-state cleanup.
 func escalateBotReviewFailure(
+	state *State,
+	params ReconcileParams,
+	pending *PendingReaction,
+	turnCount int,
+	trigger ReactionEscalationTrigger,
+	botReviewData *BotReviewReactionData,
+	fingerprint string,
+	now time.Time,
+	pollInterval time.Duration,
+	log *slog.Logger,
+	ctx context.Context,
+	metrics domain.Metrics,
+) {
+	if beginEscalation(ctx, state, params.Store, pending, trigger, fingerprint, now, log) {
+		applyBotReviewEscalation(state, params, pending, turnCount, trigger, botReviewData, log, ctx, metrics)
+	}
+
+	if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindBotReview); err != nil {
+		log.Warn("bot review fingerprint delete failed during escalation",
+			slog.Any("error", err),
+		)
+	}
+
+	pending.PendingRetryAt = now.Add(pollInterval)
+	requeueReaction(state, ReactionKey(pending.IssueID, ReactionKindBotReview), pending, waitPollInterval)
+}
+
+// applyBotReviewEscalation applies the configured escalation action of the
+// bot-review reaction: the event, and the label when so configured.
+func applyBotReviewEscalation(
 	state *State,
 	params ReconcileParams,
 	pending *PendingReaction,
@@ -246,8 +357,13 @@ func escalateBotReviewFailure(
 		)
 	}
 
-	switch params.BotReviewConfig.Escalation {
-	case "label":
+	commentText := buildBotReviewEscalationComment(botReviewData, turnCount)
+	if trigger == EscalationTriggerTriage {
+		commentText = buildTriageEscalationComment("bot-review", fmt.Sprintf("PR #%d", botReviewData.PRNumber))
+	}
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationBotReview, pending, commentText))
+
+	if params.BotReviewConfig.Escalation == "label" {
 		label := params.BotReviewConfig.EscalationLabel
 		if label == "" {
 			label = "needs-human"
@@ -273,42 +389,16 @@ func escalateBotReviewFailure(
 				}
 			})
 		}
-
-	case "comment", "":
-		commentText := buildBotReviewEscalationComment(botReviewData, turnCount)
-		if trigger == EscalationTriggerTriage {
-			commentText = buildTriageEscalationComment("bot-review", fmt.Sprintf("PR #%d", botReviewData.PRNumber))
-		}
-		if params.TrackerAdapter != nil {
-			issueID := pending.IssueID
-			tracker := params.TrackerAdapter
-			m := metrics
-			escalLog := log
-			ct := commentText
-
-			state.TrackerOpsWg.Go(func() {
-				dctx, cancel := context.WithTimeout(
-					context.WithoutCancel(ctx), 30*time.Second)
-				defer cancel()
-
-				if err := tracker.CommentIssue(dctx, issueID, ct); err != nil {
-					escalLog.Warn("bot review escalation comment failed",
-						slog.Any("error", err),
-					)
-					m.IncBotReviewEscalations("error")
-				} else {
-					m.IncBotReviewEscalations("comment")
-				}
-			})
-		}
 	}
 
-	delete(state.PendingReactions, ReactionKey(pending.IssueID, ReactionKindBotReview))
-	if err := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindBotReview); err != nil {
-		log.Warn("bot review fingerprint delete failed during escalation",
-			slog.Any("error", err),
-		)
+	// A label owns the escalation counter, so only the other modes record it.
+	var record func(action string)
+	if params.BotReviewConfig.Escalation != "label" {
+		record = metrics.IncBotReviewEscalations
 	}
+	publishEscalation(ctx, &state.TrackerOpsWg, delivery, log, record, func(err error) {
+		log.Warn("bot review escalation comment failed", slog.Any("error", err))
+	})
 }
 
 // buildBotReviewEscalationComment returns the escalation comment used when

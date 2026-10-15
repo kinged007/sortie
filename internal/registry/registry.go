@@ -25,12 +25,9 @@ type TrackerConstructor func(config map[string]any) (domain.TrackerAdapter, erro
 // the orchestrator resolves adapters via [Registry.Get] at runtime.
 var Trackers = NewRegistry[TrackerConstructor, TrackerMeta]("tracker")
 
-// AgentConstructor creates a [domain.AgentAdapter] from opaque
-// adapter-specific configuration. The config parameter is the raw map
-// from the adapter's pass-through config sub-object. Implementations
-// must validate their config and return an error if required fields
-// are missing.
-type AgentConstructor func(config map[string]any) (domain.AgentAdapter, error)
+// AgentConstructor creates a [domain.AgentAdapter] that holds no
+// settings: each session reads [domain.StartSessionParams.Settings].
+type AgentConstructor func() (domain.AgentAdapter, error)
 
 // Agents is the default agent adapter registry. Adapter packages
 // register themselves via [Registry.Register] in their init functions;
@@ -39,8 +36,8 @@ var Agents = NewRegistry[AgentConstructor, AgentMeta]("agent")
 
 // CIProviderConstructor creates a [domain.CIStatusProvider] from
 // a maximum log-line count and opaque adapter-specific configuration.
-// The maxLogLines parameter controls how many tail lines of CI log
-// output to include for failing checks (0 disables log fetching).
+// The maxLogLines parameter controls how many log lines of the excerpt
+// to include for failing checks (0 disables log fetching).
 // The adapterConfig parameter is the raw map from the adapter's
 // pass-through config sub-object. Implementations must validate
 // adapterConfig and return an error if required fields are missing.
@@ -73,8 +70,10 @@ type NotifierConstructor func(config map[string]any) (domain.Notifier, error)
 
 // Notifiers is the default notifier adapter registry. Backend packages
 // register themselves via [Registry.Register] in their init functions;
-// the sidecar resolves backends via [Registry.Get] at runtime.
-var Notifiers = NewRegistry[NotifierConstructor, struct{}]("notifier")
+// the sidecar and the program's notification router resolve backends via
+// [Registry.Get] at runtime. It reserves [domain.TrackerCommentKind],
+// which names a built-in destination rather than a backend.
+var Notifiers = NewRegistry[NotifierConstructor, struct{}]("notifier", domain.TrackerCommentKind)
 
 // TrackerConfigFields holds the config values passed to adapter
 // validation functions. This is a plain data struct that avoids
@@ -127,20 +126,9 @@ type TrackerMeta struct {
 	// Nil means no adapter-specific validation.
 	ValidateTrackerConfig func(fields TrackerConfigFields) []ValidationDiag
 
-	// DefaultActiveStates is the active-state list the tracker adapter
-	// applies when tracker.active_states is absent or empty. An empty or
-	// nil value means the adapter applies no default. The slice may alias
-	// the registering adapter's own package-level variable, so callers
-	// must treat it as read-only and copy before sorting or filtering.
-	DefaultActiveStates []string
-
-	// DefaultTerminalStates is the terminal-state list the tracker
-	// adapter applies when tracker.terminal_states is absent or empty. An
-	// empty or nil value means the adapter applies no default. The slice
-	// may alias the registering adapter's own package-level variable, so
-	// callers must treat it as read-only and copy before sorting or
-	// filtering.
-	DefaultTerminalStates []string
+	// RequiresTerminalStates indicates the tracker adapter requires a
+	// non-empty tracker.terminal_states.
+	RequiresTerminalStates bool
 
 	// BlockerSource declares where this adapter's blocker data comes
 	// from. The empty value is read as BlockersFromCandidates.
@@ -177,16 +165,19 @@ type AgentDeprecation struct {
 // by the orchestrator at preflight time. Zero value means no special
 // requirements.
 type AgentMeta struct {
-	// Deprecation is nil when the kind is not deprecated, which holds
-	// for every registered kind but one. Non-nil declares the kind
-	// deprecated in favor of Deprecation.Replacement: the kind stays
-	// registered, and it constructs and runs unchanged. Read-only after
-	// registration.
+	// Deprecation is nil when the kind is not deprecated. Non-nil
+	// declares the kind deprecated in favor of Deprecation.Replacement:
+	// the kind stays registered, and it constructs and runs unchanged.
+	// Read-only after registration.
 	Deprecation *AgentDeprecation
 
-	// RequiresCommand indicates the agent adapter requires a
-	// non-empty agent.command config value.
+	// RequiresCommand indicates the kind launches a command.
 	RequiresCommand bool
+
+	// DefaultCommand is the command the kind launches when its own
+	// command is zero: the value its StartSession hands to the shared
+	// launch resolution. Empty for a kind that has none.
+	DefaultCommand string
 
 	// ValidateAgentConfig is an optional function the preflight
 	// pipeline calls to run agent-specific config validation. Nil
@@ -233,6 +224,10 @@ type AgentMeta struct {
 	// kind's runtime reads as the credential for its default
 	// provider. The zero value means undeclared.
 	CredentialEnv CredentialEnv
+
+	// EffortForwarding declares what this adapter does with the effort
+	// key of its own settings block. The empty value means undeclared.
+	EffortForwarding EffortForwarding
 }
 
 // CredentialEnv declares the environment variable names an agent
@@ -449,6 +444,7 @@ type AgentConfigFields struct {
 // implementation.
 type Registry[T any, M any] struct {
 	name     string
+	reserved []string
 	mu       sync.RWMutex
 	adapters map[string]T
 	meta     map[string]M
@@ -456,17 +452,19 @@ type Registry[T any, M any] struct {
 
 // NewRegistry creates an empty [Registry] with the given dimension
 // name. The name appears in error messages produced by [Registry.Get]
-// (e.g. "tracker", "agent").
-func NewRegistry[T any, M any](name string) *Registry[T, M] {
+// (e.g. "tracker", "agent"). Each reserved kind is refused by
+// [Registry.Register] and [Registry.RegisterWithMeta].
+func NewRegistry[T any, M any](name string, reserved ...string) *Registry[T, M] {
 	return &Registry[T, M]{
 		name:     name,
+		reserved: slices.Clone(reserved),
 		adapters: make(map[string]T),
 		meta:     make(map[string]M),
 	}
 }
 
 // Register associates a kind string with a constructor function.
-// Panics if kind is empty or already registered. Registration is
+// Panics if kind is empty, reserved, or already registered. Registration is
 // expected during init(); duplicate registration is a programming
 // error. The zero value of M is stored as metadata so that [Meta]
 // returns (zero, true) for kinds registered without explicit metadata.
@@ -476,6 +474,9 @@ func (r *Registry[T, M]) Register(kind string, constructor T) {
 
 	if kind == "" {
 		panic("registry: kind must not be empty")
+	}
+	if slices.Contains(r.reserved, kind) {
+		panic(fmt.Sprintf("registry: kind %q is reserved", kind))
 	}
 	if _, exists := r.adapters[kind]; exists {
 		panic(fmt.Sprintf("registry: duplicate registration for kind %q", kind))
@@ -493,6 +494,9 @@ func (r *Registry[T, M]) RegisterWithMeta(kind string, constructor T, meta M) {
 
 	if kind == "" {
 		panic("registry: kind must not be empty")
+	}
+	if slices.Contains(r.reserved, kind) {
+		panic(fmt.Sprintf("registry: kind %q is reserved", kind))
 	}
 	if _, exists := r.adapters[kind]; exists {
 		panic(fmt.Sprintf("registry: duplicate registration for kind %q", kind))

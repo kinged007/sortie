@@ -16,6 +16,8 @@ func (m *mockTrackerAdapter) FetchCandidateIssues(_ context.Context) ([]Issue, e
 	return nil, nil
 }
 
+func (m *mockTrackerAdapter) SetTrackerStates(func() TrackerStates) {}
+
 func (m *mockTrackerAdapter) FetchIssueByID(_ context.Context, _ string) (Issue, error) {
 	return Issue{}, nil
 }
@@ -43,10 +45,15 @@ func (m *mockTrackerAdapter) TransitionIssue(_ context.Context, _ string, _ stri
 func (m *mockTrackerAdapter) CommentIssue(_ context.Context, _ string, _ string) error {
 	return nil
 }
+func (m *mockTrackerAdapter) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
+	return nil
+}
 
 func (m *mockTrackerAdapter) AddLabel(_ context.Context, _ string, _ string) error {
 	return nil
 }
+
+func (m *mockTrackerAdapter) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 
 func TestTrackerErrorKind_Values(t *testing.T) {
 	t.Parallel()

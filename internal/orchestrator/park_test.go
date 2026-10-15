@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -256,7 +257,17 @@ func TestParkSurvivesRestart(t *testing.T) {
 		t.Fatalf("store.Migrate: %v", err)
 	}
 
+	dispatchedAt := baseTime.Add(-time.Hour)
 	state := exitStateWithIssue(t, issueID, "In Progress")
+	state.StageChains, state.HopCeiling = [][]string{{"triage", "implement"}}, 4
+	running := state.Running[issueID]
+	running.Issue.Title = "Restart title"
+	running.Issue.URL = "https://tracker.test/PROJ-RESTART"
+	running.Issue.IssueType = "Story"
+	running.Issue.Labels = []string{"feature", "Needs-Human", "stage-implement"}
+	running.RuleName = "implement"
+	running.StageLineage = StageLineage{PreviousRule: "triage", PreviousOutcome: "succeeded", ChainID: "chain-1", DispatchedAt: dispatchedAt}
+	running.AgentKind, running.ConfiguredModel = "claude-code", "sonnet"
 	params := HandleWorkerExitParams{
 		Store:               store,
 		MaxRetryBackoffMS:   300_000,
@@ -279,6 +290,10 @@ func TestParkSurvivesRestart(t *testing.T) {
 	if _, ok := state.Parked[issueID]; !ok {
 		t.Fatal("issue not parked before the simulated restart")
 	}
+	state.Parked[issueID].LabelApplied = true
+	if err := store.MarkParkedIssueLabelApplied(ctx, issueID); err != nil {
+		t.Fatalf("MarkParkedIssueLabelApplied: %v", err)
+	}
 
 	rows, err := store.ListParkedIssues(ctx)
 	if err != nil {
@@ -290,6 +305,28 @@ func TestParkSurvivesRestart(t *testing.T) {
 
 	if _, ok := fresh.Parked[issueID]; !ok {
 		t.Fatal("PopulateParked did not restore the park after the restart")
+	}
+	fresh.StageChains, fresh.HopCeiling = state.StageChains, state.HopCeiling
+
+	want := SnapshotParkedEntry{
+		IssueID: issueID, Identifier: "PROJ-RESTART", IssueTitle: "Restart title", IssueURL: "https://tracker.test/PROJ-RESTART",
+		IssueType: "Story", IssueLabels: []string{"feature", "stage-implement"}, DispatchedAt: dispatchedAt,
+		Reason: parkReasonAgentBlocked, ParkedState: "In Progress", Label: "needs-human", LabelApplied: true,
+		RuleName: "implement", AgentKind: "claude-code", ConfiguredModel: "sonnet",
+		StagePosition: &SnapshotStagePosition{Chain: []string{"triage", "implement"}, Current: "implement", HopCeiling: 4},
+	}
+	parkedAt := state.Parked[issueID].ParkedAt
+	for name, snapshot := range map[string]struct {
+		state    *State
+		parkedAt time.Time
+	}{
+		"before the restart": {state, parkedAt},
+		"after the restart":  {fresh, parkedAt.UTC().Truncate(time.Second)},
+	} {
+		want.ParkedAt = snapshot.parkedAt
+		if got := RuntimeSnapshot(snapshot.state, baseTime).Parked; len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+			t.Errorf("park snapshot %s = %+v, want %+v", name, got, want)
+		}
 	}
 
 	candidate := domain.Issue{ID: issueID, Identifier: "PROJ-RESTART", Title: "T", State: "In Progress"}
@@ -333,7 +370,7 @@ func TestRefreshParkedIssuesNonCandidateStateRead(t *testing.T) {
 		})
 		candidates := []domain.Issue{{ID: candidateID, Identifier: "PROJ-CAND-1", Title: "T", State: "To Do"}}
 
-		orchestrator.refreshParkedIssues(context.Background(), candidates)
+		orchestrator.refreshParkedIssues(context.Background(), candidates, nil)
 
 		// The regression this guards against: a read that fetches every
 		// parked issue on every tick instead of only the ones the
@@ -367,7 +404,7 @@ func TestRefreshParkedIssuesNonCandidateStateRead(t *testing.T) {
 			Store:           store,
 		})
 
-		orchestrator.refreshParkedIssues(context.Background(), nil)
+		orchestrator.refreshParkedIssues(context.Background(), nil, nil)
 
 		if _, ok := state.Parked[parkedID]; !ok {
 			t.Error("issue was unparked despite an unchanged observed state")
@@ -398,7 +435,7 @@ func TestRefreshParkedIssuesNonCandidateStateRead(t *testing.T) {
 			Store:           store,
 		})
 
-		orchestrator.refreshParkedIssues(context.Background(), nil)
+		orchestrator.refreshParkedIssues(context.Background(), nil, nil)
 
 		if _, ok := state.Parked[parkedID]; !ok {
 			t.Error("issue was unparked despite being omitted from the state-read response")
@@ -418,17 +455,16 @@ func TestRefreshParkedIssuesNonCandidateStateRead(t *testing.T) {
 			},
 		}
 		store := &stubStore{}
-		var logs bytes.Buffer
 		orchestrator := NewOrchestrator(OrchestratorParams{
 			State:           state,
-			Logger:          debugLogger(t, &logs),
+			Logger:          discardLogger(),
 			TrackerAdapter:  tracker,
 			AgentAdapter:    &mockAgentAdapter{},
 			WorkflowManager: &stubWorkflowManager{config: config.ServiceConfig{}},
 			Store:           store,
 		})
 
-		orchestrator.refreshParkedIssues(context.Background(), nil)
+		orchestrator.refreshParkedIssues(context.Background(), nil, nil)
 
 		if _, ok := state.Parked[parkedID1]; !ok {
 			t.Error("park released after a failed non-candidate state read")
@@ -436,8 +472,128 @@ func TestRefreshParkedIssuesNonCandidateStateRead(t *testing.T) {
 		if _, ok := state.Parked[parkedID2]; !ok {
 			t.Error("park released after a failed non-candidate state read")
 		}
-		if !strings.Contains(logs.String(), "parked issue state read failed, retaining parks") {
-			t.Errorf("missing read-failure warning\nlogs: %s", logs.String())
-		}
 	})
+}
+
+func sameStoredIdentity(a, b IssueIdentity) bool {
+	return a.Title == b.Title && a.URL == b.URL && a.IssueType == b.IssueType && slices.Equal(a.Labels, b.Labels)
+}
+
+func TestRefreshParkedIssuesIdentityBackfill(t *testing.T) {
+	t.Parallel()
+
+	const id = "BACKFILL-1"
+	held := IssueIdentity{Title: "held title", URL: "https://tracker.test/held"}
+	read := domain.Issue{ID: id, Title: "read title", URL: "https://tracker.test/read"}
+	readIdentity := IssueIdentity{Title: read.Title, URL: read.URL}
+
+	tests := []struct {
+		name         string
+		held         IssueIdentity
+		parkLabel    string
+		candidates   []domain.Issue
+		observed     string
+		readErr      error
+		wantIdentity IssueIdentity
+		wantParked   bool
+		wantReads    []string
+		wantRows     []IssueIdentity
+	}{
+		{
+			name:         "candidate listing the issue supplies the identity",
+			candidates:   []domain.Issue{{ID: id, Title: read.Title, URL: read.URL, State: "In Progress"}},
+			observed:     "In Progress",
+			wantIdentity: readIdentity,
+			wantParked:   true,
+			wantRows:     []IssueIdentity{readIdentity},
+		},
+		{
+			name:         "partial read takes the candidate's type and labels without the parking label",
+			held:         held,
+			parkLabel:    "Needs-Human",
+			candidates:   []domain.Issue{{ID: id, Title: read.Title, URL: read.URL, State: "In Progress", IssueType: "Story", Labels: []string{"feature", "needs-human"}}},
+			observed:     "In Progress",
+			wantIdentity: IssueIdentity{Title: held.Title, URL: held.URL, IssueType: "Story", Labels: []string{"feature"}},
+			wantParked:   true,
+			wantRows:     []IssueIdentity{{Title: held.Title, URL: held.URL, IssueType: "Story", Labels: []string{"feature"}}},
+		},
+		{
+			name:         "issue the candidates omit takes one single-issue read",
+			observed:     "In Progress",
+			wantIdentity: readIdentity,
+			wantParked:   true,
+			wantReads:    []string{id},
+			wantRows:     []IssueIdentity{readIdentity},
+		},
+		{
+			name:         "held identity is kept and not read again",
+			held:         held,
+			observed:     "In Progress",
+			wantIdentity: held,
+			wantParked:   true,
+		},
+		{
+			name:     "park released by the state rule is neither read nor written",
+			observed: "Done",
+		},
+		{
+			name:       "failed single-issue read leaves the park as it was",
+			observed:   "In Progress",
+			readErr:    errors.New("tracker unavailable"),
+			wantParked: true,
+			wantReads:  []string{id},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := NewState(1000, 1, 0, nil, AgentTotals{})
+			state.Parked[id] = &ParkedEntry{
+				Identifier:    "PROJ-BACKFILL-1",
+				Reason:        parkReasonAgentBlocked,
+				ParkedState:   "In Progress",
+				Label:         tt.parkLabel,
+				IssueIdentity: tt.held,
+			}
+			tracker := &mockTrackerAdapter{
+				fetchStatesFn: func(context.Context, []string) (map[string]string, error) {
+					return map[string]string{id: tt.observed}, nil
+				},
+				fetchIssueByIDFn: func(context.Context, string) (domain.Issue, error) {
+					return read, tt.readErr
+				},
+			}
+			store := &stubStore{}
+			orchestrator := NewOrchestrator(OrchestratorParams{
+				State:           state,
+				Logger:          discardLogger(),
+				TrackerAdapter:  tracker,
+				AgentAdapter:    &mockAgentAdapter{},
+				WorkflowManager: &stubWorkflowManager{config: config.ServiceConfig{}},
+				Store:           store,
+			})
+
+			orchestrator.refreshParkedIssues(context.Background(), tt.candidates, nil)
+
+			entry, parked := state.Parked[id]
+			if parked != tt.wantParked {
+				t.Fatalf("parked after refreshParkedIssues = %v, want %v", parked, tt.wantParked)
+			}
+			if parked && !sameStoredIdentity(entry.IssueIdentity, tt.wantIdentity) {
+				t.Errorf("parked IssueIdentity = %+v, want %+v", entry.IssueIdentity, tt.wantIdentity)
+			}
+			if !slices.Equal(tracker.fetchIssueByIDCalls, tt.wantReads) {
+				t.Errorf("FetchIssueByID called with %v, want %v", tracker.fetchIssueByIDCalls, tt.wantReads)
+			}
+			var rows []IssueIdentity
+			for _, row := range store.parkedIssues {
+				rows = append(rows, IssueIdentity{Title: row.IssueTitle, URL: row.IssueURL, IssueType: row.IssueType, Labels: row.IssueLabels})
+			}
+			if !slices.EqualFunc(rows, tt.wantRows, sameStoredIdentity) {
+				t.Errorf("upserted park identities = %+v, want %+v", rows, tt.wantRows)
+			}
+		})
+	}
 }

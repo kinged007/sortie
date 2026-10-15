@@ -1,12 +1,18 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 )
@@ -263,5 +269,138 @@ func TestIntegration_VerifyAutoMergeScopes(t *testing.T) {
 		if len(missing) != 0 {
 			t.Errorf("missing = %v; want nil when scopes are unverifiable", missing)
 		}
+	}
+}
+
+const integrationStatement = "/close\n@sortie-literal-probe please look\n[~jdoe] see https://example.com/probe?x=1\n" +
+	"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat}\ntoken=[redacted]"
+
+func renderedGitHubComment(t *testing.T, ctx context.Context, issueID, since, marker string) string {
+	t.Helper()
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/issues/%s/comments?since=%s&per_page=100",
+		os.Getenv("SORTIE_GITHUB_PROJECT"), issueID, since)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("SORTIE_GITHUB_TOKEN"))
+	req.Header.Set("Accept", "application/vnd.github.full+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	var comments []struct {
+		Body     string `json:"body"`
+		BodyHTML string `json:"body_html"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+		t.Fatalf("decode comments: %v", err)
+	}
+	for _, comment := range comments {
+		if strings.Contains(comment.Body, marker) {
+			return comment.BodyHTML
+		}
+	}
+	t.Fatalf("no comment containing %q among %d comments since %s", marker, len(comments), since)
+	return ""
+}
+
+func TestIntegration_CommentIssueWithLiteral_RendersInert(t *testing.T) {
+	skipUnlessGitHubIntegration(t)
+
+	issueID := os.Getenv("SORTIE_GITHUB_ISSUE_ID")
+	if issueID == "" {
+		t.Skip("skipping: SORTIE_GITHUB_ISSUE_ID not set; set to a valid issue number")
+	}
+	a := integrationAdapter(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	since := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	marker := "sortie literal round trip " + time.Now().UTC().Format(time.RFC3339Nano)
+	if err := a.CommentIssueWithLiteral(ctx, issueID, marker, integrationStatement); err != nil {
+		t.Fatalf("CommentIssueWithLiteral(%s): %v", issueID, err)
+	}
+
+	rendered := renderedGitHubComment(t, ctx, issueID, since, marker)
+
+	if got := strings.Count(rendered, "<pre"); got != 1 {
+		t.Errorf("body_html holds %d <pre> blocks, want 1:\n%s", got, rendered)
+	}
+	if strings.Contains(rendered, "<a ") {
+		t.Errorf("body_html holds a link or mention, want the statement inert:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "@sortie-literal-probe") {
+		t.Errorf("body_html does not show the statement:\n%s", rendered)
+	}
+}
+
+func ensureProbeLabel(t *testing.T, ctx context.Context, a *GitHubAdapter, name string) {
+	t.Helper()
+
+	labelPath := "/repos/" + a.owner + "/" + a.repo + "/labels/" + url.PathEscape(name)
+	_, _, err := a.client.Get(ctx, labelPath, nil)
+	if err == nil {
+		return
+	}
+	if !domain.IsNotFound(err) {
+		t.Fatalf("GET %s: %v", labelPath, err)
+	}
+
+	payload, err := json.Marshal(map[string]string{"name": name, "color": "ededed"})
+	if err != nil {
+		t.Fatalf("marshal label payload: %v", err)
+	}
+	if _, err := a.client.Send(ctx, "POST", "/repos/"+a.owner+"/"+a.repo+"/labels", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("create probe label %q: %v", name, err)
+	}
+}
+
+func TestIntegration_LabelRoundTrip(t *testing.T) {
+	skipUnlessGitHubIntegration(t)
+
+	issueID := os.Getenv("SORTIE_GITHUB_ISSUE_ID")
+	if issueID == "" {
+		t.Skip("skipping: SORTIE_GITHUB_ISSUE_ID not set; set to a valid issue number")
+	}
+
+	a := integrationAdapter(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const probe = "sortie-label-probe"
+	ensureProbeLabel(t, ctx, a, probe)
+
+	if err := a.AddLabel(ctx, issueID, probe); err != nil {
+		t.Fatalf("AddLabel(%s, %q): %v", issueID, probe, err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := a.RemoveLabel(cleanupCtx, issueID, probe); err != nil {
+			t.Errorf("cleanup RemoveLabel(%s, %q): %v", issueID, probe, err)
+		}
+	})
+
+	fetched, err := a.FetchIssueByID(ctx, issueID)
+	if err != nil {
+		t.Fatalf("FetchIssueByID(%s): %v", issueID, err)
+	}
+	if !slices.Contains(fetched.Labels, probe) {
+		t.Fatalf("FetchIssueByID(%s) labels = %v, want %q after AddLabel", issueID, fetched.Labels, probe)
+	}
+
+	if err := a.RemoveLabel(ctx, issueID, probe); err != nil {
+		t.Fatalf("RemoveLabel(%s, %q): %v", issueID, probe, err)
+	}
+	fetched, err = a.FetchIssueByID(ctx, issueID)
+	if err != nil {
+		t.Fatalf("FetchIssueByID(%s) after removal: %v", issueID, err)
+	}
+	if slices.Contains(fetched.Labels, probe) {
+		t.Errorf("FetchIssueByID(%s) labels = %v, want %q gone immediately after RemoveLabel", issueID, fetched.Labels, probe)
 	}
 }

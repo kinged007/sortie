@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
@@ -17,8 +18,6 @@ type tokenStoreResponse struct {
 	err   error
 }
 
-// fakeTokenStore replays responses in order; the last response repeats
-// once the script is exhausted.
 type fakeTokenStore struct {
 	responses []tokenStoreResponse
 	calls     []string
@@ -36,8 +35,6 @@ func (f *fakeTokenStore) TokenUsageByIssue(_ context.Context, issueID string) (p
 	return f.responses[idx].usage, f.responses[idx].err
 }
 
-// failingIssueTokenStore fails the test if read, so a "no store read"
-// assertion cannot pass by accident.
 type failingIssueTokenStore struct {
 	t *testing.T
 }
@@ -107,22 +104,60 @@ func TestFreezeIssueTokenBaseline(t *testing.T) {
 		}
 	})
 
-	t.Run("MaxTokens zero performs no store read and emits no record", func(t *testing.T) {
+	t.Run("MaxTokens zero keeps the read on the entry and emits no record", func(t *testing.T) {
 		t.Parallel()
 
-		_, logger := textLogger()
-		state := NewState(5000, 4, 0, nil, AgentTotals{})
-		state.Running["ISS-3"] = &RunningEntry{
-			Identifier:   "ISS-3-ident",
-			AgentKind:    "mock",
-			UsageArrival: registry.UsageArrivalNone,
+		tests := []struct {
+			name      string
+			arrival   registry.UsageArrival
+			response  tokenStoreResponse
+			wantUsage bool
+		}{
+			{
+				name:      "successful read",
+				arrival:   registry.UsageArrivalNone,
+				response:  tokenStoreResponse{usage: persistence.IssueTokenUsage{TotalTokens: 420, Sessions: 3}},
+				wantUsage: true,
+			},
+			{
+				name:     "failed read",
+				arrival:  registry.UsageArrivalIncremental,
+				response: tokenStoreResponse{err: errors.New("db unavailable")},
+			},
 		}
-		store := &failingIssueTokenStore{t: t}
 
-		freezeIssueTokenBaseline(context.Background(), state, "ISS-3", store, logger)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
 
-		if got := state.Running["ISS-3"].IssueTokensCompleted; got != 0 {
-			t.Errorf("entry.IssueTokensCompleted = %d, want 0 (untouched when MaxTokens is 0)", got)
+				lb, logger := textLogger()
+				state := NewState(5000, 4, 0, nil, AgentTotals{})
+				state.Running["ISS-3"] = &RunningEntry{
+					Identifier:   "ISS-3-ident",
+					AgentKind:    "mock",
+					UsageArrival: tt.arrival,
+				}
+				store := &fakeTokenStore{responses: []tokenStoreResponse{tt.response}}
+
+				freezeIssueTokenBaseline(context.Background(), state, "ISS-3", store, logger)
+
+				entry := state.Running["ISS-3"]
+				if lb.String() != "" {
+					t.Errorf("freezeIssueTokenBaseline log = %q, want no record without a ceiling", lb.String())
+				}
+				if !tt.wantUsage {
+					if entry.IssueUsage != nil {
+						t.Errorf("entry.IssueUsage = %+v, want nil after a failed read", entry.IssueUsage)
+					}
+					return
+				}
+				if entry.IssueUsage == nil || entry.IssueUsage.TotalTokens != 420 || entry.IssueUsage.Sessions != 3 {
+					t.Errorf("entry.IssueUsage = %+v, want the read (TotalTokens 420, Sessions 3)", entry.IssueUsage)
+				}
+				if entry.IssueTokensCompleted != 420 {
+					t.Errorf("entry.IssueTokensCompleted = %d, want 420", entry.IssueTokensCompleted)
+				}
+			})
 		}
 	})
 
@@ -419,7 +454,7 @@ func TestEnforceInFlightTokenCeiling(t *testing.T) {
 		}
 		// Pre-filter (stale 900 + 150 = 1050) crosses the ceiling, but
 		// the confirming read's true 800 + 150 = 950 stays under it.
-		store := &fakeTokenStore{responses: []tokenStoreResponse{{usage: persistence.IssueTokenUsage{TotalTokens: 800}}}}
+		store := &fakeTokenStore{responses: []tokenStoreResponse{{usage: persistence.IssueTokenUsage{TotalTokens: 800, Sessions: 2}}}}
 
 		driveEvent(state, "ISS-BELOW", domain.TokenUsage{TotalTokens: 150}, store, spy, logger)
 
@@ -429,6 +464,9 @@ func TestEnforceInFlightTokenCeiling(t *testing.T) {
 		}
 		if entry.IssueTokensCompleted != 800 {
 			t.Errorf("entry.IssueTokensCompleted = %d, want 800 (replaced by the confirming read)", entry.IssueTokensCompleted)
+		}
+		if entry.IssueUsage == nil || entry.IssueUsage.TotalTokens != 800 || entry.IssueUsage.Sessions != 2 {
+			t.Errorf("entry.IssueUsage = %+v, want the confirming read (TotalTokens 800, Sessions 2)", entry.IssueUsage)
 		}
 		if cancelCalls != 0 {
 			t.Errorf("entry.TokenCeilingCancelFunc called %d times, want 0", cancelCalls)
@@ -511,11 +549,38 @@ func TestEnforceInFlightTokenCeiling(t *testing.T) {
 		if request == nil {
 			t.Fatal("setup failed: run did not record a stop request")
 		}
-		// UsedTokens = confirming read 20 + AgentTotalTokens 80 = 100.
 		if request.UsedTokens != 100 {
 			t.Errorf("request.UsedTokens = %d, want 100 (confirming sum 20 + AgentTotalTokens 80)", request.UsedTokens)
 		}
 	})
+}
+
+func TestRuntimeSnapshot_IssueUsageByKind(t *testing.T) {
+	t.Parallel()
+
+	state := NewState(5000, 4, 1000, nil, AgentTotals{})
+	state.Running["ISS-KIND"] = &RunningEntry{
+		Identifier: "ISS-KIND-ident",
+		Issue:      domain.Issue{ID: "ISS-KIND"},
+		StartedAt:  time.Now().UTC(),
+		IssueUsage: &persistence.IssueTokenUsage{
+			Sessions:    3,
+			TotalTokens: 420,
+			ByKind: map[string]persistence.KindTokenUsage{
+				"claude-code": {FreshInputTokens: 100, CacheReadTokens: 300, CacheWriteTokens: 7, OutputTokens: 20},
+			},
+		},
+	}
+
+	snap := RuntimeSnapshot(state, time.Now())
+
+	if len(snap.Running) != 1 || snap.Running[0].IssueUsage == nil {
+		t.Fatalf("RuntimeSnapshot().Running = %+v, want one row carrying IssueUsage", snap.Running)
+	}
+	want := domain.TokenUsage{InputTokens: 407, OutputTokens: 20, CacheReadTokens: 300, CacheWriteTokens: 7}
+	if got := snap.Running[0].IssueUsage.ByKind["claude-code"]; got != want {
+		t.Errorf("IssueUsage.ByKind[claude-code] = %+v, want %+v (input spans fresh and both cache classes, total left zero)", got, want)
+	}
 }
 
 func lineWith(t *testing.T, rendered, msg string) string {

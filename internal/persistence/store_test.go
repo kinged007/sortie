@@ -1,10 +1,13 @@
 package persistence
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -104,43 +107,48 @@ func TestOpen_BasicCRUD(t *testing.T) {
 func TestSaveAndLoadRetryEntry(t *testing.T) {
 	t.Parallel()
 
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	entry := RetryEntry{
-		IssueID:    "ISS-1",
-		Identifier: "PROJ-1",
-		Attempt:    1,
-		DueAtMs:    1000,
-		Error:      nil,
+	sessionID := "sess-abc"
+	base := RetryEntry{
+		IssueID: "ISS-1", Identifier: "PROJ-1", Attempt: 1, DueAtMs: 1000,
+		ConfiguredModel: "provider/cheap", IssueType: "Bug", IssueState: "In Progress", DispatchedAt: "2026-03-19T10:00:00Z",
 	}
-	if err := s.SaveRetryEntry(ctx, entry); err != nil {
-		t.Fatalf("SaveRetryEntry: %v", err)
+	withLabels := func(labels []string) RetryEntry { e := base; e.IssueLabels = labels; return e }
+	withSession := base
+	withSession.SessionID = &sessionID
+	stale := RetryEntry{
+		IssueID: "ISS-1", Identifier: "stale", ConfiguredModel: "stale", IssueType: "stale",
+		IssueLabels: []string{"stale"}, IssueState: "stale", DispatchedAt: "stale",
 	}
 
-	entries, err := s.LoadRetryEntries(ctx)
-	if err != nil {
-		t.Fatalf("LoadRetryEntries: %v", err)
+	tests := []struct {
+		name  string
+		entry RetryEntry
+	}{
+		{"nil labels", withLabels(nil)},
+		{"empty labels", withLabels([]string{})},
+		{"two labels", withLabels([]string{"backend", "needs-review"})},
+		{"session id", withSession},
 	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	got := entries[0]
-	if got.IssueID != "ISS-1" {
-		t.Errorf("IssueID = %q, want %q", got.IssueID, "ISS-1")
-	}
-	if got.Identifier != "PROJ-1" {
-		t.Errorf("Identifier = %q, want %q", got.Identifier, "PROJ-1")
-	}
-	if got.Attempt != 1 {
-		t.Errorf("Attempt = %d, want 1", got.Attempt)
-	}
-	if got.DueAtMs != 1000 {
-		t.Errorf("DueAtMs = %d, want 1000", got.DueAtMs)
-	}
-	if got.Error != nil {
-		t.Errorf("Error = %v, want nil", got.Error)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := openTestStore(t)
+			migrateOrFatal(t, s)
+			ctx := context.Background()
+			for _, entry := range []RetryEntry{stale, tt.entry} {
+				if err := s.SaveRetryEntry(ctx, entry); err != nil {
+					t.Fatalf("SaveRetryEntry(%+v): %v", entry, err)
+				}
+			}
+
+			got, err := s.LoadRetryEntries(ctx)
+
+			if err != nil || len(got) != 1 || !reflect.DeepEqual(got[0], tt.entry) {
+				t.Errorf("LoadRetryEntries = %+v, %v, want [%+v], nil", got, err, tt.entry)
+			}
+		})
 	}
 }
 
@@ -157,6 +165,7 @@ func TestSaveRetryEntry_Upsert(t *testing.T) {
 		Attempt:    1,
 		DueAtMs:    1000,
 		Error:      nil,
+		ChainID:    "chain-1",
 	}
 	if err := s.SaveRetryEntry(ctx, entry1); err != nil {
 		t.Fatalf("SaveRetryEntry (first): %v", err)
@@ -168,6 +177,7 @@ func TestSaveRetryEntry_Upsert(t *testing.T) {
 		Attempt:    2,
 		DueAtMs:    2000,
 		Error:      new("retry failed"),
+		ChainID:    "chain-2",
 	}
 	if err := s.SaveRetryEntry(ctx, entry2); err != nil {
 		t.Fatalf("SaveRetryEntry (upsert): %v", err)
@@ -192,6 +202,48 @@ func TestSaveRetryEntry_Upsert(t *testing.T) {
 	}
 	if *got.Error != "retry failed" {
 		t.Errorf("Error = %q, want %q", *got.Error, "retry failed")
+	}
+	if got.ChainID != "chain-2" {
+		t.Errorf("ChainID = %q, want %q", got.ChainID, "chain-2")
+	}
+}
+
+func TestRecordStageHop_ChainFollowsLatestHop(t *testing.T) {
+	t.Parallel()
+
+	s := openTestStore(t)
+	migrateOrFatal(t, s)
+	ctx := context.Background()
+	first := StageHop{
+		IssueID: "ISS-1", Identifier: "PROJ-1", HopCount: 1, SourceRule: "specify", TargetRule: "plan", SourceDispatchID: "d1", ChainID: "chain-1",
+		DisplayID: "owner/repo#1", IssueTitle: "Old title", IssueURL: "https://example.test/old", DispatchedAt: "2026-03-19T10:00:00Z",
+		IssueType: "Bug", IssueLabels: []string{"stage-specify"}, IssueState: "To Do",
+	}
+	latest := first
+	latest.SourceDispatchID, latest.ChainID = "d2", "chain-2"
+	latest.DisplayID, latest.IssueTitle, latest.IssueURL = "owner/repo#2", "New title", "https://example.test/new"
+	latest.DispatchedAt = "2026-03-19T11:00:00Z"
+	latest.IssueType, latest.IssueLabels, latest.IssueState = "Story", []string{"feature", "plan"}, "In Review"
+	other := latest
+	other.IssueID, other.IssueLabels = "ISS-2", []string{}
+	recorded := other
+	recorded.IssueID, recorded.IssueLabels, recorded.RunDispatched = "ISS-3", nil, true
+	for _, hop := range []StageHop{first, latest, other, recorded} {
+		if err := s.RecordStageHop(ctx, hop); err != nil {
+			t.Fatalf("RecordStageHop(%+v): %v", hop, err)
+		}
+	}
+
+	for _, issueID := range []string{"ISS-1", "ISS-ABSENT"} {
+		if err := s.MarkStageHopDispatched(ctx, issueID); err != nil {
+			t.Fatalf("MarkStageHopDispatched(%q) = %v, want nil", issueID, err)
+		}
+	}
+	latest.RunDispatched = true
+
+	hops, err := s.ListStageHops(ctx)
+	if err != nil || !reflect.DeepEqual(hops, []StageHop{latest, other, recorded}) {
+		t.Errorf("ListStageHops = %+v, %v, want [%+v %+v %+v], nil", hops, err, latest, other, recorded)
 	}
 }
 
@@ -448,71 +500,6 @@ func TestLoadRetryEntries_DeterministicTieBreak(t *testing.T) {
 	}
 }
 
-func TestSaveAndLoadRetryEntry_SessionID(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	sessID := "sess-abc"
-	entry := RetryEntry{
-		IssueID:    "ISS-1",
-		Identifier: "PROJ-1",
-		Attempt:    1,
-		DueAtMs:    1000,
-		SessionID:  &sessID,
-	}
-	if err := s.SaveRetryEntry(ctx, entry); err != nil {
-		t.Fatalf("SaveRetryEntry: %v", err)
-	}
-
-	entries, err := s.LoadRetryEntries(ctx)
-	if err != nil {
-		t.Fatalf("LoadRetryEntries: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("LoadRetryEntries count = %d, want 1", len(entries))
-	}
-	got := entries[0]
-	if got.SessionID == nil {
-		t.Fatal("SessionID = nil, want non-nil")
-	}
-	if *got.SessionID != sessID {
-		t.Errorf("SaveAndLoadRetryEntry_SessionID: SessionID = %q, want %q", *got.SessionID, sessID)
-	}
-}
-
-func TestSaveAndLoadRetryEntry_SessionID_Nil(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	entry := RetryEntry{
-		IssueID:    "ISS-NIL",
-		Identifier: "PROJ-NIL",
-		Attempt:    1,
-		DueAtMs:    2000,
-		SessionID:  nil,
-	}
-	if err := s.SaveRetryEntry(ctx, entry); err != nil {
-		t.Fatalf("SaveRetryEntry: %v", err)
-	}
-
-	entries, err := s.LoadRetryEntries(ctx)
-	if err != nil {
-		t.Fatalf("LoadRetryEntries: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("LoadRetryEntries count = %d, want 1", len(entries))
-	}
-	if entries[0].SessionID != nil {
-		t.Errorf("SaveAndLoadRetryEntry_SessionID_Nil: SessionID = %q, want nil", *entries[0].SessionID)
-	}
-}
-
 func TestSaveRetryEntry_Upsert_SessionID(t *testing.T) {
 	t.Parallel()
 
@@ -520,7 +507,6 @@ func TestSaveRetryEntry_Upsert_SessionID(t *testing.T) {
 	migrateOrFatal(t, s)
 	ctx := context.Background()
 
-	// First upsert: SessionID nil.
 	entry1 := RetryEntry{
 		IssueID:    "ISS-UPS",
 		Identifier: "PROJ-UPS",
@@ -532,7 +518,6 @@ func TestSaveRetryEntry_Upsert_SessionID(t *testing.T) {
 		t.Fatalf("SaveRetryEntry (first): %v", err)
 	}
 
-	// Second upsert: same IssueID, now with a non-nil SessionID.
 	sessID := "sess-updated"
 	entry2 := RetryEntry{
 		IssueID:    "ISS-UPS",
@@ -701,200 +686,234 @@ func TestAppendRunHistory_MultipleAppendsAutoIncrement(t *testing.T) {
 func TestQueryRunHistoryByIssue(t *testing.T) {
 	t.Parallel()
 
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	// Insert runs for two different issues.
-	r1 := newTestRun(1)
-	r1.IssueID = "ISS-A"
-	r2 := newTestRun(2)
-	r2.IssueID = "ISS-A"
-	r3 := newTestRun(3)
-	r3.IssueID = "ISS-B"
-
-	a1 := appendOrFatal(t, s, r1)
-	a2 := appendOrFatal(t, s, r2)
-	appendOrFatal(t, s, r3)
-
-	entries, err := s.QueryRunHistoryByIssue(ctx, "ISS-A")
-	if err != nil {
-		t.Fatalf("QueryRunHistoryByIssue: %v", err)
+	tests := []struct {
+		name     string
+		issueID  string
+		wantRuns []int
+	}{
+		{name: "newest first, other issues left out", issueID: "ISS-A", wantRuns: []int{2, 1}},
+		{name: "unknown issue is an empty slice", issueID: "no-such-issue", wantRuns: []int{}},
 	}
-	if len(entries) != 2 {
-		t.Fatalf("got %d entries, want 2", len(entries))
-	}
-	// Most recent first (descending id).
-	if entries[0].ID != a2.ID {
-		t.Errorf("entries[0].ID = %d, want %d", entries[0].ID, a2.ID)
-	}
-	if entries[1].ID != a1.ID {
-		t.Errorf("entries[1].ID = %d, want %d", entries[1].ID, a1.ID)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := openTestStore(t)
+			migrateOrFatal(t, s)
+			ids := make([]int64, 0, 3)
+			for i, issueID := range []string{"ISS-A", "ISS-A", "ISS-B"} {
+				run := newTestRun(i + 1)
+				run.IssueID = issueID
+				ids = append(ids, appendOrFatal(t, s, run).ID)
+			}
+
+			got, err := s.QueryRunHistoryByIssue(context.Background(), tt.issueID)
+			if err != nil {
+				t.Fatalf("QueryRunHistoryByIssue(%q): %v", tt.issueID, err)
+			}
+
+			if got == nil {
+				t.Fatalf("QueryRunHistoryByIssue(%q) = nil, want a non-nil slice", tt.issueID)
+			}
+			gotRuns := []int{}
+			for _, r := range got {
+				gotRuns = append(gotRuns, slices.Index(ids, r.ID)+1)
+			}
+			if !slices.Equal(gotRuns, tt.wantRuns) {
+				t.Errorf("QueryRunHistoryByIssue(%q) runs = %v, want %v", tt.issueID, gotRuns, tt.wantRuns)
+			}
+		})
 	}
 }
 
-func TestQueryRunHistoryByIssue_Empty(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
+func readBackByEveryReader(t *testing.T, s *Store, issueID string) map[string]RunHistory {
+	t.Helper()
 	ctx := context.Background()
 
-	entries, err := s.QueryRunHistoryByIssue(ctx, "no-such-issue")
+	byIssue, err := s.QueryRunHistoryByIssue(ctx, issueID)
 	if err != nil {
-		t.Fatalf("QueryRunHistoryByIssue: %v", err)
+		t.Fatalf("QueryRunHistoryByIssue(%q): %v", issueID, err)
 	}
-	if entries == nil {
-		t.Fatal("returned nil slice, want non-nil empty slice")
+	filtered, err := s.QueryRunHistory(ctx, RunHistoryFilter{IssueID: issueID, Limit: 10})
+	if err != nil {
+		t.Fatalf("QueryRunHistory(%q): %v", issueID, err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("got %d entries, want 0", len(entries))
+	if len(byIssue) != 1 || len(filtered) != 1 {
+		t.Fatalf("rows for %q = %d by issue, %d filtered, want 1 each", issueID, len(byIssue), len(filtered))
+	}
+	return map[string]RunHistory{"QueryRunHistoryByIssue": byIssue[0], "QueryRunHistory": filtered[0]}
+}
+
+func TestQueryRunHistory_Paging(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		rows   int
+		limit  int
+		before int
+		want   []int
+	}{
+		{name: "newest first", rows: 5, limit: 3, want: []int{5, 4, 3}},
+		{name: "cursor row is excluded", rows: 5, limit: 2, before: 4, want: []int{3, 2}},
+		{name: "last page is short", rows: 5, limit: 2, before: 2, want: []int{1}},
+		{name: "limit above the row count", rows: 2, limit: 10, want: []int{2, 1}},
+		{name: "zero limit reads as one", rows: 3, limit: 0, want: []int{3}},
+		{name: "negative limit reads as one", rows: 3, limit: -100, want: []int{3}},
+		{name: "no rows", rows: 0, limit: 10, want: []int{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := openTestStore(t)
+			migrateOrFatal(t, s)
+			ids := make([]int64, tt.rows)
+			for i := range ids {
+				ids[i] = appendOrFatal(t, s, newTestRun(i+1)).ID
+			}
+			var beforeID int64
+			if tt.before > 0 {
+				beforeID = ids[tt.before-1]
+			}
+
+			got, err := s.QueryRunHistory(context.Background(), RunHistoryFilter{BeforeID: beforeID, Limit: tt.limit})
+			if err != nil {
+				t.Fatalf("QueryRunHistory(before=%d, limit=%d): %v", tt.before, tt.limit, err)
+			}
+
+			if got == nil {
+				t.Fatalf("QueryRunHistory(before=%d, limit=%d) = nil, want a non-nil slice", tt.before, tt.limit)
+			}
+			gotRows := []int{}
+			for _, r := range got {
+				gotRows = append(gotRows, slices.Index(ids, r.ID)+1)
+			}
+			if !slices.Equal(gotRows, tt.want) {
+				t.Errorf("QueryRunHistory(before=%d, limit=%d) rows = %v, want %v", tt.before, tt.limit, gotRows, tt.want)
+			}
+		})
 	}
 }
 
-func TestQueryRecentRunHistory_FirstPage(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	var allIDs [5]int64
-	for i := range allIDs {
-		got := appendOrFatal(t, s, newTestRun(i+1))
-		allIDs[i] = got.ID
-	}
-
-	entries, err := s.QueryRecentRunHistory(ctx, 3, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if len(entries) != 3 {
-		t.Fatalf("got %d entries, want 3", len(entries))
-	}
-	// Most recent first: ids[4], ids[3], ids[2].
-	if entries[0].ID != allIDs[4] {
-		t.Errorf("entries[0].ID = %d, want %d", entries[0].ID, allIDs[4])
-	}
-	if entries[1].ID != allIDs[3] {
-		t.Errorf("entries[1].ID = %d, want %d", entries[1].ID, allIDs[3])
-	}
-	if entries[2].ID != allIDs[2] {
-		t.Errorf("entries[2].ID = %d, want %d", entries[2].ID, allIDs[2])
-	}
+type issueGroupSeed struct {
+	issue, identifier, display, status string
 }
 
-func TestQueryRecentRunHistory_Pagination(t *testing.T) {
+func TestQueryIssueGroups(t *testing.T) {
 	t.Parallel()
 
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	var allIDs [5]int64
-	for i := range allIDs {
-		got := appendOrFatal(t, s, newTestRun(i+1))
-		allIDs[i] = got.ID
+	tests := []struct {
+		name        string
+		seeds       []issueGroupSeed
+		filter      IssueGroupFilter
+		between     *issueGroupSeed
+		wantPages   [][]string
+		wantRestart []string
+	}{
+		{
+			name:      "an issue holding most runs is served once",
+			seeds:     []issueGroupSeed{{issue: "A"}, {issue: "B"}, {issue: "A"}, {issue: "C"}, {issue: "A"}, {issue: "D"}, {issue: "A"}, {issue: "A"}},
+			filter:    IssueGroupFilter{Limit: 2},
+			wantPages: [][]string{{"A:8", "D:6"}, {"C:4", "B:2"}},
+		},
+		{
+			name:        "a run appended between pages moves its issue to the first page only",
+			seeds:       []issueGroupSeed{{issue: "A"}, {issue: "B"}, {issue: "C"}, {issue: "D"}},
+			filter:      IssueGroupFilter{Limit: 2},
+			between:     &issueGroupSeed{issue: "B"},
+			wantPages:   [][]string{{"D:4", "C:3"}, {"A:1"}},
+			wantRestart: []string{"B:5", "D:4"},
+		},
+		{
+			name:      "a status filter keys a group on its newest matching run",
+			seeds:     []issueGroupSeed{{issue: "A", status: "failed"}, {issue: "B", status: "failed"}, {issue: "A", status: "succeeded"}},
+			filter:    IssueGroupFilter{Status: "failed", Limit: 10},
+			wantPages: [][]string{{"B:2", "A:1"}},
+		},
+		{
+			name:      "an identifier selects its issue",
+			seeds:     []issueGroupSeed{{issue: "A", identifier: "9", display: "o/r#9"}, {issue: "B", identifier: "10", display: "o/r#10"}},
+			filter:    IssueGroupFilter{IssueKey: "9", Limit: 10},
+			wantPages: [][]string{{"A:1"}},
+		},
+		{
+			name:      "a display identifier selects its issue",
+			seeds:     []issueGroupSeed{{issue: "A", identifier: "9", display: "o/r#9"}, {issue: "B", identifier: "10", display: "o/r#10"}},
+			filter:    IssueGroupFilter{IssueKey: "o/r#10", Limit: 10},
+			wantPages: [][]string{{"B:2"}},
+		},
+		{
+			name:      "a key recorded on an older run still keys the group on the newest run",
+			seeds:     []issueGroupSeed{{issue: "A", identifier: "OLD-1"}, {issue: "B", identifier: "OTHER"}, {issue: "A", identifier: "NEW-1"}},
+			filter:    IssueGroupFilter{IssueKey: "OLD-1", Limit: 10},
+			wantPages: [][]string{{"A:3"}},
+		},
 	}
 
-	// First page: 2 most recent.
-	page1, err := s.QueryRecentRunHistory(ctx, 2, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory page1: %v", err)
-	}
-	if len(page1) != 2 {
-		t.Fatalf("page1: got %d entries, want 2", len(page1))
-	}
-	if page1[0].ID != allIDs[4] || page1[1].ID != allIDs[3] {
-		t.Errorf("page1 IDs = [%d, %d], want [%d, %d]",
-			page1[0].ID, page1[1].ID, allIDs[4], allIDs[3])
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Second page: use smallest ID from page1 as cursor.
-	cursor := page1[len(page1)-1].ID
-	page2, err := s.QueryRecentRunHistory(ctx, 2, cursor)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory page2: %v", err)
-	}
-	if len(page2) != 2 {
-		t.Fatalf("page2: got %d entries, want 2", len(page2))
-	}
-	if page2[0].ID != allIDs[2] || page2[1].ID != allIDs[1] {
-		t.Errorf("page2 IDs = [%d, %d], want [%d, %d]",
-			page2[0].ID, page2[1].ID, allIDs[2], allIDs[1])
-	}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			s := openTestStore(t)
+			migrateOrFatal(t, s)
+			var ids []int64
+			appendSeed := func(seed issueGroupSeed) {
+				run := newTestRun(1)
+				run.IssueID = seed.issue
+				run.Identifier = cmp.Or(seed.identifier, "PROJ-"+seed.issue)
+				run.DisplayID = seed.display
+				run.Status = cmp.Or(seed.status, "succeeded")
+				ids = append(ids, appendOrFatal(t, s, run).ID)
+			}
+			readPage := func(f IssueGroupFilter) []IssueGroup {
+				page, err := s.QueryIssueGroups(ctx, f)
+				if err != nil {
+					t.Fatalf("QueryIssueGroups(%+v): %v", f, err)
+				}
+				if page == nil {
+					t.Fatalf("QueryIssueGroups(%+v) = nil, want a non-nil slice", f)
+				}
+				return page
+			}
+			labels := func(page []IssueGroup) []string {
+				out := []string{}
+				for _, g := range page {
+					out = append(out, fmt.Sprintf("%s:%d", g.IssueID, slices.Index(ids, g.NewestRunID)+1))
+				}
+				return out
+			}
+			for _, seed := range tt.seeds {
+				appendSeed(seed)
+			}
 
-	// Third page: one remaining.
-	cursor = page2[len(page2)-1].ID
-	page3, err := s.QueryRecentRunHistory(ctx, 2, cursor)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory page3: %v", err)
-	}
-	if len(page3) != 1 {
-		t.Fatalf("page3: got %d entries, want 1", len(page3))
-	}
-	if page3[0].ID != allIDs[0] {
-		t.Errorf("page3[0].ID = %d, want %d", page3[0].ID, allIDs[0])
-	}
-}
+			var gotPages [][]string
+			f := tt.filter
+			for range len(tt.seeds) + 2 {
+				page := readPage(f)
+				if len(page) == 0 {
+					break
+				}
+				gotPages = append(gotPages, labels(page))
+				f.BeforeID = page[len(page)-1].NewestRunID
+				if tt.between != nil && len(gotPages) == 1 {
+					appendSeed(*tt.between)
+				}
+			}
 
-func TestQueryRecentRunHistory_Empty(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	entries, err := s.QueryRecentRunHistory(ctx, 10, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if entries == nil {
-		t.Fatal("returned nil slice, want non-nil empty slice")
-	}
-	if len(entries) != 0 {
-		t.Fatalf("got %d entries, want 0", len(entries))
-	}
-}
-
-func TestQueryRecentRunHistory_LimitExceedsRows(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	appendOrFatal(t, s, newTestRun(1))
-	appendOrFatal(t, s, newTestRun(2))
-
-	entries, err := s.QueryRecentRunHistory(ctx, 10, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("got %d entries, want 2", len(entries))
-	}
-}
-
-func TestQueryRecentRunHistory_NonPositiveLimit(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	appendOrFatal(t, s, newTestRun(1))
-	appendOrFatal(t, s, newTestRun(2))
-	appendOrFatal(t, s, newTestRun(3))
-
-	for _, limit := range []int{0, -1, -100} {
-		entries, err := s.QueryRecentRunHistory(ctx, limit, 0)
-		if err != nil {
-			t.Fatalf("QueryRecentRunHistory(limit=%d): %v", limit, err)
-		}
-		if len(entries) != 1 {
-			t.Errorf("QueryRecentRunHistory(limit=%d): got %d entries, want 1", limit, len(entries))
-		}
+			if !reflect.DeepEqual(gotPages, tt.wantPages) {
+				t.Errorf("QueryIssueGroups(%+v) pages = %v, want %v", tt.filter, gotPages, tt.wantPages)
+			}
+			if tt.between != nil {
+				if got := labels(readPage(tt.filter)); !slices.Equal(got, tt.wantRestart) {
+					t.Errorf("QueryIssueGroups(%+v) restarted = %v, want %v", tt.filter, got, tt.wantRestart)
+				}
+			}
+		})
 	}
 }
 
@@ -919,21 +938,15 @@ func TestAppendRunHistory_WorkflowFile(t *testing.T) {
 
 	s := openTestStore(t)
 	migrateOrFatal(t, s)
-	ctx := context.Background()
 
 	run := newTestRun(1)
 	run.WorkflowFile = "backend.WORKFLOW.md"
 	appendOrFatal(t, s, run)
 
-	entries, err := s.QueryRunHistoryByIssue(ctx, run.IssueID)
-	if err != nil {
-		t.Fatalf("QueryRunHistoryByIssue: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].WorkflowFile != "backend.WORKFLOW.md" {
-		t.Errorf("WorkflowFile = %q, want %q", entries[0].WorkflowFile, "backend.WORKFLOW.md")
+	for reader, row := range readBackByEveryReader(t, s, run.IssueID) {
+		if row.WorkflowFile != "backend.WORKFLOW.md" {
+			t.Errorf("%s WorkflowFile = %q, want %q", reader, row.WorkflowFile, "backend.WORKFLOW.md")
+		}
 	}
 }
 
@@ -961,35 +974,11 @@ func TestAppendRunHistory_WorkflowFile_EmptyStoredAsNull(t *testing.T) {
 	}
 }
 
-func TestQueryRecentRunHistory_WorkflowFileRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	run := newTestRun(1)
-	run.WorkflowFile = "infra.WORKFLOW.md"
-	appendOrFatal(t, s, run)
-
-	entries, err := s.QueryRecentRunHistory(ctx, 1, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].WorkflowFile != "infra.WORKFLOW.md" {
-		t.Errorf("WorkflowFile = %q, want %q", entries[0].WorkflowFile, "infra.WORKFLOW.md")
-	}
-}
-
 func TestAppendRunHistory_TurnsCompleted(t *testing.T) {
 	t.Parallel()
 
 	s := openTestStore(t)
 	migrateOrFatal(t, s)
-	ctx := context.Background()
 
 	run := newTestRun(1)
 	run.TurnsCompleted = 7
@@ -998,16 +987,10 @@ func TestAppendRunHistory_TurnsCompleted(t *testing.T) {
 	if got.TurnsCompleted != 7 {
 		t.Errorf("AppendRunHistory returned TurnsCompleted = %d, want 7", got.TurnsCompleted)
 	}
-
-	entries, err := s.QueryRunHistoryByIssue(ctx, run.IssueID)
-	if err != nil {
-		t.Fatalf("QueryRunHistoryByIssue: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].TurnsCompleted != 7 {
-		t.Errorf("QueryRunHistoryByIssue TurnsCompleted = %d, want 7", entries[0].TurnsCompleted)
+	for reader, row := range readBackByEveryReader(t, s, run.IssueID) {
+		if row.TurnsCompleted != 7 {
+			t.Errorf("%s TurnsCompleted = %d, want 7", reader, row.TurnsCompleted)
+		}
 	}
 }
 
@@ -1036,35 +1019,11 @@ func TestAppendRunHistory_TurnsCompleted_Zero(t *testing.T) {
 	}
 }
 
-func TestQueryRecentRunHistory_TurnsCompleted(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	run := newTestRun(1)
-	run.TurnsCompleted = 12
-	appendOrFatal(t, s, run)
-
-	entries, err := s.QueryRecentRunHistory(ctx, 1, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].TurnsCompleted != 12 {
-		t.Errorf("QueryRecentRunHistory TurnsCompleted = %d, want 12", entries[0].TurnsCompleted)
-	}
-}
-
 func TestAppendRunHistory_DisplayIDRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	s := openTestStore(t)
 	migrateOrFatal(t, s)
-	ctx := context.Background()
 
 	run := newTestRun(1)
 	run.DisplayID = "owner/repo#1"
@@ -1073,16 +1032,10 @@ func TestAppendRunHistory_DisplayIDRoundTrip(t *testing.T) {
 	if got.DisplayID != "owner/repo#1" {
 		t.Errorf("AppendRunHistory returned DisplayID = %q, want %q", got.DisplayID, "owner/repo#1")
 	}
-
-	entries, err := s.QueryRunHistoryByIssue(ctx, run.IssueID)
-	if err != nil {
-		t.Fatalf("QueryRunHistoryByIssue: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].DisplayID != "owner/repo#1" {
-		t.Errorf("QueryRunHistoryByIssue DisplayID = %q, want %q", entries[0].DisplayID, "owner/repo#1")
+	for reader, row := range readBackByEveryReader(t, s, run.IssueID) {
+		if row.DisplayID != "owner/repo#1" {
+			t.Errorf("%s DisplayID = %q, want %q", reader, row.DisplayID, "owner/repo#1")
+		}
 	}
 }
 
@@ -1110,29 +1063,6 @@ func TestAppendRunHistory_EmptyDisplayIDRoundTrip(t *testing.T) {
 	}
 	if entries[0].DisplayID != "" {
 		t.Errorf("QueryRunHistoryByIssue DisplayID = %q, want empty string for NULL column", entries[0].DisplayID)
-	}
-}
-
-func TestQueryRecentRunHistory_DisplayIDRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	s := openTestStore(t)
-	migrateOrFatal(t, s)
-	ctx := context.Background()
-
-	run := newTestRun(1)
-	run.DisplayID = "sortie-ai/sortie#42"
-	appendOrFatal(t, s, run)
-
-	entries, err := s.QueryRecentRunHistory(ctx, 1, 0)
-	if err != nil {
-		t.Fatalf("QueryRecentRunHistory: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d entries, want 1", len(entries))
-	}
-	if entries[0].DisplayID != "sortie-ai/sortie#42" {
-		t.Errorf("QueryRecentRunHistory DisplayID = %q, want %q", entries[0].DisplayID, "sortie-ai/sortie#42")
 	}
 }
 
