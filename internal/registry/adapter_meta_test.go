@@ -17,6 +17,7 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitea"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
+	_ "github.com/sortie-ai/sortie/internal/scm/githubpr"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitlab"
 	_ "github.com/sortie-ai/sortie/internal/tracker/file"
 	_ "github.com/sortie-ai/sortie/internal/tracker/jira"
@@ -45,6 +46,13 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 			{
 				name:               "github requires api_key, project and terminal states",
 				kind:               "github",
+				wantAPIKey:         true,
+				wantProject:        true,
+				wantTerminalStates: true,
+			},
+			{
+				name:               "github-pr requires api_key, project and terminal states",
+				kind:               "github-pr",
 				wantAPIKey:         true,
 				wantProject:        true,
 				wantTerminalStates: true,

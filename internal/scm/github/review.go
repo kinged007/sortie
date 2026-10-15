@@ -12,6 +12,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/githubapi"
 	"github.com/sortie-ai/sortie/internal/scm/scmcore"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -100,10 +101,10 @@ func NewGitHubSCMAdapter(adapterConfig map[string]any) (domain.SCMAdapter, error
 	}
 
 	adapter := &GitHubSCMAdapter{
-		client:  newGitHubClient(endpoint, apiKey, userAgent),
+		client:  githubapi.NewClient(endpoint, apiKey, userAgent),
 		baseURL: endpoint,
 	}
-	adapter.graphqlClient = newGitHubClient(adapter.graphqlBasePath(), apiKey, userAgent)
+	adapter.graphqlClient = githubapi.NewClient(adapter.graphqlBasePath(), apiKey, userAgent)
 	return adapter, nil
 }
 
