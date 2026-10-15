@@ -32,26 +32,29 @@ import (
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
+const defaultCommand = "pi"
+
 func init() {
 	registry.Agents.RegisterWithMeta("pi", NewPiAdapter, registry.AgentMeta{
 		RequiresCommand:     true,
+		DefaultCommand:      defaultCommand,
 		ValidateAgentConfig: validateConfig,
 		MCPInjection:        registry.MCPInjectionUnsupported,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
+		EffortForwarding:    registry.EffortNotForwarded,
 	})
 }
 
 var _ domain.AgentAdapter = (*PiAdapter)(nil)
 
-type PiAdapter struct {
-	passthrough passthroughConfig
-}
+type PiAdapter struct{}
 
 type sessionState struct {
 	target        agentcore.LaunchTarget
 	agentConfig   domain.AgentConfig
+	passthrough   passthroughConfig
 	sessionID     string
 	sessionOpened bool
 	closed        bool
@@ -76,6 +79,7 @@ type sessionState struct {
 type turnRuntime struct {
 	pid             string
 	proc            *os.Process
+	group           *procutil.Group
 	waitCh          chan waitResult
 	reapedCh        chan struct{}
 	reader          *procutil.StdoutReader
@@ -120,24 +124,30 @@ type waitResult struct {
 	err      error
 }
 
-// NewPiAdapter creates an [PiAdapter] from the raw "pi"
-// adapter configuration in WORKFLOW.md.
-func NewPiAdapter(config map[string]any) (domain.AgentAdapter, error) {
-	pt, faults := parsePassthroughConfig(config)
-	if len(faults) > 0 {
-		messages := make([]string, len(faults))
-		for i, f := range faults {
-			messages[i] = f.Message
-		}
-		return nil, errors.New(strings.Join(messages, "; "))
-	}
-	return &PiAdapter{passthrough: pt}, nil
+// NewPiAdapter creates an [PiAdapter]. Settings are resolved per
+// session in [PiAdapter.StartSession] from
+// [domain.StartSessionParams.Settings].
+func NewPiAdapter() (domain.AgentAdapter, error) {
+	return &PiAdapter{}, nil
 }
 
 // StartSession resolves the launch target and initializes adapter-owned
 // session state without starting a Pi subprocess.
 func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	target, agentErr := agentcore.ResolveLaunchTarget(params, "pi")
+	pt, faults := parsePassthroughConfig(params.Settings)
+	if len(faults) > 0 {
+		messages := make([]string, len(faults))
+		for i, f := range faults {
+			messages[i] = f.Message
+		}
+		msg := strings.Join(messages, "; ")
+		var firstErr error
+		if len(faults) > 0 {
+			firstErr = errors.New(faults[0].Message)
+		}
+		return domain.Session{}, agentcore.SettingsError(msg, firstErr)
+	}
+	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
 	}
@@ -145,6 +155,7 @@ func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionPa
 	state := &sessionState{
 		target:      target,
 		agentConfig: params.AgentConfig,
+		passthrough: pt,
 		sessionID:   params.ResumeSessionID,
 		baseLogger:  slog.Default().With(slog.String("component", "pi-adapter")),
 		usage:       agentcore.NewTurnEndUsage(),
@@ -191,7 +202,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	}
 
 	env := os.Environ()
-	cmdArgs := buildRunArgs(state, params.Prompt, a.passthrough)
+	cmdArgs := buildRunArgs(state, params.Prompt, state.passthrough)
 	logger := state.loggerLocked()
 
 	var cmd *exec.Cmd
@@ -215,10 +226,13 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		return domain.TurnResult{}, bindErr
 	}
 
-	pipes, err := procutil.StartWithOwnedPipes(cmd, logger)
+	pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, logger)
 	if err != nil {
 		state.mu.Unlock()
 
+		if cancelled := agentcore.SessionStartCancelledError(ctx, err); cancelled != nil {
+			return domain.TurnResult{}, cancelled
+		}
 		var startErr *procutil.StartError
 		if !errors.As(err, &startErr) {
 			return domain.TurnResult{}, &domain.AgentError{
@@ -255,6 +269,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	runtime := &turnRuntime{
 		pid:        strconv.Itoa(cmd.Process.Pid),
 		proc:       cmd.Process,
+		group:      group,
 		waitCh:     make(chan waitResult, 1),
 		reapedCh:   make(chan struct{}),
 		drainGrace: state.drainGrace,
@@ -805,7 +820,9 @@ func stopActiveTurn(ctx context.Context, runtime *turnRuntime, grace time.Durati
 		return nil
 	}
 
-	_ = procutil.SignalGraceful(runtime.proc.Pid) //nolint:errcheck // best-effort signal; process may already be dead
+	if runtime.group != nil {
+		_ = runtime.group.SignalGraceful() //nolint:errcheck // best-effort signal; process may already be dead
+	}
 
 	started := time.Now()
 	graceTimer := time.NewTimer(grace)
@@ -834,7 +851,10 @@ func killTurnProcess(runtime *turnRuntime) {
 	if runtime == nil || runtime.proc == nil {
 		return
 	}
-	procutil.KillProcessGroup(runtime.proc.Pid) //nolint:errcheck,gosec // best-effort cleanup
+	if runtime.group != nil {
+		_ = runtime.group.Kill() //nolint:errcheck,gosec // best-effort cleanup
+		return
+	}
 }
 
 func stopTimer(timer *time.Timer) {

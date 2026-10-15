@@ -9,10 +9,10 @@ import (
 
 func TestEarlyExitConformance(t *testing.T) {
 	// Not parallel: AssertEarlyExitReport sets PATH through t.Setenv.
-	adapter, err := NewPiAdapter(map[string]any{})
+	adapter, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 
-	credentialtest.AssertEarlyExitReport(t, "pi", adapter, domain.AgentConfig{}, credentialtest.StructuredOutput)
+	credentialtest.AssertEarlyExitReport(t, "pi", adapter, domain.AgentConfig{})
 }

@@ -42,10 +42,11 @@ func newAdapter(t *testing.T, config map[string]any) domain.AgentAdapter {
 	if err != nil {
 		t.Fatalf("registry.Agents.Get(pi): %v", err)
 	}
-	adapter, err := factory(config)
+	adapter, err := factory()
 	if err != nil {
 		t.Fatalf("factory(pi): %v", err)
 	}
+	_ = config
 	return adapter
 }
 
@@ -57,6 +58,7 @@ func startSession(t *testing.T, adapter domain.AgentAdapter, workspace, resumeID
 	session, err := adapter.StartSession(ctx, domain.StartSessionParams{
 		WorkspacePath:   workspace,
 		ResumeSessionID: resumeID,
+		Settings:        integrationConfig(),
 		AgentConfig: domain.AgentConfig{
 			Command:       integrationCommand(),
 			ReadTimeoutMS: 3 * 60 * 1000,

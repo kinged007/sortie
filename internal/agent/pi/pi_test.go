@@ -89,7 +89,7 @@ func notificationMessages(events []domain.AgentEvent) []string {
 func TestRunTurn_SimpleText(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -123,7 +123,7 @@ func TestRunTurn_SimpleText(t *testing.T) {
 func TestRunTurn_ReasoningStaysOutOfOutput(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -181,7 +181,7 @@ func TestRunTurn_ToolResultPerExecution(t *testing.T) {
 		t.Run(tt.fixture, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			a, err := NewPiAdapter(map[string]any{})
+			a, err := NewPiAdapter()
 			if err != nil {
 				t.Fatalf("NewPiAdapter() error = %v", err)
 			}
@@ -242,7 +242,7 @@ func TestRunTurn_AssistantErrorAbortsExitZero(t *testing.T) {
 			script := writePiScript(t, dir, `echo "request failed: upstream said no" >&2
 sed "s|__CWD__|$PWD|g" '`+fixture+`'`)
 
-			a, err := NewPiAdapter(map[string]any{})
+			a, err := NewPiAdapter()
 			if err != nil {
 				t.Fatalf("NewPiAdapter() error = %v", err)
 			}
@@ -283,7 +283,7 @@ sed "s|__CWD__|$PWD|g" '`+fixture+`'`)
 func TestRunTurn_ExitZeroNoWorkIsFailure(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -306,7 +306,7 @@ func TestRunTurn_ExitZeroNoWorkIsFailure(t *testing.T) {
 func TestRunTurn_FramingEventsProduceNothing(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -333,7 +333,7 @@ func TestRunTurn_FramingEventsProduceNothing(t *testing.T) {
 func TestRunTurn_MalformedLinesAreReported(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -381,7 +381,7 @@ func TestRunTurn_MalformedLinesAreReported(t *testing.T) {
 func TestRunTurn_NonObjectLineIsMalformed(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -405,7 +405,7 @@ func TestRunTurn_CompactionAccounting(t *testing.T) {
 	t.Run("usage counted once", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
-		a, err := NewPiAdapter(map[string]any{})
+		a, err := NewPiAdapter()
 		if err != nil {
 			t.Fatalf("NewPiAdapter() error = %v", err)
 		}
@@ -426,7 +426,7 @@ func TestRunTurn_CompactionAccounting(t *testing.T) {
 	t.Run("failure surfaced and retry settles", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
-		a, err := NewPiAdapter(map[string]any{})
+		a, err := NewPiAdapter()
 		if err != nil {
 			t.Fatalf("NewPiAdapter() error = %v", err)
 		}
@@ -471,7 +471,7 @@ func TestRunTurn_MixedModelAttribution(t *testing.T) {
 {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"second"}],"api":"openai-responses","provider":"openai","model":"model-two","usage":{"input":20,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":23},"stopReason":"stop"}}
 {"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"second"}],"api":"openai-responses","provider":"openai","model":"model-two","usage":{"input":20,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":23},"stopReason":"stop"},"toolResults":[]}
 EOF`)
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -493,7 +493,7 @@ EOF`)
 func TestRunTurn_UsageAccumulatesAcrossTurns(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -525,7 +525,7 @@ func TestRunTurn_UsageAccumulatesAcrossTurns(t *testing.T) {
 func TestRunTurn_ResumeSession(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -561,7 +561,7 @@ func TestRunTurn_ResumeSession(t *testing.T) {
 func TestAssertUsageReporting(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -579,7 +579,7 @@ func TestAssertUsageReporting(t *testing.T) {
 func TestRunTurn_NonZeroExitFails(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -638,7 +638,7 @@ func TestRunTurn_EveryDeltaVariantIsRecognized(t *testing.T) {
 		`{"type":"turn_end","message":`+msg+`,"toolResults":[]}`,
 	)
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -676,7 +676,7 @@ func TestRunTurn_ToolErrorComesFromTheTopLevelFlag(t *testing.T) {
 		`{"type":"turn_end","message":` + msg + `,"toolResults":[]}`,
 	}
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -712,7 +712,7 @@ func TestRunTurn_TurnEndSuppliesTheMissingMessage(t *testing.T) {
 		`{"type":"turn_end","message":`+msg+`,"toolResults":[]}`,
 	)
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -750,7 +750,7 @@ func TestRunTurn_AgentEndRepeatsNeitherTextNorUsage(t *testing.T) {
 		`{"type":"agent_end","messages":[` + first + `,` + second + `],"willRetry":false}`,
 	}
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}

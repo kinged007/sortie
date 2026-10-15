@@ -144,28 +144,29 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			a, err := NewPiAdapter(tt.config)
+			pt, faults := parsePassthroughConfig(tt.config)
+			hasErr := len(faults) > 0
 
 			if tt.wantErr {
-				if err == nil {
-					t.Fatal("NewPiAdapter() error = nil, want error")
+				if !hasErr {
+					t.Fatal("parsePassthroughConfig() faults = nil, want error")
 				}
-				if !strings.Contains(err.Error(), "bash") {
-					t.Errorf("error = %q, want it to mention %q", err.Error(), "bash")
+				joined := ""
+				for _, f := range faults {
+					joined += f.Message + "; "
+				}
+				if !strings.Contains(joined, "bash") {
+					t.Errorf("faults = %q, want them to mention %q", joined, "bash")
 				}
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("NewPiAdapter() error = %v", err)
+			if hasErr {
+				t.Fatalf("parsePassthroughConfig() faults = %v", faults)
 			}
 
-			oc, ok := a.(*PiAdapter)
-			if !ok {
-				t.Fatalf("adapter type = %T, want *PiAdapter", a)
-			}
 			if tt.checkFunc != nil {
-				tt.checkFunc(t, oc.passthrough)
+				tt.checkFunc(t, pt)
 			}
 		})
 	}
@@ -200,12 +201,16 @@ func TestParsePassthroughConfig_Faults(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := NewPiAdapter(tt.config)
-			if err == nil {
-				t.Fatal("NewPiAdapter() error = nil, want a refusal")
+			_, faults := parsePassthroughConfig(tt.config)
+			if len(faults) == 0 {
+				t.Fatal("parsePassthroughConfig() faults = nil, want a refusal")
 			}
-			if !strings.Contains(err.Error(), tt.wantInMsg) {
-				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.wantInMsg)
+			joined := ""
+			for _, f := range faults {
+				joined += f.Message + "; "
+			}
+			if !strings.Contains(joined, tt.wantInMsg) {
+				t.Errorf("faults = %q, want them to contain %q", joined, tt.wantInMsg)
 			}
 
 			diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: tt.config})
@@ -219,8 +224,8 @@ func TestParsePassthroughConfig_Faults(t *testing.T) {
 			if found == nil {
 				t.Fatalf("validateConfig() diags = %+v, want one with check %q", diags, tt.wantCheck)
 			}
-			if found.Message != err.Error() {
-				t.Errorf("validateConfig() message = %q, want it byte-identical to the constructor's %q", found.Message, err.Error())
+			if !strings.Contains(joined, found.Message) {
+				t.Errorf("validateConfig() message = %q, want parse faults %q to contain it", found.Message, joined)
 			}
 		})
 	}
@@ -244,8 +249,8 @@ func TestParsePassthroughConfig_GenericAgentKeysAreNotPiKeys(t *testing.T) {
 		"project_trust":    "ignore",
 	}
 
-	if _, err := NewPiAdapter(config); err != nil {
-		t.Errorf("NewPiAdapter() error = %v, want nil: the agent block's own keys are not pi block keys", err)
+	if _, faults := parsePassthroughConfig(config); len(faults) != 0 {
+		t.Errorf("parsePassthroughConfig() faults = %+v, want none: the agent block's own keys are not pi block keys", faults)
 	}
 	if diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config}); len(diags) != 0 {
 		t.Errorf("validateConfig() diags = %+v, want none", diags)
@@ -455,7 +460,7 @@ func TestMCPInjectionConformance(t *testing.T) {
 env > `+envFile+`
 exit 0`)
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}

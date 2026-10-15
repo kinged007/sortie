@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -25,12 +27,11 @@ import (
 
 func init() {
 	registry.Trackers.RegisterWithMeta("github-pr", NewGitHubPRAdapter, registry.TrackerMeta{
-		RequiresProject:       true,
-		RequiresAPIKey:        true,
-		ValidateTrackerConfig: validateConfig,
-		DefaultActiveStates:   defaultActiveStates,
-		DefaultTerminalStates: defaultTerminalStates,
-		BlockerSource:         registry.BlockersUnsupported,
+		RequiresProject:        true,
+		RequiresAPIKey:         true,
+		RequiresTerminalStates: true,
+		ValidateTrackerConfig:  validateConfig,
+		BlockerSource:          registry.BlockersUnsupported,
 	})
 }
 
@@ -38,28 +39,24 @@ var _ domain.TrackerAdapter = (*GitHubPRAdapter)(nil)
 
 const maxPages = 200
 
-var defaultActiveStates = issuekit.DefaultActiveLabelStates()
-var defaultTerminalStates = issuekit.DefaultTerminalLabelStates()
-
 // GitHubPRAdapter implements [domain.TrackerAdapter] against the GitHub
 // Pulls REST API for reads and the Issues REST API for label writes.
 // Safe for concurrent use.
 type GitHubPRAdapter struct {
-	client         *httpkit.Client
-	owner          string
-	repo           string
-	activeStates   []string
-	terminalStates []string
-	handoffState   string
-	queryFilter    string
-	metrics        domain.Metrics
-	log            *slog.Logger
+	*issuekit.StateSource
+	client      *httpkit.Client
+	owner       string
+	repo        string
+	queryFilter string
+	metrics     domain.Metrics
+	log         *slog.Logger
+	model       *issuekit.LabelStateModel
 }
 
 // NewGitHubPRAdapter creates a [GitHubPRAdapter] from adapter
 // configuration. Required config keys: "api_key", "project"
 // (owner/repo format). Optional: "endpoint", "active_states",
-// "terminal_states", "handoff_state", "query_filter", "user_agent".
+// "terminal_states", "handoff_state", "in_progress_state", "query_filter", "user_agent".
 func NewGitHubPRAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	apiKey, fault := typeutil.StringField(config, "api_key")
 	if fault != nil {
@@ -87,10 +84,12 @@ func NewGitHubPRAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fmt.Sprintf("github-pr: endpoint %q is not a valid absolute http(s) url", redacted)}
 	}
 
-	handoffRaw, fault := typeutil.StringField(config, "handoff_state")
-	if fault != nil {
-		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
+	states, err := issuekit.TrackerStatesFromConfig(config)
+	if err != nil {
+		return nil, err
 	}
+	source := issuekit.NewStateSource(states)
+
 	queryFilter, fault := typeutil.StringField(config, "query_filter")
 	if fault != nil {
 		return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fault.Error()}
@@ -104,14 +103,13 @@ func NewGitHubPRAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return &GitHubPRAdapter{
-		client:         githubapi.NewClient(endpoint, apiKey, userAgent),
-		owner:          owner,
-		repo:           repo,
-		activeStates:   lowerStates(typeutil.ExtractStringSlice(config["active_states"]), defaultActiveStates),
-		terminalStates: lowerStates(typeutil.ExtractStringSlice(config["terminal_states"]), defaultTerminalStates),
-		handoffState:   lowerSingle(handoffRaw),
-		queryFilter:    queryFilter,
-		log:            slog.Default(),
+		StateSource: source,
+		client:      githubapi.NewClient(endpoint, apiKey, userAgent),
+		owner:       owner,
+		repo:        repo,
+		queryFilter: queryFilter,
+		log:         slog.Default(),
+		model:       issuekit.NewLabelStateModel(source, slog.Default()),
 	}, nil
 }
 
@@ -130,25 +128,28 @@ func splitProject(project string) (owner, repo string, ok bool) {
 // search-qualifier fragment handed to the search endpoint, which applies it
 // server-side; an empty filter keeps the plain pulls-list route.
 func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issue, error) {
+	states := a.model.Snapshot()
 	issues := make([]domain.Issue, 0)
+	if len(states.Active) == 0 {
+		return issues, nil
+	}
 	err := trackermetrics.Track(a.metrics, "fetch_candidates", func() error {
+		a.model.CheckActiveLabels(ctx, states, func(ctx context.Context) ([]string, error) {
+			return a.readRepositoryLabelNames(ctx)
+		})
 		var fetched []domain.Issue
 		var fetchErr error
 		if a.queryFilter != "" {
-			fetched, fetchErr = a.fetchCandidatesViaSearch(ctx)
+			fetched, fetchErr = a.fetchCandidatesViaSearch(ctx, states)
 		} else {
-			fetched, fetchErr = a.fetchOpenPRs(ctx)
+			fetched, fetchErr = a.fetchOpenPRs(ctx, states)
 		}
 		if fetchErr != nil {
 			return fetchErr
 		}
-		activeSet := toSet(a.activeStates)
-		for _, issue := range fetched {
-			if _, ok := activeSet[issue.State]; !ok {
-				continue
-			}
-			issue.Comments = nil
-			issues = append(issues, issue)
+		issues = a.model.Candidates(states, fetched)
+		for i := range issues {
+			issues[i].Comments = nil
 		}
 		return nil
 	})
@@ -159,7 +160,7 @@ func (a *GitHubPRAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Is
 // endpoint so the operator's query_filter is evaluated by GitHub. The filter
 // is passed through verbatim: GitHub documents @me as a suffix for every
 // username qualifier, so no client-side clause parsing is required.
-func (a *GitHubPRAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domain.Issue, error) {
+func (a *GitHubPRAdapter) fetchCandidatesViaSearch(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
 	q := fmt.Sprintf("repo:%s/%s type:pr state:open %s", a.owner, a.repo, a.queryFilter)
 	params := url.Values{
 		"q":        {q},
@@ -178,7 +179,7 @@ func (a *GitHubPRAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domai
 		}
 		issues := make([]domain.Issue, 0, len(page.Items))
 		for _, item := range page.Items {
-			issues = append(issues, a.normalize(item.asPullRequest()))
+			issues = append(issues, a.normalize(item.asPullRequest(), states))
 		}
 		return issues, nil
 	}, httpkit.PaginatorOptions{
@@ -190,10 +191,14 @@ func (a *GitHubPRAdapter) fetchCandidatesViaSearch(ctx context.Context) ([]domai
 		},
 	})
 
-	return paginator.All(ctx)
+	open, err := paginator.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return open, nil
 }
 
-func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context) ([]domain.Issue, error) {
+func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/pulls"
 	params := url.Values{
 		"state":     {"open"},
@@ -209,7 +214,7 @@ func (a *GitHubPRAdapter) fetchOpenPRs(ctx context.Context) ([]domain.Issue, err
 		}
 		issues := make([]domain.Issue, 0, len(raw))
 		for _, pr := range raw {
-			issue := a.normalize(pr)
+			issue := a.normalize(pr, states)
 			issues = append(issues, issue)
 		}
 		return issues, nil
@@ -248,7 +253,8 @@ func (a *GitHubPRAdapter) FetchIssueByID(ctx context.Context, issueID string) (d
 			return &domain.TrackerError{Kind: domain.ErrTrackerNotFound, Message: fmt.Sprintf("pull request not found: %s", issueID)}
 		}
 
-		issue = a.normalize(pr)
+		states := a.model.Snapshot()
+		issue = a.normalize(pr, states)
 
 		issue.Comments, err = a.FetchIssueComments(ctx, issueID)
 		return err
@@ -266,12 +272,16 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 	if len(states) == 0 {
 		return []domain.Issue{}, nil
 	}
-	stateSet := toSetLower(states)
+	snapshot := a.model.Snapshot()
+	stateSet := make(map[string]struct{}, len(states))
+	for _, s := range states {
+		stateSet[strings.ToLower(s)] = struct{}{}
+	}
 
 	var requestedTerminal []string
 	needOpenFetch := false
 	for s := range stateSet {
-		if isTerminal(s, a.terminalStates) {
+		if slices.Contains(snapshot.Terminal, s) {
 			requestedTerminal = append(requestedTerminal, s)
 		} else {
 			needOpenFetch = true
@@ -284,7 +294,7 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 		seen := make(map[string]struct{})
 
 		if needOpenFetch {
-			prs, err := a.fetchOpenPRs(ctx)
+			prs, err := a.fetchOpenPRs(ctx, snapshot)
 			if err != nil {
 				return err
 			}
@@ -305,7 +315,7 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			issues, err := a.fetchClosedPRsByLabel(ctx, label, seen)
+			issues, err := a.fetchClosedPRsByLabel(ctx, label, seen, snapshot)
 			if err != nil {
 				return err
 			}
@@ -318,7 +328,7 @@ func (a *GitHubPRAdapter) FetchIssuesByStates(ctx context.Context, states []stri
 	return matched, err
 }
 
-func (a *GitHubPRAdapter) fetchClosedPRsByLabel(ctx context.Context, label string, seen map[string]struct{}) ([]domain.Issue, error) {
+func (a *GitHubPRAdapter) fetchClosedPRsByLabel(ctx context.Context, label string, seen map[string]struct{}, states issuekit.LabelStates) ([]domain.Issue, error) {
 	q := fmt.Sprintf(`repo:%s/%s type:pr state:closed label:"%s"`, a.owner, a.repo, label)
 	params := url.Values{
 		"q":        {q},
@@ -338,7 +348,7 @@ func (a *GitHubPRAdapter) fetchClosedPRsByLabel(ctx context.Context, label strin
 		issues := make([]domain.Issue, 0, len(page.Items))
 		for _, item := range page.Items {
 			pr := item.asPullRequest()
-			issue := a.normalize(pr)
+			issue := a.normalize(pr, states)
 			if _, dup := seen[issue.Identifier]; dup {
 				continue
 			}
@@ -395,6 +405,7 @@ func (a *GitHubPRAdapter) fetchStatesByNumbers(ctx context.Context, numbers []st
 	if len(numbers) == 0 {
 		return map[string]string{}, nil
 	}
+	snapshot := a.model.Snapshot()
 	states := make(map[string]string, len(numbers))
 	for _, num := range numbers {
 		if ctx.Err() != nil {
@@ -415,7 +426,8 @@ func (a *GitHubPRAdapter) fetchStatesByNumbers(ctx context.Context, numbers []st
 		if pr.Number == 0 {
 			continue
 		}
-		states[num] = a.stateOf(pr)
+		labels := labelNames(pr.Labels)
+		states[num] = a.model.Derive(snapshot, num, labels, pr.State == "closed")
 	}
 	return states, nil
 }
@@ -460,14 +472,7 @@ func (a *GitHubPRAdapter) FetchIssueComments(ctx context.Context, issueID string
 // TransitionIssue moves a PR to the target state by swapping the state
 // label via the issues labels route and closing or reopening the PR.
 func (a *GitHubPRAdapter) TransitionIssue(ctx context.Context, issueID string, targetState string) error {
-	targetLower := lowerSingle(targetState)
-
 	return trackermetrics.Track(a.metrics, "transition", func() error {
-		isHandoffTarget := a.handoffState != "" && targetLower == a.handoffState
-		if !isActive(targetLower, a.activeStates) && !isTerminal(targetLower, a.terminalStates) && !isHandoffTarget {
-			return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: fmt.Sprintf("invalid target state: %q is not a configured active, terminal, or handoff state", targetState)}
-		}
-
 		prPath := "/repos/" + a.owner + "/" + a.repo + "/pulls/" + url.PathEscape(issueID)
 		body, _, err := a.client.Get(ctx, prPath, nil)
 		if err != nil {
@@ -478,76 +483,73 @@ func (a *GitHubPRAdapter) TransitionIssue(ctx context.Context, issueID string, t
 			return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse pull response", Err: err}
 		}
 
-		labels := labelNames(pr.Labels)
-		currentLabel := issuekit.CurrentLabelState(labels,
-			issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState})
-		currentNative := "open"
-		if pr.State == "closed" {
-			currentNative = "closed"
+		snapshot := a.model.Snapshot()
+		plan, err := snapshot.PlanTransition(targetState, labelNames(pr.Labels), pr.State == "closed")
+		if err != nil {
+			return err
 		}
-
-		issuePath := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID)
-		if currentLabel != "" && currentLabel != targetLower {
-			labelPath := issuePath + "/labels/" + url.PathEscape(currentLabel)
-			if err := a.client.SendNoBody(ctx, "DELETE", labelPath); err != nil && !domain.IsNotFound(err) {
-				return err
-			}
-		}
-		if currentLabel != targetLower {
-			payload, err := json.Marshal(map[string][]string{"labels": {targetLower}})
-			if err != nil {
-				return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal label payload", Err: err}
-			}
-			if _, err := a.client.Send(ctx, "POST", issuePath+"/labels", bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		}
-
-		if isTerminal(targetLower, a.terminalStates) && currentNative == "open" {
-			payload, err := json.Marshal(map[string]any{"state": "closed"})
-			if err != nil {
-				return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal state payload", Err: err}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", prPath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		} else if isActive(targetLower, a.activeStates) && currentNative == "closed" {
-			payload, err := json.Marshal(map[string]any{"state": "open"})
-			if err != nil {
-				return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal state payload", Err: err}
-			}
-			if _, err := a.client.Send(ctx, "PATCH", prPath, bytes.NewReader(payload)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return issuekit.ApplyTransition(ctx, plan, issuekit.TransitionOps{
+			Labels: a.labelOps(issueID),
+			SetClosed: func(ctx context.Context, closed bool) error {
+				return a.setIssueClosed(ctx, prPath, closed)
+			},
+		})
 	})
+}
+
+func (a *GitHubPRAdapter) setIssueClosed(ctx context.Context, prPath string, closed bool) error {
+	var payload []byte
+	var err error
+	if closed {
+		payload, err = json.Marshal(map[string]any{"state": "closed"})
+	} else {
+		payload, err = json.Marshal(map[string]any{"state": "open"})
+	}
+	if err != nil {
+		return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal state payload", Err: err}
+	}
+	_, err = a.client.Send(ctx, "PATCH", prPath, bytes.NewReader(payload))
+	return err
 }
 
 // CommentIssue posts a Markdown comment on the specified PR via the
 // issues comments route.
 func (a *GitHubPRAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
-		payload, err := json.Marshal(map[string]string{"body": text})
-		if err != nil {
-			return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal comment payload", Err: err}
-		}
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return a.postComment(ctx, issueID, text)
 	})
+}
+
+// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
+// code block, so the tracker shows literal verbatim.
+func (a *GitHubPRAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
+	return trackermetrics.Track(a.metrics, "comment", func() error {
+		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
+	})
+}
+
+func (a *GitHubPRAdapter) postComment(ctx context.Context, issueID, body string) error {
+	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal comment payload", Err: err}
+	}
+	_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
+	return err
 }
 
 // AddLabel adds a label to the specified PR via the issues labels route.
 func (a *GitHubPRAdapter) AddLabel(ctx context.Context, issueID string, label string) error {
 	return trackermetrics.Track(a.metrics, "add_label", func() error {
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/labels"
-		payload, err := json.Marshal(map[string][]string{"labels": {label}})
-		if err != nil {
-			return &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal label payload", Err: err}
-		}
-		_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-		return err
+		return issuekit.AddIssueLabel(ctx, label, a.labelOps(issueID))
+	})
+}
+
+// RemoveLabel removes every label of the PR that names label, ignoring
+// letter case, and confirms the removal against the PR's labels.
+func (a *GitHubPRAdapter) RemoveLabel(ctx context.Context, issueID string, label string) error {
+	return trackermetrics.Track(a.metrics, "remove_label", func() error {
+		return issuekit.RemoveIssueLabel(ctx, label, a.labelOps(issueID))
 	})
 }
 
@@ -558,12 +560,119 @@ func (a *GitHubPRAdapter) SetMetrics(m domain.Metrics) {
 	a.metrics = m
 }
 
-func (a *GitHubPRAdapter) stateOf(pr pullRequest) string {
-	states := issuekit.LabelStates{Active: a.activeStates, Terminal: a.terminalStates, Handoff: a.handoffState}
-	return issuekit.DeriveLabelState(labelNames(pr.Labels), pr.State, "open", "closed", states, strconv.Itoa(pr.Number), a.log)
+func (a *GitHubPRAdapter) labelOps(issueID string) issuekit.IssueLabelOps {
+	labelsPath := "/repos/" + url.PathEscape(a.owner) + "/" + url.PathEscape(a.repo) + "/issues/" + url.PathEscape(issueID) + "/labels"
+	return issuekit.IssueLabelOps{
+		Read: func(ctx context.Context) ([]issuekit.IssueLabel, error) {
+			labels, err := a.readIssueLabels(ctx, labelsPath)
+			if err != nil {
+				return nil, err
+			}
+			stored := make([]issuekit.IssueLabel, len(labels))
+			for i, l := range labels {
+				stored[i] = issuekit.IssueLabel{Name: l.Name}
+			}
+			return stored, nil
+		},
+		Add: func(ctx context.Context, label string) (issuekit.LabelWrite, error) {
+			payload, err := json.Marshal(map[string][]string{"labels": {label}})
+			if err != nil {
+				return issuekit.LabelWrite{}, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to marshal label payload", Err: err}
+			}
+			body, err := a.client.Send(ctx, "POST", labelsPath, bytes.NewReader(payload))
+			if err != nil {
+				return issuekit.LabelWrite{}, err
+			}
+			return reportedLabelList(body), nil
+		},
+		Remove: func(ctx context.Context, labels []issuekit.IssueLabel) (issuekit.LabelWrite, error) {
+			var write issuekit.LabelWrite
+			var rejected error
+			for _, label := range labels {
+				body, err := a.client.Send(ctx, "DELETE", labelsPath+"/"+url.PathEscape(label.Name), nil)
+				switch {
+				case err == nil:
+					write = reportedLabelList(body)
+				case domain.IsNotFound(err) || isPayloadRejection(err):
+					if rejected == nil {
+						rejected = err
+					}
+				default:
+					return issuekit.LabelWrite{}, err
+				}
+			}
+			return write, rejected
+		},
+	}
 }
 
-func (a *GitHubPRAdapter) normalize(pr pullRequest) domain.Issue {
+func (a *GitHubPRAdapter) readIssueLabels(ctx context.Context, labelsPath string) ([]pullLabel, error) {
+	paginator := httpkit.NewLinkPaginator(a.client, labelsPath, url.Values{"per_page": {"100"}}, func(body []byte) ([]pullLabel, error) {
+		var labels []pullLabel
+		if err := json.Unmarshal(body, &labels); err != nil {
+			return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse labels response", Err: err}
+		}
+		return labels, nil
+	}, httpkit.PaginatorOptions{
+		MaxPages: maxPages,
+		OnLimitReached: func(limit int) {
+			slog.Warn("pagination limit reached",
+				slog.Int("max_pages", limit),
+				slog.String("endpoint", labelsPath))
+		},
+	})
+	return paginator.All(ctx)
+}
+
+func (a *GitHubPRAdapter) readRepositoryLabelNames(ctx context.Context) ([]string, error) {
+	labels, err := a.readRepositoryLabels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, l.Name)
+	}
+	return names, nil
+}
+
+func (a *GitHubPRAdapter) readRepositoryLabels(ctx context.Context) ([]pullLabel, error) {
+	path := "/repos/" + url.PathEscape(a.owner) + "/" + url.PathEscape(a.repo) + "/labels"
+	paginator := httpkit.NewLinkPaginator(a.client, path, url.Values{"per_page": {"100"}}, func(body []byte) ([]pullLabel, error) {
+		var labels []pullLabel
+		if err := json.Unmarshal(body, &labels); err != nil {
+			return nil, &domain.TrackerError{Kind: domain.ErrTrackerPayload, Message: "failed to parse labels response", Err: err}
+		}
+		return labels, nil
+	}, httpkit.PaginatorOptions{
+		MaxPages: maxPages,
+		OnLimitReached: func(limit int) {
+			slog.Warn("pagination limit reached",
+				slog.Int("max_pages", limit),
+				slog.String("endpoint", "/repos/{owner}/{repo}/labels"))
+		},
+	})
+	return paginator.All(ctx)
+}
+
+func reportedLabelList(body []byte) issuekit.LabelWrite {
+	var labels []pullLabel
+	if err := json.Unmarshal(body, &labels); err != nil || labels == nil {
+		return issuekit.LabelWrite{}
+	}
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Name
+	}
+	return issuekit.LabelWrite{After: names, Reported: true}
+}
+
+func isPayloadRejection(err error) bool {
+	var te *domain.TrackerError
+	return errors.As(err, &te) && te.Kind == domain.ErrTrackerPayload
+}
+
+func (a *GitHubPRAdapter) normalize(pr pullRequest, states issuekit.LabelStates) domain.Issue {
 	num := strconv.Itoa(pr.Number)
 	desc := ""
 	if pr.Body != nil {
@@ -573,12 +682,13 @@ func (a *GitHubPRAdapter) normalize(pr pullRequest) domain.Issue {
 	if len(pr.Assignees) > 0 {
 		assignee = pr.Assignees[0].Login
 	}
+	state := a.model.Derive(states, num, labelNames(pr.Labels), pr.State == "closed")
 	issue := domain.Issue{
 		ID:                 num,
 		Identifier:         num,
 		Title:              pr.Title,
 		Description:        desc,
-		State:              a.stateOf(pr),
+		State:              state,
 		URL:                pr.HTMLURL,
 		Labels:             issuekit.NormalizeLabels(labelNames(pr.Labels)),
 		Assignee:           assignee,

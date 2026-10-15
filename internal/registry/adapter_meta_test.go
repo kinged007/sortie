@@ -52,12 +52,11 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantTerminalStates: true,
 			},
 			{
-				name:         "github-pr requires api_key and project and declares both state lists",
-				kind:         "github-pr",
-				wantAPIKey:   true,
-				wantProject:  true,
-				wantActive:   []string{"backlog", "in-progress", "review"},
-				wantTerminal: []string{"done", "wontfix"},
+				name:               "github-pr requires api_key, project and terminal states",
+				kind:               "github-pr",
+				wantAPIKey:         true,
+				wantProject:        true,
+				wantTerminalStates: true,
 			},
 			{
 				name:               "gitea requires api_key, project and terminal states",
@@ -174,6 +173,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortNotForwarded,
 			},
 			{
 				name:                   "opencode requires command, declares MCP injection translated, declares turn_end/per_model usage, declares no resume blocker, and declares no credential names",

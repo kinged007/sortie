@@ -422,7 +422,7 @@ func TestClientGetConditional_Error(t *testing.T) {
 	assertClientError(t, err, domain.ErrTrackerTransport)
 }
 
-func TestClientGetRaw_Success(t *testing.T) {
+func TestClientGetStream_Success(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -432,9 +432,14 @@ func TestClientGetRaw_Success(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestClient(t, srv.URL)
-	body, err := client.GetRaw(context.Background(), "/repos/o/r/actions/jobs/1/logs", 5)
+	var body []byte
+	err := client.GetStream(context.Background(), "/repos/o/r/actions/jobs/1/logs", func(r io.Reader) error {
+		data, readErr := io.ReadAll(io.LimitReader(r, 5))
+		body = data
+		return readErr
+	})
 	if err != nil {
-		t.Fatalf("GetRaw: %v", err)
+		t.Fatalf("GetStream: %v", err)
 	}
 	if string(body) != "hello" {
 		t.Errorf("body = %q, want %q", body, "hello")

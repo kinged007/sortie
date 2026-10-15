@@ -2,10 +2,12 @@ package githubpr
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -15,9 +17,11 @@ import (
 
 func validConfig(endpoint string) map[string]any {
 	return map[string]any{
-		"endpoint": endpoint,
-		"api_key":  "test-token",
-		"project":  "owner/repo",
+		"endpoint":        endpoint,
+		"api_key":         "test-token",
+		"project":         "owner/repo",
+		"active_states":   []any{"backlog", "in-progress", "review"},
+		"terminal_states": []any{"done", "wontfix"},
 	}
 }
 
@@ -99,19 +103,63 @@ func TestTransitionIssue_SwapsLabel(t *testing.T) {
 	t.Parallel()
 
 	var deleted, posted []string
+	labels := []string{"backlog"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/pulls/7":
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, prJSON(7, "backlog", "open"))
+		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/issues/7/labels":
+			w.WriteHeader(http.StatusOK)
+			parts := make([]string, len(labels))
+			for i, name := range labels {
+				parts[i] = fmt.Sprintf(`{"name":%q}`, name)
+			}
+			_, _ = io.WriteString(w, `[`+strings.Join(parts, ",")+`]`)
 		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/7/labels/"):
 			deleted = append(deleted, r.URL.Path)
-			w.WriteHeader(http.StatusNoContent)
+			name := strings.TrimPrefix(r.URL.Path, "/repos/owner/repo/issues/7/labels/")
+			if decoded, err := url.PathUnescape(name); err == nil {
+				name = decoded
+			}
+			kept := labels[:0]
+			for _, l := range labels {
+				if !strings.EqualFold(l, name) {
+					kept = append(kept, l)
+				}
+			}
+			labels = kept
+			w.WriteHeader(http.StatusOK)
+			parts := make([]string, len(labels))
+			for i, n := range labels {
+				parts[i] = fmt.Sprintf(`{"name":%q}`, n)
+			}
+			_, _ = io.WriteString(w, `[`+strings.Join(parts, ",")+`]`)
 		case r.Method == "POST" && r.URL.Path == "/repos/owner/repo/issues/7/labels":
 			posted = append(posted, r.URL.Path)
+			var payload struct {
+				Labels []string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			for _, l := range payload.Labels {
+				found := false
+				for _, have := range labels {
+					if strings.EqualFold(have, l) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					labels = append(labels, l)
+				}
+			}
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `[]`)
+			parts := make([]string, len(labels))
+			for i, n := range labels {
+				parts[i] = fmt.Sprintf(`{"name":%q}`, n)
+			}
+			_, _ = io.WriteString(w, `[`+strings.Join(parts, ",")+`]`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = io.WriteString(w, `{"message":"unexpected path "+r.URL.Path}`)
@@ -181,11 +229,14 @@ func TestFetchCandidates_EmptyFilterUsesPullsList(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		paths = append(paths, r.URL.Path)
-		if r.URL.Path != "/repos/owner/repo/pulls" {
+		switch r.URL.Path {
+		case "/repos/owner/repo/labels":
+			_, _ = io.WriteString(w, `[{"name":"backlog"},{"name":"in-progress"},{"name":"review"}]`)
+		case "/repos/owner/repo/pulls":
+			_, _ = io.WriteString(w, `[`+prJSON(1, "backlog", "open")+`]`)
+		default:
 			w.WriteHeader(http.StatusNotFound)
-			return
 		}
-		_, _ = io.WriteString(w, `[`+prJSON(1, "backlog", "open")+`]`)
 	}))
 	defer srv.Close()
 
@@ -197,8 +248,10 @@ func TestFetchCandidates_EmptyFilterUsesPullsList(t *testing.T) {
 	if len(issues) != 1 || issues[0].ID != "1" {
 		t.Fatalf("issues = %+v, want only PR 1", issues)
 	}
-	if len(paths) != 1 || paths[0] != "/repos/owner/repo/pulls" {
-		t.Errorf("paths = %v, want only the pulls list", paths)
+	// FetchCandidateIssues now checks the active-label catalog (labels route)
+	// before listing candidates, then uses the pulls list.
+	if len(paths) != 2 || paths[0] != "/repos/owner/repo/labels" || paths[1] != "/repos/owner/repo/pulls" {
+		t.Errorf("paths = %v, want [labels pulls]", paths)
 	}
 }
 
@@ -296,7 +349,11 @@ func TestFetchCandidates_PaginationCeilingStops(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		w.Header().Set("Content-Type", "application/json")
-		// An endless chain: every page advertises a next one.
+		if r.URL.Path == "/repos/owner/repo/labels" {
+			_, _ = io.WriteString(w, `[{"name":"backlog"},{"name":"in-progress"},{"name":"review"}]`)
+			return
+		}
+		// An endless chain on the pulls route: every page advertises a next one.
 		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?page=%d>; rel="next"`, r.Host, r.URL.Path, requests+1))
 		_, _ = io.WriteString(w, `[]`)
 	}))
@@ -306,8 +363,9 @@ func TestFetchCandidates_PaginationCeilingStops(t *testing.T) {
 	if _, err := a.FetchCandidateIssues(context.Background()); err != nil {
 		t.Fatalf("FetchCandidateIssues: %v", err)
 	}
-	if requests != maxPages {
-		t.Errorf("requests = %d, want the walk to stop at the %d-page ceiling", requests, maxPages)
+	// One labels read plus maxPages pulls pages.
+	if requests != maxPages+1 {
+		t.Errorf("requests = %d, want %d (labels + %d pulls pages)", requests, maxPages+1, maxPages)
 	}
 }
 

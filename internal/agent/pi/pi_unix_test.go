@@ -116,7 +116,7 @@ func TestRunTurn_SessionHeaderWorkspaceMismatch(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -149,7 +149,7 @@ func TestRunTurn_SessionIDMismatch(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -189,7 +189,7 @@ func TestRunTurn_SessionStartedOnceAcrossTurns(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -227,7 +227,7 @@ func TestRunTurn_ResumeForwardsTheSessionID(t *testing.T) {
 	script := writePiScript(t, dir, `printf '%s\n' "$@" > `+argvPath+`
 exit 0`)
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -263,7 +263,7 @@ func TestStopSession_NoActiveTurn(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -287,7 +287,7 @@ func TestRunTurn_ContextCancellationEndsTheTurn(t *testing.T) {
 	defer cancelTest()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -317,7 +317,7 @@ func TestStopSession_DuringTurnCancelsTheTurn(t *testing.T) {
 	defer cancelTest()
 
 	dir := t.TempDir()
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
@@ -378,7 +378,7 @@ while [ ! -s %[1]s ]; do sleep 0.01; done
 exit 0
 `, descendant, chatter))
 
-	a, err := NewPiAdapter(map[string]any{})
+	a, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}

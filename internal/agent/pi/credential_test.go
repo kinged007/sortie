@@ -14,7 +14,7 @@ func TestCredentialVerification(t *testing.T) {
 	verifiedBin := writeRunFixtureScript(t, t.TempDir(), "simple_turn.jsonl")
 	unverifiedBin := writeRunFixtureScript(t, t.TempDir(), "assistant_error.jsonl")
 
-	adapter, err := NewPiAdapter(map[string]any{})
+	adapter, err := NewPiAdapter()
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
