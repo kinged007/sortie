@@ -1608,6 +1608,21 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request, allowe
 		fmt.Sprintf("method %s is not allowed on this endpoint", r.Method))
 }
 
+// crossOriginForbidden answers a state-changing request that the cross-origin
+// check refused, before any route runs.
+func (s *Server) crossOriginForbidden(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("cross-origin request rejected",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.String("origin", r.Header.Get("Origin")),
+		slog.String("sec_fetch_site", r.Header.Get("Sec-Fetch-Site")),
+		slog.String("host", r.Host),
+	)
+	writeErrorJSON(w, s.logger, http.StatusForbidden,
+		"cross_origin_request_rejected",
+		"Sortie refused this request because it could not confirm that it came from a page on Sortie's own origin, and nothing changed; a reverse proxy in front of Sortie must pass on the Host header the browser sent unchanged, including its port.")
+}
+
 // buildIssueDetail assembles the live detail of one issue, or nil when no live
 // entry holds it. An entry belongs to the issue when its identifier equals
 // identifier, or when issueID is non-empty and the entry carries it, which

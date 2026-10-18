@@ -220,6 +220,8 @@ Enablement and configuration:
 - The HTTP server starts by default on `127.0.0.1:7678` with no flags required.
 - `--port N` overrides the listening port. Port `0` disables the server entirely.
 - `--host ADDR` overrides the bind address. `ADDR` must be a parseable IP address. Default: `127.0.0.1`. Container deployments use `0.0.0.0`.
+
+The server refuses a state-changing request that a browser sends from a page on another origin. A method other than GET, HEAD, or OPTIONS answers `403` with the error code `cross_origin_request_rejected` on every path, before routing and with nothing changed, so the refusal comes before every `404` or `405` this document states for a route. A request that carries neither an `Origin` nor a `Sec-Fetch-Site` header (curl, scripts, probes, Prometheus), one with `Sec-Fetch-Site: same-origin` or `none`, and one whose `Origin` host equals its `Host` header, port included, are served as before. A reverse proxy in front of Sortie must therefore pass on the `Host` header the browser sent unchanged, including its port; a proxy that rewrites it makes Sortie refuse every dashboard action.
 - `server.port` and `server.host` extension keys provide the same overrides via workflow front matter. CLI flags take precedence over extension keys.
 - `server.port` must be an integer in the range 1–65535, or `0` to disable.
 - `server.host` must be a parseable IP address string. DNS hostnames are not accepted.
@@ -1702,7 +1704,7 @@ API design notes:
   - The list is not exhaustive. It leaves out what the configuration does not decide: a stop the agent requests, a person's tracker or pull request edit other than a label command, a failed tracker, forge, or store call, a withheld handoff and the park it leads to, and a wait for a free agent slot. A client does not read a missing branch as one that cannot happen.
   - A pair whose condition or text fails to render is left out of the list and the failure is logged. The route answers as it would otherwise.
 - Endpoints should be read-only except for operational triggers like `/refresh`, `/retries/{identifier}/run`, `/attention/{id}/acknowledge`, and `/reactions/{identifier}/{kind}/check`.
-- Unsupported methods on defined routes should return `405 Method Not Allowed`.
+- Unsupported methods on defined routes should return `405 Method Not Allowed`, except that a request refused as cross-origin answers `403`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - The dashboard consumes this API and holds no state logic of its own.
 

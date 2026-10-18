@@ -166,6 +166,28 @@ func TestServeMethod(t *testing.T) {
 	}
 }
 
+func TestServedHandlerRejectsCrossOrigin(t *testing.T) {
+	srv := New(Params{SnapshotFn: fixedSnapshot(orchestrator.RuntimeSnapshotResult{}), RefreshFn: acceptingRefresh(), Logger: slog.New(slog.DiscardHandler)})
+	for _, tt := range []struct {
+		name, origin, site string
+		want               int
+	}{
+		{"cross-origin", "https://evil.example", "", http.StatusForbidden},
+		{"dashboard", "", "same-origin", http.StatusAccepted},
+		{"non-browser client", "", "", http.StatusAccepted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/refresh", nil)
+			req.Header = http.Header{"Origin": {tt.origin}, "Sec-Fetch-Site": {tt.site}}
+			rec := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(rec, req)
+			if rejected := strings.Contains(rec.Body.String(), "cross_origin_request_rejected"); rec.Code != tt.want || rejected != (tt.want == http.StatusForbidden) {
+				t.Errorf("POST /api/v1/refresh Origin=%q Sec-Fetch-Site=%q = %d %q, want %d", tt.origin, tt.site, rec.Code, rec.Body.String(), tt.want)
+			}
+		})
+	}
+}
+
 func testServerWithRegistry(t *testing.T, reg *prometheus.Registry) *httptest.Server {
 	t.Helper()
 	srv := New(Params{

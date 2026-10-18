@@ -389,7 +389,8 @@ type Server struct {
 var _ orchestrator.Observer = (*Server)(nil)
 
 // New creates a [Server] with all API routes registered on an internal
-// [http.ServeMux]. Does not start listening; call
+// [http.ServeMux]. The server refuses a state-changing request that a page on
+// another origin sent. Does not start listening; call
 // [Server.ListenAndServe].
 func New(params Params) *Server {
 	if params.SnapshotFn == nil {
@@ -467,9 +468,12 @@ func New(params Params) *Server {
 		))
 	}
 
+	protection := http.NewCrossOriginProtection()
+	protection.SetDenyHandler(http.HandlerFunc(s.crossOriginForbidden))
+
 	s.httpServer = &http.Server{
 		Addr:              params.Addr,
-		Handler:           mux,
+		Handler:           protection.Handler(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -483,7 +487,8 @@ func New(params Params) *Server {
 // Mux returns the underlying [*http.ServeMux] so callers can register
 // additional routes beyond those registered by [New]. When
 // [Params.MetricsRegistry] is non-nil, New registers GET /metrics
-// internally; Mux remains available for any further external routes.
+// internally; Mux remains available for any further external routes. A
+// handler built from the returned mux alone skips the cross-origin check.
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
 }
