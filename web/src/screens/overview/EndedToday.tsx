@@ -14,13 +14,15 @@ import type { EndedIssue } from "@/lib/ended";
 const LINK =
   "text-link underline underline-offset-2 hover:text-link-hover focus-visible:outline-2 focus-visible:outline-focus-ring active:text-link-active";
 
-/** What the section says when it has no rows to list. */
-export type EndedEmpty = "unavailable" | "first-run" | "none" | "all-read" | "loading";
+/** Why the section has no rows to list. */
+export type EndedEmpty = "unavailable" | "first-run" | "none" | "loading";
 
 /** Props of {@link EndedToday}. */
 export interface EndedTodayProps {
-  /** The ended issues the reader has not read, newest ending first. */
+  /** Every issue that ended today, newest ending first. */
   rows: readonly EndedIssue[];
+  /** Issue ids of the rows the reader has not read; those rows carry the unread dot. */
+  unreadIds: ReadonlySet<string>;
   /** Why the list is empty when it is; ignored while `rows` holds issues. */
   empty: EndedEmpty;
   /** The tally line, or `undefined` while it is unavailable. */
@@ -31,16 +33,10 @@ export interface EndedTodayProps {
   onOpen: (issue: EndedIssue) => void;
 }
 
-const EMPTY_TEXT: Record<Exclude<EndedEmpty, "loading">, string> = {
-  unavailable: "Run history is not available.",
-  "first-run": "Nothing has ended yet.",
-  none: "Nothing has ended today.",
-  "all-read": "All of today's endings are read.",
-};
-
-/** Renders the Ended today section: the tally line and the endings the reader has not read. */
+/** Renders the Ended today section: the tally line and every ending of the day. */
 export function EndedToday({
   rows,
+  unreadIds,
   empty,
   tally,
   selectedKey,
@@ -52,7 +48,7 @@ export function EndedToday({
       <div className="flex flex-wrap items-baseline gap-x-sm">
         <h2 className="font-heading text-h7 font-semibold text-ink">Ended today</h2>
         {tally === undefined ? undefined : (
-          <span className="text-body-md text-ink-muted [overflow-wrap:anywhere]">{tally}</span>
+          <span className="text-body-md text-ink-muted wrap-anywhere">{tally}</span>
         )}
         <Link to="/history" className={cn("ml-auto text-body-md", LINK)}>
           History
@@ -64,16 +60,20 @@ export function EndedToday({
             <EndedRow
               key={issue.issueId}
               issue={issue}
+              isUnread={unreadIds.has(issue.issueId)}
               isSelected={selectedKey === endedNavKey(issue.issueId)}
               showSelection={showSelection}
               onOpen={onOpen}
             />
           ))}
         </ul>
-      ) : empty === "loading" ? undefined : (
+      ) : empty === "loading" ? undefined : empty === "unavailable" ? (
         <p className="rounded-lg border border-line bg-canvas px-md py-lg text-body-md text-ink-body">
-          {EMPTY_TEXT[empty]}
+          Run history is not available.
         </p>
+      ) : (
+        // Holds the section's place so the page does not shift when the first ending arrives.
+        <div aria-hidden="true" className="min-h-lh border border-transparent py-lg text-body-md" />
       )}
     </section>
   );
@@ -81,12 +81,13 @@ export function EndedToday({
 
 interface EndedRowProps {
   issue: EndedIssue;
+  isUnread: boolean;
   isSelected: boolean;
   showSelection: boolean;
   onOpen: (issue: EndedIssue) => void;
 }
 
-function EndedRow({ issue, isSelected, showSelection, onOpen }: EndedRowProps) {
+function EndedRow({ issue, isUnread, isSelected, showSelection, onOpen }: EndedRowProps) {
   const isLook = isSelected && showSelection;
   const mark = outcomeMark(issue.outcome.kind);
   const meta = [issue.title === null ? null : issue.displayKey, issue.rule, issue.agentKind]
@@ -98,12 +99,15 @@ function EndedRow({ issue, isSelected, showSelection, onOpen }: EndedRowProps) {
       data-nav-key={endedNavKey(issue.issueId)}
       onClick={() => onOpen(issue)}
       className={cn(
-        "grid grid-cols-[auto_auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md [overflow-wrap:anywhere]",
+        "grid grid-cols-[auto_auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md wrap-anywhere",
         rowStyles(isLook, true),
       )}
     >
       <span className="flex h-5 items-center">
-        <span aria-hidden="true" className="size-xs rounded-full bg-primary" />
+        <span
+          aria-hidden="true"
+          className={cn("size-xs rounded-full", isUnread ? "bg-primary" : "bg-transparent")}
+        />
       </span>
       <span className="flex h-5 w-(--size-icon) items-center">
         {mark === null ? undefined : <StatusMark mark={mark} />}

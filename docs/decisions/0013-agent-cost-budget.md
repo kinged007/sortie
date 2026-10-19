@@ -36,9 +36,11 @@ Chosen option: **Option A**, because it caps real consumption, copies the proven
 
 ### Budget unit: tokens
 
-The unit is the cumulative `total_tokens` reported by the adapter. A money unit is deferred to a separate future decision.
+The unit is cumulative tokens without prompt-cache reads: the adapter's `total_tokens` minus its `cache_read_tokens`. A money unit is deferred to a separate future decision.
 
-The budget reads `total_tokens` as the adapter reports it. `cache_read_tokens` is retained for information but is not a second budget axis, and the budget never recomputes `total_tokens` from its components. Sortie does not define `cache_read_tokens` as either included in `total_tokens` or disjoint from it; the orchestrator treats the adapter's `total_tokens` as authoritative and tracks `cache_read_tokens` in a separate accumulator. The budget inherits that treatment rather than inventing a competing one.
+`total_tokens` is input plus output, and input counts every token sent to the model, cache reads and cache writes included. An agent that resends its whole conversation every turn reads it back from the prompt cache each turn, so cache reads came to dominate the figure: over three runs of one agent, 139.7M of 143.54M tokens were cache reads. A ceiling read against that total measured how long the conversation had grown rather than how much work the agent did, and a budget of 2M was spent after roughly 54 thousand tokens of other input and output. Cache reads are therefore subtracted, and `cache_read_tokens` is not a second budget axis.
+
+Cache writes stay in the budget. Some agent runtimes report no cache-write count, and their writes are then indistinguishable from other input; subtracting the counter where it exists would make the same work cost less on one agent kind than on another.
 
 ### Configuration: `agent.max_tokens`
 
@@ -80,7 +82,7 @@ The result reports both ceilings so the agent sees its whole budget picture:
 }
 ```
 
-- `used_tokens`: cumulative `total_tokens` for the issue across completed sessions, plus the session currently running (see Consequences).
+- `used_tokens`: cumulative tokens without cache reads (`total_tokens` minus `cache_read_tokens`) for the issue across completed sessions, plus the session currently running (see Consequences).
 - `budget_tokens`: the configured `agent.max_tokens`, where `0` means unlimited.
 - `remaining_tokens`: `budget_tokens` minus `used_tokens`, floored at zero, or `null` when the budget is unlimited, so the agent can distinguish "no limit" from "nothing left".
 - `used_sessions`: completed sessions for the issue. The running session is not counted, matching how the session limit counts.
@@ -114,6 +116,7 @@ A dedicated `cost` configuration block was also considered and rejected: a singl
 
 - **A schema migration is required.** The migration adds token columns to `run_history`, the session-exit path must populate them, and restart recovery must tolerate rows that predate the migration. Spend recorded before the migration reads as zero and is invisible to the budget.
 - **The session-metadata write cadence changes.** This consequence carries the most weight. The tool runs in a separate, read-only sidecar process with its own database connection and no access to the orchestrator's memory, and `session_metadata` is written only when a session ends. A tool reading only the database therefore cannot see the spend of the session currently running; on a first session it would always read zero used tokens, which strips the advisory surface of its purpose. The running session's spend must be made visible to the tool. The intended mechanism writes `session_metadata` incrementally during the session, throttled and driven by the usage events already arriving, so the tool can add the running session's recorded total to the per-issue sum, keyed to the session identifier the tool already receives so a stale earlier session is never added. No double count arises, because the running session reaches `run_history` only when it ends. This turns `session_metadata` from a written-once-at-exit record into a live one, a change to an existing write path rather than an additive one.
+- **Cache reads are billed but not capped.** A provider charges for cache reads at a reduced rate, and the budget does not bound that spend. An issue whose conversation grows very long can therefore cost more than its token count suggests; the cost figures Sortie shows price cache reads separately and remain the place to see that spend.
 - **No exhaustion metric in the first version.** The session limit emits no metric when it trips, and tool calls are already counted generically by `sortie_tool_calls_total`. For parity and a smaller surface, the token budget emits no exhaustion metric either. If such a counter is wanted later, it should be added for both budgets together, across the metric definitions, the example dashboard, and its coverage test, so the two budgets stay symmetric.
 - **Documentation owes an update on acceptance.** Accepting this decision obliges edits to the configuration reference for `agent.max_tokens`, the architecture specification covering the effort budget, the persistence schema, and the agent-tool catalog, and the workflow reference. The edits are mechanical, but skipping them leaves the specification contradicting the code.
 
@@ -123,7 +126,7 @@ The decision is satisfied when all of the following hold:
 
 1. `agent.max_tokens` parses as an integer, defaults to `0`, rejects negative values with a configuration error that names the field, honors the `SORTIE_AGENT_MAX_TOKENS` override, and re-applies on live reload.
 2. A forward-only migration adds the token column or columns to `run_history`, and the session-exit path populates `total_tokens`, and the per-component counts when present, as it writes the run-history row.
-3. A per-issue token sum and a batch over-budget query exist and mirror the session-count query the session limit uses.
+3. A per-issue token sum and a batch over-budget query exist, mirror the session-count query the session limit uses, and sum `total_tokens` minus `cache_read_tokens`. Every figure compared with `agent.max_tokens`, on the dispatch lanes, in flight, in the tool, and in the refusal record, uses that same difference.
 4. Before re-dispatch, the orchestrator blocks an issue whose summed tokens have reached a non-zero `agent.max_tokens`: it marks the issue exhausted, releases the claim, drops the retry entry, and fails open on a query error. The per-tick rebuild of the exhausted-issue set accounts for both ceilings.
 5. `cost_budget` reads only local state, makes no outbound calls, returns the five-field result with `remaining_tokens` reported as `null` under an unlimited budget, and reports domain problems inside the result rather than as a returned error.
 6. While a session is running and before its `run_history` row exists, the tool reports a `used_tokens` value that includes the running session's spend.

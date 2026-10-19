@@ -17,6 +17,7 @@ function start_service():
   run_schema_migrations()
 
   persisted_retries = sqlite.load_retry_entries()
+  sqlite.delete_all_live_passes()                        // a failure is logged; startup continues
 
   state = {
     poll_interval_ms: get_config_poll_interval_ms(),
@@ -393,6 +394,8 @@ function dispatch_issue(issue, state, attempt):
     monitor_handle,
     identifier: issue.identifier,
     issue,
+    dispatch_id,                                         // minted per dispatch, never reused
+    events: register_event_buffer(state, dispatch_id),   // bounded buffer of the run's retained agent events (Section 13.9)
     agent_kind,
     template_id,
     rule_name,
@@ -418,6 +421,7 @@ function dispatch_issue(issue, state, attempt):
   if entry.stage_lineage.dispatched_at is zero:
     entry.stage_lineage.dispatched_at = entry.started_at   // the first run of a pass dates the pass
   mark_stage_hop_dispatched(state, issue.id)
+  record_running_pass(issue.id, entry)                   // only with a rule, a chain, and no reaction kind; a failure is logged
 
   state.claimed.add(issue.id)
   state.retry_attempts.remove(issue.id)
@@ -804,7 +808,21 @@ on_worker_exit(issue_id, reason, worker_result, state):
       elif evidence.verdict == "work observed":
         evidence_work_observed = true
 
-  sqlite.persist_run_attempt(running_entry, status, run_error)
+  # A session that failed to start, without a startup_failed event from its
+  # adapter, gets one from Sortie whose message is the start error. A start
+  # that ended in cancellation gets none.
+  if worker_result.startup_error is not null and reason == error
+      and not running_entry.events.has_startup_failed:
+    retain_event(running_entry, startup_failed(worker_result.startup_error))
+
+  # The retained events are stored with the run's row in one transaction.
+  # When only the events fail to store, the row stays and the events are held
+  # in memory for a bounded retry off the event loop (Section 13.9).
+  events_result = sqlite.persist_run_attempt_with_events(running_entry, status, run_error, running_entry.events)
+  if events_result is events_failed:
+    log_warn("failed to persist run events")
+    hold_events_for_retry(running_entry.dispatch_id, running_entry.events)
+  release_event_buffer(state, running_entry.dispatch_id)   // after the write, whatever it returned
 
   # The absence sequence is reconstructed from run_history rather than
   # from a verdict column (Section 19.2), so both steps below follow the
@@ -850,6 +868,7 @@ on_worker_exit(issue_id, reason, worker_result, state):
       else:
         cancel_retry(state, issue_id)
         state.claimed.remove(issue_id)
+      delete_live_pass(issue_id, "running")           // a failure is logged
       notify_observers()
       return state
 
@@ -863,6 +882,7 @@ on_worker_exit(issue_id, reason, worker_result, state):
       state.claimed.remove(issue_id)
       reset_stage_hop(state, issue_id, "terminal")
       log_info("handoff suppressed for terminal issue", observation)
+      delete_live_pass(issue_id, "running")           // a failure is logged
       notify_observers()
       return state
 
@@ -1027,6 +1047,9 @@ on_worker_exit(issue_id, reason, worker_result, state):
     # else: the retry slot (Section 7.5) is occupied, so this exit defers
     # to the incumbent instead of scheduling a backoff retry.
 
+  // After the run's row, its hop result, and any retry row the exit saved,
+  // on every exit kind, so a finished pass never reads as still in its stage.
+  delete_live_pass(issue_id, "running")                 // a failure is logged
   notify_observers()
   return state
 ```

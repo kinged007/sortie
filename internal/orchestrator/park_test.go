@@ -312,7 +312,7 @@ func TestParkSurvivesRestart(t *testing.T) {
 		IssueID: issueID, Identifier: "PROJ-RESTART", IssueTitle: "Restart title", IssueURL: "https://tracker.test/PROJ-RESTART",
 		IssueType: "Story", IssueLabels: []string{"feature", "stage-implement"}, DispatchedAt: dispatchedAt,
 		Reason: parkReasonAgentBlocked, ParkedState: "In Progress", Label: "needs-human", LabelApplied: true,
-		RuleName: "implement", AgentKind: "claude-code", ConfiguredModel: "sonnet",
+		RuleName: "implement", AgentKind: "claude-code", ConfiguredModel: "sonnet", ChainID: "chain-1",
 		StagePosition: &SnapshotStagePosition{Chain: []string{"triage", "implement"}, Current: "implement", HopCeiling: 4},
 	}
 	parkedAt := state.Parked[issueID].ParkedAt

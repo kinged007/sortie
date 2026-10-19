@@ -3,7 +3,7 @@ import { Collapsible } from "@base-ui/react/collapsible";
 import { ChevronDownIcon } from "@/components/icons";
 import { Lane } from "@/components/Lane";
 import { ServedText } from "@/components/ServedText";
-import { markWord } from "@/components/StatusMark";
+import { markWord, StatusMark } from "@/components/StatusMark";
 import { cn } from "@/lib/cn";
 import { fmtClock, plural, pluralVerb } from "@/lib/format";
 import { rowStyles, secondLineColor } from "@/lib/rows";
@@ -70,7 +70,7 @@ export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: La
       onClick={() => onOpen(lane)}
       className={cn(
         laneGridStyles(),
-        "scroll-mt-24! border-b border-line [overflow-wrap:anywhere]",
+        "scroll-mt-24! border-b border-line wrap-anywhere",
         rowStyles(isLook && !isNeeds, true),
         isNeeds && "shadow-[inset_2px_0_0_var(--color-warning-fill)]",
         isNeeds && isLook && "bg-item-selected",
@@ -96,6 +96,11 @@ export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: La
         <span className={cn("text-body-md font-medium", isNeeds ? "text-warning" : "text-ink")}>
           <ServedText text={lane.statusText} />
         </span>
+        {lane.stallText === null ? undefined : (
+          <span title={lane.stallTextFull?.replace(/`/g, "")} className="text-body-sm">
+            <StatusMark mark="stalled" label={<ServedText text={lane.stallText} />} />
+          </span>
+        )}
         <span className={cn("text-body-sm", secondLineColor(isLook))}>{stateText}</span>
         {time === null ? undefined : (
           <span

@@ -4,8 +4,16 @@ import { ArrowRightIcon } from "@/components/icons";
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
 import { StateBadge } from "@/components/StateBadge";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
-import { CELL, Code, Note, selectionText, Table } from "./workflow-text";
+import { Code, Note, selectionText } from "./workflow-text";
 
 import type { ShapeAgent, ShapeDispatch, ShapeRule } from "@/api/types.gen";
 import type { ReactNode } from "react";
@@ -53,7 +61,7 @@ function Step({ marker, hasNext, title, aside, detail }: StepProps) {
             <span className="text-body-sm text-ink-muted">{aside}</span>
           )}
         </span>
-        <span className="text-body-sm text-ink-muted [overflow-wrap:anywhere]">{detail}</span>
+        <span className="text-body-sm text-ink-muted wrap-anywhere">{detail}</span>
       </div>
     </li>
   );
@@ -235,14 +243,21 @@ export function DispatchSection({
   return (
     <Panel title="Dispatch">
       {others.length === 0 ? undefined : (
-        <Table headers={["Rule", "Selected by", "Agent"]}>
-          {others.map((rule, index) => (
-            <tr key={index}>
-              <td className={CELL}>{ruleName(rule)}</td>
-              <td className={CELL}>{selectionText(rule)}</td>
-              <td className={CELL}>{rule.agent_kind}</td>
-            </tr>
-          ))}
+        <Table>
+          <TableHeader>
+            <TableHead>Rule</TableHead>
+            <TableHead>Selected by</TableHead>
+            <TableHead>Agent</TableHead>
+          </TableHeader>
+          <TableBody>
+            {others.map((rule, index) => (
+              <TableRow key={index}>
+                <TableCell>{ruleName(rule)}</TableCell>
+                <TableCell>{selectionText(rule)}</TableCell>
+                <TableCell>{rule.agent_kind}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
         </Table>
       )}
       {lists}

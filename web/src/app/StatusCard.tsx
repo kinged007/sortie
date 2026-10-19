@@ -92,12 +92,12 @@ function StatusSummary({ state }: StatusSummaryProps) {
         </span>
       </span>
       {state !== undefined && current === "degraded" ? (
-        <span className="mt-xxs block text-body-sm text-error [overflow-wrap:anywhere]">
+        <span className="mt-xxs block text-body-sm text-error wrap-anywhere">
           {joinNames(failingChecks(state))} failing
         </span>
       ) : undefined}
       {state === undefined ? undefined : (
-        <span className="mt-xxs block text-body-sm text-ink-muted [overflow-wrap:anywhere]">
+        <span className="mt-xxs block text-body-sm text-ink-muted wrap-anywhere">
           <AgentsLine
             running={state.counts.running}
             cap={state.config?.agent.max_concurrent_agents}

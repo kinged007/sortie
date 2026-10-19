@@ -218,6 +218,9 @@ func TestHistoryTotalsOf(t *testing.T) {
 
 	spend := domain.TokenUsage{InputTokens: 1_000_000, OutputTokens: 100_000, TotalTokens: 1_100_000}
 	byKind := map[string]domain.TokenUsage{"claude-code": spend}
+	partialTokens := tokenInfo{
+		InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
+	}
 
 	tests := []struct {
 		name string
@@ -228,14 +231,15 @@ func TestHistoryTotalsOf(t *testing.T) {
 			name: "every run measured and priced",
 			in: IssueRunTotals{
 				Usage:  orchestrator.SnapshotIssueUsage{Sessions: 2, TotalTokens: 1_100_000, ByKind: byKind},
-				Tokens: spend,
+				Tokens: domain.TokenUsage{InputTokens: 1_000_000, OutputTokens: 100_000, CacheReadTokens: 300_000},
 			},
 			want: historyTotalsResponse{
 				RunCount: 2,
 				Tokens: tokenInfo{
 					InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
-					CacheReadTokens: new(int64(0)), CacheWriteTokens: new(int64(0)),
+					CacheReadTokens: new(int64(300_000)), CacheWriteTokens: new(int64(0)),
 				},
+				UncachedTokens:   new(int64(800_000)),
 				TokensComplete:   true,
 				EstimatedCostUSD: new(4.5),
 				CostStatus:       costStatusEstimated,
@@ -248,11 +252,10 @@ func TestHistoryTotalsOf(t *testing.T) {
 				Tokens: spend,
 			},
 			want: historyTotalsResponse{
-				RunCount:       3,
-				UnmeasuredRuns: 1,
-				Tokens: tokenInfo{
-					InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
-				},
+				RunCount:         3,
+				UnmeasuredRuns:   1,
+				Tokens:           partialTokens,
+				UncachedTokens:   new(int64(1_100_000)),
 				EstimatedCostUSD: new(4.5),
 				CostStatus:       costStatusPartial,
 			},
@@ -264,10 +267,9 @@ func TestHistoryTotalsOf(t *testing.T) {
 				Tokens: spend,
 			},
 			want: historyTotalsResponse{
-				RunCount: 2,
-				Tokens: tokenInfo{
-					InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
-				},
+				RunCount:         2,
+				Tokens:           partialTokens,
+				UncachedTokens:   new(int64(1_100_000)),
 				EstimatedCostUSD: new(4.5),
 				CostStatus:       costStatusPartial,
 			},

@@ -80,8 +80,8 @@ Events are retained and streamed per run, where a run is one dispatch. The dispa
 ### Retention: two tiers
 
 - **Live tier.** Each running run keeps its newest 1,000 events in memory, and at most 256 KiB measured as the sum of encoded events, whichever limit is reached first. The oldest events are evicted; `seq` keeps rising.
-- **Durable tier.** At worker exit the buffer is written to SQLite once, in the same transaction as the run's `run_history` row, and the memory buffer is then released. A failed write is logged at Warn and the events are dropped, with no retry.
-- **Limits.** A finished run's events stay readable for at least 7 days after the run ends. Total stored size is capped at 64 MiB, pruned oldest first. Pruning runs on each write, so 7 days is a minimum, not an expiry.
+- **Durable tier.** At worker exit the buffer is written to SQLite once, in the same transaction as the run's `run_history` row, and the memory buffer is then released. When the events cannot be written, the history row is still stored, and the events are held in memory, at most 4 MiB across runs, and retried off the event loop up to five times over about two minutes; events still unwritten after the last retry, or held when Sortie stops, are dropped with a Warn log.
+- **Limits.** A finished run's events stay readable for at least 365 days after the run ends. Total stored size is capped at 2 GiB, pruned oldest first. Pruning runs on each write, so 365 days is a minimum, not an expiry.
 - **Explicit absence.** A run whose events were pruned, lost in a crash, or recorded before the schema change answers "not retained" explicitly. A run that kept only its tail exposes `first_seq` greater than 1, so the client can say that earlier events are gone.
 
 Durability matches the run's history row: a graceful shutdown keeps both, and a crash loses both.
@@ -119,7 +119,7 @@ Change frames are unchanged: payload-free, coalesced, at most one per second. Ag
 
 Running rows carry `last_event_at` (the time of any event, liveness pings included; `null` before the first event), `quiet_at`, and `stall_at`. The reference point is `last_event_at`, else `started_at`, the same reference the orchestrator's own stall stop uses. `quiet_at` is the reference plus half the stall timeout, and `stall_at` is the reference plus the stall timeout. With stall detection off (a timeout of zero or less), both are `null`.
 
-The client shows a neutral marker once its clock, corrected by the response's `generated_at`, reaches `quiet_at`. It uses a local timer, because silence produces no signal to react to. The marker reads "no events for <silence>; Sortie stops it after <timeout>", the stall threshold after which the next poll tick stops the run. With detection off, there is no marker, only the time of the last event. The rule lives on the server; the client only compares times.
+The client shows a neutral marker once its clock, corrected by the response's `generated_at`, reaches `quiet_at`. It uses a local timer, because silence produces no signal to react to. The marker reads "no events for <silence>; Sortie stops it after <timeout>", the stall threshold after which the next poll tick stops the run. With detection off, list rows show no marker, only the time of the last event, and the server serves one sentence saying that Sortie will not stop the session as stalled, for the view that shows the session. The rule lives on the server; the client only compares times.
 
 Gaps between events in 6,711 unattended agent transcripts have a per-session median of one to two seconds, so a threshold of a multiple of the usual gap with a floor reduces to the floor in practice, and thresholds adapted to a run's history flag the same share of runs as a fixed one. Only the absolute level matters, so it follows the operator's own setting. Half the timeout leaves two and a half minutes of warning at the default five-minute timeout.
 
@@ -172,7 +172,7 @@ This record fills in the session-event stream that `0034-build-the-dashboard-as-
 
 ### Positive
 
-- An operator sees what an agent is doing as it happens and, for 7 days, what a finished run did, across restarts that were graceful.
+- An operator sees what an agent is doing as it happens and, for at least 365 days, what a finished run did, across restarts that were graceful.
 - Every loss is visible: eviction through `first_seq`, retention and crashes through "not retained", a lagging client through `reset`.
 - A slow or stuck client can delay neither the event loop nor any other client.
 - The browser keeps one connection, however many runs it shows.
@@ -181,7 +181,8 @@ This record fills in the session-event stream that `0034-build-the-dashboard-as-
 ### Negative
 
 - **A crash loses the live tier.** Events of runs that were running when the process died are gone, along with their history rows.
-- **A failed write at exit drops that run's events** with only a Warn log.
+- **A failed write at exit leaves that run's events in memory only.** They are retried a bounded number of times; a run whose retries all fail, or that is still held when Sortie stops, loses its events with only a Warn log, and until a retry succeeds the run answers "not retained".
+- **The database file outgrows the 2 GiB cap.** The cap counts encoded events; indexes and per-row overhead come on top, so a database at the cap measured 3.8 GB with events averaging 250 bytes, and SQLite reuses the pages pruning frees instead of shrinking the file.
 - **Events dropped before retention are invisible.** When the orchestrator's inbound agent-event channel is full, an event is dropped before it reaches the buffer, and no `seq` gap marks it.
 - **The sizes are judgments.** 1,000 events, 256 KiB, 50 events on the detail route, and 16 subscriptions per connection are sizing choices, not measurements.
 - **The stall evidence comes from one dataset** of agent transcripts, not from Sortie's own runs.

@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"log/slog"
 	"maps"
+	"strings"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
@@ -29,7 +30,9 @@ func isTurnTerminalEvent(t domain.AgentEventType) bool {
 
 // HandleAgentEvent applies an incoming agent event from the worker's
 // OnEvent relay to the running map entry for issueID and, for
-// token_usage events, to the global agent totals.
+// token_usage events, to the global agent totals. It also retains the
+// event in the entry's bounded buffer, except those that carry nothing
+// to show.
 //
 // HandleAgentEvent is a no-op when issueID is not present in
 // state.Running.
@@ -109,19 +112,22 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		}
 		metrics.IncToolCalls(event.ToolName, outcome)
 
+		// Agents call tools constantly and a failed call is routine, so these
+		// records stay at Debug; the error keeps only its first line because
+		// a tool's output can run to thousands of lines of workspace content.
 		if event.ToolError {
-			errMsg := event.Message
-			if errMsg == "" {
+			errMsg, _, _ := strings.Cut(event.Message, "\n")
+			if strings.TrimSpace(errMsg) == "" {
 				errMsg = "tool returned error"
 			}
-			log.Info("tool call completed",
+			log.Debug("tool call completed",
 				slog.String("tool", event.ToolName),
 				slog.Int64("duration_ms", event.ToolDurationMS),
 				slog.String("outcome", outcome),
-				slog.String("tool_error", errMsg),
+				slog.String("tool_error", redact.Truncate(errMsg, 200)),
 			)
 		} else {
-			log.Info("tool call completed",
+			log.Debug("tool call completed",
 				slog.String("tool", event.ToolName),
 				slog.Int64("duration_ms", event.ToolDurationMS),
 				slog.String("outcome", outcome),
@@ -237,6 +243,8 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 	if isTurnTerminalEvent(event.Type) {
 		entry.APIRequestCountAtLastTurnEnd = entry.APIRequestCount
 	}
+
+	retainEvent(entry, event)
 }
 
 // hasUsage reports whether usage carries a non-zero component. Every

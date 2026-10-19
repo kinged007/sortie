@@ -1,4 +1,4 @@
-import { rowMark, timeBaseOf, timeText } from "@/lib/active-rows";
+import { routeText, rowMark, timeBaseOf, timeText } from "@/lib/active-rows";
 import { fmtStamp, parseInstant } from "@/lib/format";
 import { reactionLabel, reactionShortLabel } from "@/lib/labels";
 import { outcomeMark, runStatus } from "@/lib/run-status";
@@ -11,10 +11,11 @@ import type {
   IssueDetailResponse,
   IssueOutcomeResponse,
   PendingReactionResponse,
+  PrLoopStationResponse,
   RunResponse,
   ShapeReactions,
 } from "@/api/types.gen";
-import type { Mark } from "@/lib/run-status";
+import type { Mark, StateMark } from "@/lib/run-status";
 
 /** What a station stands for on the way from the tracker to the end of a pull request. */
 export type StationKind = "tracker" | "agent" | "handoff" | "reaction" | "end";
@@ -135,7 +136,7 @@ export interface StandingInput {
 }
 
 /** What a lane draws at the station it stands on: a status mark, or the ring of an issue that ended today. */
-export type LaneMarker = Mark | "ended";
+export type LaneMarker = StateMark | "ended";
 
 /** Where an issue stands: a station key, its mark, and the time shown beside it. */
 export interface Standing {
@@ -208,44 +209,83 @@ export function standingOf(input: StandingInput, stations: readonly Station[]): 
 }
 
 /** How a station reads against the issue's standing. */
-export type StationState = "passed" | "current" | "ahead" | "waiting" | "escalated" | "idle";
+export type StationState =
+  | "passed"
+  | "current"
+  | "ahead"
+  | "waiting"
+  | "escalated"
+  | "acted"
+  | "quiet"
+  | "idle";
 
 /** A {@link Station} with its state, and the mark and time of the issue standing on it. */
 export interface LaneStation extends Station {
   state: StationState;
   mark: LaneMarker | null;
   time: string | null;
+  /** The continuations scheduled at an `acted` reaction station; zero elsewhere. */
+  continuations: number;
 }
 
-function stateOf(
+type PrLoop = Record<string, PrLoopStationResponse> | null;
+
+type Reading = Pick<LaneStation, "state" | "continuations">;
+
+function reactionReadingOf(
+  station: Station,
+  pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
+  prLoop: PrLoop,
+): Reading {
+  const rows = pending.filter((r) => r.config_key === station.key);
+  if (rows.length > 0) {
+    return {
+      state: rows.some((r) => r.escalated_at !== null) ? "escalated" : "waiting",
+      continuations: 0,
+    };
+  }
+  const served: PrLoopStationResponse | undefined =
+    prLoop !== null && Object.hasOwn(prLoop, station.key) ? prLoop[station.key] : undefined;
+  switch (served?.result) {
+    case "escalated":
+      return { state: "escalated", continuations: 0 };
+    case "acted":
+      return { state: "acted", continuations: served.continuations };
+    case "quiet":
+      return { state: "quiet", continuations: 0 };
+    default:
+      return { state: "idle", continuations: 0 };
+  }
+}
+
+function readingOf(
   station: Station,
   index: number,
   current: number,
   pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
-): StationState {
+  prLoop: PrLoop,
+): Reading {
   if (station.kind === "reaction") {
-    const rows = pending.filter((r) => r.config_key === station.key);
-    if (rows.length === 0) {
-      return "idle";
-    }
-    return rows.some((r) => r.escalated_at !== null) ? "escalated" : "waiting";
+    return reactionReadingOf(station, pending, prLoop);
   }
   if (current < 0) {
-    return "idle";
+    return { state: "idle", continuations: 0 };
   }
-  return index < current ? "passed" : "ahead";
+  return { state: index < current ? "passed" : "ahead", continuations: 0 };
 }
 
 /**
  * Gives each station its state against the standing: the current station
- * carries the standing's mark and time, a reaction station reads waiting or
- * escalated while a pull request row is pending on it, and the rest read
- * passed or ahead.
+ * carries the standing's mark and time. A reaction station reads waiting or
+ * escalated while a pull request row is pending on it; with none, it reads
+ * from the served `prLoop` as escalated, acted, quiet, or idle for no record.
+ * The rest read passed or ahead.
  */
 export function laneOf(
   stations: readonly Station[],
   standing: Standing | null,
   pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
+  prLoop: PrLoop,
 ): LaneStation[] {
   const current = standing === null ? -1 : stations.findIndex((s) => s.key === standing.station);
   return stations.map((station, index) =>
@@ -255,10 +295,11 @@ export function laneOf(
           state: "current",
           mark: standing.mark,
           time: standing.time,
+          continuations: 0,
         }
       : {
           ...station,
-          state: stateOf(station, index, current, pending),
+          ...readingOf(station, index, current, pending, prLoop),
           mark: null,
           time: null,
         },
@@ -342,6 +383,12 @@ export function lastStagePositionOf(runs: readonly RunResponse[]): StagePosition
   return run === undefined
     ? null
     : positionFrom({ chain: run.stage_chain, current: run.rule_name ?? "" });
+}
+
+/** Words a finished run's place in its chain, or its rule, as an Active row words a running one. */
+export function runRouteText(run: RunResponse, config: ConfigResponse | undefined): string | null {
+  const position = lastStagePositionOf([run]);
+  return routeText({ stage_position: position, rule_name: run.rule_name }, config);
 }
 
 /** What the stage summary and the meter single out. */

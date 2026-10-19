@@ -3,9 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"reflect"
-	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
@@ -254,45 +252,6 @@ func TestMapCodexErrorInfo(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSummarizeItem(t *testing.T) {
-	t.Parallel()
-
-	t.Run("short item not truncated", func(t *testing.T) {
-		t.Parallel()
-		got := summarizeItem("agentMessage", "item-001")
-		want := "[agentMessage] item-001"
-		if got != want {
-			t.Errorf("summarizeItem() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("long item truncated with ellipsis suffix", func(t *testing.T) {
-		t.Parallel()
-		// Prefix "[agentMessage] " is 15 chars; ID of 250 chars makes 265 total.
-		// redact.Truncate keeps first 200 runes then appends "…" (1 rune) -> 201 runes.
-		longID := strings.Repeat("x", 250)
-		got := summarizeItem("agentMessage", longID)
-		runeCount := utf8.RuneCountInString(got)
-		if runeCount != 201 {
-			t.Errorf("summarizeItem() rune count = %d, want 201", runeCount)
-		}
-		if !strings.HasSuffix(got, "…") {
-			t.Errorf("summarizeItem() does not end with ellipsis: %q", got[max(0, len(got)-10):])
-		}
-	})
-
-	t.Run("exactly 200 runes not truncated", func(t *testing.T) {
-		t.Parallel()
-		// Prefix is 15 chars; ID of 185 chars makes exactly 200 total.
-		exactID := strings.Repeat("z", 185)
-		got := summarizeItem("agentMessage", exactID)
-		want := "[agentMessage] " + exactID
-		if got != want {
-			t.Errorf("summarizeItem() = %q, want %q", got, want)
-		}
-	})
 }
 
 func TestNormalizeSandbox(t *testing.T) {

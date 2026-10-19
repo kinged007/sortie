@@ -177,7 +177,6 @@ type contractSharedPackage struct {
 // stays importable across family roots but not by the orchestrator.
 var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/scmcore":                     {reason: "shared forge decision core; registers no kind and holds no adapter", coreImportable: true},
-	"github.com/sortie-ai/sortie/internal/scm/githubapi":                   {reason: "shared GitHub transport and error classification; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/scm/cilog":                       {reason: "shared CI log excerpt assembly for the forge CI providers; registers no kind and holds no adapter", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
@@ -1836,7 +1835,7 @@ func contractIdentityWordsFromIdent(name string) []string {
 		// An uppercase run ending in a lowercase rune starts a new word at
 		// that run's last uppercase rune, so useCLAUDEFlag yields "use",
 		// "claude" and "flag" rather than gluing the token to "flag".
-		// A short initialism followed by a plural s stays one word: PIDs
+				// A short initialism followed by a plural s stays one word: PIDs
 		// is not the identity token pi followed by ds.
 		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 &&
 			(len(current) > 3 || r != 's') {
@@ -2761,6 +2760,7 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/orchestrator", name: "RunWorkerAttempt", reason: "exported summary path"},
 	{importPath: "github.com/sortie-ai/sortie/tools/qualify/probe", name: "writeToolServerMCPConfig", reason: "fixture path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "NewSortieTools", reason: "returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/pi", name: "ensureBridgeFile", reason: "bridge extension path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR

@@ -697,28 +697,16 @@ func TestSummarizeAssistantMessage(t *testing.T) {
 			want: strings.Repeat("a", 200) + "…",
 		},
 		{
-			name: "empty content with single tool request",
+			name: "tool requests without content are not named",
 			data: assistantMessageData{
-				Content:      "",
-				ToolRequests: []rawToolRequest{{Name: "view"}},
+				ToolRequests: []rawToolRequest{{Name: "view"}, {Name: "edit_file"}},
 			},
-			want: "requesting 1 tool(s): view",
-		},
-		{
-			name: "empty content with multiple tool requests joined by comma",
-			data: assistantMessageData{
-				Content: "",
-				ToolRequests: []rawToolRequest{
-					{Name: "view"},
-					{Name: "edit_file"},
-				},
-			},
-			want: "requesting 2 tool(s): view, edit_file",
+			want: "",
 		},
 		{
 			name: "no content and no tool requests",
 			data: assistantMessageData{},
-			want: "assistant message",
+			want: "",
 		},
 	}
 

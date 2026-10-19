@@ -134,10 +134,10 @@ export function RuleFilter({ config, rows }: RuleFilterProps) {
                   <span
                     className={
                       option.kind === "chain"
-                        ? "font-semibold [overflow-wrap:anywhere]"
+                        ? "font-semibold wrap-anywhere"
                         : option.kind === "any" || option.kind === "none"
-                          ? "[overflow-wrap:anywhere]"
-                          : "font-mono text-body-sm [overflow-wrap:anywhere]"
+                          ? "wrap-anywhere"
+                          : "font-mono text-body-sm wrap-anywhere"
                     }
                   >
                     {option.label}

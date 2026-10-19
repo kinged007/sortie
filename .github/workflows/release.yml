@@ -491,7 +491,6 @@ jobs:
       - name: Run integration tests
         run: go test -race -count=1 -v -timeout 300s -run 'Integration' ./internal/agent/pi/...
 
-
   test-integration-acp-gemini:
     name: "Integration: Gemini - ACP"
     needs: [lint, test-unit]
@@ -593,7 +592,6 @@ jobs:
       - test-integration-codex
       - test-integration-opencode
       - test-integration-pi
-
       - test-integration-acp-gemini
       - test-integration-acp-kiro
     runs-on: ubuntu-latest

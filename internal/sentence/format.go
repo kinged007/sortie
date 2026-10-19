@@ -10,6 +10,7 @@ import (
 // funcs is the FuncMap every template in the table is parsed with.
 var funcs = template.FuncMap{
 	"duration": duration,
+	"elapsed":  elapsed,
 	"due":      due,
 	"tokens":   tokens,
 	"count":    count,
@@ -34,6 +35,28 @@ func duration(seconds float64) string {
 	}
 
 	minutes := int(math.Round(seconds / 60))
+	if minutes < 60 {
+		return strconv.Itoa(minutes) + "m"
+	}
+	hours := minutes / 60
+	if minutes < 24*60 {
+		return unitPair(hours, "h", minutes%60, "m")
+	}
+	return unitPair(hours/24, "d", hours%24, "h")
+}
+
+// elapsed words a span of seconds like duration but rounds down, so a silence
+// stays a lower bound of the real one between refetches. NaN and infinite
+// spans read as unknown.
+func elapsed(seconds float64) string {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return "unknown"
+	}
+	if seconds < 60 {
+		return strconv.Itoa(int(math.Max(math.Floor(seconds), 0))) + "s"
+	}
+
+	minutes := int(seconds / 60)
 	if minutes < 60 {
 		return strconv.Itoa(minutes) + "m"
 	}

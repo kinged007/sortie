@@ -1,3 +1,5 @@
+import type { IssueDetailResponse } from "@/api/types.gen";
+
 const ISSUE_ROUTE_PREFIX = "/issues/";
 const FALLBACK_BACK = "/";
 
@@ -48,4 +50,31 @@ export function issueLinkOf(
     ? backOf(from.state)
     : withoutPeek(from.pathname, from.search);
   return { to: `${ISSUE_ROUTE_PREFIX}${encodeURIComponent(identifier)}`, state: { back } };
+}
+
+/** Gives the target and router state of a link to a session opened from `from`; its back target is the one {@link issueLinkOf} gives. */
+export function sessionLinkOf(
+  identifier: string,
+  dispatchId: string,
+  from: { pathname: string; search: string; state: unknown },
+): { to: string; state: IssueRouteState } {
+  const { to, state } = issueLinkOf(identifier, from);
+  return { to: `${to}/sessions/${dispatchId}`, state };
+}
+
+/**
+ * Names the session an issue opens by default: the running one, else the
+ * newest run that recorded a dispatch ID. It returns `null` for an issue
+ * with neither.
+ */
+export function latestSessionOf(
+  detail: IssueDetailResponse,
+): { dispatchId: string; isLive: boolean } | null {
+  if (detail.running !== null) {
+    return { dispatchId: detail.running.dispatch_id, isLive: true };
+  }
+  const run = (detail.history?.runs ?? []).find(
+    (candidate) => candidate.dispatch_id !== null && candidate.dispatch_id !== "",
+  );
+  return run?.dispatch_id ? { dispatchId: run.dispatch_id, isLive: false } : null;
 }

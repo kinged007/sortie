@@ -18,7 +18,6 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/pi"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitea"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
-	_ "github.com/sortie-ai/sortie/internal/scm/githubpr"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitlab"
 	_ "github.com/sortie-ai/sortie/internal/tracker/file"
 	_ "github.com/sortie-ai/sortie/internal/tracker/jira"
@@ -47,13 +46,6 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 			{
 				name:               "github requires api_key, project and terminal states",
 				kind:               "github",
-				wantAPIKey:         true,
-				wantProject:        true,
-				wantTerminalStates: true,
-			},
-			{
-				name:               "github-pr requires api_key, project and terminal states",
-				kind:               "github-pr",
 				wantAPIKey:         true,
 				wantProject:        true,
 				wantTerminalStates: true,
@@ -166,10 +158,10 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
-				name:                   "pi requires command, declares MCP injection unsupported, declares turn_end/per_model usage, and declares no resume blocker",
+				name:                   "pi requires command, declares MCP injection translated, declares turn_end/per_model usage, and declares no resume blocker",
 				kind:                   "pi",
 				wantCommand:            true,
-				wantMCPInjection:       registry.MCPInjectionUnsupported,
+				wantMCPInjection:       registry.MCPInjectionTranslated,
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,

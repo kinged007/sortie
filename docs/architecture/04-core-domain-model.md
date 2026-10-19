@@ -107,6 +107,8 @@ Fields (logical):
   - `succeeded` or `no_change`: the outcome of the run of `stage_previous` that ended in the hop, rendered as `stage.previous_outcome`. Empty whenever `stage_previous` is empty.
 - `first_after_hop` (boolean)
   - True on the first attempt dispatched after the hop `stage_previous` names. False on a later dispatch into that stage while the hop record stands (after a restart, a released hold, or a lost retry), on a retry or reaction continuation, and when `stage_previous` is empty. A row recorded before the flag was kept takes it from the upgrade.
+- `agent_blocked` (boolean)
+  - True when the run's agent ended it with a `blocked` soft stop (Section 21.1). False otherwise, and on a row recorded before the flag was kept.
 - `chain_id` (string)
   - The stage chain identifier frozen with the dispatch selection. A dispatch no hop reached starts a chain with a fresh random value; a dispatch a hop reached inherits the chain of the hop; a retry or reaction continuation carries the chain of the run it continues. Empty only on a row written before the chain was recorded.
 - `dispatched_at` (timestamp)
@@ -125,6 +127,8 @@ Fields (logical):
   - The agent session the attempt used. Empty when the attempt started none. Unknown where the row does not record it.
 - `ssh_host` (string or unknown)
   - The SSH worker the attempt executed on. Empty for a local attempt. Unknown where the row does not record it.
+- `dispatch_id` (string or unknown)
+  - The dispatch ID of the attempt (Section 4.2), the key of its retained agent events. Empty on the recorded CI result, which no dispatch produced. Unknown where the row does not record it.
 - `error` (optional)
 
 #### 4.1.6 Live Session (Agent Session Metadata)
@@ -150,6 +154,8 @@ Fields:
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
   - The worker counts each turn as it starts, self-review turns included, whichever agent events the session emits.
+- `retained_events` (bounded list of events)
+  - The session's retained agent events, numbered from 1 within the run and bounded by count and by bytes, written with the run's history row at worker exit (Section 13.9).
 
 #### 4.1.7 Retry Entry
 
@@ -248,5 +254,5 @@ Fields:
 - `Session ID`
   - Opaque string assigned by the agent adapter. Composition is adapter-specific.
 - `Dispatch ID`
-  - Opaque string the orchestrator mints each time it dispatches an issue, never reused. Identifies that dispatch's running session to the tool server and in `session_metadata`. Differs from `Session ID` because a resumed session keeps its session ID across dispatches, while each dispatch mints its own dispatch ID.
+  - Opaque string the orchestrator mints each time it dispatches an issue, never reused. Identifies that dispatch's running session to the tool server and in `session_metadata`. Differs from `Session ID` because a resumed session keeps its session ID across dispatches, while each dispatch mints its own dispatch ID. Keys the run's history row and its retained agent events.
 

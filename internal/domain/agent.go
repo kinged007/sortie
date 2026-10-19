@@ -61,6 +61,12 @@ type TokenUsage struct {
 	CacheWriteTokens int64
 }
 
+// Uncached returns TotalTokens less CacheReadTokens, floored at zero.
+// Cache writes stay in the result.
+func (u TokenUsage) Uncached() int64 {
+	return max(u.TotalTokens-u.CacheReadTokens, 0)
+}
+
 // AgentEvent is a normalized event emitted by an agent adapter over the
 // lifetime of an agent session, including startup and individual turns.
 type AgentEvent struct {

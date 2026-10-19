@@ -161,7 +161,7 @@ func reconcileLabelFixCommands(state *State, params ReconcileParams, log *slog.L
 			data.HighWaterMark = newestMark
 			data.LastActor = newestMatch.Actor
 
-			ScheduleRetry(state, ScheduleRetryParams{
+			scheduleReactionContinuation(ctx, state, params.Store, ScheduleRetryParams{
 				IssueID:    pending.IssueID,
 				Identifier: pending.Identifier,
 				DisplayID:  pending.DisplayID,
@@ -181,7 +181,7 @@ func reconcileLabelFixCommands(state *State, params ReconcileParams, log *slog.L
 				Logger:              entryLog,
 
 				IssueIdentity: pending.IssueIdentity,
-			}, params.OnRetryFire)
+			}, params.OnRetryFire, now)
 
 			// Best-effort acknowledgment: the label's disappearance tells the
 			// operator the command was accepted. A failure does not affect

@@ -406,12 +406,12 @@ func TestSummarizeAssistant(t *testing.T) {
 		{
 			name:    "text and tool_use",
 			fixture: "assistant_message.json",
-			want:    "I'll analyze the codebase and implement the requested changes. [tool: Read]",
+			want:    "I'll analyze the codebase and implement the requested changes.",
 		},
 		{
-			name:    "tool_use and tool_result",
+			name:    "tool blocks without text",
 			fixture: "tool_use_message.json",
-			want:    "[tool: Bash] [tool_result: ok]",
+			want:    "",
 		},
 	}
 
@@ -436,8 +436,8 @@ func TestSummarizeAssistant_EmptyMessage(t *testing.T) {
 
 	ev := rawEvent{Type: "assistant"}
 	got := summarizeAssistant(ev)
-	if got != "assistant message" {
-		t.Errorf("summarizeAssistant(empty) = %q, want %q", got, "assistant message")
+	if got != "" {
+		t.Errorf("summarizeAssistant(empty) = %q, want blank", got)
 	}
 }
 
@@ -453,37 +453,6 @@ func TestFormatAPIRetry(t *testing.T) {
 	want := "API retry attempt 1/5 (delay 1000ms, status 429: rate_limit)"
 	if got != want {
 		t.Errorf("formatAPIRetry() = %q, want %q", got, want)
-	}
-}
-
-func TestRawEventSummary(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		ev   rawEvent
-		want string
-	}{
-		{
-			name: "type only",
-			ev:   rawEvent{Type: "stream_event"},
-			want: "stream_event",
-		},
-		{
-			name: "type and subtype",
-			ev:   rawEvent{Type: "system", Subtype: "init"},
-			want: "system/init",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := tt.ev.summary()
-			if got != tt.want {
-				t.Errorf("summary() = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 

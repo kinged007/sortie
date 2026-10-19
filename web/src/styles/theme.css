@@ -59,6 +59,7 @@
   --color-outcome-ok: #7d7f81;
   --color-outcome-stopped: #aa7403;
   --color-outcome-failed: #9e2a2a;
+  --color-outcome-cancelled: #3b82f6;
 
   --font-heading:
     "Work Sans", "Avenir Next", "Segoe UI Variable Display", "Segoe UI", "Inter Display", Ubuntu,
@@ -213,6 +214,7 @@
     --color-outcome-ok: #97999b;
     --color-outcome-stopped: #eab308;
     --color-outcome-failed: #f05d58;
+    --color-outcome-cancelled: #508ff7;
     --shadow-lg: 0 2px 4px -1px rgb(var(--color-shadow-tint) / 0.36);
     --shadow-2xl: 0 8px 12px rgb(var(--color-shadow-tint) / 0.36);
   }
@@ -275,6 +277,7 @@
   --color-outcome-ok: #97999b;
   --color-outcome-stopped: #eab308;
   --color-outcome-failed: #f05d58;
+  --color-outcome-cancelled: #508ff7;
   --shadow-lg: 0 2px 4px -1px rgb(var(--color-shadow-tint) / 0.36);
   --shadow-2xl: 0 8px 12px rgb(var(--color-shadow-tint) / 0.36);
 }

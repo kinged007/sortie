@@ -8,6 +8,7 @@ import {
   ClockIcon,
   LoaderCircleIcon,
   RotateCwIcon,
+  TriangleAlertIcon,
   XIcon,
 } from "@/components/icons";
 import { cn } from "@/lib/cn";
@@ -37,6 +38,7 @@ const STATUS: Record<Mark, StatusEntry> = {
   failed: { Glyph: XIcon, word: "Failed", tone: "error" },
   degraded: { Glyph: CircleXIcon, word: "Degraded", tone: "error" },
   clear: { Glyph: CheckIcon, word: "All clear", tone: "neutral" },
+  stalled: { Glyph: TriangleAlertIcon, word: "No events for longer than usual", tone: "neutral" },
 };
 
 const GLYPH_TONE: Record<Tone, string> = {

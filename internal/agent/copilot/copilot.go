@@ -10,6 +10,7 @@ package copilot
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -359,7 +360,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 						agentcore.EmitNotification(emit, summarizeAssistantMessage(msgData))
 					} else {
 						state.logger().Debug("failed to parse assistant.message data", slog.Any("error", dataErr))
-						agentcore.EmitNotification(emit, "assistant message")
+						agentcore.EmitNotification(emit, "")
 					}
 				}
 
@@ -367,7 +368,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				state.logger().Debug("copilot event logged only", slog.String("event_type", event.Type))
 
 			case "assistant.turn_start", "assistant.turn_end":
-				agentcore.EmitNotification(emit, event.Type)
+				agentcore.EmitNotification(emit, "")
 
 			case "tool.execution_start":
 				if len(event.Data) > 0 {
@@ -375,7 +376,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 					if dataErr == nil {
 						state.work.ObserveToolActivity()
 						state.inFlight.Begin(toolData.ToolCallID, toolData.ToolName)
-						agentcore.EmitNotification(emit, fmt.Sprintf("tool started: %s", toolData.ToolName))
+						agentcore.EmitNotification(emit, "")
 					}
 				}
 
@@ -409,21 +410,21 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				}
 
 			case "session.warning":
-				msg := "session warning"
+				msg := ""
 				if len(event.Data) > 0 {
 					warnData, dataErr := parseSessionWarningData(event.Data)
-					if dataErr == nil && warnData.Message != "" {
+					if dataErr == nil {
 						msg = warnData.Message
 					}
 				}
-				state.logger().Warn("copilot session warning", slog.String("message", msg))
+				state.logger().Warn("copilot session warning", slog.String("message", cmp.Or(msg, "session warning")))
 				agentcore.EmitNotification(emit, msg)
 
 			case "session.info":
-				msg := "session info"
+				msg := ""
 				if len(event.Data) > 0 {
 					infoData, dataErr := parseSessionInfoData(event.Data)
-					if dataErr == nil && infoData.Message != "" {
+					if dataErr == nil {
 						msg = infoData.Message
 					}
 				}
@@ -432,7 +433,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 			case "session.task_complete":
 				state.turnCompletionSeen = true
 				state.turnCompletionSuccess = true
-				msg := "task complete"
+				msg := ""
 				if len(event.Data) > 0 {
 					taskData, dataErr := parseSessionTaskCompleteData(event.Data)
 					if dataErr == nil {
@@ -440,9 +441,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 						if taskData.Success != nil {
 							state.turnCompletionSuccess = *taskData.Success
 						}
-						if taskData.Summary != "" {
-							msg = taskData.Summary
-						}
+						msg = taskData.Summary
 					}
 				}
 				agentcore.EmitNotification(emit, msg)
@@ -458,11 +457,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 						state.turnErrorMessage = strings.TrimSpace(errData.Message)
 					}
 				}
-				emit(domain.AgentEvent{
-					Type:      domain.EventOtherMessage,
-					Timestamp: now,
-					Message:   event.Type,
-				})
+				agentcore.EmitNotification(emit, "")
 
 			case "user.message":
 				if len(event.Data) > 0 {
@@ -477,11 +472,8 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				return new(event), nil
 
 			default:
-				emit(domain.AgentEvent{
-					Type:      domain.EventOtherMessage,
-					Timestamp: now,
-					Message:   event.Type,
-				})
+				state.logger().Debug("copilot event logged only", slog.String("event_type", event.Type))
+				agentcore.EmitNotification(emit, "")
 			}
 
 			return nil, nil

@@ -330,12 +330,28 @@ func TestAgentEvent_Construction(t *testing.T) {
 	}
 }
 
-// TokenUsage zero value is the documented sentinel for non-token events.
-func TestTokenUsage_ZeroValue(t *testing.T) {
+func TestTokenUsage_Uncached(t *testing.T) {
 	t.Parallel()
 
-	var usage TokenUsage
-	if usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.TotalTokens != 0 {
-		t.Errorf("zero TokenUsage = %+v, want all zeros", usage)
+	tests := []struct {
+		name  string
+		usage TokenUsage
+		want  int64
+	}{
+		{"zero value", TokenUsage{}, 0},
+		{"subtracts cache reads and keeps cache writes", TokenUsage{TotalTokens: 1000, CacheReadTokens: 300, CacheWriteTokens: 200}, 700},
+		{"cache reads above the total floor at zero", TokenUsage{TotalTokens: 100, CacheReadTokens: 250}, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.usage.Uncached()
+
+			if got != tt.want {
+				t.Errorf("%+v.Uncached() = %d, want %d", tt.usage, got, tt.want)
+			}
+		})
 	}
 }

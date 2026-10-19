@@ -18,6 +18,7 @@ type escalationRecordStore interface {
 	GetReactionEscalation(ctx context.Context, issueID, kind string) (persistence.ReactionEscalation, bool, error)
 	SaveReactionEscalation(ctx context.Context, rec persistence.ReactionEscalation) error
 	EndReactionEscalation(ctx context.Context, issueID, kind string) error
+	RecordReactionActivity(ctx context.Context, records []persistence.ReactionActivity) error
 }
 
 // ReactionEscalationRestoreStore is the persistence contract of
@@ -64,6 +65,9 @@ func beginEscalation(
 	if pending.escalationStands() {
 		return false
 	}
+
+	recordReactionActivity(ctx, store, pending.IssueID, pending.StageLineage,
+		persistence.ReactionActivityEscalation, []string{pending.Kind}, now, log)
 
 	stored, found, err := store.GetReactionEscalation(ctx, pending.IssueID, pending.Kind)
 	if err != nil {

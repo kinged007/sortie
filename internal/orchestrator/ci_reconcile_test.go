@@ -113,6 +113,7 @@ const (
 type ciReconcileStore struct {
 	noopOutcomeRecorder
 	noEscalationRecords
+	reactionActivityLog
 	unsupportedReactionObservationStore
 
 	savedEntries    []persistence.RetryEntry
@@ -277,7 +278,6 @@ func (s *ciMetricsSpy) IncCIStatusChecks(result string) { s.ciStatusChecks[resul
 func (s *ciMetricsSpy) IncCIEscalations(action string)  { s.ciEscalations[action]++ }
 func (s *ciMetricsSpy) IncRetries(trigger string)       { s.retriesByTrigger[trigger]++ }
 
-// ciBaseTime is a fixed reference for CI reconcile tests.
 var ciBaseTime = time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
 
 // newPendingEntry builds a PendingReaction for a test CI issue, with pull
@@ -301,7 +301,6 @@ func newPendingEntry(issueID, identifier, branch string, attempt int) *PendingRe
 	}
 }
 
-// defaultCIFeedback returns a CIFeedbackConfig with max_retries=2, label escalation.
 func defaultCIFeedback() config.CIFeedbackConfig {
 	return config.CIFeedbackConfig{
 		Kind:            "github",
@@ -311,7 +310,6 @@ func defaultCIFeedback() config.CIFeedbackConfig {
 	}
 }
 
-// stateWithPendingReaction creates a State with one CI PendingReaction entry.
 func stateWithPendingReaction(t *testing.T, issueID, branch string, attempt int) *State {
 	t.Helper()
 	s := NewState(5000, 4, 0, nil, AgentTotals{})
@@ -743,6 +741,7 @@ func TestReconcileCIStatus_Failing_UnderMaxRetries(t *testing.T) {
 	t.Parallel()
 
 	state := stateWithPendingReaction(t, "ISS-CI-5", "feature/break", 1)
+	state.PendingReactions[ReactionKey("ISS-CI-5", ReactionKindCI)].StageLineage = StageLineage{ChainID: "chain-ci-5", DispatchedAt: ciBaseTime}
 	store := &ciReconcileStore{getFingerprintResult: ciDefaultHead}
 	metrics := newCIMetricsSpy()
 	ci := &mockCIProvider{result: domain.CIResult{
@@ -811,6 +810,11 @@ func TestReconcileCIStatus_Failing_UnderMaxRetries(t *testing.T) {
 
 	if _, ok := state.Claimed["ISS-CI-5"]; !ok {
 		t.Error("claim released after CI failure under max retries; want preserved")
+	}
+
+	continuations := store.activities(persistence.ReactionActivityContinuation)
+	if len(continuations) != 1 || continuations[0].IssueID != "ISS-CI-5" || continuations[0].ChainID != "chain-ci-5" || continuations[0].Kind != ReactionKindCI {
+		t.Errorf("RecordReactionActivity continuation records = %+v, want one for ISS-CI-5 kind %q chain %q", continuations, ReactionKindCI, "chain-ci-5")
 	}
 }
 

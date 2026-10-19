@@ -63,7 +63,7 @@ function CheckRow({ name, check, line, unrunLine = "Not run yet." }: CheckRowPro
       <div className="col-start-2 flex min-w-0 flex-col gap-xs text-ink-body sm:col-start-3">
         <span>{hasRun ? line : unrunLine}</span>
         {hasError ? (
-          <pre className="rounded-lg bg-error-container p-sm font-mono text-body-sm whitespace-pre-wrap text-ink [overflow-wrap:anywhere]">
+          <pre className="rounded-lg bg-error-container p-sm font-mono text-body-sm whitespace-pre-wrap text-ink wrap-anywhere">
             {check.error}
           </pre>
         ) : undefined}

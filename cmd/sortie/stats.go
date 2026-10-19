@@ -53,6 +53,10 @@ type statsSource struct {
 	workflowPath string
 	rates        server.TokenRates
 	rateWarnings []string
+
+	// stages supplies the stage chains chain_funnels reads; nil serves an
+	// empty chain_funnels.
+	stages func() runstats.Stages
 }
 
 // report opens dbPath read-only and aggregates the runs completed in
@@ -71,10 +75,48 @@ func (src statsSource) report(ctx context.Context, since, until *time.Time, gene
 	}
 
 	agg := runstats.New(caps, statsPricer(src.rates))
+	if src.stages != nil {
+		stages := src.stages()
+		if len(stages.Chains) > 0 && caps.FunnelBreakdown() {
+			passes, err := store.ListLivePasses(ctx)
+			if err != nil {
+				return runstats.Report{}, err
+			}
+			stages.Live = livePasses(passes)
+		}
+		agg.SetStages(stages)
+	}
 	if err := store.ScanRunHistoryRange(ctx, caps, since, until, agg.Add); err != nil {
 		return runstats.Report{}, err
 	}
 	return agg.Report(generatedAt, src.workflowPath, src.dbPath, since, until, src.rateWarnings), nil
+}
+
+// dispatchStages joins the dispatch section to the stages chain_funnels
+// reads: its chains and the rules a stage label selects.
+func dispatchStages(d config.DispatchConfig) runstats.Stages {
+	stages := runstats.Stages{Chains: d.Chains()}
+	for _, rule := range d.Rules {
+		if rule.Stage != "" {
+			stages.LabelRules = append(stages.LabelRules, rule.Name)
+		}
+	}
+	return stages
+}
+
+// livePasses maps the persisted live passes to the stage pass records
+// chain_funnels counts.
+func livePasses(passes []persistence.LivePass) []runstats.LivePass {
+	live := make([]runstats.LivePass, len(passes))
+	for i, pass := range passes {
+		live[i] = runstats.LivePass{
+			ChainID:      pass.ChainID,
+			RuleName:     pass.RuleName,
+			PreviousRule: pass.StagePrevious,
+			BudgetHeld:   pass.Kind == persistence.LivePassBudget,
+		}
+	}
+	return live
 }
 
 // formatShare renders a 0..1 fraction as a one-decimal percentage.
@@ -167,6 +209,55 @@ func renderStatsChainTable(w io.Writer, chains []runstats.ChainGroup, full bool)
 	for _, c := range chains[:min(len(chains), statsChainTextRows)] {
 		lead := []string{c.Name, c.Issue, strings.Join(c.Stages, " -> "), cmp.Or(c.LastHop, "-")}
 		writeStatsRow(table, append(lead, statsGroupCells(c.Group, full, false)...))
+	}
+	table.Flush() //nolint:errcheck,gosec // stdout write failure is unrecoverable
+}
+
+// noHopReasonWords names each no-hop reason the way a reader of the report
+// says it.
+var noHopReasonWords = map[string]string{
+	"run_failed":       "failed run",
+	"needs_person":     "needs a person",
+	"budget_held":      "budget held",
+	"operator_stopped": "stopped by an operator",
+	"verdict_withheld": "verdict withheld",
+}
+
+// renderStatsFunnel prints one chain funnel: a title naming its entry rules
+// and one row per stage.
+func renderStatsFunnel(w io.Writer, funnel runstats.Funnel) {
+	var entries []string
+	for _, stage := range funnel.Stages {
+		if stage.Entry {
+			entries = append(entries, stage.Rule)
+		}
+	}
+	fmt.Fprintf(w, "chain from %s\n", strings.Join(entries, " or ")) //nolint:errcheck // stdout write failure is unrecoverable
+
+	table := newStatsTable(w)
+	writeStatsRow(table, upperAll([]string{
+		"#", "stage", "runs", "entered", "by label", "advanced", "ceiling", "hop failed", "no hop", "in stage", "median",
+	}))
+	for i, stage := range funnel.Stages {
+		name := stage.Rule
+		if stage.Entry {
+			name += " (entry)"
+		}
+		advanced := strconv.Itoa(stage.Outcomes.Advanced)
+		if stage.Last {
+			advanced = fmt.Sprintf("%d handed off", stage.Outcomes.HandedOff)
+		}
+		noHop := strconv.Itoa(stage.Outcomes.NoHop)
+		if stage.Outcomes.NoHop > 0 && len(stage.NoHopReasons) > 0 {
+			reason := stage.NoHopReasons[0].Reason
+			noHop += " " + cmp.Or(noHopReasonWords[reason], reason)
+		}
+		writeStatsRow(table, []string{
+			strconv.Itoa(i + 1), name,
+			strconv.Itoa(stage.Runs), strconv.Itoa(stage.Entered), strconv.Itoa(stage.Arrivals.Label),
+			advanced, strconv.Itoa(stage.Outcomes.Ceiling), strconv.Itoa(stage.Outcomes.HopFailed),
+			noHop, strconv.Itoa(stage.Outcomes.InStage), formatSecondsDash(stage.MedianSeconds),
+		})
 	}
 	table.Flush() //nolint:errcheck,gosec // stdout write failure is unrecoverable
 }
@@ -356,6 +447,10 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 			renderStatsChainTable(stdout, report.ByChain, full)
 		}
+		for _, funnel := range report.ChainFunnels {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsFunnel(stdout, funnel)
+		}
 		if len(report.ByTrigger) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 			renderStatsGroupTable(stdout, "by retry trigger", "trigger", report.ByTrigger, full, false)
@@ -459,11 +554,23 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 
+	dispatch, err := config.BuildDispatchConfig(wf.Config, filepath.Dir(path), func(string) bool { return true }, cfg.Agent.Kind)
+	if err != nil {
+		emitDiags(stdout, stderr, "text", mapManagerError(err), nil)
+		return 1
+	}
+
 	dbPath := resolveDBPath(cfg.DBPath, filepath.Dir(path))
 	rawTokenRates, tokenRatesPresent := cfg.ExtensionValue("token_rates")
 	rates, rateWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
-	src := statsSource{dbPath: dbPath, workflowPath: path, rates: rates, rateWarnings: rateWarnings}
+	src := statsSource{
+		dbPath:       dbPath,
+		workflowPath: path,
+		rates:        rates,
+		rateWarnings: rateWarnings,
+		stages:       func() runstats.Stages { return dispatchStages(dispatch) },
+	}
 	report, err := src.report(ctx, since, until, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "sortie stats: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable

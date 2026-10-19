@@ -312,6 +312,10 @@ type RunningEntry struct {
 	// and no later reconcile read it in a state. Set and cleared only by
 	// [reconcileTrackerState].
 	NoStateObserved bool
+
+	// events is the run's retained agent events, registered by
+	// [DispatchIssue]. Nil when [State.RetainedEvents] is nil.
+	events *runEventBuffer
 }
 
 // RetryEntry holds the runtime state for a pending retry. IssueID,
@@ -1209,6 +1213,15 @@ type State struct {
 	// tick. 0 means unlimited. Written only on the event-loop goroutine.
 	MaxSessions int
 
+	// StallTimeoutMS mirrors config.Agent.StallTimeoutMS as of the latest
+	// poll tick. 0 means stall detection is off. Written only on the
+	// event-loop goroutine.
+	StallTimeoutMS int
+
+	// RetainedEvents holds the event buffer of every running run. Nil
+	// retains nothing.
+	RetainedEvents *RunEventLog
+
 	// StageChains and HopCeiling mirror config.Dispatch.Chains and
 	// config.Dispatch.HopCeiling, refreshed on every poll tick. Set before the
 	// event loop serves a snapshot. Written only on the event-loop goroutine.
@@ -1429,6 +1442,7 @@ func NewState(pollIntervalMS, maxConcurrentAgents, maxTokens int, maxConcurrentB
 		StageHops:                 make(map[string]*StageHopEntry),
 		ActiveOrder:               make(map[string]time.Time),
 		AgentTotals:               totals,
+		RetainedEvents:            NewRunEventLog(),
 		ReactionAttempts:          make(map[string]int),
 		ReactionHandedOffComments: make(map[string]map[string]struct{}),
 		ReactionReportedComments:  make(map[string]map[string]struct{}),
@@ -1502,6 +1516,7 @@ type SnapshotStageHop struct {
 	TargetLabel  string    `json:"target_label"`
 	HoppedAt     time.Time `json:"hopped_at"`
 	DispatchedAt time.Time `json:"dispatched_at"`
+	ChainID      string    `json:"-"`
 
 	RuleName        string                 `json:"rule_name,omitempty"`
 	StagePosition   *SnapshotStagePosition `json:"stage_position"`
@@ -1562,6 +1577,16 @@ type SnapshotRunningEntry struct {
 	TokensAwaited       bool                      `json:"tokens_awaited"`
 	IssueUsage          *SnapshotIssueUsage       `json:"issue_usage,omitempty"`
 	UnaccountedTurns    int                       `json:"unaccounted_turns"`
+	DispatchID          string                    `json:"dispatch_id"`
+
+	// QuietAt and StallAt are the instants half and all of the stall timeout
+	// after StallReference; both are zero with stall detection off.
+	QuietAt time.Time `json:"quiet_at"`
+	StallAt time.Time `json:"stall_at"`
+
+	// StallReference is the last agent event instant, else the start of the
+	// run: the instant the stall timeout is measured from.
+	StallReference time.Time `json:"-"`
 }
 
 // SnapshotRetryEntry is a read-only view of a pending retry, produced by
@@ -1611,6 +1636,7 @@ type SnapshotParkedEntry struct {
 	Label        string    `json:"label"`
 	LabelApplied bool      `json:"label_applied"`
 	ParkedAt     time.Time `json:"parked_at"`
+	ChainID      string    `json:"-"`
 
 	RuleName        string                 `json:"rule_name,omitempty"`
 	StagePosition   *SnapshotStagePosition `json:"stage_position"`
@@ -1668,6 +1694,7 @@ type SnapshotPendingReaction struct {
 	PullRequest  SnapshotPullRequest `json:"pull_request"`
 	CreatedAt    time.Time           `json:"created_at"`
 	DispatchedAt time.Time           `json:"dispatched_at"`
+	ChainID      string              `json:"-"`
 	NextPollAt   time.Time           `json:"next_poll_at"`
 	Wait         string              `json:"wait,omitempty"`
 	UsedAttempts *int                `json:"used_attempts"`
@@ -1830,6 +1857,26 @@ func SnapshotIssueUsageOf(usage *persistence.IssueTokenUsage) *SnapshotIssueUsag
 	}
 }
 
+// stallReference returns the instant the stall timeout of entry is measured
+// from: its last agent event, else the start of the run. The stall check and
+// the snapshot's stall instants share it so they cannot disagree.
+func stallReference(entry *RunningEntry) time.Time {
+	if !entry.LastAgentTimestamp.IsZero() {
+		return entry.LastAgentTimestamp
+	}
+	return entry.StartedAt
+}
+
+// stallInstants returns the instants half and all of timeoutMS after
+// reference, and zero values when timeoutMS is not positive.
+func stallInstants(reference time.Time, timeoutMS int) (quietAt, stallAt time.Time) {
+	if timeoutMS <= 0 {
+		return time.Time{}, time.Time{}
+	}
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	return reference.Add(timeout / 2), reference.Add(timeout)
+}
+
 // RuntimeSnapshot captures a point-in-time view of the orchestrator's
 // runtime state. now is normalized to UTC internally.
 //
@@ -1876,6 +1923,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			maps.Copy(modelRequests, entry.RequestsByModel)
 		}
 		identity := maskedIdentity(issueIdentityOf(entry.Issue))
+		quietAt, stallAt := stallInstants(stallReference(entry), state.StallTimeoutMS)
 		snap.Running = append(snap.Running, SnapshotRunningEntry{
 			IssueID:             entry.Issue.ID,
 			Identifier:          entry.Identifier,
@@ -1924,6 +1972,10 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			TokensAwaited:    tokensAwaited,
 			IssueUsage:       SnapshotIssueUsageOf(entry.IssueUsage),
 			UnaccountedTurns: entry.UnaccountedTurns,
+			DispatchID:       entry.DispatchID,
+			QuietAt:          quietAt,
+			StallAt:          stallAt,
+			StallReference:   stallReference(entry),
 		})
 
 		if !entry.StartedAt.IsZero() {
@@ -2030,6 +2082,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			Label:        entry.Label,
 			LabelApplied: entry.LabelApplied,
 			ParkedAt:     entry.ParkedAt,
+			ChainID:      entry.StageLineage.ChainID,
 
 			RuleName:        entry.RuleName,
 			StagePosition:   stagePosition(state, id, entry.RuleName, entry.StageLineage.PreviousRule),
@@ -2081,6 +2134,7 @@ func snapshotPendingReactions(state *State) []SnapshotPendingReaction {
 			},
 			CreatedAt:    entry.CreatedAt,
 			DispatchedAt: entry.StageLineage.DispatchedAt,
+			ChainID:      entry.StageLineage.ChainID,
 			NextPollAt:   cmp.Or(entry.PendingRetryAt, entry.CreatedAt),
 			Wait:         entry.Wait,
 			LastCheck:    snapshotReactionCheck(entry.LastCheck),
@@ -2157,6 +2211,7 @@ func snapshotBetweenStages(state *State) []SnapshotStageHop {
 			TargetLabel:  hop.TargetLabel,
 			HoppedAt:     hop.HoppedAt,
 			DispatchedAt: hop.DispatchedAt,
+			ChainID:      hop.ChainID,
 
 			RuleName:        hop.TargetRule,
 			StagePosition:   stagePosition(state, id, hop.TargetRule, hop.SourceRule),

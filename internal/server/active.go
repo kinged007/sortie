@@ -32,6 +32,11 @@ type activeIssueResponse struct {
 	DispatchedAt      *time.Time             `json:"dispatched_at"`
 	StatusText        string                 `json:"status_text"`
 	StatusTextFull    string                 `json:"status_text_full"`
+
+	// PRLoop is what each configured pull request reaction recorded in the
+	// pass that decides the entry's status; null when the read failed or the
+	// server holds no run history or workflow shape.
+	PRLoop map[string]prLoopStationResponse `json:"pr_loop"`
 }
 
 // issueRows holds one issue's rows of the state route's row lists, as served.

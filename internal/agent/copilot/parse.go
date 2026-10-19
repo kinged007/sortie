@@ -218,19 +218,9 @@ func completionFailureMessage(summary string) string {
 	return redact.Truncate(summary, 500)
 }
 
-// summarizeAssistantMessage produces a human-readable summary from an
-// [assistantMessageData]. If content is non-empty it is truncated to
-// 200 runes; otherwise tool requests are listed by name.
+// summarizeAssistantMessage returns the message content truncated to 200
+// runes, or "" when there is none. Tool requests are reported as tool_result
+// events, so listing them here would only repeat them in the run timeline.
 func summarizeAssistantMessage(data assistantMessageData) string {
-	if data.Content != "" {
-		return redact.Truncate(strings.TrimSpace(data.Content), 200)
-	}
-	if len(data.ToolRequests) > 0 {
-		names := make([]string, len(data.ToolRequests))
-		for i, tr := range data.ToolRequests {
-			names[i] = tr.Name
-		}
-		return fmt.Sprintf("requesting %d tool(s): %s", len(data.ToolRequests), strings.Join(names, ", "))
-	}
-	return "assistant message"
+	return redact.Truncate(strings.TrimSpace(data.Content), 200)
 }

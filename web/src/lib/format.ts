@@ -216,3 +216,8 @@ export function fmtVersion(version: string): string {
   const release = version.replace(DESCRIBE_SUFFIX, "").replace(DIRTY_SUFFIX, "");
   return /^\d/.test(release) ? `v${release}` : release;
 }
+
+/** Lowercases a leading capital so a capitalized word reads inside a sentence; an acronym such as `CI` stays. */
+export function lowerFirst(text: string): string {
+  return /^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text;
+}

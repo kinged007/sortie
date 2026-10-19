@@ -286,8 +286,11 @@ func TestStartWithOwnedPipes_AssignSeamDelayDoesNotLowerJobMembership(t *testing
 		pipes, g := startOwned(t, cmd)
 		defer pipes.Close() //nolint:errcheck // best-effort
 
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):

@@ -81,6 +81,7 @@ func (m *mockSCMAdapter) RemoveLabel(_ context.Context, _ int, _, _, _ string) e
 
 // reviewReconcileStore is a self-contained ReconcileStore for review tests.
 type reviewReconcileStore struct {
+	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	unsupportedReactionObservationStore
@@ -309,6 +310,7 @@ func reviewParams(store *reviewReconcileStore, scm domain.SCMAdapter, tracker do
 }
 
 type fingerprintModelStore struct {
+	livePassLog
 	reviewReconcileStore
 	fingerprints map[string]*modelFingerprint
 	rows         map[string]map[string]struct{}
@@ -366,6 +368,10 @@ func (s *fingerprintModelStore) seedRows(issueID, kind string, commentIDs ...str
 
 func (s *fingerprintModelStore) storedIDs(issueID, kind string) []string {
 	return slices.Sorted(maps.Keys(s.rows[ReactionKey(issueID, kind)]))
+}
+
+func (s *fingerprintModelStore) AppendRunHistoryWithEvents(_ context.Context, run persistence.RunHistory, _ []persistence.RunEvent, _ persistence.RunEventLimits) (persistence.RunHistory, error) {
+	return run, nil
 }
 
 func (s *fingerprintModelStore) CountRunHistoryByIssue(context.Context, string) (int, error) {

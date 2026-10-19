@@ -1,9 +1,9 @@
 import { Meter } from "@base-ui/react/meter";
 
-import { CircleAlertFilledIcon, XIcon } from "@/components/icons";
+import { CheckIcon, CircleAlertFilledIcon, MinusIcon, XIcon } from "@/components/icons";
 import { markWord } from "@/components/StatusMark";
 import { cn } from "@/lib/cn";
-import { ruleLabel } from "@/lib/labels";
+import { reactionCountLabel, ruleLabel } from "@/lib/labels";
 
 import type {
   LaneMarker,
@@ -33,10 +33,19 @@ const MARKER: Record<LaneMarker, string> = {
     "size-3.5 border-2 border-track-done bg-[radial-gradient(circle,var(--color-track-done)_0_3px,var(--color-canvas)_3px)]",
 };
 
-const DOT: Record<StationState, string> = {
+const GLYPH = {
+  escalated: { Icon: XIcon, tone: "text-ink-body" },
+  acted: { Icon: CheckIcon, tone: "text-ink-body" },
+  quiet: { Icon: MinusIcon, tone: "text-ink-muted" },
+};
+
+function isGlyphState(state: StationState): state is keyof typeof GLYPH {
+  return Object.hasOwn(GLYPH, state);
+}
+
+const DOT: Record<Exclude<StationState, keyof typeof GLYPH>, string> = {
   passed: "border-track-done bg-track-done",
   current: "border-track-done bg-track-done",
-  escalated: "border-track-done bg-canvas",
   waiting: "border-dashed border-track-done bg-canvas",
   ahead: "border-track-todo bg-canvas",
   idle: "border-track-todo bg-canvas",
@@ -49,6 +58,22 @@ export function stationX(index: number, count: number): number {
 
 function laneMarkerWord(mark: LaneMarker): string {
   return mark === "ended" ? "Ended today" : markWord(mark);
+}
+
+const STATE_WORD: Partial<Record<StationState, string>> = {
+  acted: "Sortie acted",
+  quiet: "nothing to act on",
+};
+
+function stateWord(state: StationState): string {
+  return STATE_WORD[state] ?? state;
+}
+
+function countLineOf(station: LaneStation, variant: LaneVariant): string {
+  if (station.state !== "acted" || (variant !== "page" && variant !== "lane")) {
+    return "";
+  }
+  return reactionCountLabel(station.key, station.continuations);
 }
 
 /** Props of {@link StageMeter}. */
@@ -171,6 +196,7 @@ export function Lane({
   const agent = stations.findIndex((station) => station.kind === "agent");
   const handoff = stations.findIndex((station) => station.kind === "handoff");
   const hasMeter = position !== null && progress !== null && agent >= 0;
+  const hasCount = stations.some((station) => countLineOf(station, variant) !== "");
   const hasPullRequest =
     variant === "lane" && pullRequestNumber !== null && handoff >= 0 && current >= handoff;
   const reached = current < 0 ? 0 : stationX(current, count) - stationX(0, count);
@@ -186,7 +212,12 @@ export function Lane({
   const track = (
     <div
       aria-hidden="true"
-      className={cn("relative", TRACK_HEIGHT[variant], hasMeter && METER_MARGIN[variant])}
+      className={cn(
+        "relative",
+        TRACK_HEIGHT[variant],
+        hasMeter && METER_MARGIN[variant],
+        !hasMeter && hasCount && variant === "page" && "mb-md",
+      )}
     >
       <div
         className="absolute top-1/2 h-px bg-track-todo"
@@ -196,12 +227,13 @@ export function Lane({
         }}
       />
       <div
-        className="absolute top-[calc(50%-1px)] h-[3px] rounded-full bg-track-done"
+        className="absolute top-[calc(50%-1px)] h-0.75 rounded-full bg-track-done"
         style={{ left: `${stationX(0, count)}%`, width: `${reached}%` }}
       />
       {stations.map((station, index) => {
         const left = `${stationX(index, count)}%`;
         const isCurrent = index === current;
+        const countLine = countLineOf(station, variant);
         return (
           <div key={station.key}>
             {isCurrent ? (
@@ -212,7 +244,7 @@ export function Lane({
                 edge={index === count - 1 ? "end" : index === 0 ? "start" : null}
               />
             ) : (
-              <StationDot station={station} left={left} />
+              <StationDot station={station} left={left} countLine={countLine} />
             )}
             {variant === "page" ? (
               <span
@@ -225,6 +257,17 @@ export function Lane({
                 {station.label}
               </span>
             ) : undefined}
+            {countLine === "" ? undefined : (
+              <span
+                className={cn(
+                  "absolute -translate-x-1/2 text-body-sm whitespace-nowrap text-ink-muted tabular-nums max-md:hidden",
+                  variant === "page" ? "top-[calc(50%+28px)]" : "top-[calc(50%+8px)]",
+                )}
+                style={{ left }}
+              >
+                {countLine}
+              </span>
+            )}
           </div>
         );
       })}
@@ -260,7 +303,12 @@ export function Lane({
     <ol className="sr-only" aria-label="Stations">
       {stations.map((station) => (
         <li key={station.key}>
-          {[station.label, station.state === "idle" ? undefined : station.state, station.time]
+          {[
+            station.label,
+            station.state === "idle" ? undefined : stateWord(station.state),
+            countLineOf(station, variant) || undefined,
+            station.time,
+          ]
             .filter((part) => part !== undefined && part !== null)
             .join(", ")}
         </li>
@@ -294,6 +342,11 @@ export function Lane({
 interface StationMarkProps {
   station: LaneStation;
   left: string;
+}
+
+interface StationDotProps extends StationMarkProps {
+  /** The count line the station shows, or an empty string; the tooltip repeats it. */
+  countLine: string;
 }
 
 interface CurrentMarkerProps extends StationMarkProps {
@@ -332,22 +385,24 @@ function CurrentMarker({ station, left, variant, edge }: CurrentMarkerProps) {
   );
 }
 
-function StationDot({ station, left }: StationMarkProps) {
-  if (station.state === "escalated") {
+function StationDot({ station, left, countLine }: StationDotProps) {
+  if (isGlyphState(station.state)) {
+    const { Icon, tone } = GLYPH[station.state];
+    const word = [stateWord(station.state), countLine].filter((part) => part !== "").join(", ");
     return (
       <span
-        className="absolute top-1/2 -translate-1/2 text-ink-body"
+        className={cn("absolute top-1/2 -translate-1/2", tone)}
         style={{ left }}
-        title={`${station.label}: escalated`}
+        title={`${station.label}: ${word}`}
       >
-        <XIcon className="size-3.5" />
+        <Icon className="size-3.5" />
       </span>
     );
   }
   return (
     <span
       className={cn(
-        "absolute top-1/2 size-[11px] -translate-1/2 rounded-full border-[1.5px]",
+        "absolute top-1/2 size-2.75 -translate-1/2 rounded-full border-[1.5px]",
         DOT[station.state],
       )}
       style={{ left }}

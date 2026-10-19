@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/redact"
 )
 
 // tokenUsageBreakdown is one token-count breakdown inside a
@@ -173,11 +172,4 @@ func mapCodexErrorInfo(info string) domain.AgentErrorKind {
 	default:
 		return domain.ErrTurnFailed
 	}
-}
-
-// summarizeItem returns a short human-readable string for an item
-// event. Truncated to 200 runes.
-func summarizeItem(itemType, itemID string) string {
-	s := fmt.Sprintf("[%s] %s", itemType, itemID)
-	return redact.Truncate(s, 200)
 }

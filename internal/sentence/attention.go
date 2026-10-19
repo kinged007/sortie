@@ -134,7 +134,6 @@ func parkedItem(cause orchestrator.AttentionCause) AttentionItem {
 		template = "attn_parked_handoff_absence"
 	}
 	reason, why, clears := attentionTexts(template, map[string]any{
-		"Key":    issueKey(e.DisplayID, e.Identifier),
 		"Label":  strings.TrimSpace(e.Label),
 		"Unseen": !e.LabelApplied,
 		"State":  strings.TrimSpace(e.ParkedState),
@@ -159,7 +158,6 @@ func parkedItem(cause orchestrator.AttentionCause) AttentionItem {
 
 func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 	e := cause.Budget
-	key := issueKey(e.DisplayID, e.Identifier)
 	evidence := AttentionEvidence{Reason: e.Reason}
 	var template string
 	var data map[string]any
@@ -171,7 +169,6 @@ func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 		}
 		template = "attn_budget_tokens"
 		data = map[string]any{
-			"Key":     key,
 			"Used":    used,
 			"AtLeast": atLeast,
 			"Budget":  new(e.BudgetTokens),
@@ -183,7 +180,6 @@ func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 	} else {
 		template = "attn_budget_sessions"
 		data = map[string]any{
-			"Key":            key,
 			"UsedSessions":   e.UsedSessions,
 			"BudgetSessions": e.BudgetSessions,
 		}
@@ -212,7 +208,6 @@ func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 func escalatedReactionItem(cause orchestrator.AttentionCause, c Context) AttentionItem {
 	e := cause.Reaction
 	data := map[string]any{
-		"Key":           issueKey(e.DisplayID, e.Identifier),
 		"PR":            e.PullRequest.Number,
 		"Trigger":       e.EscalationTrigger,
 		"Tries":         0,

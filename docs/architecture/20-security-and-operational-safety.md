@@ -9,6 +9,7 @@ Operational safety requirements:
 - Deployments should state clearly whether they are intended for trusted environments, more restrictive environments, or both.
 - Deployments should state clearly whether they rely on auto-approved actions, operator approvals, stricter sandboxing, or some combination of those controls.
 - Workspace isolation and path validation are important baseline controls, but they are not a substitute for whatever approval and sandbox policy a deployment chooses.
+- The HTTP server has no authentication. A page served from another origin cannot change state through it: the server refuses such a state-changing request. DNS rebinding is outside this protection. Any other client that reaches the port can change state, so a deployment others can reach sits behind an authenticating reverse proxy or a VPN.
 
 ### 15.2 Filesystem Safety Requirements
 

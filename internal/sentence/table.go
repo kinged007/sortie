@@ -43,22 +43,30 @@ const (
 	inNext       = "{{if .Window}} in the next {{duration .Window}}{{end}}"
 	heldAt       = "{{if .TokenHold}}token budget of {{tokens .Budget}}{{else}}session budget ({{count .Sessions}} of {{count .MaxSessions}} sessions used){{end}}"
 	ofMax        = "{{if .Max}} of {{count .Max}}{{end}}"
-	posture      = "{{if eq .Escalation \"label\"}}applies `{{.EscalationLabel}}` to {{.Key}}" +
-		"{{else if eq .Escalation \"comment\"}}comments on {{.Key}}" +
+	posture      = "{{if eq .Escalation \"label\"}}applies `{{.EscalationLabel}}` to the issue" +
+		"{{else if eq .Escalation \"comment\"}}comments on the issue" +
 		"{{else}}sends `escalation.{{.ConfigKey}}` only to the notification destinations that subscribe to it{{end}}"
+	thePR      = "{{if .PR}}PR #{{.PR}}{{else}}the pull request{{end}}"
 	afterAhead = "{{if eq .Ahead \"retry\"}} after {{retry .AheadTrigger .AheadRunInline .AheadAttempt}} ends" +
 		"{{else if eq .Ahead \"run\"}} after the current run ends{{end}}"
 )
 
+// errorDetail ends a run-error sentence with the text the stored error
+// carried, when it carried any.
+const errorDetail = "{{if .Detail}}: {{.Detail}}{{end}}."
+
+// eventMessage appends an event's message to its sentence when it has one.
+const eventMessage = "{{if .Message}}: {{.Message}}{{end}}"
+
 // Fragments shared by the attention templates.
 const (
-	parkedClears = "Clears when a poll tick finds `{{.Label}}` removed from {{.Key}}{{if .Unseen}} after Sortie has seen it there{{end}}" +
-		"{{if .State}}, or {{.Key}} moved out of {{.State}}{{end}}."
+	parkedClears = "Clears when a poll tick finds `{{.Label}}` removed from the issue{{if .Unseen}} after Sortie has seen it there{{end}}" +
+		"{{if .State}}, or the issue moved out of {{.State}}{{end}}."
 	parkedSeen      = "{{if .Unseen}} (not yet seen on the issue){{end}}"
-	budgetLeaves    = "or after {{.Key}} leaves the active tracker states."
+	budgetLeaves    = "or after the issue leaves the active tracker states."
 	triesOfMax      = "{{count .Tries}}{{if .HasMax}} of {{count .Max}}{{end}}"
 	orLeavesHandoff = "{{if .Handoff}} or leaves {{.Handoff}}{{end}}"
-	terminalExit    = "{{.Key}} reaches a terminal tracker state" + orLeavesHandoff
+	terminalExit    = "the issue reaches a terminal tracker state" + orLeavesHandoff
 	latestCheck     = "{{if eq .Latest \"failing\"}}; the latest check found " +
 		"{{if .FailingChecks}}{{list .FailingChecks}} failing{{else}}{{plural .FailingN \"failing check\" \"failing checks\"}}{{end}}" +
 		"{{else if eq .Latest \"pending\"}}; the latest check found CI pending{{end}}"
@@ -84,173 +92,173 @@ func onBudget(text string) string {
 var table = map[string]parts{
 	"run_work": {
 		short: "Turn {{count .Turn}}" + onStage,
-		long:  "{{.Key}} is running" + stagePlace + ", turn {{count .Turn}}.",
+		long:  "Running" + stagePlace + ", turn {{count .Turn}}.",
 	},
 	"run_starting": {
 		short: "Starting, no turn yet",
-		long:  "{{.Key}} is starting" + stagePlace + "; no turn has begun yet.",
+		long:  "Starting" + stagePlace + "; no turn has begun yet.",
 	},
 	"run_self_review": {
 		short: "Self-review" + iteration + onStage,
-		long:  "{{.Key}} is in self-review" + onStagePlace + iteration + ".",
+		long:  "In self-review" + onStagePlace + iteration + ".",
 	},
 	"run_ci_fix": {
 		short: "Fixing CI on #{{.PR}}, fix {{count .Attempt}}" + ofLimit,
-		long:  "{{.Key}} is fixing CI on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
+		long:  "Fixing CI on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
 	},
 	"run_merge_conflict": {
 		short: "Resolving the merge conflict on #{{.PR}}, rebase {{count .Attempt}}" + ofLimit,
-		long:  "{{.Key}} is resolving the merge conflict on PR #{{.PR}}, rebase {{count .Attempt}}" + ofLimit + ".",
+		long:  "Resolving the merge conflict on PR #{{.PR}}, rebase {{count .Attempt}}" + ofLimit + ".",
 	},
 	"run_review_fix": {
 		short: "Answering review comments on #{{.PR}}, fix {{count .Attempt}}" + ofLimit,
-		long:  "{{.Key}} is answering review comments on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
+		long:  "Answering review comments on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
 	},
 	"run_bot_review_fix": {
 		short: "Answering bot review comments on #{{.PR}}, fix {{count .Attempt}}" + ofLimit,
-		long:  "{{.Key}} is answering bot review comments on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
+		long:  "Answering bot review comments on PR #{{.PR}}, fix {{count .Attempt}}" + ofLimit + ".",
 	},
 	"run_label_review": {
 		short: "Reviewing #{{.PR}}{{if .Label}} for `{{.Label}}`{{end}}",
-		long:  "{{.Key}} is reviewing PR #{{.PR}}{{if .Label}}, as the `{{.Label}}` label asked{{end}}.",
+		long:  "Reviewing PR #{{.PR}}{{if .Label}}, as the `{{.Label}}` label asked{{end}}.",
 	},
 	"run_label_fix": {
 		short: "Fixing #{{.PR}}{{if .Label}} for `{{.Label}}`{{end}}",
-		long:  "{{.Key}} is fixing PR #{{.PR}}{{if .Label}}, as the `{{.Label}}` label asked{{end}}.",
+		long:  "Fixing PR #{{.PR}}{{if .Label}}, as the `{{.Label}}` label asked{{end}}.",
 	},
 
 	"retry_paused": {
 		short: "Retry {{count .Attempt}} paused: {{.Reason}}",
-		long:  "{{.Key}}'s retry {{count .Attempt}} is paused: {{.Reason}}; next check {{due .Due}}.",
+		long:  "Retry {{count .Attempt}} is paused: {{.Reason}}; next check {{due .Due}}.",
 	},
 	"retry_due_now": {
 		short: "Retry {{count .Attempt}} due now",
-		long:  "{{.Key}}'s retry {{count .Attempt}} is due now.",
+		long:  "Retry {{count .Attempt}} is due now.",
 	},
 	"retry_error": {
 		short: "Retry {{count .Attempt}} {{due .Due}} after an error",
-		long:  "{{.Key}}'s last run ended with an error{{if .Error}}: {{.Error}}{{end}}. Retry {{count .Attempt}} {{due .Due}}.",
+		long:  "The last run ended with an error{{if .Error}}: {{.Error}}{{end}}. Retry {{count .Attempt}} {{due .Due}}.",
 	},
 	"retry_continuation": {
 		short: "Next run {{due .Due}}: the issue is still active",
-		long:  "{{.Key}}'s last run ended cleanly and the issue is still active; next run {{due .Due}}.",
+		long:  "The last run ended cleanly and the issue is still active; next run {{due .Due}}.",
 	},
 	"retry_stall": {
 		short: "Retry {{count .Attempt}} {{due .Due}}: the agent stalled",
-		long:  "{{.Key}}'s last run stalled: the agent sent no event within the stall timeout. Retry {{count .Attempt}} {{due .Due}}.",
+		long:  "The last run stalled: the agent sent no event within the stall timeout. Retry {{count .Attempt}} {{due .Due}}.",
 	},
 	"retry_timer": {
 		short: "Retry {{count .Attempt}} {{due .Due}}: {{.Reason}}",
-		long:  "{{.Key}}'s retry came due and was not dispatched: {{.Reason}}. Retry {{count .Attempt}} {{due .Due}}.",
+		long:  "The retry came due and was not dispatched: {{.Reason}}. Retry {{count .Attempt}} {{due .Due}}.",
 	},
 	"retry_ci_fix": {
 		short: "CI fix run {{due .Due}}",
-		long:  "{{.Key}}: CI failed on its pull request; fix run {{due .Due}}.",
+		long:  "CI failed on the pull request; fix run {{due .Due}}.",
 	},
 	"retry_reaction": {
 		short: "{{.Run}} {{due .Due}}",
-		long:  "{{.Key}}: {{.RunInline}} {{due .Due}}.",
+		long:  "{{.Run}} {{due .Due}}.",
 	},
 	"retry_generic": {
 		short: "Retry {{count .Attempt}} {{due .Due}}",
-		long:  "{{.Key}}: retry {{count .Attempt}} {{due .Due}}.",
+		long:  "Retry {{count .Attempt}} {{due .Due}}.",
 	},
 
 	"held_budget_tokens": {
 		short: "Held: token budget reached",
-		long:  "{{.Key}} is held at its token budget{{if .HasBudget}} of {{tokens .Budget}}{{end}}. Tokens used: {{if .AtLeast}}at least {{end}}{{tokens .Used}}.",
+		long:  "Held at the token budget{{if .HasBudget}} of {{tokens .Budget}}{{end}}. Tokens and cache reads used: {{if .AtLeast}}at least {{end}}{{tokens .Used}}.",
 	},
 	"held_budget_sessions": {
 		short: "Held: session budget reached",
-		long:  "{{.Key}} is held at its session budget" + ofLimit + ". Sessions used: {{count .Sessions}}.",
+		long:  "Held at the session budget" + ofLimit + ". Sessions used: {{count .Sessions}}.",
 	},
 
 	"parked_agent_blocked": {
 		short: "Parked: the agent needs a person",
-		long:  "{{.Key}} is parked: the agent stopped because it cannot go on without a person. " + parkingLabel,
+		long:  "Parked: the agent stopped because it cannot go on without a person. " + parkingLabel,
 	},
 	"parked_handoff_absence": {
 		short: "Parked: no evidence of work",
-		long:  "{{.Key}} is parked: its runs ended without evidence of work as many times in a row as the limit allows. " + parkingLabel,
+		long:  "Parked: the issue's runs ended without evidence of work as many times in a row as the limit allows. " + parkingLabel,
 	},
 
 	"held_escalated_ci": {
 		short: "CI escalated on #{{.PR}}",
-		long:  "{{.Key}}: Sortie escalated failing CI on PR #{{.PR}}; it keeps watching the pull request." + usedCount,
+		long:  "Sortie escalated failing CI on PR #{{.PR}}; it keeps watching the pull request." + usedCount,
 	},
 	"held_escalated_reaction": {
 		short: "{{.KindInitial}} escalated on #{{.PR}}",
-		long:  "{{.Key}}: Sortie escalated {{.KindInline}} on PR #{{.PR}}." + usedCount,
+		long:  "Sortie escalated {{.KindInline}} on PR #{{.PR}}." + usedCount,
 	},
 	"wait_ci": {
 		short: "Waiting on CI for #{{.PR}}" + ciProgress,
-		long:  "{{.Key}} is waiting on CI for PR #{{.PR}}" + ciProgress + "; " + nextCheck + "." + usedCount,
+		long:  "Waiting on CI for PR #{{.PR}}" + ciProgress + "; " + nextCheck + "." + usedCount,
 	},
 	"wait_ci_passing": {
 		short: "CI passing on #{{.PR}}",
-		long:  "{{.Key}}: CI passes on PR #{{.PR}} ({{count .Passing}} passing); " + nextCheck + "." + usedCount,
+		long:  "CI passes on PR #{{.PR}} ({{count .Passing}} passing); " + nextCheck + "." + usedCount,
 	},
 	"wait_ci_failing": {
 		short: "CI failing on #{{.PR}}",
-		long:  "{{.Key}}: CI fails on PR #{{.PR}}: " + failingList + "; " + nextCheck + "." + usedCount,
+		long:  "CI fails on PR #{{.PR}}: " + failingList + "; " + nextCheck + "." + usedCount,
 	},
 	"wait_review_debounce": {
 		short: newComments + " on #{{.PR}}; next check {{due .Next}}",
-		long:  "{{.Key}} has " + newComments + " on PR #{{.PR}} ({{count .Actionable}} actionable) and waits for the comments to settle; next check {{due .Next}}." + usedCount,
+		long:  "Waiting for " + newComments + " on PR #{{.PR}} ({{count .Actionable}} actionable) to settle; next check {{due .Next}}." + usedCount,
 	},
 	"wait_review": {
 		short: "Waiting on review of #{{.PR}}",
-		long:  "{{.Key}} is waiting on review of PR #{{.PR}}" + commentsOf + "; " + nextCheck + "." + usedCount,
+		long:  "Waiting on review of PR #{{.PR}}" + commentsOf + "; " + nextCheck + "." + usedCount,
 	},
 	"wait_bot": {
 		short: "Waiting on bot review of #{{.PR}}",
-		long:  "{{.Key}} is waiting on bot review of PR #{{.PR}}{{if .Bots}} by {{.Bots}}{{end}}" + commentsOf + "; " + nextCheck + "." + usedCount,
+		long:  "Waiting on bot review of PR #{{.PR}}{{if .Bots}} by {{.Bots}}{{end}}" + commentsOf + "; " + nextCheck + "." + usedCount,
 	},
 	"wait_merge": {
 		short: "Auto-merge waiting on #{{.PR}}",
-		long:  "{{.Key}}: auto-merge waits for PR #{{.PR}} to meet its merge conditions{{if .Strategy}} ({{.Strategy}} strategy){{end}}; " + nextCheck + "." + usedCount,
+		long:  "Auto-merge waits for PR #{{.PR}} to meet its merge conditions{{if .Strategy}} ({{.Strategy}} strategy){{end}}; " + nextCheck + "." + usedCount,
 	},
 	"merge_conflict_found": {
 		short: "Merge conflict on #{{.PR}}",
-		long:  "{{.Key}}: PR #{{.PR}} has a merge conflict; " + nextCheck + "." + usedCount,
+		long:  "PR #{{.PR}} has a merge conflict; " + nextCheck + "." + usedCount,
 	},
 	"wait_merge_conflict": {
 		short: "Watching #{{.PR}} for merge conflicts",
-		long:  "{{.Key}}: Sortie watches PR #{{.PR}} for merge conflicts; {{.Mergeability}}; " + nextCheck + "." + usedCount,
+		long:  "Sortie watches PR #{{.PR}} for merge conflicts; {{.Mergeability}}; " + nextCheck + "." + usedCount,
 	},
 	"wait_merge_completion": {
 		short: "Waiting for #{{.PR}} to merge",
-		long:  "{{.Key}} waits{{if .Handoff}} in {{.Handoff}}{{end}} for PR #{{.PR}} to merge{{if .Target}}, then Sortie moves it to {{.Target}}{{end}}; " + nextCheck + "." + usedCount,
+		long:  "Waiting{{if .Handoff}} in {{.Handoff}}{{end}} for PR #{{.PR}} to merge{{if .Target}}, then Sortie moves the issue to {{.Target}}{{end}}; " + nextCheck + "." + usedCount,
 	},
 	"wait_label_command": {
 		short: "Watching #{{.PR}} for " + watched,
-		long:  "{{.Key}}: Sortie watches PR #{{.PR}} for " + watched + "; " + nextCheck + ".",
+		long:  "Sortie watches PR #{{.PR}} for " + watched + "; " + nextCheck + ".",
 	},
 	"wait_reaction": {
 		short: "Waiting on #{{.PR}}",
-		long:  "{{.Key}} waits on a pull request reaction for PR #{{.PR}}; " + nextCheck + ".",
+		long:  "Waiting on a pull request reaction for PR #{{.PR}}; " + nextCheck + ".",
 	},
 
 	"attn_parked_agent_blocked": {
 		reason: "Parked: the agent needs a person",
-		why:    "The agent stopped because it cannot go on without a person, so Sortie parked {{.Key}} under the label `{{.Label}}`" + parkedSeen + ".",
+		why:    "The agent stopped because it cannot go on without a person, so Sortie parked the issue under the label `{{.Label}}`" + parkedSeen + ".",
 		clears: parkedClears,
 	},
 	"attn_parked_handoff_absence": {
 		reason: "Parked: no evidence of work",
-		why: "{{.Key}}'s runs ended without evidence of work as many times in a row as `agent.max_consecutive_absences` allows, " +
+		why: "The issue's runs ended without evidence of work as many times in a row as `agent.max_consecutive_absences` allows, " +
 			"so Sortie parked it under the label `{{.Label}}`" + parkedSeen + ".",
 		clears: parkedClears,
 	},
 	"attn_budget_tokens": {
 		reason: "Token budget reached",
-		why: "{{.Key}} has used {{if .AtLeast}}at least {{end}}{{tokens .Used}} tokens of its budget of {{tokens .Budget}}" +
+		why: "The issue has used {{if .AtLeast}}at least {{end}}{{tokens .Used}} tokens and cache reads of its budget of {{tokens .Budget}}" +
 			"{{if .Stopped}}, and the budget stopped {{plural .Stopped \"session\" \"sessions\"}} mid-run{{end}}.",
-		clears: "Clears on the next poll tick after `agent.max_tokens` is raised above what {{.Key}} has used or is removed, " + budgetLeaves,
+		clears: "Clears on the next poll tick after `agent.max_tokens` is raised above what the issue has used or is removed, " + budgetLeaves,
 	},
 	"attn_budget_sessions": {
 		reason: "Session budget reached",
-		why:    "{{.Key}} has used {{plural .UsedSessions \"session\" \"sessions\"}} of its budget of {{count .BudgetSessions}}.",
+		why:    "The issue has used {{plural .UsedSessions \"session\" \"sessions\"}} of its budget of {{count .BudgetSessions}}.",
 		clears: "Clears on the next poll tick after `agent.max_sessions` is raised above {{count .UsedSessions}} or is removed, " + budgetLeaves,
 	},
 	"attn_reload": {
@@ -307,10 +315,10 @@ var table = map[string]parts{
 	"attn_escalated_merge_completion": {
 		reason: "Merge completion escalated on #{{.PR}}",
 		why: ifTrigger(orchestrator.EscalationTriggerRefused) +
-			"Sortie could not move {{.Key}}{{if .Target}} to {{.Target}}{{end}} after PR #{{.PR}} merged, because the tracker refused the move." +
+			"Sortie could not move the issue{{if .Target}} to {{.Target}}{{end}} after PR #{{.PR}} merged, because the tracker refused the move." +
 			elseIfTrigger(orchestrator.EscalationTriggerMissingMergeCommit) +
-			"PR #{{.PR}} merged, but the forge reports no merge commit for it, so Sortie has not moved {{.Key}}{{if .Target}} to {{.Target}}{{end}}." +
-			"{{else}}Sortie could not move {{.Key}}{{if .Target}} to {{.Target}}{{end}} after PR #{{.PR}} merged: " +
+			"PR #{{.PR}} merged, but the forge reports no merge commit for it, so Sortie has not moved the issue{{if .Target}} to {{.Target}}{{end}}." +
+			"{{else}}Sortie could not move the issue{{if .Target}} to {{.Target}}{{end}} after PR #{{.PR}} merged: " +
 			"{{plural .Tries \"tracker move\" \"tracker moves\"}} failed.{{end}}",
 		clears: "Clears when " + terminalExit +
 			ifTrigger(orchestrator.EscalationTriggerMissingMergeCommit) + ", or when the forge reports the merge commit of PR #{{.PR}}{{end}}.",
@@ -318,66 +326,66 @@ var table = map[string]parts{
 
 	"stage_wait": {
 		short: "Between stages: {{.Source}} to {{.Target}}",
-		long:  "{{.Key}} moved from stage {{.Source}} to stage {{.Target}}, and Sortie added `{{.Label}}`; {{.Target}} starts when a poll tick reads that label on the issue.",
+		long:  "Moved from stage {{.Source}} to stage {{.Target}}, and Sortie added `{{.Label}}`; {{.Target}} starts when a poll tick reads that label on the issue.",
 	},
 
 	"ended_handed": {
 		short: "Handed off to {{.State}}",
-		long:  "{{.Key}} was handed off: Sortie moved it to {{.State}}.",
+		long:  "Handed off: Sortie moved the issue to {{.State}}.",
 	},
 	"ended_not_advanced": {
 		short: "Handed off to {{.State}}; stage {{.Target}} not reached",
-		long:  "{{.Key}} was handed off to {{.State}} because the hop to stage {{.Target}} was not made: {{.Why}}.",
+		long:  "Handed off to {{.State}} because the hop to stage {{.Target}} was not made: {{.Why}}.",
 	},
 	"ended_merged": {
 		short: "Merged #{{.PR}}",
-		long:  "{{.Key}} ended merged: {{.HowBefore}}{{.PR}}{{.HowAfter}}.",
+		long:  "Ended merged: {{.HowBefore}}{{.PR}}{{.HowAfter}}.",
 	},
 	"ended_done": {
 		short: "Reached {{.State}}",
-		long:  "{{.Key}} reached the tracker state {{.State}}.",
+		long:  "Reached the tracker state {{.State}}.",
 	},
 	"ended_none": {
 		short: "Not active; no ending recorded",
-		long:  "{{.Key}} is not active, and Sortie recorded no ending for its latest work.",
+		long:  "Not active, and Sortie recorded no ending for the latest work.",
 	},
 
 	"next_if_run_succeeds": {condition: "If the run succeeds"},
 	"next_if_run_fails":    {condition: "If the run fails"},
-	"next_if_tokens_reach": {condition: "If {{.Key}}'s token use reaches {{tokens .Budget}}"},
+	"next_if_tokens_reach": {condition: "If tokens and cache reads reach {{tokens .Budget}}"},
 	"next_when_retry_due":  {condition: "When {{retry .Trigger .RunInline .Attempt}} comes due"},
-	"next_when_label_read": {condition: "When a poll tick reads `{{.Label}}` on {{.Key}}"},
-	"next_if_ci_fails":     {condition: "If a check" + inNext + " finds CI failing on PR #{{.PR}}"},
-	"next_if_review_comments": {condition: "{{if .Settle}}When the new review comments on PR #{{.PR}} settle" + inNext +
-		"{{else}}If a check" + inNext + " finds new review comments on PR #{{.PR}}{{end}}"},
+	"next_when_label_read": {condition: "When a poll tick reads `{{.Label}}` on the issue"},
+	"next_if_ci_fails":     {condition: "If a check" + inNext + " finds CI failing on " + thePR},
+	"next_if_review_comments": {condition: "{{if .Settle}}When the new review comments on " + thePR + " settle" + inNext +
+		"{{else}}If a check" + inNext + " finds new review comments on " + thePR + "{{end}}"},
 	"next_if_bot_comments": {condition: "If a check" + inNext + " finds " +
-		"{{if .Spent}}a new review bot comment on the code of PR #{{.PR}}{{else}}new review bot comments on PR #{{.PR}}{{end}}"},
-	"next_if_merge_conflict": {condition: "If a check" + inNext + " finds a new merge conflict on PR #{{.PR}}"},
-	"next_when_merge_ready": {condition: "When a check" + inNext + " finds that PR #{{.PR}} " +
+		"{{if .Spent}}a new review bot comment on the code of " + thePR + "{{else}}new review bot comments on " + thePR + "{{end}}"},
+	"next_if_merge_conflict": {condition: "If a check" + inNext + " finds a new merge conflict on " + thePR},
+	"next_when_merge_ready": {condition: "When a check" + inNext + " finds that " + thePR + " " +
 		"{{if .RequireCI}}passes CI and meets its other merge conditions{{else}}meets its merge conditions{{end}}"},
-	"next_when_pr_merges": {condition: "When PR #{{.PR}} merges"},
-	"next_if_label_added": {condition: "If `{{.Label}}` is added to PR #{{.PR}}"},
+	"next_when_pr_merges": {condition: "When " + thePR + " merges"},
+	"next_if_label_added": {condition: "If `{{.Label}}` is added to " + thePR},
 
 	"next_stage":      {text: "Sortie adds `{{.Label}}`, and a poll tick then starts stage {{.Next}} in a new session."},
-	"next_stage_held": {text: "Sortie adds `{{.Label}}`, then holds {{.Key}} at its " + heldAt + " before stage {{.Next}} starts."},
+	"next_stage_held": {text: "Sortie adds `{{.Label}}`, then holds the issue at its " + heldAt + " before stage {{.Next}} starts."},
 	"next_handoff": {text: "{{if .AtCeiling}}The hop count is at its ceiling ({{count .Hops}} of {{count .Ceiling}}), so stage {{.Next}} does not start: {{end}}" +
-		"Sortie moves {{.Key}} to {{.Handoff}}" +
+		"Sortie moves the issue to {{.Handoff}}" +
 		"{{if .NoChange}}, or to {{.NoChange}} if the agent reports that nothing needed changing{{end}}" +
 		"{{if .Watch}}, and a pull request the run leaves gets the {{series .Watch}} {{if gt (len .Watch) 1}}reactions{{else}}reaction{{end}}{{end}}."},
-	"next_continue":   {text: "Sortie dispatches another session for {{.Key}} if it is still in an active state."},
-	"next_backoff":    {text: "Sortie retries {{.Key}} with exponential backoff."},
-	"next_token_stop": {text: "Sortie stops the session and holds {{.Key}} at its token budget."},
-	"next_dispatch": {text: "Sortie dispatches {{.Key}}" + onStage + " in a new session" +
-		"{{if .ActiveState}} if it is still in an active state{{end}}."},
+	"next_continue":   {text: "Sortie dispatches another session if the issue is still in an active state."},
+	"next_backoff":    {text: "Sortie retries with exponential backoff."},
+	"next_token_stop": {text: "Sortie stops the session and holds the issue at its token budget."},
+	"next_dispatch": {text: "Sortie dispatches a new session" + onStage +
+		"{{if .ActiveState}} if the issue is still in an active state{{end}}."},
 	"next_stage_start": {text: "Stage {{.Next}} starts in a new session."},
 	"next_fix": {text: "Sortie dispatches {{.Run}} {{count .N}}" + ofMax +
 		"{{if .Debounce}} once no newer comment arrives for {{duration .Debounce}}{{end}}."},
 	"next_escalate": {text: "{{.Runs}} are used up ({{count .Used}} of {{count .Max}}), so Sortie " + posture + " and keeps watching the pull request." +
 		"{{if .Restart}} A new commit that no Sortie run made can restart the count.{{end}}"},
 	"next_triage":           {text: "Sortie runs the triage command, and its answer decides what follows."},
-	"next_held":             {text: "Sortie holds {{.Key}} at its " + heldAt + "."},
+	"next_held":             {text: "Sortie holds the issue at its " + heldAt + "."},
 	"next_auto_merge":       {text: "Auto-merge merges it with the {{.Strategy}} strategy{{if .DeleteBranch}} and deletes its branch{{end}}."},
-	"next_merge_completion": {text: "Sortie moves {{.Key}} to {{.State}}."},
+	"next_merge_completion": {text: "Sortie moves the issue to {{.State}}."},
 	"next_label_command":    {text: "Sortie dispatches {{.What}} of the pull request" + afterAhead + "."},
 
 	"ctl_refresh":           {text: "Tracker poll and reconciliation queued."},
@@ -389,6 +397,55 @@ var table = map[string]parts{
 	"ctl_acknowledge":         {text: "Acknowledged{{if .Key}} {{.Key}} ({{.Reason}}){{else}}: {{.Reason}}{{end}}. It comes back only if a new cause appears."},
 	"ctl_acknowledge_already": {text: "Already acknowledged{{if .Key}} {{.Key}} ({{.Reason}}){{else}}: {{.Reason}}{{end}}. It comes back only if a new cause appears."},
 	"ctl_acknowledge_refused": {text: "Nothing acknowledged: Sortie is shutting down."},
+
+	"event_session_started":       {text: "Session started."},
+	"event_startup_failed":        {text: "The session failed to start" + eventMessage + "."},
+	"event_turn_completed":        {text: "Turn completed" + eventMessage + "."},
+	"event_turn_failed":           {text: "Turn failed" + eventMessage + "."},
+	"event_turn_cancelled":        {text: "Turn cancelled" + eventMessage + "."},
+	"event_turn_ended_with_error": {text: "Turn ended with an error" + eventMessage + "."},
+	"event_turn_input_required": {text: "Turn ended: {{if .Message}}{{.Message}}{{else}}" +
+		"the agent asked for a decision only a person can make{{end}}."},
+	"event_tool_result": {text: "Ran {{.Tool}}{{if .HasDuration}} in {{duration .Duration}}{{end}}" +
+		"{{if .ToolError}}; it returned an error.{{else}}.{{end}}"},
+	"event_notification":  {text: "{{.Raw}}"},
+	"event_other_message": {text: "{{.Raw}}"},
+	"event_malformed":     {text: "Sortie could not read a message from the agent" + eventMessage + "."},
+
+	"run_error_absence":      {text: "The agent finished without changing anything, so Sortie did not hand the issue off."},
+	"run_error_undetermined": {text: "Sortie could not tell whether the agent changed anything, so it did not hand the issue off."},
+	"run_error_withheld":     {text: "Sortie did not hand the issue off" + errorDetail},
+
+	"run_error_agent_not_found":       {text: "Sortie could not find the agent command" + errorDetail},
+	"run_error_invalid_workspace_cwd": {text: "The agent could not use the workspace directory" + errorDetail},
+	"run_error_response_timeout":      {text: "The agent did not respond in time" + errorDetail},
+	"run_error_turn_timeout":          {text: "The agent did not finish {{.Turn}} within the turn time limit, so Sortie stopped it."},
+	"run_error_port_exit":             {text: "The agent process ended unexpectedly" + errorDetail},
+	"run_error_response_error":        {text: "The agent returned an error" + errorDetail},
+	"run_error_turn_failed":           {text: "The agent reported that {{.Turn}} failed" + errorDetail},
+	"run_error_turn_cancelled":        {text: "Sortie stopped the session before the agent finished {{if .Start}}starting{{else}}{{.Turn}}{{end}}."},
+	"run_error_turn_input_required":   {text: "The agent stopped {{.Turn}} and asked for input" + errorDetail},
+	"run_error_turn_incomplete":       {text: "The agent ended {{.Turn}} without finishing the task" + errorDetail},
+	"run_error_turn_refused":          {text: "The agent declined to continue {{.Turn}}" + errorDetail},
+	"run_error_turn_outcome_unknown":  {text: "The agent ended {{.Turn}} with an outcome Sortie could not read" + errorDetail},
+	"run_error_turn_token_limit":      {text: "The agent ended {{.Turn}} because a token limit was reached" + errorDetail},
+	"run_error_turn_request_limit":    {text: "The agent ended {{.Turn}} because it used up its request limit" + errorDetail},
+	"run_error_credential_unverified": {text: "The agent could not confirm its credential before the first turn" + errorDetail},
+	"run_error_agent_other":           {text: "The agent reported an error" + errorDetail},
+	"run_error_turn_ended":            {text: "The agent ended {{.Turn}} early{{if .Detail}} ({{.Detail}}){{end}}."},
+	"run_error_stage_stopped":         {text: "Sortie stopped the run while {{.Doing}}."},
+	"run_error_stage_timeout":         {text: "Sortie gave up on {{.Doing}} because it took too long."},
+	"run_error_stage":                 {text: "Sortie hit an error while {{.Doing}}" + errorDetail},
+	"run_error_panic":                 {text: "Sortie hit an internal error while running the agent" + errorDetail},
+	"run_error_stopped":               {text: "Sortie stopped the run before it finished."},
+	"run_error_out_of_time":           {text: "The run ran out of time."},
+
+	"stall_marker": {
+		short: "No events for {{elapsed .Silence}}; Sortie stops it after {{duration .Timeout}}",
+		long: "No agent event for at least {{elapsed .Silence}}; Sortie stops the session as stalled after " +
+			"{{duration .Timeout}} without one (`agent.stall_timeout_ms`).",
+	},
+	"stall_off": {text: "Stall detection is off; Sortie will not stop this session as stalled (`agent.stall_timeout_ms`)."},
 
 	"health_poll_unrun": {text: "Sortie has not polled the tracker yet."},
 	"health_poll_pass":  {text: "The latest poll read the tracker without an error."},

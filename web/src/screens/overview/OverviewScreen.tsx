@@ -7,6 +7,7 @@ import { useEndedQuery, useFirstRunQuery, useStateQuery, useTallyQuery } from "@
 import { useHold, useLive, useNow } from "@/app/live";
 import { useShortcuts } from "@/app/keys";
 import { useAttentionActions } from "@/components/use-attention-actions";
+import { useOpenLatestSession } from "@/components/use-open-session";
 import { usePeek } from "@/components/use-peek";
 import { activeRows, filterRows } from "@/lib/active-rows";
 import { condition } from "@/lib/condition";
@@ -53,7 +54,7 @@ function isHistoryUnavailable(error: unknown): boolean {
   return error instanceof ApiError && error.status === 503 && error.code === "history_unavailable";
 }
 
-function endedEmpty(view: OverviewView, endedCount: number): EndedEmpty {
+function endedEmpty(view: OverviewView): EndedEmpty {
   if (view.isHistoryUnavailable) {
     return "unavailable";
   }
@@ -63,7 +64,7 @@ function endedEmpty(view: OverviewView, endedCount: number): EndedEmpty {
   if (view.pages === undefined) {
     return "loading";
   }
-  return endedCount === 0 ? "none" : "all-read";
+  return "none";
 }
 
 interface OverviewBodyProps {
@@ -77,6 +78,7 @@ function OverviewBody({ state }: OverviewBodyProps) {
   const { identifier: peekIdentifier, open, follow, close } = usePeek();
   const { paused } = useLive();
   const actions = useAttentionActions();
+  const openLatestSession = useOpenLatestSession();
   const readSet = useReadSet();
   const now = useNow();
   const midnight = localMidnight(now).toISOString();
@@ -118,10 +120,12 @@ function OverviewBody({ state }: OverviewBodyProps) {
     () => (view.pages === undefined ? [] : buildEnded(view.pages, view.state)),
     [view.pages, view.state],
   );
-  const endedUnread = useMemo(
+  const endedUnreadIds = useMemo(
     () =>
-      endedAll.filter(
-        (issue) => !view.readSet.has(endedKey(issue.issueId, issue.outcome.observed_at)),
+      new Set(
+        endedAll
+          .filter((issue) => !view.readSet.has(endedKey(issue.issueId, issue.outcome.observed_at)))
+          .map((issue) => issue.issueId),
       ),
     [endedAll, view.readSet],
   );
@@ -138,13 +142,13 @@ function OverviewBody({ state }: OverviewBodyProps) {
         identifier: row.identifier,
         attention: null,
       })),
-      ...endedUnread.map((issue) => ({
+      ...endedAll.map((issue) => ({
         key: endedNavKey(issue.issueId),
         identifier: issue.identifier,
         attention: null,
       })),
     ],
-    [unacknowledged, visibleRows, endedUnread],
+    [unacknowledged, visibleRows, endedAll],
   );
 
   const foundIndex =
@@ -229,6 +233,13 @@ function OverviewBody({ state }: OverviewBodyProps) {
     }
   }
 
+  function handleOpenSession() {
+    const identifier = peekIdentifier ?? selected?.identifier;
+    if (identifier) {
+      openLatestSession(identifier);
+    }
+  }
+
   function actionTarget(): AttentionItemResponse | undefined {
     if (isHeld) {
       if (selected?.attention && selected.attention.issue_identifier === peekIdentifier) {
@@ -246,6 +257,7 @@ function OverviewBody({ state }: OverviewBodyProps) {
     { keys: ["k", "ArrowUp"], run: () => move(-1) },
     { keys: [" "], run: handleTogglePeek },
     { keys: ["Enter"], run: handleOpenPage },
+    { keys: ["o"], run: handleOpenSession },
     {
       keys: ["a"],
       run: () => {
@@ -312,8 +324,9 @@ function OverviewBody({ state }: OverviewBodyProps) {
         onOpen={(row) => selectAndOpen(activeNavKey(row.issueId), row.identifier)}
       />
       <EndedToday
-        rows={endedUnread}
-        empty={endedEmpty(view, endedAll.length)}
+        rows={endedAll}
+        unreadIds={endedUnreadIds}
+        empty={endedEmpty(view)}
         tally={tallyText}
         selectedKey={selectedKey}
         showSelection={showSelection}

@@ -398,7 +398,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid step_start payload"})
 				return domain.TurnResult{}, nil, false
 			}
-			agentcore.EmitNotification(emit, "step started")
+			agentcore.EmitNotification(emit, "")
 
 		case "text":
 			part, err := parseTextPart(rawEvent.Part)
@@ -415,11 +415,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 				return domain.TurnResult{}, nil, false
 			}
 			runtime.work.ObserveAssistantOutput()
-			emit(domain.AgentEvent{
-				Type:      domain.EventOtherMessage,
-				Timestamp: now,
-				Message:   "reasoning block",
-			})
+			agentcore.EmitNotification(emit, "")
 
 		case "tool_use":
 			part, err := parseToolPart(rawEvent.Part)
@@ -446,7 +442,7 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 			if stepFinishEndsTurn(part.Reason) {
 				runtime.turnFinished = true
 			}
-			agentcore.EmitNotification(emit, fmt.Sprintf("step finished: %s", part.Reason))
+			agentcore.EmitNotification(emit, "")
 
 		case "error":
 			runtime.terminalOutcome = domain.EventTurnFailed

@@ -28,6 +28,21 @@ export interface ActiveIssueResponse {
   dispatched_at: string | null;
   status_text: string;
   status_text_full: string;
+  pr_loop: Record<string, PrLoopStationResponse> | null;
+}
+
+export interface AgentEventFrame {
+  dispatch_id: string;
+  seq: number;
+  at: string;
+  event: string;
+  message: string;
+  text: string;
+  session_id?: string;
+  tool_name?: string;
+  duration_ms?: number;
+  tool_error?: boolean;
+  usage?: TokenInfo | null;
 }
 
 export interface AttemptsInfo {
@@ -159,6 +174,37 @@ export interface ErrorResponse {
   error: ErrorDetail;
 }
 
+export interface Funnel {
+  stages: FunnelStage[] | null;
+}
+
+export interface FunnelArrivals {
+  hop: number;
+  match: number;
+  label: number;
+}
+
+export interface FunnelOutcomes {
+  advanced: number;
+  handed_off: number;
+  ceiling: number;
+  hop_failed: number;
+  no_hop: number;
+  in_stage: number;
+}
+
+export interface FunnelStage {
+  rule: string;
+  entry: boolean;
+  last: boolean;
+  runs: number;
+  entered: number;
+  arrivals: FunnelArrivals;
+  outcomes: FunnelOutcomes;
+  no_hop_reasons: NoHopReason[] | null;
+  median_seconds: number | null;
+}
+
 export interface Group {
   name: string;
   runs: number;
@@ -191,6 +237,7 @@ export interface HistoryTotalsResponse {
   run_count: number;
   unmeasured_runs: number;
   tokens: TokenInfo;
+  uncached_tokens: number | null;
   tokens_complete: boolean;
   estimated_cost_usd: number | null;
   cost_status: string;
@@ -218,10 +265,11 @@ export interface IssueDetailResponse {
   parked: ParkedEntryResponse | null;
   pending_reactions: PendingReactionResponse[] | null;
   between_stages: StageHopResponse | null;
-  recent_events: unknown[] | null;
+  recent_events: RunEventResponse[] | null;
   last_error: string | null;
   tracked: Record<string, unknown> | null;
   history: IssueHistoryResponse | null;
+  pr_loop: Record<string, PrLoopStationResponse> | null;
   status_text: string;
   status_text_full: string;
   next_outcomes: NextOutcomeResponse[] | null;
@@ -282,6 +330,11 @@ export interface LastStageResponse {
 export interface NextOutcomeResponse {
   condition: string;
   text: string;
+}
+
+export interface NoHopReason {
+  reason: string;
+  passes: number;
 }
 
 export interface ParkedEntryResponse {
@@ -349,6 +402,11 @@ export interface PollHealthResponse {
   summary_text: string;
 }
 
+export interface PrLoopStationResponse {
+  result: string;
+  continuations: number;
+}
+
 export interface PullRequestResponse {
   number: number;
   repository: string;
@@ -400,6 +458,7 @@ export interface Report {
   by_template: Group[] | null;
   by_model: Group[] | null;
   by_chain: ChainGroup[] | null;
+  chain_funnels: Funnel[] | null;
   by_trigger: Group[] | null;
   by_origin: Group[] | null;
   self_review: SelfReview | null;
@@ -441,6 +500,36 @@ export interface RetryNowResponse {
   outcome_text: string;
 }
 
+export interface RunEndedFrame {
+  dispatch_id: string;
+  last_seq: number;
+}
+
+export interface RunEventResponse {
+  seq: number;
+  at: string;
+  event: string;
+  message: string;
+  text: string;
+  session_id?: string;
+  tool_name?: string;
+  duration_ms?: number;
+  tool_error?: boolean;
+  usage?: TokenInfo | null;
+}
+
+export interface RunEventsResponse {
+  dispatch_id: string;
+  first_seq: number | null;
+  events: RunEventResponse[] | null;
+}
+
+export interface RunResetFrame {
+  dispatch_id: string;
+  reason: string;
+  first_seq?: number;
+}
+
 export interface RunResponse {
   run_id: number;
   issue_id: string;
@@ -462,6 +551,7 @@ export interface RunResponse {
   dispatched_at: string | null;
   turns_completed: number;
   tokens: TokenInfo;
+  uncached_tokens: number | null;
   tokens_measured: boolean;
   unaccounted_turns: number;
   estimated_cost_usd: number | null;
@@ -478,8 +568,10 @@ export interface RunResponse {
   reaction_config_key: string | null;
   session_id: string | null;
   ssh_host: string | null;
+  dispatch_id: string | null;
   stage_chain: string[] | null;
   issue_outcome: IssueOutcomeResponse | null;
+  pr_loop: Record<string, PrLoopStationResponse> | null;
 }
 
 export interface RunningEntryResponse {
@@ -499,10 +591,11 @@ export interface RunningEntryResponse {
   last_message: string;
   started_at: string;
   dispatched_at: string | null;
-  last_event_at: string;
+  last_event_at: string | null;
   workspace_path: string;
   ssh_host?: string;
   tokens: TokenInfo;
+  uncached_tokens: number | null;
   model_name?: string;
   rule_name?: string;
   stage_lineage: StageLineageResponse | null;
@@ -531,6 +624,7 @@ export interface RunningEntryResponse {
   unmeasured_sessions: number | null;
   used_tokens: number | null;
   used_tokens_complete: boolean;
+  issue_uncached_tokens: number | null;
   budget_tokens: number | null;
   estimated_cost_usd: number | null;
   cost_status: string;
@@ -538,6 +632,12 @@ export interface RunningEntryResponse {
   issue_cost_status: string;
   status_text: string;
   status_text_full: string;
+  dispatch_id: string;
+  quiet_at: string | null;
+  stall_at: string | null;
+  stall_text: string | null;
+  stall_text_full: string | null;
+  stall_off_text: string | null;
 }
 
 export interface RunsResponse {
@@ -831,6 +931,7 @@ export interface Tokens {
   total: number;
   cache_read: number;
   cache_write: number;
+  uncached: number;
 }
 
 export interface VerdictCount {

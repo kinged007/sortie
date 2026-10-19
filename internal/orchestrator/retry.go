@@ -27,6 +27,8 @@ const pausedRetryMaxDwell = 30 * time.Minute
 type RetryTimerStore interface {
 	SaveRetryEntry(ctx context.Context, entry persistence.RetryEntry) error
 	DeleteRetryEntry(ctx context.Context, issueID string) error
+	UpsertLivePass(ctx context.Context, pass persistence.LivePass) error
+	DeleteLivePass(ctx context.Context, issueID, kind string) error
 	CountRunHistoryByIssue(ctx context.Context, issueID string) (int, error)
 	QueryConsecutiveHandoffAbsenceCounts(ctx context.Context, issueIDs []string) (map[string]int, error)
 	TokenUsageByIssue(ctx context.Context, issueID string) (persistence.IssueTokenUsage, error)
@@ -331,6 +333,7 @@ func HandleRetryTimer(state *State, issueID string, params HandleRetryTimerParam
 		}
 		state.BudgetExhausted[issueID] = entry
 		delete(state.Claimed, issueID)
+		recordBudgetPass(ctx, params.Store, issueID, entry, log)
 		if !blocked {
 			if err := params.Store.DeleteRetryEntry(ctx, issueID); err != nil {
 				log.Error("failed to delete retry entry after budget exhaustion",
@@ -769,6 +772,7 @@ func HandleRetryTimer(state *State, issueID string, params HandleRetryTimerParam
 		entry.Continuation = popped.Continuation
 		entry.UsageArrival, entry.UsageAttribution = attemptSettings.UsageArrival, attemptSettings.UsageAttribution
 		freezeIssueTokenBaseline(ctx, state, issueID, params.Store, params.Logger)
+		recordRunningPass(ctx, params.Store, issueID, entry, log)
 	}
 	metrics.IncDispatches(outcomeSuccess)
 

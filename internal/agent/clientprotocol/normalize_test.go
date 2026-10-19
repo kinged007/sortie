@@ -44,7 +44,7 @@ func TestApplySessionUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("agent_thought_chunk emits the reasoning-block constant", func(t *testing.T) {
+	t.Run("agent_thought_chunk emits a blank other_message", func(t *testing.T) {
 		t.Parallel()
 		ev, ok := parseSessionUpdate(loadSessionUpdateFixture(t, "agent_thought_chunk.json"))
 		if !ok {
@@ -54,8 +54,8 @@ func TestApplySessionUpdate(t *testing.T) {
 		if !got.hasEvent || got.event.Type != domain.EventOtherMessage {
 			t.Fatalf("applySessionUpdate() = %+v, want an other_message event", got)
 		}
-		if got.event.Message != reasoningBlockMessage {
-			t.Errorf("applySessionUpdate() Message = %q, want %q", got.event.Message, reasoningBlockMessage)
+		if got.event.Message != "" {
+			t.Errorf("applySessionUpdate() Message = %q, want blank", got.event.Message)
 		}
 	})
 
@@ -74,15 +74,15 @@ func TestApplySessionUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("plan emits the plan-update constant", func(t *testing.T) {
+	t.Run("plan emits a blank other_message", func(t *testing.T) {
 		t.Parallel()
 		ev, ok := parseSessionUpdate(loadSessionUpdateFixture(t, "plan.json"))
 		if !ok {
 			t.Fatal("parseSessionUpdate() found = false, want true")
 		}
 		got := applySessionUpdate(agentcore.NewToolTracker(), ev)
-		if !got.hasEvent || got.event.Message != planUpdateMessage {
-			t.Fatalf("applySessionUpdate() = %+v, want message %q", got, planUpdateMessage)
+		if !got.hasEvent || got.event.Type != domain.EventOtherMessage || got.event.Message != "" {
+			t.Fatalf("applySessionUpdate() = %+v, want a blank other_message event", got)
 		}
 	})
 

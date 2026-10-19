@@ -37,7 +37,7 @@ export function ActiveRow({ row, now, isSelected, showSelection, onOpen }: Activ
       data-nav-key={activeNavKey(row.issueId)}
       onClick={() => onOpen(row)}
       className={cn(
-        "grid grid-cols-[auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md [overflow-wrap:anywhere]",
+        "grid grid-cols-[auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md wrap-anywhere",
         rowStyles(isLook, true),
       )}
     >
@@ -54,6 +54,11 @@ export function ActiveRow({ row, now, isSelected, showSelection, onOpen }: Activ
           row.mark === "needs" ? "text-warning" : "text-ink-body",
         )}
       >
+        {row.stallText === null ? undefined : (
+          <span title={row.stallTextFull?.replace(/`/g, "")} className="mr-sm inline-block">
+            <StatusMark mark="stalled" label={<ServedText text={row.stallText} />} />
+          </span>
+        )}
         <ServedText text={row.statusText} />
         {row.mark === "held" && row.acknowledgedAt !== null
           ? ` · Acknowledged at ${fmtClock(row.acknowledgedAt)}`

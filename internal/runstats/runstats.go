@@ -15,7 +15,7 @@ import "github.com/sortie-ai/sortie/internal/domain"
 type Pricer func(agentKind string, usage domain.TokenUsage) *float64
 
 // Report is the "sortie stats --format json" envelope. Every slice
-// field, by_trigger and by_origin included, is never nil; every pointer field is null
+// field, by_trigger, by_origin, and chain_funnels included, is never nil; every pointer field is null
 // when the figure it carries is unavailable.
 type Report struct {
 	GeneratedAt  string       `json:"generated_at"`
@@ -32,6 +32,7 @@ type Report struct {
 	ByTemplate   []Group      `json:"by_template"`
 	ByModel      []Group      `json:"by_model"`
 	ByChain      []ChainGroup `json:"by_chain"`
+	ChainFunnels []Funnel     `json:"chain_funnels"`
 	ByTrigger    []Group      `json:"by_trigger"`
 	ByOrigin     []Group      `json:"by_origin"`
 	SelfReview   *SelfReview  `json:"self_review"`
@@ -74,13 +75,16 @@ type Duration struct {
 	Samples int      `json:"samples"`
 }
 
-// Tokens reports the five token sums as stored, never recomputed.
+// Tokens reports the stored token sums, never recomputed, and Uncached,
+// which the report derives from Total and CacheRead so that Uncached plus
+// CacheRead equals Total.
 type Tokens struct {
 	Input      int64 `json:"input"`
 	Output     int64 `json:"output"`
 	Total      int64 `json:"total"`
 	CacheRead  int64 `json:"cache_read"`
 	CacheWrite int64 `json:"cache_write"`
+	Uncached   int64 `json:"uncached"`
 }
 
 // Group is one row of a by_status, by_adapter, by_rule, by_template,
@@ -116,6 +120,70 @@ type ChainGroup struct {
 	Issue   string   `json:"issue"`
 	Stages  []string `json:"stages"`
 	LastHop string   `json:"last_hop"`
+}
+
+// Funnel is one chain definition: the configured chains that share a stage,
+// merged. Stages follow chain order.
+type Funnel struct {
+	Stages []FunnelStage `json:"stages"`
+}
+
+// FunnelStage reports the passes that reached one stage of a [Funnel].
+// Entered equals the sum of Arrivals and the sum of Outcomes, and Runs equals
+// the by_rule group's runs for Rule. MedianSeconds is null when no pass of the
+// stage has a usable duration.
+type FunnelStage struct {
+	Rule          string         `json:"rule"`
+	Entry         bool           `json:"entry"`
+	Last          bool           `json:"last"`
+	Runs          int            `json:"runs"`
+	Entered       int            `json:"entered"`
+	Arrivals      FunnelArrivals `json:"arrivals"`
+	Outcomes      FunnelOutcomes `json:"outcomes"`
+	NoHopReasons  []NoHopReason  `json:"no_hop_reasons"`
+	MedianSeconds *float64       `json:"median_seconds"`
+}
+
+// FunnelArrivals splits a stage's passes by how they reached it.
+type FunnelArrivals struct {
+	Hop   int `json:"hop"`
+	Match int `json:"match"`
+	Label int `json:"label"`
+}
+
+// FunnelOutcomes splits a stage's passes by how each one left it.
+type FunnelOutcomes struct {
+	Advanced  int `json:"advanced"`
+	HandedOff int `json:"handed_off"`
+	Ceiling   int `json:"ceiling"`
+	HopFailed int `json:"hop_failed"`
+	NoHop     int `json:"no_hop"`
+	InStage   int `json:"in_stage"`
+}
+
+// NoHopReason counts the passes of one stage that stopped without a hop
+// decision for Reason: run_failed, needs_person, budget_held,
+// operator_stopped, or verdict_withheld.
+type NoHopReason struct {
+	Reason string `json:"reason"`
+	Passes int    `json:"passes"`
+}
+
+// Stages is what chain_funnels reads besides run history; no response
+// carries it.
+type Stages struct {
+	Chains     [][]string // as DispatchConfig.Chains returns them
+	LabelRules []string   // the rules a stage label selects
+	Live       []LivePass // passes a running session, a queued retry, or a budget hold holds now
+}
+
+// LivePass is a pass held outside finished runs. A pass with an empty ChainID
+// or RuleName is ignored.
+type LivePass struct {
+	ChainID      string
+	RuleName     string
+	PreviousRule string // the rule whose hop reached the pass; empty when none did
+	BudgetHeld   bool   // a budget hold; otherwise a running session or a queued retry
 }
 
 // SelfReview reports the self-review aggregation. MeanIterations is

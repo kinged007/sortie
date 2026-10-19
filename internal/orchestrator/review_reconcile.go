@@ -277,7 +277,7 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 		// Dispatch.
 		metrics.IncReviewChecks("dispatched")
 
-		ScheduleRetry(state, ScheduleRetryParams{
+		scheduleReactionContinuation(ctx, state, params.Store, ScheduleRetryParams{
 			IssueID:     pending.IssueID,
 			Identifier:  pending.Identifier,
 			DisplayID:   pending.DisplayID,
@@ -298,7 +298,7 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 			Logger:              entryLog,
 
 			IssueIdentity: pending.IssueIdentity,
-		}, params.OnRetryFire)
+		}, params.OnRetryFire, now)
 
 		state.ReactionAttempts[rkey]++
 

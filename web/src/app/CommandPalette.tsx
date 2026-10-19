@@ -17,11 +17,21 @@ import {
   useAutocompleteFilter,
 } from "@/components/ui/autocomplete";
 import { Dialog, DialogPopup } from "@/components/ui/dialog";
-import { issueLinkOf } from "@/lib/issue-link";
+import { routeText } from "@/lib/active-rows";
+import { fmtStamp, parseInstant } from "@/lib/format";
+import { issueLinkOf, sessionLinkOf } from "@/lib/issue-link";
+import { runRouteText } from "@/lib/lane";
+import { numberedRunsOf } from "@/lib/run-number";
+import { runStatus } from "@/lib/run-status";
 import { setTheme } from "@/lib/theme";
 
 import type { ScreenEntry } from "@/app/Rail";
-import type { ActiveIssueResponse, IssueGroupResponse } from "@/api/types.gen";
+import type {
+  ActiveIssueResponse,
+  ConfigResponse,
+  IssueGroupResponse,
+  RunningEntryResponse,
+} from "@/api/types.gen";
 import type { AutocompleteGroupData } from "@/components/ui/autocomplete";
 import type { ThemeChoice } from "@/lib/theme";
 
@@ -39,16 +49,32 @@ interface IssueEntry {
   statusText: string;
 }
 
-type PaletteItem = Command | IssueEntry;
+interface SessionEntry {
+  value: string;
+  label: string;
+  identifier: string;
+  dispatchId: string;
+  route: string | null;
+  status: string;
+  startedAt: string;
+}
+
+type PaletteItem = Command | IssueEntry | SessionEntry;
 
 const ISSUES_GROUP = "Issues";
+const SESSIONS_GROUP = "Sessions";
 const ACTIVE_ENTRY_CAP = 8;
+const SESSION_ENTRY_CAP = 8;
 const FINISHED_ENTRY_CAP = 5;
 const LOOKUP_DEBOUNCE_MS = 250;
 const LOOKUP_FAILED = "Run history could not be read.";
 
 function isIssueEntry(item: PaletteItem): item is IssueEntry {
-  return "identifier" in item;
+  return "statusText" in item;
+}
+
+function isSessionEntry(item: PaletteItem): item is SessionEntry {
+  return "dispatchId" in item;
 }
 
 function issueEntryOf(issue: ActiveIssueResponse | IssueGroupResponse): IssueEntry {
@@ -61,12 +87,53 @@ function issueEntryOf(issue: ActiveIssueResponse | IssueGroupResponse): IssueEnt
   };
 }
 
-function matchesActive(issue: ActiveIssueResponse, query: string): boolean {
+function matchesActive(
+  issue: Pick<ActiveIssueResponse, "issue_identifier" | "display_identifier" | "issue_title">,
+  query: string,
+): boolean {
   const needle = query.toLowerCase();
   const key = issue.display_identifier || issue.issue_identifier;
   return (
     key.toLowerCase().includes(needle) || (issue.issue_title ?? "").toLowerCase().includes(needle)
   );
+}
+
+function liveSessionEntryOf(
+  running: RunningEntryResponse,
+  config: ConfigResponse | undefined,
+): SessionEntry {
+  const key = running.display_identifier || running.issue_identifier;
+  return {
+    value: `session:${running.dispatch_id}`,
+    label: `${key} live session`,
+    identifier: running.issue_identifier,
+    dispatchId: running.dispatch_id,
+    route: routeText(running, config),
+    status: "Running",
+    startedAt: running.started_at,
+  };
+}
+
+function finishedSessionEntriesOf(
+  groups: readonly IssueGroupResponse[],
+  config: ConfigResponse | undefined,
+): SessionEntry[] {
+  return groups
+    .flatMap((group) =>
+      numberedRunsOf(group.runs ?? [], group.totals.run_count).flatMap(({ run, number }) =>
+        run.dispatch_id ? [{ group, run, number, dispatchId: run.dispatch_id }] : [],
+      ),
+    )
+    .sort((a, b) => (parseInstant(b.run.started_at) ?? 0) - (parseInstant(a.run.started_at) ?? 0))
+    .map(({ group, run, number, dispatchId }) => ({
+      value: `session:${dispatchId}`,
+      label: `${group.display_identifier || group.issue_identifier} session ${number}`,
+      identifier: group.issue_identifier,
+      dispatchId,
+      route: runRouteText(run, config),
+      status: runStatus(run.status).word,
+      startedAt: run.started_at,
+    }));
 }
 
 function useDebounced(value: string, delayMs: number): string {
@@ -152,9 +219,19 @@ export function CommandPalette({
           .filter((group) => !activeIds.has(group.issue_id))
           .slice(0, FINISHED_ENTRY_CAP);
   const issueEntries = [...activeIssues, ...finishedIssues].map(issueEntryOf);
+  const sessionEntries =
+    issueQuery === ""
+      ? []
+      : [
+          ...(state?.running ?? [])
+            .filter((running) => matchesActive(running, issueQuery))
+            .map((running) => liveSessionEntryOf(running, state?.config)),
+          ...finishedSessionEntriesOf(lookup.data ?? [], state?.config),
+        ].slice(0, SESSION_ENTRY_CAP);
   const groups: AutocompleteGroupData<PaletteItem>[] = [
     { value: "Commands", items: commands },
     ...(issueEntries.length === 0 ? [] : [{ value: ISSUES_GROUP, items: issueEntries }]),
+    ...(sessionEntries.length === 0 ? [] : [{ value: SESSIONS_GROUP, items: sessionEntries }]),
   ];
 
   const handleRun = (command: Command) => {
@@ -168,13 +245,19 @@ export function CommandPalette({
     void navigate(link.to, { state: link.state });
   };
 
-  // Issue entries are already matched by key or title, or by the server, so
-  // the query must not narrow them again.
+  const handleOpenSession = (entry: SessionEntry) => {
+    const link = sessionLinkOf(entry.identifier, entry.dispatchId, location);
+    onOpenChange(false);
+    void navigate(link.to, { state: link.state });
+  };
+
+  // Issue and session entries are already matched by key or title, or by the
+  // server, so the query must not narrow them again.
   const handleFilter = (
     item: PaletteItem,
     text: string,
     itemToString?: (item: PaletteItem) => string,
-  ) => isIssueEntry(item) || contains(item, text, itemToString);
+  ) => isIssueEntry(item) || isSessionEntry(item) || contains(item, text, itemToString);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -184,12 +267,28 @@ export function CommandPalette({
           <AutocompleteList>
             {(group: AutocompleteGroupData<PaletteItem>) => (
               <AutocompleteGroup key={group.value} items={group.items}>
-                {group.value === ISSUES_GROUP ? (
-                  <AutocompleteGroupLabel>{ISSUES_GROUP}</AutocompleteGroupLabel>
+                {group.value === ISSUES_GROUP || group.value === SESSIONS_GROUP ? (
+                  <AutocompleteGroupLabel>{group.value}</AutocompleteGroupLabel>
                 ) : undefined}
                 <AutocompleteCollection>
                   {(item: PaletteItem) =>
-                    isIssueEntry(item) ? (
+                    isSessionEntry(item) ? (
+                      <AutocompleteItem
+                        key={item.value}
+                        value={item}
+                        onClick={() => handleOpenSession(item)}
+                        className="py-xs"
+                      >
+                        <span className="flex min-w-0 flex-col">
+                          <span className="wrap-anywhere">{item.label}</span>
+                          <span className="flex flex-wrap gap-x-sm text-body-sm text-ink-muted wrap-anywhere">
+                            {item.route === null ? undefined : <span>{item.route}</span>}
+                            <span>{item.status}</span>
+                            <span className="tabular-nums">{fmtStamp(item.startedAt)}</span>
+                          </span>
+                        </span>
+                      </AutocompleteItem>
+                    ) : isIssueEntry(item) ? (
                       <AutocompleteItem
                         key={item.value}
                         value={item}
@@ -197,8 +296,8 @@ export function CommandPalette({
                         className="py-xs"
                       >
                         <span className="flex min-w-0 flex-col">
-                          <span className="[overflow-wrap:anywhere]">{item.label}</span>
-                          <span className="text-body-sm text-ink-muted [overflow-wrap:anywhere]">
+                          <span className="wrap-anywhere">{item.label}</span>
+                          <span className="text-body-sm text-ink-muted wrap-anywhere">
                             <ServedText text={item.statusText} />
                           </span>
                         </span>

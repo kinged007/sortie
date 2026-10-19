@@ -5,12 +5,22 @@ import { useHistoryRunsQuery } from "@/api/queries";
 import { ServedText } from "@/components/ServedText";
 import { StatusMark } from "@/components/StatusMark";
 import { Button } from "@/components/ui/button";
+import {
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TableSpanCell,
+} from "@/components/ui/table";
 import { cn } from "@/lib/cn";
 import {
   NOT_MEASURED,
   UNPRICED,
+  runCacheReadsText,
   runCostText,
   runTokensText,
+  totalsCacheReadsText,
   totalsCostText,
   totalsTokensText,
 } from "@/lib/figures";
@@ -22,10 +32,7 @@ import { outcomeMark, runStatus } from "@/lib/run-status";
 import type { HistoryFilter } from "@/api/client";
 import type { ConfigResponse, IssueGroupResponse, RunResponse } from "@/api/types.gen";
 import type { Mark } from "@/lib/run-status";
-import type { ReactNode } from "react";
 
-const CELL = "px-md py-sm align-top whitespace-nowrap tabular-nums";
-const HEAD = "px-md py-sm text-left text-label-caps font-medium whitespace-nowrap text-ink-muted";
 const READ_FAILED = "Run history could not be read.";
 
 interface Columns {
@@ -49,38 +56,16 @@ export interface HistoryTableHeadProps {
 export function HistoryTableHead({ config }: HistoryTableHeadProps) {
   const { hasRule, hasCost } = columnsOf(config);
   return (
-    <thead className="border-b border-line">
-      <tr>
-        <th scope="col" className={HEAD}>
-          Status
-        </th>
-        {hasRule ? (
-          <th scope="col" className={HEAD}>
-            Rule
-          </th>
-        ) : undefined}
-        <th scope="col" className={HEAD}>
-          Agent
-        </th>
-        <th scope="col" className={HEAD}>
-          Duration
-        </th>
-        <th scope="col" className={HEAD}>
-          Turns
-        </th>
-        <th scope="col" className={HEAD}>
-          Tokens
-        </th>
-        {hasCost ? (
-          <th scope="col" className={HEAD}>
-            Est. cost
-          </th>
-        ) : undefined}
-        <th scope="col" className={HEAD}>
-          Finished
-        </th>
-      </tr>
-    </thead>
+    <TableHeader>
+      <TableHead>Status</TableHead>
+      {hasRule ? <TableHead>Rule</TableHead> : undefined}
+      <TableHead>Agent</TableHead>
+      <TableHead>Duration</TableHead>
+      <TableHead>Turns</TableHead>
+      <TableHead title="Cache reads not included">Tokens</TableHead>
+      {hasCost ? <TableHead>Est. cost</TableHead> : undefined}
+      <TableHead>Finished</TableHead>
+    </TableHeader>
   );
 }
 
@@ -111,12 +96,21 @@ function runSeconds(run: RunResponse): number | null {
     : (completed - started) / 1000;
 }
 
-function joined(parts: readonly ReactNode[]): ReactNode {
-  return parts.flatMap((part, index) => (index === 0 ? [part] : [" · ", part]));
+function hopText(run: RunResponse): string | undefined {
+  if (!run.stage_target) {
+    return undefined;
+  }
+  return run.stage_result
+    ? `Hop to ${run.stage_target}: ${run.stage_result}`
+    : `Hop to ${run.stage_target}`;
 }
 
 function tokensPart(text: string): string {
   return text === NOT_MEASURED ? "tokens not measured" : `${text} tokens`;
+}
+
+function cacheReadsTitle(text: string | null): string | undefined {
+  return text === null ? undefined : `${text} cache reads`;
 }
 
 function costPart(text: string): string {
@@ -142,13 +136,11 @@ function RunRow({ run, columns }: RunRowProps) {
     !!run.model_name && !!run.configured_model && run.model_name !== run.configured_model;
   const ruleName = run.rule_name;
   const rule = ruleLabel(ruleName);
+  const hop = hopText(run);
 
   return (
-    <tr
-      onClick={() => void navigate(link.to, { state: link.state })}
-      className="cursor-pointer border-t border-line hover:bg-state-hover"
-    >
-      <td className={CELL}>
+    <TableRow look="link" onClick={() => void navigate(link.to, { state: link.state })}>
+      <TableCell>
         <Link
           to={link.to}
           state={link.state}
@@ -161,29 +153,26 @@ function RunRow({ run, columns }: RunRowProps) {
             <StatusMark mark={status.mark} label={<ServedText text={status.word} />} />
           )}
         </Link>
-      </td>
+      </TableCell>
       {columns.hasRule ? (
-        <td className={CELL}>
+        <TableCell note={hop === undefined ? undefined : <ServedText text={hop} />}>
           <span className={cn(rule === ruleName && "font-mono text-body-sm")}>
             <ServedText text={rule} />
           </span>
-          {run.stage_target ? (
-            <ServedText text={` → ${run.stage_target}: ${run.stage_result ?? ""}`} />
-          ) : undefined}
-        </td>
+        </TableCell>
       ) : undefined}
-      <td
-        className={CELL}
+      <TableCell
         title={isModelDiverged ? `Configured ${run.configured_model}` : undefined}
+        note={agent[1] === undefined ? undefined : <ServedText text={agent[1]} />}
       >
-        <ServedText text={agent.join(" · ")} />
-      </td>
-      <td className={CELL}>{fmtDuration(runSeconds(run))}</td>
-      <td className={CELL}>{fmtCount(run.turns_completed)}</td>
-      <td className={CELL}>{runTokensText(run)}</td>
-      {columns.hasCost ? <td className={CELL}>{runCostText(run)}</td> : undefined}
-      <td className={CELL}>{fmtStamp(run.completed_at)}</td>
-    </tr>
+        {agent[0] === undefined ? undefined : <ServedText text={agent[0]} />}
+      </TableCell>
+      <TableCell>{fmtDuration(runSeconds(run))}</TableCell>
+      <TableCell>{fmtCount(run.turns_completed)}</TableCell>
+      <TableCell title={cacheReadsTitle(runCacheReadsText(run))}>{runTokensText(run)}</TableCell>
+      {columns.hasCost ? <TableCell>{runCostText(run)}</TableCell> : undefined}
+      <TableCell>{fmtStamp(run.completed_at)}</TableCell>
+    </TableRow>
   );
 }
 
@@ -212,13 +201,17 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
   const title = group.issue_title || key;
   const mark = groupMark(group);
   const ending = group.status === "history" ? group.issue_outcome : null;
-  const secondLine = [
-    group.issue_title ? key : undefined,
-    <ServedText key="status" text={group.status_text} />,
-    plural(group.totals.run_count, "run", "runs"),
-    tokensPart(totalsTokensText(group.totals)),
-    columns.hasCost ? costPart(totalsCostText(group.totals)) : undefined,
-  ].filter((part) => part !== undefined);
+  const cacheReads = totalsCacheReadsText(group.totals);
+  const secondLine = (
+    [
+      ["key", group.issue_title ? key : undefined],
+      ["status", group.status_text],
+      ["runs", plural(group.totals.run_count, "run", "runs")],
+      ["tokens", tokensPart(totalsTokensText(group.totals))],
+      ["cache-reads", cacheReads === null ? undefined : `${cacheReads} cache reads`],
+      ["cost", columns.hasCost ? costPart(totalsCostText(group.totals)) : undefined],
+    ] as const
+  ).filter(([, part]) => part !== undefined);
 
   const expandedRuns = expansion.data?.pages.flatMap((page) => page.runs ?? []);
   const runs = expandedRuns ?? group.runs ?? [];
@@ -239,18 +232,15 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
   }
 
   return (
-    <tbody className="border-b border-line last:border-b-0">
-      <tr
-        onClick={() => void navigate(link.to, { state: link.state })}
-        className="cursor-pointer bg-surface hover:bg-state-hover"
-      >
-        <td colSpan={columns.span} className="px-md py-sm">
+    <TableBody>
+      <TableRow look="group" onClick={() => void navigate(link.to, { state: link.state })}>
+        <TableSpanCell colSpan={columns.span}>
           <div className="flex items-start gap-sm">
             <span className="flex h-6 w-(--size-icon) shrink-0 items-center">
               {mark === null ? undefined : <StatusMark mark={mark} />}
             </span>
             <div className="min-w-0 flex-1">
-              <p className="text-body-md font-medium text-ink [overflow-wrap:anywhere]">
+              <p className="text-body-md font-medium text-ink wrap-anywhere">
                 <Link
                   to={link.to}
                   state={link.state}
@@ -260,8 +250,10 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
                   <ServedText text={title} />
                 </Link>
               </p>
-              <p className="text-body-sm text-ink-muted [overflow-wrap:anywhere]">
-                {joined(secondLine)}
+              <p className="flex flex-wrap gap-x-md text-body-sm text-ink-muted wrap-anywhere">
+                {secondLine.map(([id, part]) => (
+                  <span key={id}>{id === "status" ? <ServedText text={part} /> : part}</span>
+                ))}
               </p>
             </div>
             {ending === null ? undefined : (
@@ -270,14 +262,14 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
               </span>
             )}
           </div>
-        </td>
-      </tr>
+        </TableSpanCell>
+      </TableRow>
       {runs.map((run) => (
         <RunRow key={run.run_id} run={run} columns={columns} />
       ))}
       {hasMore ? (
-        <tr className="border-t border-line">
-          <td colSpan={columns.span} className="px-md py-xs">
+        <TableRow>
+          <TableSpanCell colSpan={columns.span} isCompact>
             <div className="flex items-center gap-sm">
               <Button variant="ghost" onClick={handleShowMore} disabled={expansion.isFetching}>
                 Show more runs
@@ -286,9 +278,9 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
                 <span className="text-body-sm text-error">{READ_FAILED}</span>
               ) : undefined}
             </div>
-          </td>
-        </tr>
+          </TableSpanCell>
+        </TableRow>
       ) : undefined}
-    </tbody>
+    </TableBody>
   );
 }

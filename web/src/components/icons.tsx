@@ -86,12 +86,32 @@ export function ActivityIcon(props: IconProps) {
   );
 }
 
+/** Draws the Lucide `arrow-down` glyph. */
+export function ArrowDownIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 5v14" />
+      <path d="m19 12-7 7-7-7" />
+    </Svg>
+  );
+}
+
 /** Draws the Lucide `arrow-right` glyph. */
 export function ArrowRightIcon(props: IconProps) {
   return (
     <Svg {...props}>
       <path d="M5 12h14" />
       <path d="m12 5 7 7-7 7" />
+    </Svg>
+  );
+}
+
+/** Draws the Lucide `arrow-up` glyph. */
+export function ArrowUpIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="m5 12 7-7 7 7" />
+      <path d="M12 19V5" />
     </Svg>
   );
 }
@@ -134,6 +154,16 @@ export function ChevronDownIcon(props: IconProps) {
   return (
     <Svg {...props}>
       <path d="m6 9 6 6 6-6" />
+    </Svg>
+  );
+}
+
+/** Draws the Lucide `chevrons-up-down` glyph. */
+export function ChevronsUpDownIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="m7 15 5 5 5-5" />
+      <path d="m7 9 5-5 5 5" />
     </Svg>
   );
 }
@@ -239,6 +269,15 @@ export function LoaderCircleIcon(props: IconProps) {
   return (
     <Svg {...props}>
       <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+    </Svg>
+  );
+}
+
+/** Draws the Lucide `minus` glyph. */
+export function MinusIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5 12h14" />
     </Svg>
   );
 }

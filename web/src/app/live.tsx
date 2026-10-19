@@ -11,13 +11,15 @@ import {
 } from "react";
 
 import { useStateQuery } from "@/api/queries";
+import { parseInstant } from "@/lib/format";
 import { now } from "@/lib/server-clock";
 import { connectChangeStream } from "@/stream/client";
 
 import type { Query, QueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
-import type { StreamMessage, StreamStatus } from "@/stream/core";
+import type { RunningEntryResponse } from "@/api/types.gen";
+import type { RunMessage, StreamMessage, StreamStatus } from "@/stream/core";
 
 const STATE_KEY_ROOT = "state";
 
@@ -118,19 +120,29 @@ function createFloorGate(
 
 let streamStatus: StreamStatus = "connecting";
 let streamStarted = false;
+let connection: ReturnType<typeof connectChangeStream> | undefined;
+let shownRun: string | null = null;
 const statusListeners = new Set<() => void>();
 const changeListeners = new Set<() => void>();
+const runListeners = new Set<(message: RunMessage) => void>();
 
 function handleStreamMessage(message: StreamMessage): void {
-  if (message.kind === "status") {
-    streamStatus = message.status;
-    for (const listener of statusListeners) {
-      listener();
-    }
-    return;
-  }
-  for (const listener of changeListeners) {
-    listener();
+  switch (message.kind) {
+    case "status":
+      streamStatus = message.status;
+      for (const listener of statusListeners) {
+        listener();
+      }
+      return;
+    case "change":
+      for (const listener of changeListeners) {
+        listener();
+      }
+      return;
+    case "run":
+      for (const listener of runListeners) {
+        listener(message);
+      }
   }
 }
 
@@ -143,7 +155,25 @@ export function startLiveStream(): void {
     return;
   }
   streamStarted = true;
-  connectChangeStream(handleStreamMessage);
+  connection = connectChangeStream(handleStreamMessage);
+  if (shownRun !== null) {
+    connection.show(shownRun);
+  }
+}
+
+/** Subscribes to the items of the run this tab shows; the returned function unsubscribes. */
+export function subscribeRunMessages(listener: (m: RunMessage) => void): () => void {
+  runListeners.add(listener);
+  return () => runListeners.delete(listener);
+}
+
+/**
+ * Names the run whose events this tab receives, or null for none. A call made
+ * before `startLiveStream` applies when the stream starts.
+ */
+export function showRun(dispatchId: string | null): void {
+  shownRun = dispatchId;
+  connection?.show(dispatchId);
 }
 
 function subscribeStatus(listener: () => void): () => void {
@@ -153,6 +183,10 @@ function subscribeStatus(listener: () => void): () => void {
 
 function getStreamStatus(): StreamStatus {
   return streamStatus;
+}
+
+function quietKeyOf(row: RunningEntryResponse): string {
+  return `${row.dispatch_id}|${row.quiet_at}`;
 }
 
 /** What the shell and the screens read about live updates. */
@@ -177,6 +211,7 @@ export function LiveProvider({ children }: LiveProviderProps) {
   const pausedRef = useRef(false);
   const pendingChange = useRef(false);
   const floorGate = useRef<FloorGate | undefined>(undefined);
+  const requestedQuiet = useRef(new Set<string>());
   const firstVersion = useRef<string | null>(null);
   const noticedVersion = useRef<string | null>(null);
   const status = useSyncExternalStore(subscribeStatus, getStreamStatus);
@@ -227,6 +262,39 @@ export function LiveProvider({ children }: LiveProviderProps) {
       changeListeners.delete(handleChange);
     };
   }, [handleChange]);
+
+  const running = data?.running;
+  useEffect(() => {
+    const rows = running ?? [];
+    const requested = requestedQuiet.current;
+    const held = new Set(rows.map(quietKeyOf));
+    for (const key of requested) {
+      if (!held.has(key)) {
+        requested.delete(key);
+      }
+    }
+    // A row that still serves no stall text after its refetch is not asked again, or the refetch would loop.
+    const due = rows.flatMap((row) => {
+      const at = parseInstant(row.quiet_at);
+      const key = quietKeyOf(row);
+      return at !== null && row.stall_text === null && !requested.has(key) ? [{ key, at }] : [];
+    });
+    if (due.length === 0) {
+      return;
+    }
+    const timer = setTimeout(
+      () => {
+        for (const { key, at } of due) {
+          if (at <= now()) {
+            requested.add(key);
+          }
+        }
+        handleChange();
+      },
+      Math.max(0, Math.min(...due.map(({ at }) => at)) - now()),
+    );
+    return () => clearTimeout(timer);
+  }, [running, handleChange]);
 
   const version = data?.version;
   useEffect(() => {

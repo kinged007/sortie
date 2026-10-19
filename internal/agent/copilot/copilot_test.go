@@ -1055,7 +1055,7 @@ func TestRunTurn_SessionErrorMessageIsFailureReason(t *testing.T) {
 	}
 }
 
-func TestRunTurn_SessionErrorEventStillEmitted(t *testing.T) {
+func TestRunTurn_SessionErrorEmitsBlankPing(t *testing.T) {
 	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -1065,12 +1065,17 @@ func TestRunTurn_SessionErrorEventStillEmitted(t *testing.T) {
 
 	_, _, events := runFailedTurn(t, adapter, session)
 
-	other, ok := findEventByType(events, domain.EventOtherMessage)
-	if !ok {
-		t.Fatalf("RunTurn events = %v, want an EventOtherMessage for session.error", events)
+	var blankPings int
+	for _, e := range events {
+		if e.Message == "session.error" {
+			t.Errorf("%s event leaked the protocol event name as its message", e.Type)
+		}
+		if e.Type == domain.EventNotification && e.Message == "" {
+			blankPings++
+		}
 	}
-	if other.Message != "session.error" {
-		t.Errorf("EventOtherMessage.Message = %q, want %q", other.Message, "session.error")
+	if blankPings == 0 {
+		t.Errorf("RunTurn events = %v, want a blank ping for session.error", events)
 	}
 }
 

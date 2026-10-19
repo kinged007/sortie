@@ -111,7 +111,7 @@ const wantPendingReactionsJSON = `[
    "last_check": {"observed_at": "2026-02-24T20:12:40Z", "head_sha": "9b7e3d1c0a2f4e6b8d0c1a3e5f7b9d2c4e6a8f0b",
                   "status": "failing", "failing_checks": ["Test"], "failing": 1, "pending": 0, "passing": 4},
    "status_text": "CI escalated on #931",
-   "status_text_full": "MT-653: Sortie escalated failing CI on PR #931; it keeps watching the pull request. CI fixes used: 2 of 2."},
+   "status_text_full": "Sortie escalated failing CI on PR #931; it keeps watching the pull request. CI fixes used: 2 of 2."},
   {"issue_id": "mno345", "issue_identifier": "MT-653", "issue_title": "Add the export button",
    "issue_url": "https://tracker.example.com/browse/MT-653", "kind": "review", "config_key": "review_comments",
    "pull_request": {"number": 931, "repository": "acme/web", "url": "https://github.com/acme/web/pull/931",
@@ -120,7 +120,7 @@ const wantPendingReactionsJSON = `[
    "used_attempts": 1, "max_attempts": 3, "escalated_at": null, "watch_ends_at": null,
    "last_check": {"observed_at": "2026-02-24T20:15:10Z", "actionable_comments": 3, "new_comments": 1},
    "status_text": "1 new review comment on #931; next check in 30s",
-   "status_text_full": "MT-653 has 1 new review comment on PR #931 (3 actionable) and waits for the comments to settle; next check in 30s. Review fix runs used: 1 of 3."}
+   "status_text_full": "Waiting for 1 new review comment on PR #931 (3 actionable) to settle; next check in 30s. Review fix runs used: 1 of 3."}
 ]`
 
 func pendingReactionRows() []orchestrator.SnapshotPendingReaction {
@@ -1454,7 +1454,7 @@ func TestToStateResponse(t *testing.T) {
 			"between_stages": json.RawMessage(`[{"issue_id": "id-1", "issue_identifier": "MT-1", "source_rule": "specify",
 				"target_rule": "implement", "target_label": "stage:implement", "hopped_at": null, "dispatched_at": null, "stage_position": null,
 				"status_text": "Between stages: specify to implement",
-				"status_text_full": "MT-1 moved from stage specify to stage implement, and Sortie added \u0060stage:implement\u0060; implement starts when a poll tick reads that label on the issue."}]`),
+				"status_text_full": "Moved from stage specify to stage implement, and Sortie added \u0060stage:implement\u0060; implement starts when a poll tick reads that label on the issue."}]`),
 		})
 	})
 
@@ -1774,11 +1774,11 @@ func TestToServedRunningEntry(t *testing.T) {
 	}
 	unknownSpend := func(completed any) map[string]any {
 		return map[string]any{
-			"issue_tokens_completed": completed, "used_tokens": nil, "used_tokens_complete": false,
+			"issue_tokens_completed": completed, "used_tokens": nil, "issue_uncached_tokens": nil, "used_tokens_complete": false,
 			"cost_status": "unmeasured", "estimated_cost_usd": nil, "issue_cost_status": "unmeasured", "issue_estimated_cost_usd": nil,
 		}
 	}
-	partialWorked := map[string]any{"used_tokens": 485000, "used_tokens_complete": false, "issue_cost_status": "partial", "issue_estimated_cost_usd": 0.837}
+	partialWorked := map[string]any{"used_tokens": 485000, "issue_uncached_tokens": 145000, "used_tokens_complete": false, "issue_cost_status": "partial", "issue_estimated_cost_usd": 0.837}
 
 	tests := []struct {
 		name                   string
@@ -1791,7 +1791,7 @@ func TestToServedRunningEntry(t *testing.T) {
 			name: "worked example", maxTokens: 1_000_000, maxSessions: 5,
 			want: map[string]any{
 				"used_sessions": 3, "budget_sessions": 5, "issue_tokens_completed": 420000, "unmeasured_sessions": 0,
-				"used_tokens": 485000, "used_tokens_complete": true, "budget_tokens": 1_000_000,
+				"used_tokens": 485000, "issue_uncached_tokens": 145000, "used_tokens_complete": true, "budget_tokens": 1_000_000,
 				"estimated_cost_usd": 0.147, "cost_status": "estimated", "issue_estimated_cost_usd": 0.837, "issue_cost_status": "estimated",
 			},
 		},
@@ -2310,9 +2310,46 @@ func TestHandleState(t *testing.T) {
 			t.Error("rate_limits = null in JSON, want {}")
 		}
 	})
+
+	t.Run("failed reaction activity read serves null pr_loop", func(t *testing.T) {
+		t.Parallel()
+
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: fixedTime,
+			Running: []orchestrator.SnapshotRunningEntry{
+				{IssueID: "id-1", Identifier: "MT-1", StageLineage: orchestrator.StageLineage{ChainID: "chain-1", DispatchedAt: fixedTime}},
+				{IssueID: "id-2", Identifier: "MT-2", StageLineage: orchestrator.StageLineage{ChainID: "chain-2", DispatchedAt: fixedTime}},
+			},
+		}
+		srv := New(Params{
+			SnapshotFn: fixedSnapshot(snap),
+			RefreshFn:  acceptingRefresh(),
+			Logger:     slog.New(slog.DiscardHandler),
+			RunHistory: &fakeRunHistory{passesErr: errors.New("database is locked")},
+			WorkflowShapeFn: func() orchestrator.WorkflowShape {
+				return orchestrator.WorkflowShape{Reactions: orchestrator.ShapeReactions{CIFailure: &orchestrator.ShapeCIFailure{}}}
+			},
+		})
+		ts := httptest.NewServer(srv.Mux())
+		t.Cleanup(ts.Close)
+
+		status, body := getJSON[stateResponse](t, ts, "/api/v1/state")
+
+		if status != http.StatusOK {
+			t.Fatalf("GET /api/v1/state status = %d, want %d", status, http.StatusOK)
+		}
+		if len(body.Active) != 2 {
+			t.Fatalf("GET /api/v1/state active = %d entries, want 2", len(body.Active))
+		}
+		for _, entry := range body.Active {
+			if entry.PRLoop != nil {
+				t.Errorf("GET /api/v1/state active %s pr_loop = %v, want null", entry.IssueID, entry.PRLoop)
+			}
+		}
+	})
 }
 
-func TestHandleState_EveryRowNamesItsOwnIssue(t *testing.T) {
+func TestHandleState_EveryRowCarriesBothForms(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
@@ -2345,8 +2382,8 @@ func TestHandleState_EveryRowNamesItsOwnIssue(t *testing.T) {
 		}
 		for _, row := range rows {
 			served++
-			if row.Short == "" || !strings.Contains(row.Long, row.Identifier) {
-				t.Errorf("GET /api/v1/state %s %s status_text, status_text_full = %q, %q, want a short form and a long form naming the issue", list, row.Identifier, row.Short, row.Long)
+			if row.Short == "" || row.Long == "" || strings.Contains(row.Long, row.Identifier) {
+				t.Errorf("GET /api/v1/state %s %s status_text, status_text_full = %q, %q, want a short form and a long form that does not repeat the issue key", list, row.Identifier, row.Short, row.Long)
 			}
 		}
 	}
@@ -2589,7 +2626,7 @@ func TestHandleIssueDetail_StatusSentence(t *testing.T) {
 			history:   &fakeRunHistory{},
 			path:      "MT-1",
 			wantShort: "Between stages: specify to implement",
-			wantFull:  "MT-1 moved from stage specify to stage implement, and Sortie added `stage:implement`; implement starts when a poll tick reads that label on the issue.",
+			wantFull:  "Moved from stage specify to stage implement, and Sortie added `stage:implement`; implement starts when a poll tick reads that label on the issue.",
 		},
 		{
 			name:      "escalated pending reaction decides when it is not first",
@@ -2597,7 +2634,7 @@ func TestHandleIssueDetail_StatusSentence(t *testing.T) {
 			history:   &fakeRunHistory{},
 			path:      "MT-653",
 			wantShort: "CI escalated on #931",
-			wantFull:  "MT-653: Sortie escalated failing CI on PR #931; it keeps watching the pull request. CI fixes used: 2 of 2.",
+			wantFull:  "Sortie escalated failing CI on PR #931; it keeps watching the pull request. CI fixes used: 2 of 2.",
 		},
 		{
 			name: "history only, merged by auto-merge",
@@ -2607,9 +2644,9 @@ func TestHandleIssueDetail_StatusSentence(t *testing.T) {
 			},
 			path:             "MT-1",
 			wantShort:        "Merged #88",
-			wantFull:         "MT-1 ended merged: auto-merge merged PR #88.",
+			wantFull:         "Ended merged: auto-merge merged PR #88.",
 			wantOutcomeShort: "Merged #88",
-			wantOutcomeFull:  "MT-1 ended merged: auto-merge merged PR #88.",
+			wantOutcomeFull:  "Ended merged: auto-merge merged PR #88.",
 		},
 		{
 			name: "history only, hop ceiling then handoff",
@@ -2619,9 +2656,9 @@ func TestHandleIssueDetail_StatusSentence(t *testing.T) {
 			},
 			path:             "MT-2",
 			wantShort:        "Handed off to In Review; stage implement not reached",
-			wantFull:         "MT-2 was handed off to In Review because the hop to stage implement was not made: the issue reached its limit of consecutive stage moves (`dispatch.max_consecutive_hops`).",
+			wantFull:         "Handed off to In Review because the hop to stage implement was not made: the issue reached its limit of consecutive stage moves (`dispatch.max_consecutive_hops`).",
 			wantOutcomeShort: "Handed off to In Review",
-			wantOutcomeFull:  "MT-2 was handed off: Sortie moved it to In Review.",
+			wantOutcomeFull:  "Handed off: Sortie moved the issue to In Review.",
 		},
 	}
 
@@ -2699,7 +2736,7 @@ func TestHandleIssueDetail_NextOutcomes(t *testing.T) {
 		fakeRunHistory: &fakeRunHistory{rows: []RunHistoryEntry{{ID: 3, IssueID: "id-1", Identifier: "MT-1", Status: "succeeded"}}},
 		totals:         IssueRunTotals{Usage: orchestrator.SnapshotIssueUsage{Sessions: 2}},
 	}
-	held := "Sortie holds MT-1 at its session budget (3 of 3 sessions used)."
+	held := "Sortie holds the issue at its session budget (3 of 3 sessions used)."
 
 	tests := []struct {
 		name          string
@@ -3241,50 +3278,6 @@ func TestMethodNotAllowed(t *testing.T) {
 				t.Errorf("error code = %q, want %q", body.Error.Code, "method_not_allowed")
 			}
 		})
-	}
-}
-
-func TestStateResponseJSON(t *testing.T) {
-	t.Parallel()
-
-	fixedTime := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
-
-	resp := stateResponse{
-		GeneratedAt: fixedTime,
-		Counts:      stateCounts{Running: 1, Retrying: 0},
-		Running: []runningEntryResponse{
-			{
-				IssueID:         "id-1",
-				IssueIdentifier: "MT-1",
-				State:           "In Progress",
-				StartedAt:       fixedTime,
-				LastEventAt:     fixedTime,
-				Tokens: tokenInfo{
-					InputTokens:  new(int64(10)),
-					OutputTokens: new(int64(5)),
-					TotalTokens:  new(int64(15)),
-				},
-			},
-		},
-		Retrying:    []retryEntryResponse{},
-		AgentTotals: orchestrator.SnapshotAgentTotals{},
-		RateLimits:  map[string]any{},
-	}
-
-	data, err := json.Marshal(resp)
-	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
-	}
-
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatalf("json.Unmarshal: %v", err)
-	}
-
-	for _, key := range []string{"generated_at", "counts", "running", "retrying", "agent_totals", "rate_limits"} {
-		if _, ok := m[key]; !ok {
-			t.Errorf("missing JSON key %q", key)
-		}
 	}
 }
 
@@ -3831,9 +3824,12 @@ type fakeRunHistory struct {
 	totalsErr   error
 	outcomes    map[string]IssueOutcome
 	outcomesErr error
+	passes      map[PassKey]PassActivity
+	passesErr   error
 	onQuery     func(RunHistoryQuery)
 	groups      []IssueGroupKey
 	onGroups    func(IssueGroupQuery)
+	events      map[string][]orchestrator.RunEvent
 }
 
 func (f *fakeRunHistory) QueryRuns(_ context.Context, q RunHistoryQuery) ([]RunHistoryEntry, error) {
@@ -3858,14 +3854,32 @@ func (f *fakeRunHistory) IssueOutcomes(context.Context, []string) (map[string]Is
 	return f.outcomes, f.outcomesErr
 }
 
+func (f *fakeRunHistory) PassActivities(context.Context, []PassRef) (map[PassKey]PassActivity, error) {
+	return f.passes, f.passesErr
+}
+
+func (f *fakeRunHistory) RunEvents(_ context.Context, dispatchID string, newest int) ([]orchestrator.RunEvent, error) {
+	events := f.events[dispatchID]
+	if newest > 0 {
+		events = events[max(len(events)-newest, 0):]
+	}
+	return events, f.err
+}
+
 func historyServer(t *testing.T, snap orchestrator.RuntimeSnapshotResult, history RunHistoryReader) *httptest.Server {
 	t.Helper()
+	return eventsServer(t, snap, history, nil)
+}
+
+func eventsServer(t *testing.T, snap orchestrator.RuntimeSnapshotResult, history RunHistoryReader, runEvents RunEventsFunc) *httptest.Server {
+	t.Helper()
 	srv := New(Params{
-		SnapshotFn: fixedSnapshot(snap),
-		RefreshFn:  acceptingRefresh(),
-		Logger:     slog.New(slog.DiscardHandler),
-		StartedAt:  time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
-		RunHistory: history,
+		SnapshotFn:  fixedSnapshot(snap),
+		RefreshFn:   acceptingRefresh(),
+		Logger:      slog.New(slog.DiscardHandler),
+		StartedAt:   time.Date(2026, 3, 24, 10, 0, 0, 0, time.UTC),
+		RunHistory:  history,
+		RunEventsFn: runEvents,
 	})
 	ts := httptest.NewServer(srv.Mux())
 	t.Cleanup(ts.Close)
@@ -3900,6 +3914,148 @@ func TestLastStageOf(t *testing.T) {
 
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("lastStageOf(%+v, %v) = %+v, want %+v", tt.runs, tt.chains, got, tt.want)
+			}
+		})
+	}
+}
+
+type servedEvent struct {
+	Seq     int64  `json:"seq"`
+	Event   string `json:"event"`
+	Message string `json:"message"`
+	Text    string `json:"text"`
+}
+
+type servedEventsBody struct {
+	FirstSeq     *int64         `json:"first_seq"`
+	Events       []servedEvent  `json:"events"`
+	RecentEvents *[]servedEvent `json:"recent_events"`
+	Error        struct {
+		Code string `json:"code"`
+	} `json:"error"`
+}
+
+func liveRunEvents(first, last int64) []orchestrator.RunEvent {
+	at := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	var events []orchestrator.RunEvent
+	for seq := first; seq <= last; seq++ {
+		event := orchestrator.RunEvent{Seq: seq, At: at.Add(time.Duration(seq) * time.Second), Event: domain.EventNotification, Message: fmt.Sprintf("step %d", seq)}
+		if seq%3 == 0 {
+			event.Event, event.ToolName, event.DurationMS = domain.EventToolResult, "Bash", 2400
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func TestRunEventsServed(t *testing.T) {
+	t.Parallel()
+
+	live := orchestrator.RuntimeSnapshotResult{Running: []orchestrator.SnapshotRunningEntry{
+		{IssueID: "id-1", Identifier: "MT-1", DispatchID: "d-live", StartedAt: time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)},
+	}}
+	memory := func(dispatchID string) ([]orchestrator.RunEvent, bool) {
+		return liveRunEvents(81, 200), dispatchID == "d-live"
+	}
+	noDispatchID := &fakeRunHistory{rows: []RunHistoryEntry{
+		{ID: 3, IssueID: "id-2", Identifier: "MT-2", Status: "succeeded", DispatchID: new("")},
+		{ID: 2, IssueID: "id-2", Identifier: "MT-2", Status: "succeeded"},
+	}}
+
+	tests := []struct {
+		name         string
+		snap         orchestrator.RuntimeSnapshotResult
+		history      *fakeRunHistory
+		path         string
+		wantStatus   int
+		wantCode     string
+		wantFirstSeq int64
+		wantCount    int
+	}{
+		{name: "route serves every memory event", snap: live, history: &fakeRunHistory{}, path: "/api/v1/runs/d-live/events", wantStatus: 200, wantFirstSeq: 81, wantCount: 120},
+		{name: "recent_events is the newest 50", snap: live, history: &fakeRunHistory{}, path: "/api/v1/MT-1", wantStatus: 200, wantFirstSeq: 151, wantCount: 50},
+		{name: "run without rows is not retained", snap: live, history: &fakeRunHistory{}, path: "/api/v1/runs/d-gone/events", wantStatus: 404, wantCode: "run_events_not_retained"},
+		{name: "runs without a dispatch ID serve no recent_events", history: noDispatchID, path: "/api/v1/MT-2", wantStatus: 200},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ts := eventsServer(t, tt.snap, tt.history, memory)
+
+			status, body := getJSON[servedEventsBody](t, ts, tt.path)
+
+			if status != tt.wantStatus || body.Error.Code != tt.wantCode {
+				t.Fatalf("GET %s = %d %q, want %d %q", tt.path, status, body.Error.Code, tt.wantStatus, tt.wantCode)
+			}
+			served := body.Events
+			if body.RecentEvents != nil {
+				served = *body.RecentEvents
+			} else if strings.HasPrefix(tt.path, "/api/v1/MT-") {
+				t.Fatalf("GET %s recent_events = null, want an array", tt.path)
+			}
+			if len(served) != tt.wantCount {
+				t.Fatalf("GET %s served %d events, want %d", tt.path, len(served), tt.wantCount)
+			}
+			if body.FirstSeq != nil && *body.FirstSeq != tt.wantFirstSeq {
+				t.Errorf("GET %s first_seq = %d, want %d", tt.path, *body.FirstSeq, tt.wantFirstSeq)
+			}
+			for i, event := range served {
+				if want := tt.wantFirstSeq + int64(i); event.Seq != want {
+					t.Errorf("GET %s event %d seq = %d, want %d", tt.path, i, event.Seq, want)
+				}
+				if event.Text == "" || event.Text == "Status not available" {
+					t.Errorf("GET %s event %d (%s) text = %q, want a worded sentence", tt.path, i, event.Event, event.Text)
+				}
+			}
+		})
+	}
+}
+
+func TestStateStallInstants(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	lastEvent := started.Add(10 * time.Second)
+	tests := []struct {
+		name          string
+		timeoutMS     int
+		lastEvent     time.Time
+		wantLastEvent *time.Time
+		wantQuiet     *time.Time
+		wantStall     *time.Time
+	}{
+		{name: "before any event", timeoutMS: 60_000, wantQuiet: new(started.Add(30 * time.Second)), wantStall: new(started.Add(60 * time.Second))},
+		{name: "after an event", timeoutMS: 60_000, lastEvent: lastEvent, wantLastEvent: &lastEvent, wantQuiet: new(lastEvent.Add(30 * time.Second)), wantStall: new(lastEvent.Add(60 * time.Second))},
+		{name: "stall detection off", lastEvent: lastEvent, wantLastEvent: &lastEvent},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := orchestrator.NewState(5000, 4, 0, nil, orchestrator.AgentTotals{})
+			state.StallTimeoutMS = tt.timeoutMS
+			state.Running["id-1"] = &orchestrator.RunningEntry{
+				Issue: domain.Issue{ID: "id-1", Identifier: "MT-1"}, Identifier: "MT-1", StartedAt: started, LastAgentTimestamp: tt.lastEvent,
+			}
+			ts := historyServer(t, orchestrator.RuntimeSnapshot(state, started.Add(time.Hour)), nil)
+
+			status, body := getJSON[stateResponse](t, ts, "/api/v1/state")
+
+			if status != http.StatusOK || len(body.Running) != 1 {
+				t.Fatalf("GET /api/v1/state = %d with %d running rows, want 200 with 1", status, len(body.Running))
+			}
+			row := body.Running[0]
+			for name, pair := range map[string][2]*time.Time{
+				"last_event_at": {row.LastEventAt, tt.wantLastEvent},
+				"quiet_at":      {row.QuietAt, tt.wantQuiet},
+				"stall_at":      {row.StallAt, tt.wantStall},
+			} {
+				if got, want := pair[0], pair[1]; (got == nil) != (want == nil) || got != nil && !got.Equal(*want) {
+					t.Errorf("running row %s = %v, want %v", name, got, want)
+				}
 			}
 		})
 	}
