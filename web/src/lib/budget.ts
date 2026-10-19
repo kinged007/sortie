@@ -18,6 +18,8 @@ export interface BudgetLine {
 export interface BudgetFigures {
   sessions: BudgetLine;
   tokens: BudgetLine & { complete: boolean };
+  /** The tokens of the issue without cache reads; null while the spend is not known. */
+  uncachedTokens: number | null;
   /** Null while `config` or its `token_rates` is absent, and when the issue has no recorded run. */
   cost: CostFigure | null;
 }
@@ -26,6 +28,10 @@ function totalsCost(history: IssueHistoryResponse | null): CostFigure | null {
   return history === null
     ? null
     : { usd: history.totals.estimated_cost_usd, status: history.totals.cost_status };
+}
+
+function uncachedTotal(history: IssueHistoryResponse | null): number | null {
+  return history === null ? 0 : history.totals.uncached_tokens;
 }
 
 function figuresOf(detail: IssueDetailResponse, config: ConfigResponse | undefined): BudgetFigures {
@@ -39,6 +45,7 @@ function figuresOf(detail: IssueDetailResponse, config: ConfigResponse | undefin
         limitKnown: true,
         complete: running.used_tokens_complete,
       },
+      uncachedTokens: running.issue_uncached_tokens,
       cost: { usd: running.issue_estimated_cost_usd, status: running.issue_cost_status },
     };
   }
@@ -55,6 +62,7 @@ function figuresOf(detail: IssueDetailResponse, config: ConfigResponse | undefin
         limitKnown: true,
         complete: exhausted.unmeasured_sessions === 0,
       },
+      uncachedTokens: uncachedTotal(history),
       cost: totalsCost(history),
     };
   }
@@ -71,6 +79,7 @@ function figuresOf(detail: IssueDetailResponse, config: ConfigResponse | undefin
       limitKnown: isKnown,
       complete: history === null ? true : history.totals.tokens_complete,
     },
+    uncachedTokens: uncachedTotal(history),
     cost: totalsCost(history),
   };
 }

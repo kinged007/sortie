@@ -2,6 +2,7 @@ import { parseInstant } from "@/lib/format";
 
 import type {
   IssueOutcomeResponse,
+  PrLoopStationResponse,
   RunResponse,
   RunsResponse,
   StateResponse,
@@ -16,6 +17,8 @@ export interface EndedIssue {
   rule: string | null;
   agentKind: string | null;
   outcome: IssueOutcomeResponse;
+  /** What each pull request reaction recorded in the pass of the issue's newest run. */
+  prLoop: Record<string, PrLoopStationResponse> | null;
 }
 
 function activeIssueIds(state: StateResponse): Set<string> {
@@ -54,6 +57,7 @@ export function buildEnded(pages: RunsResponse[], state: StateResponse): EndedIs
         rule: run.rule_name && run.rule_name !== "default" ? run.rule_name : null,
         agentKind: run.agent_kind || null,
         outcome: run.issue_outcome,
+        prLoop: run.pr_loop,
       });
     }
   }

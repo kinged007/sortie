@@ -7,10 +7,12 @@ import { StatusMark } from "@/components/StatusMark";
 import { Segmented } from "@/components/ui/segmented";
 import { cn } from "@/lib/cn";
 import { fmtClock, fmtDate } from "@/lib/format";
-import { agentLabel, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
+import { agentLabel, isNamedRuleGroup, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
 import { runStatus } from "@/lib/run-status";
 
+import { ChainFunnel } from "./ChainFunnel";
 import { GroupTable } from "./GroupTable";
+import { OutcomeBar } from "./OutcomeBar";
 import { SummaryTiles } from "./SummaryTiles";
 
 import type { AnalyticsRange } from "@/api/queries";
@@ -51,14 +53,17 @@ function NameText({ name, label }: NameTextProps) {
 const RULE_COLUMN: NameColumn<Group> = {
   header: "Rule",
   cell: (row) => <NameText name={row.name} label={ruleLabel(row.name)} />,
+  sortText: (row) => ruleLabel(row.name),
 };
 const MODEL_COLUMN: NameColumn<Group> = {
   header: "Model",
   cell: (row) => <NameText name={row.name} label={modelLabel(row.name)} />,
+  sortText: (row) => modelLabel(row.name),
 };
 const AGENT_COLUMN: NameColumn<Group> = {
   header: "Agent",
   cell: (row) => <NameText name={row.name} label={agentLabel(row.name)} />,
+  sortText: (row) => agentLabel(row.name),
 };
 const STATUS_COLUMN: NameColumn<Group> = {
   header: "Status",
@@ -70,14 +75,17 @@ const STATUS_COLUMN: NameColumn<Group> = {
       <StatusMark mark={mark} label={<ServedText text={word} />} />
     );
   },
+  sortText: (row) => runStatus(row.name).word,
 };
 const TRIGGER_COLUMN: NameColumn<Group> = {
   header: "Trigger",
   cell: (row) => <ServedText text={startLabel(row.name, "trigger")} />,
+  sortText: (row) => startLabel(row.name, "trigger"),
 };
 const ORIGIN_COLUMN: NameColumn<Group> = {
   header: "Started by",
   cell: (row) => <ServedText text={startLabel(row.name, "origin")} />,
+  sortText: (row) => startLabel(row.name, "origin"),
 };
 
 interface BreakdownsProps {
@@ -95,21 +103,42 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
   const byStatus = report.by_status ?? [];
   const byTrigger = report.by_trigger ?? [];
   const byOrigin = report.by_origin ?? [];
+  const showByRule =
+    hasRules && byRule.some((group) => byRule.length > 1 || isNamedRuleGroup(group.name));
 
   return (
     <>
-      {hasRules && byRule.length > 0 ? (
-        <GroupTable title="By rule" nameColumns={[RULE_COLUMN]} rows={byRule} {...common} />
+      {showByRule ? (
+        <GroupTable
+          title="By rule"
+          sortParam="by-rule"
+          nameColumns={[RULE_COLUMN]}
+          rows={byRule}
+          {...common}
+        />
       ) : undefined}
       {byModel.length > 0 ? (
-        <GroupTable title="By model" nameColumns={[MODEL_COLUMN]} rows={byModel} {...common} />
+        <GroupTable
+          title="By model"
+          sortParam="by-model"
+          nameColumns={[MODEL_COLUMN]}
+          rows={byModel}
+          {...common}
+        />
       ) : undefined}
       {byAdapter.length > 0 ? (
-        <GroupTable title="By agent" nameColumns={[AGENT_COLUMN]} rows={byAdapter} {...common} />
+        <GroupTable
+          title="By agent"
+          sortParam="by-agent"
+          nameColumns={[AGENT_COLUMN]}
+          rows={byAdapter}
+          {...common}
+        />
       ) : undefined}
       {byStatus.length > 0 ? (
         <GroupTable
           title="By run status"
+          sortParam="by-status"
           nameColumns={[STATUS_COLUMN]}
           rows={byStatus}
           measure="share"
@@ -119,6 +148,7 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
       {byTrigger.length > 0 ? (
         <GroupTable
           title="By retry trigger"
+          sortParam="by-trigger"
           nameColumns={[TRIGGER_COLUMN]}
           rows={byTrigger}
           {...common}
@@ -127,6 +157,7 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
       {byOrigin.length > 0 ? (
         <GroupTable
           title="Why runs started"
+          sortParam="by-origin"
           nameColumns={[ORIGIN_COLUMN]}
           rows={byOrigin}
           {...common}
@@ -136,7 +167,7 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
   );
 }
 
-/** Renders Analytics: the run statistics report of a range with its summary and breakdowns, every figure as the report serves it. */
+/** Renders Analytics: the run statistics report of a range with its summary and breakdowns. */
 export function AnalyticsScreen() {
   const { data: state } = useStateQuery();
   const config = state?.config;
@@ -199,6 +230,10 @@ export function AnalyticsScreen() {
           ) : (
             <div key={range} className="flex flex-col gap-xl">
               <SummaryTiles report={report} config={config} />
+              <OutcomeBar summary={report.summary} />
+              {(report.chain_funnels ?? []).map((funnel) => (
+                <ChainFunnel key={funnel.stages?.[0]?.rule} funnel={funnel} config={config} />
+              ))}
               <Breakdowns
                 report={report}
                 hasRules={(config?.dispatch.rules ?? []).length > 0}

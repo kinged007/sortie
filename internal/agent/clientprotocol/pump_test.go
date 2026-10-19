@@ -542,11 +542,11 @@ func TestPumpAgentMessageChunksAreCoalesced(t *testing.T) {
 	var chunkNotifications []string
 	for _, event := range events {
 		isChunk := event.Type == domain.EventNotification && (event.Message == "" || event.Message == "hello world" || event.Message == "Next")
-		if isChunk || event.Message == planUpdateMessage {
+		if isChunk || event.Type == domain.EventOtherMessage {
 			chunkNotifications = append(chunkNotifications, event.Message)
 		}
 	}
-	want := []string{"", "", "hello world", "", "Next", planUpdateMessage}
+	want := []string{"", "", "hello world", "", "Next", ""}
 	if len(chunkNotifications) != len(want) {
 		t.Fatalf("chunk notifications = %q, want %q", chunkNotifications, want)
 	}

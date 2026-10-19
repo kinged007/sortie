@@ -77,6 +77,19 @@
         "issue_url": {
           "type": "string"
         },
+        "pr_loop": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/PrLoopStationResponse"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "reaction_kind": {
           "type": "string"
         },
@@ -110,7 +123,62 @@
         "stage_position",
         "dispatched_at",
         "status_text",
-        "status_text_full"
+        "status_text_full",
+        "pr_loop"
+      ],
+      "type": "object"
+    },
+    "AgentEventFrame": {
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "dispatch_id": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "event": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "tool_error": {
+          "type": "boolean"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "seq",
+        "at",
+        "event",
+        "message",
+        "text"
       ],
       "type": "object"
     },
@@ -685,6 +753,137 @@
       ],
       "type": "object"
     },
+    "Funnel": {
+      "properties": {
+        "stages": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/FunnelStage"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "stages"
+      ],
+      "type": "object"
+    },
+    "FunnelArrivals": {
+      "properties": {
+        "hop": {
+          "type": "integer"
+        },
+        "label": {
+          "type": "integer"
+        },
+        "match": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hop",
+        "match",
+        "label"
+      ],
+      "type": "object"
+    },
+    "FunnelOutcomes": {
+      "properties": {
+        "advanced": {
+          "type": "integer"
+        },
+        "ceiling": {
+          "type": "integer"
+        },
+        "handed_off": {
+          "type": "integer"
+        },
+        "hop_failed": {
+          "type": "integer"
+        },
+        "in_stage": {
+          "type": "integer"
+        },
+        "no_hop": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "advanced",
+        "handed_off",
+        "ceiling",
+        "hop_failed",
+        "no_hop",
+        "in_stage"
+      ],
+      "type": "object"
+    },
+    "FunnelStage": {
+      "properties": {
+        "arrivals": {
+          "$ref": "#/$defs/FunnelArrivals"
+        },
+        "entered": {
+          "type": "integer"
+        },
+        "entry": {
+          "type": "boolean"
+        },
+        "last": {
+          "type": "boolean"
+        },
+        "median_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "no_hop_reasons": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/NoHopReason"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcomes": {
+          "$ref": "#/$defs/FunnelOutcomes"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rule",
+        "entry",
+        "last",
+        "runs",
+        "entered",
+        "arrivals",
+        "outcomes",
+        "no_hop_reasons",
+        "median_seconds"
+      ],
+      "type": "object"
+    },
     "Group": {
       "properties": {
         "cost_per_succeeded_run_usd": {
@@ -857,6 +1056,16 @@
         "tokens_complete": {
           "type": "boolean"
         },
+        "uncached_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "unmeasured_runs": {
           "type": "integer"
         }
@@ -865,6 +1074,7 @@
         "run_count",
         "unmeasured_runs",
         "tokens",
+        "uncached_tokens",
         "tokens_complete",
         "estimated_cost_usd",
         "cost_status"
@@ -998,10 +1208,25 @@
             }
           ]
         },
+        "pr_loop": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/PrLoopStationResponse"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "recent_events": {
           "anyOf": [
             {
-              "items": {},
+              "items": {
+                "$ref": "#/$defs/RunEventResponse"
+              },
               "type": "array"
             },
             {
@@ -1077,6 +1302,7 @@
         "last_error",
         "tracked",
         "history",
+        "pr_loop",
         "status_text",
         "status_text_full",
         "next_outcomes"
@@ -1356,6 +1582,21 @@
       "required": [
         "condition",
         "text"
+      ],
+      "type": "object"
+    },
+    "NoHopReason": {
+      "properties": {
+        "passes": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "passes"
       ],
       "type": "object"
     },
@@ -1689,6 +1930,21 @@
       ],
       "type": "object"
     },
+    "PrLoopStationResponse": {
+      "properties": {
+        "continuations": {
+          "type": "integer"
+        },
+        "result": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "result",
+        "continuations"
+      ],
+      "type": "object"
+    },
     "PullRequestResponse": {
       "properties": {
         "branch": {
@@ -1939,6 +2195,19 @@
             }
           ]
         },
+        "chain_funnels": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Funnel"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "db_path": {
           "type": "string"
         },
@@ -2013,6 +2282,7 @@
         "by_template",
         "by_model",
         "by_chain",
+        "chain_funnels",
         "by_trigger",
         "by_origin",
         "self_review"
@@ -2164,6 +2434,125 @@
       ],
       "type": "object"
     },
+    "RunEndedFrame": {
+      "properties": {
+        "dispatch_id": {
+          "type": "string"
+        },
+        "last_seq": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "last_seq"
+      ],
+      "type": "object"
+    },
+    "RunEventResponse": {
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "event": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "tool_error": {
+          "type": "boolean"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "seq",
+        "at",
+        "event",
+        "message",
+        "text"
+      ],
+      "type": "object"
+    },
+    "RunEventsResponse": {
+      "properties": {
+        "dispatch_id": {
+          "type": "string"
+        },
+        "events": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunEventResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_seq": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "first_seq",
+        "events"
+      ],
+      "type": "object"
+    },
+    "RunResetFrame": {
+      "properties": {
+        "dispatch_id": {
+          "type": "string"
+        },
+        "first_seq": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "reason"
+      ],
+      "type": "object"
+    },
     "RunResponse": {
       "properties": {
         "agent_kind": {
@@ -2186,6 +2575,16 @@
         },
         "cost_status": {
           "type": "string"
+        },
+        "dispatch_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "dispatched_at": {
           "anyOf": [
@@ -2247,6 +2646,19 @@
         },
         "origin_recorded": {
           "type": "boolean"
+        },
+        "pr_loop": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/PrLoopStationResponse"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reaction_config_key": {
           "anyOf": [
@@ -2357,6 +2769,16 @@
         "unaccounted_turns": {
           "type": "integer"
         },
+        "uncached_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "workflow_file": {
           "type": "string"
         }
@@ -2373,6 +2795,7 @@
         "dispatched_at",
         "turns_completed",
         "tokens",
+        "uncached_tokens",
         "tokens_measured",
         "unaccounted_turns",
         "estimated_cost_usd",
@@ -2384,8 +2807,10 @@
         "reaction_config_key",
         "session_id",
         "ssh_host",
+        "dispatch_id",
         "stage_chain",
-        "issue_outcome"
+        "issue_outcome",
+        "pr_loop"
       ],
       "type": "object"
     },
@@ -2444,6 +2869,9 @@
           "type": "string"
         },
         "cost_status": {
+          "type": "string"
+        },
+        "dispatch_id": {
           "type": "string"
         },
         "dispatched_at": {
@@ -2518,6 +2946,16 @@
         "issue_type": {
           "type": "string"
         },
+        "issue_uncached_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "issue_url": {
           "type": "string"
         },
@@ -2525,8 +2963,15 @@
           "type": "string"
         },
         "last_event_at": {
-          "format": "date-time",
-          "type": "string"
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "last_message": {
           "type": "string"
@@ -2536,6 +2981,17 @@
         },
         "pull_request": {
           "$ref": "#/$defs/PullRequestResponse"
+        },
+        "quiet_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reaction_attempt": {
           "type": "integer"
@@ -2587,6 +3043,47 @@
             }
           ]
         },
+        "stall_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stall_off_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stall_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stall_text_full": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "started_at": {
           "format": "date-time",
           "type": "string"
@@ -2624,6 +3121,16 @@
         },
         "turn_count": {
           "type": "integer"
+        },
+        "uncached_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "unmeasured_sessions": {
           "anyOf": [
@@ -2687,6 +3194,7 @@
         "last_event_at",
         "workspace_path",
         "tokens",
+        "uncached_tokens",
         "stage_lineage",
         "stage_position",
         "api_request_count",
@@ -2704,13 +3212,20 @@
         "unmeasured_sessions",
         "used_tokens",
         "used_tokens_complete",
+        "issue_uncached_tokens",
         "budget_tokens",
         "estimated_cost_usd",
         "cost_status",
         "issue_estimated_cost_usd",
         "issue_cost_status",
         "status_text",
-        "status_text_full"
+        "status_text_full",
+        "dispatch_id",
+        "quiet_at",
+        "stall_at",
+        "stall_text",
+        "stall_text_full",
+        "stall_off_text"
       ],
       "type": "object"
     },
@@ -4094,6 +4609,9 @@
         },
         "total": {
           "type": "integer"
+        },
+        "uncached": {
+          "type": "integer"
         }
       },
       "required": [
@@ -4101,7 +4619,8 @@
         "output",
         "total",
         "cache_read",
-        "cache_write"
+        "cache_write",
+        "uncached"
       ],
       "type": "object"
     },

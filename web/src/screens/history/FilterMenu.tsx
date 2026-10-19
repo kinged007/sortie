@@ -54,7 +54,7 @@ export function FilterMenu({ label, valueText, options, value, onChange }: Filte
     <Popover open={isOpen} onOpenChange={handleOpenChange}>
       <PopoverTrigger className={TRIGGER}>
         {label}
-        <span className="text-ink [overflow-wrap:anywhere]">{valueText}</span>
+        <span className="text-ink wrap-anywhere">{valueText}</span>
         <ChevronDownIcon />
       </PopoverTrigger>
       <PopoverPopup aria-label={label} className="w-72 max-w-[calc(100vw-2rem)]">
@@ -78,7 +78,7 @@ export function FilterMenu({ label, valueText, options, value, onChange }: Filte
           <ComboboxList>
             {(option: FilterOption) => (
               <ComboboxItem key={option.value} value={option}>
-                <span className="[overflow-wrap:anywhere]">{option.label}</span>
+                <span className="wrap-anywhere">{option.label}</span>
               </ComboboxItem>
             )}
           </ComboboxList>

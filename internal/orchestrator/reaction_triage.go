@@ -13,6 +13,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/config"
+	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -569,6 +570,7 @@ func reactionTriageGate(
 		switch outcome.Disposition {
 		case TriageHandled:
 			markTriageDispatched(params, run, req, log, ctx)
+			recordTriageAction(ctx, params, pending, log)
 			return triageHandled
 		case TriageEscalate:
 			markTriageDispatched(params, run, req, log, ctx)
@@ -589,6 +591,17 @@ func reactionTriageGate(
 		markTriageDispatched(params, run, req, log, ctx)
 	}
 	return triageHandled
+}
+
+// recordTriageAction records that triage handled the entry's reaction in
+// place of an agent run.
+func recordTriageAction(ctx context.Context, params ReconcileParams, pending *PendingReaction, log *slog.Logger) {
+	now := time.Now().UTC()
+	if params.NowFunc != nil {
+		now = params.NowFunc().UTC()
+	}
+	recordReactionActivity(ctx, params.Store, pending.IssueID, pending.StageLineage,
+		persistence.ReactionActivityAction, []string{pending.Kind}, now, log)
 }
 
 // markTriageDispatched marks the reaction fingerprint dispatched and

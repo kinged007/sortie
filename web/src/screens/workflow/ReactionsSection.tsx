@@ -1,7 +1,15 @@
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
-import { CELL, escalationText, joinLabels, Table } from "./workflow-text";
+import { escalationText, joinLabels } from "./workflow-text";
 
 import type { ShapeReactions } from "@/api/types.gen";
 import type { ReactNode } from "react";
@@ -105,14 +113,23 @@ export function ReactionsSection({ reactions, handoffState }: ReactionsSectionPr
       {rows.length === 0 ? (
         <p className="text-body-md text-ink-body">No reactions: Sortie's part ends at {handoff}.</p>
       ) : (
-        <Table headers={["Kind", "Limit", "Escalation"]}>
-          {rows.map((row) => (
-            <tr key={row.kind}>
-              <td className={`${CELL} font-mono`}>{row.kind}</td>
-              <td className={CELL}>{row.limit}</td>
-              <td className={CELL}>{row.escalation}</td>
-            </tr>
-          ))}
+        <Table>
+          <TableHeader>
+            <TableHead>Kind</TableHead>
+            <TableHead>Limit</TableHead>
+            <TableHead>Escalation</TableHead>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.kind}>
+                <TableCell>
+                  <span className="font-mono">{row.kind}</span>
+                </TableCell>
+                <TableCell>{row.limit}</TableCell>
+                <TableCell>{row.escalation}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
         </Table>
       )}
     </Panel>

@@ -14,11 +14,11 @@ Sortie follows [Semantic Versioning](https://semver.org/). Security fixes are ap
 
 | Version | Supported |
 |---------|-----------|
-| 1.27.x | Yes (1.27.0 recommended) |
-| 1.26.x | Security patches until 11 Jan 2027 |
-| < 1.26 | No |
+| 1.28.x | Yes (1.28.1 recommended) |
+| 1.27.x | Security patches until 16 Jan 2027 |
+| < 1.27 | No |
 
-When a new minor version ships (e.g., 1.27.0), the immediately preceding minor (e.g., 1.26.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
+When a new minor version ships (e.g., 1.28.0), the immediately preceding minor (e.g., 1.27.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
 
 ## Reporting a Vulnerability
 
@@ -98,6 +98,7 @@ across multiple projects. Extensions require reporter agreement.
 - SQLite persistence layer vulnerabilities (injection, corruption, unauthorized access).
 - Configuration injection via environment variable handling or YAML parsing.
 - Denial of service against the orchestrator (crash, resource exhaustion, deadlock).
+- Cross-site request forgery against the HTTP API.
 - Vulnerabilities in direct dependencies of code that ships in the binary: Go
   modules (see [go.mod](go.mod)) and any third-party code bundled into the
   embedded dashboard.
@@ -129,6 +130,9 @@ Sortie's security model is documented in the
 - **Input sanitization**: workspace directory names are restricted to
   `[A-Za-z0-9._-]`; all other characters are replaced. Filesystem special
   names (`.`, `..`) are explicitly rejected.
+- **Cross-origin requests**: the HTTP server refuses a state-changing request
+  that a page served from another origin sends. DNS rebinding is outside this
+  protection.
 - **Agent execution boundary**: the coding agent subprocess `cwd` is validated
   to equal the workspace path before every launch.
 - **Secret handling**: API tokens and secret values support `$VAR` indirection

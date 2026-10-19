@@ -35,6 +35,10 @@ type RunHistoryCapabilities struct {
 	// HasFirstAfterHop is outside [RunHistoryCapabilities.Full];
 	// [RunHistoryCapabilities.OriginBreakdown] depends on it.
 	HasFirstAfterHop bool // migration 032: first_after_hop
+
+	// HasAgentBlocked is outside [RunHistoryCapabilities.Full];
+	// [RunHistoryCapabilities.FunnelBreakdown] depends on it.
+	HasAgentBlocked bool // migration 037: agent_blocked
 }
 
 // Full reports whether the database carries every optional run_history
@@ -69,6 +73,12 @@ func (c RunHistoryCapabilities) TriggerBreakdown() bool {
 // TriggerBreakdown plus the first-run-after-hop column.
 func (c RunHistoryCapabilities) OriginBreakdown() bool {
 	return c.TriggerBreakdown() && c.HasFirstAfterHop
+}
+
+// FunnelBreakdown reports whether a read can fold runs into stage funnels:
+// OriginBreakdown plus the blocked-run column.
+func (c RunHistoryCapabilities) FunnelBreakdown() bool {
+	return c.OriginBreakdown() && c.HasAgentBlocked
 }
 
 // RunStatsRow is the narrow run_history projection the aggregate read
@@ -116,6 +126,12 @@ type RunStatsRow struct {
 	// FirstAfterHop is false unless [RunHistoryCapabilities.OriginBreakdown]
 	// reports true.
 	FirstAfterHop bool
+
+	// Each is false unless [RunHistoryCapabilities.FunnelBreakdown] reports
+	// true. HandoffWithheld marks a failed run whose error begins with
+	// [HandoffAbsenceErrorPrefix].
+	AgentBlocked    bool
+	HandoffWithheld bool
 }
 
 // runStatsColumnsFull is the column list when Full reports true and
@@ -180,6 +196,7 @@ func (s *Store) RunHistoryCapabilities(ctx context.Context) (RunHistoryCapabilit
 		HasStageChains:   columns["chain_id"] && columns["stage_target"] && columns["stage_result"],
 		HasTrigger:       columns["trigger"] && columns["reaction_kind"],
 		HasFirstAfterHop: columns["first_after_hop"],
+		HasAgentBlocked:  columns["agent_blocked"],
 	}, nil
 }
 
@@ -208,6 +225,7 @@ func (s *Store) ScanRunHistoryRange(
 	chains := caps.ChainBreakdown()
 	triggers := caps.TriggerBreakdown()
 	origins := caps.OriginBreakdown()
+	funnels := caps.FunnelBreakdown()
 	query := runStatsColumnsBase
 	switch {
 	case full && caps.HasCacheWriteTokens:
@@ -227,9 +245,14 @@ func (s *Store) ScanRunHistoryRange(
 	if origins {
 		query += ", first_after_hop"
 	}
+	var args []any
+	if funnels {
+		query += `, agent_blocked,
+		CASE WHEN status = 'failed' AND substr(error, 1, ?) = ? THEN 1 ELSE 0 END`
+		args = append(args, len(HandoffAbsenceErrorPrefix), HandoffAbsenceErrorPrefix)
+	}
 	query += "\nFROM run_history"
 
-	var args []any
 	where := ""
 	if since != nil {
 		where += " WHERE completed_at >= ?"
@@ -283,6 +306,9 @@ func (s *Store) ScanRunHistoryRange(
 		}
 		if origins {
 			dest = append(dest, &row.FirstAfterHop)
+		}
+		if funnels {
+			dest = append(dest, &row.AgentBlocked, &row.HandoffWithheld)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			return fmt.Errorf("scan run history range: %w", err)

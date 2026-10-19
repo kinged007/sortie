@@ -37,8 +37,8 @@ function tokensPart(summary: Summary): string {
   if (summary.tokens === null) {
     return "tokens not recorded";
   }
-  const { total } = summary.tokens;
-  const text = `${fmtTokens(total)} ${total === 1 ? "token" : "tokens"}`;
+  const { uncached } = summary.tokens;
+  const text = `${fmtTokens(uncached)} ${uncached === 1 ? "token" : "tokens"}`;
   return summary.tokens_unmeasured_runs > 0
     ? `${text} (${plural(summary.tokens_unmeasured_runs, "run", "runs")} not measured)`
     : text;

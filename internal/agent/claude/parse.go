@@ -176,34 +176,16 @@ func (e rawEvent) contentBlocks() []rawContentBlock {
 	return msg.Content
 }
 
-// summarizeAssistant extracts a human-readable summary from an
-// assistant message event's content blocks.
+// summarizeAssistant returns the text blocks of an assistant message event
+// joined by spaces, or "" when there are none. Tool calls are reported
+// separately as tool_result events, so naming them here would only repeat
+// them as noise in the run timeline.
 func summarizeAssistant(event rawEvent) string {
-	blocks := event.contentBlocks()
-	if len(blocks) == 0 {
-		return "assistant message"
-	}
-
 	var parts []string
-	for _, b := range blocks {
-		switch b.Type {
-		case "text":
-			if b.Text != "" {
-				parts = append(parts, redact.Truncate(b.Text, 200))
-			}
-		case "tool_use":
-			parts = append(parts, fmt.Sprintf("[tool: %s]", b.Name))
-		case "tool_result":
-			status := "ok"
-			if b.IsError {
-				status = "error"
-			}
-			parts = append(parts, fmt.Sprintf("[tool_result: %s]", status))
+	for _, b := range event.contentBlocks() {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, redact.Truncate(b.Text, 200))
 		}
-	}
-
-	if len(parts) == 0 {
-		return "assistant message"
 	}
 	return strings.Join(parts, " ")
 }
@@ -214,11 +196,4 @@ func formatAPIRetry(event rawEvent) string {
 	return fmt.Sprintf("API retry attempt %d/%d (delay %dms, status %d: %s)",
 		event.Attempt, event.MaxRetries, event.RetryDelayMS,
 		event.ErrorStatus, event.ErrorField)
-}
-
-func (e rawEvent) summary() string {
-	if e.Subtype != "" {
-		return fmt.Sprintf("%s/%s", e.Type, e.Subtype)
-	}
-	return e.Type
 }

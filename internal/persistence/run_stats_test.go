@@ -525,32 +525,62 @@ func TestScanRunHistoryRange_OptionalColumns(t *testing.T) {
 			first.FirstAfterHop = true
 			appendOrFatal(t, s, first)
 		}, []string{
-			"with-model|provider/cheap|with-model|PROJ-1|chain-1|specify|advanced|\"ci_fix\"|review|false",
-			"no-model||no-model|||||<nil>||false",
-			"empty-trigger||empty-trigger|||||\"\"||false",
-			"first-after-hop||first-after-hop|||||<nil>||true",
+			"with-model|provider/cheap|with-model|PROJ-1|chain-1|specify|advanced|\"ci_fix\"|review|false|false|false|true",
+			"no-model||no-model|||||<nil>||false|false|false|true",
+			"empty-trigger||empty-trigger|||||\"\"||false|false|false|true",
+			"first-after-hop||first-after-hop|||||<nil>||true|false|false|true",
 		}},
 		{"origin left empty without error on a database upgraded from before migration 028", func(t *testing.T, s *Store) {
 			migrateToVersion(t, s, 27)
 			insertBareRun(t, s, "pre-028")
 			migrateOrFatal(t, s)
-		}, []string{"pre-028||MT-1|||||<nil>||false"}},
+		}, []string{"pre-028||MT-1|||||<nil>||false|false|false|true"}},
 		{"first_after_hop left false without error on a database before migration 032", func(t *testing.T, s *Store) {
 			migrateToVersion(t, s, 31)
 			insertBareRun(t, s, "pre-032")
-		}, []string{"pre-032||MT-1|||||<nil>||false"}},
+		}, []string{"pre-032||MT-1|||||<nil>||false|false|false|false"}},
 		{"trigger left nil without error on a database before migration 028", func(t *testing.T, s *Store) {
 			migrateToVersion(t, s, 27)
 			insertBareRun(t, s, "pre-028")
-		}, []string{"pre-028||MT-1|||||<nil>||false"}},
+		}, []string{"pre-028||MT-1|||||<nil>||false|false|false|false"}},
 		{"left empty without error on a database before migration 021", func(t *testing.T, s *Store) {
 			migrateToVersion(t, s, 20)
 			insertBareRun(t, s, "old")
-		}, []string{"old|||||||<nil>||false"}},
+		}, []string{"old|||||||<nil>||false|false|false|false"}},
 		{"chain columns left empty without error on a database before migration 024", func(t *testing.T, s *Store) {
 			migrateToVersion(t, s, 23)
 			insertBareRun(t, s, "old")
-		}, []string{"old|||||||<nil>||false"}},
+		}, []string{"old|||||||<nil>||false|false|false|false"}},
+		{"funnel columns hidden without error on a database before migration 037", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 36)
+			insertBareRun(t, s, "pre-037")
+		}, []string{"pre-037||MT-1|||||<nil>||false|false|false|false"}},
+		{"a row from before migration 037 reads as not blocked after migrating", func(t *testing.T, s *Store) {
+			migrateToVersion(t, s, 36)
+			insertBareRun(t, s, "pre-037")
+			migrateOrFatal(t, s)
+		}, []string{"pre-037||MT-1|||||<nil>||false|false|false|true"}},
+		{"blocked run and handoff-withheld failure flagged by status and error prefix", func(t *testing.T, s *Store) {
+			migrateOrFatal(t, s)
+			withError := func(id, completedAt, status string, errText *string) RunHistory {
+				row := runAt(id, completedAt)
+				row.Status, row.Error = status, errText
+				return row
+			}
+			blocked := runAt("blocked", "2026-01-01T00:00:00Z")
+			blocked.AgentBlocked = true
+			appendOrFatal(t, s, blocked)
+			appendOrFatal(t, s, withError("withheld", "2026-01-02T00:00:00Z", "failed", new(HandoffAbsenceErrorPrefix+"no label")))
+			appendOrFatal(t, s, withError("other-error", "2026-01-03T00:00:00Z", "failed", new("agent crashed")))
+			appendOrFatal(t, s, withError("no-error", "2026-01-04T00:00:00Z", "failed", nil))
+			appendOrFatal(t, s, withError("not-failed", "2026-01-05T00:00:00Z", "succeeded", new(HandoffAbsenceErrorPrefix+"no label")))
+		}, []string{
+			"blocked||blocked|||||<nil>||false|true|false|true",
+			"withheld||withheld|||||<nil>||false|false|true|true",
+			"other-error||other-error|||||<nil>||false|false|false|true",
+			"no-error||no-error|||||<nil>||false|false|false|true",
+			"not-failed||not-failed|||||<nil>||false|false|false|true",
+		}},
 		{"a legacy table with only the base columns still scans", createLegacyRunHistoryTable, nil},
 	}
 
@@ -572,7 +602,7 @@ func TestScanRunHistoryRange_OptionalColumns(t *testing.T) {
 				if row.Trigger != nil {
 					trigger = strconv.Quote(*row.Trigger)
 				}
-				got = append(got, strings.Join([]string{row.IssueID, row.ConfiguredModel, row.Identifier, row.DisplayID, row.ChainID, row.StagePrevious, row.StageResult, trigger, row.ReactionKind, strconv.FormatBool(row.FirstAfterHop)}, "|"))
+				got = append(got, strings.Join([]string{row.IssueID, row.ConfiguredModel, row.Identifier, row.DisplayID, row.ChainID, row.StagePrevious, row.StageResult, trigger, row.ReactionKind, strconv.FormatBool(row.FirstAfterHop), strconv.FormatBool(row.AgentBlocked), strconv.FormatBool(row.HandoffWithheld), strconv.FormatBool(caps.FunnelBreakdown())}, "|"))
 				return nil
 			})
 

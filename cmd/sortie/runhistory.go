@@ -30,6 +30,7 @@ func (r runHistoryReader) QueryRuns(ctx context.Context, q server.RunHistoryQuer
 		CompletedBefore: q.Until,
 		EndedSince:      q.EndedSince,
 		EndedBefore:     q.EndedUntil,
+		HasDispatchID:   q.HasDispatchID,
 		BeforeID:        q.BeforeID,
 		Limit:           q.Limit,
 	})
@@ -82,6 +83,16 @@ func (r runHistoryReader) IssueTotals(ctx context.Context, issueID string) (serv
 	}, nil
 }
 
+// RunEvents returns one run's stored events, decoded, ascending by seq: all
+// when newest is 0, else the newest up to newest.
+func (r runHistoryReader) RunEvents(ctx context.Context, dispatchID string, newest int) ([]orchestrator.RunEvent, error) {
+	rows, err := r.store.RunEvents(ctx, dispatchID, newest)
+	if err != nil {
+		return nil, err
+	}
+	return orchestrator.RunEventsFromRows(rows)
+}
+
 // IssueOutcomes returns the outcome of each listed issue that has one.
 func (r runHistoryReader) IssueOutcomes(ctx context.Context, issueIDs []string) (map[string]server.IssueOutcome, error) {
 	stored, err := r.store.IssueOutcomes(ctx, issueIDs)
@@ -98,6 +109,32 @@ func (r runHistoryReader) IssueOutcomes(ctx context.Context, issueIDs []string) 
 			PRNumber:          o.PRNumber,
 			PRRepository:      o.PRRepository,
 		}
+	}
+	return out, nil
+}
+
+// PassActivities returns what the reactions recorded in each listed pass.
+func (r runHistoryReader) PassActivities(ctx context.Context, passes []server.PassRef) (map[server.PassKey]server.PassActivity, error) {
+	refs := make([]persistence.PassRef, len(passes))
+	for i, p := range passes {
+		refs[i] = persistence.PassRef{IssueID: p.IssueID, ChainID: p.ChainID, DispatchedAt: p.DispatchedAt}
+	}
+	stored, err := r.store.PassActivities(ctx, refs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[server.PassKey]server.PassActivity, len(stored))
+	for key, activity := range stored {
+		kinds := make(map[string]server.KindActivity, len(activity.Kinds))
+		for kind, k := range activity.Kinds {
+			kinds[kind] = server.KindActivity{
+				Watched:       k.Watched,
+				Continuations: k.Continuations,
+				Acted:         k.Acted,
+				Escalated:     k.Escalated,
+			}
+		}
+		out[server.PassKey{IssueID: key.IssueID, ChainID: key.ChainID}] = server.PassActivity{Recorded: activity.Recorded, Kinds: kinds}
 	}
 	return out, nil
 }
@@ -143,5 +180,6 @@ func runHistoryEntry(r persistence.RunHistory) server.RunHistoryEntry {
 		ReactionKind:         r.ReactionKind,
 		SessionID:            r.SessionID,
 		SSHHost:              r.SSHHost,
+		DispatchID:           r.DispatchID,
 	}
 }

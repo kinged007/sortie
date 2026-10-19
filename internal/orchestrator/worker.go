@@ -101,6 +101,10 @@ type WorkerResult struct {
 	// for a cancellation that interrupted no failing operation.
 	Error error
 
+	// StartupError is what credential verification or StartSession
+	// returned when the worker exits on it; else nil.
+	StartupError error
+
 	// StoppedByTokenCeiling is true when the worker context's cancellation
 	// cause is the in-flight token ceiling's own stop request.
 	StoppedByTokenCeiling bool
@@ -1075,6 +1079,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			Identifier:       issue.Identifier,
 			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
 			Error:            fmt.Errorf("agent session start: %w", verificationErr),
+			StartupError:     verificationErr,
 			WorkspacePath:    wsResult.Path,
 			AgentAdapter:     agentKind,
 			Attempt:          attempt,
@@ -1099,6 +1104,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			Identifier:       issue.Identifier,
 			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
 			Error:            fmt.Errorf("agent session start: %w", err),
+			StartupError:     err,
 			WorkspacePath:    wsResult.Path,
 			AgentAdapter:     agentKind,
 			Attempt:          attempt,

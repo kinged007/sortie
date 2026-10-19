@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router";
 import { ApiError } from "@/api/client";
 import { useHistoryQuery, useStateQuery } from "@/api/queries";
 import { Button } from "@/components/ui/button";
+import { Table } from "@/components/ui/table";
 
 import { filterFromParams, HistoryFilters } from "./HistoryFilters";
 import { HistoryTableHead, IssueGroupRows } from "./IssueGroupRows";
@@ -70,19 +71,17 @@ export function HistoryScreen() {
         </div>
       ) : (
         <>
-          <div className="max-w-full overflow-x-auto rounded-lg border border-line bg-canvas">
-            <table className="w-full min-w-[56rem] border-collapse text-body-md text-ink-body">
-              <HistoryTableHead config={config} />
-              {groups.map((group) => (
-                <IssueGroupRows
-                  key={`${filterKey}|${group.issue_id}`}
-                  group={group}
-                  filter={filter}
-                  config={config}
-                />
-              ))}
-            </table>
-          </div>
+          <Table isWide>
+            <HistoryTableHead config={config} />
+            {groups.map((group) => (
+              <IssueGroupRows
+                key={`${filterKey}|${group.issue_id}`}
+                group={group}
+                filter={filter}
+                config={config}
+              />
+            ))}
+          </Table>
           {history.hasNextPage ? (
             <div className="flex items-center gap-sm">
               <Button

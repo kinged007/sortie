@@ -41,6 +41,7 @@ type goldenStepRecord struct {
 }
 
 type goldenRecorder struct {
+	reactionActivityLog
 	*mockTrackerAdapter
 	*reviewReconcileStore
 

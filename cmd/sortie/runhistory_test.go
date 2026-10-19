@@ -203,25 +203,25 @@ func TestRunHistoryServesIssueOutcome(t *testing.T) {
 			name:   "handed off",
 			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeHandedOff, ObservedAt: at, State: "In Review"},
 			want: map[string]any{"kind": "handed_off", "observed_at": at, "state": "In Review",
-				"status_text": "Handed off to In Review", "status_text_full": "PROJ-1 was handed off: Sortie moved it to In Review."},
+				"status_text": "Handed off to In Review", "status_text_full": "Handed off: Sortie moved the issue to In Review."},
 		},
 		{
 			name:   "terminal",
 			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeTerminal, ObservedAt: at, State: "Done"},
 			want: map[string]any{"kind": "terminal", "observed_at": at, "state": "Done",
-				"status_text": "Reached Done", "status_text_full": "PROJ-1 reached the tracker state Done."},
+				"status_text": "Reached Done", "status_text_full": "Reached the tracker state Done."},
 		},
 		{
 			name:   "merged by auto-merge",
 			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge", PRNumber: 88, PRRepository: "acme/api"},
 			want: map[string]any{"kind": "merged", "observed_at": at, "merge_path": "auto_merge", "pull_request": map[string]any{"number": 88.0, "repository": "acme/api"},
-				"status_text": "Merged #88", "status_text_full": "PROJ-1 ended merged: auto-merge merged PR #88."},
+				"status_text": "Merged #88", "status_text_full": "Ended merged: auto-merge merged PR #88."},
 		},
 		{
 			name:   "merged by merge completion",
 			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge-completion", PRNumber: 89, PRRepository: "acme/web"},
 			want: map[string]any{"kind": "merged", "observed_at": at, "merge_path": "merge_completion", "pull_request": map[string]any{"number": 89.0, "repository": "acme/web"},
-				"status_text": "Merged #89", "status_text_full": "PROJ-1 ended merged: merge completion saw PR #89 merge."},
+				"status_text": "Merged #89", "status_text_full": "Ended merged: merge completion saw PR #89 merge."},
 		},
 	}
 

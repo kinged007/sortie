@@ -260,7 +260,7 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 		// Dispatch immediately: bot comments are not debounced.
 		metrics.IncBotReviewChecks("dispatched")
 
-		ScheduleRetry(state, ScheduleRetryParams{
+		scheduleReactionContinuation(ctx, state, params.Store, ScheduleRetryParams{
 			IssueID:     pending.IssueID,
 			Identifier:  pending.Identifier,
 			DisplayID:   pending.DisplayID,
@@ -281,7 +281,7 @@ func reconcileBotReviewComments(state *State, params ReconcileParams, log *slog.
 			Logger:              entryLog,
 
 			IssueIdentity: pending.IssueIdentity,
-		}, params.OnRetryFire)
+		}, params.OnRetryFire, now)
 
 		state.ReactionAttempts[rkey]++
 

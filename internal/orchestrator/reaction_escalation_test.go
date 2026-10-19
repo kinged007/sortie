@@ -57,6 +57,15 @@ func (t *escTracker) actions() int {
 	return int(t.labels.Load()) + len(t.commentCalls) + len(t.transitionCalls)
 }
 
+type escActivitySpy struct {
+	*persistence.Store
+	log reactionActivityLog
+}
+
+func (s *escActivitySpy) RecordReactionActivity(ctx context.Context, records []persistence.ReactionActivity) error {
+	return s.log.RecordReactionActivity(ctx, records)
+}
+
 type escWorld struct {
 	t       *testing.T
 	state   *State
@@ -393,6 +402,36 @@ func standingRows(rig escRig) []escRow {
 		}
 	}
 	return rows
+}
+
+func TestBeginEscalation_RecordsWhenItBegins(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	spy := &escActivitySpy{Store: openInMemoryStore(t)}
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+	lineage := StageLineage{ChainID: "chain-esc", DispatchedAt: escBase}
+	pending := &PendingReaction{IssueID: escIssue, Identifier: "PROJ-1", Kind: ReactionKindCI, StageLineage: lineage}
+	begin := func() bool {
+		return beginEscalation(ctx, state, spy, pending, EscalationTriggerBudget, "head-1", escBase, discardLogger())
+	}
+
+	if !begin() {
+		t.Fatal("beginEscalation() = false, want true for the first escalation on a subject")
+	}
+	begin()
+	got := spy.log.activities(persistence.ReactionActivityEscalation)
+	if len(got) != 1 || got[0].IssueID != escIssue || got[0].ChainID != lineage.ChainID || got[0].Kind != ReactionKindCI {
+		t.Fatalf("escalation records after begin and a call while it stands = %+v, want one for %q kind %q chain %q", got, escIssue, ReactionKindCI, lineage.ChainID)
+	}
+
+	endEscalation(ctx, spy, pending, discardLogger())
+	if begin() {
+		t.Error("beginEscalation() = true, want false: the subject is latched")
+	}
+	if got := spy.log.activities(persistence.ReactionActivityEscalation); len(got) != 2 {
+		t.Errorf("escalation records after a latched subject begins again = %d, want 2", len(got))
+	}
 }
 
 func TestReactionEscalation_EndsOutsideHandoff(t *testing.T) {

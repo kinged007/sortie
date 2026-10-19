@@ -40,6 +40,7 @@ type ReconcileStore interface {
 	SaveReactionEscalation(ctx context.Context, rec persistence.ReactionEscalation) error
 	EndReactionEscalation(ctx context.Context, issueID, kind string) error
 	DeleteReactionEscalations(ctx context.Context, issueID string) error
+	RecordReactionActivity(ctx context.Context, records []persistence.ReactionActivity) error
 }
 
 var _ ReconcileStore = (*persistence.Store)(nil)
@@ -384,12 +385,7 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 	for issueID, entry := range state.Running {
 		entryLog := logging.WithIssue(log, issueID, entry.Identifier)
 
-		refTime := entry.StartedAt
-		if !entry.LastAgentTimestamp.IsZero() {
-			refTime = entry.LastAgentTimestamp
-		}
-
-		elapsedMS := now.Sub(refTime).Milliseconds()
+		elapsedMS := now.Sub(stallReference(entry)).Milliseconds()
 		if elapsedMS <= stallThreshold {
 			continue
 		}

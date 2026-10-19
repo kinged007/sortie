@@ -82,6 +82,7 @@ func (m *mergeabilitySCM) RemoveLabel(_ context.Context, _ int, _, _, _ string) 
 // than canned values. Only the fingerprint methods carry behavior; the rest
 // satisfy the interface.
 type statefulFingerprintStore struct {
+	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	unsupportedReactionObservationStore

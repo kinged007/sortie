@@ -1042,7 +1042,11 @@ cat '`+runPath+`'`)
 		if !result2.UsageMeasured {
 			t.Error("turn 2 (cancelled after a measured turn): UsageMeasured = false, want true")
 		}
-		<-errCh
+		runErr := <-errCh
+		var agentErr *domain.AgentError
+		if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
+			t.Errorf("turn 2: RunTurn() error = %v, want AgentError{Kind: %q}", runErr, domain.ErrTurnCancelled)
+		}
 	case <-outerCtx.Done():
 		t.Fatal("RunTurn (turn 2) did not return after context cancel")
 	}
@@ -1646,9 +1650,8 @@ printf '{"type":"step_finish","timestamp":1002,"sessionID":"ses_visibility123","
 	}
 
 	var sawPermissionWarning bool
-	var sawStepStarted bool
+	var blankPings int
 	var sawUnknownMalformed bool
-	var sawStepFinished bool
 	var sawSessionStarted bool
 	var sawTurnCompleted bool
 
@@ -1658,10 +1661,8 @@ printf '{"type":"step_finish","timestamp":1002,"sessionID":"ses_visibility123","
 			switch {
 			case strings.HasPrefix(event.Message, "the agent runtime refused a permission request"):
 				sawPermissionWarning = true
-			case event.Message == "step started":
-				sawStepStarted = true
-			case event.Message == "step finished: stop":
-				sawStepFinished = true
+			case event.Message == "":
+				blankPings++
 			}
 		case domain.EventMalformed:
 			if strings.Contains(event.Message, "unknown event type") {
@@ -1677,14 +1678,11 @@ printf '{"type":"step_finish","timestamp":1002,"sessionID":"ses_visibility123","
 	if !sawPermissionWarning {
 		t.Error("permission warning notification was not emitted")
 	}
-	if !sawStepStarted {
-		t.Error("step_start notification was not emitted")
+	if blankPings != 2 {
+		t.Errorf("blank pings = %d, want 2 (step_start and step_finish)", blankPings)
 	}
 	if !sawUnknownMalformed {
 		t.Error("unknown JSON envelope did not emit malformed event")
-	}
-	if !sawStepFinished {
-		t.Error("step_finish notification was not emitted")
 	}
 	if !sawSessionStarted {
 		t.Error("session_started event was not emitted")
@@ -1725,18 +1723,18 @@ printf '{"type":"reasoning","timestamp":1000,"sessionID":"ses_reasoning123","par
 		t.Fatalf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
 	}
 
-	var sawReasoningBlock bool
+	var blankPings int
 	var sawTurnCompleted bool
 	for _, event := range events {
 		switch {
-		case event.Type == domain.EventOtherMessage && event.Message == "reasoning block":
-			sawReasoningBlock = true
+		case event.Type == domain.EventNotification && event.Message == "":
+			blankPings++
 		case event.Type == domain.EventTurnCompleted:
 			sawTurnCompleted = true
 		}
 	}
-	if !sawReasoningBlock {
-		t.Error("reasoning block event was not emitted")
+	if blankPings != 1 {
+		t.Errorf("blank pings = %d, want 1 for the reasoning part", blankPings)
 	}
 	if !sawTurnCompleted {
 		t.Error("turn_completed event was not emitted")

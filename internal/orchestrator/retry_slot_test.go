@@ -85,6 +85,7 @@ func (s *retrySlotSCM) RemoveLabel(_ context.Context, _ int, _, _, label string)
 // so "unchanged" and "advanced" assertions exercise real state rather than
 // a canned return value.
 type retrySlotStore struct {
+	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	unsupportedReactionObservationStore

@@ -868,9 +868,10 @@ func TestConn_CloseReturnsWithWriteParked(t *testing.T) {
 	sig := newEntrySignalingWriter(pw)
 	conn := jsonrpc.NewConn(sig, strings.NewReader(""), discardSink())
 
-	writeErr := make(chan error, 1)
+	written := make(chan struct{})
 	go func() {
-		writeErr <- conn.Notify("parked/notify", nil)
+		_ = conn.Notify("parked/notify", nil)
+		close(written)
 	}()
 
 	// Registered before the assertions below, so a t.Fatal on the
@@ -879,7 +880,7 @@ func TestConn_CloseReturnsWithWriteParked(t *testing.T) {
 		_ = pr.Close()
 		_ = pw.Close()
 		select {
-		case <-writeErr:
+		case <-written:
 		case <-time.After(2 * time.Second):
 		}
 	})

@@ -78,11 +78,11 @@ func TestNextOutcomes(t *testing.T) {
 	const (
 		succeeds      = "If the run succeeds"
 		fails         = "If the run fails"
-		retries       = "Sortie retries MT-654 with exponential backoff."
-		handoff       = "Sortie moves MT-654 to Human Review"
+		retries       = "Sortie retries with exponential backoff."
+		handoff       = "Sortie moves the issue to Human Review"
 		watchHandoff  = handoff + ", and a pull request the run leaves gets the CI failure and auto-merge reactions."
-		ciCondition   = "If a check in the next 25m finds CI failing on PR #88"
-		fixCondition  = "If `sortie:fix` is added to PR #88"
+		ciCondition   = "If a check in the next 25m finds CI failing on the pull request"
+		fixCondition  = "If `sortie:fix` is added to the pull request"
 		sessionsHeld  = "session budget (5 of 5 sessions used)"
 		reviewCommand = "Sortie dispatches review fix 1 of 3"
 	)
@@ -129,7 +129,7 @@ func TestNextOutcomes(t *testing.T) {
 			shape:     fixtureShape(ci),
 			want: []NextOutcome{{
 				ciCondition,
-				"CI fixes are used up (2 of 2), so Sortie applies `needs-human` to MT-1 and keeps watching the pull request. A new commit that no Sortie run made can restart the count.",
+				"CI fixes are used up (2 of 2), so Sortie applies `needs-human` to the issue and keeps watching the pull request. A new commit that no Sortie run made can restart the count.",
 			}},
 		},
 		{
@@ -137,8 +137,8 @@ func TestNextOutcomes(t *testing.T) {
 			situation: Situation{PendingReactions: pendingRow("review", watchedFor(1590*time.Second, 3, 3))},
 			shape:     fixtureShape(review),
 			want: []NextOutcome{{
-				"If a check in the next 25m finds new review comments on PR #88",
-				"Review fixes are used up (3 of 3), so Sortie applies `needs-human` to MT-1 and keeps watching the pull request.",
+				"If a check in the next 25m finds new review comments on the pull request",
+				"Review fixes are used up (3 of 3), so Sortie applies `needs-human` to the issue and keeps watching the pull request.",
 			}},
 		},
 		{
@@ -146,8 +146,8 @@ func TestNextOutcomes(t *testing.T) {
 			situation: Situation{PendingReactions: pendingRow("bot-review", watchedFor(1500*time.Second, 3, 3))},
 			shape:     fixtureShape(botReview),
 			want: []NextOutcome{{
-				"If a check in the next 25m finds a new review bot comment on the code of PR #88",
-				"Bot review fixes are used up (3 of 3), so Sortie applies `needs-human` to MT-1 and keeps watching the pull request.",
+				"If a check in the next 25m finds a new review bot comment on the code of the pull request",
+				"Bot review fixes are used up (3 of 3), so Sortie applies `needs-human` to the issue and keeps watching the pull request.",
 			}},
 		},
 		{
@@ -155,8 +155,8 @@ func TestNextOutcomes(t *testing.T) {
 			situation: Situation{PendingReactions: pendingRow("merge-conflict", watchedFor(1500*time.Second, 2, 2))},
 			shape:     fixtureShape(mergeConflicts),
 			want: []NextOutcome{{
-				"If a check in the next 25m finds a new merge conflict on PR #88",
-				"Rebases are used up (2 of 2), so Sortie applies `needs-human` to MT-1 and keeps watching the pull request. A new commit that no Sortie run made can restart the count.",
+				"If a check in the next 25m finds a new merge conflict on the pull request",
+				"Rebases are used up (2 of 2), so Sortie applies `needs-human` to the issue and keeps watching the pull request. A new commit that no Sortie run made can restart the count.",
 			}},
 		},
 		{
@@ -176,8 +176,8 @@ func TestNextOutcomes(t *testing.T) {
 			situation: Situation{Running: workSession("specify", 0), Spend: &Spend{Sessions: 4}},
 			shape:     withSessionBudget(fixtureShape(noReactions), 5),
 			want: []NextOutcome{
-				{succeeds, "Sortie adds `stage-implement`, then holds MT-654 at its " + sessionsHeld + " before stage implement starts."},
-				{fails, "Sortie holds MT-654 at its " + sessionsHeld + "."},
+				{succeeds, "Sortie adds `stage-implement`, then holds the issue at its " + sessionsHeld + " before stage implement starts."},
+				{fails, "Sortie holds the issue at its " + sessionsHeld + "."},
 			},
 		},
 		{
@@ -191,7 +191,7 @@ func TestNextOutcomes(t *testing.T) {
 			situation: Situation{PendingReactions: pendingRow("review", watchedFor(1590*time.Second, 0, 3))},
 			shape:     fixtureShape(review),
 			want: []NextOutcome{{
-				"If a check in the next 25m finds new review comments on PR #88",
+				"If a check in the next 25m finds new review comments on the pull request",
 				reviewCommand + " once no newer comment arrives for 1m.",
 			}},
 		},
@@ -203,7 +203,7 @@ func TestNextOutcomes(t *testing.T) {
 			})},
 			shape: fixtureShape(review),
 			want: []NextOutcome{{
-				"When the new review comments on PR #88 settle in the next 26m",
+				"When the new review comments on the pull request settle in the next 26m",
 				reviewCommand + ".",
 			}},
 		},
@@ -224,7 +224,7 @@ func TestNextOutcomes(t *testing.T) {
 			},
 			shape: fixtureShape(fixLabel),
 			want: []NextOutcome{
-				{"When the CI fix run comes due", "Sortie dispatches MT-1 in a new session."},
+				{"When the CI fix run comes due", "Sortie dispatches a new session."},
 				{fixCondition, "Sortie dispatches a fix of the pull request after the CI fix run ends."},
 			},
 		},
@@ -244,7 +244,7 @@ func TestNextOutcomes(t *testing.T) {
 				PendingReactions: pendingRow("label-fix", nil),
 			},
 			shape: fixtureShape(fixLabel),
-			want:  []NextOutcome{{"When the label fix run comes due", "Sortie dispatches MT-1 in a new session."}},
+			want:  []NextOutcome{{"When the label fix run comes due", "Sortie dispatches a new session."}},
 		},
 	}
 

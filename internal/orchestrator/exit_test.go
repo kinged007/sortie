@@ -27,6 +27,8 @@ import (
 )
 
 type mockExitStore struct {
+	reactionActivityLog
+	livePassLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	runHistories    []persistence.RunHistory
@@ -57,6 +59,7 @@ type mockExitStore struct {
 	deleteRetryEntryErr       error
 	absenceCountErr           error
 	absenceResetErr           error
+	writesAtPassDelete        int
 }
 
 type recordedStageResult struct {
@@ -67,7 +70,7 @@ type recordedStageResult struct {
 
 var _ WorkerExitStore = (*mockExitStore)(nil)
 
-func (m *mockExitStore) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (m *mockExitStore) AppendRunHistoryWithEvents(_ context.Context, run persistence.RunHistory, _ []persistence.RunEvent, _ persistence.RunEventLimits) (persistence.RunHistory, error) {
 	m.runHistories = append(m.runHistories, run)
 	if m.appendRunHistoryErr != nil {
 		return persistence.RunHistory{}, m.appendRunHistoryErr
@@ -84,6 +87,11 @@ func (m *mockExitStore) UpsertAggregateMetrics(_ context.Context, metrics persis
 func (m *mockExitStore) SaveRetryEntry(_ context.Context, entry persistence.RetryEntry) error {
 	m.retryEntries = append(m.retryEntries, entry)
 	return m.saveRetryEntryErr
+}
+
+func (m *mockExitStore) DeleteLivePass(ctx context.Context, issueID, kind string) error {
+	m.writesAtPassDelete = len(m.runHistories) + len(m.retryEntries)
+	return m.livePassLog.DeleteLivePass(ctx, issueID, kind)
 }
 
 func (m *mockExitStore) DeleteRetryEntry(_ context.Context, issueID string) error {
@@ -1037,6 +1045,9 @@ func TestHandleWorkerExit_RetryableError(t *testing.T) {
 	if len(store.retryEntries) != 1 {
 		t.Fatalf("SaveRetryEntry called %d times, want 1", len(store.retryEntries))
 	}
+	if store.writesAtPassDelete != 2 {
+		t.Errorf("run history and retry rows written before DeleteLivePass = %d, want 2", store.writesAtPassDelete)
+	}
 }
 
 func TestHandleWorkerExit_RetryableReactionErrorPreservesContext(t *testing.T) {
@@ -1324,6 +1335,7 @@ func TestHandleWorkerExit_CancelledExit(t *testing.T) {
 	if len(store.retryEntries) != 0 {
 		t.Errorf("SaveRetryEntry called %d times, want 0", len(store.retryEntries))
 	}
+	requireLivePasses(t, "DeleteLivePass", store.deleted, []persistence.LivePass{{IssueID: "ISSUE-4", Kind: persistence.LivePassRunning}})
 }
 
 func TestHandleWorkerExit_TokenCeilingStoppedRecordsBudgetStoppedStatus(t *testing.T) {
@@ -2161,9 +2173,9 @@ func (s *orderRecordingExitStore) UpsertSessionMetadata(ctx context.Context, met
 	return s.mockExitStore.UpsertSessionMetadata(ctx, meta)
 }
 
-func (s *orderRecordingExitStore) AppendRunHistory(ctx context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (s *orderRecordingExitStore) AppendRunHistoryWithEvents(ctx context.Context, run persistence.RunHistory, events []persistence.RunEvent, limits persistence.RunEventLimits) (persistence.RunHistory, error) {
 	s.callOrder = append(s.callOrder, "AppendRunHistory")
-	return s.mockExitStore.AppendRunHistory(ctx, run)
+	return s.mockExitStore.AppendRunHistoryWithEvents(ctx, run, events, limits)
 }
 
 func TestHandleWorkerExit_SessionExitWriteOrder(t *testing.T) {
@@ -3938,6 +3950,9 @@ func TestHandleWorkerExit_HandoffTransitionSucceeds(t *testing.T) {
 	if len(store.retryEntries) != 0 {
 		t.Errorf("SaveRetryEntry called %d times, want 0", len(store.retryEntries))
 	}
+	if len(store.runHistories) != 1 || store.runHistories[0].AgentBlocked {
+		t.Errorf("appended run history = %+v, want one row with AgentBlocked false", store.runHistories)
+	}
 }
 
 func TestHandleWorkerExit_HandoffTransitionFails(t *testing.T) {
@@ -4799,6 +4814,7 @@ func TestHandleWorkerExit_HandoffReview_DoesNotOverwriteExistingPendingReaction(
 	tracker := &mockTrackerAdapter{}
 	state := exitStateWithIssue(t, "HO-DUP1", "In Progress")
 
+	state.Running["HO-DUP1"].StageLineage = StageLineage{ChainID: "chain-dup", DispatchedAt: baseTime}
 	existingEntry := &PendingReaction{
 		IssueID:   "HO-DUP1",
 		Kind:      ReactionKindReview,
@@ -4818,6 +4834,7 @@ func TestHandleWorkerExit_HandoffReview_DoesNotOverwriteExistingPendingReaction(
 	params.HandoffState = "In Review"
 	params.ActiveStates = []string{"In Progress"}
 	params.SCMAdapter = &scmAdapterStubExit{}
+	params.ReviewReactionConfigured = true
 
 	HandleWorkerExit(state, WorkerResult{
 		IssueID:       "HO-DUP1",
@@ -4837,6 +4854,9 @@ func TestHandleWorkerExit_HandoffReview_DoesNotOverwriteExistingPendingReaction(
 	}
 	if reviewData.PRNumber != 99 {
 		t.Errorf("ReviewReactionData.PRNumber = %d, want 99 (seeded value)", reviewData.PRNumber)
+	}
+	if watches := store.activities(persistence.ReactionActivityWatch); len(watches) != 0 {
+		t.Errorf("RecordReactionActivity watch records = %+v, want none for an entry the exit did not create", watches)
 	}
 }
 
@@ -6112,6 +6132,10 @@ func TestHandleWorkerExitBlockedDrivingDispatchParksIssue(t *testing.T) {
 	if len(calls) != 1 || calls[0].issueID != "BLK-1" || calls[0].label != "needs-human" {
 		t.Errorf("AddLabel calls = %+v, want one needs-human call for BLK-1", calls)
 	}
+	if len(store.runHistories) != 1 || !store.runHistories[0].AgentBlocked {
+		t.Errorf("appended run history = %+v, want one row with AgentBlocked true", store.runHistories)
+	}
+	requireLivePasses(t, "DeleteLivePass", store.deleted, []persistence.LivePass{{IssueID: "BLK-1", Kind: persistence.LivePassRunning}})
 }
 
 func TestHandleWorkerExitBlockedWithReviewMetadataTakesBlockedDisposition(t *testing.T) {
@@ -6404,6 +6428,7 @@ func TestHandleWorkerExit_CIProvider_PopulatesPendingReaction(t *testing.T) {
 	store := &mockExitStore{}
 	state := exitState(t, "CI-ISS-1", nil)
 	state.Running["CI-ISS-1"].RuleSettingsApplied = true
+	state.Running["CI-ISS-1"].StageLineage = StageLineage{ChainID: "chain-ci-1", DispatchedAt: baseTime}
 	params := defaultExitParams(t, store)
 	params.CIProvider = &ciProviderStubExit{}
 	params.SCMAdapter = &scmAdapterStubExit{}
@@ -6446,6 +6471,10 @@ func TestHandleWorkerExit_CIProvider_PopulatesPendingReaction(t *testing.T) {
 	}
 	if _, ok := state.PendingReactions[ReactionKey("CI-ISS-1", ReactionKindReview)]; ok {
 		t.Error("PendingReactions[CI-ISS-1:review] present, want absent without the review reaction configured")
+	}
+	watches := store.activities(persistence.ReactionActivityWatch)
+	if len(watches) != 1 || watches[0].IssueID != "CI-ISS-1" || watches[0].ChainID != "chain-ci-1" || watches[0].Kind != ReactionKindCI {
+		t.Errorf("RecordReactionActivity watch records = %+v, want one for CI-ISS-1 kind %q chain %q", watches, ReactionKindCI, "chain-ci-1")
 	}
 }
 
@@ -8703,10 +8732,6 @@ func TestHandleWorkerExit_RetryableErrorDeferral(t *testing.T) {
 	}
 }
 
-// TestHandleWorkerExit_StopSignalDispositionsDestroyForeignIncumbent pins
-// the six stop-signal dispositions that cancel a foreign incumbent
-// regardless: blocked soft stop, terminal observation, other soft stop,
-// and the three handoff soft-stop variants.
 func TestHandleWorkerExit_StopSignalDispositionsDestroyForeignIncumbent(t *testing.T) {
 	t.Parallel()
 
@@ -8868,6 +8893,7 @@ func TestHandleWorkerExit_StopSignalDispositionsDestroyForeignIncumbent(t *testi
 			if _, ok := state.Claimed[tc.issueID]; ok {
 				t.Error("Claimed entry survived a stop-signal disposition, want released even against a foreign incumbent")
 			}
+			requireLivePasses(t, "DeleteLivePass", store.deleted, []persistence.LivePass{{IssueID: tc.issueID, Kind: persistence.LivePassRunning}})
 		})
 	}
 
@@ -10358,7 +10384,7 @@ func TestHandleWorkerExit_StageHopOnlyForSuccessfulRun(t *testing.T) {
 			want := SnapshotStageHop{
 				IssueID: hopExitIssueID, Identifier: "HOP-1-ident", DisplayID: "acme/web#1", IssueTitle: "Add search", IssueURL: "https://example.test/acme/web/issues/1",
 				IssueLabels: []string{"feature", hopExitTargetLabel}, State: "In Progress", RuleName: "implement",
-				SourceRule: "specify", TargetRule: "implement", TargetLabel: hopExitTargetLabel, HoppedAt: between[0].HoppedAt, DispatchedAt: hopExitPassAt,
+				SourceRule: "specify", TargetRule: "implement", TargetLabel: hopExitTargetLabel, HoppedAt: between[0].HoppedAt, DispatchedAt: hopExitPassAt, ChainID: hopExitChain,
 			}
 			if !reflect.DeepEqual(between[0], want) || between[0].HoppedAt.IsZero() {
 				t.Errorf("BetweenStages[0] = %+v, want %+v with a hop time", between[0], want)

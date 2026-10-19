@@ -97,16 +97,13 @@ export function ActiveList({
             />
           ))}
         </ul>
+      ) : rows.length === 0 ? (
+        // Holds the list's place so the sections below do not shift when work starts.
+        <div aria-hidden="true" className="min-h-lh border border-transparent py-lg text-body-md" />
       ) : (
         <div className="flex flex-wrap items-center gap-sm rounded-lg border border-line bg-canvas px-md py-lg text-body-md text-ink-body">
-          {rows.length === 0 ? (
-            "No issue is active."
-          ) : (
-            <>
-              No active issue matches these filters.
-              <Button onClick={handleShowAll}>Show all</Button>
-            </>
-          )}
+          No active issue matches these filters.
+          <Button onClick={handleShowAll}>Show all</Button>
         </div>
       )}
     </section>

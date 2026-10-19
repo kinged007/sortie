@@ -55,6 +55,13 @@ export const router = createBrowserRouter(
               },
             },
             {
+              path: "issues/:identifier/sessions/:dispatchId",
+              lazy: {
+                Component: async () =>
+                  (await import("@/screens/session/SessionScreen")).SessionScreen,
+              },
+            },
+            {
               path: "history",
               lazy: {
                 Component: async () =>

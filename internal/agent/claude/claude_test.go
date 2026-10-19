@@ -1631,6 +1631,9 @@ func TestRunTurn_UnknownEventType(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	script := fakeClaude(t, tmpDir, agenttest.Output{Stdout: `{"type":"unknown_future_type","data":"something"}
+{"type":"system","subtype":"task_started","task_id":"t1"}
+{"type":"rate_limit_event"}
+{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}
 {"type":"result","subtype":"success","result":"ok","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}
 `})
 
@@ -1654,8 +1657,18 @@ func TestRunTurn_UnknownEventType(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if events[0].Type != domain.EventOtherMessage {
-		t.Errorf("unknown type mapped to %q, want %q", events[0].Type, domain.EventOtherMessage)
+	var pings int
+	for _, e := range events {
+		if e.Type != domain.EventNotification && e.Type != domain.EventOtherMessage {
+			continue
+		}
+		pings++
+		if e.Message != "" {
+			t.Errorf("%s message = %q, want blank", e.Type, e.Message)
+		}
+	}
+	if pings != 4 {
+		t.Errorf("blank pings = %d, want 4", pings)
 	}
 }
 

@@ -248,11 +248,11 @@ func sessionProcessGroup(t *testing.T, session domain.Session) int {
 
 // awaitProbeUnderTurn folds every snapshot into owned. ended=true
 // means the turn finished first, the one case no signal can be sent.
-func awaitProbeUnderTurn(owned *ownedDescendants, probePath string, pgid int, done <-chan error, bound time.Duration) (observed, ended bool) {
+func awaitProbeUnderTurn(owned *ownedDescendants, probePath string, pgid int, turnEnded <-chan struct{}, bound time.Duration) (observed, ended bool) {
 	deadline := time.Now().Add(bound)
 	for {
 		select {
-		case <-done:
+		case <-turnEnded:
 			return false, true
 		default:
 		}
@@ -266,7 +266,7 @@ func awaitProbeUnderTurn(owned *ownedDescendants, probePath string, pgid int, do
 			return false, false
 		}
 		select {
-		case <-done:
+		case <-turnEnded:
 			return false, true
 		case <-time.After(probeExecutionPollInterval):
 		}
@@ -308,6 +308,7 @@ func induceProtocolCancellation(t *testing.T, coords Coordinates, fixture *share
 	defer cancel()
 
 	done := make(chan error, 1)
+	turnEnded := make(chan struct{})
 	go func() {
 		result, runErr := adapter.RunTurn(ctx, session, domain.RunTurnParams{
 			Prompt:  prompt,
@@ -315,9 +316,10 @@ func induceProtocolCancellation(t *testing.T, coords Coordinates, fixture *share
 		})
 		fixture.usage.observe(session.ID, result.UsageMeasured)
 		done <- runErr
+		close(turnEnded)
 	}()
 
-	observed, ended := awaitProbeUnderTurn(fixture.ownership(), fixture.probePath("cancellation"), sessionProcessGroup(t, session), done, fixture.observationBound())
+	observed, ended := awaitProbeUnderTurn(fixture.ownership(), fixture.probePath("cancellation"), sessionProcessGroup(t, session), turnEnded, fixture.observationBound())
 	if ended {
 		return transportGraded(evidence.Observation{Grade: evidence.GradeNotObserved, Outcome: evidence.OutcomeFixtureInductionFailed, Detail: "the turn ended before the probe was observed running", SessionID: session.ID})
 	}
@@ -379,6 +381,7 @@ func induceProtocolAsyncSignal(t *testing.T, coords Coordinates, fixture *shared
 	}
 
 	done := make(chan error, 1)
+	turnEnded := make(chan struct{})
 	go func() {
 		result, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 			Prompt:  prompt,
@@ -386,9 +389,10 @@ func induceProtocolAsyncSignal(t *testing.T, coords Coordinates, fixture *shared
 		})
 		fixture.usage.observe(session.ID, result.UsageMeasured)
 		done <- runErr
+		close(turnEnded)
 	}()
 
-	observed, ended := awaitProbeUnderTurn(fixture.ownership(), probePath, sessionProcessGroup(t, session), done, fixture.observationBound())
+	observed, ended := awaitProbeUnderTurn(fixture.ownership(), probePath, sessionProcessGroup(t, session), turnEnded, fixture.observationBound())
 	if ended {
 		return transportGraded(evidence.Observation{Grade: evidence.GradeNotObserved, Outcome: evidence.OutcomeFixtureInductionFailed, Detail: "the turn ended before the probe was observed running", SessionID: session.ID})
 	}

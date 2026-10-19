@@ -1713,17 +1713,6 @@ func TestHandleAgentEvent_ToolCallMetric(t *testing.T) {
 	}
 }
 
-// infoLogger returns a *slog.Logger that writes text records at INFO level
-// to buf. Debug-level lines are excluded, enabling clean negative assertions.
-func infoLogger(t *testing.T, buf *bytes.Buffer) *slog.Logger {
-	t.Helper()
-	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-}
-
-// TestHandleAgentEvent_ToolCallLogging verifies the INFO-level structured
-// log emitted for tool_result events with non-empty ToolName. Covers
-// success, error with message, error with empty message (fallback), and
-// the empty-ToolName negative case.
 func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 	t.Parallel()
 
@@ -1735,7 +1724,7 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 		t.Parallel()
 
 		var buf bytes.Buffer
-		logger := infoLogger(t, &buf)
+		logger := debugLogger(t, &buf)
 		spy := &spyMetrics{}
 
 		state, entry := newStateWithEntry(issueID)
@@ -1752,7 +1741,7 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 
 		out := buf.String()
 		for _, want := range []string{
-			"level=INFO",
+			"level=DEBUG",
 			"tool call completed",
 			"issue_id=" + issueID,
 			"issue_identifier=" + identifier,
@@ -1774,7 +1763,7 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 		t.Parallel()
 
 		var buf bytes.Buffer
-		logger := infoLogger(t, &buf)
+		logger := debugLogger(t, &buf)
 		spy := &spyMetrics{}
 
 		state, entry := newStateWithEntry(issueID)
@@ -1787,12 +1776,12 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 			ToolName:       "Bash",
 			ToolDurationMS: 0,
 			ToolError:      true,
-			Message:        "command failed",
+			Message:        "command failed\ndrwxr-xr-x  2 ubuntu ubuntu 4096 docs",
 		}, logger, spy)
 
 		out := buf.String()
 		for _, want := range []string{
-			"level=INFO",
+			"level=DEBUG",
 			"tool call completed",
 			"tool=Bash",
 			"outcome=error",
@@ -1802,13 +1791,16 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 				t.Errorf("log output missing %q\ngot: %s", want, out)
 			}
 		}
+		if strings.Contains(out, "drwxr-xr-x") {
+			t.Errorf("log output carries tool output past the first line\ngot: %s", out)
+		}
 	})
 
 	t.Run("error with empty message uses fallback", func(t *testing.T) {
 		t.Parallel()
 
 		var buf bytes.Buffer
-		logger := infoLogger(t, &buf)
+		logger := debugLogger(t, &buf)
 		spy := &spyMetrics{}
 
 		state, entry := newStateWithEntry(issueID)
@@ -1830,11 +1822,11 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 		}
 	})
 
-	t.Run("empty ToolName does not emit INFO log", func(t *testing.T) {
+	t.Run("empty ToolName emits no log", func(t *testing.T) {
 		t.Parallel()
 
 		var buf bytes.Buffer
-		logger := infoLogger(t, &buf)
+		logger := debugLogger(t, &buf)
 		spy := &spyMetrics{}
 
 		state, entry := newStateWithEntry(issueID)

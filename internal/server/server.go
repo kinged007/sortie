@@ -41,6 +41,14 @@ type AcknowledgeFunc func(ctx context.Context, itemID string) orchestrator.Ackno
 // reaction of the given kind due now; ctx is the request's context.
 type CheckNowFunc func(ctx context.Context, identifier, kind string) orchestrator.CheckNowResult
 
+// RunEventsFunc returns a copy of a running run's retained events, oldest
+// first, and false when no running run carries dispatchID.
+type RunEventsFunc func(dispatchID string) ([]orchestrator.RunEvent, bool)
+
+// RunEventsAfterFunc returns the events of a running run after cursor, and
+// false when no running run carries dispatchID.
+type RunEventsAfterFunc func(dispatchID string, cursor int64) (orchestrator.RunEventPage, bool)
+
 // RunHistoryEntry is a server-layer view of a completed run attempt.
 // Decoupled from persistence types to avoid leaking internal packages.
 type RunHistoryEntry struct {
@@ -121,6 +129,9 @@ type RunHistoryEntry struct {
 	SessionID string
 	// SSHHost is the SSH worker the run executed on; empty for a local run.
 	SSHHost string
+	// DispatchID keys the run's retained events: empty on the recorded CI
+	// result, nil for a run recorded before the dispatch ID existed.
+	DispatchID *string
 }
 
 // RunHistoryQuery selects completed runs; a zero field matches every run.
@@ -137,6 +148,8 @@ type RunHistoryQuery struct {
 	EndedSince *time.Time
 	// EndedUntil keeps runs of issues whose outcome was observed before it.
 	EndedUntil *time.Time
+	// HasDispatchID keeps runs whose dispatch ID is a non-empty string.
+	HasDispatchID bool
 	// BeforeID keeps runs recorded before this run ID; 0 starts at the newest.
 	BeforeID int64
 	// Limit is the most runs returned.
@@ -188,6 +201,35 @@ type IssueOutcome struct {
 	PRRepository string
 }
 
+// PassRef names one pass of one issue and when its first run was dispatched.
+type PassRef struct {
+	IssueID      string
+	ChainID      string
+	DispatchedAt time.Time // zero for an undated pass
+}
+
+// PassKey keys a pass in a PassActivities result.
+type PassKey struct {
+	IssueID string
+	ChainID string
+}
+
+// KindActivity sums what one reaction kind recorded in one pass.
+type KindActivity struct {
+	Watched       bool
+	Continuations int
+	Acted         bool // an action row exists
+	Escalated     bool
+}
+
+// PassActivity is what the reactions recorded in one pass. Recorded is false
+// for a pass without a chain identifier or a dispatch time, or dispatched
+// before reaction activity was first recorded; Kinds is then empty.
+type PassActivity struct {
+	Recorded bool
+	Kinds    map[string]KindActivity // keyed by reaction kind
+}
+
 // IssueRunTotals is one issue's spend over all of its runs.
 type IssueRunTotals struct {
 	// Usage counts runs and prices spend per agent kind.
@@ -207,6 +249,15 @@ type RunHistoryReader interface {
 	// IssueOutcomes returns the outcome of each listed issue that has one,
 	// keyed by issue ID.
 	IssueOutcomes(ctx context.Context, issueIDs []string) (map[string]IssueOutcome, error)
+	// PassActivities returns what the reactions recorded in each listed
+	// pass, keyed by issue and chain. A listed pass without records maps to
+	// a PassActivity with no Kinds.
+	PassActivities(ctx context.Context, passes []PassRef) (map[PassKey]PassActivity, error)
+	// RunEvents returns one run's stored events ascending by seq: all when
+	// newest is 0, else the newest up to newest. It returns an empty non-nil
+	// slice when the run has none, and an error for a row that does not
+	// decode.
+	RunEvents(ctx context.Context, dispatchID string, newest int) ([]orchestrator.RunEvent, error)
 }
 
 // DBPingFunc checks whether the SQLite database is accessible.
@@ -284,6 +335,15 @@ type Params struct {
 	// history.
 	RunHistory RunHistoryReader
 
+	// RunEventsFn returns a running run's retained events. When nil, the
+	// run-events route and recent_events serve running runs from the store
+	// only, which holds none.
+	RunEventsFn RunEventsFunc
+
+	// RunEventsAfterFn reads running runs for the change stream. When nil,
+	// the stream reads every run from the store only.
+	RunEventsAfterFn RunEventsAfterFunc
+
 	// TokenRates maps agent adapter kind strings to per-token USD
 	// rates for cost estimation in the JSON API. When nil or empty,
 	// the API reports raw token counts without cost estimates.
@@ -316,6 +376,8 @@ type Server struct {
 	preflightFn      func() bool
 	workflowLoadedFn func() bool
 	runHistory       RunHistoryReader
+	runEventsFn      RunEventsFunc
+	runEventsAfterFn RunEventsAfterFunc
 	tokenRates       TokenRates
 	stats            StatsFunc
 
@@ -327,7 +389,8 @@ type Server struct {
 var _ orchestrator.Observer = (*Server)(nil)
 
 // New creates a [Server] with all API routes registered on an internal
-// [http.ServeMux]. Does not start listening; call
+// [http.ServeMux]. The server refuses a state-changing request that a page on
+// another origin sent. Does not start listening; call
 // [Server.ListenAndServe].
 func New(params Params) *Server {
 	if params.SnapshotFn == nil {
@@ -360,6 +423,8 @@ func New(params Params) *Server {
 		preflightFn:      params.PreflightFn,
 		workflowLoadedFn: params.WorkflowLoadedFn,
 		runHistory:       params.RunHistory,
+		runEventsFn:      params.RunEventsFn,
+		runEventsAfterFn: params.RunEventsAfterFn,
 		tokenRates:       params.TokenRates,
 		stats:            params.Stats,
 		changes:          newChangeFeed(),
@@ -387,6 +452,7 @@ func New(params Params) *Server {
 	mux.HandleFunc("/api/v1/state", s.routeState)
 	mux.HandleFunc("/api/v1/runs", s.routeRuns)
 	mux.HandleFunc("/api/v1/runs/issues", s.routeIssueGroups)
+	mux.HandleFunc("/api/v1/runs/{dispatch_id}/events", s.routeRunEvents)
 	mux.HandleFunc("/api/v1/stats", s.routeStats)
 	mux.HandleFunc("/api/v1/refresh", s.routeRefresh)
 	mux.HandleFunc("/api/v1/retries/{identifier}/run", s.routeRetryNow)
@@ -402,9 +468,12 @@ func New(params Params) *Server {
 		))
 	}
 
+	protection := http.NewCrossOriginProtection()
+	protection.SetDenyHandler(http.HandlerFunc(s.crossOriginForbidden))
+
 	s.httpServer = &http.Server{
 		Addr:              params.Addr,
-		Handler:           mux,
+		Handler:           protection.Handler(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -418,7 +487,8 @@ func New(params Params) *Server {
 // Mux returns the underlying [*http.ServeMux] so callers can register
 // additional routes beyond those registered by [New]. When
 // [Params.MetricsRegistry] is non-nil, New registers GET /metrics
-// internally; Mux remains available for any further external routes.
+// internally; Mux remains available for any further external routes. A
+// handler built from the returned mux alone skips the cross-origin check.
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
 }

@@ -726,6 +726,21 @@ func runContextFrom(ctx context.Context) context.Context {
 // must select on ctx.Done() to terminate promptly when cancelled.
 type WorkerFunc func(ctx context.Context, issue domain.Issue, attempt *int)
 
+// IsDispatchID reports whether s has the form [DispatchIssue] mints: 1 to 64
+// characters from "A" to "Z" and "2" to "7", the alphabet of [rand.Text].
+// The two change together.
+func IsDispatchID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := range len(s) {
+		if c := s[i]; (c < 'A' || c > 'Z') && (c < '2' || c > '7') {
+			return false
+		}
+	}
+	return true
+}
+
 // DispatchIssue claims the issue, populates the running map with initial
 // session fields, clears any existing retry entry, and spawns the worker
 // goroutine. All state mutations happen synchronously on the caller's
@@ -770,6 +785,7 @@ func DispatchIssue(ctx context.Context, state *State, issue domain.Issue, attemp
 		TokenCeilingCancelFunc: tokenCeilingCancelFn,
 		WorkerDone:             workerCtx.Done(),
 		SSHHost:                sshHost,
+		events:                 state.RetainedEvents.register(dispatchID),
 	}
 
 	CancelRetry(state, issue.ID)

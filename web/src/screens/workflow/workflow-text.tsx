@@ -14,7 +14,7 @@ export interface CodeProps {
 /** Renders a configured name or pattern in the monospace face. */
 export function Code({ children }: CodeProps) {
   return (
-    <code className="rounded bg-surface-raised px-xxs font-mono text-[0.9em] [overflow-wrap:anywhere]">
+    <code className="rounded bg-surface-raised px-xxs font-mono text-[0.9em] wrap-anywhere">
       {children}
     </code>
   );
@@ -149,36 +149,3 @@ export interface NoteProps {
 export function Note({ children }: NoteProps) {
   return <p className="text-body-md text-ink-body">{children}</p>;
 }
-
-/** Props of {@link Table}. */
-export interface TableProps {
-  headers: readonly string[];
-  children: ReactNode;
-}
-
-/** Renders a borderless table of rules or reactions in a container that scrolls sideways. */
-export function Table({ headers, children }: TableProps) {
-  return (
-    <div className="max-w-full overflow-x-auto">
-      <table className="w-full border-collapse text-body-md text-ink">
-        <thead>
-          <tr>
-            {headers.map((header) => (
-              <th
-                key={header}
-                scope="col"
-                className="border-b border-line px-sm pb-xs text-left text-body-sm font-medium whitespace-nowrap text-ink-muted"
-              >
-                {header}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>{children}</tbody>
-      </table>
-    </div>
-  );
-}
-
-/** The class of a {@link Table} body cell. */
-export const CELL = "border-b border-line px-sm py-xs align-baseline whitespace-nowrap";

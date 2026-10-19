@@ -109,9 +109,8 @@ func selectOutcomes(s Situation, c Context) []outcomePair {
 
 // newData returns the data map of one pair with every key a next outcome
 // template reads set to its zero value, since a missing key fails the render.
-func newData(key string) map[string]any {
+func newData() map[string]any {
 	return map[string]any{
-		"Key":             key,
 		"PR":              0,
 		"Window":          0.0,
 		"Settle":          false,
@@ -240,7 +239,6 @@ func hopTarget(shape *orchestrator.WorkflowShape, ruleName string) *orchestrator
 func runPairs(s Situation, c Context) []outcomePair {
 	r := s.Running
 	shape := c.Shape
-	key := issueKey(r.DisplayID, r.Identifier)
 	handoff := strings.TrimSpace(shape.Tracker.HandoffState)
 	queued := s.Retry != nil
 	target := hopTarget(shape, r.RuleName)
@@ -250,7 +248,7 @@ func runPairs(s Situation, c Context) []outcomePair {
 	}
 
 	var pairs []outcomePair
-	succeeds := outcomePair{condition: "next_if_run_succeeds", data: newData(key)}
+	succeeds := outcomePair{condition: "next_if_run_succeeds", data: newData()}
 	switch {
 	case handoff == "":
 		if !queued {
@@ -277,13 +275,13 @@ func runPairs(s Situation, c Context) []outcomePair {
 	}
 
 	if !queued {
-		fails := outcomePair{condition: "next_if_run_fails", data: newData(key)}
+		fails := outcomePair{condition: "next_if_run_fails", data: newData()}
 		fails.text = textOrHold(s, c, 0, fails.data, "next_backoff", "next_held")
 		pairs = append(pairs, fails)
 	}
 
 	if shape.Agent.MaxTokens != nil && r.UsageArrival.ReportsAnyFigure() {
-		stops := outcomePair{condition: "next_if_tokens_reach", text: "next_token_stop", data: newData(key)}
+		stops := outcomePair{condition: "next_if_tokens_reach", text: "next_token_stop", data: newData()}
 		setBudgets(stops.data, shape)
 		pairs = append(pairs, stops)
 	}
@@ -309,7 +307,7 @@ func recordHandoff(data map[string]any, shape *orchestrator.WorkflowShape, hando
 
 func retryPair(s Situation, c Context) outcomePair {
 	e := s.Retry
-	data := newData(issueKey(e.DisplayID, e.Identifier))
+	data := newData()
 	data["Trigger"] = e.Trigger
 	data["RunInline"] = retryRunInline(e)
 	data["Attempt"] = e.Attempt
@@ -343,7 +341,7 @@ func betweenStagesPair(s Situation, c Context) (outcomePair, bool) {
 	if !holdsRule {
 		return outcomePair{}, false
 	}
-	data := newData(issueKey(hop.DisplayID, hop.Identifier))
+	data := newData()
 	data["Label"] = label
 	data["Next"] = rule
 	return outcomePair{
@@ -420,8 +418,10 @@ func reactionPair(row orchestrator.SnapshotPendingReaction, s Situation, c Conte
 	if !present || row.EscalatedAt != nil {
 		return outcomePair{}, false
 	}
-	data := newData(issueKey(row.DisplayID, row.Identifier))
-	data["PR"] = row.PullRequest.Number
+	data := newData()
+	if spansPullRequests(s.PendingReactions) {
+		data["PR"] = row.PullRequest.Number
+	}
 	if left, watched := timeLeft(row, member, c); watched {
 		if left < time.Second {
 			return outcomePair{}, false
@@ -474,6 +474,14 @@ func reactionPair(row orchestrator.SnapshotPendingReaction, s Situation, c Conte
 		return labelCommandPair(row, s, c, data)
 	}
 	return outcomePair{}, false
+}
+
+// spansPullRequests reports whether rows watch more than one pull request,
+// the only case where a next step must name which one it means.
+func spansPullRequests(rows []orchestrator.SnapshotPendingReaction) bool {
+	return slices.ContainsFunc(rows, func(r orchestrator.SnapshotPendingReaction) bool {
+		return r.PullRequest.Number != rows[0].PullRequest.Number
+	})
 }
 
 // recordFixWords records the wording of the fix a kind runs and the escalation

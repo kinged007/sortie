@@ -176,7 +176,9 @@ func TestFakeRuntime_Hang(t *testing.T) {
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("Kill() error = %v", err)
 	}
-	<-done
+	if err := <-done; err == nil {
+		t.Error("Wait() after Kill() = nil, want the kill reported")
+	}
 }
 
 func TestFakeRuntimeRemovesItsBinaryBeforeTheDirectoryGoes(t *testing.T) {

@@ -1,3 +1,5 @@
+import { plural } from "@/lib/format";
+
 const NONE = "<none>";
 const UNKNOWN = "<unknown>";
 
@@ -28,7 +30,7 @@ const TRIGGER_LABELS: Record<string, string> = {
 };
 
 const REACTION_LABELS: Record<string, string> = {
-  ci_failure: "CI",
+  ci_failure: "CI fix",
   review_comments: "Review",
   bot_review: "Bot review",
   merge_conflicts: "Conflicts",
@@ -49,6 +51,11 @@ export function ruleLabel(name: string | undefined): string {
   return name === "default" ? "dispatch.default" : name;
 }
 
+/** Reports whether a rule breakdown group names a configured rule, as opposed to the dispatch default or runs that recorded no rule. */
+export function isNamedRuleGroup(name: string): boolean {
+  return name !== NONE && name !== "default";
+}
+
 /** Words a model name; a run that neither configured nor reported one reads "Not reported". */
 export function modelLabel(name: string): string {
   return name === NONE ? "Not reported" : name;
@@ -67,6 +74,23 @@ export function startLabel(name: string, breakdown: "trigger" | "origin"): strin
 /** Words a reaction config key; a key the client has no wording for reads as served. */
 export function reactionLabel(configKey: string): string {
   return worded(REACTION_LABELS, configKey);
+}
+
+const REACTION_COUNT_NOUNS: Record<string, readonly [one: string, many: string]> = {
+  ci_failure: ["fix", "fixes"],
+  review_comments: ["fix", "fixes"],
+  bot_review: ["fix", "fixes"],
+  merge_conflicts: ["fix", "fixes"],
+  label_commands: ["run", "runs"],
+};
+
+/** Words how many times a reaction acted; a key with no count wording, or a count below one, reads empty. */
+export function reactionCountLabel(configKey: string, count: number): string {
+  if (count < 1 || !Object.hasOwn(REACTION_COUNT_NOUNS, configKey)) {
+    return "";
+  }
+  const [one, many] = REACTION_COUNT_NOUNS[configKey];
+  return plural(count, one, many);
 }
 
 const REACTION_SHORT_LABELS: Record<string, string> = {

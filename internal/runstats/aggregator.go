@@ -208,6 +208,13 @@ type totalAccum struct {
 	succeededSamples     []float64
 }
 
+// withUncached returns t with Uncached derived from its Total and
+// CacheRead sums.
+func withUncached(t Tokens) Tokens {
+	t.Uncached = domain.TokenUsage{TotalTokens: t.Total, CacheReadTokens: t.CacheRead}.Uncached()
+	return t
+}
+
 // bumpGroup returns groups' entry for name, creating it on first
 // use, and increments its run count and, when isSucceeded, its
 // succeeded count.
@@ -283,6 +290,7 @@ func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
 		{caps.HasStageChains, "stage chains"},
 		{caps.HasTrigger, "what started each run"},
 		{caps.HasFirstAfterHop, "the first run after each stage hop"},
+		{caps.HasAgentBlocked, "which runs stopped to wait for a person"},
 	}
 
 	var unrecorded, dropped []string
@@ -358,6 +366,8 @@ type Aggregator struct {
 	byOrigin   map[string]*groupAccum
 	chains     map[string]*chainAccum
 	issueIDs   map[string]struct{}
+	passes     map[passKey]*passAccum
+	stages     Stages
 
 	selfReview selfReviewAccum
 }
@@ -380,9 +390,18 @@ func New(caps persistence.RunHistoryCapabilities, price Pricer) *Aggregator {
 		byTrigger:       make(map[string]*groupAccum),
 		byOrigin:        make(map[string]*groupAccum),
 		chains:          make(map[string]*chainAccum),
+		passes:          make(map[passKey]*passAccum),
 		issueIDs:        make(map[string]struct{}),
 		selfReview:      selfReviewAccum{byVerdict: make(map[string]int)},
 	}
+}
+
+// SetStages supplies the stage chains and live passes chain_funnels reads. A
+// later call replaces an earlier one; it may run before or after [Aggregator.Add]
+// and MUST precede [Aggregator.Report]. Without a call the report serves no
+// funnels.
+func (a *Aggregator) SetStages(stages Stages) {
+	a.stages = stages
 }
 
 // Add folds one row into the aggregator. It is the visit callback
@@ -420,6 +439,9 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 		if a.caps.ChainBreakdown() && row.ChainID != "" {
 			bumped = append(bumped, bumpGroup(a.byChain, row.ChainID, isSucceeded))
 			a.foldChain(row)
+		}
+		if a.caps.FunnelBreakdown() {
+			a.foldPass(row)
 		}
 		if a.caps.TriggerBreakdown() {
 			bumped = append(bumped, bumpGroup(a.byTrigger, triggerLabel(row.Trigger), isSucceeded))
@@ -572,6 +594,7 @@ func (a *Aggregator) Report(
 		ByTemplate:   []Group{},
 		ByModel:      []Group{},
 		ByChain:      []ChainGroup{},
+		ChainFunnels: a.funnelReport(generatedAt, until),
 		ByTrigger:    []Group{},
 		ByOrigin:     []Group{},
 
@@ -619,6 +642,8 @@ func (a *Aggregator) composeWarnings(extra []string) []string {
 		list = append(list, triggerBreakdownWarning)
 	case !a.caps.OriginBreakdown():
 		list = append(list, originBreakdownWarning)
+	case len(a.stages.Chains) > 0 && !a.caps.FunnelBreakdown():
+		list = append(list, funnelBreakdownWarning)
 	}
 	return append(list, extra...)
 }
@@ -647,7 +672,7 @@ func (a *Aggregator) summary(full bool) Summary {
 		s.TokensUnmeasuredRuns = a.total.unmeasuredRuns
 	}
 	if full && a.total.measuredRuns > 0 {
-		s.Tokens = new(a.total.tokens)
+		s.Tokens = new(withUncached(a.total.tokens))
 	}
 	if full && a.total.pricedRuns > 0 {
 		cost := round2(a.total.costUSD)
@@ -691,7 +716,7 @@ func (a *Aggregator) groupStat(g *groupAccum, full bool) Group {
 		stat.TokensUnmeasuredRuns = g.unmeasuredRuns
 		stat.CostUnpricedRuns = g.costUnpricedRuns
 		if g.measuredRuns > 0 {
-			stat.Tokens = new(g.tokens)
+			stat.Tokens = new(withUncached(g.tokens))
 		}
 		if g.pricedRuns > 0 {
 			cost := round2(g.costUSD)

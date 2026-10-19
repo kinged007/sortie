@@ -870,7 +870,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				if state.turnCount == 1 {
 					agentcore.EmitSessionStarted(params.OnEvent, session.AgentPID, state.threadID)
 				} else {
-					agentcore.EmitNotification(params.OnEvent, "turn started")
+					agentcore.EmitNotification(params.OnEvent, "")
 				}
 
 			case "thread/tokenUsage/updated":
@@ -972,10 +972,8 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall":
 					toolName := cmp.Or(item.Command, item.Type)
 					inFlight.Begin(item.ID, toolName)
-					agentcore.EmitNotification(params.OnEvent, summarizeItem(item.Type, item.ID))
-				default:
-					agentcore.EmitNotification(params.OnEvent, summarizeItem(item.Type, item.ID))
 				}
+				agentcore.EmitNotification(params.OnEvent, "")
 
 			case "item/completed":
 				var ip itemParams
@@ -1011,11 +1009,8 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				// rather than changing what this adapter answers as a
 				// side effect of the shared framing learning the form.
 				if !requestID.Present() || requestID.IsNull() {
-					params.OnEvent(domain.AgentEvent{
-						Type:      domain.EventOtherMessage,
-						Timestamp: now,
-						Message:   method,
-					})
+					logger.Debug("codex request without id ignored", slog.String("method", method))
+					agentcore.EmitNotification(params.OnEvent, "")
 					break
 				}
 
@@ -1092,7 +1087,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				}
 
 			case "turn/plan/updated":
-				agentcore.EmitNotification(params.OnEvent, "plan updated")
+				agentcore.EmitNotification(params.OnEvent, "")
 
 			case "turn/diff/updated":
 				logger.Debug("diff updated")
@@ -1104,7 +1099,7 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				p, parseErr := parseModelRerouted(msg.Params)
 				if parseErr != nil {
 					logger.Debug("model/rerouted unmarshal failed", slog.Any("error", parseErr))
-					agentcore.EmitNotification(params.OnEvent, method)
+					agentcore.EmitNotification(params.OnEvent, reroutedMessage(""))
 					continue
 				}
 				if p.ToModel != "" {
@@ -1116,11 +1111,8 @@ func (a *CodexAdapter) RunTurn(ctx context.Context, session domain.Session, para
 				if msg.Kind == jsonrpc.KindRequest && msg.ID.Present() && !msg.ID.IsNull() {
 					answerUnrecognizedRequest(state, msg.ID)
 				}
-				params.OnEvent(domain.AgentEvent{
-					Type:      domain.EventOtherMessage,
-					Timestamp: now,
-					Message:   method,
-				})
+				logger.Debug("codex message logged only", slog.String("method", method))
+				agentcore.EmitNotification(params.OnEvent, "")
 			}
 		}
 	}

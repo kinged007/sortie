@@ -739,12 +739,12 @@ func TestRunTurn_ModelRerouted_MalformedPayload(t *testing.T) {
 
 	notified := false
 	for _, n := range filterEventsOfType(events, domain.EventNotification) {
-		if n.Message == "model/rerouted" {
+		if n.Message == "model rerouted" {
 			notified = true
 		}
 	}
 	if !notified {
-		t.Error("expected an EventNotification carrying \"model/rerouted\" for the malformed payload, none found")
+		t.Error("expected an EventNotification carrying \"model rerouted\" for the malformed payload, none found")
 	}
 
 	tokenUsageEvents := filterEventsOfType(events, domain.EventTokenUsage)
@@ -1235,20 +1235,17 @@ func TestRunTurn_MiscNotifications(t *testing.T) {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
 
-	// some/unknown/method -> EventOtherMessage
-	if _, ok := firstEventOfType(events, domain.EventOtherMessage); !ok {
-		t.Error("expected EventOtherMessage for unknown notification method, not found")
-	}
-	// turn/plan/updated -> EventNotification
-	found := false
 	for _, e := range events {
-		if e.Type == domain.EventNotification && e.Message == "plan updated" {
-			found = true
-			break
+		if e.Type == domain.EventOtherMessage {
+			t.Errorf("unexpected other_message %q, want protocol methods reported as blank pings", e.Message)
+		}
+		if e.Type == domain.EventNotification && e.Message != "" {
+			t.Errorf("notification message = %q, want blank", e.Message)
 		}
 	}
-	if !found {
-		t.Error("expected 'plan updated' EventNotification, not found")
+	// The unknown method, the plan update and the two output deltas.
+	if n := countBlankPings(events); n != 4 {
+		t.Errorf("blank pings = %d, want 4", n)
 	}
 }
 
@@ -1997,14 +1994,13 @@ func TestRunTurn_NullIDApprovalRequestIsNotAnswered(t *testing.T) {
 		t.Error("a reply was written for a null-id request, which the reply path refuses and the peer cannot match")
 	}
 
-	var reported bool
 	for _, e := range events {
-		if e.Type == domain.EventOtherMessage && e.Message == "item/commandExecution/requestApproval" {
-			reported = true
+		if e.Message == "item/commandExecution/requestApproval" {
+			t.Errorf("null-id approval request leaked its method name into %s event", e.Type)
 		}
 	}
-	if !reported {
-		t.Error("null-id approval request was not reported as another message")
+	if countBlankPings(events) == 0 {
+		t.Error("null-id approval request was not reported as a blank ping")
 	}
 }
 

@@ -170,6 +170,7 @@ type mgcFingerprintRecord struct {
 // cross-kind-clear interaction are exercised against real stored
 // state rather than canned values.
 type mgcStoreFake struct {
+	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	fingerprints map[string]mgcFingerprintRecord

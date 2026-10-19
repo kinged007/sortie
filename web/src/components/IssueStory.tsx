@@ -1,5 +1,6 @@
 import { Collapsible } from "@base-ui/react/collapsible";
 import { useEffect, useState } from "react";
+import { Link, useLocation } from "react-router";
 
 import { useHistoryRunsQuery, useStateQuery } from "@/api/queries";
 import { useNow } from "@/app/live";
@@ -14,7 +15,8 @@ import {
   runningTokensText,
   runTokensText,
 } from "@/lib/figures";
-import { fmtClock, fmtDuration, parseInstant, plural, pluralVerb } from "@/lib/format";
+import { fmtClock, fmtDuration, lowerFirst, parseInstant, plural, pluralVerb } from "@/lib/format";
+import { sessionLinkOf } from "@/lib/issue-link";
 import { agentLabel, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
 import { numberedRunsOf } from "@/lib/run-number";
 import { runStatus } from "@/lib/run-status";
@@ -187,17 +189,15 @@ function originOf(item: StoryRun): string | undefined {
     : undefined;
 }
 
-function lowerFirst(text: string): string {
-  return /^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text;
-}
-
 interface RunCardProps {
   item: StoryRun;
+  identifier: string;
   now: number;
   hasEstimates: boolean;
 }
 
-function RunCard({ item, now, hasEstimates }: RunCardProps) {
+function RunCard({ item, identifier, now, hasEstimates }: RunCardProps) {
+  const location = useLocation();
   const isLive = item.kind === "live";
   const status = isLive ? { word: "Running", mark: "running" as Mark } : runStatus(item.run.status);
   const origin = originOf(item);
@@ -210,6 +210,8 @@ function RunCard({ item, now, hasEstimates }: RunCardProps) {
     ? costText(item.running.cost_status, item.running.estimated_cost_usd)
     : runCostText(item.run);
   const error = isLive ? null : item.run.error;
+  const dispatchId = isLive ? item.running.dispatch_id : item.run.dispatch_id;
+  const session = dispatchId ? sessionLinkOf(identifier, dispatchId, location) : undefined;
 
   return (
     <div className="flex flex-col gap-xxs rounded-xl border border-line bg-canvas px-md py-sm">
@@ -245,6 +247,15 @@ function RunCard({ item, now, hasEstimates }: RunCardProps) {
             Est. cost <b className="font-medium text-ink-body tabular-nums">{cost}</b>
           </span>
         ) : undefined}
+        {session === undefined ? undefined : (
+          <Link
+            to={session.to}
+            state={session.state}
+            className="text-link underline underline-offset-2 hover:text-link-hover focus-visible:outline-2 focus-visible:outline-focus-ring active:text-link-active"
+          >
+            Session timeline
+          </Link>
+        )}
       </p>
     </div>
   );
@@ -270,7 +281,7 @@ function Beat({ time, node, children }: BeatProps) {
       <span
         aria-hidden="true"
         className={cn(
-          "relative z-(--z-raised) mt-xs ml-xxs size-[9px] rounded-full border-[1.5px]",
+          "relative z-(--z-raised) mt-xs ml-xxs size-2.25 rounded-full border-[1.5px]",
           NODE[node],
         )}
       />
@@ -281,7 +292,7 @@ function Beat({ time, node, children }: BeatProps) {
 
 function Beats({ children }: { children: ReactNode }) {
   return (
-    <ul className="relative before:absolute before:top-xs before:bottom-xs before:left-[60px] before:w-px before:bg-line max-md:before:left-[52px]">
+    <ul className="relative before:absolute before:top-xs before:bottom-xs before:left-15 before:w-px before:bg-line max-md:before:left-13">
       {children}
     </ul>
   );
@@ -395,13 +406,14 @@ function StageSummary({ position, progress, chapters }: StageSummaryProps) {
 
 interface ChapterBodyProps {
   chapter: Chapter;
+  identifier: string;
   now: number;
   hasEstimates: boolean;
   /** The served sentence the current chapter ends on. */
   nowLine?: { text: string; needsAttention: boolean };
 }
 
-function ChapterBeats({ chapter, now, hasEstimates, nowLine }: ChapterBodyProps) {
+function ChapterBeats({ chapter, identifier, now, hasEstimates, nowLine }: ChapterBodyProps) {
   return (
     <Beats>
       {chapter.items.map((item) => (
@@ -410,7 +422,7 @@ function ChapterBeats({ chapter, now, hasEstimates, nowLine }: ChapterBodyProps)
           time={fmtClock(startOf(item))}
           node={item.kind === "live" ? "now" : "solid"}
         >
-          <RunCard item={item} now={now} hasEstimates={hasEstimates} />
+          <RunCard item={item} identifier={identifier} now={now} hasEstimates={hasEstimates} />
         </Beat>
       ))}
       {nowLine === undefined ? undefined : (
@@ -524,17 +536,17 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
           const isCurrent = index === chapters.length - 1;
           if (position !== null && !isCurrent) {
             return (
-              <Collapsible.Root key={chapter.id} className="border-t border-line data-[open]:pb-md">
+              <Collapsible.Root key={chapter.id} className="border-t border-line data-open:pb-md">
                 <Collapsible.Trigger className="group flex w-full cursor-pointer items-baseline gap-sm rounded py-xs text-left hover:bg-item-hover focus-visible:outline-2 focus-visible:outline-focus-ring">
                   <span
                     aria-hidden="true"
-                    className="w-3 text-ink-muted tabular-nums group-data-[panel-open]:hidden"
+                    className="w-3 text-ink-muted tabular-nums group-data-panel-open:hidden"
                   >
                     +
                   </span>
                   <span
                     aria-hidden="true"
-                    className="hidden w-3 text-ink-muted tabular-nums group-data-[panel-open]:inline"
+                    className="hidden w-3 text-ink-muted tabular-nums group-data-panel-open:inline"
                   >
                     −
                   </span>
@@ -545,7 +557,12 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
                   {head.sub === undefined ? undefined : (
                     <p className="mb-sm text-body-sm text-ink-muted">{head.sub}</p>
                   )}
-                  <ChapterBeats chapter={chapter} now={now} hasEstimates={hasEstimates} />
+                  <ChapterBeats
+                    chapter={chapter}
+                    identifier={detail.issue_identifier}
+                    now={now}
+                    hasEstimates={hasEstimates}
+                  />
                 </Collapsible.Panel>
               </Collapsible.Root>
             );
@@ -558,6 +575,7 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
               )}
               <ChapterBeats
                 chapter={chapter}
+                identifier={detail.issue_identifier}
                 now={now}
                 hasEstimates={hasEstimates}
                 {...(isCurrent ? { nowLine } : {})}

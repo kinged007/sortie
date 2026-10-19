@@ -25,12 +25,16 @@ import (
 // shorten it and assert that a stalled inspection still returns.
 var handoffEvidenceTimeout = 30 * time.Second
 
+// WorkerExitedErrorPrefix leads the error a retry entry records for a worker
+// that exited, whether the exit failed or its handoff was withheld.
+const WorkerExitedErrorPrefix = "worker exited: "
+
 type handoffEvidenceVerdict string
 
 const (
 	handoffWorkObserved         handoffEvidenceVerdict = "work observed"
-	handoffAbsenceObserved      handoffEvidenceVerdict = "absence of work observed"
-	handoffEvidenceUndetermined handoffEvidenceVerdict = "evidence not determinable"
+	handoffAbsenceObserved      handoffEvidenceVerdict = persistence.HandoffVerdictAbsence
+	handoffEvidenceUndetermined handoffEvidenceVerdict = persistence.HandoffVerdictUndetermined
 )
 
 type handoffEvidenceResult struct {

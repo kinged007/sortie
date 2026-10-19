@@ -7,9 +7,12 @@
 // an issue, [Attention] for what needs a person, [PollHealth] for the tracker
 // poll check, and [RefreshOutcome], [RetryNowOutcome], [CheckNowOutcome], and
 // [AcknowledgeOutcome] for a refresh, a retry-now, a check-now, and an
-// acknowledge request. All are safe for concurrent use and never fail: a
-// template that cannot render yields a fixed fallback text, or leaves out the
-// one next outcome it belongs to, and logs one record.
+// acknowledge request. [Event] words one retained agent event, and [Stall]
+// and [StallOff] word a running row's quiet marker and its absence, and
+// [RunError] words a finished run's stored error. All are
+// safe for concurrent use and never fail: a template that cannot render
+// yields a fixed fallback text, or leaves out the one next outcome it
+// belongs to, and logs one record.
 package sentence
 
 import (
@@ -160,6 +163,49 @@ func AcknowledgeOutcome(acknowledged, already bool, cause orchestrator.Attention
 	})
 }
 
+// Event returns the sentence of a retained agent event. An event type with no
+// template reads as the fallback text.
+func Event(e orchestrator.RunEvent) string {
+	name := "event_" + string(e.Event)
+	if _, known := table[name]; !known {
+		return redact.Mask(fallbackText)
+	}
+	message := strings.TrimSpace(e.Message)
+	cleaned := strings.TrimSuffix(message, ".")
+	if strings.EqualFold(cleaned, strings.ReplaceAll(string(e.Event), "_", " ")) {
+		cleaned = ""
+	}
+	return render(name, "text", map[string]any{
+		"Raw":         message,
+		"Message":     cleaned,
+		"Tool":        cmp.Or(e.ToolName, "a tool"),
+		"HasDuration": e.DurationMS > 0,
+		"Duration":    float64(e.DurationMS) / 1000,
+		"ToolError":   e.ToolError,
+	})
+}
+
+// Stall returns a running row's stall sentence, and false when its stall
+// detection is off or c.Now is before its quiet instant.
+func Stall(e *orchestrator.SnapshotRunningEntry, c Context) (Status, bool) {
+	if e.QuietAt.IsZero() || c.Now.Before(e.QuietAt) {
+		return Status{}, false
+	}
+	return status("stall_marker", map[string]any{
+		"Silence": c.Now.Sub(e.StallReference).Seconds(),
+		"Timeout": e.StallAt.Sub(e.StallReference).Seconds(),
+	}), true
+}
+
+// StallOff returns a running row's stall-off sentence, and false when its
+// stall detection is on.
+func StallOff(e *orchestrator.SnapshotRunningEntry) (string, bool) {
+	if !e.QuietAt.IsZero() {
+		return "", false
+	}
+	return render("stall_off", "text", nil), true
+}
+
 func status(name string, data map[string]any) Status {
 	return Status{Short: render(name, "short", data), Long: render(name, "long", data)}
 }
@@ -228,7 +274,6 @@ func word(vocabulary map[string]string, served string) string {
 
 func selectRunning(e *orchestrator.SnapshotRunningEntry, c Context) (string, map[string]any) {
 	data := map[string]any{
-		"Key":       issueKey(e.DisplayID, e.Identifier),
 		"Turn":      e.TurnCount,
 		"Stage":     "",
 		"Pos":       0,
@@ -303,13 +348,11 @@ func commandLabel(kind string, shape *orchestrator.WorkflowShape) string {
 
 func selectRetry(e *orchestrator.SnapshotRetryEntry, c Context) (string, map[string]any) {
 	data := map[string]any{
-		"Key":       issueKey(e.DisplayID, e.Identifier),
-		"Attempt":   e.Attempt,
-		"Due":       float64(e.DueAtMS-c.Now.UnixMilli()) / 1000,
-		"Error":     strings.TrimSpace(e.Error),
-		"Reason":    "",
-		"Run":       "",
-		"RunInline": "",
+		"Attempt": e.Attempt,
+		"Due":     float64(e.DueAtMS-c.Now.UnixMilli()) / 1000,
+		"Error":   strings.TrimSuffix(RunError(strings.TrimSpace(e.Error)), "."),
+		"Reason":  "",
+		"Run":     "",
 	}
 
 	if e.Paused {
@@ -327,7 +370,6 @@ func selectRetry(e *orchestrator.SnapshotRetryEntry, c Context) (string, map[str
 	}
 	if phrase, ok := runPhrases[e.ReactionKind]; ok && e.Trigger == "" {
 		data["Run"] = phrase.initial
-		data["RunInline"] = phrase.inline
 		return "retry_reaction", data
 	}
 	return "retry_generic", data
@@ -336,7 +378,6 @@ func selectRetry(e *orchestrator.SnapshotRetryEntry, c Context) (string, map[str
 func selectBudgetHold(e *orchestrator.SnapshotBudgetEntry) (string, map[string]any) {
 	used, atLeast := heldTokenSpend(e)
 	data := map[string]any{
-		"Key":       issueKey(e.DisplayID, e.Identifier),
 		"HasBudget": e.BudgetTokens > 0,
 		"Budget":    new(e.BudgetTokens),
 		"Used":      used,
@@ -373,7 +414,6 @@ func heldTokenSpend(e *orchestrator.SnapshotBudgetEntry) (used *int64, atLeast b
 
 func selectParked(e *orchestrator.SnapshotParkedEntry) (string, map[string]any) {
 	data := map[string]any{
-		"Key":    issueKey(e.DisplayID, e.Identifier),
 		"Label":  strings.TrimSpace(e.Label),
 		"Unseen": !e.LabelApplied,
 	}
@@ -389,7 +429,6 @@ func selectPendingReaction(e *orchestrator.SnapshotPendingReaction, c Context) (
 		words = otherReactionKind
 	}
 	data := map[string]any{
-		"Key":           issueKey(e.DisplayID, e.Identifier),
 		"PR":            e.PullRequest.Number,
 		"KindInitial":   words.initial,
 		"KindInline":    words.inline,
@@ -541,7 +580,6 @@ func addShapeFacts(data map[string]any, kind string, shape *orchestrator.Workflo
 
 func selectBetweenStages(e *orchestrator.SnapshotStageHop) (string, map[string]any) {
 	return "stage_wait", map[string]any{
-		"Key":    issueKey(e.DisplayID, e.Identifier),
 		"Source": strings.TrimSpace(e.SourceRule),
 		"Target": strings.TrimSpace(e.TargetRule),
 		"Label":  strings.TrimSpace(e.TargetLabel),
@@ -550,7 +588,6 @@ func selectBetweenStages(e *orchestrator.SnapshotStageHop) (string, map[string]a
 
 func selectFinished(f *Finished) (string, map[string]any) {
 	data := map[string]any{
-		"Key":       issueKey(f.DisplayIdentifier, f.Identifier),
 		"State":     "",
 		"PR":        0,
 		"Target":    strings.TrimSpace(f.StageTarget),

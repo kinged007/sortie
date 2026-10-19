@@ -41,6 +41,14 @@ func (h groupsHistory) IssueTotals(context.Context, string) (IssueRunTotals, err
 	return IssueRunTotals{}, nil
 }
 
+func (h groupsHistory) RunEvents(context.Context, string, int) ([]orchestrator.RunEvent, error) {
+	return nil, nil
+}
+
+func (h groupsHistory) PassActivities(context.Context, []PassRef) (map[PassKey]PassActivity, error) {
+	return nil, nil
+}
+
 func (h groupsHistory) IssueOutcomes(context.Context, []string) (map[string]IssueOutcome, error) {
 	return h.outcomes, nil
 }

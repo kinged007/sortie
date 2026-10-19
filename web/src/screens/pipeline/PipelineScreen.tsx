@@ -5,12 +5,13 @@ import { useEndedQuery, useStateQuery } from "@/api/queries";
 import { useHold, useNow } from "@/app/live";
 import { useShortcuts } from "@/app/keys";
 import { ActiveHead } from "@/components/ActiveHead";
-import { XIcon } from "@/components/icons";
+import { CheckIcon, MinusIcon, XIcon } from "@/components/icons";
 import { PhaseFilter } from "@/components/PhaseFilter";
 import { RuleFilter } from "@/components/RuleFilter";
 import { StatusMark } from "@/components/StatusMark";
 import { Button } from "@/components/ui/button";
 import { useAttentionActions } from "@/components/use-attention-actions";
+import { useOpenLatestSession } from "@/components/use-open-session";
 import { usePeek } from "@/components/use-peek";
 import { filterRows, isPhase } from "@/lib/active-rows";
 import { cn } from "@/lib/cn";
@@ -38,11 +39,8 @@ interface AttentionLineProps {
 function AttentionLine({ items }: AttentionLineProps) {
   const location = useLocation();
   if (items.length === 0) {
-    return (
-      <p className="mb-lg rounded-xl border border-dashed border-line-strong bg-surface px-md py-sm text-body-md text-ink-body">
-        Nothing needs attention.
-      </p>
-    );
+    // Holds the line's place so the lanes do not shift when attention comes and goes.
+    return <div aria-hidden="true" className="mb-lg min-h-lh text-body-md" />;
   }
   const firstOfIssue = new Map<string, AttentionItemResponse>();
   for (const item of items) {
@@ -127,15 +125,23 @@ function Legend({ hasReactions, hasChains }: LegendProps) {
             a reaction waiting
           </span>
           <span className="inline-flex items-center gap-xs">
+            <XIcon aria-hidden="true" className="size-3 text-ink-body" />
+            an escalated reaction
+          </span>
+          <span className="inline-flex items-center gap-xs">
+            <CheckIcon aria-hidden="true" className="size-3 text-ink-body" />
+            Sortie acted
+          </span>
+          <span className="inline-flex items-center gap-xs">
+            <MinusIcon aria-hidden="true" className="size-3 text-ink-muted" />
+            nothing to act on
+          </span>
+          <span className="inline-flex items-center gap-xs">
             <i
               aria-hidden="true"
               className={cn(swatch, "border-[1.5px] border-track-todo bg-canvas")}
             />
-            nothing waiting
-          </span>
-          <span className="inline-flex items-center gap-xs">
-            <XIcon aria-hidden="true" className="size-3 text-ink-body" />
-            an escalated reaction
+            no record
           </span>
         </>
       ) : undefined}
@@ -181,6 +187,7 @@ function PipelineBody({ state }: PipelineBodyProps) {
   const [params, setParams] = useSearchParams();
   const { identifier: peekIdentifier, open, follow, close } = usePeek();
   const actions = useAttentionActions();
+  const openLatestSession = useOpenLatestSession();
   const now = useNow();
   const ended = useEndedQuery(localMidnight(now).toISOString());
   const [selection, setSelection] = useState({ key: null as string | null, index: 0 });
@@ -292,6 +299,13 @@ function PipelineBody({ state }: PipelineBodyProps) {
     }
   }
 
+  function handleOpenSession() {
+    const identifier = peekIdentifier ?? selected?.identifier;
+    if (identifier) {
+      openLatestSession(identifier);
+    }
+  }
+
   function peekedItem(): AttentionItemResponse | undefined {
     return isHeld
       ? (view.state.attention ?? []).find(
@@ -305,6 +319,7 @@ function PipelineBody({ state }: PipelineBodyProps) {
     { keys: ["k", "ArrowUp"], run: () => handleMove(-1) },
     { keys: [" "], run: handleTogglePeek },
     { keys: ["Enter"], run: handleOpenPage },
+    { keys: ["o"], run: handleOpenSession },
     {
       keys: ["a"],
       run: () => {
@@ -364,16 +379,16 @@ function PipelineBody({ state }: PipelineBodyProps) {
             <PhaseFilter rows={ruleLanes} />
             <RuleFilter config={config} rows={lanes} />
           </div>
-          {visible.length === 0 ? (
+          {lanes.length === 0 ? (
+            // Holds the lanes' place so the page does not shift when work starts.
+            <div
+              aria-hidden="true"
+              className="min-h-lh border border-transparent py-lg text-body-md"
+            />
+          ) : visible.length === 0 ? (
             <div className="flex flex-wrap items-center gap-sm rounded-lg border border-line bg-canvas px-md py-lg text-body-md text-ink-body">
-              {lanes.length === 0 ? (
-                "No issue is active."
-              ) : (
-                <>
-                  No issue matches these filters.
-                  <Button onClick={handleShowAll}>Show all</Button>
-                </>
-              )}
+              No issue matches these filters.
+              <Button onClick={handleShowAll}>Show all</Button>
             </div>
           ) : (
             <div className="-mx-md mt-xs">

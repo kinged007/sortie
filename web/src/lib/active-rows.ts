@@ -10,10 +10,9 @@ import type {
   RetryEntryResponse,
   RunningEntryResponse,
   StageHopResponse,
-  StagePositionResponse,
   StateResponse,
 } from "@/api/types.gen";
-import type { Mark } from "@/lib/run-status";
+import type { StateMark } from "@/lib/run-status";
 
 /** The row list of the state that decided a row. */
 export type RowKind =
@@ -57,9 +56,11 @@ export interface ActiveRow {
   title: string | null;
   kind: RowKind;
   phase: Phase;
-  mark: Mark;
+  mark: StateMark;
   statusText: string;
   statusTextFull: string;
+  stallText: string | null;
+  stallTextFull: string | null;
   route: string | null;
   agentKind: string | null;
   rule: string | null;
@@ -86,7 +87,7 @@ export type Deciding =
   | { kind: "between_stages"; entry: StageHopResponse };
 
 interface RuleSource {
-  stage_position: StagePositionResponse | null;
+  stage_position: { chain: readonly string[] | null; current: string } | null;
   rule_name?: string;
 }
 
@@ -118,7 +119,7 @@ export function rowMark(
   kind: RowKind,
   issueId: string,
   attention: readonly AttentionItemResponse[],
-): { mark: Mark; acknowledgedAt: string | null } {
+): { mark: StateMark; acknowledgedAt: string | null } {
   const items = attention.filter((item) => item.issue_id === issueId);
   if (items.some((item) => item.acknowledged_at === null)) {
     return { mark: "needs", acknowledgedAt: null };
@@ -253,6 +254,8 @@ function toRow(entry: ActiveIssueResponse, kind: RowKind, state: StateResponse):
     mark,
     statusText: entry.status_text,
     statusTextFull: entry.status_text_full,
+    stallText: named?.kind === "running" ? named.entry.stall_text : null,
+    stallTextFull: named?.kind === "running" ? named.entry.stall_text_full : null,
     route: routeText(entry, state.config),
     agentKind: entry.agent_kind || null,
     rule: ruleOf(entry),

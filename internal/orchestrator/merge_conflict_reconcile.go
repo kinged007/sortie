@@ -299,7 +299,7 @@ func handleMergeConflictDirty(
 		return
 	}
 
-	dispatchMergeConflictContinuation(state, params, pending, data, status, log, ctx)
+	dispatchMergeConflictContinuation(state, params, pending, data, status, now, log, ctx)
 	metrics.IncMergeConflictChecks("dispatched")
 }
 
@@ -363,12 +363,13 @@ func dispatchMergeConflictContinuation(
 	pending *PendingReaction,
 	data *MergeConflictReactionData,
 	status domain.PRMergeStatus,
+	now time.Time,
 	log *slog.Logger,
 	ctx context.Context,
 ) {
 	mergeContext := buildMergeConflictTemplateMap(data, status)
 
-	ScheduleRetry(state, ScheduleRetryParams{
+	scheduleReactionContinuation(ctx, state, params.Store, ScheduleRetryParams{
 		IssueID:     pending.IssueID,
 		Identifier:  pending.Identifier,
 		DisplayID:   pending.DisplayID,
@@ -389,7 +390,7 @@ func dispatchMergeConflictContinuation(
 		Logger:              log,
 
 		IssueIdentity: pending.IssueIdentity,
-	}, params.OnRetryFire)
+	}, params.OnRetryFire, now)
 
 	if markErr := params.Store.MarkReactionDispatched(ctx, pending.IssueID, ReactionKindMergeConflict); markErr != nil {
 		log.Warn("failed to mark merge conflict dispatched",

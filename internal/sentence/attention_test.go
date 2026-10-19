@@ -272,7 +272,7 @@ func TestAttentionOrder(t *testing.T) {
 func TestAttentionTexts(t *testing.T) {
 	t.Parallel()
 
-	const handoffTail = "or MT-1 reaches a terminal tracker state or leaves In Review."
+	const handoffTail = "or the issue reaches a terminal tracker state or leaves In Review."
 	shape := &orchestrator.WorkflowShape{
 		Tracker:   orchestrator.ShapeTracker{HandoffState: "In Review"},
 		Reactions: orchestrator.ShapeReactions{MergeCompletion: &orchestrator.ShapeMergeCompletion{TargetState: "Done"}},
@@ -297,29 +297,29 @@ func TestAttentionTexts(t *testing.T) {
 	}{
 		{"agent_blocked park with the label seen, parked in a state", parkedInput(func(r *orchestrator.SnapshotParkedEntry) { r.ParkedState = "In Progress" }), nil, texts{
 			"Parked: the agent needs a person",
-			"The agent stopped because it cannot go on without a person, so Sortie parked MT-652 under the label `needs-human`.",
-			"Clears when a poll tick finds `needs-human` removed from MT-652, or MT-652 moved out of In Progress.",
+			"The agent stopped because it cannot go on without a person, so Sortie parked the issue under the label `needs-human`.",
+			"Clears when a poll tick finds `needs-human` removed from the issue, or the issue moved out of In Progress.",
 		}},
 		{"handoff_absence park with the label unseen", parkedInput(func(r *orchestrator.SnapshotParkedEntry) { r.Reason, r.LabelApplied = "handoff_absence", false }), nil, texts{
 			"Parked: no evidence of work",
-			"MT-652's runs ended without evidence of work as many times in a row as `agent.max_consecutive_absences` allows, so Sortie parked it under the label `needs-human` (not yet seen on the issue).",
-			"Clears when a poll tick finds `needs-human` removed from MT-652 after Sortie has seen it there.",
+			"The issue's runs ended without evidence of work as many times in a row as `agent.max_consecutive_absences` allows, so Sortie parked it under the label `needs-human` (not yet seen on the issue).",
+			"Clears when a poll tick finds `needs-human` removed from the issue after Sortie has seen it there.",
 		}},
 		{"token hold with a lower-bound spend", budgetInput(func(r *orchestrator.SnapshotBudgetEntry) {
 			r.IssueID, r.Reason, r.UsedTokens, r.BudgetTokens = "id-651", "token_budget", new(int64(2_020_000)), 2_000_000
 			r.UnmeasuredSessions, r.StoppedInFlight = new(1), new(1)
 		}), nil, texts{
 			"Token budget reached",
-			"MT-651 has used at least 2.02M tokens of its budget of 2M, and the budget stopped 1 session mid-run.",
-			"Clears on the next poll tick after `agent.max_tokens` is raised above what MT-651 has used or is removed, or after MT-651 leaves the active tracker states.",
+			"The issue has used at least 2.02M tokens and cache reads of its budget of 2M, and the budget stopped 1 session mid-run.",
+			"Clears on the next poll tick after `agent.max_tokens` is raised above what the issue has used or is removed, or after the issue leaves the active tracker states.",
 		}},
 		{"token hold with a complete spend and no stopped session", budgetInput(func(r *orchestrator.SnapshotBudgetEntry) {
 			r.Reason, r.UsedTokens, r.BudgetTokens = "token_budget", new(int64(2_020_000)), 2_000_000
-		}), nil, texts{why: "MT-651 has used 2.02M tokens of its budget of 2M."}},
+		}), nil, texts{why: "The issue has used 2.02M tokens and cache reads of its budget of 2M."}},
 		{"session hold", budgetInput(nil), nil, texts{
 			"Session budget reached",
-			"MT-651 has used 3 sessions of its budget of 3.",
-			"Clears on the next poll tick after `agent.max_sessions` is raised above 3 or is removed, or after MT-651 leaves the active tracker states.",
+			"The issue has used 3 sessions of its budget of 3.",
+			"Clears on the next poll tick after `agent.max_sessions` is raised above 3 or is removed, or after the issue leaves the active tracker states.",
 		}},
 		{"workflow reload failure", healthInput(failingHealth(attentionAt, time.Time{}, false)), nil, texts{
 			"WORKFLOW.md failed to load",
@@ -345,25 +345,25 @@ func TestAttentionTexts(t *testing.T) {
 		}},
 		{"ci budget escalation with no max, no check, and no shape", escalatedInput("ci", budget, noMax), nil, texts{
 			why:    "Sortie escalated failing CI on PR #931 after 2 CI fixes.",
-			clears: "Clears when a check of PR #931 passes, a new commit lands on it, it merges or closes, `reactions.ci_failure.max_retries` rises above 2, or MT-1 reaches a terminal tracker state.",
+			clears: "Clears when a check of PR #931 passes, a new commit lands on it, it merges or closes, `reactions.ci_failure.max_retries` rises above 2, or the issue reaches a terminal tracker state.",
 		}},
 		{"review budget escalation", escalatedInput("review", budget, nil), shape, texts{
 			"Review comments escalated on #931",
 			"Sortie used 2 of 2 review fix runs on PR #931, and the pull request still holds review comments no Sortie run was given.",
-			"Clears when no review comment on PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.review_comments.max_continuation_turns` above 2, or when MT-1 reaches a terminal tracker state or leaves In Review.",
+			"Clears when no review comment on PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.review_comments.max_continuation_turns` above 2, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"review triage escalation", escalatedInput("review", triage, func(r *orchestrator.SnapshotPendingReaction) { r.Identifier, r.PullRequest.Number = "MT-654", 940 }), shape, texts{
 			why:    "Sortie escalated review comments on PR #940 because the triage command asked for a person.",
-			clears: "Clears when the review comments on PR #940 change, when the pull request merges or closes, or when MT-654 reaches a terminal tracker state or leaves In Review.",
+			clears: "Clears when the review comments on PR #940 change, when the pull request merges or closes, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"bot review budget escalation", escalatedInput("bot-review", budget, nil), shape, texts{
 			"Bot review escalated on #931",
 			"Sortie used 2 of 2 bot review fix runs on PR #931, and the pull request still holds review bot comments on its code that no Sortie run was given.",
-			"Clears when no review bot comment on the code of PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.bot_review.max_continuation_turns` above 2, or when MT-1 reaches a terminal tracker state or leaves In Review.",
+			"Clears when no review bot comment on the code of PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.bot_review.max_continuation_turns` above 2, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"bot review triage escalation", escalatedInput("bot-review", triage, nil), shape, texts{
 			why:    "Sortie escalated review bot comments on PR #931 because the triage command asked for a person.",
-			clears: "Clears when the review bot comments on PR #931 change, when the pull request merges or closes, or when MT-1 reaches a terminal tracker state or leaves In Review.",
+			clears: "Clears when the review bot comments on PR #931 change, when the pull request merges or closes, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"merge conflict budget escalation", escalatedInput("merge-conflict", budget, nil), shape, texts{
 			"Merge conflict escalated on #931",
@@ -385,16 +385,16 @@ func TestAttentionTexts(t *testing.T) {
 		}},
 		{"merge completion budget escalation", escalatedInput("merge-completion", budget, nil), shape, texts{
 			"Merge completion escalated on #931",
-			"Sortie could not move MT-1 to Done after PR #931 merged: 2 tracker moves failed.",
-			"Clears when MT-1 reaches a terminal tracker state or leaves In Review.",
+			"Sortie could not move the issue to Done after PR #931 merged: 2 tracker moves failed.",
+			"Clears when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"merge completion refused escalation", escalatedInput("merge-completion", refused, func(r *orchestrator.SnapshotPendingReaction) { r.Identifier, r.PullRequest.Number = "MT-655", 950 }), shape, texts{
-			why:    "Sortie could not move MT-655 to Done after PR #950 merged, because the tracker refused the move.",
-			clears: "Clears when MT-655 reaches a terminal tracker state or leaves In Review.",
+			why:    "Sortie could not move the issue to Done after PR #950 merged, because the tracker refused the move.",
+			clears: "Clears when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"merge completion escalation on a missing merge commit", escalatedInput("merge-completion", noCommit, nil), shape, texts{
-			why:    "PR #931 merged, but the forge reports no merge commit for it, so Sortie has not moved MT-1 to Done.",
-			clears: "Clears when MT-1 reaches a terminal tracker state or leaves In Review, or when the forge reports the merge commit of PR #931.",
+			why:    "PR #931 merged, but the forge reports no merge commit for it, so Sortie has not moved the issue to Done.",
+			clears: "Clears when the issue reaches a terminal tracker state or leaves In Review, or when the forge reports the merge commit of PR #931.",
 		}},
 	}
 	for _, tt := range tests {

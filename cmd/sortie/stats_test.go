@@ -1176,3 +1176,111 @@ func TestRunStatsByModelAgainstDatabases(t *testing.T) {
 		})
 	}
 }
+
+const funnelDispatch = `dispatch:
+  rules:
+    - name: specify
+      agent: mock
+      next: plan
+    - name: plan
+      stage: plan
+      next: implement
+    - name: implement
+      stage: implement
+`
+
+func funnelRuns() []persistence.RunHistory {
+	var runs []persistence.RunHistory
+	add := func(chain, rule, previous, status, result string) {
+		runs = append(runs, persistence.RunHistory{
+			IssueID: "ISS-" + chain, Identifier: "PROJ-" + chain, Attempt: 1, AgentAdapter: "mock", Workspace: "/tmp/ws",
+			StartedAt: "2026-01-10T10:00:00Z", CompletedAt: "2026-01-10T10:10:00Z",
+			Status: status, RuleName: rule, ChainID: chain, StagePrevious: previous, StageResult: result,
+		})
+	}
+	for _, chain := range []string{"c1", "c2", "c3", "c4", "c5", "c6"} {
+		add(chain, "specify", "", "succeeded", "advanced")
+	}
+	add("c1", "plan", "specify", "succeeded", "advanced")
+	add("c1", "implement", "plan", "succeeded", "")
+	add("c2", "plan", "specify", "succeeded", "ceiling")
+	add("c3", "plan", "specify", "failed", "failed")
+	add("c5", "plan", "specify", "succeeded", "advanced")
+	add("c6", "plan", "specify", "succeeded", "")
+	return runs
+}
+
+func holdFunnelPasses(t *testing.T, dbPath string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := persistence.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("persistence.Open(%q): %v", dbPath, err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	retry := persistence.RetryEntry{IssueID: "ISS-c4", Identifier: "PROJ-c4", Attempt: 1, DueAtMs: 1, RuleName: "plan", ChainID: "c4", StagePrevious: "specify"}
+	if err := store.SaveRetryEntry(ctx, retry); err != nil {
+		t.Fatalf("SaveRetryEntry: %v", err)
+	}
+	for _, pass := range []persistence.LivePass{
+		{IssueID: "ISS-c5", Kind: persistence.LivePassRunning, ChainID: "c5", RuleName: "implement", StagePrevious: "plan"},
+		{IssueID: "ISS-c6", Kind: persistence.LivePassBudget, ChainID: "c6", RuleName: "plan", StagePrevious: "specify"},
+	} {
+		if err := store.UpsertLivePass(ctx, pass); err != nil {
+			t.Fatalf("UpsertLivePass(%+v): %v", pass, err)
+		}
+	}
+}
+
+func statsFunnels(t *testing.T, wfPath string) []runstats.Funnel {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"stats", "--format", "json", wfPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(stats --format json) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var report runstats.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", stdout.String(), err)
+	}
+	return report.ChainFunnels
+}
+
+func TestRunStatsChainFunnel(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "funnel.db")
+	createStatsDB(t, dbPath, funnelRuns()...)
+	holdFunnelPasses(t, dbPath)
+	dbKey := fmt.Sprintf("db_path: %q\n", dbPath)
+	chained := writeCustomWorkflowFile(t, t.TempDir(), statsWorkflow(dbKey+funnelDispatch))
+	plain := writeCustomWorkflowFile(t, t.TempDir(), statsWorkflow(dbKey))
+
+	funnels := statsFunnels(t, chained)
+
+	want := []struct {
+		rule     string
+		entered  int
+		outcomes runstats.FunnelOutcomes
+	}{
+		{"specify", 6, runstats.FunnelOutcomes{Advanced: 6}},
+		{"plan", 6, runstats.FunnelOutcomes{Advanced: 2, Ceiling: 1, HopFailed: 1, NoHop: 1, InStage: 1}},
+		{"implement", 2, runstats.FunnelOutcomes{HandedOff: 1, InStage: 1}},
+	}
+	if len(funnels) != 1 || len(funnels[0].Stages) != len(want) {
+		t.Fatalf("chain_funnels = %+v, want one funnel of %d stages", funnels, len(want))
+	}
+	for i, stage := range funnels[0].Stages {
+		o, a := stage.Outcomes, stage.Arrivals
+		outcomes := o.Advanced + o.HandedOff + o.Ceiling + o.HopFailed + o.NoHop + o.InStage
+		if stage.Rule != want[i].rule || stage.Entered != want[i].entered || o != want[i].outcomes || a.Hop+a.Match+a.Label != stage.Entered || outcomes != stage.Entered {
+			t.Errorf("stage %d = %+v, want %q entered %d outcomes %+v, both sums equal to entered", i, stage, want[i].rule, want[i].entered, want[i].outcomes)
+		}
+	}
+	if reasons := funnels[0].Stages[1].NoHopReasons; len(reasons) != 1 || reasons[0].Reason != "budget_held" {
+		t.Errorf("plan no_hop_reasons = %+v, want one budget_held pass", reasons)
+	}
+
+	if got := statsFunnels(t, plain); got == nil || len(got) != 0 {
+		t.Errorf("chain_funnels without chains = %v, want a non-nil empty slice", got)
+	}
+}

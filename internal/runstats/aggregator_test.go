@@ -19,6 +19,7 @@ var fullCaps = persistence.RunHistoryCapabilities{
 	HasRuleRouting:      true,
 	HasTokens:           true,
 	HasTokenMeasurement: true,
+	HasAgentBlocked:     true,
 }
 
 var fixedNow = time.Date(2026, 8, 7, 9, 15, 0, 0, time.UTC)
@@ -442,7 +443,7 @@ func TestDegradedSchemaWarning(t *testing.T) {
 			caps: persistence.RunHistoryCapabilities{},
 			want: []string{
 				"before sortie recorded turns, self-review results, dispatch-rule routing, tokens and cost",
-				"stage chains, what started each run, the first run after each stage hop",
+				"stage chains, what started each run, the first run after each stage hop, which runs stopped to wait for a person",
 				"Run sortie once with this workflow to add them.",
 			},
 			absent: []string{"does carry", "falls back"},
@@ -686,15 +687,22 @@ func TestAggregatorReport_WarningsComposition(t *testing.T) {
 	triggerCaps := withTriggerBreakdown(fullCaps)
 	originlessCaps := triggerCaps
 	originlessCaps.HasFirstAfterHop = false
+	unblockedCaps := triggerCaps
+	unblockedCaps.HasAgentBlocked = false
 	callerWarnings := []string{"token_rates: first", "token_rates: second"}
 
 	tests := []struct {
-		name  string
-		caps  persistence.RunHistoryCapabilities
-		extra []string
-		want  []string
+		name    string
+		caps    persistence.RunHistoryCapabilities
+		stages  Stages
+		extra   []string
+		want    []string
+		funnels bool
 	}{
 		{name: "every breakdown supported and no caller warnings", caps: triggerCaps, want: []string{}},
+		{name: "chains configured and every breakdown supported", caps: triggerCaps, stages: threeStageChain, want: []string{}, funnels: true},
+		{name: "funnel breakdown missing while chains exist", caps: unblockedCaps, stages: threeStageChain, extra: callerWarnings, want: append([]string{funnelBreakdownWarning}, callerWarnings...)},
+		{name: "funnel breakdown missing without chains", caps: unblockedCaps, extra: callerWarnings, want: callerWarnings},
 		{name: "trigger breakdown missing", caps: chainCaps, extra: callerWarnings, want: append([]string{triggerBreakdownWarning}, callerWarnings...)},
 		{name: "origin breakdown missing", caps: originlessCaps, extra: callerWarnings, want: append([]string{originBreakdownWarning}, callerWarnings...)},
 		{name: "chain breakdown missing", caps: modelCaps, extra: callerWarnings, want: append([]string{chainBreakdownWarning}, callerWarnings...)},
@@ -706,13 +714,20 @@ func TestAggregatorReport_WarningsComposition(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := New(tt.caps, nil).Report(fixedNow, "/wf", "/db", nil, nil, tt.extra).Warnings
+			agg := New(tt.caps, nil)
+			agg.SetStages(tt.stages)
 
+			report := agg.Report(fixedNow, "/wf", "/db", nil, nil, tt.extra)
+
+			got := report.Warnings
 			if got == nil {
 				t.Fatalf("Report(caps=%+v, warnings=%v).Warnings = nil, want a non-nil list", tt.caps, tt.extra)
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("Report(caps=%+v, warnings=%v).Warnings = %q, want %q", tt.caps, tt.extra, got, tt.want)
+			}
+			if report.ChainFunnels == nil || (len(report.ChainFunnels) > 0) != tt.funnels {
+				t.Errorf("Report(caps=%+v, chains=%v).ChainFunnels = %+v, want a non-nil list, non-empty %t", tt.caps, tt.stages.Chains, report.ChainFunnels, tt.funnels)
 			}
 		})
 	}

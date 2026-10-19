@@ -53,6 +53,7 @@ function ShellFrame({ screens }: ShellFrameProps) {
   const isOverview = useMatch("/") !== null;
   const isPipeline = useMatch("/pipeline") !== null;
   const isIssueRoute = useMatch("/issues/:identifier") !== null;
+  const sessionIdentifier = useMatch("/issues/:identifier/sessions/:dispatchId")?.params.identifier;
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const noticedVersion = useRef<string | null>(null);
@@ -111,6 +112,10 @@ function ShellFrame({ screens }: ShellFrameProps) {
       peek.close();
     } else if (isIssueRoute) {
       void navigate(backOf(routeState));
+    } else if (sessionIdentifier !== undefined) {
+      void navigate(`/issues/${encodeURIComponent(sessionIdentifier)}`, {
+        state: { back: backOf(routeState) },
+      });
     }
   };
 

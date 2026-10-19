@@ -35,11 +35,12 @@ const continuationDelayMS int64 = 1_000
 // WorkerExitStore is the persistence interface required by
 // [HandleWorkerExit].
 type WorkerExitStore interface {
-	AppendRunHistory(ctx context.Context, run persistence.RunHistory) (persistence.RunHistory, error)
+	AppendRunHistoryWithEvents(ctx context.Context, run persistence.RunHistory, events []persistence.RunEvent, limits persistence.RunEventLimits) (persistence.RunHistory, error)
 	UpsertAggregateMetrics(ctx context.Context, metrics persistence.AggregateMetrics) error
 	UpsertSessionMetadata(ctx context.Context, meta persistence.SessionMetadata) error
 	SaveRetryEntry(ctx context.Context, entry persistence.RetryEntry) error
 	DeleteRetryEntry(ctx context.Context, issueID string) error
+	DeleteLivePass(ctx context.Context, issueID, kind string) error
 	DeleteReactionEscalations(ctx context.Context, issueID string) error
 	QueryConsecutiveHandoffAbsenceCounts(ctx context.Context, issueIDs []string) (map[string]int, error)
 	ResetHandoffAbsenceSequence(ctx context.Context, issueID string) error
@@ -51,12 +52,18 @@ type WorkerExitStore interface {
 	DeleteStageHop(ctx context.Context, issueID string) error
 	RecordRunStageResult(ctx context.Context, runID int64, targetRule, result string) error
 	RecordIssueOutcome(ctx context.Context, outcome persistence.IssueOutcome) error
+	RecordReactionActivity(ctx context.Context, records []persistence.ReactionActivity) error
 }
 
 // HandleWorkerExitParams holds the dependencies for [HandleWorkerExit] that
 // are not part of the core [State], separating pure state mutation from I/O.
 type HandleWorkerExitParams struct {
 	Store WorkerExitStore
+
+	// RunEventRetry holds the events of a run whose events part failed to
+	// store and retries them. Nil holds nothing: a failed events part ends
+	// at its warning.
+	RunEventRetry *RunEventRetry
 
 	MaxRetryBackoffMS int
 
@@ -172,6 +179,21 @@ func resolveExitTarget(params HandleWorkerExitParams, workerResult WorkerResult)
 		return params.NoChangeState, declared
 	}
 	return params.HandoffState, declared
+}
+
+// retainStartupFailure retains a startup_failed event carrying the start
+// error when the session failed to start and its adapter emitted none. A
+// start that ended in cancellation retains none, because Sortie stopped it.
+func retainStartupFailure(entry *RunningEntry, result WorkerResult, at time.Time) {
+	if result.StartupError == nil || result.ExitKind != WorkerExitError ||
+		entry.events == nil || entry.events.hasStartupFailed() {
+		return
+	}
+	retainEvent(entry, domain.AgentEvent{
+		Type:      domain.EventStartupFailed,
+		Timestamp: at,
+		Message:   result.StartupError.Error(),
+	})
 }
 
 // HandleWorkerExit processes a worker's terminal outcome: removes the running
@@ -452,6 +474,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		SSHHost:      entry.SSHHost,
 
 		FirstAfterHop: entry.FirstAfterHop,
+		AgentBlocked:  blockedSoftStop,
 	}
 	// A row recording no measurement must carry zero in all five token
 	// columns. The reconciliation above can populate them from a worker
@@ -512,16 +535,43 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		)
 	}
 
+	retainStartupFailure(entry, workerResult, now)
+	var eventRows []persistence.RunEvent
+	if entry.events != nil {
+		eventRows = entry.events.storeRows()
+	}
+	runHistory.DispatchID = new(entry.DispatchID)
+
 	runHistoryPersisted := true
 	var runID int64
-	if row, err := params.Store.AppendRunHistory(ctx, runHistory); err != nil {
+	row, appendErr := params.Store.AppendRunHistoryWithEvents(ctx, runHistory, eventRows, runEventStoreLimits)
+	var eventsErr *persistence.RunEventsError
+	switch {
+	case errors.As(appendErr, &eventsErr):
+		log.Warn("failed to persist run events",
+			slog.String("dispatch_id", entry.DispatchID),
+			slog.Int("events", len(eventRows)),
+			slog.Any("error", eventsErr),
+		)
+		runID = row.ID
+		if params.RunEventRetry != nil {
+			params.RunEventRetry.Hold(HeldRunEvents{
+				IssueID:     workerResult.IssueID,
+				Identifier:  workerResult.Identifier,
+				DispatchID:  entry.DispatchID,
+				CompletedAt: runHistory.CompletedAt,
+				Events:      eventRows,
+			})
+		}
+	case appendErr != nil:
 		runHistoryPersisted = false
 		log.Error("failed to persist run history",
-			slog.Any("error", err),
+			slog.Any("error", appendErr),
 		)
-	} else {
+	default:
 		runID = row.ID
 	}
+	state.RetainedEvents.release(entry.DispatchID)
 
 	identity := sessionEvent{
 		IssueID:    workerResult.IssueID,
@@ -720,7 +770,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					DisplayID:           entry.Issue.DisplayID,
 					Attempt:             nextAttempt,
 					DelayMS:             delayMS,
-					Error:               "worker exited: " + evidenceErr.Error(),
+					Error:               WorkerExitedErrorPrefix + evidenceErr.Error(),
 					LastSSHHost:         workerResult.SSHHost,
 					ContinuationContext: entry.ContinuationContext,
 					ReactionKind:        entry.ReactionKind,
@@ -994,6 +1044,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 		// watches keyed on that head must start over.
 		fixExit := claimedAtExit && dispatchPostureForReactionKind(entry.ReactionKind) == PostureFix && !blockedSoftStop && !terminalSuppressed
 		headWatchesAllowed := reactionEnqueueAllowed || fixExit
+		var seededKinds []string
 
 		// Seed a pending CI check when CI provider and SCM adapter are both
 		// configured and the workspace carries PR identity: the reaction
@@ -1008,6 +1059,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 						nowCI = params.NowFunc().UTC()
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindCI)
+					seededKinds = append(seededKinds, ReactionKindCI)
 					replaced := state.PendingReactions[rkey]
 					state.PendingReactions[rkey] = &PendingReaction{
 						IssueID:     workerResult.IssueID,
@@ -1060,6 +1112,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindReview)
 					// Skip if already present to preserve in-progress debounce.
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindReview)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1102,6 +1155,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindBotReview)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindBotReview)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1143,6 +1197,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindAutoMerge)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindAutoMerge)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1185,6 +1240,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindMergeConflict)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindMergeConflict)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1230,6 +1286,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindLabelReview)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindLabelReview)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1272,6 +1329,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindLabelFix)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindLabelFix)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1313,6 +1371,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 					}
 					rkey := ReactionKey(workerResult.IssueID, ReactionKindMergeCompletion)
 					if _, exists := state.PendingReactions[rkey]; !exists {
+						seededKinds = append(seededKinds, ReactionKindMergeCompletion)
 						state.PendingReactions[rkey] = &PendingReaction{
 							IssueID:     workerResult.IssueID,
 							Identifier:  workerResult.Identifier,
@@ -1339,6 +1398,9 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 				}
 			}
 		}
+
+		recordReactionActivity(ctx, params.Store, workerResult.IssueID, entry.StageLineage,
+			persistence.ReactionActivityWatch, seededKinds, now, log)
 
 	case WorkerExitCancelled:
 		// Release the claim only if reconciliation stall detection has not
@@ -1367,7 +1429,7 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 
 				var errMsg string
 				if workerResult.Error != nil {
-					errMsg = redact.Mask("worker exited: " + workerResult.Error.Error())
+					errMsg = redact.Mask(WorkerExitedErrorPrefix + workerResult.Error.Error())
 				}
 
 				ScheduleRetry(state, ScheduleRetryParams{
@@ -1415,6 +1477,8 @@ func HandleWorkerExit(state *State, workerResult WorkerResult, params HandleWork
 			}
 		}
 	}
+
+	deleteLivePass(ctx, params.Store, workerResult.IssueID, persistence.LivePassRunning, log)
 
 	runDuration := max(now.Sub(entry.StartedAt), 0)
 

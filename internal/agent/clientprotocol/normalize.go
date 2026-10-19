@@ -10,20 +10,11 @@ import (
 	"github.com/sortie-ai/sortie/internal/redact"
 )
 
-// reasoningBlockMessage and planUpdateMessage are the compile-time
-// constant messages the normalization table assigns to a thought chunk,
-// a plan update, and a message chunk carrying no text; none of them
-// carries agent-produced text.
-const (
-	reasoningBlockMessage = "reasoning block"
-
-	// nonTextChunkMessage stands in for a message chunk whose content
-	// block is not text. The chunk is work the agent did, so the turn
-	// still observes work, but there is no text to show an operator and
-	// an empty notification would read as the agent having said nothing.
-	nonTextChunkMessage = "agent sent a message chunk this client does not render"
-	planUpdateMessage   = "plan update"
-)
+// nonTextChunkMessage stands in for a message chunk whose content block is
+// not text. The chunk is work the agent did, so the turn still observes
+// work, but there is no text to show an operator and an empty notification
+// would read as the agent having said nothing.
+const nonTextChunkMessage = "agent sent a message chunk this client does not render"
 
 // messageTruncateLimit bounds every agent-produced message this adapter
 // emits, matching the shared per-adapter convention.
@@ -70,7 +61,7 @@ func applySessionUpdate(tracker *agentcore.ToolTracker, ev sessionUpdateEvent) n
 
 	case updateAgentThoughtChunk:
 		return normalizedUpdate{
-			event:    domain.AgentEvent{Type: domain.EventOtherMessage, Timestamp: now, Message: reasoningBlockMessage},
+			event:    domain.AgentEvent{Type: domain.EventOtherMessage, Timestamp: now},
 			hasEvent: true,
 		}
 
@@ -120,7 +111,7 @@ func applySessionUpdate(tracker *agentcore.ToolTracker, ev sessionUpdateEvent) n
 
 	case updatePlan:
 		return normalizedUpdate{
-			event:    domain.AgentEvent{Type: domain.EventOtherMessage, Timestamp: now, Message: planUpdateMessage},
+			event:    domain.AgentEvent{Type: domain.EventOtherMessage, Timestamp: now},
 			hasEvent: true,
 		}
 

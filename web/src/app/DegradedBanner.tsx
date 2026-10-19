@@ -69,7 +69,7 @@ export function DegradedBanner() {
       className="mb-lg flex items-start gap-sm rounded-xl bg-error-container p-md text-body-md text-ink"
     >
       <TriangleAlertIcon className="mt-xxs text-error" />
-      <div className="min-w-0 [overflow-wrap:anywhere]">
+      <div className="min-w-0 wrap-anywhere">
         {lines.map((line) => (
           <div key={line.label}>
             <strong className="font-bold text-error">{line.label}</strong>

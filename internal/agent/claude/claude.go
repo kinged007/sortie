@@ -267,7 +267,10 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 					}
 					agentcore.EmitNotification(emit, posture.NoticeWithDetail(detail))
 				default:
-					agentcore.EmitNotification(emit, event.summary())
+					// Task and background-task bookkeeping carries no
+					// operator-readable text; a blank ping keeps stall
+					// detection alive without cluttering the run timeline.
+					agentcore.EmitNotification(emit, "")
 				}
 
 			case "assistant":
@@ -346,11 +349,7 @@ func (a *ClaudeCodeAdapter) StartSession(_ context.Context, params domain.StartS
 				agentcore.EmitNotification(emit, "")
 
 			default:
-				emit(domain.AgentEvent{
-					Type:      domain.EventOtherMessage,
-					Timestamp: now,
-					Message:   event.summary(),
-				})
+				agentcore.EmitNotification(emit, "")
 			}
 
 			return nil, nil

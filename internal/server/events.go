@@ -1,10 +1,10 @@
 package server
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,16 +112,85 @@ func (s *Server) routeEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	subs, err := parseRunSubscriptions(r.URL.Query()["run"], r.Header.Get("Last-Event-ID"))
+	if err != nil {
+		writeErrorJSON(w, s.logger, http.StatusBadRequest, "invalid_parameter", err.Error())
+		return
+	}
 	started := time.Now()
-	reason := s.streamEvents(w, r)
+	reason := s.streamEvents(w, r, subs)
 	s.logger.Debug("event stream closed",
 		slog.String("reason", reason),
 		slog.Duration("duration", time.Since(started)),
 	)
 }
 
+// eventStream is the state of one open stream. Only the handler goroutine
+// that owns it reads or writes it.
+type eventStream struct {
+	s            *Server
+	r            *http.Request
+	out          frameWriter
+	subs         []runSubscription
+	revision     string
+	lastSignalAt time.Time
+	hold         *time.Timer // set while a due change signal waits for its second
+}
+
+func (st *eventStream) currentRevision() string {
+	return strconv.FormatUint(st.s.changes.current(), 10)
+}
+
+func (st *eventStream) changeDue() bool {
+	return st.currentRevision() != st.revision && !time.Now().Before(st.lastSignalAt.Add(st.s.timing.signalInterval))
+}
+
+func (st *eventStream) writeChange() error {
+	revision := st.currentRevision()
+	if err := st.out.write(changeFrame(frameID(revision, st.subs))); err != nil {
+		return err
+	}
+	st.revision = revision
+	st.lastSignalAt = time.Now()
+	st.disarmHold()
+	return nil
+}
+
+func (st *eventStream) armHold() {
+	st.hold = time.NewTimer(time.Until(st.lastSignalAt.Add(st.s.timing.signalInterval)))
+}
+
+func (st *eventStream) disarmHold() {
+	if st.hold != nil {
+		st.hold.Stop()
+		st.hold = nil
+	}
+}
+
+// holdFired returns a channel that receives when the armed hold ends, and
+// blocks forever while none is armed.
+func (st *eventStream) holdFired() <-chan time.Time {
+	if st.hold == nil {
+		return nil
+	}
+	return st.hold.C
+}
+
+// reopenFailedReads makes every subscription whose stored read failed open
+// again and reports whether there was one.
+func (st *eventStream) reopenFailedReads() bool {
+	reopened := false
+	for i := range st.subs {
+		if st.subs[i].state == runReadFailed {
+			st.subs[i].state = runOpen
+			reopened = true
+		}
+	}
+	return reopened
+}
+
 // streamEvents serves one stream until it ends and returns why it ended.
-func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) string {
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request, subs []runSubscription) string {
 	pending, unsubscribe := s.changes.subscribe()
 	defer unsubscribe()
 
@@ -138,31 +207,23 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) string {
 		return streamEndShutdown
 	}
 
+	st := &eventStream{s: s, r: r, out: out, subs: subs}
+	defer st.disarmHold()
+	// A revision part that is not the current revision is dropped rather
+	// than kept, so no client-supplied byte is ever echoed back in a frame id.
+	if revision, _, _ := strings.Cut(r.Header.Get("Last-Event-ID"), ";"); revision == st.currentRevision() {
+		st.revision = revision
+	}
+	if st.currentRevision() != st.revision {
+		if err := st.writeChange(); err != nil {
+			return streamEndWriteFailed
+		}
+	}
+	if reason := st.deliver(); reason != "" {
+		return reason
+	}
+
 	ctx := r.Context()
-	// A Last-Event-ID that is not the current revision is dropped rather than
-	// kept, so no client-supplied byte is ever echoed back in a heartbeat.
-	lastID := ""
-	if id := strconv.FormatUint(s.changes.current(), 10); id == r.Header.Get("Last-Event-ID") {
-		lastID = id
-	}
-	var lastSignalAt time.Time
-
-	signal := func() error {
-		id := strconv.FormatUint(s.changes.current(), 10)
-		if id == lastID {
-			return nil
-		}
-		if err := out.write(changeFrame(id)); err != nil {
-			return err
-		}
-		lastID = id
-		lastSignalAt = time.Now()
-		return nil
-	}
-	if err := signal(); err != nil {
-		return streamEndWriteFailed
-	}
-
 	heartbeat := time.NewTicker(s.timing.heartbeat)
 	defer heartbeat.Stop()
 	for {
@@ -172,41 +233,36 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) string {
 		case <-s.changes.closed():
 			return streamEndShutdown
 		case <-heartbeat.C:
-			if err := out.write(heartbeatFrame(lastID)); err != nil {
+			if err := out.write(heartbeatFrame(frameID(st.revision, st.subs))); err != nil {
 				return streamEndWriteFailed
 			}
-		case <-pending:
-			if !lastSignalAt.IsZero() {
-				if reason := s.waitOut(ctx, time.Until(lastSignalAt.Add(s.timing.signalInterval))); reason != "" {
+			if st.reopenFailedReads() {
+				if reason := st.deliver(); reason != "" {
 					return reason
 				}
 			}
-			select {
-			case <-pending:
-			default:
+		case <-st.holdFired():
+			st.hold = nil
+			if st.currentRevision() != st.revision {
+				if err := st.writeChange(); err != nil {
+					return streamEndWriteFailed
+				}
 			}
-			if err := signal(); err != nil {
+		case <-pending:
+			if reason := st.deliver(); reason != "" {
+				return reason
+			}
+			if st.currentRevision() == st.revision || st.hold != nil {
+				continue
+			}
+			if !st.changeDue() {
+				st.armHold()
+				continue
+			}
+			if err := st.writeChange(); err != nil {
 				return streamEndWriteFailed
 			}
 		}
-	}
-}
-
-// waitOut sleeps for d and returns "" or, when the client leaves or shutdown
-// begins first, the reason the stream ends.
-func (s *Server) waitOut(ctx context.Context, d time.Duration) string {
-	if d <= 0 {
-		return ""
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return ""
-	case <-ctx.Done():
-		return streamEndClientGone
-	case <-s.changes.closed():
-		return streamEndShutdown
 	}
 }
 
@@ -225,6 +281,27 @@ func (fw frameWriter) write(frame []byte) error {
 		return err
 	}
 	if _, err := fw.w.Write(frame); err != nil {
+		return err
+	}
+	if err := fw.rc.Flush(); err != nil {
+		return err
+	}
+	return fw.rc.SetWriteDeadline(time.Time{})
+}
+
+// put writes one frame under a fresh deadline and leaves it buffered. The
+// deadline stays set until the next write or [frameWriter.flush] replaces it.
+func (fw frameWriter) put(frame []byte) error {
+	if err := fw.rc.SetWriteDeadline(time.Now().Add(fw.deadline)); err != nil {
+		return err
+	}
+	_, err := fw.w.Write(frame)
+	return err
+}
+
+// flush sends what put left buffered under a fresh deadline, then clears it.
+func (fw frameWriter) flush() error {
+	if err := fw.rc.SetWriteDeadline(time.Now().Add(fw.deadline)); err != nil {
 		return err
 	}
 	if err := fw.rc.Flush(); err != nil {

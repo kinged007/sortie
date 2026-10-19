@@ -34,6 +34,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/runstats"
 	"github.com/sortie-ai/sortie/internal/server"
 	"github.com/sortie-ai/sortie/internal/tool/trackerapi"
 	"github.com/sortie-ai/sortie/internal/workspace"
@@ -339,6 +340,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	if err != nil {
 		br.logger.Error("failed to load retry entries", slog.Any("error", err))
 		return 1
+	}
+
+	if err := store.DeleteAllLivePasses(ctx); err != nil {
+		br.logger.Error("failed to clear live passes", slog.Any("error", err))
 	}
 
 	var totals orchestrator.AgentTotals
@@ -894,6 +899,13 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		tokenRates, rateWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
 		addr := net.JoinHostPort(br.serverHost, strconv.Itoa(br.serverPort))
+		stats := statsSource{
+			dbPath:       dbPath,
+			workflowPath: br.path,
+			rates:        tokenRates,
+			rateWarnings: rateWarnings,
+			stages:       func() runstats.Stages { return dispatchStages(br.mgr.Config().Dispatch) },
+		}
 		srv = server.New(server.Params{
 			SnapshotFn:       o.SnapshotFunc(),
 			RefreshFn:        o.RefreshFunc(),
@@ -912,7 +924,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			WorkflowLoadedFn: func() bool { return br.mgr.Config().Tracker.Kind != "" },
 			TokenRates:       tokenRates,
 			RunHistory:       runHistoryReader{store: store},
-			Stats:            statsSource{dbPath: dbPath, workflowPath: br.path, rates: tokenRates, rateWarnings: rateWarnings}.report,
+			RunEventsFn:      o.RunEvents,
+			RunEventsAfterFn: o.RunEventsAfter,
+			Stats:            stats.report,
 		})
 		o.AddObserver(srv)
 		br.mgr.SetLoadNotifier(srv.OnStateChange)

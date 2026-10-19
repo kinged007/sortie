@@ -65,9 +65,12 @@ function handledClauses(state: StateResponse, acknowledged: number): Segment[][]
   }
   if (waiting.length > 0) {
     const kinds = joinWords(waitingKinds(waiting.map((reaction) => reaction.config_key)), "or");
+    const pullRequests = new Set(
+      waiting.map(({ pull_request: pr }) => JSON.stringify([pr.repository, pr.number])),
+    );
     clauses.push(
       clause(
-        waiting.length,
+        pullRequests.size,
         ["pull request", "pull requests"],
         ["is", "are"],
         `waiting on ${kinds}`,

@@ -285,7 +285,7 @@ function ToastView({ item, onLeave, onRemove }: ToastViewProps) {
         >
           <Mark />
         </span>
-        <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+        <div className="min-w-0 flex-1 wrap-anywhere">
           <p className="text-body-md font-medium text-ink">{item.title}</p>
           {item.message === "" ? undefined : (
             <p className="text-body-sm text-ink-muted">{item.message}</p>

@@ -77,7 +77,7 @@ func TestFor(t *testing.T) {
 			name:  "running CI fix without a shape",
 			entry: continuation("ci"),
 			short: "Fixing CI on #7, fix 1",
-			long:  "MT-1 is fixing CI on PR #7, fix 1.",
+			long:  "Fixing CI on PR #7, fix 1.",
 		},
 		{"running merge conflict", continuation("merge-conflict"), "Resolving the merge conflict on #7, rebase 1", ""},
 		{"running review fix", continuation("review"), "Answering review comments on #7, fix 1", ""},
@@ -93,7 +93,7 @@ func TestFor(t *testing.T) {
 			name:  "running turn without a stage position",
 			entry: Entry{Running: &orchestrator.SnapshotRunningEntry{Identifier: key, TurnCount: 3}},
 			short: "Turn 3",
-			long:  "MT-1 is running, turn 3.",
+			long:  "Running, turn 3.",
 		},
 		{
 			name: "running turn on a stage",
@@ -102,7 +102,7 @@ func TestFor(t *testing.T) {
 				StagePosition: &orchestrator.SnapshotStagePosition{Chain: []string{"plan", "implement"}, Current: "implement"},
 			}},
 			short: "Turn 3 on stage implement",
-			long:  "MT-1 is running stage implement (2 of 2), turn 3.",
+			long:  "Running stage implement (2 of 2), turn 3.",
 		},
 
 		{"retry paused", retry(orchestrator.SnapshotRetryEntry{Paused: true, Error: "reaction retry paused by issue state"}), "Retry 2 paused: the issue's tracker state does not allow it", ""},
@@ -119,7 +119,7 @@ func TestFor(t *testing.T) {
 			name:  "token budget with no measured usage",
 			entry: held(orchestrator.SnapshotBudgetEntry{Reason: "token_budget"}),
 			short: "Held: token budget reached",
-			long:  "MT-1 is held at its token budget. Tokens used: not measured.",
+			long:  "Held at the token budget. Tokens and cache reads used: not measured.",
 		},
 		{
 			name: "token budget with an unmeasured session",
@@ -127,7 +127,7 @@ func TestFor(t *testing.T) {
 				Reason: "token_budget", UsedTokens: new(int64(704000)), UnmeasuredSessions: new(1),
 			}),
 			short: "Held: token budget reached",
-			long:  "MT-1 is held at its token budget. Tokens used: at least 704K.",
+			long:  "Held at the token budget. Tokens and cache reads used: at least 704K.",
 		},
 		{
 			name: "token budget fully measured",
@@ -135,7 +135,7 @@ func TestFor(t *testing.T) {
 				Reason: "token_budget", UsedTokens: new(int64(704000)), UnmeasuredSessions: new(0),
 			}),
 			short: "Held: token budget reached",
-			long:  "MT-1 is held at its token budget. Tokens used: 704K.",
+			long:  "Held at the token budget. Tokens and cache reads used: 704K.",
 		},
 		{"session budget", held(orchestrator.SnapshotBudgetEntry{Reason: "session_budget"}), "Held: session budget reached", ""},
 

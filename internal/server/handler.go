@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/sentence"
@@ -70,10 +71,11 @@ type runningEntryResponse struct {
 	LastMessage         string                 `json:"last_message"`
 	StartedAt           time.Time              `json:"started_at"`
 	DispatchedAt        *time.Time             `json:"dispatched_at"`
-	LastEventAt         time.Time              `json:"last_event_at"`
+	LastEventAt         *time.Time             `json:"last_event_at"`
 	WorkspacePath       string                 `json:"workspace_path"`
 	SSHHost             string                 `json:"ssh_host,omitempty"`
 	Tokens              tokenInfo              `json:"tokens"`
+	UncachedTokens      *int64                 `json:"uncached_tokens"`
 	ModelName           string                 `json:"model_name,omitempty"`
 	RuleName            string                 `json:"rule_name,omitempty"`
 	StageLineage        *stageLineageResponse  `json:"stage_lineage"`
@@ -112,6 +114,7 @@ type runningEntryResponse struct {
 	UnmeasuredSessions    *int     `json:"unmeasured_sessions"`
 	UsedTokens            *int64   `json:"used_tokens"`
 	UsedTokensComplete    bool     `json:"used_tokens_complete"`
+	IssueUncachedTokens   *int64   `json:"issue_uncached_tokens"`
 	BudgetTokens          *int64   `json:"budget_tokens"`
 	EstimatedCostUSD      *float64 `json:"estimated_cost_usd"`
 	CostStatus            string   `json:"cost_status"`
@@ -120,6 +123,20 @@ type runningEntryResponse struct {
 
 	StatusText     string `json:"status_text"`
 	StatusTextFull string `json:"status_text_full"`
+
+	// DispatchID keys the run's retained events.
+	DispatchID string `json:"dispatch_id"`
+
+	// QuietAt and StallAt are half and all of agent.stall_timeout_ms after
+	// the last event, else after the start; both are null with stall
+	// detection off. StallText and StallTextFull are null until QuietAt
+	// has passed and with stall detection off, and StallOffText is null
+	// while it is on.
+	QuietAt       *time.Time `json:"quiet_at"`
+	StallAt       *time.Time `json:"stall_at"`
+	StallText     *string    `json:"stall_text"`
+	StallTextFull *string    `json:"stall_text_full"`
+	StallOffText  *string    `json:"stall_off_text"`
 }
 
 // tokenInfo carries a running row's five token figures. The members
@@ -424,10 +441,16 @@ type issueDetailResponse struct {
 	Parked           *parkedEntryResponse      `json:"parked"`
 	PendingReactions []pendingReactionResponse `json:"pending_reactions"`
 	BetweenStages    *stageHopResponse         `json:"between_stages"`
-	RecentEvents     []any                     `json:"recent_events"`
+	RecentEvents     []runEventResponse        `json:"recent_events"`
 	LastError        *string                   `json:"last_error"`
 	Tracked          map[string]any            `json:"tracked"`
 	History          *issueHistoryResponse     `json:"history"`
+
+	// PRLoop is what each configured pull request reaction recorded in the
+	// pass that decides a live issue's status, or in the newest run's pass
+	// of an issue that only run history knows; null without run history or a
+	// workflow shape.
+	PRLoop map[string]prLoopStationResponse `json:"pr_loop"`
 
 	StatusText     string `json:"status_text"`
 	StatusTextFull string `json:"status_text_full"`
@@ -525,7 +548,10 @@ func toRunningEntryResponse(e orchestrator.SnapshotRunningEntry, nowArgs ...time
 		LastMessage:         e.LastAgentMessage,
 		StartedAt:           e.StartedAt.UTC(),
 		DispatchedAt:        utcOrNil(e.StageLineage.DispatchedAt),
-		LastEventAt:         e.LastAgentTimestamp.UTC(),
+		LastEventAt:         utcOrNil(e.LastAgentTimestamp),
+		DispatchID:          e.DispatchID,
+		QuietAt:             utcOrNil(e.QuietAt),
+		StallAt:             utcOrNil(e.StallAt),
 		WorkspacePath:       e.WorkspacePath,
 		SSHHost:             e.SSHHost,
 		ModelName:           e.ModelName,
@@ -557,6 +583,7 @@ func toRunningEntryResponse(e orchestrator.SnapshotRunningEntry, nowArgs ...time
 			CacheReadTokens:  &e.CacheReadTokens,
 			CacheWriteTokens: &e.CacheWriteTokens,
 		}
+		resp.UncachedTokens = new(domain.TokenUsage{TotalTokens: e.AgentTotalTokens, CacheReadTokens: e.CacheReadTokens}.Uncached())
 	}
 	if e.APIRequestsMeasured {
 		resp.APIRequestCount = &e.APIRequestCount
@@ -598,8 +625,10 @@ func toServedRunningEntry(e orchestrator.SnapshotRunningEntry, snap orchestrator
 	}
 
 	known := completed
+	knownCacheReads := completedCacheReads(e.IssueUsage)
 	if e.UsageMeasured {
 		known += e.AgentTotalTokens
+		knownCacheReads += e.CacheReadTokens
 	}
 	resp.UsedTokensComplete = e.IssueUsage != nil && !completedIncomplete && e.UsageMeasured && e.UnaccountedTurns == 0
 
@@ -610,6 +639,7 @@ func toServedRunningEntry(e orchestrator.SnapshotRunningEntry, snap orchestrator
 	}
 	if known != 0 || resp.UsedTokensComplete {
 		resp.UsedTokens = new(known)
+		resp.IssueUncachedTokens = new(domain.TokenUsage{TotalTokens: known, CacheReadTokens: knownCacheReads}.Uncached())
 	}
 
 	if snap.MaxTokens > 0 {
@@ -622,6 +652,19 @@ func toServedRunningEntry(e orchestrator.SnapshotRunningEntry, snap orchestrator
 	resp.EstimatedCostUSD, resp.CostStatus = sessionCostOf(e, rates)
 	resp.IssueEstimatedCostUSD, resp.IssueCostStatus = issueCostOf(e, resp.UsedTokens, resp.UsedTokensComplete, resp.EstimatedCostUSD, resp.CostStatus, rates)
 	return resp
+}
+
+// completedCacheReads sums the cache reads of the sessions an issue's
+// completed total counts.
+func completedCacheReads(usage *orchestrator.SnapshotIssueUsage) int64 {
+	if usage == nil {
+		return 0
+	}
+	var sum int64
+	for _, kind := range usage.ByKind {
+		sum += kind.CacheReadTokens
+	}
+	return sum
 }
 
 // utcOrNil returns the UTC value of at, or nil for the zero time, so a time
@@ -694,7 +737,7 @@ func toRetryEntryResponse(e orchestrator.SnapshotRetryEntry) retryEntryResponse 
 		DispatchedAt:      utcOrNil(e.StageLineage.DispatchedAt),
 		Attempt:           e.Attempt,
 		DueAt:             time.UnixMilli(e.DueAtMS).UTC(),
-		Error:             e.Error,
+		Error:             sentence.RunError(e.Error),
 
 		Trigger:           e.Trigger,
 		ReactionKind:      e.ReactionKind,
@@ -848,6 +891,18 @@ func toPendingReactionResponses(rows []orchestrator.SnapshotPendingReaction, wor
 	return responses
 }
 
+// setRunningSentences sets the status pair, the stall pair, and the stall-off
+// sentence of a running row.
+func setRunningSentences(row *runningEntryResponse, e orchestrator.SnapshotRunningEntry, words sentence.Context) {
+	row.StatusText, row.StatusTextFull = sentencesOf(sentence.Entry{Running: &e}, words)
+	if stall, quiet := sentence.Stall(&e, words); quiet {
+		row.StallText, row.StallTextFull = &stall.Short, &stall.Long
+	}
+	if text, off := sentence.StallOff(&e); off {
+		row.StallOffText = &text
+	}
+}
+
 // sentencesOf returns the short and long status sentence of one entry.
 func sentencesOf(entry sentence.Entry, words sentence.Context) (short, long string) {
 	status := sentence.For(entry, words)
@@ -910,7 +965,7 @@ func toStateResponse(snap orchestrator.RuntimeSnapshotResult, tokenRates TokenRa
 	running := make([]runningEntryResponse, 0, len(snap.Running))
 	for _, e := range snap.Running {
 		row := toServedRunningEntry(e, snap, tokenRates)
-		row.StatusText, row.StatusTextFull = sentencesOf(sentence.Entry{Running: &e}, words)
+		setRunningSentences(&row, e, words)
 		running = append(running, row)
 	}
 
@@ -1097,6 +1152,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if health != nil {
 		resp.Health = toStateHealthResponse(*health, words)
 	}
+	s.attachActivePRLoops(r, &resp, snap, words.Shape)
 	writeJSON(w, s.logger, http.StatusOK, resp)
 
 	s.logger.Debug("request served",
@@ -1147,6 +1203,10 @@ func (s *Server) handleIssueDetail(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("issue identifier %q not found in %s", identifier, notFoundIn))
 		return
 	}
+	if detail.RecentEvents, err = s.recentEvents(r.Context(), detail); err != nil {
+		s.historyReadFailed(w, r, err)
+		return
+	}
 
 	for _, outcome := range sentence.NextOutcomes(detail.situation, words) {
 		detail.NextOutcomes = append(detail.NextOutcomes, nextOutcomeResponse(outcome))
@@ -1193,6 +1253,10 @@ func (s *Server) withIssueHistory(w http.ResponseWriter, r *http.Request, identi
 	if len(page) == 0 {
 		if detail != nil {
 			detail.situation.Spend = &sentence.Spend{}
+			if err := s.attachIssuePRLoop(ctx, detail, snap, words.Shape, nil); err != nil {
+				s.historyReadFailed(w, r, err)
+				return nil, false
+			}
 		}
 		return detail, true
 	}
@@ -1223,6 +1287,10 @@ func (s *Server) withIssueHistory(w http.ResponseWriter, r *http.Request, identi
 	if hasOutcome {
 		detail.History.IssueOutcome = toIssueOutcomeResponse(outcome, newest.Identifier, newest.DisplayID)
 	}
+	if err := s.attachIssuePRLoop(ctx, detail, snap, words.Shape, &newest); err != nil {
+		s.historyReadFailed(w, r, err)
+		return nil, false
+	}
 	return detail, true
 }
 
@@ -1236,7 +1304,7 @@ func historyOnlyDetail(issueID string, newest RunHistoryEntry) *issueDetailRespo
 		Issue:            issueResponse{Title: redact.Mask(newest.IssueTitle), URL: redact.Mask(newest.IssueURL)},
 		Attempts:         &attemptsInfo{},
 		PendingReactions: []pendingReactionResponse{},
-		RecentEvents:     []any{},
+		RecentEvents:     []runEventResponse{},
 		Tracked:          map[string]any{},
 		NextOutcomes:     []nextOutcomeResponse{},
 	}
@@ -1540,6 +1608,21 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request, allowe
 		fmt.Sprintf("method %s is not allowed on this endpoint", r.Method))
 }
 
+// crossOriginForbidden answers a state-changing request that the cross-origin
+// check refused, before any route runs.
+func (s *Server) crossOriginForbidden(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("cross-origin request rejected",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.String("origin", r.Header.Get("Origin")),
+		slog.String("sec_fetch_site", r.Header.Get("Sec-Fetch-Site")),
+		slog.String("host", r.Host),
+	)
+	writeErrorJSON(w, s.logger, http.StatusForbidden,
+		"cross_origin_request_rejected",
+		"Sortie refused this request because it could not confirm that it came from a page on Sortie's own origin, and nothing changed; a reverse proxy in front of Sortie must pass on the Host header the browser sent unchanged, including its port.")
+}
+
 // buildIssueDetail assembles the live detail of one issue, or nil when no live
 // entry holds it. An entry belongs to the issue when its identifier equals
 // identifier, or when issueID is non-empty and the entry carries it, which
@@ -1560,7 +1643,7 @@ func buildIssueDetail(identifier, issueID string, snap orchestrator.RuntimeSnaps
 		if matches(e.Identifier, e.IssueID) {
 			situation.Running = &e
 			runEntry = new(toServedRunningEntry(e, snap, rates))
-			runEntry.StatusText, runEntry.StatusTextFull = sentencesOf(sentence.Entry{Running: &e}, words)
+			setRunningSentences(runEntry, e, words)
 			break
 		}
 	}
@@ -1736,7 +1819,7 @@ func buildIssueDetail(identifier, issueID string, snap orchestrator.RuntimeSnaps
 		Parked:           parkedEntry,
 		PendingReactions: pending,
 		BetweenStages:    hopEntry,
-		RecentEvents:     []any{},
+		RecentEvents:     []runEventResponse{},
 		LastError:        lastError,
 		Tracked:          map[string]any{},
 		StatusText:       statusText,

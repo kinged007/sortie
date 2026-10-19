@@ -59,6 +59,7 @@ type runResponse struct {
 	DispatchedAt         *string             `json:"dispatched_at"`
 	TurnsCompleted       int                 `json:"turns_completed"`
 	Tokens               tokenInfo           `json:"tokens"`
+	UncachedTokens       *int64              `json:"uncached_tokens"`
 	TokensMeasured       bool                `json:"tokens_measured"`
 	UnaccountedTurns     int                 `json:"unaccounted_turns"`
 	EstimatedCostUSD     *float64            `json:"estimated_cost_usd"`
@@ -76,12 +77,21 @@ type runResponse struct {
 	SessionID            *string             `json:"session_id"`
 	SSHHost              *string             `json:"ssh_host"`
 
+	// DispatchID is "" on the recorded CI result and null for a run recorded
+	// before the dispatch ID existed.
+	DispatchID *string `json:"dispatch_id"`
+
 	// StageChain is the chain the run's rule stood on; null when the run has
 	// no rule, its rule is on no chain, or no workflow shape is held.
 	StageChain []string `json:"stage_chain"`
 
 	// IssueOutcome is the issue's, the same on every run of the issue.
 	IssueOutcome *issueOutcomeResponse `json:"issue_outcome"`
+
+	// PRLoop is what each configured pull request reaction recorded in the
+	// run's pass; null on the runs the per-issue history and the issue
+	// groups serve, and when the server holds no workflow shape.
+	PRLoop map[string]prLoopStationResponse `json:"pr_loop"`
 }
 
 // issueOutcomeResponse is how an issue's latest work ended. State is present
@@ -129,6 +139,7 @@ type historyTotalsResponse struct {
 	RunCount         int       `json:"run_count"`
 	UnmeasuredRuns   int       `json:"unmeasured_runs"`
 	Tokens           tokenInfo `json:"tokens"`
+	UncachedTokens   *int64    `json:"uncached_tokens"`
 	TokensComplete   bool      `json:"tokens_complete"`
 	EstimatedCostUSD *float64  `json:"estimated_cost_usd"`
 	CostStatus       string    `json:"cost_status"`
@@ -261,9 +272,10 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 		SelfReview:           toSelfReviewResponse(e.ReviewMetadata),
 		OriginRecorded:       e.OriginRecorded,
 		StageChain:           orchestrator.StageChainOf(chains, e.RuleName, e.StagePrevious),
+		DispatchID:           copyText(e.DispatchID),
 	}
 	if e.Error != nil {
-		resp.Error = new(redact.Mask(*e.Error))
+		resp.Error = new(redact.Mask(sentence.RunError(*e.Error)))
 	}
 	if e.DispatchedAt != "" {
 		resp.DispatchedAt = new(e.DispatchedAt)
@@ -276,6 +288,7 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 			CacheReadTokens:  new(e.Tokens.CacheReadTokens),
 			CacheWriteTokens: new(e.Tokens.CacheWriteTokens),
 		}
+		resp.UncachedTokens = new(domain.TokenUsage{TotalTokens: e.Tokens.TotalTokens, CacheReadTokens: e.Tokens.CacheReadTokens}.Uncached())
 	}
 	resp.EstimatedCostUSD, resp.CostStatus = runCostOf(e, rates)
 
@@ -415,6 +428,7 @@ func historyTotalsOf(t IssueRunTotals, rates TokenRates) historyTotalsResponse {
 		RunCount:         t.Usage.Sessions,
 		UnmeasuredRuns:   t.Usage.UnmeasuredSessions,
 		Tokens:           tokens,
+		UncachedTokens:   known(domain.TokenUsage{TotalTokens: t.Usage.TotalTokens, CacheReadTokens: t.Tokens.CacheReadTokens}.Uncached()),
 		TokensComplete:   complete,
 		EstimatedCostUSD: cost,
 		CostStatus:       status,
@@ -490,12 +504,24 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		s.historyReadFailed(w, r, err)
 		return
 	}
+	var shape *orchestrator.WorkflowShape
 	var chains [][]string
 	if s.workflowShapeFn != nil {
-		chains = s.workflowShapeFn().Dispatch.Chains
+		shape = new(s.workflowShapeFn())
+		chains = shape.Dispatch.Chains
+	}
+	passes := make([]PassRef, len(rows))
+	for i, row := range rows {
+		passes[i] = passOfRun(row)
+	}
+	loops, err := s.readPRLoops(r.Context(), shape, passes)
+	if err != nil {
+		s.historyReadFailed(w, r, err)
+		return
 	}
 	runs := toRunResponses(rows, s.tokenRates, chains)
 	attachIssueOutcomes(runs, outcomes)
+	attachRunPRLoops(runs, rows, loops)
 	writeJSON(w, s.logger, http.StatusOK, runsResponse{Runs: runs, NextCursor: next})
 
 	s.logger.Debug("request served",

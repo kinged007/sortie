@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,12 +20,16 @@ import (
 )
 
 type mockRetryStore struct {
+	reactionActivityLog
+	livePassLog
 	noopOutcomeRecorder
 	noEscalationRecords
 	unsupportedReactionObservationStore
 
 	savedEntries   []persistence.RetryEntry
 	deletedIssueID []string
+
+	upsertedAtRetryDelete int
 
 	saveRetryEntryErr         error
 	deleteRetryEntryErr       error
@@ -68,6 +73,7 @@ func (m *mockRetryStore) SaveRetryEntry(_ context.Context, entry persistence.Ret
 
 func (m *mockRetryStore) DeleteRetryEntry(_ context.Context, issueID string) error {
 	m.deletedIssueID = append(m.deletedIssueID, issueID)
+	m.upsertedAtRetryDelete = len(m.upserted)
 	return m.deleteRetryEntryErr
 }
 
@@ -1925,6 +1931,8 @@ func TestHandleRetryTimer_BudgetExhaustedBlocksShouldDispatch(t *testing.T) {
 	const id = "ISS-COMP"
 	spy := &spyMetrics{}
 	state := retryState(t, id, "PROJ-COMP", 2)
+	state.RetryAttempts[id].RuleName = "plan"
+	state.RetryAttempts[id].StageLineage = StageLineage{PreviousRule: "specify", ChainID: "chain-1"}
 	store := &mockRetryStore{runHistoryCount: 3}
 	tracker := &mockRetryTracker{
 		fetchedIssue: candidateIssue(id, "PROJ-COMP", "To Do"),
@@ -1947,6 +1955,8 @@ func TestHandleRetryTimer_BudgetExhaustedBlocksShouldDispatch(t *testing.T) {
 	if ShouldDispatch(candidateIssue(id, "PROJ-COMP", "To Do"), state, params.ActiveStates, params.TerminalStates) {
 		t.Error("ShouldDispatch() = true after budget exhaustion, want false")
 	}
+
+	requireLivePasses(t, "UpsertLivePass", store.upserted, []persistence.LivePass{{IssueID: id, Kind: persistence.LivePassBudget, ChainID: "chain-1", RuleName: "plan", StagePrevious: "specify"}})
 }
 
 func TestHandleRetryTimer_BudgetMetrics(t *testing.T) {
@@ -2430,15 +2440,14 @@ func TestHandleRetryTimer_SessionID_PassedToMakeWorkerFn(t *testing.T) {
 	}
 }
 
-// TestHandleRetryTimer_PassesReactionKindToMakeWorkerFn checks that a
-// popped entry's ReactionKind reaches MakeWorkerFn, which uses it to derive
-// the read-only posture for label-review dispatches.
 func TestHandleRetryTimer_PassesReactionKindToMakeWorkerFn(t *testing.T) {
 	t.Parallel()
 
 	const id = "ISS-LR-RK"
 	state := retryState(t, id, id, 1)
 	state.RetryAttempts[id].ReactionKind = ReactionKindLabelReview
+	state.RetryAttempts[id].RuleName = "plan"
+	state.RetryAttempts[id].StageLineage = StageLineage{ChainID: "chain-1"}
 
 	store := &mockRetryStore{}
 	tracker := &mockRetryTracker{
@@ -2466,6 +2475,7 @@ func TestHandleRetryTimer_PassesReactionKindToMakeWorkerFn(t *testing.T) {
 	if gotReactionKind != ReactionKindLabelReview {
 		t.Errorf("MakeWorkerFn reactionKind = %q, want %q", gotReactionKind, ReactionKindLabelReview)
 	}
+	requireLivePasses(t, "UpsertLivePass", store.upserted, nil)
 }
 
 func TestHandleRetryTimer_Reschedule_PreservesSessionID(t *testing.T) {
@@ -3366,7 +3376,8 @@ func TestHandleRetryTimer_StageLineage(t *testing.T) {
 			if tt.hop != nil {
 				state.StageHops[id] = tt.hop
 			}
-			params := capturingRetryParams(t, &mockRetryStore{}, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}, new([]dispatchedWorker))
+			store := &mockRetryStore{}
+			params := capturingRetryParams(t, store, &mockRetryTracker{fetchedIssue: candidateIssue(id, id, "To Do")}, new([]dispatchedWorker))
 			if tt.resolveRule != "" {
 				params.ResolveSelection = func(frozen DispatchResolution, _ domain.Issue) DispatchResolution {
 					frozen.RuleName = tt.resolveRule
@@ -3390,6 +3401,10 @@ func TestHandleRetryTimer_StageLineage(t *testing.T) {
 			}
 			if got != want {
 				t.Errorf("RunningEntry.StageLineage = %+v, want %+v (a fresh chain differs from %q, an unset pass time is the run's start %v)", got, want, tt.lineage.ChainID, running.StartedAt)
+			}
+			requireLivePasses(t, "UpsertLivePass", store.upserted, []persistence.LivePass{{IssueID: id, Kind: persistence.LivePassRunning, ChainID: running.StageLineage.ChainID, RuleName: cmp.Or(tt.resolveRule, "plan"), StagePrevious: tt.want.PreviousRule}})
+			if store.upsertedAtRetryDelete != 1 {
+				t.Errorf("live passes stored before DeleteRetryEntry = %d, want 1", store.upsertedAtRetryDelete)
 			}
 		})
 	}
