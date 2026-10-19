@@ -419,11 +419,10 @@ func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 
 // TestMCPInjectionConformance drives a real turn for a session that
 // carries the worker-generated MCP config path, captures the argv and
-// environment the pi process actually received, and asserts neither the
-// path nor the Sortie server command reaches it. Capturing the launch
-// rather than composing one is what makes this negative assertion able
-// to fail: an adapter that delivered the document through any channel
-// would have it in one of these two files.
+// environment the pi process actually received, and asserts the
+// translated servers reach it locally but not over SSH. Capturing the
+// launch rather than composing one is what makes both assertions able
+// to fail.
 func TestMCPInjectionConformance(t *testing.T) {
 	t.Parallel()
 
@@ -431,17 +430,14 @@ func TestMCPInjectionConformance(t *testing.T) {
 	if !ok {
 		t.Fatal(`registry.Agents.Meta("pi") reported not registered`)
 	}
-	if declared.MCPInjection != registry.MCPInjectionUnsupported {
-		t.Fatalf("registered MCPInjection = %q, want %q", declared.MCPInjection, registry.MCPInjectionUnsupported)
+	if declared.MCPInjection != registry.MCPInjectionTranslated {
+		t.Fatalf("registered MCPInjection = %q, want %q", declared.MCPInjection, registry.MCPInjectionTranslated)
 	}
-	// The same disposition is what the generic preflight reads to warn
-	// that a pi session can reach no tool at all. A local and a remote
-	// launch must both deliver none, or that warning is a false alarm
-	// in one of the two modes.
-	for _, remote := range []bool{false, true} {
-		if declared.MCPInjection.DeliversTools(remote) {
-			t.Errorf("MCPInjection.DeliversTools(remote=%t) = true, want false: a pi session can reach no Sortie tool in either launch mode", remote)
-		}
+	if !declared.MCPInjection.DeliversTools(false) {
+		t.Error("MCPInjection.DeliversTools(remote=false) = false, want true: a local pi session must reach Sortie tools")
+	}
+	if declared.MCPInjection.DeliversTools(true) {
+		t.Error("MCPInjection.DeliversTools(remote=true) = true, want false: a remote pi launch cannot deliver Sortie tools")
 	}
 
 	dir := t.TempDir()
@@ -454,51 +450,95 @@ func TestMCPInjectionConformance(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	argvFile := filepath.Join(dir, "argv.txt")
-	envFile := filepath.Join(dir, "env.txt")
-	script := writePiScript(t, dir, `printf '%s\n' "$*" > `+argvFile+`
+	// Local launch: the bridge extension and the env JSON both carry the
+	// server detail, which the Translated assertion looks for as
+	// substrings on the launch surface.
+	t.Run("local launch delivers the translated servers", func(t *testing.T) {
+		t.Parallel()
+
+		localDir := filepath.Join(dir, "local")
+		if err := os.MkdirAll(filepath.Join(localDir, ".sortie"), 0o750); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localDir, ".sortie", "mcp.json"), []byte(generatedConfig), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		localMCP := filepath.Join(localDir, ".sortie", "mcp.json")
+		argvFile := filepath.Join(localDir, "argv.txt")
+		envFile := filepath.Join(localDir, "env.txt")
+		script := writePiScript(t, localDir, `printf '%s\n' "$*" > `+argvFile+`
 env > `+envFile+`
 exit 0`)
 
-	a, err := NewPiAdapter()
-	if err != nil {
-		t.Fatalf("NewPiAdapter() error = %v", err)
-	}
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath:   dir,
-		AgentConfig:     domain.AgentConfig{Command: script},
-		MCPConfigPath:   mcpConfigPath,
-		ResumeSessionID: "",
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	// The fake process writes its launch surface and then exits without a
-	// JSON response, so the shared no-work rule returns an error here. The
-	// launch capture is still the subject of this test.
-	_, _, _ = collectEvents(t, a, session, "work")
-
-	argv, err := os.ReadFile(argvFile)
-	if err != nil {
-		t.Fatalf("ReadFile(argv) error = %v", err)
-	}
-	env, err := os.ReadFile(envFile)
-	if err != nil {
-		t.Fatalf("ReadFile(env) error = %v", err)
-	}
-
-	surface := agenttest.MCPLaunchSurface{
-		Args: strings.Split(strings.TrimRight(string(argv), "\n"), "\n"),
-		Env:  strings.Split(strings.TrimRight(string(env), "\n"), "\n"),
-	}
-	agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, surface)
-	// The generated document names the server and its command, so their
-	// absence is a second, independent reading of the same capture.
-	for _, forbidden := range []string{"sortie-tools", "/usr/local/bin/sortie", "mcp-server"} {
-		if strings.Contains(string(argv)+string(env), forbidden) {
-			t.Errorf("launch surface carries %q, want the pi process to receive no Sortie MCP detail", forbidden)
+		a, err := NewPiAdapter()
+		if err != nil {
+			t.Fatalf("NewPiAdapter() error = %v", err)
 		}
-	}
+		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+			WorkspacePath:   localDir,
+			AgentConfig:     domain.AgentConfig{Command: script},
+			MCPConfigPath:   localMCP,
+			ResumeSessionID: "",
+		})
+		if err != nil {
+			t.Fatalf("StartSession() error = %v", err)
+		}
+		_, _, _ = collectEvents(t, a, session, "work")
+
+		argv, err := os.ReadFile(argvFile)
+		if err != nil {
+			t.Fatalf("ReadFile(argv) error = %v", err)
+		}
+		env, err := os.ReadFile(envFile)
+		if err != nil {
+			t.Fatalf("ReadFile(env) error = %v", err)
+		}
+
+		surface := agenttest.MCPLaunchSurface{
+			Args: strings.Split(strings.TrimRight(string(argv), "\n"), "\n"),
+			Env:  strings.Split(strings.TrimRight(string(env), "\n"), "\n"),
+		}
+		agenttest.AssertMCPInjection(t, declared.MCPInjection, localMCP, surface)
+	})
+
+	// Remote launch: no Sortie server detail must reach the launch.
+	t.Run("remote launch delivers no tool servers", func(t *testing.T) {
+		t.Parallel()
+
+		remoteDir := filepath.Join(dir, "remote")
+		if err := os.MkdirAll(filepath.Join(remoteDir, ".sortie"), 0o750); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(remoteDir, ".sortie", "mcp.json"), []byte(generatedConfig), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		// The remote's server-side launch is not observable from this
+		// process, but the translation itself must already be nil so no
+		// bridge file or env value is built for it. Rendering the arg
+		// slice from the translated result is enough to drive the
+		// Unsupported assertion against its launch surface.
+		servers, err := translateMCPServers(mcpConfigPath, true)
+		if err != nil {
+			t.Fatalf("translateMCPServers() error = %v", err)
+		}
+		if servers != nil {
+			t.Fatalf("translateMCPServers(remote=true) = %v, want nil", servers)
+		}
+		doc, err := buildMCPEnvValue(servers)
+		if err != nil {
+			t.Fatalf("buildMCPEnvValue() error = %v", err)
+		}
+		if doc != "" {
+			t.Fatalf("buildMCPEnvValue(remote) = %q, want %q", doc, "")
+		}
+		state := newTestSessionState(remoteDir, "")
+		args := buildRunArgs(state, "work", passthroughConfig{ProjectTrust: trustApprove})
+		env := []string{"PATH=/usr/bin"}
+		if doc != "" {
+			env = append(env, "SORTIE_PI_MCP_SERVERS="+doc)
+		}
+		agenttest.AssertMCPInjection(t, registry.MCPInjectionUnsupported, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
+	})
 }
 
 // TestRemoteLaunch_ForwardsSessionAndWorkspace asserts the SSH launch

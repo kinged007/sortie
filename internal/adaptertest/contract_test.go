@@ -2972,6 +2972,7 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/copilot", name: "writeDerivedConfig", reason: "returned path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "WriteSeededMCPConfig", reason: "returned path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "assertMalformedMCPConfigRejected", reason: "fixture path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/pi", name: "ensureBridgeFile", reason: "bridge extension path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR
