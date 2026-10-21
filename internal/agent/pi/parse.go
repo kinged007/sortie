@@ -109,8 +109,10 @@ type rawRunEvent struct {
 	Result     json.RawMessage `json:"result,omitempty"`
 	DurationMS int64           `json:"durationMs,omitempty"`
 
-	WillRetry bool   `json:"willRetry,omitempty"`
-	Reason    string `json:"reason,omitempty"`
+	Aborted      bool   `json:"aborted,omitempty"`
+	WillRetry    bool   `json:"willRetry,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
 // rawMessage is an AgentMessage as the pi CLI serializes it. Only
@@ -139,6 +141,15 @@ type rawUsage struct {
 	CacheRead  int64 `json:"cacheRead"`
 	CacheWrite int64 `json:"cacheWrite"`
 	Reasoning  int64 `json:"reasoning"`
+}
+
+// rawCompactionResult is the CompactionResult a compaction_end carries.
+// Its usage is the one model call the summarization made.
+type rawCompactionResult struct {
+	Summary        string    `json:"summary"`
+	TokensBefore   int64     `json:"tokensBefore"`
+	FirstKeptEntry string    `json:"firstKeptEntryId"`
+	Usage          *rawUsage `json:"usage,omitempty"`
 }
 
 // rawAssistantDelta is the assistantMessageEvent of a message_update.
@@ -216,6 +227,27 @@ func (e *rawRunEvent) completedMessage() (rawMessage, error) {
 		return rawMessage{}, fmt.Errorf("event %q message: %w", e.Type, err)
 	}
 	return msg, nil
+}
+
+// compactionUsage decodes the usage a compaction_end carries for the
+// summarization model call. The second result is false when the event
+// carries no result at all, which is how an aborted or failed
+// compaction reports itself.
+func (e *rawRunEvent) compactionUsage() (domain.TokenUsage, bool, error) {
+	if e.Type != "compaction_end" {
+		return domain.TokenUsage{}, false, fmt.Errorf("event %q is not a compaction_end", e.Type)
+	}
+	if len(e.Result) == 0 || string(e.Result) == "null" {
+		return domain.TokenUsage{}, false, nil
+	}
+	var result rawCompactionResult
+	if err := decodeStrict(e.Result, &result); err != nil {
+		return domain.TokenUsage{}, false, fmt.Errorf("compaction_end result: %w", err)
+	}
+	if result.Usage == nil {
+		return domain.TokenUsage{}, false, nil
+	}
+	return result.Usage.tokenUsage(), true, nil
 }
 
 // assistantDelta decodes the assistantMessageEvent of a message_update.

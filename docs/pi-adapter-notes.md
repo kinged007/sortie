@@ -38,7 +38,7 @@ stdout carries one JSON object per line, framed by a session header before anyth
 {"type":"agent_end","messages":[...],"willRetry":false}
 ```
 
-Those are the families the adapter reads. The full 1.3.0 set also contains `agent_settled`, `bash_execution_update`, `queue_update`, `entry_appended`, `session_info_changed`, `thinking_level_changed`, `compaction_start`, `compaction_end`, `auto_retry_start`, `auto_retry_end`, `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and `summarization_retry_finished`. Most of them are framing with nothing for the orchestrator to record, and several only appear in an interactive session. The exception is `tool_execution_end`, covered below.
+Those are the families the adapter reads. The full 1.3.0 set also contains `agent_settled`, `bash_execution_update`, `queue_update`, `entry_appended`, `session_info_changed`, `thinking_level_changed`, `compaction_start`, `compaction_end`, `auto_retry_start`, `auto_retry_end`, `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and `summarization_retry_finished`. Most of them are framing with nothing for the orchestrator to record, and several only appear in an interactive session. Two are not: `tool_execution_end` and `compaction_end`, both covered below.
 
 A line that is not a JSON object carrying a `type`, and a `type` outside that set, are both reported as a malformed line rather than skipped. That is deliberate. A future event the adapter silently dropped could carry the only text, the only usage, or the only failure the turn produced, and a stream that has moved past what this adapter understands is worth an operator's attention rather than a quiet empty turn. The same holds for the `message_update` delta types (`text_start`, `text_delta`, `text_end`, `thinking_start`, `thinking_delta`, `thinking_end`, `toolcall_start`, `toolcall_delta`, `toolcall_end`, `start`, `done`, `error`): a variant outside the set is a fault.
 
@@ -85,14 +85,14 @@ The JSON event stream documents no approval request or human-input event, so the
 
 ## Usage accounting
 
-The registered kind declares turn-end arrival and per-model attribution. Each pi model response carries one `usage` figure on the `turn_end` (or `message_end`) message, and the turn's own figure is the sum of every such response. Two normalizations matter:
+The registered kind declares turn-end arrival and per-model attribution. Each pi model response carries one `usage` figure on the `turn_end` (or `message_end`) message, and the turn's own figure is the sum of every such response plus every compaction call. Two normalizations matter:
 
 - `reasoning` is a subset of `output`, not an addition to it, so it is never summed a second time. A thinking block is also excluded from the text the turn reports, for the same reason: the runtime already counts its tokens inside the response's output usage.
 - `cacheRead` is part of the input the provider billed, so it is added into the input total, and it is also reported as its own subset counter. `cacheWrite` is likewise folded into the input total.
 
-The model the turn reports is the model of the last response whose usage was counted, which is the right answer for a turn that ran on more than one model. A run-cumulative total is kept per Sortie session across every turn of that session, and a turn that produced no usage at all reports no figure rather than a zero that would lower an already-reported run.
+The model the turn reports is the model of the last response whose usage was counted, which is the right answer for a turn that ran on more than one model. A run-cumulative total is kept per Sortie session across every turn of that session, including the compaction calls, and a turn that produced no usage at all reports no figure rather than a zero that would lower an already-reported run.
 
-Compaction is an extra model call, so it is an extra charge, and the adapter does not count it. `compaction_start` and `compaction_end` are recognized as framing events, and a `compaction_end` result's `usage` figure is not read. The usage a turn reports therefore leaves out the summarization calls pi's auto-compaction makes, and a session that compacts reports fewer tokens than the provider billed.
+Compaction is an extra model call, so it is an extra charge. A `compaction_end` carrying a result with a `usage` figure contributes that figure to the turn; an aborted or failed compaction carries no result, contributes nothing, and a non-aborted failure additionally surfaces as a notification naming the runtime's error message. Pi's own auto-compaction is therefore a real cost driver, and a workflow that expects the whole session's tokens to be the sum of its assistant responses will undercount by exactly the summarization calls.
 
 A turn is settled once pi ends its run with `agent_end` and no retry pending. A turn that served output (a delta, a response, a tool result) and ends without that event, for example because it was stopped or timed out, is reported as spend not fully accounted for. The adapter's total is its own sum of this process's turns, not a session total the runtime reports, so a turn never covers the spend of earlier turns.
 
@@ -119,4 +119,4 @@ The preflight reports this: `agent.kind.no_tool_channel` warns that the kind has
 
 ## Verifying a change
 
-The package's own tests drive a fake `pi` written as a shell script, so argument construction, every event family, session resume, workspace and session-id mismatch, cancellation, and each exit path are covered hermetically. There is no live-runtime suite in this package; a change to the event vocabulary is therefore only as trustworthy as the fixtures, so a version bump should re-run the turn against the real binary and diff the stream against the recorded fixtures before the accepted sets are widened.
+The package's own tests drive a fake `pi` written as a shell script, so argument construction, every event family, compaction accounting, session resume, workspace and session-id mismatch, cancellation, and each exit path are covered hermetically. There is no live-runtime suite in this package; a change to the event vocabulary is therefore only as trustworthy as the fixtures, so a version bump should re-run the turn against the real binary and diff the stream against the recorded fixtures before the accepted sets are widened.

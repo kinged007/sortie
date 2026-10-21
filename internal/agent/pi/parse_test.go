@@ -146,6 +146,78 @@ func TestCompletedMessage(t *testing.T) {
 	}
 }
 
+func TestCompactionUsage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		event   rawRunEvent
+		want    domain.TokenUsage
+		wantOK  bool
+		wantErr string
+	}{
+		{
+			name:   "result carries the summarization call",
+			event:  rawRunEvent{Type: "compaction_end", Result: []byte(`{"summary":"s","tokensBefore":10,"usage":{"input":9000,"output":800,"cacheRead":0,"cacheWrite":0}}`)},
+			want:   domain.TokenUsage{InputTokens: 9000, OutputTokens: 800, TotalTokens: 9800},
+			wantOK: true,
+		},
+		{
+			name:  "result without usage",
+			event: rawRunEvent{Type: "compaction_end", Result: []byte(`{"summary":"s","tokensBefore":10}`)},
+		},
+		{
+			name:  "no result at all",
+			event: rawRunEvent{Type: "compaction_end", Aborted: true},
+		},
+		{
+			name:  "null result",
+			event: rawRunEvent{Type: "compaction_end", Result: []byte(`null`)},
+		},
+		{
+			name:    "wrong event type",
+			event:   rawRunEvent{Type: "turn_end"},
+			wantErr: "is not a compaction_end",
+		},
+		{
+			name:    "result is not an object",
+			event:   rawRunEvent{Type: "compaction_end", Result: []byte(`"nope"`)},
+			wantErr: "compaction_end result",
+		},
+		{
+			name:    "usage is not an object",
+			event:   rawRunEvent{Type: "compaction_end", Result: []byte(`{"usage":3}`)},
+			wantErr: "compaction_end result",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			usage, ok, err := tt.event.compactionUsage()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("compactionUsage() error = nil, want %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("compactionUsage() error = %q, want it to contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("compactionUsage() error = %v", err)
+			}
+			if ok != tt.wantOK {
+				t.Errorf("compactionUsage() ok = %t, want %t", ok, tt.wantOK)
+			}
+			if usage != tt.want {
+				t.Errorf("compactionUsage() = %+v, want %+v", usage, tt.want)
+			}
+		})
+	}
+}
+
 func TestAssistantDelta(t *testing.T) {
 	t.Parallel()
 

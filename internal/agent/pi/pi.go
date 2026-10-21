@@ -491,6 +491,19 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				Message:        message,
 			})
 
+		case "compaction_end":
+			usage, ok, err := rawEvent.compactionUsage()
+			if err != nil {
+				malformed(err)
+				return domain.TurnResult{}, nil, false
+			}
+			if ok {
+				runtime.usage = addUsage(runtime.usage, usage)
+			}
+			if rawEvent.ErrorMessage != "" && !rawEvent.Aborted {
+				agentcore.EmitNotification(emit, "pi compaction failed: "+rawEvent.ErrorMessage)
+			}
+
 		default:
 			if !rawEvent.known() {
 				malformed(fmt.Errorf("unknown pi event type %q", rawEvent.Type))
