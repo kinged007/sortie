@@ -349,11 +349,11 @@ func TestRunTurn_MalformedLinesAreReported(t *testing.T) {
 	// malformed_turn.jsonl carries one bad line per fault class: an
 	// undecodable turn_end message, a message with no role, a turn_end
 	// with no message at all, a message whose content is not a list, two
-	// bad message_updates, a tool_execution_end with no toolName, and an
-	// unknown event type.
+	// bad message_updates, a tool_execution_end with no toolName, an
+	// undecodable compaction result, and an unknown event type.
 	malformed := eventsOfType(events, domain.EventMalformed)
-	if len(malformed) != 9 {
-		t.Errorf("malformed count = %d, want 9: %+v", len(malformed), malformed)
+	if len(malformed) != 10 {
+		t.Errorf("malformed count = %d, want 10: %+v", len(malformed), malformed)
 	}
 	for _, want := range []string{
 		`event "turn_end" message`,
@@ -362,6 +362,7 @@ func TestRunTurn_MalformedLinesAreReported(t *testing.T) {
 		`event "message_end" message`,
 		"assistantMessageEvent",
 		"carries no toolName",
+		"compaction_end result",
 		"unknown pi event type \"future_event\"",
 	} {
 		found := false
@@ -393,6 +394,65 @@ printf '{"type":"session","version":3,"id":"s1","timestamp":"t","cwd":"%s"}\n' "
 	if len(malformed) != 1 || !strings.Contains(malformed[0].Message, "warming up") {
 		t.Errorf("malformed = %+v, want exactly one carrying the non-JSON line", malformed)
 	}
+}
+
+// TestRunTurn_CompactionAccounting asserts that a compaction's model call
+// is counted once, that a failed compaction is surfaced, and that a
+// later successful retry still settles.
+func TestRunTurn_CompactionAccounting(t *testing.T) {
+	t.Parallel()
+
+	t.Run("usage counted once", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a, err := NewPiAdapter()
+		if err != nil {
+			t.Fatalf("NewPiAdapter() error = %v", err)
+		}
+		session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "compaction_turn.jsonl"))
+		_, result, err := collectEvents(t, a, session, "work")
+		if err != nil {
+			t.Fatalf("RunTurn() error = %v", err)
+		}
+
+		// 50+10 from the tool call, 9000+800 from the compaction, 40+9
+		// from the final response.
+		want := domain.TokenUsage{InputTokens: 9090, OutputTokens: 819, TotalTokens: 9909}
+		if result.Usage != want {
+			t.Errorf("usage = %+v, want %+v", result.Usage, want)
+		}
+	})
+
+	t.Run("failure surfaced and retry settles", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		a, err := NewPiAdapter()
+		if err != nil {
+			t.Fatalf("NewPiAdapter() error = %v", err)
+		}
+		session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "compaction_retry.jsonl"))
+		events, result, err := collectEvents(t, a, session, "work")
+		if err != nil {
+			t.Fatalf("RunTurn() error = %v", err)
+		}
+
+		var surfaced bool
+		for _, msg := range notificationMessages(events) {
+			if strings.Contains(msg, "summarizer timed out") {
+				surfaced = true
+			}
+		}
+		if !surfaced {
+			t.Errorf("notifications = %v, want the compaction failure surfaced", notificationMessages(events))
+		}
+
+		// 40+9 from the response, 8000+700 from the successful retry.
+		// The failed attempt contributed no usage, so it is not counted.
+		want := domain.TokenUsage{InputTokens: 8040, OutputTokens: 709, TotalTokens: 8749}
+		if result.Usage != want {
+			t.Errorf("usage = %+v, want %+v", result.Usage, want)
+		}
+	})
 }
 
 // TestRunTurn_MixedModelAttribution pins the deterministic rule for a
