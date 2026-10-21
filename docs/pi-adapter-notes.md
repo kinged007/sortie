@@ -126,10 +126,6 @@ The servers delivered are Sortie's own plus those the file named by `mcp_config`
 
 A remote (SSH) launch carries no servers, as described under SSH.
 
-## Native pi sessions over ACP
-
-pi has no native Agent Client Protocol mode. The community bridge `pi-acp` (https://github.com/svkozak/pi-acp, installed with `npm install -g pi-acp` or run with `npx -y pi-acp`) runs `pi --mode rpc` and translates ACP onto it, and it requires `pi` on `PATH`. It can be driven through the generic `agent-client-protocol` kind by naming it in `agent.command`; see the runtimes table in the Agent Client Protocol adapter notes. That route has not been driven end to end, and its usage is unmeasured, because Sortie has no usage source for it. The native `pi` kind is the measured route: it reads the usage figure each pi response carries and settles it per model.
-
 ## Failure modes worth recognizing
 
 - **Exit 0 with a failed turn.** A provider failure, such as a rejected model name or an authentication error, can end an assistant response with stop reason `error` while the process exits 0. The turn still fails, as `response_error`, from that stop reason. A report of a failed turn with exit status 0 is this, not an adapter fault.
