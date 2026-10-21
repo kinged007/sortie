@@ -24,6 +24,7 @@ What each runtime showed in its `initialize` handshake:
 | `kiro-cli` | `acp` subcommand, listed only under `--help-all` | Driven end to end. Empty `sessionCapabilities`; `mcpCapabilities.sse` is false. |
 | `copilot` | `--acp` | Handshake only. `sessionCapabilities` has `close` and `list`, not `resume`. |
 | `opencode` | `acp` subcommand | Handshake only. `sessionCapabilities` has `close`, `fork`, `list`, and `resume`. |
+| `pi` | none; the community bridge `pi-acp` (`npm install -g pi-acp` or `npx -y pi-acp`) runs `pi --mode rpc` and translates the protocol, and requires `pi` on `PATH` | Not driven. No usage source exists for it, so a session through it is unmeasured. The native `pi` kind is the measured route. |
 | `claude` | none | The CLI exposes no protocol entry point. |
 | `codex` | none | `app-server` speaks a different JSON-RPC dialect, the one the `codex` adapter drives. |
 

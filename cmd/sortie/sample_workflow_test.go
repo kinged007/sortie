@@ -513,13 +513,10 @@ func TestSampleWorkflowPiExtension(t *testing.T) {
 	if !ok {
 		t.Fatal("WORKFLOW.pi.md config missing 'pi' block")
 	}
-	for _, key := range []string{"model", "thinking", "project_trust", "allowed_tools", "denied_tools"} {
+	for _, key := range []string{"model", "effort", "project_trust", "allowed_tools", "denied_tools"} {
 		if _, ok := pi[key]; !ok {
 			t.Errorf("pi block missing %q", key)
 		}
-	}
-	if _, ok := pi["mcp_config"]; ok {
-		t.Error("pi block must not declare mcp_config: Pi has no MCP transport")
 	}
 
 	agent, ok := wf.Config["agent"].(map[string]any)

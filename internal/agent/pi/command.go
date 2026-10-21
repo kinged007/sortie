@@ -2,14 +2,17 @@ package pi
 
 import (
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 type passthroughConfig struct {
 	Model        string
+	Effort       string
 	Thinking     string
 	ProjectTrust projectTrust
 	AllowedTools []string
@@ -31,8 +34,9 @@ const (
 	trustApprove projectTrust = "approve"
 )
 
-// validThinkingLevels are the --thinking levels pi 0.85.1 accepts, and
-// the only values a pi block's thinking key may take.
+// validThinkingLevels are the --thinking levels pi accepts, and the only
+// values a pi block's thinking key may take. The effort key is forwarded
+// as written.
 var validThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // knownConfigKeys is every key the pi block of WORKFLOW.md accepts. A
@@ -41,7 +45,9 @@ var validThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "x
 // doing nothing.
 var knownConfigKeys = map[string]struct{}{
 	"model":         {},
+	"effort":        {},
 	"thinking":      {},
+	"mcp_config":    {},
 	"project_trust": {},
 	"allowed_tools": {},
 	"denied_tools":  {},
@@ -62,15 +68,40 @@ var genericConfigKeys = map[string]struct{}{
 
 // configFault is one reason a pi passthrough is refused. Check is the
 // diagnostic key, Message the text both the constructor and the
-// registered validator report, so the two can never disagree.
+// registered validator report, so the two can never disagree. Err is the
+// wrapped cause when there is one.
 type configFault struct {
 	Check   string
 	Message string
+	Err     error
 }
 
 // fault builds one configFault under the adapter's diagnostic namespace.
 func fault(check, format string, args ...any) *configFault {
 	return &configFault{Check: "pi." + check, Message: fmt.Sprintf(format, args...)}
+}
+
+// typeFault builds the configFault for a key holding the wrong YAML type.
+func typeFault(f *typeutil.TypeFault) *configFault {
+	return &configFault{Check: "pi." + f.Key + ".wrong_type", Message: f.Error(), Err: f}
+}
+
+// thinkingConflictMessage returns the message reported when effort and
+// thinking are both set, or "" otherwise.
+func thinkingConflictMessage(pt passthroughConfig) string {
+	if pt.Effort == "" || pt.Thinking == "" {
+		return ""
+	}
+	return fmt.Sprintf("pi.%s and pi.thinking both set the thinking level; set one of them", registry.EffortKey)
+}
+
+// thinkingLevel returns the value --thinking carries: effort when set,
+// otherwise thinking. Both set is refused before a session starts.
+func (pt passthroughConfig) thinkingLevel() string {
+	if pt.Effort != "" {
+		return pt.Effort
+	}
+	return pt.Thinking
 }
 
 // parsePassthroughConfig extracts pi-specific settings from the raw
@@ -87,16 +118,27 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 
 	pt := passthroughConfig{}
 
-	model, modelFault := typeutil.StringField(config, "model")
+	model, modelFault := registry.ModelSetting(config)
 	if modelFault != nil {
-		faults = append(faults, fault(modelFault.Key+".wrong_type", "%s", modelFault.Error()))
+		faults = append(faults, typeFault(modelFault))
 	}
 	pt.Model = model
+
+	effort, effortFault := registry.EffortSetting(config)
+	if effortFault != nil {
+		faults = append(faults, typeFault(effortFault))
+	}
+	pt.Effort = effort
+
+	_, mcpConfigFault := typeutil.StringField(config, "mcp_config")
+	if mcpConfigFault != nil {
+		faults = append(faults, typeFault(mcpConfigFault))
+	}
 
 	thinking, thinkingFault := typeutil.StringField(config, "thinking")
 	switch {
 	case thinkingFault != nil:
-		faults = append(faults, fault(thinkingFault.Key+".wrong_type", "%s", thinkingFault.Error()))
+		faults = append(faults, typeFault(thinkingFault))
 	case thinking != "" && !slices.Contains(validThinkingLevels, thinking):
 		faults = append(faults, fault("thinking.invalid_value",
 			"thinking: %q is not a pi thinking level; valid values are %s",
@@ -109,7 +151,7 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 	trust, trustFault := typeutil.StringField(config, "project_trust")
 	switch {
 	case trustFault != nil:
-		faults = append(faults, fault(trustFault.Key+".wrong_type", "%s", trustFault.Error()))
+		faults = append(faults, typeFault(trustFault))
 	case trust == "":
 	case projectTrust(trust) == trustIgnore, projectTrust(trust) == trustApprove:
 		pt.ProjectTrust = projectTrust(trust)
@@ -129,6 +171,9 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 
 	if message := overlapMessage(pt.AllowedTools, pt.DeniedTools); message != "" {
 		faults = append(faults, fault("allowed_tools.overlap", "%s", message))
+	}
+	if message := thinkingConflictMessage(pt); message != "" {
+		faults = append(faults, fault(registry.EffortKey+".conflict", "%s", message))
 	}
 
 	if len(faults) > 0 {
@@ -206,25 +251,31 @@ func sortedConfigKeys() []string {
 	return keys
 }
 
-// pi runs non-interactive with -p --mode json; the prompt is a positional
-// arg after --, and cmd.Dir is already the workspace, so no --dir.
-// When the session carries Sortie MCP servers locally the static bridge
-// extension is loaded through --extension and the JSON document is
-// delivered through SORTIE_PI_MCP_SERVERS in the turn's environment.
-func buildRunArgs(state *sessionState, prompt string, pt passthroughConfig) []string {
+// pi runs non-interactive with -p --mode json and reads the prompt from
+// standard input, so neither a prompt beginning with "@" (which pi treats
+// as a file to include) nor a prompt longer than the kernel's argument
+// limit reaches the command line. cmd.Dir is already the workspace, so
+// no --dir. A credential-verification session is ephemeral: --no-session
+// leaves no session file behind. When the session carries Sortie MCP
+// servers locally the static bridge extension is loaded through
+// --extension and the JSON document is delivered through
+// SORTIE_PI_MCP_SERVERS in the turn's environment.
+func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	args := []string{"-p", "--mode", "json"}
 
 	if state.mcpBridgePath != "" {
 		args = append(args, "--extension", state.mcpBridgePath)
 	}
-	if state.sessionID != "" {
+	if state.credentialVerification {
+		args = append(args, "--no-session")
+	} else if state.sessionID != "" {
 		args = append(args, "--session", state.sessionID)
 	}
 	if pt.Model != "" {
 		args = append(args, "--model", pt.Model)
 	}
-	if pt.Thinking != "" {
-		args = append(args, "--thinking", pt.Thinking)
+	if level := pt.thinkingLevel(); level != "" {
+		args = append(args, "--thinking", level)
 	}
 	if len(pt.AllowedTools) > 0 {
 		args = append(args, "--tools", strings.Join(pt.AllowedTools, ","))
@@ -238,6 +289,16 @@ func buildRunArgs(state *sessionState, prompt string, pt passthroughConfig) []st
 		args = append(args, "--no-approve")
 	}
 
-	args = append(args, "--", prompt)
 	return args
+}
+
+// buildTurnStdin returns the reader a turn's subprocess reads from:
+// prompt, preceded by preamble (nil on a local launch, the SSH preamble
+// otherwise).
+func buildTurnStdin(prompt string, preamble io.Reader) io.Reader {
+	promptReader := strings.NewReader(prompt)
+	if preamble == nil {
+		return promptReader
+	}
+	return io.MultiReader(preamble, promptReader)
 }

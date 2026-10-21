@@ -1,21 +1,33 @@
 # Pi adapter notes
 
-Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: what `pi -p --mode json` actually writes to stdout, why the exit code is not a failure signal, how session identity and resume work, and the tool channel this runtime does not have.
+Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: what `pi -p --mode json` actually writes to stdout, why the exit code is not a failure signal, how session identity and resume work, and how Sortie's own tools reach the runtime.
 
 ## Where to get the volatile facts
 
 Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 0.85.1 schema, so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
+
+## Version check and launch contract
+
+`StartSession` runs the configured command with `--version` at every session start and accepts pi 0.99.0 or later. A version below that, or no readable version, refuses the session with error kind `agent_not_found`. The refusal names the package, `@earendil-works/pi-coding-agent`, which publishes pi on npm. The check runs before the bridge extension file is written.
+
+The minimum is the newest of the releases that added what the adapter launches with: `--exclude-tools` in 0.77.0, `--approve` and `--no-approve` in 0.79.0, and `--extension` with `pi.registerMcpServer` in 0.99.0. The event stream shapes the parser reads were checked against pi 1.3.0.
+
+The launch contract:
+
+- The prompt is written to standard input, not passed on the command line. pi treats a message argument beginning with `@` as a file to include, and Linux limits a single argument string to 128 KiB. Over SSH the prompt follows the environment preamble on standard input.
+- A credential-verification run adds `--no-session`, so it leaves no session file in the runtime's session store.
+- The version query's environment never carries `SORTIE_PI_MCP_SERVERS`, and neither does a turn's: an inherited value is removed before the adapter adds its own.
 
 ## The surface Sortie drives
 
 The adapter launches one subprocess per turn:
 
 ```
-pi -p --mode json [--session <id>] [--model <name>] [--thinking <level>] \
-   [--tools a,b] [--exclude-tools c,d] [--approve | --no-approve] -- <prompt>
+pi -p --mode json [--extension <bridge>] [--session <id> | --no-session] [--model <name>] \
+   [--thinking <level>] [--tools a,b] [--exclude-tools c,d] [--approve | --no-approve]
 ```
 
-`-p` is the non-interactive prompt mode, `--mode json` is the machine-readable stream, and the prompt is a positional argument after `--`, so a prompt beginning with a dash cannot be read as a flag. The process working directory is already the issue workspace, so no directory flag is sent, and the workspace is not named on the command line. The adapter's own flags, not the workflow's `agent.command`, decide the binary: `agent.command` overrides the program and may carry leading arguments, and the adapter's arguments follow them.
+`-p` is the non-interactive prompt mode, `--mode json` is the machine-readable stream, and the prompt arrives on standard input. The process working directory is already the issue workspace, so no directory flag is sent, and the workspace is not named on the command line. The adapter's own flags, not the workflow's `agent.command`, decide the binary: `agent.command` overrides the program and may carry leading arguments, and the adapter's arguments follow them.
 
 stdout carries one JSON object per line, framed by a session header before anything else:
 
@@ -45,13 +57,17 @@ A line that is not a JSON object carrying a `type`, and a `type` outside that se
 
 ## Exit codes and failure
 
-`pi --mode json` applies no exit-code check to a failed model response. A response that stopped with `stopReason` `error` or `aborted` still exits 0, so the exit code cannot decide whether a turn succeeded. The stop reason on the assistant message is the only evidence: the adapter records the first assistant response that stopped either way, and the finalize path turns it into a terminal failure with error kind `response_error`, taking the response's `errorMessage` as the message and falling back to naming the stop reason when the runtime carried none. A bounded excerpt of the turn's stderr is appended when there is one, and the collected stderr lines are logged as warnings.
+`pi --mode json` applies no exit-code check to a failed model response. A response that stopped with `stopReason` `error` or `aborted` still exits 0, so the exit code cannot decide whether a turn succeeded. The stop reason on the assistant message is the only evidence: the adapter records the failure of the last assistant response, and the finalize path turns it into a terminal failure with error kind `response_error`, taking the response's `errorMessage` as the message and falling back to naming the stop reason when the runtime carried none. A bounded excerpt of the turn's stderr is appended when there is one, and the collected stderr lines are logged as warnings.
 
-The first assistant response to fail is kept rather than the last, because a later response in the same turn may succeed and mask the first fault. A turn that produced no assistant output at all takes the shared zero-work row and is reported as a failure rather than a silent success, which is also where a stream that never produced a JSON event and exited 0 lands.
+The last response decides because pi retries a response that stopped with `error` inside the same process (`agent_end` with `willRetry` true, `auto_retry_start`, a new `agent_start`): a retry that succeeds makes the turn succeed, and a turn whose retries all fail reports the last error. Usage of every response, including each retry, is summed. A turn that produced no assistant output at all takes the shared zero-work row and is reported as a failure rather than a silent success, which is also where a stream that never produced a JSON event and exited 0 lands.
 
 The first-JSON deadline defaults to thirty seconds and takes the workflow's read timeout when one is configured. It is armed only until the first JSON event arrives, so it guards a subprocess that never starts talking; a mid-turn stall is the orchestrator's `stall_timeout_ms`. Once the subprocess has been reaped, the remaining stdout is drained for a bounded grace so a descendant holding the output handle cannot withhold the turn's result.
 
 The session header is checked, not merely recorded. Its `cwd` must be the turn's own workspace, and on a resumed session its id must be the id Sortie already holds. Either mismatch kills the process and fails the turn with `response_error` naming both values, because a stream that reports a different workspace or a different session is not the session this turn was supposed to continue.
+
+A turn whose process exits on its own as the context is cancelled is reported by its real outcome, a success or a failure, rather than as cancelled.
+
+Each tool result the adapter reports carries a duration and, for a tool that errored, the result text truncated to 500 characters. The duration is the `durationMs` pi's `tool_execution_end` carries (pi 1.2.0 and later), and the adapter's own measurement from the tool's start event when pi omits it.
 
 ## Session identity and resume
 
@@ -64,9 +80,18 @@ Once an id is known, every later turn of that session passes `--session <id>`. T
 Every key the `pi` block accepts maps to a flag, and a key outside the accepted set is refused rather than ignored: pi has no passthrough channel, so an unrecognized key would look configured while doing nothing.
 
 - `model` becomes `--model`.
-- `thinking` becomes `--thinking`. The accepted values are the levels pi itself accepts: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Any other value is refused, so a level a later release adds fails construction until someone establishes what it does.
+- `effort` and `thinking` both become `--thinking`; they fill the same flag, so setting both is refused under `pi.effort.conflict` with the message "set one of them". `effort` is the generic key every forwarding kind shares, and the registered kind declares it forwarded, so it rides every turn, credential verification included. Its value reaches `--thinking` unchanged and unchecked, because the shared effort contract delivers arbitrary levels as written; pi itself warns and runs at its default level when it does not accept the name. Only `thinking` is checked against the list below. `thinking` is the pi-native spelling of the same setting. The accepted `thinking` values are the levels pi itself accepts: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Any other `thinking` value is refused, so a level a later release adds fails construction until someone establishes what it does.
+- `mcp_config` is a path to the operator's own MCP server file. It is not a pi flag: the orchestrator merges its servers into the generated MCP configuration, and a local launch delivers them through the bridge extension (see Sortie's own tools).
 - `allowed_tools` becomes `--tools` with the names joined by commas. `denied_tools` becomes `--exclude-tools` the same way. A tool list must be a list of non-empty names; anything else is a type fault rather than a silently shortened list, and a name in both lists is refused because the two would contradict each other.
 - `project_trust` decides between `--approve` and `--no-approve`. The default is `ignore`, which sends `--no-approve` and keeps the workspace's own project-local files and packages out of the run. An unattended turn has no operator to answer a trust prompt, so the permissive value has to be asked for by name rather than inherited from a developer's shell.
+
+## Permissions
+
+pi's own approval prompt cannot be answered by an unattended turn, so the adapter always sends one of two flags and never leaves the choice to pi's defaults. `project_trust` selects between them: `ignore`, the default, sends `--no-approve`, and `approve` sends `--approve`. With `--no-approve` the project-local files and packages of the workspace, which come from the repository an issue's agent works on, are not loaded. `approve` is the operator's explicit decision to run what the workspace declares. Any other value is refused.
+
+The tool set is narrowed with `allowed_tools` (`--tools`) and `denied_tools` (`--exclude-tools`). The adapter does not know pi's tool names: it forwards the names as written, so a misspelled name is pi's to reject or ignore. Both lists are comma-joined into one argument, so a tool name containing a comma cannot be expressed. The adapter validates only the list shape and the overlap between the two lists.
+
+The JSON event stream documents no approval request or human-input event, so the adapter performs no refusal or permission classification. A tool call that fails, whatever the reason, appears as a `tool_execution_end` with `isError` set.
 
 ## Usage accounting
 
@@ -81,13 +106,39 @@ Compaction is an extra model call, so it is an extra charge. A `compaction_end` 
 
 ## SSH
 
-The adapter builds the same ssh argument vector the other fork-per-turn kinds use, from the shared helper, with the same per-turn arguments: a remote session runs the same `pi -p --mode json ... -- <prompt>` command on the remote host, in the remote workspace, with the same session flag. Nothing is delivered over SSH that a local launch withholds, because nothing is delivered on a local launch either: the only thing the local launch could have added is the MCP configuration, and this adapter has none to add. `AgentPID` is left unset for a remote turn, since the pid belongs to the ssh process rather than to pi.
+The adapter builds the same ssh argument vector the other fork-per-turn kinds use, from the shared helper, with the same per-turn arguments: a remote session runs the same `pi -p --mode json ...` command on the remote host, in the remote workspace, with the same session flag. `AgentPID` is left unset for a remote turn, since the pid belongs to the ssh process rather than to pi.
+
+A remote launch takes its ssh options from the shared launch target, the same path `opencode` uses. It carries the names listed under `worker.ssh_pass_env` that are set and non-empty in Sortie's environment, minus those under `worker.ssh_disallow_pass_env`, applies the target's host-key checking setting, and unsets a withheld variable for the remote command. The kind declares no credential variables of its own, so nothing is carried that the operator did not list. Carried values and the prompt travel on the ssh connection's standard input, the values first, which is why the remote host needs `dd` once a variable is carried; see the SSH section of the workflow reference.
+
+The MCP delivery is not carried over SSH. The bridge extension is a file in the local workspace and the server document is an environment variable of the local subprocess, so a remote turn carries neither `--extension` nor `SORTIE_PI_MCP_SERVERS`.
 
 ## Sortie's own tools
 
-pi has no MCP transport. The kind registers `MCPInjectionUnsupported` and delivers nothing: the generated `.sortie/mcp.json` is never read, Sortie's tools are never advertised to a pi session, and nothing in the session can call them. A workflow that needs Sortie's own tools must not run on this kind; the tool set the agent works with is whatever pi itself provides, narrowed by `allowed_tools` and `denied_tools`.
+The kind registers `MCPInjectionTranslated`. pi loads MCP servers from its own `mcp.json` and from extensions, and the adapter does not use the generated `.sortie/mcp.json` as is. For a local launch whose session carries Sortie MCP servers:
 
-`mcp_config` is not a key of the `pi` block. Writing it is an unknown-key fault, reported by `sortie validate` under `pi.mcp_config.unknown_key` and refused at construction, rather than a warning about a value that goes nowhere. Two preflight warnings still describe the situation: `agent.kind.no_tool_channel` fires for every workflow on this kind, because there is no local-launch channel to advertise one through, and `agent.mcp_config` fires as well when a `mcp_config` key is configured for it. Both are warnings; the run proceeds.
+- `ensureBridgeFile` writes a fixed extension, `.sortie/pi-mcp-bridge.js`, in the workspace and reuses an existing file whose content already matches. The file's text never varies between sessions; it holds no server data.
+- Each turn's command line adds `--extension <path>`.
+- The servers travel as one JSON document in `SORTIE_PI_MCP_SERVERS` in the turn's environment, in the shape `{"mcpServers": {"<name>": {"command"|"url", ...}}}`. The extension parses it and calls `pi.registerMcpServer` once per entry with `exposure: "direct"`, so each server's tools are listed to the model directly.
+
+The extension writes a parse failure or a failed registration to stderr with the prefix `sortie-pi-mcp-bridge:` and carries on without that server. A fault in building the document or writing the file fails the session start instead.
+
+The servers delivered are Sortie's own plus those the file named by `mcp_config` declares, merged by the orchestrator into the generated configuration.
+
+A remote (SSH) launch carries no servers, as described under SSH.
+
+## Native pi sessions over ACP
+
+pi has no native Agent Client Protocol mode. The community bridge `pi-acp` (https://github.com/svkozak/pi-acp, installed with `npm install -g pi-acp` or run with `npx -y pi-acp`) runs `pi --mode rpc` and translates ACP onto it, and it requires `pi` on `PATH`. It can be driven through the generic `agent-client-protocol` kind by naming it in `agent.command`; see the runtimes table in the Agent Client Protocol adapter notes. That route has not been driven end to end, and its usage is unmeasured, because Sortie has no usage source for it. The native `pi` kind is the measured route: it reads the usage figure each pi response carries and settles it per model.
+
+## Failure modes worth recognizing
+
+- **Exit 0 with a failed turn.** A provider failure, such as a rejected model name or an authentication error, can end an assistant response with stop reason `error` while the process exits 0. The turn still fails, as `response_error`, from that stop reason. A report of a failed turn with exit status 0 is this, not an adapter fault.
+- **Early exit.** A process that exits before it wrote any readable line is reported as an early exit carrying its exit status and the end of its stderr, so a wrong `agent.command`, a missing binary, or an option pi rejects shows up with pi's own usage text rather than as an empty turn. It is not reported when the turn was cancelled or the session was stopped.
+- **No first event.** A subprocess that stays alive without printing a JSON event is killed when the first-JSON deadline passes, and the turn fails with `response_timeout` and the message `timed out waiting for first pi json event`. A credential or provider prompt that waits on a terminal is the usual cause.
+- **Empty turn.** An exit-0 turn with no assistant text, reasoning, or tool call takes the shared zero-work row and fails, so it is retried instead of counting as work done.
+- **SSH connection failure.** On a remote launch, exit status 255 with no assistant failure on the stream is reported as a failed SSH connection, not as a pi failure. The same status with an assistant failure on the stream is reported as that failure.
+- **MCP servers not loaded.** When a turn's stderr carries a line starting with `sortie-pi-mcp-bridge:`, the adapter logs a warning, "pi could not load Sortie's MCP servers", with the line as its detail, even if the turn succeeded. The session ran without the tools of the server that failed.
+- **Wrong workspace or session.** The header check described under Exit codes and failure fails the turn with `response_error` naming both values.
 
 ## Verifying a change
 

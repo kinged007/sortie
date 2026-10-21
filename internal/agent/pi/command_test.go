@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
-	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -118,6 +118,28 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 				"denied_tools":  []any{"bash"},
 			},
 			wantErr: true,
+		},
+		{
+			name:   "effort_parses",
+			config: map[string]any{"effort": "high"},
+			checkFunc: func(t *testing.T, pt passthroughConfig) {
+				t.Helper()
+				want := passthroughConfig{Effort: "high", ProjectTrust: trustIgnore}
+				if !reflect.DeepEqual(pt, want) {
+					t.Errorf("passthroughConfig = %+v, want %+v", pt, want)
+				}
+			},
+		},
+		{
+			name:   "mcp_config_is_the_orchestrators_key",
+			config: map[string]any{"mcp_config": "./mcp-servers.json"},
+			checkFunc: func(t *testing.T, pt passthroughConfig) {
+				t.Helper()
+				want := passthroughConfig{ProjectTrust: trustIgnore}
+				if !reflect.DeepEqual(pt, want) {
+					t.Errorf("passthroughConfig = %+v, want %+v", pt, want)
+				}
+			},
 		},
 		{
 			name: "model_and_flags",
@@ -283,69 +305,69 @@ func TestBuildRunArgs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		sessionID   string
-		pt          passthroughConfig
-		prompt      string
-		wantPresent []string
-		wantPairs   [][2]string
-		wantAbsent  []string
+		name         string
+		sessionID    string
+		verification bool
+		bridgePath   string
+		pt           passthroughConfig
+		wantPairs    [][2]string
+		wantAbsent   []string
 	}{
 		{
 			name:       "fresh_session",
-			sessionID:  "",
-			pt:         passthroughConfig{},
-			prompt:     "do work",
-			wantAbsent: []string{"--session"},
+			wantAbsent: []string{"--session", "--no-session", "--thinking"},
 		},
 		{
 			name:      "resume_session",
 			sessionID: "ses_abc",
-			pt:        passthroughConfig{},
-			prompt:    "continue",
 			wantPairs: [][2]string{{"--session", "ses_abc"}},
 		},
 		{
-			name:        "noninteractive_json_mode",
-			sessionID:   "",
-			pt:          passthroughConfig{},
-			prompt:      "work",
-			wantPresent: []string{"-p", "--mode"},
-			wantPairs:   [][2]string{{"--mode", "json"}},
+			name:      "noninteractive_json_mode",
+			wantPairs: [][2]string{{"-p", ""}, {"--mode", "json"}},
 		},
 		{
 			name:      "model_flag",
-			sessionID: "",
 			pt:        passthroughConfig{Model: "anthropic/claude-3-5-sonnet"},
-			prompt:    "work",
 			wantPairs: [][2]string{{"--model", "anthropic/claude-3-5-sonnet"}},
 		},
 		{
 			name:      "thinking_flag",
-			sessionID: "",
 			pt:        passthroughConfig{Thinking: "medium"},
-			prompt:    "work",
 			wantPairs: [][2]string{{"--thinking", "medium"}},
 		},
 		{
+			name:      "effort_fills_the_thinking_flag",
+			pt:        passthroughConfig{Effort: "high"},
+			wantPairs: [][2]string{{"--thinking", "high"}},
+		},
+		{
 			name:      "tool_lists_join_with_commas",
-			sessionID: "",
 			pt:        passthroughConfig{AllowedTools: []string{"read", "grep"}, DeniedTools: []string{"bash", "write"}},
-			prompt:    "work",
 			wantPairs: [][2]string{{"--tools", "read,grep"}, {"--exclude-tools", "bash,write"}},
 		},
 		{
 			name:      "trust_approve",
-			sessionID: "",
 			pt:        passthroughConfig{ProjectTrust: trustApprove},
-			prompt:    "work",
 			wantPairs: [][2]string{{"--approve", ""}},
 		},
 		{
-			name:      "prompt_after_dashdash",
-			sessionID: "",
-			pt:        passthroughConfig{},
-			prompt:    "my --prompt with flags",
+			name:       "bridge_extension",
+			bridgePath: "/ws/.sortie/pi-mcp-bridge.js",
+			wantPairs:  [][2]string{{"--extension", "/ws/.sortie/pi-mcp-bridge.js"}},
+		},
+		{
+			name:         "credential_verification_is_ephemeral",
+			verification: true,
+			wantPairs:    [][2]string{{"--no-session", ""}},
+			wantAbsent:   []string{"--session"},
+		},
+		{
+			name:         "credential_verification_never_resumes",
+			sessionID:    "ses_abc",
+			verification: true,
+			wantPairs:    [][2]string{{"--no-session", ""}},
+			wantAbsent:   []string{"--session"},
 		},
 	}
 
@@ -354,11 +376,10 @@ func TestBuildRunArgs(t *testing.T) {
 			t.Parallel()
 
 			state := newTestSessionState("/tmp/workspace", tt.sessionID)
-			args := buildRunArgs(state, tt.prompt, tt.pt)
+			state.credentialVerification = tt.verification
+			state.mcpBridgePath = tt.bridgePath
+			args := buildRunArgs(state, tt.pt)
 
-			for _, flag := range tt.wantPresent {
-				assertHasFlag(t, args, flag)
-			}
 			for _, pair := range tt.wantPairs {
 				if pair[1] == "" {
 					assertHasFlag(t, args, pair[0])
@@ -381,18 +402,36 @@ func TestBuildRunArgs(t *testing.T) {
 				assertNoFlag(t, args, "--no-approve")
 			}
 
-			// Prompt must be the last argument, after "--".
-			if len(args) < 2 {
-				t.Fatalf("args too short: %v", args)
-			}
-			lastTwo := args[len(args)-2:]
-			if lastTwo[0] != "--" {
-				t.Errorf("second-to-last arg = %q, want %q", lastTwo[0], "--")
-			}
-			if lastTwo[1] != tt.prompt {
-				t.Errorf("last arg = %q, want prompt %q", lastTwo[1], tt.prompt)
-			}
+			// The prompt travels on standard input, so no argument
+			// separator or message follows the flags.
+			assertNoFlag(t, args, "--")
 		})
+	}
+}
+
+// TestBuildTurnStdin asserts the prompt reaches pi byte for byte on
+// standard input, behind the SSH preamble when there is one. A prompt
+// beginning with "@" would be read as a file to include if it were an
+// argument.
+func TestBuildTurnStdin(t *testing.T) {
+	t.Parallel()
+
+	const prompt = "@/etc/passwd\n--help\n" + "'quoted' $(not run)"
+
+	got, err := io.ReadAll(buildTurnStdin(prompt, nil))
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != prompt {
+		t.Errorf("stdin without a preamble = %q, want %q", got, prompt)
+	}
+
+	got, err = io.ReadAll(buildTurnStdin(prompt, strings.NewReader("PREAMBLE")))
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != "PREAMBLE"+prompt {
+		t.Errorf("stdin with a preamble = %q, want %q", got, "PREAMBLE"+prompt)
 	}
 }
 
@@ -404,14 +443,14 @@ func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 	t.Parallel()
 
 	state := newTestSessionState("/tmp/workspace", "")
-	args := buildRunArgs(state, "work", passthroughConfig{
+	args := buildRunArgs(state, passthroughConfig{
 		AllowedTools: []string{"read"},
 		DeniedTools:  []string{"bash"},
 		Thinking:     "high",
 		ProjectTrust: trustApprove,
 	})
 
-	want := []string{"-p", "--mode", "json", "--thinking", "high", "--tools", "read", "--exclude-tools", "bash", "--approve", "--", "work"}
+	want := []string{"-p", "--mode", "json", "--thinking", "high", "--tools", "read", "--exclude-tools", "bash", "--approve"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -532,41 +571,13 @@ exit 0`)
 			t.Fatalf("buildMCPEnvValue(remote) = %q, want %q", doc, "")
 		}
 		state := newTestSessionState(remoteDir, "")
-		args := buildRunArgs(state, "work", passthroughConfig{ProjectTrust: trustApprove})
+		args := buildRunArgs(state, passthroughConfig{ProjectTrust: trustApprove})
 		env := []string{"PATH=/usr/bin"}
 		if doc != "" {
 			env = append(env, "SORTIE_PI_MCP_SERVERS="+doc)
 		}
 		agenttest.AssertMCPInjection(t, registry.MCPInjectionUnsupported, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
 	})
-}
-
-// TestRemoteLaunch_ForwardsSessionAndWorkspace asserts the SSH launch
-// keeps --session on the remote command line and runs the turn in the
-// workspace.
-func TestRemoteLaunch_ForwardsSessionAndWorkspace(t *testing.T) {
-	t.Parallel()
-
-	state := newTestSessionState("/remote/ws", "ses_remote")
-	args := buildRunArgs(state, "work", passthroughConfig{ProjectTrust: trustApprove})
-
-	sshArgs := buildSSHArgsForTest(state, args)
-	joined := strings.Join(sshArgs, " ")
-
-	for _, want := range []string{"/remote/ws", "--session", "ses_remote", "--approve", "--", "work"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("ssh args = %q, want them to carry %q", joined, want)
-		}
-	}
-}
-
-// buildSSHArgsForTest builds the ssh argv the adapter builds for a
-// remote launch of the given run arguments.
-func buildSSHArgsForTest(state *sessionState, cmdArgs []string) []string {
-	target := state.target
-	target.RemoteCommand = "pi"
-	target.SSHHost = "host"
-	return sshutil.BuildSSHLaunch(target.SSHHost, target.WorkspacePath, target.RemoteCommand, cmdArgs, sshutil.SSHOptions{}).Args
 }
 
 // TestValidateConfig_NoFaultsForSupportedConfiguration asserts a pi
@@ -579,6 +590,7 @@ func TestValidateConfig_NoFaultsForSupportedConfiguration(t *testing.T) {
 		Passthrough: map[string]any{
 			"model":         "anthropic/claude-3-5-sonnet",
 			"thinking":      "off",
+			"mcp_config":    "./mcp-servers.json",
 			"project_trust": "ignore",
 			"allowed_tools": []any{"read", "grep"},
 			"denied_tools":  []any{"bash"},

@@ -5,44 +5,64 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
+// mcpServersEnv is the variable the bridge extension reads its servers from.
+const mcpServersEnv = "SORTIE_PI_MCP_SERVERS"
+
+// bridgeFailurePrefix starts every line the bridge extension writes to
+// standard error when it cannot register a server.
+const bridgeFailurePrefix = "sortie-pi-mcp-bridge:"
+
 // buildTurnEnv returns the environment every turn's subprocess inherits,
-// plus SORTIE_PI_MCP_SERVERS when the session carries Sortie MCP servers
-// locally. The orchestrator passes MCPConfigPath only for a local launch
-// carrying servers, so a remote session carries neither the bridge path
-// nor this variable.
+// minus an inherited mcpServersEnv, plus mcpServersEnv when the session
+// carries Sortie MCP servers locally. The orchestrator passes
+// MCPConfigPath only for a local launch carrying servers, so a remote
+// session carries neither the bridge path nor this variable.
 func buildTurnEnv(state *sessionState) []string {
-	env := os.Environ()
+	base := os.Environ()
+	env := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if shouldDropManagedEnv(entry) {
+			continue
+		}
+		env = append(env, entry)
+	}
 	if state.mcpEnvValue != "" {
-		env = append(env, "SORTIE_PI_MCP_SERVERS="+state.mcpEnvValue)
+		env = append(env, mcpServersEnv+"="+state.mcpEnvValue)
 	}
 	return env
+}
+
+func shouldDropManagedEnv(entry string) bool {
+	key, _, found := strings.Cut(entry, "=")
+	return found && key == mcpServersEnv
 }
 
 const bridgeFileName = "pi-mcp-bridge.js"
 
 const bridgeFileContent = `export default function(pi){
+  const fail = (what, e) => console.error("sortie-pi-mcp-bridge: " + what + ": " + (e && e.message ? e.message : e));
   const raw = process.env.SORTIE_PI_MCP_SERVERS;
   if(!raw) return;
   let doc;
-  try{ doc = JSON.parse(raw); } catch{ return; }
+  try{ doc = JSON.parse(raw); } catch(e){ fail("cannot parse SORTIE_PI_MCP_SERVERS", e); return; }
   const servers = doc.mcpServers || {};
   for(const [name, cfg] of Object.entries(servers)){
-    try{ pi.registerMcpServer(name, {...cfg, exposure: "direct"}); } catch{}
+    try{ pi.registerMcpServer(name, {...cfg, exposure: "direct"}); } catch(e){ fail("cannot register server " + name, e); }
   }
 }
 `
 
 // translateMCPServers parses mcpConfigPath into its servers, or returns
 // nil for a remote launch, an empty path, or a configuration declaring no
-// server. Remote launches carry no Sortie MCP servers because the
-// translated delivery is a local extension file and an environment
-// variable, neither of which a REMOTE_COMMAND launch withholds in a way
-// the DeliversTools predicate can promise.
+// server. Remote launches carry no Sortie MCP servers: the bridge
+// extension file and the environment variable that points pi at it exist
+// only on the local host.
 func translateMCPServers(mcpConfigPath string, remote bool) ([]mcpconfig.Server, error) {
 	if mcpConfigPath == "" || remote {
 		return nil, nil
@@ -124,7 +144,7 @@ func ensureBridgeFile(workspacePath string, servers []mcpconfig.Server) (string,
 	defer dir.Close() //nolint:errcheck
 
 	// Reuse if already correct, to avoid rewriting on every retry.
-	if existing, err := os.ReadFile(filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName)); err == nil {
+	if existing, err := os.ReadFile(filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName)); err == nil { //nolint:gosec // path is the workspace plus constant names
 		if string(existing) == bridgeFileContent {
 			return filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName), nil
 		}
