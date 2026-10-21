@@ -12,6 +12,8 @@ import (
 
 type passthroughConfig struct {
 	Model        string
+	Effort       string
+	Thinking     string
 	ProjectTrust projectTrust
 }
 
@@ -30,15 +32,19 @@ const (
 	trustApprove projectTrust = "approve"
 )
 
+// validThinkingLevels are the --thinking levels pi accepts, and the only
+// values a pi block's thinking key may take. The effort key is forwarded
+// as written.
+var validThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
 // knownConfigKeys is every key the pi block of WORKFLOW.md accepts. A
 // key outside it is refused rather than ignored: pi has no passthrough
 // channel, so an unrecognized key would otherwise look configured while
-// doing nothing. effort is accepted and never read: the kind declares
-// [registry.EffortNotForwarded], so a set effort draws the
-// orchestrator's advisory instead of this refusal.
+// doing nothing.
 var knownConfigKeys = map[string]struct{}{
 	"model":         {},
 	"effort":        {},
+	"thinking":      {},
 	"mcp_config":    {},
 	"project_trust": {},
 }
@@ -76,6 +82,24 @@ func typeFault(f *typeutil.TypeFault) *configFault {
 	return &configFault{Check: "pi." + f.Key + ".wrong_type", Message: f.Error(), Err: f}
 }
 
+// thinkingConflictMessage returns the message reported when effort and
+// thinking are both set, or "" otherwise.
+func thinkingConflictMessage(pt passthroughConfig) string {
+	if pt.Effort == "" || pt.Thinking == "" {
+		return ""
+	}
+	return fmt.Sprintf("pi.%s and pi.thinking both set the thinking level; set one of them", registry.EffortKey)
+}
+
+// thinkingLevel returns the value --thinking carries: effort when set,
+// otherwise thinking. Both set is refused before a session starts.
+func (pt passthroughConfig) thinkingLevel() string {
+	if pt.Effort != "" {
+		return pt.Effort
+	}
+	return pt.Thinking
+}
+
 // parsePassthroughConfig extracts pi-specific settings from the raw
 // config map, reporting every fault it finds rather than only the first,
 // so one pass tells an operator everything that needs fixing.
@@ -96,9 +120,27 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 	}
 	pt.Model = model
 
+	effort, effortFault := registry.EffortSetting(config)
+	if effortFault != nil {
+		faults = append(faults, typeFault(effortFault))
+	}
+	pt.Effort = effort
+
 	_, mcpConfigFault := typeutil.StringField(config, "mcp_config")
 	if mcpConfigFault != nil {
 		faults = append(faults, typeFault(mcpConfigFault))
+	}
+
+	thinking, thinkingFault := typeutil.StringField(config, "thinking")
+	switch {
+	case thinkingFault != nil:
+		faults = append(faults, typeFault(thinkingFault))
+	case thinking != "" && !slices.Contains(validThinkingLevels, thinking):
+		faults = append(faults, fault("thinking.invalid_value",
+			"thinking: %q is not a pi thinking level; valid values are %s",
+			thinking, strings.Join(validThinkingLevels, ", ")))
+	default:
+		pt.Thinking = thinking
 	}
 
 	pt.ProjectTrust = trustIgnore
@@ -113,6 +155,10 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 		faults = append(faults, fault("project_trust.invalid_value",
 			"project_trust: %q is not a pi trust setting; valid values are %s, %s",
 			trust, trustIgnore, trustApprove))
+	}
+
+	if message := thinkingConflictMessage(pt); message != "" {
+		faults = append(faults, fault(registry.EffortKey+".conflict", "%s", message))
 	}
 
 	if len(faults) > 0 {
@@ -164,6 +210,9 @@ func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	}
 	if pt.Model != "" {
 		args = append(args, "--model", pt.Model)
+	}
+	if level := pt.thinkingLevel(); level != "" {
+		args = append(args, "--thinking", level)
 	}
 	if pt.ProjectTrust == trustApprove {
 		args = append(args, "--approve")

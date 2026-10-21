@@ -43,7 +43,7 @@ func init() {
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
-		EffortForwarding:    registry.EffortNotForwarded,
+		EffortForwarding:    registry.EffortForwarded,
 	})
 }
 
