@@ -1631,7 +1631,7 @@ func checkContractImports(fset *token.FileSet, file *ast.File, pkg contractPacka
 // identity rule always treats as identity tokens, in addition to the kind
 // strings extracted from the tree. It is a floor, not a closed world.
 var contractAgentIdentityFloorTable = []string{
-	"claude", "codex", "copilot", "kiro", "opencode", "mock",
+	"claude", "codex", "copilot", "kiro", "opencode", "pi", "mock",
 	"gemini", "amp", "goose", "zed", "cursor", "aider", "qwen", "crush",
 }
 
@@ -1836,7 +1836,10 @@ func contractIdentityWordsFromIdent(name string) []string {
 		// An uppercase run ending in a lowercase rune starts a new word at
 		// that run's last uppercase rune, so useCLAUDEFlag yields "use",
 		// "claude" and "flag" rather than gluing the token to "flag".
-		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 {
+		// A short initialism followed by a plural s stays one word: PIDs
+		// is not the identity token pi followed by ds.
+		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 &&
+			(len(current) > 3 || r != 's') {
 			last := current[len(current)-1]
 			current = current[:len(current)-1]
 			flush()
@@ -2805,6 +2808,7 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/tools/qualify/probe", name: "writeToolServerMCPConfig", reason: "fixture path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "NewSortieTools", reason: "returned path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/claude", name: "alwaysLoadToolServer", reason: "location check and returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/pi", name: "ensureBridgeFile", reason: "bridge extension path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR
