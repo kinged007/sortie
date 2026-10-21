@@ -101,11 +101,6 @@ func TestSampleWorkflowLoad(t *testing.T) {
 			wantKeys: []string{"tracker", "polling", "workspace", "hooks", "agent", "opencode", "server"},
 		},
 		{
-			name:     "WORKFLOW.pi.md loads with expected config keys",
-			file:     "WORKFLOW.pi.md",
-			wantKeys: []string{"tracker", "polling", "workspace", "hooks", "agent", "pi", "server"},
-		},
-		{
 			name:     "WORKFLOW.linear.md loads with expected config keys",
 			file:     "WORKFLOW.linear.md",
 			wantKeys: []string{"tracker", "polling", "workspace", "hooks", "agent", "claude-code", "server"},
@@ -182,16 +177,6 @@ func TestSampleWorkflowRender(t *testing.T) {
 			issue: minimalIssue(),
 		},
 		{
-			name:  "WORKFLOW.pi.md full issue",
-			file:  "WORKFLOW.pi.md",
-			issue: fullIssue(),
-		},
-		{
-			name:  "WORKFLOW.pi.md minimal issue",
-			file:  "WORKFLOW.pi.md",
-			issue: minimalIssue(),
-		},
-		{
 			name:  "WORKFLOW.linear.md full issue",
 			file:  "WORKFLOW.linear.md",
 			issue: fullIssue(),
@@ -249,7 +234,6 @@ var shippedExampleWorkflows = []string{
 	"WORKFLOW.codex.md",
 	"WORKFLOW.copilot.md",
 	"WORKFLOW.opencode.md",
-	"WORKFLOW.pi.md",
 	"WORKFLOW.linear.md",
 	"WORKFLOW.gitea.md",
 	"WORKFLOW.gitlab.md",
@@ -482,7 +466,7 @@ func TestSampleWorkflowTestFilePathConfig(t *testing.T) {
 func TestSampleWorkflowNoHTMLComments(t *testing.T) {
 	t.Parallel()
 
-	files := []string{"WORKFLOW.md", "WORKFLOW.test.md", "WORKFLOW.opencode.md", "WORKFLOW.pi.md", "WORKFLOW.linear.md", "WORKFLOW.gitea.md", "WORKFLOW.gitlab.md"}
+	files := []string{"WORKFLOW.md", "WORKFLOW.test.md", "WORKFLOW.opencode.md", "WORKFLOW.linear.md", "WORKFLOW.gitea.md", "WORKFLOW.gitlab.md"}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -498,36 +482,6 @@ func TestSampleWorkflowNoHTMLComments(t *testing.T) {
 				t.Errorf("%s prompt body contains HTML comment (<!--); use Go template comments {{/* */}} instead", name)
 			}
 		})
-	}
-}
-
-func TestSampleWorkflowPiExtension(t *testing.T) {
-	t.Parallel()
-
-	wf, err := workflow.Load(filepath.Join(repoRoot(t), "examples", "WORKFLOW.pi.md"))
-	if err != nil {
-		t.Fatalf("workflow.Load(WORKFLOW.pi.md): %v", err)
-	}
-
-	pi, ok := wf.Config["pi"].(map[string]any)
-	if !ok {
-		t.Fatal("WORKFLOW.pi.md config missing 'pi' block")
-	}
-	for _, key := range []string{"model", "effort", "project_trust", "allowed_tools", "denied_tools"} {
-		if _, ok := pi[key]; !ok {
-			t.Errorf("pi block missing %q", key)
-		}
-	}
-
-	agent, ok := wf.Config["agent"].(map[string]any)
-	if !ok {
-		t.Fatal("WORKFLOW.pi.md config missing 'agent' map")
-	}
-	if kind, _ := agent["kind"].(string); kind != "pi" {
-		t.Errorf("agent.kind = %q, want %q", kind, "pi")
-	}
-	if command, _ := agent["command"].(string); command != "pi" {
-		t.Errorf("agent.command = %q, want %q", command, "pi")
 	}
 }
 
