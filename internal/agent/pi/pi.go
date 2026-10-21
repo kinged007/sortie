@@ -1,14 +1,12 @@
-// Package pi implements [domain.AgentAdapter] for the Pi CLI (pi 0.99.0
-// or later). It launches one `pi -p --mode json` subprocess per Sortie
-// turn, normalizes the JSON event stream into domain events, and settles
-// the session's cumulative token usage from the one usage figure each pi
+// Package pi implements [domain.AgentAdapter] for the Pi CLI. It
+// launches one `pi -p --mode json` subprocess per Sortie turn,
+// normalizes the JSON event stream into domain events, and settles the
+// session's cumulative token usage from the one usage figure each pi
 // turn_end carries.
 //
-// pi loads MCP servers from mcp.json and from extensions. The adapter
-// re-expresses the worker-generated .sortie/mcp.json in the form pi
-// parses: a static bridge extension loaded through --extension and a
-// JSON environment variable the extension reads with
-// pi.registerMcpServer, so the session can call Sortie's tools.
+// The adapter declares [registry.MCPInjectionUnsupported]: it does not
+// hand the worker-generated MCP configuration to pi, so Sortie's tools
+// are not available to a pi session.
 package pi
 
 import (
@@ -41,7 +39,7 @@ func init() {
 		RequiresCommand:     true,
 		DefaultCommand:      defaultCommand,
 		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionTranslated,
+		MCPInjection:        registry.MCPInjectionUnsupported,
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
@@ -76,16 +74,6 @@ type sessionState struct {
 	// StartSession, or by a test before a session's first turn; RunTurn
 	// reads it when it builds each turn's own turnRuntime.
 	drainGrace time.Duration
-
-	// mcpBridgePath is the absolute path to the static bridge extension
-	// pi loads through --extension when the session carries Sortie MCP
-	// servers locally. Empty for a remote launch, an empty
-	// MCPConfigPath, or a configuration declaring no server.
-	mcpBridgePath string
-
-	// mcpEnvValue is the JSON document the bridge extension reads from
-	// SORTIE_PI_MCP_SERVERS. Empty when the session carries no server.
-	mcpEnvValue string
 
 	credentialVerification bool
 }
@@ -155,11 +143,9 @@ func NewPiAdapter() (domain.AgentAdapter, error) {
 	return &PiAdapter{}, nil
 }
 
-// StartSession checks that the installed pi is a supported release,
-// resolves the launch target, translates MCPConfigPath into the bridge
-// extension and its environment value, and initializes adapter-owned
+// StartSession resolves the launch target and initializes adapter-owned
 // session state without starting a turn subprocess.
-func (a *PiAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
+func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	pt, faults := parsePassthroughConfig(params.Settings)
 	if len(faults) > 0 {
 		messages := make([]string, len(faults))
@@ -187,38 +173,6 @@ func (a *PiAdapter) StartSession(ctx context.Context, params domain.StartSession
 		drainGrace:             procutil.DefaultDrainGrace,
 		credentialVerification: params.CredentialVerification,
 	}
-
-	if versionErr := checkRuntimeVersion(ctx, state); versionErr != nil {
-		return domain.Session{}, versionErr
-	}
-
-	servers, translateErr := translateMCPServers(params.MCPConfigPath, target.RemoteCommand != "")
-	if translateErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("translate MCP config: %v", translateErr),
-			Err:     translateErr,
-		}
-	}
-	envValue, envErr := buildMCPEnvValue(servers)
-	if envErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("build pi mcp env value: %v", envErr),
-			Err:     envErr,
-		}
-	}
-	bridgePath, bridgeErr := ensureBridgeFile(target.WorkspacePath, servers)
-	if bridgeErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("write pi mcp bridge: %v", bridgeErr),
-			Err:     bridgeErr,
-		}
-	}
-
-	state.mcpBridgePath = bridgePath
-	state.mcpEnvValue = envValue
 
 	return domain.Session{
 		ID:       state.sessionID,
@@ -259,7 +213,6 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		}
 	}
 
-	env := buildTurnEnv(state)
 	cmdArgs := buildRunArgs(state, state.passthrough)
 	logger := state.loggerLocked()
 
@@ -279,7 +232,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		cmd = exec.CommandContext(ctx, state.target.Command, allArgs...) //nolint:gosec // args are constructed programmatically
 	}
 	procutil.SetGroupCancel(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS))
-	cmd.Env = env
+	cmd.Env = os.Environ()
 	if bindErr := state.target.BindWorkspace(cmd); bindErr != nil {
 		state.mu.Unlock()
 		return domain.TurnResult{}, bindErr
@@ -707,11 +660,6 @@ func (a *PiAdapter) finalizeExitedTurn(state *sessionState, runtime *turnRuntime
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
 	sessionID := state.currentSessionID()
-	for _, line := range stderrLines {
-		if text := strings.TrimSpace(agentcore.SanitizeLine(line)); strings.HasPrefix(text, bridgeFailurePrefix) {
-			state.logger().Warn("pi could not load Sortie's MCP servers", slog.String("detail", redact.Truncate(text, 300)))
-		}
-	}
 
 	ev := agentcore.TurnEvidence{
 		ExitObserved: true,
