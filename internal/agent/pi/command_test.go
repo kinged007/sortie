@@ -61,6 +61,7 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 	tests := []struct {
 		name      string
 		config    map[string]any
+		wantErr   bool
 		checkFunc func(t *testing.T, pt passthroughConfig)
 	}{
 		{
@@ -73,6 +74,50 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 					t.Errorf("passthroughConfig = %+v, want %+v (an unattended turn defaults to --no-approve)", pt, want)
 				}
 			},
+		},
+		{
+			name: "allowed_tools_parse",
+			config: map[string]any{
+				"allowed_tools": []any{"read", "edit"},
+			},
+			checkFunc: func(t *testing.T, pt passthroughConfig) {
+				t.Helper()
+				if !slices.Equal(pt.AllowedTools, []string{"read", "edit"}) {
+					t.Errorf("AllowedTools = %v, want [read edit]", pt.AllowedTools)
+				}
+			},
+		},
+		{
+			name: "denied_tools_parse",
+			config: map[string]any{
+				"denied_tools": []any{"bash"},
+			},
+			checkFunc: func(t *testing.T, pt passthroughConfig) {
+				t.Helper()
+				if !slices.Equal(pt.DeniedTools, []string{"bash"}) {
+					t.Errorf("DeniedTools = %v, want [bash]", pt.DeniedTools)
+				}
+			},
+		},
+		{
+			name: "unknown_extension_tool_names_preserved",
+			config: map[string]any{
+				"allowed_tools": []any{"customtool"},
+			},
+			checkFunc: func(t *testing.T, pt passthroughConfig) {
+				t.Helper()
+				if !slices.Equal(pt.AllowedTools, []string{"customtool"}) {
+					t.Errorf("AllowedTools = %v, want [customtool]", pt.AllowedTools)
+				}
+			},
+		},
+		{
+			name: "overlap_error",
+			config: map[string]any{
+				"allowed_tools": []any{"bash"},
+				"denied_tools":  []any{"bash"},
+			},
+			wantErr: true,
 		},
 		{
 			name:   "effort_parses",
@@ -124,6 +169,20 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			pt, faults := parsePassthroughConfig(tt.config)
 			hasErr := len(faults) > 0
 
+			if tt.wantErr {
+				if !hasErr {
+					t.Fatal("parsePassthroughConfig() faults = nil, want error")
+				}
+				joined := ""
+				for _, f := range faults {
+					joined += f.Message + "; "
+				}
+				if !strings.Contains(joined, "bash") {
+					t.Errorf("faults = %q, want them to mention %q", joined, "bash")
+				}
+				return
+			}
+
 			if hasErr {
 				t.Fatalf("parsePassthroughConfig() faults = %v", faults)
 			}
@@ -152,7 +211,12 @@ func TestParsePassthroughConfig_Faults(t *testing.T) {
 		{"trust wrong type", map[string]any{"project_trust": 7}, "pi.project_trust.wrong_type", "project_trust: expected string, got integer"},
 		{"thinking invalid value", map[string]any{"thinking": "turbo"}, "pi.thinking.invalid_value", `"turbo" is not a pi thinking level`},
 		{"trust invalid value", map[string]any{"project_trust": "maybe"}, "pi.project_trust.invalid_value", `"maybe" is not a pi trust setting`},
+		{"allowed_tools wrong type", map[string]any{"allowed_tools": "read"}, "pi.allowed_tools.wrong_type", "allowed_tools: expected list, got string"},
+		{"denied_tools wrong type", map[string]any{"denied_tools": 5}, "pi.denied_tools.wrong_type", "denied_tools: expected list, got integer"},
+		{"allowed_tools non-string element", map[string]any{"allowed_tools": []any{"read", 4}}, "pi.allowed_tools.malformed_list", "allowed_tools[1]: expected a tool name, got integer"},
+		{"denied_tools empty name", map[string]any{"denied_tools": []any{" "}}, "pi.denied_tools.malformed_list", "denied_tools[0]: tool name is empty"},
 		{"unknown key", map[string]any{"auto_compact": false}, "pi.auto_compact.unknown_key", `unknown pi config key "auto_compact"`},
+		{"overlap", map[string]any{"allowed_tools": []any{"read", "bash"}, "denied_tools": []any{"bash"}}, "pi.allowed_tools.overlap", "overlap: bash"},
 	}
 
 	for _, tt := range tests {
@@ -222,12 +286,13 @@ func TestParsePassthroughConfig_ReportsEveryFault(t *testing.T) {
 		"model":         123,
 		"thinking":      "turbo",
 		"project_trust": "maybe",
+		"denied_tools":  "bash",
 		"auto_compact":  false,
 	}
 
 	diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config})
-	if len(diags) != 4 {
-		t.Fatalf("validateConfig() reported %d diagnostics, want 4: %+v", len(diags), diags)
+	if len(diags) != 5 {
+		t.Fatalf("validateConfig() reported %d diagnostics, want 5: %+v", len(diags), diags)
 	}
 	for _, d := range diags {
 		if d.Severity != "error" {
@@ -274,6 +339,11 @@ func TestBuildRunArgs(t *testing.T) {
 			name:      "effort_fills_the_thinking_flag",
 			pt:        passthroughConfig{Effort: "high"},
 			wantPairs: [][2]string{{"--thinking", "high"}},
+		},
+		{
+			name:      "tool_lists_join_with_commas",
+			pt:        passthroughConfig{AllowedTools: []string{"read", "grep"}, DeniedTools: []string{"bash", "write"}},
+			wantPairs: [][2]string{{"--tools", "read,grep"}, {"--exclude-tools", "bash,write"}},
 		},
 		{
 			name:      "trust_approve",
@@ -367,11 +437,13 @@ func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 
 	state := newTestSessionState("/tmp/workspace", "")
 	args := buildRunArgs(state, passthroughConfig{
+		AllowedTools: []string{"read"},
+		DeniedTools:  []string{"bash"},
 		Thinking:     "high",
 		ProjectTrust: trustApprove,
 	})
 
-	want := []string{"-p", "--mode", "json", "--thinking", "high", "--approve"}
+	want := []string{"-p", "--mode", "json", "--thinking", "high", "--tools", "read", "--exclude-tools", "bash", "--approve"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -450,6 +522,8 @@ func TestValidateConfig_NoFaultsForSupportedConfiguration(t *testing.T) {
 			"thinking":      "off",
 			"mcp_config":    "./mcp-servers.json",
 			"project_trust": "ignore",
+			"allowed_tools": []any{"read", "grep"},
+			"denied_tools":  []any{"bash"},
 		},
 	})
 	if len(diags) != 0 {

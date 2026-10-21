@@ -21,6 +21,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 const resumeFixtureSessionID = "7a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
@@ -118,6 +119,32 @@ func TestStartSession_InvalidWorkspace(t *testing.T) {
 			}
 			if agentErr.Kind != tt.wantErr {
 				t.Errorf("Kind = %q, want %q", agentErr.Kind, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestStartSession_RefusalMatchesValidateConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		settings map[string]any
+		check    string
+	}{
+		{name: "tool overlap", settings: map[string]any{"allowed_tools": []any{"bash"}, "denied_tools": []any{"bash"}}, check: "pi.allowed_tools.overlap"},
+		{name: "unknown key", settings: map[string]any{"auto_compact": false}, check: "pi.auto_compact.unknown_key"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			startErr, launched := startRefusedSession(t, tt.settings)
+			agentErr, ok := errors.AsType[*domain.AgentError](startErr)
+			diag := hasCheck(validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: tt.settings}), tt.check)
+			if !ok || agentErr.Kind != domain.ErrAgentNotFound || diag == nil || agentErr.Message != diag.Message || launched {
+				t.Errorf("StartSession(%v) error, launched = %v, %v, want an agent_not_found *domain.AgentError carrying the message of validateConfig check %q (%+v), no launch", tt.settings, startErr, launched, tt.check, diag)
 			}
 		})
 	}

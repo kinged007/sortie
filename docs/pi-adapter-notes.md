@@ -17,7 +17,7 @@ The adapter launches one subprocess per turn:
 
 ```
 pi -p --mode json [--session <id> | --no-session] [--model <name>] \
-   [--thinking <level>] [--approve | --no-approve]
+   [--thinking <level>] [--tools a,b] [--exclude-tools c,d] [--approve | --no-approve]
 ```
 
 `-p` is the non-interactive prompt mode, `--mode json` is the machine-readable stream, and the prompt arrives on standard input. The process working directory is already the issue workspace, so no directory flag is sent, and the workspace is not named on the command line. The adapter's own flags, not the workflow's `agent.command`, decide the binary: `agent.command` overrides the program and may carry leading arguments, and the adapter's arguments follow them.
@@ -75,11 +75,14 @@ Every key the `pi` block accepts maps to a flag, and a key outside the accepted 
 - `model` becomes `--model`.
 - `effort` and `thinking` both become `--thinking`; they fill the same flag, so setting both is refused under `pi.effort.conflict` with the message "set one of them". `effort` is the generic key every forwarding kind shares, and the registered kind declares it forwarded, so it rides every turn, credential verification included. Its value reaches `--thinking` unchanged and unchecked, because the shared effort contract delivers arbitrary levels as written; pi itself warns and runs at its default level when it does not accept the name. Only `thinking` is checked against the list below. `thinking` is the pi-native spelling of the same setting. The accepted `thinking` values are the levels pi itself accepts: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Any other `thinking` value is refused, so a level a later release adds fails construction until someone establishes what it does.
 - `mcp_config` is a path to the operator's own MCP server file. It is checked to be a string and is not delivered: the adapter hands pi no MCP configuration (see Sortie's own tools).
+- `allowed_tools` becomes `--tools` with the names joined by commas. `denied_tools` becomes `--exclude-tools` the same way. A tool list must be a list of non-empty names; anything else is a type fault rather than a silently shortened list, and a name in both lists is refused because the two would contradict each other.
 - `project_trust` decides between `--approve` and `--no-approve`. The default is `ignore`, which sends `--no-approve` and keeps the workspace's own project-local files and packages out of the run. An unattended turn has no operator to answer a trust prompt, so the permissive value has to be asked for by name rather than inherited from a developer's shell.
 
 ## Permissions
 
 pi's own approval prompt cannot be answered by an unattended turn, so the adapter always sends one of two flags and never leaves the choice to pi's defaults. `project_trust` selects between them: `ignore`, the default, sends `--no-approve`, and `approve` sends `--approve`. With `--no-approve` the project-local files and packages of the workspace, which come from the repository an issue's agent works on, are not loaded. `approve` is the operator's explicit decision to run what the workspace declares. Any other value is refused.
+
+The tool set is narrowed with `allowed_tools` (`--tools`) and `denied_tools` (`--exclude-tools`). The adapter does not know pi's tool names: it forwards the names as written, so a misspelled name is pi's to reject or ignore. Both lists are comma-joined into one argument, so a tool name containing a comma cannot be expressed. The adapter validates only the list shape and the overlap between the two lists.
 
 The JSON event stream documents no approval request or human-input event, so the adapter performs no refusal or permission classification. A tool call that fails, whatever the reason, appears as a `tool_execution_end` with `isError` set.
 

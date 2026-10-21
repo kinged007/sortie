@@ -1338,7 +1338,7 @@ A rule may carry one settings block, named for the agent kind the rule runs and 
 
 The block an attempt runs with is the top-level block of the rule's kind with the rule's block laid over it, one level deep:
 
-- A key the rule writes replaces the inherited value whole, whatever its type. A map or a list is replaced, never merged or appended: `codex.turn_sandbox_policy`, `opencode.allowed_tools`, and `opencode.denied_tools` are the keys that hold one.
+- A key the rule writes replaces the inherited value whole, whatever its type. A map or a list is replaced, never merged or appended: `codex.turn_sandbox_policy`, `opencode.allowed_tools`, `opencode.denied_tools`, `pi.allowed_tools`, and `pi.denied_tools` are the keys that hold one.
 - A key the rule writes as `null` removes the inherited key, so the adapter sees it as never written and applies its own default. For `model` and `effort` that is the runtime's own default.
 - Every key the rule does not write is inherited.
 - A kind with no top-level block inherits nothing; the rule's block is the whole block.
@@ -4576,7 +4576,7 @@ A kind entry that prices its kind (both `input_per_mtok` and `output_per_mtok` s
 
 Each adapter (tracker or agent) may define configuration in a top-level object named after its `kind` value. These values are passed through to the adapter without validation by the orchestrator core.
 
-A session uses the block belonging to the agent kind it was dispatched on. That kind is the one a matching `dispatch.rules` entry selected, otherwise `dispatch.default.agent`, otherwise `agent.kind`, following the fallback chain in [Section 2.10](#210-dispatch--rule-based-routing). The block named by `agent.kind` therefore applies only when neither a matching rule nor the dispatch default chose another kind. The block an attempt runs with is resolved from `WORKFLOW.md` at the start of every attempt, so a change to a block applies from the next attempt without a restart, while a running session keeps the settings it started with. A rule may carry its own block for the kind it runs, laid over the kind's top-level block key by key; see [Rule settings blocks](#rule-settings-blocks). A key whose value is a map or a list, such as `codex.turn_sandbox_policy`, `opencode.allowed_tools`, and `opencode.denied_tools`, is replaced whole by a rule that writes it, never merged. A key with the wrong YAML type fails validation and, if it reaches a session, the session start; nothing is constructed from a block in advance.
+A session uses the block belonging to the agent kind it was dispatched on. That kind is the one a matching `dispatch.rules` entry selected, otherwise `dispatch.default.agent`, otherwise `agent.kind`, following the fallback chain in [Section 2.10](#210-dispatch--rule-based-routing). The block named by `agent.kind` therefore applies only when neither a matching rule nor the dispatch default chose another kind. The block an attempt runs with is resolved from `WORKFLOW.md` at the start of every attempt, so a change to a block applies from the next attempt without a restart, while a running session keeps the settings it started with. A rule may carry its own block for the kind it runs, laid over the kind's top-level block key by key; see [Rule settings blocks](#rule-settings-blocks). A key whose value is a map or a list, such as `codex.turn_sandbox_policy`, `opencode.allowed_tools`, `opencode.denied_tools`, `pi.allowed_tools`, and `pi.denied_tools`, is replaced whole by a rule that writes it, never merged. A key with the wrong YAML type fails validation and, if it reaches a session, the session start; nothing is constructed from a block in advance.
 
 **Model:** `model` is an optional string key that means the same in the block of every agent kind that reads it, as `effort` does. An absent key, a YAML null, and an empty string leave the model unset, and the agent runs at its own default. Any other string is handed to the runtime exactly as written, and the runtime judges the name. A value of any other YAML type fails validation under the check `<kind>.model.wrong_type` and fails the session start. The `claude-code`, `codex`, `copilot-cli`, `opencode`, and `pi` kinds read it.
 
@@ -4755,9 +4755,17 @@ pi:
   model: claude-sonnet-4-6
   effort: high
   project_trust: ignore
+  allowed_tools:
+    - read
+    - glob
+    - grep
+    - edit
+    - bash
+  denied_tools:
+    - web_search
 ```
 
-The `pi` block is forwarded to the Pi adapter, which runs `pi -p --mode json` once per turn with the prompt on standard input, with the issue workspace as the process working directory, and adds `--session <session_id>` on every turn once a session ID is known. The block accepts exactly the five keys in the table below: a key outside that set is refused rather than ignored, because pi has no passthrough channel, so an unrecognized key would otherwise look configured while doing nothing. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `pi.<key>.wrong_type`. Every fault the constructor refuses is also reported offline under the `pi.` check namespace, because both read the same configuration parser.
+The `pi` block is forwarded to the Pi adapter, which runs `pi -p --mode json` once per turn with the prompt on standard input, with the issue workspace as the process working directory, and adds `--session <session_id>` on every turn once a session ID is known. The block accepts exactly the seven keys in the table below: a key outside that set is refused rather than ignored, because pi has no passthrough channel, so an unrecognized key would otherwise look configured while doing nothing. A string key whose YAML value carries another type fails construction and, offline, is reported by `sortie validate` under the check `pi.<key>.wrong_type`. Every fault the constructor refuses is also reported offline under the `pi.` check namespace, because both read the same configuration parser.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -4766,10 +4774,14 @@ The `pi` block is forwarded to the Pi adapter, which runs `pi -p --mode json` on
 | `pi.thinking` | string | _(absent)_ | Fills the same `--thinking` flag as `pi.effort`; setting both fails the session start and, offline, is reported by `sortie validate` under the check `pi.effort.conflict`. Values: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Any other value fails construction and is reported offline under `pi.thinking.invalid_value`. |
 | `pi.project_trust` | string | `ignore` | Decides between `--no-approve` and `--approve`, which control whether pi loads the workspace's own project-local files and packages. `ignore` sends `--no-approve`; `approve` sends `--approve`. The default is the restrictive one because an unattended turn has no operator to answer a trust prompt and must not silently adopt whatever the workspace declares. |
 | `pi.mcp_config` | string | _(absent)_ | Path to an MCP server configuration JSON file, resolved relative to the directory holding WORKFLOW.md when it is not absolute, same as the other adapters. See the MCP paragraph below. |
+| `pi.allowed_tools` | list of strings | _(absent)_ | Forwarded to `--tools` as a comma-joined list, narrowing the tools the agent may use. Must be a list of non-empty names; anything else is a type fault. |
+| `pi.denied_tools` | list of strings | _(absent)_ | Forwarded to `--exclude-tools` as a comma-joined list. Same list rules as `pi.allowed_tools`. |
 
 **Validation rules:**
 
 - `pi.effort` and `pi.thinking` MUST NOT both be set, because both fill the `--thinking` flag.
+- `pi.allowed_tools` and `pi.denied_tools` MUST NOT name the same tool. An overlap fails construction and is reported offline under `pi.allowed_tools.overlap`.
+- A tool list is a list of non-empty tool names. An entry that is not a string, and an entry that is empty or whitespace only, fail construction and are reported offline under `pi.<list_key>.malformed_list`.
 
 **MCP:** the adapter delivers no MCP configuration to pi. `pi.mcp_config` is checked to be a string and has no other effect, and Sortie's tools are neither advertised to nor callable by a `pi` session. `sortie validate` and the preflight report both as warnings, under `agent.mcp_config` and `agent.kind.no_tool_channel`.
 

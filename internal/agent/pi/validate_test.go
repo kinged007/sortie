@@ -23,6 +23,8 @@ func TestValidateConfig_AcceptsEveryKey(t *testing.T) {
 		"thinking":      "high",
 		"mcp_config":    "./mcp-servers.json",
 		"project_trust": "approve",
+		"allowed_tools": []any{"read", "grep"},
+		"denied_tools":  []any{"bash"},
 	}
 
 	for _, key := range slices.Sorted(maps.Keys(knownConfigKeys)) {
@@ -42,7 +44,9 @@ func TestValidateConfig_AcceptsEveryKey(t *testing.T) {
 		"trust unset":              map[string]any{"project_trust": ""},
 		"trust ignore":             map[string]any{"project_trust": "ignore"},
 		"model unset":              map[string]any{"model": ""},
-		"nil value reads as unset": map[string]any{"model": nil},
+		"native string list":       map[string]any{"allowed_tools": []string{"read"}},
+		"empty list":               map[string]any{"denied_tools": []any{}},
+		"nil value reads as unset": map[string]any{"model": nil, "allowed_tools": nil},
 	}
 
 	extra["effort and thinking, one empty"] = map[string]any{"effort": "high", "thinking": ""}
@@ -78,7 +82,7 @@ func TestValidateConfig_Refusals(t *testing.T) {
 			name:      "unknown key",
 			config:    map[string]any{"auto_compact": false},
 			wantCheck: "pi.auto_compact.unknown_key",
-			wantMsg:   `unknown pi config key "auto_compact"; the pi block accepts effort, mcp_config, model, project_trust, thinking`,
+			wantMsg:   `unknown pi config key "auto_compact"; the pi block accepts allowed_tools, denied_tools, effort, mcp_config, model, project_trust, thinking`,
 		},
 		{
 			name:      "model wrong type",
@@ -128,6 +132,36 @@ func TestValidateConfig_Refusals(t *testing.T) {
 			wantCheck: "pi.project_trust.invalid_value",
 			wantMsg:   `project_trust: "maybe" is not a pi trust setting; valid values are ignore, approve`,
 		},
+		{
+			name:      "allowed_tools is not a list",
+			config:    map[string]any{"allowed_tools": "read"},
+			wantCheck: "pi.allowed_tools.wrong_type",
+			wantMsg:   "allowed_tools: expected list, got string",
+		},
+		{
+			name:      "denied_tools is not a list",
+			config:    map[string]any{"denied_tools": 5},
+			wantCheck: "pi.denied_tools.wrong_type",
+			wantMsg:   "denied_tools: expected list, got integer",
+		},
+		{
+			name:      "allowed_tools element is not a name",
+			config:    map[string]any{"allowed_tools": []any{"read", 4}},
+			wantCheck: "pi.allowed_tools.malformed_list",
+			wantMsg:   "allowed_tools[1]: expected a tool name, got integer",
+		},
+		{
+			name:      "denied_tools element is blank",
+			config:    map[string]any{"denied_tools": []any{" "}},
+			wantCheck: "pi.denied_tools.malformed_list",
+			wantMsg:   "denied_tools[0]: tool name is empty",
+		},
+		{
+			name:      "overlap names every conflicting tool in order",
+			config:    map[string]any{"allowed_tools": []any{"write", "bash", "read"}, "denied_tools": []any{"bash", "write"}},
+			wantCheck: "pi.allowed_tools.overlap",
+			wantMsg:   "allowed_tools and denied_tools overlap: bash, write",
+		},
 	}
 
 	for _, tt := range tests {
@@ -153,7 +187,8 @@ func TestValidateConfig_Refusals(t *testing.T) {
 
 // TestValidateConfig_ReportsEveryFaultOnce pins the two properties an
 // operator fixing a pi block depends on: every mistake in one pass, and
-// one diagnostic per mistake.
+// one diagnostic per mistake, so a list with two bad elements does not
+// read as one fault.
 func TestValidateConfig_ReportsEveryFaultOnce(t *testing.T) {
 	t.Parallel()
 
@@ -161,6 +196,8 @@ func TestValidateConfig_ReportsEveryFaultOnce(t *testing.T) {
 		"model":         123,
 		"thinking":      "turbo",
 		"project_trust": "maybe",
+		"denied_tools":  []any{4, " "},
+		"allowed_tools": "read",
 		"auto_compact":  false,
 	}})
 
@@ -177,9 +214,23 @@ func TestValidateConfig_ReportsEveryFaultOnce(t *testing.T) {
 		"pi.model.wrong_type",
 		"pi.thinking.invalid_value",
 		"pi.project_trust.invalid_value",
+		"pi.allowed_tools.wrong_type",
+		"pi.denied_tools.malformed_list",
+		"pi.denied_tools.malformed_list",
 	}
 	if strings.Join(checks, "|") != strings.Join(want, "|") {
 		t.Errorf("checks = %v, want %v", checks, want)
+	}
+	for _, message := range []string{"denied_tools[0]: expected a tool name, got integer", "denied_tools[1]: tool name is empty"} {
+		var found bool
+		for _, d := range diags {
+			if d.Message == message {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no diagnostic carries %q", message)
+		}
 	}
 }
 
