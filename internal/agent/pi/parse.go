@@ -8,7 +8,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// The wire schema of `pi --mode json` at 0.85.1. One JSON object per
+// The wire schema of `pi --mode json`, as pi 1.3.0 writes it. One JSON object per
 // stdout line. The session header comes first, then one AgentSessionEvent
 // per line as the session runs:
 //
@@ -31,7 +31,7 @@ import (
 // response, so a response that stopped with "error" or "aborted" still
 // exits 0; only the message's stopReason distinguishes it.
 
-// knownEventTypes is every event type the 0.85.1 CLI writes to the run
+// knownEventTypes is every event type the pi CLI writes to the run
 // stream, framing and content alike. A type outside this set is a stream
 // the adapter does not understand, and is reported as a malformed line
 // rather than skipped: a future event the adapter silently drops could
@@ -64,7 +64,7 @@ var knownEventTypes = map[string]struct{}{
 	"summarization_retry_finished":      {},
 }
 
-// knownDeltaTypes is every assistantMessageEvent variant the 0.85.1 CLI
+// knownDeltaTypes is every assistantMessageEvent variant the pi CLI
 // writes inside a message_update. It is bounded for the same reason
 // knownEventTypes is.
 var knownDeltaTypes = map[string]struct{}{
@@ -107,6 +107,7 @@ type rawRunEvent struct {
 	ToolName   string          `json:"toolName,omitempty"`
 	IsError    bool            `json:"isError,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
+	DurationMS int64           `json:"durationMs,omitempty"`
 
 	Aborted      bool   `json:"aborted,omitempty"`
 	WillRetry    bool   `json:"willRetry,omitempty"`
@@ -114,7 +115,7 @@ type rawRunEvent struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
-// rawMessage is an AgentMessage as the 0.85.1 CLI serializes it. Only
+// rawMessage is an AgentMessage as the pi CLI serializes it. Only
 // the assistant role carries usage, a model name, and a stop reason.
 type rawMessage struct {
 	Role         string       `json:"role"`
@@ -178,7 +179,7 @@ func parseRunEvent(line []byte) (rawRunEvent, error) {
 	return event, nil
 }
 
-// known reports whether the CLI's 0.85.1 schema defines this event type.
+// known reports whether the CLI's schema defines this event type.
 func (e *rawRunEvent) known() bool {
 	_, ok := knownEventTypes[e.Type]
 	return ok
@@ -209,11 +210,21 @@ func (e *rawRunEvent) completedMessage() (rawMessage, error) {
 		return rawMessage{}, fmt.Errorf("event %q carries no completed message", e.Type)
 	}
 	var msg rawMessage
-	if err := decodeStrict(e.Message, &msg); err != nil {
+	if err := decodeStrict(e.Message, &struct {
+		Role *string `json:"role"`
+	}{&msg.Role}); err != nil {
 		return rawMessage{}, fmt.Errorf("event %q message: %w", e.Type, err)
 	}
 	if msg.Role == "" {
 		return rawMessage{}, fmt.Errorf("event %q message carries no role", e.Type)
+	}
+	if msg.Role == "system" {
+		// The system message's content is a string and carries nothing
+		// the adapter reads.
+		return msg, nil
+	}
+	if err := json.Unmarshal(e.Message, &msg); err != nil {
+		return rawMessage{}, fmt.Errorf("event %q message: %w", e.Type, err)
 	}
 	return msg, nil
 }
@@ -240,7 +251,7 @@ func (e *rawRunEvent) compactionUsage() (domain.TokenUsage, bool, error) {
 }
 
 // assistantDelta decodes the assistantMessageEvent of a message_update.
-// Every delta the 0.85.1 CLI writes is one of knownDeltaTypes; anything
+// Every delta the pi CLI writes is one of knownDeltaTypes; anything
 // else is a variant the adapter does not understand.
 func (e *rawRunEvent) assistantDelta() (rawAssistantDelta, error) {
 	if e.Type != "message_update" {
@@ -254,7 +265,7 @@ func (e *rawRunEvent) assistantDelta() (rawAssistantDelta, error) {
 		return rawAssistantDelta{}, fmt.Errorf("message_update assistantMessageEvent carries no type")
 	}
 	if _, ok := knownDeltaTypes[delta.Type]; !ok {
-		return rawAssistantDelta{}, fmt.Errorf("message_update assistantMessageEvent type %q is not part of the pi 0.85.1 schema", delta.Type)
+		return rawAssistantDelta{}, fmt.Errorf("message_update assistantMessageEvent type %q is not part of the pi schema", delta.Type)
 	}
 	return delta, nil
 }
@@ -319,4 +330,17 @@ func decodeStrict(raw json.RawMessage, target any) error {
 		return fmt.Errorf("missing payload")
 	}
 	return json.Unmarshal(raw, target)
+}
+
+// resultText concatenates the text blocks of the result a
+// tool_execution_end carries, which for a failed tool is its error
+// message. It returns "" when the result carries no text.
+func (e *rawRunEvent) resultText() string {
+	var result struct {
+		Content []rawContent `json:"content"`
+	}
+	if err := json.Unmarshal(e.Result, &result); err != nil {
+		return ""
+	}
+	return rawMessage{Content: result.Content}.text()
 }

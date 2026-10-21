@@ -16,10 +16,17 @@ import (
 )
 
 // writePiScript writes an executable shell script named fake-pi in dir
-// with the given body and returns its path.
+// that answers --version and otherwise runs the given body, and returns
+// its path.
 func writePiScript(t *testing.T, dir, body string) string {
 	t.Helper()
-	return agenttest.WriteScript(t, dir, "fake-pi", body)
+	return agenttest.WriteScript(t, dir, "fake-pi", versionAnsweringScript(body))
+}
+
+// versionAnsweringScript prefixes body with the answer StartSession's
+// version query reads, so a script written for a turn also passes it.
+func versionAnsweringScript(body string) string {
+	return "case \"$1\" in\n  --version) echo '1.3.0'; exit 0;;\nesac\n" + body
 }
 
 // mustStartSession starts a session with the given command or fatals.
@@ -211,7 +218,7 @@ func TestRunTurn_ToolResultPerExecution(t *testing.T) {
 }
 
 // TestRunTurn_AssistantErrorAbortsExitZero pins the exit-code gap the
-// 0.85.1 CLI has: --mode json applies no stop-reason check, so a
+// pi CLI has: --mode json applies no stop-reason check, so a
 // provider failure and an abort both exit 0. Neither may be recorded as
 // a successful turn, and the failure's stderr reaches the terminal
 // report as a bounded excerpt.
@@ -314,7 +321,7 @@ func TestRunTurn_FramingEventsProduceNothing(t *testing.T) {
 	events, result, _ := collectEvents(t, a, session, "work")
 
 	if got := eventsOfType(events, domain.EventMalformed); len(got) != 0 {
-		t.Errorf("malformed events = %+v, want none: every framing type is part of the 0.85.1 schema", got)
+		t.Errorf("malformed events = %+v, want none: every framing type is part of the pi schema", got)
 	}
 	if got := eventsOfType(events, domain.EventToolResult); len(got) != 0 {
 		t.Errorf("tool results = %+v, want none: this fixture has no tool_execution_end", got)
@@ -326,7 +333,7 @@ func TestRunTurn_FramingEventsProduceNothing(t *testing.T) {
 }
 
 // TestRunTurn_MalformedLinesAreReported asserts that every fault class
-// the 0.85.1 stream can carry reaches the orchestrator as a malformed
+// the pi stream can carry reaches the orchestrator as a malformed
 // event rather than as a silently successful turn: an undecodable
 // nested payload, a terminal record with no role, an unknown event type,
 // an unknown delta variant, and a non-object line.
@@ -618,7 +625,7 @@ func assistantMessage(text string, input, output int) string {
 		text, input, output)
 }
 
-// TestRunTurn_EveryDeltaVariantIsRecognized walks the 0.85.1 delta set
+// TestRunTurn_EveryDeltaVariantIsRecognized walks the pi delta set
 // through a real stream. An unlisted variant is reported as a malformed
 // line, so a variant the CLI does write but the adapter does not know
 // fails here by name.
@@ -649,7 +656,7 @@ func TestRunTurn_EveryDeltaVariantIsRecognized(t *testing.T) {
 	}
 
 	if got := eventsOfType(events, domain.EventMalformed); len(got) != 0 {
-		t.Errorf("malformed events = %+v, want none: every 0.85.1 delta variant is recognized", got)
+		t.Errorf("malformed events = %+v, want none: every pi delta variant is recognized", got)
 	}
 	if got := notificationMessages(events); len(got) != 1 || got[0] != "done" {
 		t.Errorf("notifications = %v, want exactly [\"done\"]", got)
@@ -767,5 +774,99 @@ func TestRunTurn_AgentEndRepeatsNeitherTextNorUsage(t *testing.T) {
 	// 10+2 and 20+4 counted once each; agent_end's copies add nothing.
 	if result.Usage != (domain.TokenUsage{InputTokens: 30, OutputTokens: 6, TotalTokens: 36}) {
 		t.Errorf("usage = %+v, want the two responses counted once each", result.Usage)
+	}
+}
+
+// TestRunTurn_RealStreams replays streams captured from pi 1.3.0 with the
+// system prompt text omitted. They carry events the synthetic fixtures do
+// not: a system message with string content and sections, entry_appended,
+// auto_retry_start, auto_retry_end and agent_settled, and a run of several
+// agent_start/agent_end pairs.
+func TestRunTurn_RealStreams(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		fixture      string
+		wantFailure  string
+		wantNotes    []string
+		wantTools    []string
+		wantInput    int64
+		wantOutput   int64
+		wantComplete bool
+	}{
+		{
+			name:         "simple turn",
+			fixture:      "real_simple_turn.jsonl",
+			wantNotes:    []string{"OK"},
+			wantInput:    29442,
+			wantOutput:   4,
+			wantComplete: true,
+		},
+		{
+			name:         "tool call",
+			fixture:      "real_tool_turn.jsonl",
+			wantNotes:    []string{"I'll read the file a.txt for you.", "hello"},
+			wantTools:    []string{"read"},
+			wantInput:    20673,
+			wantOutput:   71,
+			wantComplete: true,
+		},
+		{
+			name:        "upstream error after every retry",
+			fixture:     "real_retry_error.jsonl",
+			wantFailure: "Unsupported model mimo-v2.5-pro",
+		},
+		{
+			name:         "retry that succeeds",
+			fixture:      "retry_then_success.jsonl",
+			wantNotes:    []string{"OK"},
+			wantInput:    29442,
+			wantOutput:   4,
+			wantComplete: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			a, err := NewPiAdapter()
+			if err != nil {
+				t.Fatalf("NewPiAdapter() error = %v", err)
+			}
+			session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, tt.fixture))
+			events, result, err := collectEvents(t, a, session, "do work")
+
+			if bad := eventsOfType(events, domain.EventMalformed); len(bad) != 0 {
+				t.Errorf("malformed events = %+v, want none", bad)
+			}
+			if tt.wantComplete {
+				if err != nil {
+					t.Fatalf("RunTurn() error = %v, want nil", err)
+				}
+				if result.ExitReason != domain.EventTurnCompleted {
+					t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tt.wantFailure) {
+					t.Fatalf("RunTurn() error = %v, want it to contain %q", err, tt.wantFailure)
+				}
+				if result.ExitReason != domain.EventTurnFailed {
+					t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+				}
+			}
+			if got := notificationMessages(events); !slices.Equal(got, tt.wantNotes) {
+				t.Errorf("notifications = %v, want %v", got, tt.wantNotes)
+			}
+			var tools []string
+			for _, e := range eventsOfType(events, domain.EventToolResult) {
+				tools = append(tools, e.ToolName)
+			}
+			if !slices.Equal(tools, tt.wantTools) {
+				t.Errorf("tool results = %v, want %v", tools, tt.wantTools)
+			}
+			if result.Usage.InputTokens != tt.wantInput || result.Usage.OutputTokens != tt.wantOutput {
+				t.Errorf("usage = %+v, want input %d output %d", result.Usage, tt.wantInput, tt.wantOutput)
+			}
+		})
 	}
 }

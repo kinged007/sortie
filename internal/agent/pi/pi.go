@@ -1,13 +1,13 @@
-// Package pi implements [domain.AgentAdapter] for the Pi CLI
-// (pi 0.99.2). It launches one `pi -p --mode json` subprocess per
-// Sortie turn, normalizes the JSON event stream into domain events, and
-// settles the session's cumulative token usage from the one usage
-// figure each pi turn_end carries.
+// Package pi implements [domain.AgentAdapter] for the Pi CLI (pi 0.99.0
+// or later). It launches one `pi -p --mode json` subprocess per Sortie
+// turn, normalizes the JSON event stream into domain events, and settles
+// the session's cumulative token usage from the one usage figure each pi
+// turn_end carries.
 //
-// pi 0.99 loads MCP servers from mcp.json and from extensions. The
-// adapter re-expresses the worker-generated .sortie/mcp.json in the
-// form pi parses: a static bridge extension loaded through
-// --extension and a JSON environment variable the extension reads with
+// pi loads MCP servers from mcp.json and from extensions. The adapter
+// re-expresses the worker-generated .sortie/mcp.json in the form pi
+// parses: a static bridge extension loaded through --extension and a
+// JSON environment variable the extension reads with
 // pi.registerMcpServer, so the session can call Sortie's tools.
 package pi
 
@@ -45,7 +45,7 @@ func init() {
 		UsageArrival:        registry.UsageArrivalTurnEnd,
 		UsageAttribution:    registry.UsageAttributionPerModel,
 		CredentialEnv:       registry.DeclareCredentialEnv(),
-		EffortForwarding:    registry.EffortNotForwarded,
+		EffortForwarding:    registry.EffortForwarded,
 	})
 }
 
@@ -86,11 +86,14 @@ type sessionState struct {
 	// mcpEnvValue is the JSON document the bridge extension reads from
 	// SORTIE_PI_MCP_SERVERS. Empty when the session carries no server.
 	mcpEnvValue string
+
+	credentialVerification bool
 }
 
 type turnRuntime struct {
 	pid             string
 	proc            *os.Process
+	tools           *agentcore.ToolTracker
 	group           *procutil.Group
 	waitCh          chan waitResult
 	reapedCh        chan struct{}
@@ -120,9 +123,11 @@ type turnRuntime struct {
 	usage      domain.TokenUsage
 	usageModel string
 
-	// assistantFailure holds the first assistant response that stopped
-	// with reason "error" or "aborted". pi --mode json exits 0 for both,
-	// so this is the only evidence such a turn failed.
+	// assistantFailure holds the failure of the last assistant response, or ""
+	// when it completed. pi retries a response that stopped with "error"
+	// inside the same process, so only the last response decides the turn.
+	// pi --mode json exits 0 for "error" and "aborted", so this is the
+	// only evidence such a turn failed.
 	assistantFailure string
 
 	// sawAssistantMessageEnd records whether the current pi turn already
@@ -134,6 +139,9 @@ type turnRuntime struct {
 type waitResult struct {
 	exitCode int
 	err      error
+	// stopped is the launch record's verdict: a stop began while the
+	// subprocess was still running.
+	stopped bool
 }
 
 // NewPiAdapter creates an [PiAdapter]. Settings are resolved per
@@ -143,26 +151,41 @@ func NewPiAdapter() (domain.AgentAdapter, error) {
 	return &PiAdapter{}, nil
 }
 
-// StartSession resolves the launch target, translates MCPConfigPath into
-// the bridge extension and its environment value, and initializes
-// adapter-owned session state without starting a Pi subprocess.
-func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
+// StartSession checks that the installed pi is a supported release,
+// resolves the launch target, translates MCPConfigPath into the bridge
+// extension and its environment value, and initializes adapter-owned
+// session state without starting a turn subprocess.
+func (a *PiAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	pt, faults := parsePassthroughConfig(params.Settings)
 	if len(faults) > 0 {
 		messages := make([]string, len(faults))
 		for i, f := range faults {
 			messages[i] = f.Message
 		}
-		msg := strings.Join(messages, "; ")
-		var firstErr error
-		if len(faults) > 0 {
+		firstErr := faults[0].Err
+		if firstErr == nil {
 			firstErr = errors.New(faults[0].Message)
 		}
-		return domain.Session{}, agentcore.SettingsError(msg, firstErr)
+		return domain.Session{}, agentcore.SettingsError(strings.Join(messages, "; "), firstErr)
 	}
 	target, agentErr := agentcore.ResolveLaunchTarget(params, defaultCommand)
 	if agentErr != nil {
 		return domain.Session{}, agentErr
+	}
+
+	state := &sessionState{
+		target:                 target,
+		agentConfig:            params.AgentConfig,
+		passthrough:            pt,
+		sessionID:              params.ResumeSessionID,
+		baseLogger:             slog.Default().With(slog.String("component", "pi-adapter")),
+		usage:                  agentcore.NewTurnEndUsage(),
+		drainGrace:             procutil.DefaultDrainGrace,
+		credentialVerification: params.CredentialVerification,
+	}
+
+	if versionErr := checkRuntimeVersion(ctx, state); versionErr != nil {
+		return domain.Session{}, versionErr
 	}
 
 	servers, translateErr := translateMCPServers(params.MCPConfigPath, target.RemoteCommand != "")
@@ -190,17 +213,8 @@ func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionPa
 		}
 	}
 
-	state := &sessionState{
-		target:        target,
-		agentConfig:   params.AgentConfig,
-		passthrough:   pt,
-		sessionID:     params.ResumeSessionID,
-		baseLogger:    slog.Default().With(slog.String("component", "pi-adapter")),
-		usage:         agentcore.NewTurnEndUsage(),
-		drainGrace:    procutil.DefaultDrainGrace,
-		mcpBridgePath: bridgePath,
-		mcpEnvValue:   envValue,
-	}
+	state.mcpBridgePath = bridgePath
+	state.mcpEnvValue = envValue
 
 	return domain.Session{
 		ID:       state.sessionID,
@@ -242,19 +256,20 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	}
 
 	env := buildTurnEnv(state)
-	cmdArgs := buildRunArgs(state, params.Prompt, state.passthrough)
+	cmdArgs := buildRunArgs(state, state.passthrough)
 	logger := state.loggerLocked()
 
 	var cmd *exec.Cmd
+	var launch sshutil.SSHLaunch
 	if state.target.RemoteCommand != "" {
-		sshArgs := sshutil.BuildSSHLaunch(
+		launch = sshutil.BuildSSHLaunch(
 			state.target.SSHHost,
 			state.target.WorkspacePath,
 			state.target.RemoteCommand,
 			cmdArgs,
-			sshutil.SSHOptions{StrictHostKeyChecking: state.target.SSHStrictHostKeyChecking},
-		).Args
-		cmd = exec.CommandContext(ctx, state.target.Command, sshArgs...) //nolint:gosec // args are constructed programmatically with shell quoting
+			state.target.SSHOptions(),
+		)
+		cmd = exec.CommandContext(ctx, state.target.Command, launch.Args...) //nolint:gosec // args are constructed programmatically with shell quoting
 	} else {
 		allArgs := append(slices.Clone(state.target.Args), cmdArgs...)
 		cmd = exec.CommandContext(ctx, state.target.Command, allArgs...) //nolint:gosec // args are constructed programmatically
@@ -265,6 +280,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		state.mu.Unlock()
 		return domain.TurnResult{}, bindErr
 	}
+	cmd.Stdin = buildTurnStdin(params.Prompt, launch.StdinReader())
 
 	pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, logger)
 	if err != nil {
@@ -309,6 +325,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	runtime := &turnRuntime{
 		pid:        strconv.Itoa(cmd.Process.Pid),
 		proc:       cmd.Process,
+		tools:      agentcore.NewToolTracker(),
 		group:      group,
 		waitCh:     make(chan waitResult, 1),
 		reapedCh:   make(chan struct{}),
@@ -341,6 +358,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 	var postExitAt time.Time
 	var exit waitResult
 	processExited := false
+	ctxDone := ctx.Done()
 
 	// handleLine applies one raw stdout line's per-event path: parsing,
 	// the first-JSON latch, and the event switch. It is shared between
@@ -449,9 +467,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				return domain.TurnResult{}, nil, false
 			}
 			runtime.sawAssistantMessageEnd = true
-			if runtime.assistantFailure == "" {
-				runtime.assistantFailure = msg.failure()
-			}
+			runtime.assistantFailure = msg.failure()
 			if text := msg.text(); text != "" {
 				runtime.work.ObserveAssistantOutput()
 				agentcore.EmitNotification(emit, redact.Truncate(text, 500))
@@ -467,9 +483,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			// message_end already reported, so it is the fallback for
 			// the text and the only source of the response's usage.
 			if msg.Role == "assistant" && !runtime.sawAssistantMessageEnd {
-				if runtime.assistantFailure == "" {
-					runtime.assistantFailure = msg.failure()
-				}
+				runtime.assistantFailure = msg.failure()
 				if text := msg.text(); text != "" {
 					runtime.work.ObserveAssistantOutput()
 					agentcore.EmitNotification(emit, redact.Truncate(text, 500))
@@ -482,17 +496,32 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				}
 			}
 
+		case "tool_execution_start":
+			if rawEvent.ToolCallID != "" {
+				runtime.tools.Begin(rawEvent.ToolCallID, rawEvent.ToolName)
+			}
+
 		case "tool_execution_end":
+			_, durationMS, _ := runtime.tools.End(rawEvent.ToolCallID)
 			if rawEvent.ToolName == "" {
 				malformed(fmt.Errorf("tool_execution_end carries no toolName"))
 				return domain.TurnResult{}, nil, false
 			}
 			runtime.work.ObserveToolActivity()
+			if rawEvent.DurationMS > 0 {
+				durationMS = rawEvent.DurationMS
+			}
+			var message string
+			if rawEvent.IsError {
+				message = redact.Truncate(rawEvent.resultText(), 500)
+			}
 			emit(domain.AgentEvent{
-				Type:      domain.EventToolResult,
-				Timestamp: now,
-				ToolName:  rawEvent.ToolName,
-				ToolError: rawEvent.IsError,
+				Type:           domain.EventToolResult,
+				Timestamp:      now,
+				ToolName:       rawEvent.ToolName,
+				ToolDurationMS: durationMS,
+				ToolError:      rawEvent.IsError,
+				Message:        message,
 			})
 
 		case "compaction_end":
@@ -526,7 +555,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			if result, agentErr, done := drainLinesBounded(lineCh, runtime, postExitAt, handleLine); done {
 				return result, agentErr
 			}
-			return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
+			return a.finalizeExitedTurn(state, runtime, emit, exit)
 		}
 
 		select {
@@ -534,12 +563,13 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			if !ok {
 				lineCh = nil
 				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
+					stoppedBeforeKill := runtime.group.Stopped()
 					killTurnProcess(runtime)
 					_ = waitForProcess(runtime)
 					clearActive(state, runtime)
 
 					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-					if ctx.Err() == nil && !state.isClosed() {
+					if !stoppedBeforeKill {
 						procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
 						ev = agentcore.TurnEvidence{
 							Terminal:          agentcore.TerminalFailure,
@@ -555,7 +585,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 					return result, nil
 				}
 				if processExited {
-					return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
+					return a.finalizeExitedTurn(state, runtime, emit, exit)
 				}
 				continue
 			}
@@ -579,18 +609,24 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			postExitC = time.After(runtime.drainGrace)
 			postExitAt = time.Now().Add(runtime.drainGrace)
 			if lineCh == nil {
-				return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
+				return a.finalizeExitedTurn(state, runtime, emit, exit)
 			}
 
 		case <-postExitC:
 			if result, agentErr, done := drainLinesBounded(lineCh, runtime, postExitAt, handleLine); done {
 				return result, agentErr
 			}
-			return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
+			return a.finalizeExitedTurn(state, runtime, emit, exit)
 
-		case <-ctx.Done():
+		case <-ctxDone:
 			killTurnProcess(runtime)
-			_ = waitForProcess(runtime)
+			if !waitForProcess(runtime).stopped {
+				// The subprocess had exited on its own before the stop
+				// reached it, so the turn finishes like one whose context
+				// is live: the closed wait channel takes the exit arm next.
+				ctxDone = nil
+				continue
+			}
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
@@ -653,19 +689,24 @@ func (a *PiAdapter) StopSession(ctx context.Context, session domain.Session) err
 
 // finalizeExitedTurn builds and emits the turn's terminal disposition once
 // the subprocess has exited.
-func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
+func (a *PiAdapter) finalizeExitedTurn(state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
 	clearActive(state, runtime)
 	stderrLines := runtime.stderrCollector.Lines()
 	sessionID := state.currentSessionID()
+	for _, line := range stderrLines {
+		if text := strings.TrimSpace(agentcore.SanitizeLine(line)); strings.HasPrefix(text, bridgeFailurePrefix) {
+			state.logger().Warn("pi could not load Sortie's MCP servers", slog.String("detail", redact.Truncate(text, 300)))
+		}
+	}
 
 	ev := agentcore.TurnEvidence{
 		ExitObserved: true,
 		ExitCode:     exit.exitCode,
-		Cause:        exit.err,
+		WaitErr:      exit.err,
 	}
 	ev.Work, ev.WorkDetail = runtime.work.Report()
 
-	if ctx.Err() == nil && !state.isClosed() {
+	if !exit.stopped {
 		ev.EarlyExit = runtime.output.ExitedBeforeOutput(state.target, exit.err).Report(runtime.stderrCollector)
 	}
 
@@ -680,7 +721,7 @@ func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState,
 		ev.TerminalMessage = connErr.Message
 		ev.Cause = connErr.Err
 
-	case ctx.Err() != nil || state.isClosed():
+	case exit.stopped:
 		ev.Terminal = agentcore.TerminalCancelled
 		ev.TerminalMessage = "turn cancelled"
 		ev.Cause = nil
@@ -760,12 +801,6 @@ func (s *sessionState) currentSessionID() string {
 	return s.sessionID
 }
 
-func (s *sessionState) isClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
-}
-
 // applySessionEvent adopts the header's session id, and reports whether
 // this is the first header of the Sortie session, so session_started is
 // emitted exactly once even across a resume.
@@ -804,6 +839,7 @@ func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
 		runtime.waitRes = waitResult{
 			exitCode: procutil.ExtractExitCode(reaper.Err()),
 			err:      reaper.Err(),
+			stopped:  reaper.Stopped(),
 		}
 		runtime.waitMu.Unlock()
 

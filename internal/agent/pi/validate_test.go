@@ -19,7 +19,9 @@ func TestValidateConfig_AcceptsEveryKey(t *testing.T) {
 
 	accepted := map[string]any{
 		"model":         "anthropic/claude-sonnet-4-5",
+		"effort":        "high",
 		"thinking":      "high",
+		"mcp_config":    "./mcp-servers.json",
 		"project_trust": "approve",
 		"allowed_tools": []any{"read", "grep"},
 		"denied_tools":  []any{"bash"},
@@ -46,6 +48,9 @@ func TestValidateConfig_AcceptsEveryKey(t *testing.T) {
 		"empty list":               map[string]any{"denied_tools": []any{}},
 		"nil value reads as unset": map[string]any{"model": nil, "allowed_tools": nil},
 	}
+
+	extra["effort and thinking, one empty"] = map[string]any{"effort": "high", "thinking": ""}
+	extra["effort with any level, forwarded as written"] = map[string]any{"effort": "turbo"}
 
 	for _, name := range slices.Sorted(maps.Keys(accepted)) {
 		t.Run(name, func(t *testing.T) {
@@ -77,13 +82,31 @@ func TestValidateConfig_Refusals(t *testing.T) {
 			name:      "unknown key",
 			config:    map[string]any{"auto_compact": false},
 			wantCheck: "pi.auto_compact.unknown_key",
-			wantMsg:   `unknown pi config key "auto_compact"; the pi block accepts allowed_tools, denied_tools, model, project_trust, thinking`,
+			wantMsg:   `unknown pi config key "auto_compact"; the pi block accepts allowed_tools, denied_tools, effort, mcp_config, model, project_trust, thinking`,
 		},
 		{
 			name:      "model wrong type",
 			config:    map[string]any{"model": 123},
 			wantCheck: "pi.model.wrong_type",
 			wantMsg:   "model: expected string, got integer",
+		},
+		{
+			name:      "effort wrong type",
+			config:    map[string]any{"effort": 7},
+			wantCheck: "pi.effort.wrong_type",
+			wantMsg:   "effort: expected string, got integer",
+		},
+		{
+			name:      "mcp_config wrong type",
+			config:    map[string]any{"mcp_config": []any{"a.json"}},
+			wantCheck: "pi.mcp_config.wrong_type",
+			wantMsg:   "mcp_config: expected string, got list",
+		},
+		{
+			name:      "effort and thinking both set",
+			config:    map[string]any{"effort": "high", "thinking": "low"},
+			wantCheck: "pi.effort.conflict",
+			wantMsg:   "pi.effort and pi.thinking both set the thinking level; set one of them",
 		},
 		{
 			name:      "thinking wrong type",

@@ -48,7 +48,7 @@ agent:
 
 pi:
   model: $SORTIE_PI_MODEL
-  thinking: high
+  effort: high
   # Keeps the workspace's own project-local files and packages out of the run,
   # which is what an unattended turn has to default to.
   project_trust: ignore
@@ -71,10 +71,9 @@ server:
      turns, so continuation uses the existing session instead of
      starting over.
 
-     pi has no MCP transport, so the `pi` block takes no mcp_config
-     and Sortie's own tools are neither advertised nor callable here.
-     The tool set the agent works with is narrowed by allowed_tools
-     and denied_tools instead.
+     On a local launch pi receives Sortie's own tools through a bridge
+     extension; over SSH it receives none. The tool set the agent works
+     with is narrowed by allowed_tools and denied_tools.
 
      Required env vars:
        SORTIE_JIRA_ENDPOINT  Jira Cloud base URL (e.g. https://mycompany.atlassian.net)

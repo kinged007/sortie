@@ -36,7 +36,7 @@ func integrationConfig() map[string]any {
 	return config
 }
 
-func newAdapter(t *testing.T, config map[string]any) domain.AgentAdapter {
+func newAdapter(t *testing.T) domain.AgentAdapter {
 	t.Helper()
 	factory, err := registry.Agents.Get("pi")
 	if err != nil {
@@ -46,11 +46,10 @@ func newAdapter(t *testing.T, config map[string]any) domain.AgentAdapter {
 	if err != nil {
 		t.Fatalf("factory(pi): %v", err)
 	}
-	_ = config
 	return adapter
 }
 
-func startSession(t *testing.T, adapter domain.AgentAdapter, workspace, resumeID string) domain.Session {
+func startSession(t *testing.T, adapter domain.AgentAdapter, config map[string]any, workspace, resumeID string) domain.Session {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -58,7 +57,7 @@ func startSession(t *testing.T, adapter domain.AgentAdapter, workspace, resumeID
 	session, err := adapter.StartSession(ctx, domain.StartSessionParams{
 		WorkspacePath:   workspace,
 		ResumeSessionID: resumeID,
-		Settings:        integrationConfig(),
+		Settings:        config,
 		AgentConfig: domain.AgentConfig{
 			Command:       integrationCommand(),
 			ReadTimeoutMS: 3 * 60 * 1000,
@@ -92,8 +91,8 @@ func runTurn(t *testing.T, adapter domain.AgentAdapter, session domain.Session, 
 func TestIntegration_HappyPathFreshTurn(t *testing.T) {
 	skipIfNotEnabled(t)
 
-	adapter := newAdapter(t, integrationConfig())
-	session := startSession(t, adapter, t.TempDir(), "")
+	adapter := newAdapter(t)
+	session := startSession(t, adapter, integrationConfig(), t.TempDir(), "")
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
 	events, result := runTurn(t, adapter, session, "Reply with exactly: hello")
@@ -115,8 +114,8 @@ func TestIntegration_SessionResume(t *testing.T) {
 	skipIfNotEnabled(t)
 
 	workspace := t.TempDir()
-	adapter := newAdapter(t, integrationConfig())
-	first := startSession(t, adapter, workspace, "")
+	adapter := newAdapter(t)
+	first := startSession(t, adapter, integrationConfig(), workspace, "")
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), first) })
 
 	_, firstResult := runTurn(t, adapter, first, "Reply with exactly: first")
@@ -127,8 +126,8 @@ func TestIntegration_SessionResume(t *testing.T) {
 		t.Fatal("first turn returned no session id")
 	}
 
-	resumedAdapter := newAdapter(t, integrationConfig())
-	resumed := startSession(t, resumedAdapter, workspace, firstResult.SessionID)
+	resumedAdapter := newAdapter(t)
+	resumed := startSession(t, resumedAdapter, integrationConfig(), workspace, firstResult.SessionID)
 	t.Cleanup(func() { _ = resumedAdapter.StopSession(context.Background(), resumed) })
 
 	_, resumedResult := runTurn(t, resumedAdapter, resumed, "Reply with exactly: second")
@@ -142,8 +141,8 @@ func TestIntegration_InvalidModelFailure(t *testing.T) {
 
 	config := integrationConfig()
 	config["model"] = "sortie-invalid/nonexistent-model"
-	adapter := newAdapter(t, config)
-	session := startSession(t, adapter, t.TempDir(), "")
+	adapter := newAdapter(t)
+	session := startSession(t, adapter, config, t.TempDir(), "")
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
 	events, result := runTurn(t, adapter, session, "Reply with exactly: hello")
@@ -155,8 +154,8 @@ func TestIntegration_InvalidModelFailure(t *testing.T) {
 func TestIntegration_ToolAndUsage(t *testing.T) {
 	skipIfNotEnabled(t)
 
-	adapter := newAdapter(t, integrationConfig())
-	session := startSession(t, adapter, t.TempDir(), "")
+	adapter := newAdapter(t)
+	session := startSession(t, adapter, integrationConfig(), t.TempDir(), "")
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
 	events, result := runTurn(t, adapter, session,
@@ -183,8 +182,8 @@ func TestIntegration_ToolAndUsage(t *testing.T) {
 func TestIntegration_TurnCancellation(t *testing.T) {
 	skipIfNotEnabled(t)
 
-	adapter := newAdapter(t, integrationConfig())
-	session := startSession(t, adapter, t.TempDir(), "")
+	adapter := newAdapter(t)
+	session := startSession(t, adapter, integrationConfig(), t.TempDir(), "")
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -231,7 +231,7 @@ func TestAssistantDelta(t *testing.T) {
 			}
 			delta, err := event.assistantDelta()
 			if err != nil {
-				t.Fatalf("assistantDelta() error = %v, want the 0.85.1 variant %q to be accepted", err, variant)
+				t.Fatalf("assistantDelta() error = %v, want the pi variant %q to be accepted", err, variant)
 			}
 			if delta.Type != variant {
 				t.Errorf("Type = %q, want %q", delta.Type, variant)
@@ -247,7 +247,7 @@ func TestAssistantDelta(t *testing.T) {
 		{
 			name:    "unknown variant",
 			event:   rawRunEvent{Type: "message_update", AssistantMessageEvent: []byte(`{"type":"teleport_delta"}`)},
-			wantErr: `type "teleport_delta" is not part of the pi 0.85.1 schema`,
+			wantErr: `type "teleport_delta" is not part of the pi schema`,
 		},
 		{
 			name:    "no payload",
@@ -421,6 +421,48 @@ func TestKnownEventTypes(t *testing.T) {
 		}
 	}
 	if (&rawRunEvent{Type: "future_event"}).known() {
-		t.Error(`known("future_event") = true, want false: a type outside the 0.85.1 schema is a fault`)
+		t.Error(`known("future_event") = true, want false: a type outside the pi schema is a fault`)
+	}
+}
+
+func TestResultText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		result string
+		want   string
+	}{
+		{name: "text blocks are joined", result: `{"content":[{"type":"text","text":"exit "},{"type":"text","text":"status 1"}]}`, want: "exit status 1"},
+		{name: "non-text blocks are skipped", result: `{"content":[{"type":"image"},{"type":"text","text":"boom"}]}`, want: "boom"},
+		{name: "no content", result: `{"content":[]}`, want: ""},
+		{name: "absent result", result: ``, want: ""},
+		{name: "malformed result", result: `[1]`, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			event := rawRunEvent{Type: "tool_execution_end", Result: []byte(tt.result)}
+			if got := event.resultText(); got != tt.want {
+				t.Errorf("resultText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompletedMessage_SystemStringContent(t *testing.T) {
+	t.Parallel()
+	event, err := parseRunEvent([]byte(`{"type":"message_end","message":{"role":"system","content":"be brief","sections":{"preamble":"x"}}}`))
+	if err != nil {
+		t.Fatalf("parseRunEvent() error = %v", err)
+	}
+	msg, err := event.completedMessage()
+	if err != nil {
+		t.Fatalf("completedMessage() error = %v", err)
+	}
+	if msg.Role != "system" {
+		t.Errorf("Role = %q, want system", msg.Role)
 	}
 }

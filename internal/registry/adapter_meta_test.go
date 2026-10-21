@@ -252,14 +252,14 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageLimit:         registry.UsageLimitRecognized,
 			},
 			{
-				name:                   "pi requires command, declares MCP dialect mcp_servers_json, derives turn_end/per_model usage, declares no resume blocker, and declares no credential names",
+				name:                   "pi requires command, declares MCP dialect mcp_servers_json, derives turn_end/per_model usage, declares no resume blocker, and declares no credential names, and forwards effort",
 				kind:                   "pi",
 				wantCommand:            true,
 				wantMCPDialect:         registry.MCPDialectMCPServersJSON,
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
-				wantEffortForwarding:   registry.EffortNotForwarded,
+				wantEffortForwarding:   registry.EffortForwarded,
 				wantUsageLimit:         registry.UsageLimitRecognized,
 			},
 			{
