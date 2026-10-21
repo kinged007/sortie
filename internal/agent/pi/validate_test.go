@@ -3,6 +3,7 @@ package pi
 import (
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -54,6 +55,101 @@ func TestValidateConfig_AcceptsEveryKey(t *testing.T) {
 			t.Parallel()
 			assertNoDiagnostics(t, extra[name].(map[string]any))
 		})
+	}
+}
+
+// TestValidateConfig_Refusals asserts the diagnostic key and the exact
+// text of every refusal the pi block makes, so an operator's remedy
+// cannot change wording without a failure here.
+func TestValidateConfig_Refusals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		config    map[string]any
+		wantCheck string
+		wantMsg   string
+	}{
+		{
+			name:      "unknown key",
+			config:    map[string]any{"auto_compact": false},
+			wantCheck: "pi.auto_compact.unknown_key",
+			wantMsg:   `unknown pi config key "auto_compact"; the pi block accepts effort, mcp_config, model, project_trust`,
+		},
+		{
+			name:      "model wrong type",
+			config:    map[string]any{"model": 123},
+			wantCheck: "pi.model.wrong_type",
+			wantMsg:   "model: expected string, got integer",
+		},
+		{
+			name:      "mcp_config wrong type",
+			config:    map[string]any{"mcp_config": []any{"a.json"}},
+			wantCheck: "pi.mcp_config.wrong_type",
+			wantMsg:   "mcp_config: expected string, got list",
+		},
+		{
+			name:      "project_trust wrong type",
+			config:    map[string]any{"project_trust": []any{"approve"}},
+			wantCheck: "pi.project_trust.wrong_type",
+			wantMsg:   "project_trust: expected string, got list",
+		},
+		{
+			name:      "project_trust invalid value",
+			config:    map[string]any{"project_trust": "maybe"},
+			wantCheck: "pi.project_trust.invalid_value",
+			wantMsg:   `project_trust: "maybe" is not a pi trust setting; valid values are ignore, approve`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: tt.config})
+			if len(diags) != 1 {
+				t.Fatalf("validateConfig() = %+v, want exactly one diagnostic for %v", diags, tt.config)
+			}
+			if diags[0].Severity != "error" {
+				t.Errorf("Severity = %q, want %q", diags[0].Severity, "error")
+			}
+			if diags[0].Check != tt.wantCheck {
+				t.Errorf("Check = %q, want %q", diags[0].Check, tt.wantCheck)
+			}
+			if diags[0].Message != tt.wantMsg {
+				t.Errorf("Message = %q, want %q", diags[0].Message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestValidateConfig_ReportsEveryFaultOnce pins the two properties an
+// operator fixing a pi block depends on: every mistake in one pass, and
+// one diagnostic per mistake.
+func TestValidateConfig_ReportsEveryFaultOnce(t *testing.T) {
+	t.Parallel()
+
+	diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: map[string]any{
+		"model":         123,
+		"project_trust": "maybe",
+		"auto_compact":  false,
+	}})
+
+	var checks []string
+	for _, d := range diags {
+		checks = append(checks, d.Check)
+		if d.Severity != "error" {
+			t.Errorf("severity = %q, want %q", d.Severity, "error")
+		}
+	}
+
+	want := []string{
+		"pi.auto_compact.unknown_key",
+		"pi.model.wrong_type",
+		"pi.project_trust.invalid_value",
+	}
+	if strings.Join(checks, "|") != strings.Join(want, "|") {
+		t.Errorf("checks = %v, want %v", checks, want)
 	}
 }
 

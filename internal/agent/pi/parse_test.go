@@ -1,6 +1,8 @@
 package pi
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -144,6 +146,74 @@ func TestCompletedMessage(t *testing.T) {
 	}
 }
 
+func TestAssistantDelta(t *testing.T) {
+	t.Parallel()
+
+	for _, variant := range slices.Sorted(maps.Keys(knownDeltaTypes)) {
+		t.Run(variant, func(t *testing.T) {
+			t.Parallel()
+
+			event := rawRunEvent{
+				Type:                  "message_update",
+				AssistantMessageEvent: []byte(`{"type":"` + variant + `","contentIndex":0,"delta":"x"}`),
+			}
+			delta, err := event.assistantDelta()
+			if err != nil {
+				t.Fatalf("assistantDelta() error = %v, want the pi variant %q to be accepted", err, variant)
+			}
+			if delta.Type != variant {
+				t.Errorf("Type = %q, want %q", delta.Type, variant)
+			}
+		})
+	}
+
+	tests := []struct {
+		name    string
+		event   rawRunEvent
+		wantErr string
+	}{
+		{
+			name:    "unknown variant",
+			event:   rawRunEvent{Type: "message_update", AssistantMessageEvent: []byte(`{"type":"teleport_delta"}`)},
+			wantErr: `type "teleport_delta" is not part of the pi schema`,
+		},
+		{
+			name:    "no payload",
+			event:   rawRunEvent{Type: "message_update"},
+			wantErr: "assistantMessageEvent: missing payload",
+		},
+		{
+			name:    "payload is a string",
+			event:   rawRunEvent{Type: "message_update", AssistantMessageEvent: []byte(`"nope"`)},
+			wantErr: "assistantMessageEvent",
+		},
+		{
+			name:    "no type",
+			event:   rawRunEvent{Type: "message_update", AssistantMessageEvent: []byte(`{"contentIndex":0}`)},
+			wantErr: "assistantMessageEvent carries no type",
+		},
+		{
+			name:    "wrong event type",
+			event:   rawRunEvent{Type: "turn_end", AssistantMessageEvent: []byte(`{"type":"done"}`)},
+			wantErr: `event "turn_end" carries no assistant message event`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := tt.event.assistantDelta()
+			if err == nil {
+				t.Fatal("assistantDelta() error = nil, want a refusal")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("assistantDelta() error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestRawMessageFailure(t *testing.T) {
 	t.Parallel()
 
@@ -266,6 +336,47 @@ func TestAddUsage(t *testing.T) {
 	}
 	if got := addUsage(domain.TokenUsage{}, domain.TokenUsage{}); got != (domain.TokenUsage{}) {
 		t.Errorf("addUsage(zero, zero) = %+v, want the zero figure", got)
+	}
+}
+
+func TestKnownEventTypes(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range slices.Sorted(maps.Keys(knownEventTypes)) {
+		event := rawRunEvent{Type: typ}
+		if !event.known() {
+			t.Errorf("known(%q) = false, want true: a type in the schema set is recognized, not a fault", typ)
+		}
+	}
+	if (&rawRunEvent{Type: "future_event"}).known() {
+		t.Error(`known("future_event") = true, want false: a type outside the pi schema is a fault`)
+	}
+}
+
+func TestResultText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		result string
+		want   string
+	}{
+		{name: "text blocks are joined", result: `{"content":[{"type":"text","text":"exit "},{"type":"text","text":"status 1"}]}`, want: "exit status 1"},
+		{name: "non-text blocks are skipped", result: `{"content":[{"type":"image"},{"type":"text","text":"boom"}]}`, want: "boom"},
+		{name: "no content", result: `{"content":[]}`, want: ""},
+		{name: "absent result", result: ``, want: ""},
+		{name: "malformed result", result: `[1]`, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			event := rawRunEvent{Type: "tool_execution_end", Result: []byte(tt.result)}
+			if got := event.resultText(); got != tt.want {
+				t.Errorf("resultText() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

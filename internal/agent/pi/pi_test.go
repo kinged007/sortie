@@ -3,8 +3,10 @@ package pi
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -112,6 +114,36 @@ func TestRunTurn_SimpleText(t *testing.T) {
 	}
 	if err := a.StopSession(context.Background(), session); err != nil {
 		t.Fatalf("StopSession() error = %v", err)
+	}
+}
+
+// TestRunTurn_ReasoningStaysOutOfOutput pins that pi's reasoning blocks
+// are internal deliberation: they never become a notification, and their
+// tokens are never added to the response's output a second time.
+func TestRunTurn_ReasoningStaysOutOfOutput(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "thinking_turn.jsonl"))
+	events, result, err := collectEvents(t, a, session, "greet me")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	got := notificationMessages(events)
+	if len(got) != 1 || got[0] != "Hi." {
+		t.Errorf("notifications = %v, want exactly [\"Hi.\"]: thinking must not become assistant text", got)
+	}
+	// pi reports output 40 including 30 reasoning tokens; adding
+	// reasoning again would report 70.
+	if result.Usage.OutputTokens != 40 {
+		t.Errorf("OutputTokens = %d, want 40: pi's output already includes reasoning", result.Usage.OutputTokens)
+	}
+	if result.Usage.InputTokens != 300 {
+		t.Errorf("InputTokens = %d, want 300", result.Usage.InputTokens)
 	}
 }
 
@@ -255,7 +287,7 @@ func TestRunTurn_ExitZeroNoWorkIsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
-	session := mustStartSession(t, a, dir, writeInlineRunScript(t, dir, `{"type":"agent_start"}`, `{"type":"turn_start"}`, `{"type":"agent_end","messages":[],"willRetry":false}`))
+	session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "framing_only.jsonl"))
 	_, result, err := collectEvents(t, a, session, "work")
 
 	if err == nil {
@@ -265,6 +297,135 @@ func TestRunTurn_ExitZeroNoWorkIsFailure(t *testing.T) {
 	if result.ExitReason != agentcore.DecideTurn(agentcoreT).ExitReason {
 		t.Errorf("ExitReason = %q, want the shared zero-work row %q", result.ExitReason, agentcore.DecideTurn(agentcoreT).ExitReason)
 	}
+}
+
+// TestRunTurn_FramingEventsProduceNothing asserts that the event families
+// carrying no content are recognized rather than dropped: an
+// unrecognized type is a malformed line, so a framing event that arrived
+// without being reported proves the two are distinguishable.
+func TestRunTurn_FramingEventsProduceNothing(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "framing_only.jsonl"))
+	events, result, _ := collectEvents(t, a, session, "work")
+
+	if got := eventsOfType(events, domain.EventMalformed); len(got) != 0 {
+		t.Errorf("malformed events = %+v, want none: every framing type is part of the pi schema", got)
+	}
+	if got := eventsOfType(events, domain.EventToolResult); len(got) != 0 {
+		t.Errorf("tool results = %+v, want none: this fixture has no tool_execution_end", got)
+	}
+	// No assistant message_end and no turn_end, so no assistant output.
+	if result.ExitReason != domain.EventTurnFailed {
+		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+	}
+}
+
+// TestRunTurn_MalformedLinesAreReported asserts that every fault class
+// the pi stream can carry reaches the orchestrator as a malformed
+// event rather than as a silently successful turn: an undecodable
+// nested payload, a terminal record with no role, an unknown event type,
+// an unknown delta variant, and a non-object line.
+func TestRunTurn_MalformedLinesAreReported(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "malformed_turn.jsonl"))
+	events, _, err := collectEvents(t, a, session, "work")
+	if err == nil {
+		t.Fatal("RunTurn() error = nil, want the no-work failure after only malformed lines")
+	}
+	if agentErr, ok := err.(*domain.AgentError); !ok || agentErr.Kind != domain.ErrTurnFailed {
+		t.Fatalf("RunTurn() error = %v, want a turn failure after only malformed lines", err)
+	}
+
+	// malformed_turn.jsonl carries one bad line per fault class: an
+	// undecodable turn_end message, a message with no role, a turn_end
+	// with no message at all, a message whose content is not a list, two
+	// bad message_updates, a tool_execution_end with no toolName, and an
+	// unknown event type.
+	malformed := eventsOfType(events, domain.EventMalformed)
+	if len(malformed) != 9 {
+		t.Errorf("malformed count = %d, want 9: %+v", len(malformed), malformed)
+	}
+	for _, want := range []string{
+		`event "turn_end" message`,
+		"carries no role",
+		"missing payload",
+		`event "message_end" message`,
+		"assistantMessageEvent",
+		"carries no toolName",
+		"unknown pi event type \"future_event\"",
+	} {
+		found := false
+		for _, e := range malformed {
+			if strings.Contains(e.Message, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no malformed event mentions %q: %+v", want, malformed)
+		}
+	}
+}
+
+func TestRunTurn_NonObjectLineIsMalformed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	script := writePiScript(t, dir, `printf 'pi: warming up\n'
+printf '{"type":"session","version":3,"id":"s1","timestamp":"t","cwd":"%s"}\n' "$PWD"`)
+	session := mustStartSession(t, a, dir, script)
+	events, _, _ := collectEvents(t, a, session, "work")
+
+	malformed := eventsOfType(events, domain.EventMalformed)
+	if len(malformed) != 1 || !strings.Contains(malformed[0].Message, "warming up") {
+		t.Errorf("malformed = %+v, want exactly one carrying the non-JSON line", malformed)
+	}
+}
+
+// TestRunTurn_MixedModelAttribution pins the deterministic rule for a
+// turn whose responses came from more than one model: the usage event
+// names the last counted response's model, and both responses'
+// usage is summed.
+func TestRunTurn_MixedModelAttribution(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	script := writePiScript(t, dir, `cat <<EOF
+{"type":"session","version":3,"id":"mix-1","timestamp":"t","cwd":"$PWD"}
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"first"}],"api":"anthropic-messages","provider":"anthropic","model":"model-one","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12},"stopReason":"stop"}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"first"}],"api":"anthropic-messages","provider":"anthropic","model":"model-one","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12},"stopReason":"stop"},"toolResults":[]}
+{"type":"turn_start"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"second"}],"api":"openai-responses","provider":"openai","model":"model-two","usage":{"input":20,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":23},"stopReason":"stop"}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"second"}],"api":"openai-responses","provider":"openai","model":"model-two","usage":{"input":20,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":23},"stopReason":"stop"},"toolResults":[]}
+EOF`)
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, script)
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	want := domain.TokenUsage{InputTokens: 30, OutputTokens: 5, TotalTokens: 35}
+	if result.Usage != want {
+		t.Errorf("usage = %+v, want %+v", result.Usage, want)
+	}
+	agenttest.AssertModelReported(t, events, "model-two")
 }
 
 // TestRunTurn_UsageAccumulatesAcrossTurns asserts the session's
@@ -397,6 +558,158 @@ func assistantMessage(text string, input, output int) string {
 		text, input, output)
 }
 
+// TestRunTurn_EveryDeltaVariantIsRecognized walks the pi delta set
+// through a real stream. An unlisted variant is reported as a malformed
+// line, so a variant the CLI does write but the adapter does not know
+// fails here by name.
+func TestRunTurn_EveryDeltaVariantIsRecognized(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	msg := assistantMessage("done", 30, 4)
+
+	lines := []string{`{"type":"turn_start"}`}
+	for _, variant := range slices.Sorted(maps.Keys(knownDeltaTypes)) {
+		lines = append(lines, fmt.Sprintf(
+			`{"type":"message_update","assistantMessageEvent":{"type":%q,"contentIndex":0,"delta":"x"}}`, variant))
+	}
+	lines = append(lines,
+		`{"type":"message_end","message":`+msg+`}`,
+		`{"type":"turn_end","message":`+msg+`,"toolResults":[]}`,
+	)
+
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeInlineRunScript(t, dir, lines...))
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	if got := eventsOfType(events, domain.EventMalformed); len(got) != 0 {
+		t.Errorf("malformed events = %+v, want none: every pi delta variant is recognized", got)
+	}
+	if got := notificationMessages(events); len(got) != 1 || got[0] != "done" {
+		t.Errorf("notifications = %v, want exactly [\"done\"]", got)
+	}
+	if result.Usage != (domain.TokenUsage{InputTokens: 30, OutputTokens: 4, TotalTokens: 34}) {
+		t.Errorf("usage = %+v, want the response counted once", result.Usage)
+	}
+}
+
+// TestRunTurn_ToolErrorComesFromTheTopLevelFlag pins which isError the
+// tool result carries. The nested result object also carries one, and the
+// two can disagree: the top-level flag is the CLI's verdict for the
+// execution, and the nested one belongs to the tool's own output.
+func TestRunTurn_ToolErrorComesFromTheTopLevelFlag(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	msg := assistantMessage("ran both", 40, 6)
+	lines := []string{
+		`{"type":"turn_start"}`,
+		`{"type":"message_end","message":` + msg + `}`,
+		`{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","result":{"content":[],"isError":true}}`,
+		`{"type":"tool_execution_end","toolCallId":"c2","toolName":"bash","result":{"content":[],"isError":false},"isError":true}`,
+		`{"type":"turn_end","message":` + msg + `,"toolResults":[]}`,
+	}
+
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeInlineRunScript(t, dir, lines...))
+	events, _, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	tools := eventsOfType(events, domain.EventToolResult)
+	if len(tools) != 2 {
+		t.Fatalf("tool results = %+v, want 2", tools)
+	}
+	if tools[0].ToolName != "read" || tools[0].ToolError {
+		t.Errorf("first tool result = %+v, want name %q with ToolError false: the nested result's flag is not the verdict", tools[0], "read")
+	}
+	if tools[1].ToolName != "bash" || !tools[1].ToolError {
+		t.Errorf("second tool result = %+v, want name %q with ToolError true", tools[1], "bash")
+	}
+}
+
+// TestRunTurn_TurnEndSuppliesTheMissingMessage covers the fallback: a
+// stream that delivered no message_end still reports the assistant
+// response, because turn_end names the same response and is the only
+// place its usage appears.
+func TestRunTurn_TurnEndSuppliesTheMissingMessage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	msg := assistantMessage("only turn_end", 12, 3)
+	script := writeInlineRunScript(t, dir,
+		`{"type":"turn_start"}`,
+		`{"type":"turn_end","message":`+msg+`,"toolResults":[]}`,
+	)
+
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, script)
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	if got := notificationMessages(events); len(got) != 1 || got[0] != "only turn_end" {
+		t.Errorf("notifications = %v, want exactly [\"only turn_end\"]", got)
+	}
+	if result.Usage != (domain.TokenUsage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15}) {
+		t.Errorf("usage = %+v, want the turn_end figure settled", result.Usage)
+	}
+}
+
+// TestRunTurn_AgentEndRepeatsNeitherTextNorUsage pins that agent_end,
+// which replays every message of the run, contributes nothing: the text
+// has already been reported and the usage already counted, so reading it
+// would report the response twice and bill it twice.
+func TestRunTurn_AgentEndRepeatsNeitherTextNorUsage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	first := assistantMessage("once", 10, 2)
+	second := assistantMessage("twice", 20, 4)
+	lines := []string{
+		`{"type":"turn_start"}`,
+		`{"type":"message_end","message":` + first + `}`,
+		`{"type":"turn_end","message":` + first + `,"toolResults":[]}`,
+		`{"type":"turn_start"}`,
+		`{"type":"message_end","message":` + second + `}`,
+		`{"type":"turn_end","message":` + second + `,"toolResults":[]}`,
+		`{"type":"agent_end","messages":[` + first + `,` + second + `],"willRetry":false}`,
+	}
+
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session := mustStartSession(t, a, dir, writeInlineRunScript(t, dir, lines...))
+	events, result, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	want := []string{"once", "twice"}
+	if got := notificationMessages(events); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("notifications = %v, want %v: agent_end replays the same messages", got, want)
+	}
+	// 10+2 and 20+4 counted once each; agent_end's copies add nothing.
+	if result.Usage != (domain.TokenUsage{InputTokens: 30, OutputTokens: 6, TotalTokens: 36}) {
+		t.Errorf("usage = %+v, want the two responses counted once each", result.Usage)
+	}
+}
+
 // TestRunTurn_SpendMarks pins which stream events mark the turn as having
 // reached the model and which settle it, through the spend flags the
 // shared rule writes onto the result.
@@ -501,6 +814,100 @@ func TestRunTurn_SpendMarks(t *testing.T) {
 			}
 			if result.SpendCoverable != tt.wantCoverable {
 				t.Errorf("SpendCoverable = %v, want %v", result.SpendCoverable, tt.wantCoverable)
+			}
+		})
+	}
+}
+
+// TestRunTurn_RealStreams replays streams captured from pi 1.3.0 with the
+// system prompt text omitted. They carry events the synthetic fixtures do
+// not: a system message with string content and sections, entry_appended,
+// auto_retry_start, auto_retry_end and agent_settled, and a run of several
+// agent_start/agent_end pairs.
+func TestRunTurn_RealStreams(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		fixture      string
+		wantFailure  string
+		wantNotes    []string
+		wantTools    []string
+		wantInput    int64
+		wantOutput   int64
+		wantComplete bool
+	}{
+		{
+			name:         "simple turn",
+			fixture:      "real_simple_turn.jsonl",
+			wantNotes:    []string{"OK"},
+			wantInput:    29442,
+			wantOutput:   4,
+			wantComplete: true,
+		},
+		{
+			name:         "tool call",
+			fixture:      "real_tool_turn.jsonl",
+			wantNotes:    []string{"I'll read the file a.txt for you.", "hello"},
+			wantTools:    []string{"read"},
+			wantInput:    20673,
+			wantOutput:   71,
+			wantComplete: true,
+		},
+		{
+			name:        "upstream error after every retry",
+			fixture:     "real_retry_error.jsonl",
+			wantFailure: "Unsupported model mimo-v2.5-pro",
+		},
+		{
+			name:         "retry that succeeds",
+			fixture:      "retry_then_success.jsonl",
+			wantNotes:    []string{"OK"},
+			wantInput:    29442,
+			wantOutput:   4,
+			wantComplete: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			a, err := NewPiAdapter()
+			if err != nil {
+				t.Fatalf("NewPiAdapter() error = %v", err)
+			}
+			session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, tt.fixture))
+			events, result, err := collectEvents(t, a, session, "do work")
+
+			if bad := eventsOfType(events, domain.EventMalformed); len(bad) != 0 {
+				t.Errorf("malformed events = %+v, want none", bad)
+			}
+			if tt.wantComplete {
+				if err != nil {
+					t.Fatalf("RunTurn() error = %v, want nil", err)
+				}
+				if result.ExitReason != domain.EventTurnCompleted {
+					t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tt.wantFailure) {
+					t.Fatalf("RunTurn() error = %v, want it to contain %q", err, tt.wantFailure)
+				}
+				if result.ExitReason != domain.EventTurnFailed {
+					t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+				}
+			}
+			if got := notificationMessages(events); !slices.Equal(got, tt.wantNotes) {
+				t.Errorf("notifications = %v, want %v", got, tt.wantNotes)
+			}
+			var tools []string
+			for _, e := range eventsOfType(events, domain.EventToolResult) {
+				tools = append(tools, e.ToolName)
+			}
+			if !slices.Equal(tools, tt.wantTools) {
+				t.Errorf("tool results = %v, want %v", tools, tt.wantTools)
+			}
+			if result.Usage.InputTokens != tt.wantInput || result.Usage.OutputTokens != tt.wantOutput {
+				t.Errorf("usage = %+v, want input %d output %d", result.Usage, tt.wantInput, tt.wantOutput)
 			}
 		})
 	}

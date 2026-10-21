@@ -119,4 +119,4 @@ The preflight reports this: `agent.kind.no_tool_channel` warns that the kind has
 
 ## Verifying a change
 
-The package's own tests drive a fake `pi` written as a shell script, so argument construction, the parser, usage accounting, session resume, and the main exit paths are covered hermetically. There is no live-runtime suite in this package; a change to the event vocabulary is therefore only as trustworthy as the fixtures, so a version bump should re-run the turn against the real binary and diff the stream against the recorded fixtures before the accepted sets are widened.
+The package's own tests drive a fake `pi` written as a shell script, so argument construction, every event family, session resume, workspace and session-id mismatch, cancellation, and each exit path are covered hermetically. There is no live-runtime suite in this package; a change to the event vocabulary is therefore only as trustworthy as the fixtures, so a version bump should re-run the turn against the real binary and diff the stream against the recorded fixtures before the accepted sets are widened.
