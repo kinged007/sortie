@@ -15,6 +15,8 @@ type passthroughConfig struct {
 	Effort       string
 	Thinking     string
 	ProjectTrust projectTrust
+	AllowedTools []string
+	DeniedTools  []string
 }
 
 // projectTrust is the operator's decision about whether pi loads the
@@ -47,6 +49,8 @@ var knownConfigKeys = map[string]struct{}{
 	"thinking":      {},
 	"mcp_config":    {},
 	"project_trust": {},
+	"allowed_tools": {},
+	"denied_tools":  {},
 }
 
 // genericConfigKeys are the keys the agent block contributes to every
@@ -157,6 +161,17 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 			trust, trustIgnore, trustApprove))
 	}
 
+	allowed, allowedFaults := toolList(config, "allowed_tools")
+	faults = append(faults, allowedFaults...)
+	pt.AllowedTools = allowed
+
+	denied, deniedFaults := toolList(config, "denied_tools")
+	faults = append(faults, deniedFaults...)
+	pt.DeniedTools = denied
+
+	if message := overlapMessage(pt.AllowedTools, pt.DeniedTools); message != "" {
+		faults = append(faults, fault("allowed_tools.overlap", "%s", message))
+	}
 	if message := thinkingConflictMessage(pt); message != "" {
 		faults = append(faults, fault(registry.EffortKey+".conflict", "%s", message))
 	}
@@ -165,6 +180,48 @@ func parsePassthroughConfig(config map[string]any) (passthroughConfig, []*config
 		return passthroughConfig{}, faults
 	}
 	return pt, nil
+}
+
+// toolList reads one tool-list key. A value that is not a list of
+// non-empty tool names is refused: typeutil.ExtractStringSlice drops
+// what it cannot read, so accepting its output would hand pi a shorter
+// list than the operator wrote.
+func toolList(config map[string]any, key string) ([]string, []*configFault) {
+	raw, present := config[key]
+	if !present || raw == nil {
+		return nil, nil
+	}
+
+	var items []any
+	switch typed := raw.(type) {
+	case []any:
+		items = typed
+	case []string:
+		items = make([]any, len(typed))
+		for i, name := range typed {
+			items[i] = name
+		}
+	default:
+		return nil, []*configFault{fault(key+".wrong_type",
+			"%s: expected list, got %s", key, typeutil.DescribeYAMLType(raw))}
+	}
+
+	var names []string
+	var faults []*configFault
+	for i, item := range items {
+		name, ok := item.(string)
+		if !ok {
+			faults = append(faults, fault(key+".malformed_list",
+				"%s[%d]: expected a tool name, got %s", key, i, typeutil.DescribeYAMLType(item)))
+			continue
+		}
+		if strings.TrimSpace(name) == "" {
+			faults = append(faults, fault(key+".malformed_list", "%s[%d]: tool name is empty", key, i))
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, faults
 }
 
 // unknownConfigKeys returns the config keys pi does not accept, sorted.
@@ -213,6 +270,12 @@ func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	}
 	if level := pt.thinkingLevel(); level != "" {
 		args = append(args, "--thinking", level)
+	}
+	if len(pt.AllowedTools) > 0 {
+		args = append(args, "--tools", strings.Join(pt.AllowedTools, ","))
+	}
+	if len(pt.DeniedTools) > 0 {
+		args = append(args, "--exclude-tools", strings.Join(pt.DeniedTools, ","))
 	}
 	if pt.ProjectTrust == trustApprove {
 		args = append(args, "--approve")
