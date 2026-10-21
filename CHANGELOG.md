@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- The new `pi` agent kind runs the Pi CLI, one `pi -p --mode json` process per turn, and resumes a session across turns. Its `pi` settings block takes `model` and `approve`: `approve: true` passes `--approve` so pi loads the workspace's own project resources, and the default passes `--no-approve`. A `pi` block's `effort` is not forwarded to pi, and a workflow that sets it draws the `agent.effort.not_forwarded` advisory. The prompt goes to pi on standard input. A `pi` session has no Sortie tool channel: Sortie's tools, and the servers `pi.mcp_config` names, are not delivered to it. A response that ends with stop reason `error` or `aborted` fails the turn as `turn_failed`, and one that ends at the output token limit fails it as `turn_token_limit`, although pi exits 0 for both. Token usage is reported per model request as each response completes, with cache write tokens kept, so a `pi` session reports its API request count. A `pi` turn on an SSH worker carries the variables `worker.ssh_pass_env` lists.
+
 ## [1.30.0] - 2026-10-23
 
 ### Added
