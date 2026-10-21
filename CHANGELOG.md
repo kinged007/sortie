@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- The new `pi` agent kind runs the Pi CLI, one `pi -p --mode json` process per turn, and resumes a session across turns. Its `pi` settings block takes `model`, `effort`, `thinking`, `project_trust`, `allowed_tools`, `denied_tools`, and `mcp_config`; `effort` is forwarded to pi's `--thinking` flag on every turn, and setting both `effort` and `thinking` fails validation. The prompt goes to pi on standard input. A `pi` session has no Sortie tool channel: Sortie's tools, and the servers `pi.mcp_config` names, are not delivered to it. Token usage is recorded per model and includes the summarization calls of pi's context compaction, and a `pi` turn on an SSH worker carries the variables `worker.ssh_pass_env` lists.
+- The new `pi` agent kind runs the Pi CLI, one `pi -p --mode json` process per turn, and resumes a session across turns. It needs pi 0.99.0 or later, published on npm as `@earendil-works/pi-coding-agent`, and a session on an older or unreadable version fails at start. Its `pi` settings block takes `model`, `effort`, `thinking`, `project_trust`, `allowed_tools`, `denied_tools`, and `mcp_config`; `effort` is forwarded to pi's `--thinking` flag on every turn, and setting both `effort` and `thinking` fails validation. The prompt goes to pi on standard input. Sortie's tools, and the servers `pi.mcp_config` names, are available to a local `pi` session through a bridge extension; a `pi` session on an SSH worker has none. Token usage is recorded per model and includes the summarization calls of pi's context compaction, and a `pi` turn on an SSH worker carries the variables `worker.ssh_pass_env` lists.
 
 ### Changed
 

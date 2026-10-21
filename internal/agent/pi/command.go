@@ -256,10 +256,16 @@ func sortedConfigKeys() []string {
 // as a file to include) nor a prompt longer than the kernel's argument
 // limit reaches the command line. cmd.Dir is already the workspace, so
 // no --dir. A credential-verification session is ephemeral: --no-session
-// leaves no session file behind.
+// leaves no session file behind. When the session carries Sortie MCP
+// servers locally the static bridge extension is loaded through
+// --extension and the JSON document is delivered through
+// SORTIE_PI_MCP_SERVERS in the turn's environment.
 func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	args := []string{"-p", "--mode", "json"}
 
+	if state.mcpBridgePath != "" {
+		args = append(args, "--extension", state.mcpBridgePath)
+	}
 	if state.credentialVerification {
 		args = append(args, "--no-session")
 	} else if state.sessionID != "" {

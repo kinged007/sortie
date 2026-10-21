@@ -1,22 +1,29 @@
 # Pi adapter notes
 
-Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: what `pi -p --mode json` actually writes to stdout, why the exit code is not a failure signal, how session identity and resume work, and why Sortie's own tools do not reach the runtime.
+Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: what `pi -p --mode json` actually writes to stdout, why the exit code is not a failure signal, how session identity and resume work, and how Sortie's own tools reach the runtime.
 
 ## Where to get the volatile facts
 
-Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 1.3.0 schema, so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
+Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 1.3.0 schema (the adapter requires 0.99.0 or later), so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
 
-## Launch contract
+## Version check and launch contract
+
+`StartSession` runs the configured command with `--version` at every session start and accepts pi 0.99.0 or later. A version below that, or no readable version, refuses the session with error kind `agent_not_found`. The refusal names the package, `@earendil-works/pi-coding-agent`, which publishes pi on npm. The check runs before the bridge extension file is written.
+
+The minimum is the newest of the releases that added what the adapter launches with: `--exclude-tools` in 0.77.0, `--approve` and `--no-approve` in 0.79.0, and `--extension` with `pi.registerMcpServer` in 0.99.0. The event stream shapes the parser reads were checked against pi 1.3.0.
+
+The launch contract:
 
 - The prompt is written to standard input, not passed on the command line. pi treats a message argument beginning with `@` as a file to include, and Linux limits a single argument string to 128 KiB. Over SSH the prompt follows the environment preamble on standard input.
 - A credential-verification run adds `--no-session`, so it leaves no session file in the runtime's session store.
+- The version query's environment never carries `SORTIE_PI_MCP_SERVERS`, and neither does a turn's: an inherited value is removed before the adapter adds its own.
 
 ## The surface Sortie drives
 
 The adapter launches one subprocess per turn:
 
 ```
-pi -p --mode json [--session <id> | --no-session] [--model <name>] \
+pi -p --mode json [--extension <bridge>] [--session <id> | --no-session] [--model <name>] \
    [--thinking <level>] [--tools a,b] [--exclude-tools c,d] [--approve | --no-approve]
 ```
 
@@ -74,7 +81,7 @@ Every key the `pi` block accepts maps to a flag, and a key outside the accepted 
 
 - `model` becomes `--model`.
 - `effort` and `thinking` both become `--thinking`; they fill the same flag, so setting both is refused under `pi.effort.conflict` with the message "set one of them". `effort` is the generic key every forwarding kind shares, and the registered kind declares it forwarded, so it rides every turn, credential verification included. Its value reaches `--thinking` unchanged and unchecked, because the shared effort contract delivers arbitrary levels as written; pi itself warns and runs at its default level when it does not accept the name. Only `thinking` is checked against the list below. `thinking` is the pi-native spelling of the same setting. The accepted `thinking` values are the levels pi itself accepts: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Any other `thinking` value is refused, so a level a later release adds fails construction until someone establishes what it does.
-- `mcp_config` is a path to the operator's own MCP server file. It is checked to be a string and is not delivered: the adapter hands pi no MCP configuration (see Sortie's own tools).
+- `mcp_config` is a path to the operator's own MCP server file. It is not a pi flag: the orchestrator merges its servers into the generated MCP configuration, and a local launch delivers them through the bridge extension (see Sortie's own tools).
 - `allowed_tools` becomes `--tools` with the names joined by commas. `denied_tools` becomes `--exclude-tools` the same way. A tool list must be a list of non-empty names; anything else is a type fault rather than a silently shortened list, and a name in both lists is refused because the two would contradict each other.
 - `project_trust` decides between `--approve` and `--no-approve`. The default is `ignore`, which sends `--no-approve` and keeps the workspace's own project-local files and packages out of the run. An unattended turn has no operator to answer a trust prompt, so the permissive value has to be asked for by name rather than inherited from a developer's shell.
 
@@ -105,11 +112,21 @@ The adapter builds the same ssh argument vector the other fork-per-turn kinds us
 
 A remote launch takes its ssh options from the shared launch target, the same path `opencode` uses. It carries the names listed under `worker.ssh_pass_env` that are set and non-empty in Sortie's environment, minus those under `worker.ssh_disallow_pass_env`, applies the target's host-key checking setting, and unsets a withheld variable for the remote command. The kind declares no credential variables of its own, so nothing is carried that the operator did not list. Carried values and the prompt travel on the ssh connection's standard input, the values first, which is why the remote host needs `dd` once a variable is carried; see the SSH section of the workflow reference.
 
+The MCP delivery is not carried over SSH. The bridge extension is a file in the local workspace and the server document is an environment variable of the local subprocess, so a remote turn carries neither `--extension` nor `SORTIE_PI_MCP_SERVERS`.
+
 ## Sortie's own tools
 
-The kind registers `MCPInjectionUnsupported`. pi loads MCP servers from its own `mcp.json` and from extensions, and the adapter does not pass it the generated `.sortie/mcp.json`, add a flag for it, or set an environment variable for it. Sortie's tools are therefore neither advertised to nor callable by a pi session, local or remote, and the servers a `mcp_config` key names are not delivered either.
+The kind registers `MCPInjectionTranslated`. pi loads MCP servers from its own `mcp.json` and from extensions, and the adapter does not use the generated `.sortie/mcp.json` as is. For a local launch whose session carries Sortie MCP servers:
 
-The preflight reports this: `agent.kind.no_tool_channel` warns that the kind has no tool execution channel, and a `mcp_config` key in a `pi` block draws `agent.mcp_config`. Both are warnings, so a workflow that does not need Sortie's tools runs unchanged.
+- `ensureBridgeFile` writes a fixed extension, `.sortie/pi-mcp-bridge.js`, in the workspace and reuses an existing file whose content already matches. The file's text never varies between sessions; it holds no server data.
+- Each turn's command line adds `--extension <path>`.
+- The servers travel as one JSON document in `SORTIE_PI_MCP_SERVERS` in the turn's environment, in the shape `{"mcpServers": {"<name>": {"command"|"url", ...}}}`. The extension parses it and calls `pi.registerMcpServer` once per entry with `exposure: "direct"`, so each server's tools are listed to the model directly.
+
+The extension writes a parse failure or a failed registration to stderr with the prefix `sortie-pi-mcp-bridge:` and carries on without that server. A fault in building the document or writing the file fails the session start instead.
+
+The servers delivered are Sortie's own plus those the file named by `mcp_config` declares, merged by the orchestrator into the generated configuration.
+
+A remote (SSH) launch carries no servers, as described under SSH.
 
 ## Failure modes worth recognizing
 
@@ -118,6 +135,7 @@ The preflight reports this: `agent.kind.no_tool_channel` warns that the kind has
 - **No first event.** A subprocess that stays alive without printing a JSON event is killed when the first-JSON deadline passes, and the turn fails with `response_timeout` and the message `timed out waiting for first pi json event`. A credential or provider prompt that waits on a terminal is the usual cause.
 - **Empty turn.** An exit-0 turn with no assistant text, reasoning, or tool call takes the shared zero-work row and fails, so it is retried instead of counting as work done.
 - **SSH connection failure.** On a remote launch, exit status 255 with no assistant failure on the stream is reported as a failed SSH connection, not as a pi failure. The same status with an assistant failure on the stream is reported as that failure.
+- **MCP servers not loaded.** When a turn's stderr carries a line starting with `sortie-pi-mcp-bridge:`, the adapter logs a warning, "pi could not load Sortie's MCP servers", with the line as its detail, even if the turn succeeded. The session ran without the tools of the server that failed.
 - **Wrong workspace or session.** The header check described under Exit codes and failure fails the turn with `response_error` naming both values.
 
 ## Verifying a change

@@ -16,10 +16,17 @@ import (
 )
 
 // writePiScript writes an executable shell script named fake-pi in dir
-// that runs the given body, and returns its path.
+// that answers --version and otherwise runs the given body, and returns
+// its path.
 func writePiScript(t *testing.T, dir, body string) string {
 	t.Helper()
-	return agenttest.WriteScript(t, dir, "fake-pi", body)
+	return agenttest.WriteScript(t, dir, "fake-pi", versionAnsweringScript(body))
+}
+
+// versionAnsweringScript prefixes body with the answer StartSession's
+// version query reads, so a script written for a turn also passes it.
+func versionAnsweringScript(body string) string {
+	return "case \"$1\" in\n  --version) echo '1.3.0'; exit 0;;\nesac\n" + body
 }
 
 // mustStartSession starts a session with the given command or fatals.
