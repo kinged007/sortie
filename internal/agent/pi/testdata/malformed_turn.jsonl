@@ -1,0 +1,14 @@
+{"type":"session","version":3,"id":"03b4c5d6-ef12-4364-9f70-91a2b3c4d5e6","timestamp":"2026-01-01T00:00:00.000Z","cwd":"__CWD__"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"turn_end","message":"not-a-message-object","toolResults":[]}
+{"type":"turn_end","message":{"content":[]},"toolResults":[]}
+{"type":"turn_end","toolResults":[]}
+{"type":"message_end","message":{"role":"assistant","content":"not-a-list"},"toolResults":[]}
+{"type":"message_update","assistantMessageEvent":"not-an-object"}
+{"type":"message_update","assistantMessageEvent":{"type":"teleport_delta","contentIndex":0,"delta":"x"}}
+{"type":"message_update"}
+{"type":"tool_execution_end","toolCallId":"call_9","result":{"content":[],"isError":false}}
+{"type":"compaction_end","reason":"threshold","aborted":false,"result":"not-an-object"}
+{"type":"future_event","payload":{"whatever":true}}
+{"type":"agent_end","messages":[],"willRetry":false}

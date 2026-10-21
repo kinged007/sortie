@@ -15,6 +15,7 @@ import (
 	_ "github.com/sortie-ai/sortie/internal/agent/copilot"
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/agent/opencode"
+	_ "github.com/sortie-ai/sortie/internal/agent/pi"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitea"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 	_ "github.com/sortie-ai/sortie/internal/scm/gitlab"
@@ -152,6 +153,16 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantCommand:            true,
 				wantMCPInjection:       registry.MCPInjectionTranslated,
 				wantUsageArrival:       registry.UsageArrivalIncremental,
+				wantUsageAttribution:   registry.UsageAttributionPerModel,
+				wantCredentialEnvNames: nil,
+				wantEffortForwarding:   registry.EffortForwarded,
+			},
+			{
+				name:                   "pi requires command, declares MCP injection translated, declares turn_end/per_model usage, declares no resume blocker, and forwards effort",
+				kind:                   "pi",
+				wantCommand:            true,
+				wantMCPInjection:       registry.MCPInjectionTranslated,
+				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
 				wantEffortForwarding:   registry.EffortForwarded,
