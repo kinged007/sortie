@@ -116,6 +116,7 @@ jobs:
   test-integration-jira:
     name: "Integration: Jira"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_JIRA_TEST: "1"
@@ -152,6 +153,7 @@ jobs:
   test-integration-github:
     name: "Integration: GitHub"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_GITHUB_TEST: "1"
@@ -185,6 +187,7 @@ jobs:
   test-integration-linear:
     name: "Integration: Linear"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_LINEAR_TEST: "1"
@@ -265,6 +268,7 @@ jobs:
   test-e2e-github:
     name: "E2E: GitHub orchestrator"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_GITHUB_E2E: "1"
@@ -298,6 +302,7 @@ jobs:
   test-integration-claude:
     name: "Integration: Claude"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_CLAUDE_TEST: "1"
@@ -339,6 +344,7 @@ jobs:
   test-integration-copilot:
     name: "Integration: Copilot"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_COPILOT_TEST: "1"
@@ -380,6 +386,7 @@ jobs:
   test-integration-codex:
     name: "Integration: Codex"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_CODEX_TEST: "1"
@@ -464,6 +471,7 @@ jobs:
   test-integration-pi:
     name: "Integration: Pi"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_PI_TEST: "1"
@@ -494,6 +502,7 @@ jobs:
   test-integration-acp-gemini:
     name: "Integration: Gemini - ACP"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_CLIENTPROTOCOL_TEST: "1"
@@ -538,6 +547,7 @@ jobs:
   test-integration-acp-kiro:
     name: "Integration: Kiro - ACP"
     needs: [lint, test-unit]
+    if: github.repository == 'sortie-ai/sortie'
     runs-on: ubuntu-latest
     env:
       SORTIE_CLIENTPROTOCOL_TEST: "1"
@@ -594,6 +604,7 @@ jobs:
       - test-integration-pi
       - test-integration-acp-gemini
       - test-integration-acp-kiro
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -614,7 +625,7 @@ jobs:
         uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
 
       - name: Verify SignPath config
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         env:
           SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
           SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
@@ -646,7 +657,7 @@ jobs:
           git tag -a "$TAG" -m "${{ inputs.dry_run && 'Dry run' || 'Release' }} ${TAG}"
 
       - name: Build binaries for signing
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
@@ -654,7 +665,7 @@ jobs:
           args: build --clean
 
       - name: Stage Windows binaries for signing
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         run: |
           staging="${RUNNER_TEMP}/unsigned"
           jq -r '.[] | select(.type == "Binary" and .goos == "windows") | "\(.goarch) \(.path)"' dist/artifacts.json |
@@ -667,7 +678,7 @@ jobs:
 
       - name: Upload unsigned Windows binaries
         id: upload-unsigned
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-unsigned
@@ -676,7 +687,7 @@ jobs:
           retention-days: 1
 
       - name: Sign Windows binaries
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -692,7 +703,7 @@ jobs:
             version: ${{ toJSON(needs.validate.outputs.version) }}
 
       - name: Verify signed binaries
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.repository == 'sortie-ai/sortie' }}
         run: |
           test -f "${RUNNER_TEMP}/signed/windows_amd64/sortie.exe"
           test -f "${RUNNER_TEMP}/signed/windows_arm64/sortie.exe"
@@ -704,12 +715,16 @@ jobs:
           git push origin "$TAG"
           echo "### Tagged \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Drop Windows targets (not signed outside upstream)
+        if: ${{ github.repository != 'sortie-ai/sortie' }}
+        run: sed -i '/^      - windows$/d' .goreleaser.yaml
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean ${{ inputs.dry_run && '--skip=publish --skip=announce' || '' }}
+          args: release --clean ${{ inputs.dry_run && '--skip=publish --skip=announce' || '' }}${{ github.repository != 'sortie-ai/sortie' && ' --skip=validate' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
