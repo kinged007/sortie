@@ -75,11 +75,11 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			},
 		},
 		{
-			name:   "effort_is_accepted_and_not_read",
+			name:   "effort_parses",
 			config: map[string]any{"effort": "high"},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
-				want := passthroughConfig{ProjectTrust: trustIgnore}
+				want := passthroughConfig{Effort: "high", ProjectTrust: trustIgnore}
 				if !reflect.DeepEqual(pt, want) {
 					t.Errorf("passthroughConfig = %+v, want %+v", pt, want)
 				}
@@ -100,12 +100,14 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 			name: "model_and_flags",
 			config: map[string]any{
 				"model":         "anthropic/claude-3-5-sonnet",
+				"thinking":      "xhigh",
 				"project_trust": "approve",
 			},
 			checkFunc: func(t *testing.T, pt passthroughConfig) {
 				t.Helper()
 				want := passthroughConfig{
 					Model:        "anthropic/claude-3-5-sonnet",
+					Thinking:     "xhigh",
 					ProjectTrust: trustApprove,
 				}
 				if !reflect.DeepEqual(pt, want) {
@@ -146,7 +148,9 @@ func TestParsePassthroughConfig_Faults(t *testing.T) {
 		wantInMsg string
 	}{
 		{"model wrong type", map[string]any{"model": 123}, "pi.model.wrong_type", "model: expected string, got integer"},
+		{"thinking wrong type", map[string]any{"thinking": true}, "pi.thinking.wrong_type", "thinking: expected string, got boolean"},
 		{"trust wrong type", map[string]any{"project_trust": 7}, "pi.project_trust.wrong_type", "project_trust: expected string, got integer"},
+		{"thinking invalid value", map[string]any{"thinking": "turbo"}, "pi.thinking.invalid_value", `"turbo" is not a pi thinking level`},
 		{"trust invalid value", map[string]any{"project_trust": "maybe"}, "pi.project_trust.invalid_value", `"maybe" is not a pi trust setting`},
 		{"unknown key", map[string]any{"auto_compact": false}, "pi.auto_compact.unknown_key", `unknown pi config key "auto_compact"`},
 	}
@@ -216,13 +220,14 @@ func TestParsePassthroughConfig_ReportsEveryFault(t *testing.T) {
 
 	config := map[string]any{
 		"model":         123,
+		"thinking":      "turbo",
 		"project_trust": "maybe",
 		"auto_compact":  false,
 	}
 
 	diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config})
-	if len(diags) != 3 {
-		t.Fatalf("validateConfig() reported %d diagnostics, want 3: %+v", len(diags), diags)
+	if len(diags) != 4 {
+		t.Fatalf("validateConfig() reported %d diagnostics, want 4: %+v", len(diags), diags)
 	}
 	for _, d := range diags {
 		if d.Severity != "error" {
@@ -244,7 +249,7 @@ func TestBuildRunArgs(t *testing.T) {
 	}{
 		{
 			name:       "fresh_session",
-			wantAbsent: []string{"--session", "--no-session"},
+			wantAbsent: []string{"--session", "--no-session", "--thinking"},
 		},
 		{
 			name:      "resume_session",
@@ -259,6 +264,16 @@ func TestBuildRunArgs(t *testing.T) {
 			name:      "model_flag",
 			pt:        passthroughConfig{Model: "anthropic/claude-3-5-sonnet"},
 			wantPairs: [][2]string{{"--model", "anthropic/claude-3-5-sonnet"}},
+		},
+		{
+			name:      "thinking_flag",
+			pt:        passthroughConfig{Thinking: "medium"},
+			wantPairs: [][2]string{{"--thinking", "medium"}},
+		},
+		{
+			name:      "effort_fills_the_thinking_flag",
+			pt:        passthroughConfig{Effort: "high"},
+			wantPairs: [][2]string{{"--thinking", "high"}},
 		},
 		{
 			name:      "trust_approve",
@@ -352,10 +367,11 @@ func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 
 	state := newTestSessionState("/tmp/workspace", "")
 	args := buildRunArgs(state, passthroughConfig{
+		Thinking:     "high",
 		ProjectTrust: trustApprove,
 	})
 
-	want := []string{"-p", "--mode", "json", "--approve"}
+	want := []string{"-p", "--mode", "json", "--thinking", "high", "--approve"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -431,6 +447,7 @@ func TestValidateConfig_NoFaultsForSupportedConfiguration(t *testing.T) {
 		Kind: "pi",
 		Passthrough: map[string]any{
 			"model":         "anthropic/claude-3-5-sonnet",
+			"thinking":      "off",
 			"mcp_config":    "./mcp-servers.json",
 			"project_trust": "ignore",
 		},
