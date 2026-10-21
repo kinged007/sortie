@@ -29,7 +29,7 @@ func piEffortProbe() agenttest.EffortProbe {
 		t.Helper()
 
 		dir := t.TempDir()
-		command := agenttest.FakeRuntime(t, dir, "pi", agenttest.OutputScenario, agenttest.Output{})
+		command := agenttest.FakeRuntime(t, dir, "pi", agenttest.OutputScenario, agenttest.Output{Version: "1.3.0"})
 		adapter, _ := NewPiAdapter()
 		resumeID := ""
 		if resumed {

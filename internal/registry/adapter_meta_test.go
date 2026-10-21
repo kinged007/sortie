@@ -158,10 +158,10 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantEffortForwarding:   registry.EffortForwarded,
 			},
 			{
-				name:                   "pi requires command, declares MCP injection unsupported, declares turn_end/per_model usage, declares no resume blocker, and forwards effort",
+				name:                   "pi requires command, declares MCP injection translated, declares turn_end/per_model usage, declares no resume blocker, and forwards effort",
 				kind:                   "pi",
 				wantCommand:            true,
-				wantMCPInjection:       registry.MCPInjectionUnsupported,
+				wantMCPInjection:       registry.MCPInjectionTranslated,
 				wantUsageArrival:       registry.UsageArrivalTurnEnd,
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,

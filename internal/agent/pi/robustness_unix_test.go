@@ -741,6 +741,69 @@ func TestRunTurn_CredentialVerificationIsEphemeral(t *testing.T) {
 	assertNoFlag(t, argv, "--session")
 }
 
+func TestBuildTurnEnv_DropsInheritedServerList(t *testing.T) {
+	// Not parallel: sets the inherited variable via t.Setenv.
+	t.Setenv(mcpServersEnv, `{"mcpServers":{"stale":{"command":"stale"}}}`)
+
+	count := func(env []string) (n int, last string) {
+		for _, entry := range env {
+			if strings.HasPrefix(entry, mcpServersEnv+"=") {
+				n++
+				last = strings.TrimPrefix(entry, mcpServersEnv+"=")
+			}
+		}
+		return n, last
+	}
+
+	if n, _ := count(buildTurnEnv(&sessionState{})); n != 0 {
+		t.Errorf("a session without servers carries %d %s entries, want the inherited one dropped", n, mcpServersEnv)
+	}
+	const fresh = `{"mcpServers":{"sortie-tools":{"command":"sortie"}}}`
+	if n, last := count(buildTurnEnv(&sessionState{mcpEnvValue: fresh})); n != 1 || last != fresh {
+		t.Errorf("a session with servers carries %d %s entries, last %q, want exactly one carrying %q", n, mcpServersEnv, last, fresh)
+	}
+}
+
+func TestRunTurn_BridgeFailureIsLogged(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := writePiScript(t, dir, `echo "sortie-pi-mcp-bridge: cannot register server sortie-tools: registerMcpServer is not a function" >&2
+printf '{"type":"session","version":3,"id":"bridge-1","timestamp":"t","cwd":"%s"}\n' "$PWD"
+printf '%s\n' '{"type":"message_end","message":`+assistantMessage("done", 5, 2)+`}'
+`)
+	spy := &agenttest.LogSpy{}
+	a, _ := NewPiAdapter()
+	session := mustStartSession(t, a, dir, script)
+	session.Internal.(*sessionState).baseLogger = slog.New(spy)
+
+	_, result, err := collectEvents(t, a, session, "work")
+	if err != nil || result.ExitReason != domain.EventTurnCompleted {
+		t.Fatalf("RunTurn() = %+v, %v, want a completed turn", result, err)
+	}
+
+	var logged int
+	for _, e := range spy.Entries() {
+		if e.Level == slog.LevelWarn && e.Msg == "pi could not load Sortie's MCP servers" && strings.Contains(e.Attrs["detail"], "registerMcpServer is not a function") {
+			logged++
+		}
+	}
+	if logged != 1 {
+		t.Errorf("bridge failure warnings = %d, want 1 even though the turn completed", logged)
+	}
+}
+
+func TestBridgeFileContent_ReportsFailuresOnStderr(t *testing.T) {
+	t.Parallel()
+
+	if got := strings.Count(bridgeFileContent, bridgeFailurePrefix); got != 1 {
+		t.Errorf("bridge extension names the failure prefix %d times in its report helper, want 1", got)
+	}
+	if strings.Contains(bridgeFileContent, "catch{}") || strings.Contains(bridgeFileContent, "catch {}") {
+		t.Error("bridge extension swallows an error, want every catch to report it")
+	}
+}
+
 // TestRunTurn_ToolDurationAndErrorMessage asserts a tool result carries
 // the duration measured from its start event, pi's own figure when it
 // reports one, and the tool's error text when it failed.
