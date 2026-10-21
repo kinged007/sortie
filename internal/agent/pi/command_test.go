@@ -133,6 +133,104 @@ func TestNewPiAdapter_ParsePassthroughConfig(t *testing.T) {
 	}
 }
 
+// TestParsePassthroughConfig_Faults covers every refusal the funnel
+// makes, so a new key whose fault arm was never wired shows up here
+// rather than at runtime.
+func TestParsePassthroughConfig_Faults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		config    map[string]any
+		wantCheck string
+		wantInMsg string
+	}{
+		{"model wrong type", map[string]any{"model": 123}, "pi.model.wrong_type", "model: expected string, got integer"},
+		{"trust wrong type", map[string]any{"project_trust": 7}, "pi.project_trust.wrong_type", "project_trust: expected string, got integer"},
+		{"trust invalid value", map[string]any{"project_trust": "maybe"}, "pi.project_trust.invalid_value", `"maybe" is not a pi trust setting`},
+		{"unknown key", map[string]any{"auto_compact": false}, "pi.auto_compact.unknown_key", `unknown pi config key "auto_compact"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, faults := parsePassthroughConfig(tt.config)
+			if len(faults) == 0 {
+				t.Fatal("parsePassthroughConfig() faults = nil, want a refusal")
+			}
+			joined := ""
+			for _, f := range faults {
+				joined += f.Message + "; "
+			}
+			if !strings.Contains(joined, tt.wantInMsg) {
+				t.Errorf("faults = %q, want them to contain %q", joined, tt.wantInMsg)
+			}
+
+			diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: tt.config})
+			var found *registry.ValidationDiag
+			for i := range diags {
+				if diags[i].Check == tt.wantCheck {
+					found = &diags[i]
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("validateConfig() diags = %+v, want one with check %q", diags, tt.wantCheck)
+			}
+			if !strings.Contains(joined, found.Message) {
+				t.Errorf("validateConfig() message = %q, want parse faults %q to contain it", found.Message, joined)
+			}
+		})
+	}
+}
+
+// TestParsePassthroughConfig_GenericAgentKeysAreNotPiKeys pins the
+// boundary between the two sources of the config map. The agent block
+// contributes kind, command, and the four timeout keys to every
+// adapter's map, so a pi validator that read them as pi block keys
+// would refuse every valid workflow rather than a misspelled option.
+func TestParsePassthroughConfig_GenericAgentKeysAreNotPiKeys(t *testing.T) {
+	t.Parallel()
+
+	config := map[string]any{
+		"kind":             "pi",
+		"command":          "pi",
+		"turn_timeout_ms":  3_600_000,
+		"read_timeout_ms":  5_000,
+		"stall_timeout_ms": 300_000,
+		"stop_grace_ms":    5_000,
+		"project_trust":    "ignore",
+	}
+
+	if _, faults := parsePassthroughConfig(config); len(faults) != 0 {
+		t.Errorf("parsePassthroughConfig() faults = %+v, want none: the agent block's own keys are not pi block keys", faults)
+	}
+	if diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config}); len(diags) != 0 {
+		t.Errorf("validateConfig() diags = %+v, want none", diags)
+	}
+}
+
+func TestParsePassthroughConfig_ReportsEveryFault(t *testing.T) {
+	t.Parallel()
+
+	config := map[string]any{
+		"model":         123,
+		"project_trust": "maybe",
+		"auto_compact":  false,
+	}
+
+	diags := validateConfig(registry.AgentConfigFields{Kind: "pi", Passthrough: config})
+	if len(diags) != 3 {
+		t.Fatalf("validateConfig() reported %d diagnostics, want 3: %+v", len(diags), diags)
+	}
+	for _, d := range diags {
+		if d.Severity != "error" {
+			t.Errorf("severity = %q, want %q", d.Severity, "error")
+		}
+	}
+}
+
 func TestBuildRunArgs(t *testing.T) {
 	t.Parallel()
 
@@ -242,6 +340,24 @@ func TestBuildTurnStdin(t *testing.T) {
 	}
 	if string(got) != "PREAMBLE"+prompt {
 		t.Errorf("stdin with a preamble = %q, want %q", got, "PREAMBLE"+prompt)
+	}
+}
+
+// TestBuildRunArgs_NoOpencodeFlagsRemains asserts that no environment
+// key from a different CLI is still being delivered: pi takes every
+// restriction it honors as a flag, so an OPENCODE_* variable would be
+// an operator-visible setting that does nothing.
+func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
+	t.Parallel()
+
+	state := newTestSessionState("/tmp/workspace", "")
+	args := buildRunArgs(state, passthroughConfig{
+		ProjectTrust: trustApprove,
+	})
+
+	want := []string{"-p", "--mode", "json", "--approve"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Errorf("args = %v, want %v", args, want)
 	}
 }
 
