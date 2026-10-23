@@ -197,7 +197,12 @@ func AssertConformance(t *testing.T, b Binding) {
 	requireValidBinding(t, b)
 	t.Run("scripted turn", func(t *testing.T) { runScenario(t, b, ScenarioTurn) })
 	t.Run("script exhaustion", func(t *testing.T) { runScenario(t, b, ScenarioExhaustion) })
-	t.Run("tool server", func(t *testing.T) { runToolServer(t, b) })
+	t.Run("tool server", func(t *testing.T) {
+		if meta, _ := registry.Agents.Meta(b.Kind); meta.MCPInjection == registry.MCPInjectionUnsupported {
+			t.Skip("the kind delivers no tool server to its runtime")
+		}
+		runToolServer(t, b)
+	})
 	if b.PermissionRefusal != nil {
 		t.Run("permission refusal", func(t *testing.T) { runPermissionRefusal(t, b) })
 	}
