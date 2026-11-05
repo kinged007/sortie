@@ -296,7 +296,8 @@ var mcpCompletenessRegisteredKinds = registry.Agents.Kinds()
 
 // TestEveryAgentKindHasMCPInjectionCoverage enumerates every agent
 // kind registry.Agents held once main's own blank imports had run,
-// and fails by name when a registered kind has no test file calling
+// and fails by name when a registered kind whose MCPDialect delivers
+// tools has no test file calling
 // agenttest.AssertMCPInjection against its own package. This closes
 // the hole a hand-maintained list of "the six known kinds" would
 // reopen on a seventh adapter: a kind that is declared and registered
@@ -304,11 +305,17 @@ var mcpCompletenessRegisteredKinds = registry.Agents.Kinds()
 func TestEveryAgentKindHasMCPInjectionCoverage(t *testing.T) {
 	t.Parallel()
 
-	if len(mcpCompletenessRegisteredKinds) == 0 {
-		t.Fatal("registry.Agents.Kinds() returned no kinds, want at least the built-in adapters main.go blank-imports")
+	var delivering []string
+	for _, kind := range mcpCompletenessRegisteredKinds {
+		if meta, _ := registry.Agents.Meta(kind); meta.MCPDialect.DeliversTools() {
+			delivering = append(delivering, kind)
+		}
+	}
+	if len(delivering) == 0 {
+		t.Fatal("no registered agent kind declares an MCP dialect that delivers tools, want at least the built-in adapters main.go blank-imports")
 	}
 
-	missing := kindsMissingCoverage(mcpCompletenessRegisteredKinds, mcpCompletenessAgentRoot, mcpCompletenessAgenttestImportPath, mcpCompletenessAssertFuncName)
+	missing := kindsMissingCoverage(delivering, mcpCompletenessAgentRoot, mcpCompletenessAgenttestImportPath, mcpCompletenessAssertFuncName)
 	if len(missing) != 0 {
 		t.Errorf("agent kind(s) %v have no test file calling agenttest.AssertMCPInjection against their own package", missing)
 	}
@@ -347,7 +354,7 @@ import (
 )
 
 func TestFixtureConformance(t *testing.T) {
-	agenttest.AssertMCPInjection(t, "supported", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
+	agenttest.AssertMCPInjection(t, "mcp_servers_json", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
 }
 `
 
@@ -392,15 +399,15 @@ import (
 )
 
 func assertNothingRunsThis(t *testing.T) {
-	agenttest.AssertMCPInjection(t, "supported", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
+	agenttest.AssertMCPInjection(t, "mcp_servers_json", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
 }
 
 func Testlowercase(t *testing.T) {
-	agenttest.AssertMCPInjection(t, "supported", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
+	agenttest.AssertMCPInjection(t, "mcp_servers_json", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
 }
 
 func TestWrongSignature(b *testing.B) {
-	agenttest.AssertMCPInjection(b, "supported", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
+	agenttest.AssertMCPInjection(b, "mcp_servers_json", "/tmp/mcp.json", agenttest.MCPLaunchSurface{})
 }
 
 func TestFixtureUnrelated(t *testing.T) {

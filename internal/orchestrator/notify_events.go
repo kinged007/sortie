@@ -32,43 +32,65 @@ type sessionEvent struct {
 	AgentText string
 }
 
-// notification builds the event for t with body as its text. severity
-// overrides the catalog severity when non-empty.
-func (s sessionEvent) notification(t domain.EventType, severity, body string) domain.Notification {
+// notification builds the event for t reporting facts. severity overrides
+// the catalog severity when non-empty.
+func (s sessionEvent) notification(t domain.EventType, severity string, facts domain.MessageFacts) domain.Notification {
 	n := orchestratorNotification(t, severity, domain.NotificationEnvelope{
 		IssueID:    s.IssueID,
 		Identifier: s.Identifier,
+		DisplayID:  s.DisplayID,
 		DispatchID: s.DispatchID,
 		SessionID:  s.SessionID,
 		Attempt:    s.Attempt,
 		Agent:      s.Agent,
-	}, cmp.Or(s.DisplayID, s.Identifier, s.IssueID), body)
+	}, facts)
 	n.Message.AgentText = s.AgentText
 	return n
 }
 
-func reactionNotification(t domain.EventType, pending *PendingReaction, body string) domain.Notification {
+func reactionNotification(t domain.EventType, pending *PendingReaction, facts domain.MessageFacts) domain.Notification {
 	return orchestratorNotification(t, "", domain.NotificationEnvelope{
 		IssueID:    pending.IssueID,
 		Identifier: pending.Identifier,
-	}, cmp.Or(pending.DisplayID, pending.Identifier, pending.IssueID), body)
+		DisplayID:  pending.DisplayID,
+	}, facts)
 }
 
+// budgetHeldNotification copies the entry's figures into the facts, so a
+// later in-place update of the entry never changes a delivery still in
+// flight.
 func budgetHeldNotification(issueID string, entry *BudgetExhaustedEntry) domain.Notification {
+	var unmeasured int
+	if entry.UnmeasuredSessions != nil {
+		unmeasured = *entry.UnmeasuredSessions
+	}
 	return orchestratorNotification(domain.EventBudgetHeld, "", domain.NotificationEnvelope{
 		IssueID:    issueID,
 		Identifier: entry.Identifier,
-	}, cmp.Or(entry.DisplayID, entry.Identifier, issueID), buildBudgetHoldComment(entry))
+		DisplayID:  entry.DisplayID,
+	}, domain.BudgetHeldFacts{
+		Reason:          entry.Reason,
+		CeilingSetting:  ceilingSettingByBudgetReason[entry.Reason],
+		UsedSessions:    entry.UsedSessions,
+		BudgetSessions:  entry.BudgetSessions,
+		UsedTokens:      clonePointer(entry.UsedTokens),
+		BudgetTokens:    entry.BudgetTokens,
+		TokensComplete:  !SpendIncomplete(unmeasured, entry.UnaccountedTurns),
+		StoppedInFlight: clonePointer(entry.StoppedInFlight),
+		UsedUSD:         clonePointer(entry.UsedUSD),
+		UsedUSDComplete: clonePointer(entry.UsedUSDComplete),
+		BudgetUSD:       entry.BudgetUSD,
+		ExhaustedAt:     entry.ExhaustedAt,
+	})
 }
 
-func orchestratorNotification(t domain.EventType, severity string, envelope domain.NotificationEnvelope, display, body string) domain.Notification {
+func orchestratorNotification(t domain.EventType, severity string, envelope domain.NotificationEnvelope, facts domain.MessageFacts) domain.Notification {
 	envelope.EventType = t
 	return domain.Notification{
 		Envelope: envelope,
 		Message: domain.NotificationMessage{
 			Severity: cmp.Or(severity, t.Severity()),
-			Title:    display + ": " + string(t),
-			Body:     body,
+			Facts:    facts,
 		},
 	}
 }
@@ -203,8 +225,14 @@ func (o *Orchestrator) updateRouter(cfg config.ServiceConfig) {
 // ctx is live, so a slow operator endpoint never delays the agent's start;
 // the tracker comment is then posted on ctx, as the dispatch comment
 // always was. The tracker outcome is logged and counted before the caller
-// goes on.
+// goes on. A dispatch with [WorkerDeps.UsageLimitNotified] set publishes
+// nothing.
 func publishSessionStarted(ctx context.Context, issue domain.Issue, attempt *int, agentKind string, deps WorkerDeps, log *slog.Logger) {
+	// The refusal that began the episode already told the operator.
+	if deps.UsageLimitNotified {
+		return
+	}
+
 	event := sessionEvent{
 		IssueID:    issue.ID,
 		Identifier: issue.Identifier,
@@ -212,7 +240,7 @@ func publishSessionStarted(ctx context.Context, issue domain.Issue, attempt *int
 		DispatchID: deps.DispatchID,
 		Attempt:    attempt,
 		Agent:      agentKind,
-	}.notification(domain.EventTypeSessionStarted, "", dispatchComment)
+	}.notification(domain.EventTypeSessionStarted, "", domain.SessionStartedFacts{})
 
 	trackerDelivery, others := deps.Router.Route(event).SplitTrackerComment()
 

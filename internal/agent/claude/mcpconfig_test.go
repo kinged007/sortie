@@ -1,50 +1,32 @@
 package claude
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"slices"
 	"testing"
 
-	"github.com/sortie-ai/sortie/internal/workspacekit"
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 )
 
-func TestAlwaysLoadToolServer(t *testing.T) {
+func TestPlaceMCPConfig(t *testing.T) {
 	t.Parallel()
 
-	workspace := t.TempDir()
-	sortieDir := filepath.Join(workspace, workspacekit.SortieDir)
-	if err := os.Mkdir(sortieDir, 0o700); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name     string
+		document string
+		want     []string
+	}{
+		{"document becomes the inline flag value", `{"mcpServers":{}}`, []string{"--mcp-config", `{"mcpServers":{}}`}},
+		{"no document places nothing", "", nil},
 	}
-	generated := filepath.Join(sortieDir, "mcp.json")
-	const config = `{"mcpServers":{"sortie-tools":{"type":"stdio","command":"sortie"},"operator":{"type":"http","url":"https://mcp.example.com"}}}`
-	if err := os.WriteFile(generated, []byte(config), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	path, err := alwaysLoadToolServer(generated)
-	if err != nil {
-		t.Fatalf("alwaysLoadToolServer() error = %v", err)
-	}
+			late := placeMCPConfig(mcpconfig.Delivery{Document: []byte(tt.document)})
 
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc struct {
-		MCPServers map[string]map[string]any `json:"mcpServers"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	if got := doc.MCPServers["sortie-tools"]["alwaysLoad"]; got != true {
-		t.Errorf("sortie-tools alwaysLoad = %v, want true", got)
-	}
-	if got := doc.MCPServers["sortie-tools"]["command"]; got != "sortie" {
-		t.Errorf("sortie-tools command = %v, want the generated entry preserved", got)
-	}
-	if _, set := doc.MCPServers["operator"]["alwaysLoad"]; set {
-		t.Error("operator server carries alwaysLoad, want only sortie-tools changed")
+			if !slices.Equal(late.Args, tt.want) || len(late.Env) != 0 {
+				t.Errorf("placeMCPConfig(%q) = %+v, want args %q and no env", tt.document, late, tt.want)
+			}
+		})
 	}
 }

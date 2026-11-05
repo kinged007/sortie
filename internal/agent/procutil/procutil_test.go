@@ -10,9 +10,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // fakeScenarios collects every non-default fake-runtime scenario this
@@ -512,11 +514,7 @@ func TestStderrCollector_DoneClosesOnlyAfterDrainComplete(t *testing.T) {
 		t.Fatalf("pw.Write(first line) = %v", err)
 	}
 
-	select {
-	case <-c.Done():
-		t.Fatal("Done() closed before the writer sent the final line and closed the pipe")
-	case <-time.After(200 * time.Millisecond):
-	}
+	waittest.Never(t, c.Done(), 200*time.Millisecond, "Done() before the writer sent the final line and closed the pipe")
 
 	const finalLine = "final line released after the block"
 	if _, err := io.WriteString(pw, finalLine+"\n"); err != nil {
@@ -526,11 +524,7 @@ func TestStderrCollector_DoneClosesOnlyAfterDrainComplete(t *testing.T) {
 		t.Fatalf("pw.Close() = %v", err)
 	}
 
-	select {
-	case <-c.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Done() did not close after the reader reached EOF")
-	}
+	waittest.Receive(t, c.Done(), "Done() after the reader reached EOF")
 
 	got := c.Lines()
 	want := []string{"first line", finalLine}
@@ -544,26 +538,28 @@ func TestStderrCollector_DoneClosesOnlyAfterDrainComplete(t *testing.T) {
 func TestStderrCollector_WaitDoneHealthyDrain(t *testing.T) {
 	t.Parallel()
 
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	synctest.Test(t, func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	c := NewStderrCollector(strings.NewReader("startup ok\n"), logger)
+		c := NewStderrCollector(strings.NewReader("startup ok\n"), logger)
 
-	start := time.Now()
-	if !c.WaitDone(DefaultDrainGrace) {
-		t.Fatalf("WaitDone(%v) = false, want true", DefaultDrainGrace)
-	}
-	if elapsed := time.Since(start); elapsed >= DefaultDrainGrace {
-		t.Errorf("WaitDone(%v) took %v, want well under the bound", DefaultDrainGrace, elapsed)
-	}
+		start := time.Now()
+		if !c.WaitDone(DefaultDrainGrace) {
+			t.Fatalf("WaitDone(%v) = false, want true", DefaultDrainGrace)
+		}
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("WaitDone(%v) took %v, want it not to wait", DefaultDrainGrace, elapsed)
+		}
 
-	want := []string{"startup ok"}
-	if got := c.Lines(); !slices.Equal(got, want) {
-		t.Errorf("Lines() = %v, want %v", got, want)
-	}
-	if strings.Contains(buf.String(), "not fully collected") {
-		t.Errorf("WaitDone() on a completed drain logged an abandonment warning; output = %q", buf.String())
-	}
+		want := []string{"startup ok"}
+		if got := c.Lines(); !slices.Equal(got, want) {
+			t.Errorf("Lines() = %v, want %v", got, want)
+		}
+		if strings.Contains(buf.String(), "not fully collected") {
+			t.Errorf("WaitDone() on a completed drain logged an abandonment warning; output = %q", buf.String())
+		}
+	})
 }
 
 // TestStderrCollector_AbandonAfterWaitDoneTimeout drives WaitDone and Abandon
@@ -619,12 +615,7 @@ func TestStderrCollector_AbandonAfterWaitDoneTimeout(t *testing.T) {
 		resCh <- readerResult{lines: c.Lines(), dropped: c.Dropped()}
 	}()
 
-	var res readerResult
-	select {
-	case res = <-resCh:
-	case <-time.After(1 * time.Second):
-		t.Fatal("Lines()/Dropped() blocked more than 1 second after Abandon()")
-	}
+	res := waittest.Receive(t, resCh, "Lines() and Dropped() after Abandon()")
 	if want := []string{AbandonedMarker}; !slices.Equal(res.lines, want) {
 		t.Errorf("Lines() after Abandon() = %v, want %v", res.lines, want)
 	}
@@ -637,11 +628,7 @@ func TestStderrCollector_AbandonAfterWaitDoneTimeout(t *testing.T) {
 		EmitWarnLines(c.Lines(), logger)
 		close(warnDone)
 	}()
-	select {
-	case <-warnDone:
-	case <-time.After(1 * time.Second):
-		t.Fatal("EmitWarnLines(c.Lines(), ...) blocked more than 1 second after Abandon()")
-	}
+	waittest.Receive(t, warnDone, "EmitWarnLines(c.Lines(), ...) after Abandon()")
 	if !strings.Contains(buf.String(), AbandonedMarker) {
 		t.Errorf("EmitWarnLines(c.Lines(), ...) after Abandon() did not emit the marker; output = %q", buf.String())
 	}
@@ -657,7 +644,7 @@ func TestStderrCollector_WaitDonePolling(t *testing.T) {
 		t.Parallel()
 
 		c := NewStderrCollector(strings.NewReader("done\n"), slog.Default())
-		<-c.Done()
+		waittest.Receive(t, c.Done(), "Done()")
 
 		for _, d := range []time.Duration{0, -1 * time.Millisecond} {
 			if !c.WaitDone(d) {
@@ -691,23 +678,21 @@ func TestStderrCollector_AbandonmentPriority(t *testing.T) {
 	t.Run("lines call already blocked returns the marker", func(t *testing.T) {
 		t.Parallel()
 
-		pr, pw := io.Pipe()
-		t.Cleanup(func() { _ = pw.Close() })
-		c := NewStderrCollector(pr, slog.Default())
+		synctest.Test(t, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			t.Cleanup(func() { _ = pw.Close() })
+			c := NewStderrCollector(pr, slog.Default())
 
-		resCh := make(chan []string, 1)
-		go func() { resCh <- c.Lines() }()
-		time.Sleep(50 * time.Millisecond)
-		c.Abandon(50 * time.Millisecond)
+			resCh := make(chan []string, 1)
+			go func() { resCh <- c.Lines() }()
+			synctest.Wait()
+			c.Abandon(50 * time.Millisecond)
 
-		select {
-		case got := <-resCh:
+			got := waittest.Receive(t, resCh, "Lines() blocked when Abandon() ran")
 			if want := []string{AbandonedMarker}; !slices.Equal(got, want) {
 				t.Errorf("Lines() blocked before Abandon() = %v, want %v", got, want)
 			}
-		case <-time.After(1 * time.Second):
-			t.Fatal("Lines() call already blocked when Abandon() ran did not unblock within 1 second")
-		}
+		})
 	})
 
 	t.Run("drain finishing after abandonment wins on the next call", func(t *testing.T) {
@@ -728,11 +713,7 @@ func TestStderrCollector_AbandonmentPriority(t *testing.T) {
 			t.Fatalf("pw.Close() = %v", err)
 		}
 
-		select {
-		case <-c.Done():
-		case <-time.After(5 * time.Second):
-			t.Fatal("Done() did not close after the reader reached EOF")
-		}
+		waittest.Receive(t, c.Done(), "Done() after the reader reached EOF")
 
 		want := []string{"real line"}
 		if got := c.Lines(); !slices.Equal(got, want) {
@@ -746,7 +727,7 @@ func TestStderrCollector_AbandonmentPriority(t *testing.T) {
 		var buf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		c := NewStderrCollector(strings.NewReader("already collected\n"), logger)
-		<-c.Done()
+		waittest.Receive(t, c.Done(), "Done()")
 
 		c.Abandon(50 * time.Millisecond)
 
@@ -766,18 +747,20 @@ func TestStderrCollector_AbandonmentPriority(t *testing.T) {
 func TestStderrCollector_FinishAndCollect_HealthyDrain(t *testing.T) {
 	t.Parallel()
 
-	c := NewStderrCollector(strings.NewReader("codex: ready\n"), slog.Default())
+	synctest.Test(t, func(t *testing.T) {
+		c := NewStderrCollector(strings.NewReader("codex: ready\n"), slog.Default())
 
-	start := time.Now()
-	got := c.FinishAndCollect(DefaultDrainGrace)
-	if elapsed := time.Since(start); elapsed >= DefaultDrainGrace {
-		t.Errorf("FinishAndCollect(%v) on a finished drain took %v, want well under the bound", DefaultDrainGrace, elapsed)
-	}
+		start := time.Now()
+		got := c.FinishAndCollect(DefaultDrainGrace)
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("FinishAndCollect(%v) on a finished drain took %v, want it not to wait", DefaultDrainGrace, elapsed)
+		}
 
-	want := []string{"codex: ready"}
-	if !slices.Equal(got, want) {
-		t.Errorf("FinishAndCollect(%v) = %v, want %v", DefaultDrainGrace, got, want)
-	}
+		want := []string{"codex: ready"}
+		if !slices.Equal(got, want) {
+			t.Errorf("FinishAndCollect(%v) = %v, want %v", DefaultDrainGrace, got, want)
+		}
+	})
 }
 
 // TestStderrCollector_FinishAndCollect_PreservesLinesOnAbandonment pins
@@ -813,19 +796,21 @@ func TestStderrCollector_FinishAndCollect_PreservesLinesOnAbandonment(t *testing
 func TestStderrCollector_FinishAndCollect_SecondCallDoesNotWaitAgain(t *testing.T) {
 	t.Parallel()
 
-	const grace = 200 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		const grace = 200 * time.Millisecond
 
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
-	c := NewStderrCollector(pr, slog.Default())
+		pr, pw := io.Pipe()
+		t.Cleanup(func() { _ = pw.Close() })
+		c := NewStderrCollector(pr, slog.Default())
 
-	c.FinishAndCollect(grace)
+		c.FinishAndCollect(grace)
 
-	start := time.Now()
-	c.FinishAndCollect(grace)
-	if elapsed := time.Since(start); elapsed > grace/2 {
-		t.Errorf("FinishAndCollect(%v) called again after the wait already resolved took %v, want near-instant: a second bounded wait was paid", grace, elapsed)
-	}
+		start := time.Now()
+		c.FinishAndCollect(grace)
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("FinishAndCollect(%v) called again after the wait already resolved took %v, want it not to wait: a second bounded wait was paid", grace, elapsed)
+		}
+	})
 }
 
 // TestStderrCollector_FinishAndCollect_LateCallerSharesRemainder pins
@@ -856,11 +841,7 @@ func TestStderrCollector_FinishAndCollect_LateCallerSharesRemainder(t *testing.T
 	c.FinishAndCollect(grace)
 	elapsed := time.Since(start)
 
-	select {
-	case <-firstDone:
-	case <-time.After(grace):
-		t.Fatal("the first FinishAndCollect call had not returned within another full grace period")
-	}
+	waittest.Receive(t, firstDone, "the first FinishAndCollect call")
 
 	if elapsed >= grace*3/4 {
 		t.Errorf("FinishAndCollect(%v) arriving at grace/2 took %v for its own elapsed time, want well under a full grace (the wait is shared, not paid twice)", grace, elapsed)

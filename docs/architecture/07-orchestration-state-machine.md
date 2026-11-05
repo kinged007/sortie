@@ -30,6 +30,7 @@ Important nuance:
 - If the issue is still in an active state, the worker should start another turn on the same live coding-agent thread in the same workspace, up to `agent.max_turns`.
 - The first turn should use the full rendered task prompt.
 - Continuation turns should send only continuation guidance to the existing thread, not resend the original task prompt that is already present in thread history.
+- With the comment feed on (`comment_feed.enabled`), every turn, continuation turns included, also carries the issue comments the conversation has not been given: the template places them through `comment_feed`, or the feed appends them after the prompt guidance for that turn. With the feed off, continuation turns read no comments.
 - Once the worker exits normally with the issue still active and no handoff state configured, the orchestrator schedules a short continuation retry (about 1 second) so it can re-check whether the issue remains active and needs another worker session. Section 7.3 gives the full set of exit dispositions and the order they are evaluated in.
 
 ### 7.2 Run Attempt Lifecycle
@@ -50,6 +51,8 @@ A run attempt transitions through these phases:
 12. `CanceledByReconciliation`
 
 Distinct terminal reasons are important because retry logic and logs differ.
+
+**Comment delivery.** With the comment feed on, the worker selects the pending comments at the start of every turn of the attempt (the first turn, each continuation turn, each reaction turn, and each self-review review and fix turn), renders that turn's prompt with them, and appends the feed's block unless the template placed them (Section 12.1). The worker takes the feed's configuration from the snapshot read when the attempt began. Once a turn has started with its prompt, whatever the turn's outcome, the worker reports the comments that prompt delivered to the orchestrator through a per-turn callback, and the orchestrator, which is the only writer of the given-comment record, writes them on its event loop. A report is applied only while the issue still has a running entry for the same dispatch, and a pending cleanup does not prevent it, because the agent received the prompt. Every report queued before a worker result is applied before that result is handled, on the normal path and in the drain at shutdown, so a run's last turn is recorded before its exit disposition runs. A report that is never recorded (the run context ended first, or the write failed) causes those comments to be delivered once more in a later run and loses none. A turn that never starts reports nothing, and the next boundary selects its comments again. A read or store failure at a boundary sends that turn's prompt without comments and never fails the turn.
 
 ### 7.3 Transition Triggers
 
@@ -104,7 +107,7 @@ A verdict that withholds the write is, immediately before any of its effects, ch
   - Schedule an exponential-backoff retry when the retry slot (Section 7.5) is free; defer to the incumbent already occupying it otherwise, keeping the claim.
 
 - `Agent Update Event`
-  - Update live session fields, token counters, and rate limits.
+  - Update live session fields, token counters, and the agent kind's usage windows.
   - Every agent update and self-review progress message a worker delivered before its exit is applied before that exit is handled, so no message from one run is applied after its exit or to a later run of the same issue. A usage figure applied this way for a run whose exit is being handled or already waiting is evaluated against neither an in-flight ceiling (token or money) nor the token warning threshold, because that run has already ended; the run's recorded total carries the figure to the next dispatch decision.
 
 - `Retry Timer Fired`
@@ -146,7 +149,7 @@ A verdict that withholds the write is, immediately before any of its effects, ch
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are required before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery uses persisted state from SQLite for retry queues, session metadata, parked issues, budget-hold notice records (the durable record that a `budget.held` notice reached at least one destination; a hold with no destination records nothing and is routed again on a later pass), and attention acknowledgements (the durable record that a person has seen an attention item), supplemented by tracker polling for current issue states and filesystem inspection for workspace existence.
+- Restart recovery uses persisted state from SQLite for retry queues, session metadata, parked issues (including a park a person released that the issue's next primary dispatch has not yet consumed), budget-hold notice records (the durable record that a `budget.held` notice reached at least one destination; a hold with no destination records nothing and is routed again on a later pass), and attention acknowledgements (the durable record that a person has seen an attention item), supplemented by tracker polling for current issue states and filesystem inspection for workspace existence.
 - Startup pending reaction recovery uses `run_history`, tracker state, and `.sortie/scm.json` to reconstruct runtime `pending_reactions` for recent handoff-stage runs before the first poll tick. The scan is bounded by `PendingReactionRecoveryLookback` and a fixed candidate cap.
 - Startup terminal cleanup maps existing workspace directories to issue identifiers, queries the tracker for the states of those specific issues, and removes the ones in terminal states. An issue that reaches a terminal state through the merge-completion transition (§11G) becomes eligible for this same cleanup without a human relabeling it first.
 
@@ -155,14 +158,15 @@ A verdict that withholds the write is, immediately before any of its effects, ch
 1. Open or create the SQLite database and run schema migrations.
 2. Load persisted retry entries from SQLite.
 3. Reconstruct retry timers from persisted `due_at` timestamps.
-4. Load persisted park records from SQLite and reconstruct the runtime park set before the event loop starts, so a parked issue stays out of dispatch across the restart.
+4. Load persisted park records from SQLite and reconstruct the runtime park set before the event loop starts, so a parked issue stays out of dispatch across the restart. A record a person already released loads as a pending release instead, so the issue stays dispatchable and its next primary dispatch carries the hand-over (Section 14.2).
    Then load persisted stage hop records and reconstruct each issue's hop count, latest hop, and hold flag, so the count and the hold survive the restart. A record with an empty issue ID is skipped with a warning, and a failed load starts with none.
 5. Load persisted budget-hold notice records from SQLite and reconstruct the runtime notice memory before the event loop starts, so a hold already announced to its destinations before the restart is not announced again after it. A record exists only for a notice that had at least one destination.
 6. Load persisted attention acknowledgements from SQLite before the event loop starts, so an attention item whose `id` survives the restart keeps its acknowledgement (§13.7.2). A record that does not parse is skipped with a warning, and a failed load starts with none.
-7. Map existing workspace directories to issue identifiers, query the tracker for the states of those specific issues, and clean the ones in terminal states.
-8. Construct reaction providers and call `RecoverPendingReactions` to restore eligible CI and review pending entries for handoff-stage issues.
-9. Query tracker for active issues and reconcile with persisted state.
-10. Begin normal polling loop.
+7. Load persisted usage-limit holds from SQLite before the first tick, so a hold a provider usage limit began before the restart still stops new sessions of its agent kind, or of that kind on one model, until its reset. A hold whose reset has passed loads and has no effect, and a failed load starts with none. The restored retry entries keep the reset as their due time and their `usage_limit` origin trigger, so a refused issue's retry is still the first dispatch the hold admits.
+8. Map existing workspace directories to issue identifiers, query the tracker for the states of those specific issues, and clean the ones in terminal states.
+9. Construct reaction providers and call `RecoverPendingReactions` to restore eligible CI and review pending entries for handoff-stage issues.
+10. Query tracker for active issues and reconcile with persisted state.
+11. Begin normal polling loop.
 
 ### 7.5 Retry-Slot Arbitration
 

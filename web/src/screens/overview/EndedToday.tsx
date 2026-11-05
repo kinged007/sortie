@@ -1,70 +1,84 @@
-import { Link } from "react-router";
-
-import { StandingMark } from "@/components/Lane";
+import { IssueTitleLink } from "@/components/IssueTitleLink";
+import { MarkSlot } from "@/components/Lane";
+import { NotedFigure } from "@/components/NotedFigure";
+import { Parts } from "@/components/Parts";
+import { Link } from "@/components/carried-links";
+import { MONO } from "@/components/ui/mono";
 import { cn } from "@/lib/cn";
 import { endingWord } from "@/lib/ended";
 import { fmtClock } from "@/lib/format";
 import { endingMarker } from "@/lib/lane";
-import { rowStyles, secondLineColor } from "@/lib/rows";
+import { ROW_GRID, ROW_LIST, rowStyles, secondLineColor } from "@/lib/rows";
+import { Panel } from "@/components/Panel";
 
 import { endedNavKey } from "./rows";
 
 import type { EndedIssue } from "@/lib/ended";
-import type { TallyLine } from "@/lib/tally";
+import type { TallyLine, TallyPart } from "@/lib/tally";
 
 const LINK =
   "text-link underline underline-offset-2 hover:text-link-hover focus-visible:outline-2 focus-visible:outline-focus-ring active:text-link-active";
 
-/** Why the section has no rows to list. */
+interface TallyPartTextProps {
+  part: TallyPart;
+}
+
+// One run of text, so the spaces between a figure and its words survive in a list.
+function TallyPartText({ part }: TallyPartTextProps) {
+  return (
+    <span>
+      {part.lead}
+      {part.figure === undefined ? undefined : <NotedFigure figure={part.figure} />}
+      {part.tail}
+    </span>
+  );
+}
+
 export type EndedEmpty = "unavailable" | "first-run" | "none" | "loading";
 
-/** Props of {@link EndedToday}. */
 export interface EndedTodayProps {
-  /** Every issue that ended today, newest ending first. */
   rows: readonly EndedIssue[];
   /** Issue ids of the rows the reader has not read; those rows carry the unread dot. */
   unreadIds: ReadonlySet<string>;
   /** Why the list is empty when it is; ignored while `rows` holds issues. */
   empty: EndedEmpty;
-  /** The tally line, or `undefined` while it is unavailable. */
   tally: TallyLine | undefined;
-  /** The hover of the tally's cost. */
-  tallyTitle?: string;
-  /** Navigation key of the selected item, or `undefined`. */
   selectedKey: string | undefined;
   showSelection: boolean;
   onOpen: (issue: EndedIssue) => void;
 }
 
-/** Renders the Ended today section: the tally line and every ending of the day. */
 export function EndedToday({
   rows,
   unreadIds,
   empty,
   tally,
-  tallyTitle,
   selectedKey,
   showSelection,
   onOpen,
 }: EndedTodayProps) {
   return (
-    <section className="flex flex-col gap-sm">
-      <div className="flex flex-wrap items-baseline gap-x-sm">
-        <h2 className="font-heading text-h7 font-semibold text-ink">Ended today</h2>
-        {tally === undefined ? undefined : (
-          <span className="text-body-md text-ink-muted wrap-anywhere">{tally.text}</span>
-        )}
-        {tally?.cost === undefined ? undefined : (
-          <span title={tallyTitle} className="text-body-md text-ink-muted wrap-anywhere">
-            {tally.cost}
-          </span>
-        )}
-        <Link to="/history" className={cn("ml-auto text-body-md", LINK)}>
+    <Panel
+      title="Ended today"
+      meta={
+        tally === undefined ? undefined : (
+          <Parts
+            parts={[
+              ...tally.parts.map((part, index) => <TallyPartText key={index} part={part} />),
+              ...(tally.cost === undefined ? [] : [<TallyPartText key="cost" part={tally.cost} />]),
+            ]}
+            className="wrap-anywhere"
+          />
+        )
+      }
+      note={
+        <Link to="/history" className={cn("text-body-md", LINK)}>
           History
         </Link>
-      </div>
+      }
+    >
       {rows.length > 0 ? (
-        <ul className="divide-y divide-line overflow-hidden rounded-lg border border-line bg-canvas">
+        <ul className={ROW_LIST}>
           {rows.map((issue) => (
             <EndedRow
               key={issue.issueId}
@@ -76,15 +90,12 @@ export function EndedToday({
             />
           ))}
         </ul>
-      ) : empty === "loading" ? undefined : empty === "unavailable" ? (
-        <p className="rounded-lg border border-line bg-canvas px-md py-lg text-body-md text-ink-body">
+      ) : empty === "unavailable" ? (
+        <p className="rounded-xl border border-line bg-canvas px-md py-lg text-body-md text-ink-body">
           Run history is not available.
         </p>
-      ) : (
-        // Holds the section's place so the page does not shift when the first ending arrives.
-        <div aria-hidden="true" className="min-h-lh border border-transparent py-lg text-body-md" />
-      )}
-    </section>
+      ) : undefined}
+    </Panel>
   );
 }
 
@@ -99,28 +110,37 @@ interface EndedRowProps {
 function EndedRow({ issue, isUnread, isSelected, showSelection, onOpen }: EndedRowProps) {
   const isLook = isSelected && showSelection;
   const marker = endingMarker(issue.outcome.kind);
-  const meta = [issue.title === null ? null : issue.displayKey, issue.rule, issue.agentKind]
-    .filter((part) => part !== null)
-    .join(" · ");
+  const meta = [
+    issue.title === null ? null : issue.displayKey,
+    issue.rule === null ? null : (
+      <span key="rule" className={MONO}>
+        {issue.rule}
+      </span>
+    ),
+    issue.agentKind === null ? null : (
+      <span key="agent" className={MONO}>
+        {issue.agentKind}
+      </span>
+    ),
+  ].filter((part) => part !== null);
 
   return (
     <li
       data-nav-key={endedNavKey(issue.issueId)}
       onClick={() => onOpen(issue)}
-      className={cn(
-        "grid grid-cols-[auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md wrap-anywhere",
-        rowStyles(isLook, true),
-      )}
+      className={cn(ROW_GRID, rowStyles(isLook, true))}
     >
-      <span className="flex w-(--size-icon) items-center justify-center self-center">
-        {marker === null ? undefined : <StandingMark marker={marker} />}
-      </span>
+      <MarkSlot marker={marker} />
       <div className="min-w-0">
         <p className={cn("text-body-md text-ink", isUnread ? "font-bold" : "font-medium")}>
-          {issue.title ?? issue.displayKey}
+          <IssueTitleLink identifier={issue.identifier}>
+            {issue.title ?? issue.displayKey}
+          </IssueTitleLink>
         </p>
-        {meta === "" ? undefined : (
-          <p className={cn("text-body-sm tabular-nums", secondLineColor(isLook))}>{meta}</p>
+        {meta.length === 0 ? undefined : (
+          <p className={cn("text-body-sm tabular-nums", secondLineColor(isLook))}>
+            <Parts parts={meta} />
+          </p>
         )}
       </div>
       <p className="text-body-md text-ink-body max-md:col-start-2">{endingWord(issue.outcome)}</p>

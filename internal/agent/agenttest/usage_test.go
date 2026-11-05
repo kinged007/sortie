@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -14,8 +15,7 @@ const (
 	usageTestKindIncremental = "agenttest-usage-incremental"
 	usageTestKindTurnEnd     = "agenttest-usage-turn-end"
 	usageTestKindNone        = "agenttest-usage-none"
-	usageTestKindWithRule    = "agenttest-usage-with-rule"
-	usageTestKindUndeclared  = "agenttest-usage-undeclared"
+	usageTestKindRecordsOnly = "agenttest-usage-records-only"
 )
 
 func usageTestConstructor() (domain.AgentAdapter, error) {
@@ -23,27 +23,38 @@ func usageTestConstructor() (domain.AgentAdapter, error) {
 }
 
 func init() {
-	registry.Agents.RegisterWithMeta(usageTestKindUndeclared, usageTestConstructor, registry.AgentMeta{})
 	registry.Agents.RegisterWithMeta(usageTestKindIncremental, usageTestConstructor, registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalIncremental,
-		UsageAttribution: registry.UsageAttributionPerModel,
+		UsageSources: usage.Sources{Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, DuringTurn: true, ServedModel: true},
+		}},
 	})
 	registry.Agents.RegisterWithMeta(usageTestKindTurnEnd, usageTestConstructor, registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalTurnEnd,
-		UsageAttribution: registry.UsageAttributionSessionTotal,
+		UsageSources: usage.Sources{Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative},
+		}},
 	})
 	registry.Agents.RegisterWithMeta(usageTestKindNone, usageTestConstructor, registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalNone,
-		UsageAttribution: registry.UsageAttributionNone,
+		UsageSources: usage.Sources{Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Amounts: []usage.AmountDeclaration{{Unit: "credits", Shape: usage.AmountPerTurn}}},
+		}},
 	})
-	registry.Agents.RegisterWithMeta(usageTestKindWithRule, usageTestConstructor, registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalTurnEnd,
-		UsageAttribution: registry.UsageAttributionSessionTotal,
-		UsageSessionRules: []registry.UsageSessionRule{
-			{
-				When:        func(passthrough map[string]any, remote bool) bool { return remote },
-				Arrival:     registry.UsageArrivalNone,
-				Attribution: registry.UsageAttributionNone,
+	registry.Agents.RegisterWithMeta(usageTestKindRecordsOnly, usageTestConstructor, registry.AgentMeta{
+		UsageSources: usage.Sources{
+			Live: usage.Source{
+				Category: usage.SourceOutput,
+				Strategy: usage.StrategyLive,
+				Spend:    usage.SpendDeclaration{Amounts: []usage.AmountDeclaration{{Unit: "credits", Shape: usage.AmountPerTurn}}},
+			},
+			Records: usage.Source{
+				Category: usage.SourceJournal,
+				Strategy: usage.StrategyRecords,
+				Spend:    usage.SpendDeclaration{Shape: usage.SpendPerRequest},
 			},
 		},
 	})
@@ -231,54 +242,6 @@ func TestAssertModelReported_Violating(t *testing.T) {
 	}
 }
 
-func TestAssertUsageReporting_Passing(t *testing.T) {
-	t.Parallel()
-
-	t.Run("incremental", func(t *testing.T) {
-		t.Parallel()
-		cases := []UsageReportingCase{
-			{
-				Name: "two figures, one per model API request",
-				Events: []domain.AgentEvent{
-					{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}, Model: "gpt-6-astra"},
-					{Type: domain.EventToolResult},
-					{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 20, OutputTokens: 4, TotalTokens: 24}, Model: "gpt-6-astra"},
-				},
-				Result: domain.TurnResult{UsageMeasured: true},
-			},
-		}
-		AssertUsageReporting(t, usageTestKindIncremental, cases)
-	})
-
-	t.Run("turn_end", func(t *testing.T) {
-		t.Parallel()
-		cases := []UsageReportingCase{
-			{
-				Name: "one figure settled after the last tool result, followed by the terminal event",
-				Events: []domain.AgentEvent{
-					{Type: domain.EventToolResult},
-					{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}},
-					{Type: domain.EventTurnCompleted},
-				},
-				Result: domain.TurnResult{UsageMeasured: true, Usage: domain.TokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}},
-			},
-		}
-		AssertUsageReporting(t, usageTestKindTurnEnd, cases)
-	})
-
-	t.Run("none", func(t *testing.T) {
-		t.Parallel()
-		cases := []UsageReportingCase{
-			{
-				Name:   "no usage reported",
-				Events: []domain.AgentEvent{{Type: domain.EventToolResult}, {Type: domain.EventTurnCompleted}},
-				Result: domain.TurnResult{UsageMeasured: false},
-			},
-		}
-		AssertUsageReporting(t, usageTestKindNone, cases)
-	})
-}
-
 func TestAssertUsageReporting_UnregisteredKind(t *testing.T) {
 	t.Parallel()
 
@@ -303,27 +266,6 @@ func TestAssertUsageReporting_EmptyCases(t *testing.T) {
 	}
 }
 
-func TestAssertUsageReporting_RuleCoverageArm(t *testing.T) {
-	t.Parallel()
-
-	reporter := &fakeReporter{}
-	assertUsageReporting(reporter, usageTestKindWithRule, []UsageReportingCase{
-		{
-			Name:   "local only, never triggers the remote rule",
-			Remote: false,
-			Events: []domain.AgentEvent{
-				{Type: domain.EventToolResult},
-				{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 5, OutputTokens: 1, TotalTokens: 6}},
-			},
-			Result: domain.TurnResult{UsageMeasured: true, Usage: domain.TokenUsage{InputTokens: 5, OutputTokens: 1, TotalTokens: 6}},
-		},
-	})
-
-	if len(reporter.errors) == 0 {
-		t.Error("assertUsageReporting recorded no failures for an unreached rule, want at least one")
-	}
-}
-
 func TestAssertResolvedUsageReporting_AdmissibilityGuard(t *testing.T) {
 	t.Parallel()
 
@@ -337,7 +279,7 @@ func TestAssertResolvedUsageReporting_AdmissibilityGuard(t *testing.T) {
 			t.Parallel()
 			reporter := &fakeReporter{}
 			tc := UsageReportingCase{Name: "inadmissible", Events: events, Result: result}
-			assertResolvedUsageReporting(reporter, tc, arrival, registry.UsageAttributionSessionTotal)
+			assertResolvedUsageReporting(reporter, tc, arrival, registry.UsageAttributionSessionTotal, true)
 
 			if len(reporter.errors) == 0 {
 				t.Errorf("assertResolvedUsageReporting(%s) recorded no failures for an inadmissible stream, want at least one", arrival)
@@ -379,7 +321,7 @@ func TestAssertResolvedUsageReporting_IncrementalShapedFailsTurnEndArm(t *testin
 				Events: tt.events,
 				Result: domain.TurnResult{UsageMeasured: true},
 			}
-			assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
+			assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal, true)
 
 			if len(reporter.errors) == 0 {
 				t.Errorf("assertResolvedUsageReporting(turn_end, %s) recorded no failures, want at least one", tt.name)
@@ -391,19 +333,35 @@ func TestAssertResolvedUsageReporting_IncrementalShapedFailsTurnEndArm(t *testin
 func TestAssertResolvedUsageReporting_TurnEndShapedFailsIncrementalArm(t *testing.T) {
 	t.Parallel()
 
-	reporter := &fakeReporter{}
-	tc := UsageReportingCase{
-		Name: "one figure after the last tool result",
-		Events: []domain.AgentEvent{
-			{Type: domain.EventToolResult},
-			{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}, Model: "m"},
-		},
-		Result: domain.TurnResult{UsageMeasured: true},
+	tests := []struct {
+		name       string
+		exitReason domain.AgentEventType
+		wantFail   bool
+	}{
+		{name: "empty exit reason", wantFail: true},
+		{name: "cancelled turn", exitReason: domain.EventTurnCancelled},
+		{name: "failed turn", exitReason: domain.EventTurnFailed},
 	}
-	assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel)
 
-	if len(reporter.errors) == 0 {
-		t.Error("assertResolvedUsageReporting(incremental) recorded no failures for a turn-end-shaped stream, want at least one")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			reporter := &fakeReporter{}
+			tc := UsageReportingCase{
+				Name: "one figure after the last tool result",
+				Events: []domain.AgentEvent{
+					{Type: domain.EventToolResult},
+					{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}, Model: "m"},
+				},
+				Result: domain.TurnResult{UsageMeasured: true, ExitReason: tt.exitReason},
+			}
+			assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel, true)
+
+			if gotFail := len(reporter.errors) > 0; gotFail != tt.wantFail {
+				t.Errorf("assertResolvedUsageReporting(incremental, %s) failed = %t (errors %v), want %t", tt.name, gotFail, reporter.errors, tt.wantFail)
+			}
+		})
 	}
 }
 
@@ -421,28 +379,10 @@ func TestAssertResolvedUsageReporting_AttributionArms(t *testing.T) {
 			},
 			Result: domain.TurnResult{UsageMeasured: true},
 		}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel)
+		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel, true)
 
 		if len(reporter.errors) == 0 {
 			t.Error("assertResolvedUsageReporting(per_model) recorded no failures, want at least one")
-		}
-	})
-
-	t.Run("session_total with a usage-bearing event naming a model", func(t *testing.T) {
-		t.Parallel()
-		reporter := &fakeReporter{}
-		tc := UsageReportingCase{
-			Name: "model named",
-			Events: []domain.AgentEvent{
-				{Type: domain.EventToolResult},
-				{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}, Model: "m"},
-			},
-			Result: domain.TurnResult{UsageMeasured: true, Usage: domain.TokenUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}},
-		}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
-
-		if len(reporter.errors) == 0 {
-			t.Error("assertResolvedUsageReporting(session_total) recorded no failures, want at least one")
 		}
 	})
 
@@ -454,7 +394,7 @@ func TestAssertResolvedUsageReporting_AttributionArms(t *testing.T) {
 			Events: []domain.AgentEvent{{Type: domain.EventToolResult}},
 			Result: domain.TurnResult{UsageMeasured: false},
 		}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionNone)
+		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionNone, true)
 
 		if len(reporter.errors) == 0 {
 			t.Error("assertResolvedUsageReporting(none attribution, turn_end arrival) recorded no failures, want at least one")
@@ -478,7 +418,7 @@ func TestAssertResolvedUsageReporting_TurnEndTerminalOrdering(t *testing.T) {
 
 		reporter := &fakeReporter{}
 		tc := UsageReportingCase{Name: "no terminal event", Events: usageStream(), Result: result}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
+		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal, true)
 
 		if len(reporter.errors) == 0 {
 			t.Error("assertResolvedUsageReporting(turn_end) recorded no failures for a usage event with no trailing terminal event, want at least one")
@@ -491,7 +431,7 @@ func TestAssertResolvedUsageReporting_TurnEndTerminalOrdering(t *testing.T) {
 		reporter := &fakeReporter{}
 		events := append(usageStream(), domain.AgentEvent{Type: domain.EventTurnCompleted})
 		tc := UsageReportingCase{Name: "terminal event appended", Events: events, Result: result}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
+		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal, true)
 
 		if len(reporter.errors) != 0 {
 			t.Errorf("assertResolvedUsageReporting(turn_end) recorded failures %v for a usage event followed by turn_completed, want none", reporter.errors)
@@ -510,7 +450,7 @@ func TestAssertResolvedUsageReporting_TurnEndTerminalOrdering(t *testing.T) {
 			},
 			Result: domain.TurnResult{UsageMeasured: true},
 		}
-		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal)
+		assertResolvedUsageReporting(reporter, tc, registry.UsageArrivalTurnEnd, registry.UsageAttributionSessionTotal, true)
 
 		if len(reporter.errors) == 0 {
 			t.Error("assertResolvedUsageReporting(turn_end) recorded no failures for a zero-payload usage event with no trailing terminal event, want at least one")
@@ -547,7 +487,7 @@ func TestAssertLiveUsageCase(t *testing.T) {
 			},
 		},
 		{
-			name: "none accepts a turn with no measurement",
+			name: "derived none accepts a turn with no measurement",
 			kind: usageTestKindNone,
 			tc: UsageReportingCase{
 				Events: []domain.AgentEvent{{Type: domain.EventTurnCompleted}},
@@ -570,8 +510,8 @@ func TestAssertLiveUsageCase(t *testing.T) {
 			},
 		},
 		{
-			name: "local session under a remote rule resolves the declared pair",
-			kind: usageTestKindWithRule,
+			name: "local launch with a records source resolves its pair",
+			kind: usageTestKindRecordsOnly,
 			tc: UsageReportingCase{
 				Events: []domain.AgentEvent{
 					{Type: domain.EventTokenUsage, Usage: usageOf(10, 2)},
@@ -581,26 +521,9 @@ func TestAssertLiveUsageCase(t *testing.T) {
 			},
 		},
 		{
-			name: "remote session resolves the rule's none arrival",
-			kind: usageTestKindWithRule,
-			tc: UsageReportingCase{
-				Remote: true,
-				Events: []domain.AgentEvent{{Type: domain.EventTurnCompleted}},
-			},
-		},
-		{
-			name:         "none arrival with a measurement",
+			name:         "derived none with a measurement",
 			kind:         usageTestKindNone,
 			tc:           UsageReportingCase{Result: domain.TurnResult{UsageMeasured: true, Usage: usageOf(10, 2)}},
-			wantFailures: []string{kindPrefix + "result.UsageMeasured = true"},
-		},
-		{
-			name: "remote session measured under the rule's none arrival",
-			kind: usageTestKindWithRule,
-			tc: UsageReportingCase{
-				Remote: true,
-				Result: domain.TurnResult{UsageMeasured: true, Usage: usageOf(10, 2)},
-			},
 			wantFailures: []string{kindPrefix + "result.UsageMeasured = true"},
 		},
 		{
@@ -644,7 +567,7 @@ func TestAssertLiveUsageCase(t *testing.T) {
 			wantFailures: []string{kindPrefix + "case %q: declared per_model, no usage-bearing event named a model"},
 		},
 		{
-			name: "session_total with a usage-bearing event naming a model",
+			name: "session_total figure that names a model passes",
 			kind: usageTestKindTurnEnd,
 			tc: UsageReportingCase{
 				Events: []domain.AgentEvent{
@@ -653,7 +576,6 @@ func TestAssertLiveUsageCase(t *testing.T) {
 				},
 				Result: domain.TurnResult{UsageMeasured: true, Usage: usageOf(10, 2)},
 			},
-			wantFailures: []string{kindPrefix + "case %q: event %d: declared session_total, a usage-bearing event named a model"},
 		},
 		{
 			name: "turn_end usage event with no later terminal event",
@@ -690,12 +612,6 @@ func TestAssertLiveUsageCase(t *testing.T) {
 				Result: domain.TurnResult{SpendUnaccounted: true},
 			},
 			wantFailures: []string{kindPrefix + "event %d: type = %q, want no token_usage event"},
-		},
-		{
-			name:         "kind that declares no usage arrival",
-			kind:         usageTestKindUndeclared,
-			tc:           UsageReportingCase{Result: domain.TurnResult{UsageMeasured: true, Usage: usageOf(10, 2)}},
-			wantFailures: []string{kindPrefix + "case %q: want a kind that declares a usage arrival"},
 		},
 		{
 			name:         "unregistered kind",
@@ -776,8 +692,8 @@ func TestAssertUsageReportingCase(t *testing.T) {
 			},
 		},
 		{
-			name: "one local case passes without reaching the session rule",
-			kind: usageTestKindWithRule,
+			name: "local launch with a records source resolves its pair",
+			kind: usageTestKindRecordsOnly,
 			tc: UsageReportingCase{
 				Events: []domain.AgentEvent{
 					{Type: domain.EventToolResult},
@@ -785,14 +701,6 @@ func TestAssertUsageReportingCase(t *testing.T) {
 					{Type: domain.EventTurnCompleted},
 				},
 				Result: domain.TurnResult{UsageMeasured: true, Usage: usageOf(5, 1)},
-			},
-		},
-		{
-			name: "one remote case passes without reaching the declared pair",
-			kind: usageTestKindWithRule,
-			tc: UsageReportingCase{
-				Remote: true,
-				Events: []domain.AgentEvent{{Type: domain.EventToolResult}, {Type: domain.EventTurnCompleted}},
 			},
 		},
 		{

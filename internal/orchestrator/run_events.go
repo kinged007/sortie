@@ -14,8 +14,8 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/redact"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 const (
@@ -34,7 +34,7 @@ const (
 )
 
 // runEventStoreLimits bounds the stored events of every run together.
-var runEventStoreLimits = persistence.RunEventLimits{
+var runEventStoreLimits = storage.RunEventLimits{
 	MaxAge:         365 * 24 * time.Hour,
 	MaxBytes:       2 << 30,
 	MaxExpiredRuns: 4,
@@ -62,6 +62,11 @@ type RunEvent struct {
 	ToolName   string
 	DurationMS int64
 	ToolError  bool
+
+	// ToolKind and ToolArgument are set on tool_result events only; both are
+	// empty for an other tool and for an event stored without them.
+	ToolKind     domain.ToolKind
+	ToolArgument string
 
 	// Usage is nil while the run's usage is unmeasured. It is read only on
 	// the turn-ending types.
@@ -109,6 +114,9 @@ type runEventPayload struct {
 	DurationMS int64           `json:"duration_ms,omitempty"`
 	ToolError  *bool           `json:"tool_error,omitempty"`
 	Usage      json.RawMessage `json:"usage,omitempty"`
+
+	ToolKind     string `json:"tool_kind,omitempty"`
+	ToolArgument string `json:"tool_argument,omitempty"`
 }
 
 type runEventUsage struct {
@@ -129,6 +137,8 @@ func (e RunEvent) Payload() []byte {
 		payload.SessionID = &e.SessionID
 	case e.Event == domain.EventToolResult:
 		payload.ToolName = e.ToolName
+		payload.ToolKind = string(e.ToolKind)
+		payload.ToolArgument = e.ToolArgument
 		payload.DurationMS = max(e.DurationMS, 0)
 		payload.ToolError = &e.ToolError
 	case isTurnTerminalEvent(e.Event):
@@ -155,8 +165,8 @@ func (e RunEvent) withSize() RunEvent {
 }
 
 // storeRow returns the stored form of e.
-func (e RunEvent) storeRow() persistence.RunEvent {
-	return persistence.RunEvent{
+func (e RunEvent) storeRow() storage.RunEvent {
+	return storage.RunEvent{
 		Seq:     e.Seq,
 		At:      e.atText(),
 		Event:   string(e.Event),
@@ -168,7 +178,7 @@ func (e RunEvent) storeRow() persistence.RunEvent {
 // RunEventsFromRows decodes stored events, oldest first, and returns an
 // error for a row that does not decode. It returns an empty non-nil slice
 // for no rows.
-func RunEventsFromRows(rows []persistence.RunEvent) ([]RunEvent, error) {
+func RunEventsFromRows(rows []storage.RunEvent) ([]RunEvent, error) {
 	events := make([]RunEvent, 0, len(rows))
 	for _, row := range rows {
 		at, err := time.Parse(time.RFC3339Nano, row.At)
@@ -181,13 +191,15 @@ func RunEventsFromRows(rows []persistence.RunEvent) ([]RunEvent, error) {
 		}
 
 		event := RunEvent{
-			Seq:        row.Seq,
-			At:         at.UTC(),
-			Event:      domain.AgentEventType(row.Event),
-			Message:    payload.Message,
-			ToolName:   payload.ToolName,
-			DurationMS: payload.DurationMS,
-			size:       row.Size,
+			Seq:          row.Seq,
+			At:           at.UTC(),
+			Event:        domain.AgentEventType(row.Event),
+			Message:      payload.Message,
+			ToolName:     payload.ToolName,
+			DurationMS:   payload.DurationMS,
+			ToolKind:     domain.ToolKind(payload.ToolKind),
+			ToolArgument: payload.ToolArgument,
+			size:         row.Size,
 		}
 		if payload.SessionID != nil {
 			event.SessionID = *payload.SessionID
@@ -309,9 +321,9 @@ func (b *runEventBuffer) hasStartupFailed() bool {
 }
 
 // storeRows returns the buffer's events in stored form, oldest first.
-func (b *runEventBuffer) storeRows() []persistence.RunEvent {
+func (b *runEventBuffer) storeRows() []storage.RunEvent {
 	events := b.snapshot()
-	rows := make([]persistence.RunEvent, len(events))
+	rows := make([]storage.RunEvent, len(events))
 	for i, e := range events {
 		rows[i] = e.storeRow()
 	}
@@ -387,6 +399,8 @@ func retainEvent(entry *RunningEntry, event domain.AgentEvent) {
 		retained.SessionID = event.SessionID
 	case event.Type == domain.EventToolResult:
 		retained.ToolName = event.ToolName
+		retained.ToolKind = event.ToolKind
+		retained.ToolArgument = event.ToolArgument
 		retained.DurationMS = event.ToolDurationMS
 		retained.ToolError = event.ToolError
 	case isTurnTerminalEvent(event.Type) && entry.UsageMeasured:
@@ -401,18 +415,13 @@ func retainEvent(entry *RunningEntry, event domain.AgentEvent) {
 	entry.events.retain(retained.withSize())
 }
 
-// RunEventStore is the persistence interface [RunEventRetry] writes through.
-type RunEventStore interface {
-	AppendRunEvents(ctx context.Context, dispatchID, completedAt string, events []persistence.RunEvent, limits persistence.RunEventLimits) error
-}
-
 // HeldRunEvents is one run's events awaiting a retry.
 type HeldRunEvents struct {
 	IssueID     string
 	Identifier  string
 	DispatchID  string
 	CompletedAt string // The run's run_history.completed_at.
-	Events      []persistence.RunEvent
+	Events      []storage.RunEvent
 }
 
 func (h HeldRunEvents) size() int64 {
@@ -436,7 +445,7 @@ type heldRun struct {
 // RunEventRetry holds the events of runs whose events part failed and retries
 // writing them off the event loop. It is safe for concurrent use.
 type RunEventRetry struct {
-	store  RunEventStore
+	store  storage.RunEventStore
 	logger *slog.Logger
 	delays []time.Duration
 	ctx    context.Context
@@ -450,7 +459,7 @@ type RunEventRetry struct {
 
 // NewRunEventRetry returns a retry component that writes through store and
 // logs to logger, which nil defaults to [slog.Default].
-func NewRunEventRetry(store RunEventStore, logger *slog.Logger) *RunEventRetry {
+func NewRunEventRetry(store storage.RunEventStore, logger *slog.Logger) *RunEventRetry {
 	if logger == nil {
 		logger = slog.Default()
 	}

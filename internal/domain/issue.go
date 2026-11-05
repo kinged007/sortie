@@ -4,6 +4,8 @@
 // contract.
 package domain
 
+import "time"
+
 // Issue is the normalized issue record used by orchestration, prompt
 // rendering, and observability output. Tracker adapters produce Issue
 // values by normalizing their native API responses.
@@ -115,6 +117,32 @@ type ParentRef struct {
 	Identifier string
 }
 
+// CommentAuthorKind is the kind of account that wrote a comment.
+type CommentAuthorKind string
+
+const (
+	// CommentAuthorUnknown means the read cannot tell the kind of account.
+	CommentAuthorUnknown CommentAuthorKind = ""
+
+	// CommentAuthorPerson is a person's account, and the tracker reports
+	// no app acting for it.
+	CommentAuthorPerson CommentAuthorKind = "person"
+
+	// CommentAuthorBot is an automation account, which the tracker marks
+	// as a bot or as an app's own account.
+	CommentAuthorBot CommentAuthorKind = "bot"
+
+	// CommentAuthorApp is a person's account, and the tracker reports that
+	// an app created the comment for it.
+	CommentAuthorApp CommentAuthorKind = "app"
+
+	// CommentAuthorExternal is a person the tracker marks as outside its
+	// own users, such as a service-desk customer or someone without an
+	// account whose comment an integration relayed. The forges never
+	// report it.
+	CommentAuthorExternal CommentAuthorKind = "external"
+)
+
 // Comment represents a single comment on an issue. Adapters normalize
 // native comment structures into this type.
 type Comment struct {
@@ -124,11 +152,85 @@ type Comment struct {
 	// Author is the display name or username of the comment author.
 	Author string
 
+	// AuthorID is the author's account identity as the tracker reports it,
+	// a login or an account ID and never a display name, compared exactly.
+	// A tracker with no account system reports its one author string
+	// instead. It is empty when the tracker reports no author.
+	AuthorID string
+
+	// AuthorKind is the kind of the author's account;
+	// [CommentAuthorUnknown] when the read cannot tell.
+	AuthorKind CommentAuthorKind
+
 	// Body is the comment text content.
 	Body string
 
-	// CreatedAt is an ISO-8601 timestamp.
+	// CreatedAt is the tracker's timestamp text, passed through unchanged.
+	// It is RFC 3339 with fractional seconds optional and a "Z" or "±hh:mm"
+	// offset, or the same with a "±hhmm" offset. [Comment.CreatedTime]
+	// parses exactly these forms.
 	CreatedAt string
+
+	// UpdatedAt is the tracker's last-update timestamp text, passed through
+	// unchanged, in the forms CreatedAt accepts; it is empty when the
+	// tracker reports none. It narrows a read and never decides whether a
+	// comment is new. [Comment.UpdatedTime] parses it.
+	UpdatedAt string
+}
+
+// commentTimeLayouts are the forms [Comment.CreatedTime] and
+// [Comment.UpdatedTime] accept. Parsing with a fractional-seconds-free
+// layout also accepts fractional input.
+var commentTimeLayouts = []string{
+	time.RFC3339,
+	"2006-01-02T15:04:05Z0700",
+}
+
+// CreatedTime reports the instant CreatedAt names. It parses RFC 3339
+// (fractional seconds optional) and the same form with a ±hhmm offset, and
+// returns an error for anything else, the empty string included.
+func (c Comment) CreatedTime() (time.Time, error) {
+	return parseCommentTime(c.CreatedAt)
+}
+
+// UpdatedTime reports the instant UpdatedAt names, in the forms
+// [Comment.CreatedTime] accepts, and returns an error for anything else,
+// the empty string included.
+func (c Comment) UpdatedTime() (time.Time, error) {
+	return parseCommentTime(c.UpdatedAt)
+}
+
+func parseCommentTime(text string) (time.Time, error) {
+	var firstErr error
+	for _, layout := range commentTimeLayouts {
+		t, err := time.Parse(layout, text)
+		if err == nil {
+			return t, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return time.Time{}, firstErr
+}
+
+// CommentTemplateMaps converts comments to template form, one map per
+// comment with keys id, author, body, created_at. A nil input yields nil;
+// any other input yields a non-nil slice of equal length.
+func CommentTemplateMaps(comments []Comment) []map[string]any {
+	if comments == nil {
+		return nil
+	}
+	maps := make([]map[string]any, len(comments))
+	for i, c := range comments {
+		maps[i] = map[string]any{
+			"id":         c.ID,
+			"author":     c.Author,
+			"body":       c.Body,
+			"created_at": c.CreatedAt,
+		}
+	}
+	return maps
 }
 
 // ToTemplateMap converts the Issue to a map[string]any with snake_case
@@ -149,16 +251,7 @@ func (iss *Issue) ToTemplateMap() map[string]any {
 
 	var comments any
 	if iss.Comments != nil {
-		cm := make([]map[string]any, len(iss.Comments))
-		for i, c := range iss.Comments {
-			cm[i] = map[string]any{
-				"id":         c.ID,
-				"author":     c.Author,
-				"body":       c.Body,
-				"created_at": c.CreatedAt,
-			}
-		}
-		comments = cm
+		comments = CommentTemplateMaps(iss.Comments)
 	}
 
 	var blockedBy any

@@ -21,6 +21,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // pgidLeaderParams parameterizes the pgid-family scenarios: it names the
@@ -125,32 +126,20 @@ func overflowOnTerminateScenario(_ []string, _ json.RawMessage) int {
 	return 0
 }
 
-// trapAndExitScenario installs a handler for the graceful termination
-// signal, writes nothing readable to standard output, and on receipt
-// exits with its own fixed status rather than dying by the signal, so
-// a caller can drive Stop against a process that survives the signal
-// with an ordinary exit.
-func trapAndExitScenario(_ []string, _ json.RawMessage) int {
-	terminate := make(chan os.Signal, 1)
-	signal.Notify(terminate, syscall.SIGTERM)
-	<-terminate
-	return 5
-}
-
 func init() {
 	scenarios["pgidLeader"] = agenttest.Typed(pgidLeaderScenario)
 	scenarios["escapedPgidLeader"] = agenttest.Typed(escapedPgidLeaderScenario)
 	scenarios["stderrOnlyLeader"] = agenttest.Typed(stderrOnlyLeaderScenario)
 	scenarios["selfSignal"] = selfSignalScenario
 	scenarios["overflowOnTerminate"] = overflowOnTerminateScenario
-	scenarios["trapAndExit"] = trapAndExitScenario
 }
 
 func TestForkPerTurnSession_StopWhileRunningCancelsWhateverTheRuntimeExitsWith(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := agenttest.FakeRuntime(t, tmpDir, "agent", "trapAndExit", nil)
+	ready := filepath.Join(tmpDir, "ready")
+	script := agenttest.FakeRuntime(t, tmpDir, "agent", "trap", trapParams{Marker: ready, ExitOnSignal: true, ExitCode: 5})
 	target := newTestTarget(tmpDir, script)
 	sess := NewForkPerTurnSession(target, hooksWithEarlyExitDisposition(), slog.Default(), 0)
 
@@ -161,17 +150,12 @@ func TestForkPerTurnSession_StopWhileRunningCancelsWhateverTheRuntimeExitsWith(t
 		done <- err
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waittest.File(t, ready)
 	if err := sess.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() = %v", err)
 	}
 
-	var err error
-	select {
-	case err = <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("RunTurn did not return within 6s after Stop")
-	}
+	err := waittest.Receive(t, done, "RunTurn return after Stop")
 
 	requireAgentError(t, err, domain.ErrTurnCancelled)
 	if !hasEventType(*events, domain.EventTurnCancelled) {
@@ -185,14 +169,13 @@ func awaitReaped(t *testing.T, pid string) {
 	if err != nil {
 		t.Fatalf("pid %q is not a number: %v", pid, err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if errors.Is(syscall.Kill(n, 0), syscall.ESRCH) {
-			return
+	waittest.Until(t, func() error {
+		killErr := syscall.Kill(n, 0)
+		if errors.Is(killErr, syscall.ESRCH) {
+			return nil
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("process %d was not reaped within 5s", n)
+		return fmt.Errorf("process %d is not reaped: kill(0) = %v", n, killErr)
+	})
 }
 
 func TestForkPerTurnSession_StopAfterOwnExitKeepsTheEarlyExitReport(t *testing.T) {
@@ -226,7 +209,7 @@ func TestForkPerTurnSession_ZeroExitIsNotCancelledWhenTheDeadlineFallsDuringTheD
 	tmpDir := t.TempDir()
 	pidFile := filepath.Join(tmpDir, "descendant.pid")
 	script := writeStderrOnlyDescendantScript(t, tmpDir, pidFile, true)
-	killEscapedGroupOnCleanup(t, pidFile)
+	t.Cleanup(func() { agenttest.KillEscaped(pidFile) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -288,78 +271,6 @@ func writeStderrOnlyDescendantScript(t *testing.T, dir, pidFile string, escape b
 	t.Helper()
 	child := agenttest.FakeRuntime(t, dir, "agent-stderr-only-child", agenttest.OutputScenario, agenttest.Output{Hang: true})
 	return agenttest.FakeRuntime(t, dir, "agent-stderr-only-descendant", "stderrOnlyLeader", pgidLeaderParams{ChildPath: child, PIDFile: pidFile, Escape: escape})
-}
-
-// pollPgidFileTimeout is the bound every pollPgidFile call in this file
-// polls under.
-const pollPgidFileTimeout = 5 * time.Second
-
-// pollPgidFile polls pidFile until it contains a valid positive integer
-// PID, or fails the test after pollPgidFileTimeout.
-func pollPgidFile(t *testing.T, pidFile string) int {
-	t.Helper()
-	deadline := time.Now().Add(pollPgidFileTimeout)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(pidFile)
-		if err == nil {
-			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("pollPgidFile(%q): no valid PID after %v", pidFile, pollPgidFileTimeout)
-	return 0
-}
-
-// killEscapedGroupOnCleanup registers a best-effort SIGKILL of the
-// process group led by pid, read from pidFile, so a setsid-escaped
-// descendant this file's fixtures leave running does not survive past
-// the test that started it.
-func killEscapedGroupOnCleanup(t *testing.T, pidFile string) {
-	t.Helper()
-	t.Cleanup(func() {
-		data, err := os.ReadFile(pidFile)
-		if err != nil {
-			return
-		}
-		pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if convErr != nil || pid <= 0 {
-			return
-		}
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-	})
-}
-
-// isPgidZombie reports whether pid is a zombie by reading /proc/<pid>/stat.
-// Returns false if the file cannot be read.
-func isPgidZombie(pid int) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return false
-	}
-	if i := strings.LastIndex(string(data), ")"); i >= 0 && i+2 < len(data) {
-		return data[i+2] == 'Z'
-	}
-	return false
-}
-
-// assertPgidProcessDead polls until the process is gone (or a zombie) or
-// the timeout expires.
-func assertPgidProcessDead(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return // any error means the process is gone or unreachable
-		}
-		if isPgidZombie(pid) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("assertPgidProcessDead: process %d still alive after %v", pid, timeout)
 }
 
 // TestForkPerTurnSession_Arm5_ExternalSIGTERM verifies that a subprocess
@@ -476,12 +387,12 @@ func TestForkPerTurnSession_ProcessGroupIsolation(t *testing.T) {
 		sess.RunTurn(ctx, "p", emit) //nolint:errcheck // testing process group kill
 	}()
 
-	grandchildPID := pollPgidFile(t, pidFile)
+	grandchildPID := waittest.PIDFile(t, pidFile)
 
 	cancel()
 	<-done
 
-	assertPgidProcessDead(t, grandchildPID, 3*time.Second)
+	waittest.ProcessGone(t, grandchildPID)
 }
 
 // TestForkPerTurnSession_DescendantHoldsStderrOnly verifies that a
@@ -522,14 +433,9 @@ func TestForkPerTurnSession_DescendantHoldsStderrOnly(t *testing.T) {
 		done <- outcome{result, err}
 	}()
 
-	descendantPID := pollPgidFile(t, pidFile)
+	descendantPID := waittest.PIDFile(t, pidFile)
 
-	var got outcome
-	select {
-	case got = <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunTurn did not return within 10s")
-	}
+	got := waittest.Receive(t, done, "RunTurn outcome")
 
 	if got.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", got.err)
@@ -546,7 +452,7 @@ func TestForkPerTurnSession_DescendantHoldsStderrOnly(t *testing.T) {
 		t.Errorf("OnFinalize stderrLines = %v, want %v", gotStderrLines, wantStderrLines)
 	}
 
-	assertPgidProcessDead(t, descendantPID, 3*time.Second)
+	waittest.ProcessGone(t, descendantPID)
 }
 
 // TestForkPerTurnSession_InGroupDescendantHoldsStdout drives
@@ -585,22 +491,17 @@ func TestForkPerTurnSession_InGroupDescendantHoldsStdout(t *testing.T) {
 		done <- outcome{result, err}
 	}()
 
-	descendantPID := pollPgidFile(t, pidFile)
+	descendantPID := waittest.PIDFile(t, pidFile)
 	cancel()
 
-	var got outcome
-	select {
-	case got = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("RunTurn did not return within 5s")
-	}
+	got := waittest.Receive(t, done, "RunTurn outcome")
 
 	requireAgentError(t, got.err, domain.ErrTurnCancelled)
 	if !hasEventType(*events, domain.EventTurnCancelled) {
 		t.Errorf("EventTurnCancelled not emitted; got %v", *events)
 	}
 
-	assertPgidProcessDead(t, descendantPID, 3*time.Second)
+	waittest.ProcessGone(t, descendantPID)
 
 	for _, e := range spy.Entries() {
 		if e.Level == slog.LevelWarn && e.Msg == "agent stdout was not fully collected before the turn ended" {
@@ -648,22 +549,17 @@ func TestForkPerTurnSession_EscapedDescendantHoldsStdout(t *testing.T) {
 		done <- outcome{result, err}
 	}()
 
-	pollPgidFile(t, pidFile)
-	killEscapedGroupOnCleanup(t, pidFile)
+	waittest.PIDFile(t, pidFile)
+	t.Cleanup(func() { agenttest.KillEscaped(pidFile) })
 
 	reapStart := time.Now()
 	cancel()
 
-	var got outcome
-	select {
-	case got = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("RunTurn did not return within 5s")
-	}
+	got := waittest.Receive(t, done, "RunTurn outcome")
 	elapsed := time.Since(reapStart)
 
-	if elapsed > 2*time.Second {
-		t.Errorf("RunTurn published %v after cancellation, want well under 2s (sess.drainGrace=200ms plus scheduling overhead)", elapsed)
+	if elapsed > procutil.DefaultDrainGrace {
+		t.Errorf("RunTurn published %v after cancellation, want under the default drain grace %v: sess.drainGrace=200ms must bound it", elapsed, procutil.DefaultDrainGrace)
 	}
 
 	requireAgentError(t, got.err, domain.ErrTurnCancelled)

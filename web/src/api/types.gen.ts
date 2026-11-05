@@ -38,11 +38,19 @@ export interface AgentEventFrame {
   event: string;
   message: string;
   text: string;
+  tool_line?: string;
   session_id?: string;
   tool_name?: string;
+  tool_kind?: string;
+  tool_argument?: string;
   duration_ms?: number;
   tool_error?: boolean;
   usage?: TokenInfo | null;
+}
+
+export interface AgentUsageWindowsResponse {
+  reported_at: string;
+  windows: UsageWindowResponse[] | null;
 }
 
 export interface AttemptsInfo {
@@ -140,6 +148,12 @@ export interface ChainGroup {
   tokens_unmeasured_runs: number;
   cost_unpriced_runs: number;
   cost_partial_runs: number;
+  tokens_lower_bound_runs: number;
+  tokens_lower_bound: boolean;
+  cost_lower_bound: boolean;
+  agent_priced_usd: number | null;
+  unmeasured_cause: string | null;
+  unmeasured_units: string[] | null;
   issue: string;
   stages: string[] | null;
   last_hop: string;
@@ -233,6 +247,12 @@ export interface Group {
   tokens_unmeasured_runs: number;
   cost_unpriced_runs: number;
   cost_partial_runs: number;
+  tokens_lower_bound_runs: number;
+  tokens_lower_bound: boolean;
+  cost_lower_bound: boolean;
+  agent_priced_usd: number | null;
+  unmeasured_cause: string | null;
+  unmeasured_units: string[] | null;
 }
 
 export interface HealthCheckResponse {
@@ -248,6 +268,20 @@ export interface HealthResponse {
   status: string;
 }
 
+export interface HeldIssueResponse {
+  issue_id: string;
+  issue_identifier: string;
+  display_identifier?: string;
+  issue_title?: string;
+  issue_url?: string;
+  issue_type?: string;
+  issue_labels?: string[];
+  state?: string;
+  hold: HoldResponse;
+  status_text: string;
+  status_text_full: string;
+}
+
 export interface HistoryTotalsResponse {
   run_count: number;
   unmeasured_runs: number;
@@ -256,6 +290,38 @@ export interface HistoryTotalsResponse {
   tokens_complete: boolean;
   estimated_cost_usd: number | null;
   cost_status: string;
+  unmeasured_cause: string | null;
+  unmeasured_units: string[] | null;
+  vendor_amounts: UnitAmountResponse[] | null;
+  agent_priced_usd: number | null;
+  agent_priced_models: string[] | null;
+}
+
+export interface HoldBlockerResponse {
+  issue_id: string;
+  issue_identifier: string;
+  display_identifier?: string;
+  state?: string;
+}
+
+export interface HoldResponse {
+  reason: "agent_slots_full" | "ssh_hosts_full" | "blockers_not_read" | "blockers_unresolved" | "blockers_incomplete" | "blocked_by" | "daily_spend_ceiling" | "weekly_spend_ceiling" | "monthly_spend_ceiling" | "stage_hop_unconfirmed" | "usage_limit" | "park_comments_unread";
+  held_since: string;
+  blockers: HoldBlockerResponse[] | null;
+  slot: HoldSlotResponse | null;
+  resets_at: string | null;
+  agent_kind?: string;
+  model_only?: boolean;
+  model?: string;
+  reason_text: string;
+  release_text: string;
+}
+
+export interface HoldSlotResponse {
+  scope: string;
+  state?: string;
+  used: number;
+  limit: number;
 }
 
 export interface HopDecisionResponse {
@@ -337,6 +403,13 @@ export interface IssueResponse {
   state?: string;
 }
 
+export interface KindCosts {
+  fresh_input_usd: number;
+  output_usd: number;
+  cache_write_usd: number;
+  cache_read_usd: number;
+}
+
 export interface LastStageResponse {
   chain: string[] | null;
   rule: string;
@@ -365,6 +438,7 @@ export interface ModelUsageResponse {
   estimated_cost_usd: number | null;
   cost_status: string;
   unrated_classes: string[] | null;
+  price_source: string | null;
 }
 
 export interface NextOutcomeResponse {
@@ -476,6 +550,7 @@ export interface ReactionCheckResponse {
   actionable_comments?: number;
   new_comments?: number;
   handled?: boolean;
+  awaiting_approval?: boolean;
   mergeable?: boolean | null;
 }
 
@@ -503,7 +578,7 @@ export interface Report {
   schema_tier: string;
   warnings: string[] | null;
   summary: Summary;
-  spend: Spend | null;
+  spend: Spend;
   by_status: Group[] | null;
   by_adapter: Group[] | null;
   by_rule: Group[] | null;
@@ -513,6 +588,8 @@ export interface Report {
   chain_funnels: Funnel[] | null;
   by_trigger: Group[] | null;
   by_origin: Group[] | null;
+  by_provenance: Group[] | null;
+  skill_calls: SkillCallReport | null;
   self_review: SelfReview | null;
 }
 
@@ -563,8 +640,11 @@ export interface RunEventResponse {
   event: string;
   message: string;
   text: string;
+  tool_line?: string;
   session_id?: string;
   tool_name?: string;
+  tool_kind?: string;
+  tool_argument?: string;
   duration_ms?: number;
   tool_error?: boolean;
   usage?: TokenInfo | null;
@@ -592,6 +672,8 @@ export interface RunResponse {
   attempt: number;
   status: string;
   error: string | null;
+  declared_outcome: string | null;
+  agent_text: string | null;
   rule_name?: string;
   agent_kind?: string;
   configured_model?: string;
@@ -604,8 +686,6 @@ export interface RunResponse {
   turns_completed: number;
   tokens: TokenInfo;
   uncached_tokens: number | null;
-  tokens_measured: boolean;
-  unaccounted_turns: number;
   estimated_cost_usd: number | null;
   cost_status: string;
   chain_id?: string;
@@ -620,8 +700,14 @@ export interface RunResponse {
   reaction_config_key: string | null;
   session_id: string | null;
   ssh_host: string | null;
+  usage_completeness: string;
+  usage_provenance: UsageSourceResponse[] | null;
+  vendor_amounts: VendorAmountResponse[] | null;
+  unmeasured_cause: string | null;
+  unmeasured_units: string[] | null;
   dispatch_id: string | null;
   model_usage: ModelUsageResponse[] | null;
+  skills?: SkillCall[];
   stage_chain: string[] | null;
   issue_outcome: IssueOutcomeResponse | null;
   pr_loop: Record<string, PrLoopStationResponse> | null;
@@ -663,6 +749,7 @@ export interface RunningEntryResponse {
   pull_request?: PullRequestResponse;
   api_request_count: number | null;
   requests_by_model?: Record<string, number>;
+  skills?: SkillCall[];
   tool_time_percent: number | null;
   api_time_percent: number | null;
   tokens_measured: boolean;
@@ -846,6 +933,8 @@ export interface ShapeSelection {
 
 export interface ShapeTracker {
   kind: string;
+  project?: string;
+  project_url?: string;
   active_states: string[] | null;
   in_progress_state?: string;
   handoff_state?: string;
@@ -856,6 +945,23 @@ export interface ShapeTracker {
 export interface ShapeWorker {
   ssh_hosts: string[] | null;
   max_concurrent_agents_per_host: number | null;
+}
+
+export interface SkillCall {
+  skill: string;
+  tool_error?: boolean;
+}
+
+export interface SkillCallReport {
+  unrecorded_runs: number;
+  by_skill: SkillCount[] | null;
+}
+
+export interface SkillCount {
+  skill: string;
+  runs: number;
+  calls: number;
+  failed_calls: number;
 }
 
 export interface SnapshotAgentTotals {
@@ -870,22 +976,59 @@ export interface SnapshotAgentTotals {
   running_non_reporting: number;
 }
 
+export interface SpanReport {
+  generated_at: string;
+  since: string;
+  until: string | null;
+  period: "five_minutes" | "quarter_hour" | "hour" | "day" | "month";
+  totals: SpendBucket;
+  sessions: SpanSession[] | null;
+}
+
+export interface SpanSession {
+  identifier: string;
+  display_identifier?: string;
+  issue_title: string;
+  dispatch_id: string | null;
+  rule_name: string;
+  agent_kind: string;
+  status: string;
+  turns: number | null;
+  tokens: Tokens | null;
+  cost_usd: number | null;
+  cost_unpriced: boolean;
+  cost_share: number | null;
+  tokens_share: number | null;
+}
+
 export interface Spend {
-  period: string;
+  period: "five_minutes" | "quarter_hour" | "hour" | "day" | "month";
   buckets: SpendBucket[] | null;
 }
 
 export interface SpendBucket {
   start: string;
   runs: number;
+  turns: number;
+  tool_calls: number;
+  errors: number;
+  turns_unrecorded_runs: number;
+  tokens: Tokens | null;
   cost_usd: number | null;
+  cost_by_kind: KindCosts | null;
   tokens_unmeasured_runs: number;
   cost_unpriced_runs: number;
   cost_partial_runs: number;
+  tokens_lower_bound_runs: number;
+  tokens_lower_bound: boolean;
+  cost_lower_bound: boolean;
+  agent_priced_usd: number | null;
+  in_progress: boolean;
 }
 
 export interface SpendCeilingResponse {
   daily: SpendWindowResponse | null;
+  weekly: SpendWindowResponse | null;
   monthly: SpendWindowResponse | null;
 }
 
@@ -915,6 +1058,7 @@ export interface StageHopResponse {
   stage_position: StagePositionResponse | null;
   agent_kind?: string;
   configured_model?: string;
+  hold: HoldResponse | null;
   status_text: string;
   status_text_full: string;
 }
@@ -939,6 +1083,7 @@ export interface StateCounts {
   parked: number;
   pending_reactions: number;
   between_stages: number;
+  held: number;
   attention: number;
 }
 
@@ -962,9 +1107,10 @@ export interface StateResponse {
   pending_reactions: PendingReactionResponse[] | null;
   between_stages: StageHopResponse[] | null;
   active: ActiveIssueResponse[] | null;
+  held: HeldIssueResponse[] | null;
   attention: AttentionItemResponse[] | null;
   agent_totals: SnapshotAgentTotals;
-  rate_limits: Record<string, unknown> | null;
+  rate_limits: Record<string, AgentUsageWindowsResponse>;
   active_estimated_cost_usd?: number;
   cost_unpriced_running?: number;
   spend_ceiling?: SpendCeilingResponse;
@@ -990,6 +1136,12 @@ export interface Summary {
   cost_unpriced_runs: number;
   cost_partial_runs: number;
   tokens_unmeasured_runs: number;
+  tokens_lower_bound_runs: number;
+  tokens_lower_bound: boolean;
+  cost_lower_bound: boolean;
+  agent_priced_usd: number | null;
+  unmeasured_cause: string | null;
+  unmeasured_units: string[] | null;
 }
 
 export interface TableInForceResponse {
@@ -1043,6 +1195,40 @@ export interface Tokens {
   cache_read: number;
   cache_write: number;
   uncached: number;
+  fresh_input: number;
+}
+
+export interface UnitAmountResponse {
+  unit: string;
+  amount: number;
+  lower_bound: boolean;
+}
+
+export interface UsageSourceResponse {
+  source: string;
+  strategy: string;
+}
+
+export interface UsageWindowAmountResponse {
+  used: number;
+  limit: number;
+  unit: string;
+}
+
+export interface UsageWindowResponse {
+  label: string;
+  used_percent: number | null;
+  status: "allowed" | "warning" | "exhausted" | null;
+  resets_at: string | null;
+  reported_at: string;
+  amount: UsageWindowAmountResponse | null;
+}
+
+export interface VendorAmountResponse {
+  unit: string;
+  model: string;
+  amount: number;
+  lower_bound: boolean;
 }
 
 export interface VerdictCount {

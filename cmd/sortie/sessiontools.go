@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"log/slog"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/tool/budget"
 	"github.com/sortie-ai/sortie/internal/tool/history"
 	"github.com/sortie-ai/sortie/internal/tool/notify"
@@ -84,7 +84,7 @@ type SessionToolRegistry struct {
 	// Store is the read-only connection backing workspace_history and
 	// cost_budget, or nil when neither was registered. The caller closes
 	// it after consuming Registry.
-	Store *persistence.Store
+	Store io.Closer
 }
 
 // BuildSessionToolRegistry returns tools whose registration inputs are satisfied.
@@ -97,7 +97,7 @@ func BuildSessionToolRegistry(ctx context.Context, logger *slog.Logger, params S
 	}
 
 	reg := domain.NewToolRegistry()
-	var store *persistence.Store
+	var store io.Closer
 
 	if params.TrackerAdapter != nil && params.Project != "" {
 		reg.Register(trackerapi.New(params.TrackerAdapter, params.Project))
@@ -110,15 +110,15 @@ func BuildSessionToolRegistry(ctx context.Context, logger *slog.Logger, params S
 	}
 
 	if params.DBPath != "" && params.IssueID != "" {
-		openedStore, err := persistence.OpenReadOnly(ctx, params.DBPath)
+		openedStore, err := openStoreReadOnly(ctx, params.DBPath)
 		if err != nil {
 			logger.Warn("failed to open read-only db for workspace_history and cost_budget",
 				slog.String("db_path", params.DBPath),
 				slog.Any("error", err))
 		} else {
 			store = openedStore
-			reg.Register(history.New(buildHistoryQuery(store), params.IssueID))
-			reg.Register(budget.New(buildBudgetQuery(store), params.IssueID, params.DispatchID, params.MaxTokens, params.MaxSessions, params.TokenWarningThreshold, params.MaxCostUSD))
+			reg.Register(history.New(buildHistoryQuery(openedStore), params.IssueID))
+			reg.Register(budget.New(buildBudgetQuery(openedStore), params.IssueID, params.DispatchID, params.MaxTokens, params.MaxSessions, params.TokenWarningThreshold, params.MaxCostUSD))
 		}
 	}
 

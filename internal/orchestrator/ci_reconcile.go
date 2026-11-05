@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/scm/scmcore"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // ciPendingBackoffBaseDefault is the fallback base interval for CI-pending
@@ -473,7 +472,7 @@ func handleCIFailure(
 	// A standing escalation never reaches this function, so every call
 	// dispatches a fix or begins an escalation, and each row counts against
 	// agent.max_sessions.
-	ciRunHistory := persistence.RunHistory{
+	ciRunHistory := storage.RunHistory{
 		IssueID:        pending.IssueID,
 		Identifier:     pending.Identifier,
 		DisplayID:      pending.DisplayID,
@@ -489,6 +488,9 @@ func handleCIFailure(
 		DispatchedAt:   formatDispatchedAt(pending.StageLineage.DispatchedAt),
 		Trigger:        new(""),
 		DispatchID:     new(""),
+		Skills:         new("[]"),
+
+		UsageCompleteness: storage.UsageComplete,
 	}
 	recordRunCost(&ciRunHistory, state.Rates)
 	if _, err := params.Store.AppendRunHistory(ctx, ciRunHistory); err != nil {
@@ -618,11 +620,11 @@ func applyCIEscalation(
 		)
 	}
 
-	commentText := buildCIEscalationComment(result, ref, attempts)
+	var facts domain.MessageFacts = ciFailureFacts(result, ref, attempts)
 	if trigger == EscalationTriggerTriage {
-		commentText = buildTriageEscalationComment("ci", "ref "+ref)
+		facts = domain.TriageEscalationFacts{Ref: ref}
 	}
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationCIFailure, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationCIFailure, pending, facts))
 
 	if params.CIFeedback.Escalation == "label" {
 		label := params.CIFeedback.EscalationLabel
@@ -663,34 +665,23 @@ func applyCIEscalation(
 	})
 }
 
-// buildCIEscalationComment builds a plain-text escalation comment for
-// CI failures that exceeded the retry budget. Plain text is used so the
-// comment renders consistently across all tracker adapters.
-//
-// The comment names exactly the checks the verdict counted as failing,
-// obtaining that classification from [scmcore.IsFailingConclusion]
-// rather than restating it, so the named checks never disagree with the
-// verdict that triggered the escalation.
-func buildCIEscalationComment(result domain.CIResult, ref string, attempts int) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "CI fix retries exhausted\n\n")
-	fmt.Fprintf(&b, "Sortie attempted %d CI-fix continuation(s) on ref %s but CI is still failing.\n\n", attempts, ref)
-
-	if result.FailingCount > 0 {
-		fmt.Fprintf(&b, "Failing checks: %d\n", result.FailingCount)
-	}
-
+// ciFailureFacts reports every check run of result in result order, each
+// marked failing by [scmcore.IsFailingConclusion] so the checks a comment
+// names never disagree with the verdict that triggered the escalation.
+func ciFailureFacts(result domain.CIResult, ref string, attempts int) domain.CIFailureFacts {
+	checks := make([]domain.CICheckFacts, 0, len(result.CheckRuns))
 	for _, cr := range result.CheckRuns {
-		if !scmcore.IsFailingConclusion(cr.Conclusion) {
-			continue
-		}
-		fmt.Fprintf(&b, "- %s: %s", cr.Name, cr.Conclusion)
-		if cr.DetailsURL != "" {
-			fmt.Fprintf(&b, " (details: %s)", cr.DetailsURL)
-		}
-		b.WriteString("\n")
+		checks = append(checks, domain.CICheckFacts{
+			Name:       cr.Name,
+			Conclusion: string(cr.Conclusion),
+			DetailsURL: cr.DetailsURL,
+			Failing:    scmcore.IsFailingConclusion(cr.Conclusion),
+		})
 	}
-
-	b.WriteString("\nManual intervention required.")
-	return b.String()
+	return domain.CIFailureFacts{
+		Ref:          ref,
+		Attempts:     attempts,
+		FailingCount: result.FailingCount,
+		Checks:       checks,
+	}
 }

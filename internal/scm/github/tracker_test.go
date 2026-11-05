@@ -16,11 +16,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func validConfig(endpoint string) map[string]any {
@@ -543,11 +543,8 @@ func TestFetchCandidateIssues_MaxPagesGuard(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	a := mustAdapter(t, validConfig(srv.URL))
-	issues, err := a.FetchCandidateIssues(ctx)
+	issues, err := a.FetchCandidateIssues(waittest.Context(t))
 	if err != nil {
 		t.Fatalf("FetchCandidateIssues: %v", err)
 	}
@@ -1123,7 +1120,9 @@ func TestFetchIssueComments_SinglePage(t *testing.T) {
 	t.Parallel()
 
 	fixture := loadFixture(t, "comments.json")
+	var requests requestLog
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.add(r)
 		w.WriteHeader(http.StatusOK)
 		w.Write(fixture) //nolint:errcheck // test helper
 	}))
@@ -1145,6 +1144,11 @@ func TestFetchIssueComments_SinglePage(t *testing.T) {
 		t.Errorf("comments[1].Author = %q, want bob", comments[1].Author)
 	}
 	adaptertest.AssertCommentsAscending(t, comments)
+
+	wantRequests := []string{`GET /repos/owner/repo/issues/42/comments?per_page=50 if-none-match=""`}
+	if got := requests.all(); !slices.Equal(got, wantRequests) {
+		t.Errorf("FetchIssueComments requests = %q, want %q", got, wantRequests)
+	}
 }
 
 func TestFetchIssueComments_EmptyIsNonNil(t *testing.T) {
@@ -1211,6 +1215,171 @@ func TestFetchIssueComments_NotFound(t *testing.T) {
 	a := mustAdapter(t, validConfig(srv.URL))
 	_, err := a.FetchIssueComments(context.Background(), "999")
 	assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
+}
+
+type requestLog struct {
+	mu   sync.Mutex
+	list []string
+}
+
+func (l *requestLog) add(r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.list = append(l.list, fmt.Sprintf("%s %s if-none-match=%q", r.Method, r.URL.RequestURI(), r.Header.Get("If-None-Match")))
+}
+
+func (l *requestLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.list)
+}
+
+type commentPageReply struct {
+	status int
+	etag   string
+	body   []byte
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	page := loadFixture(t, "comment_changes_page.json")
+	nextPage := loadFixture(t, "comment_changes_next_page.json")
+	pageComments := []domain.Comment{
+		{ID: "9001", Author: "alice", AuthorID: "alice", AuthorKind: domain.CommentAuthorPerson, Body: "Looks good, please proceed.", CreatedAt: "2026-01-15T10:00:00Z", UpdatedAt: "2026-01-15T10:00:00Z"},
+		{ID: "9002", Author: "bob", AuthorID: "bob", AuthorKind: domain.CommentAuthorPerson, Body: "Please fix the indentation, then rebase.", CreatedAt: "2026-01-16T11:30:00Z", UpdatedAt: "2026-01-17T08:15:00Z"},
+		{ID: "9003", Author: "github-actions[bot]", AuthorID: "github-actions[bot]", AuthorKind: domain.CommentAuthorBot, Body: "CI finished: all checks passed.", CreatedAt: "2026-01-17T09:00:00Z", UpdatedAt: "2026-01-17T09:00:00Z"},
+	}
+
+	const (
+		page1Request  = `GET /repos/owner/repo/issues/42/comments?page=1&per_page=100 if-none-match=""`
+		page1Validate = `GET /repos/owner/repo/issues/42/comments?page=1&per_page=100 if-none-match="W/\"v1\""`
+		page2Request  = `GET /repos/owner/repo/issues/42/comments?page=2&per_page=100 if-none-match=""`
+		page2Validate = `GET /repos/owner/repo/issues/42/comments?page=2&per_page=100 if-none-match="W/\"v2\""`
+		onePageV1     = `[{"etag":"W/\"v1\"","count":2}]`
+		fullPageV1    = `[{"etag":"W/\"v1\"","count":100}]`
+		fullThenOne   = `[{"etag":"W/\"v1\"","count":100},{"etag":"W/\"v2\"","count":1}]`
+	)
+
+	tests := []struct {
+		name         string
+		since        domain.CommentReadPoint
+		cacheOff     bool
+		replies      map[string]commentPageReply
+		wantRequests []string
+		wantComments []domain.Comment
+		wantNext     domain.CommentReadPoint
+		wantErr      domain.TrackerErrorKind
+	}{
+		{
+			name:         "new and edited comments come back with author fields and the new body",
+			since:        onePageV1,
+			replies:      map[string]commentPageReply{"1": {http.StatusOK, `W/"v2"`, page}},
+			wantRequests: []string{page1Validate},
+			wantComments: pageComments,
+			wantNext:     `[{"etag":"W/\"v2\"","count":3}]`,
+		},
+		{
+			name:  "every page not modified returns nothing and keeps the point",
+			since: fullThenOne,
+			replies: map[string]commentPageReply{
+				"1": {status: http.StatusNotModified},
+				"2": {status: http.StatusNotModified},
+			},
+			wantRequests: []string{page1Validate, page2Validate},
+			wantComments: []domain.Comment{},
+			wantNext:     fullThenOne,
+		},
+		{
+			name:  "a full page that answers not modified is followed by an unconditional next page",
+			since: fullPageV1,
+			replies: map[string]commentPageReply{
+				"1": {status: http.StatusNotModified},
+				"2": {http.StatusOK, `W/"v2"`, nextPage},
+			},
+			wantRequests: []string{page1Validate, page2Request},
+			wantComments: []domain.Comment{
+				{ID: "9101", Author: "carol", AuthorID: "carol", AuthorKind: domain.CommentAuthorPerson, Body: "The 101st comment.", CreatedAt: "2026-01-18T12:00:00Z", UpdatedAt: "2026-01-18T12:00:00Z"},
+			},
+			wantNext: fullThenOne,
+		},
+		{
+			name:         "undecodable point reads page one unconditionally",
+			since:        "x",
+			replies:      map[string]commentPageReply{"1": {http.StatusOK, `W/"v1"`, page}},
+			wantRequests: []string{page1Request},
+			wantComments: pageComments,
+			wantNext:     `[{"etag":"W/\"v1\"","count":3}]`,
+		},
+		{
+			name:         "disabled conditional requests send no validator and return no point",
+			since:        onePageV1,
+			cacheOff:     true,
+			replies:      map[string]commentPageReply{"1": {http.StatusOK, `W/"v2"`, page}},
+			wantRequests: []string{page1Request},
+			wantComments: pageComments,
+		},
+		{
+			name:         "body that is not an array is a payload error",
+			replies:      map[string]commentPageReply{"1": {http.StatusOK, `W/"v1"`, []byte(`{"message":"unexpected"}`)}},
+			wantRequests: []string{page1Request},
+			wantErr:      domain.ErrTrackerPayload,
+		},
+		{
+			name:         "missing issue is not found",
+			replies:      map[string]commentPageReply{"1": {status: http.StatusNotFound}},
+			wantRequests: []string{page1Request},
+			wantErr:      domain.ErrTrackerNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var requests requestLog
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.add(r)
+				reply, ok := tt.replies[r.URL.Query().Get("page")]
+				if !ok {
+					reply.status = http.StatusInternalServerError
+				}
+				if reply.etag != "" {
+					w.Header().Set("ETag", reply.etag)
+				}
+				w.WriteHeader(reply.status)
+				w.Write(reply.body) //nolint:errcheck // test helper
+			}))
+			defer srv.Close()
+			cfg := validConfig(srv.URL)
+			if tt.cacheOff {
+				cfg["etag_cache_size"] = 0
+			}
+
+			got, err := mustAdapter(t, cfg).FetchIssueCommentChanges(context.Background(), "42", tt.since)
+
+			if gotRequests := requests.all(); !slices.Equal(gotRequests, tt.wantRequests) {
+				t.Errorf("FetchIssueCommentChanges(%q) requests = %q, want %q", tt.since, gotRequests, tt.wantRequests)
+			}
+			if tt.wantErr != "" {
+				assertTrackerErrorKind(t, err, tt.wantErr)
+				if got.Comments != nil || got.Next != "" {
+					t.Errorf("FetchIssueCommentChanges(%q) on error = %+v, want zero value", tt.since, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FetchIssueCommentChanges(%q): %v", tt.since, err)
+			}
+			if got.Comments == nil || !slices.Equal(got.Comments, tt.wantComments) {
+				t.Errorf("FetchIssueCommentChanges(%q).Comments = %+v, want %+v", tt.since, got.Comments, tt.wantComments)
+			}
+			if got.Next != tt.wantNext {
+				t.Errorf("FetchIssueCommentChanges(%q).Next = %q, want %q", tt.since, got.Next, tt.wantNext)
+			}
+			adaptertest.AssertCommentsAscending(t, got.Comments)
+		})
+	}
 }
 
 const labelFakeNumber = 42
@@ -1587,89 +1756,76 @@ func TestTransitionIssue_WriteOrder(t *testing.T) {
 func TestCommentIssue_Success(t *testing.T) {
 	t.Parallel()
 
+	const created = `{"id":1234567890123,"node_id":"IC_kwDOA1b2c4wAAAGF","user":{"login":"sortie-bot"},"body":"Hello from Sortie!","created_at":"2026-08-04T12:00:00Z"}`
+	const listed = `[{"id":4001,"node_id":"IC_kwDOA1b2c4wAAAAB","user":{"login":"alice"},"body":"Looks good.","created_at":"2026-01-15T10:00:00Z"},` + created + `]`
+
 	var gotBody map[string]string
+	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			t.Errorf("method = %q, want POST", r.Method)
+		requests.Add(1)
+		if r.Method == http.MethodGet {
+			w.Write([]byte(listed)) //nolint:errcheck // test helper
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		json.Unmarshal(body, &gotBody) //nolint:errcheck // test helper
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"id":12345}`)) //nolint:errcheck // test helper
+		w.Write([]byte(created)) //nolint:errcheck // test helper
 	}))
 	defer srv.Close()
 
 	a := mustAdapter(t, validConfig(srv.URL))
-	if err := a.CommentIssue(context.Background(), "42", "Hello from Sortie!"); err != nil {
+	id, err := a.CommentIssue(context.Background(), "42", "Hello from Sortie!")
+	if err != nil {
 		t.Fatalf("CommentIssue: %v", err)
 	}
-
+	if got := requests.Load(); got != 1 {
+		t.Errorf("request count during CommentIssue = %d, want 1", got)
+	}
 	if gotBody["body"] != "Hello from Sortie!" {
 		t.Errorf("request body.body = %q, want %q", gotBody["body"], "Hello from Sortie!")
 	}
-}
 
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
+	comments, err := a.FetchIssueComments(context.Background(), "42")
+	if err != nil {
+		t.Fatalf("FetchIssueComments: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			bodies := make(chan string, 1)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var payload map[string]string
-				raw, _ := io.ReadAll(r.Body)
-				json.Unmarshal(raw, &payload) //nolint:errcheck // asserted through the received body
-				bodies <- payload["body"]
-				w.WriteHeader(http.StatusCreated)
-				w.Write([]byte(`{"id":12345}`)) //nolint:errcheck // test helper
-			}))
-			defer srv.Close()
-			a := mustAdapter(t, validConfig(srv.URL))
-
-			if err := a.CommentIssueWithLiteral(context.Background(), "42", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			if got := <-bodies; got != tt.want {
-				t.Errorf("request body.body = %q, want %q", got, tt.want)
-			}
-		})
+	adaptertest.AssertPostedCommentListed(t, id, comments)
+	if id != "1234567890123" {
+		t.Errorf("CommentIssue identity = %q, want the decimal id %q", id, "1234567890123")
 	}
 }
 
 func TestCommentIssue_Error(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   domain.TrackerErrorKind
+	}{
+		{name: "404 maps to not found", status: http.StatusNotFound, want: domain.ErrTrackerNotFound},
+		{name: "201 with only a node_id maps to payload error", status: http.StatusCreated, body: `{"node_id":"IC_kwDOA1b2c4wAAAGF","body":"comment"}`, want: domain.ErrTrackerPayload},
+		{name: "201 with malformed JSON maps to payload error", status: http.StatusCreated, body: `{"id":`, want: domain.ErrTrackerPayload},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				w.Write([]byte(tt.body)) //nolint:errcheck // test helper
+			}))
+			defer srv.Close()
 
-	a := mustAdapter(t, validConfig(srv.URL))
-	err := a.CommentIssue(context.Background(), "999", "comment")
-	assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
+			a := mustAdapter(t, validConfig(srv.URL))
+			id, err := a.CommentIssue(context.Background(), "999", "comment")
+			assertTrackerErrorKind(t, err, tt.want)
+			if id != "" {
+				t.Errorf("CommentIssue identity = %q, want empty on error", id)
+			}
+		})
+	}
 }
 
 func TestSetMetrics_RecordsOperations(t *testing.T) {
@@ -2116,68 +2272,38 @@ func TestTransitionIssue_GetIssueError(t *testing.T) {
 	assertTrackerErrorKind(t, err, domain.ErrTrackerTransport)
 }
 
-func TestNewGitHubAdapter_ETagCacheSizeDefault(t *testing.T) {
+func TestNewGitHubAdapter_ETagCacheSize(t *testing.T) {
 	t.Parallel()
 
-	a := mustAdapter(t, validConfig("http://localhost"))
-	if a.etagCache.maxSize != 1000 {
-		t.Errorf("etagCache.maxSize = %d, want 1000 (default)", a.etagCache.maxSize)
+	tests := []struct {
+		name  string
+		value any
+		set   bool
+		want  int
+	}{
+		{name: "absent uses the default", want: 1000},
+		{name: "custom int", value: 50, set: true, want: 50},
+		{name: "zero disables the cache", value: 0, set: true, want: 0},
+		{name: "float64 from JSON decoding", value: float64(75), set: true, want: 75},
+		{name: "non-numeric falls back to the default", value: "not a number", set: true, want: 1000},
+		{name: "negative falls back to the default", value: -5, set: true, want: 1000},
 	}
-}
 
-func TestNewGitHubAdapter_ETagCacheSizeCustom(t *testing.T) {
-	t.Parallel()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	cfg := validConfig("http://localhost")
-	cfg["etag_cache_size"] = 50
-	a := mustAdapter(t, cfg)
-	if a.etagCache.maxSize != 50 {
-		t.Errorf("etagCache.maxSize = %d, want 50", a.etagCache.maxSize)
-	}
-}
+			cfg := validConfig("http://localhost")
+			if tt.set {
+				cfg["etag_cache_size"] = tt.value
+			}
 
-func TestNewGitHubAdapter_ETagCacheSizeZero(t *testing.T) {
-	t.Parallel()
+			a := mustAdapter(t, cfg)
 
-	cfg := validConfig("http://localhost")
-	cfg["etag_cache_size"] = 0
-	a := mustAdapter(t, cfg)
-	if a.etagCache.maxSize != 0 {
-		t.Errorf("etagCache.maxSize = %d, want 0 (disabled)", a.etagCache.maxSize)
-	}
-}
-
-func TestNewGitHubAdapter_ETagCacheSizeFloat64(t *testing.T) {
-	t.Parallel()
-
-	// encoding/json deserializes integers as float64; verify the adapter handles it.
-	cfg := validConfig("http://localhost")
-	cfg["etag_cache_size"] = float64(75)
-	a := mustAdapter(t, cfg)
-	if a.etagCache.maxSize != 75 {
-		t.Errorf("etagCache.maxSize = %d, want 75 (float64 key)", a.etagCache.maxSize)
-	}
-}
-
-func TestNewGitHubAdapter_ETagCacheSizeInvalid(t *testing.T) {
-	t.Parallel()
-
-	cfg := validConfig("http://localhost")
-	cfg["etag_cache_size"] = "not a number"
-	a := mustAdapter(t, cfg)
-	if a.etagCache.maxSize != 1000 {
-		t.Errorf("etagCache.maxSize = %d, want 1000 (invalid falls back to default)", a.etagCache.maxSize)
-	}
-}
-
-func TestNewGitHubAdapter_ETagCacheSizeNegative(t *testing.T) {
-	t.Parallel()
-
-	cfg := validConfig("http://localhost")
-	cfg["etag_cache_size"] = -5
-	a := mustAdapter(t, cfg)
-	if a.etagCache.maxSize != 1000 {
-		t.Errorf("etagCache.maxSize = %d, want 1000 (negative falls back to default)", a.etagCache.maxSize)
+			if a.etagCache.maxSize != tt.want {
+				t.Errorf("etagCache.maxSize for etag_cache_size=%v = %d, want %d", tt.value, a.etagCache.maxSize, tt.want)
+			}
+		})
 	}
 }
 

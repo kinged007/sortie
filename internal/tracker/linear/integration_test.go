@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -293,9 +294,16 @@ func TestIntegration_CommentIssue(t *testing.T) {
 	issue := firstCandidate(t, adapter, ctx)
 
 	body := "sortie write-path integration test comment at " + time.Now().UTC().Format(time.RFC3339)
-	if err := adapter.CommentIssue(ctx, issue.ID, body); err != nil {
+	id, err := adapter.CommentIssue(ctx, issue.ID, body)
+	if err != nil {
 		t.Fatalf("CommentIssue(%s): %v", issue.Identifier, err)
 	}
+
+	comments, err := adapter.FetchIssueComments(ctx, issue.Identifier)
+	if err != nil {
+		t.Fatalf("FetchIssueComments(%s): %v", issue.Identifier, err)
+	}
+	adaptertest.AssertPostedCommentListed(t, id, comments)
 }
 
 func TestIntegration_AddLabel(t *testing.T) {
@@ -312,24 +320,6 @@ func TestIntegration_AddLabel(t *testing.T) {
 
 	if err := adapter.AddLabel(ctx, issue.ID, label); err != nil {
 		t.Fatalf("AddLabel(%s, %q): %v", issue.Identifier, label, err)
-	}
-}
-
-func TestIntegration_CommentIssueWithLiteral(t *testing.T) {
-	skipUnlessIntegration(t)
-
-	adapter := newIntegrationAdapter(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	issue := firstCandidate(t, adapter, ctx)
-
-	text := "sortie literal round trip " + time.Now().UTC().Format(time.RFC3339Nano)
-	statement := "/close\n@sortie-literal-probe please look\n[~jdoe] see https://example.com/probe?x=1\n" +
-		"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat}\ntoken=[redacted]"
-	if err := adapter.CommentIssueWithLiteral(ctx, issue.ID, text, statement); err != nil {
-		t.Fatalf("CommentIssueWithLiteral(%s): %v", issue.Identifier, err)
 	}
 }
 

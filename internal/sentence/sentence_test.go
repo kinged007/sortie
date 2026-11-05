@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 )
 
@@ -61,6 +62,17 @@ func TestFor(t *testing.T) {
 		f.Identifier = key
 		return Entry{Finished: &f}
 	}
+	holding := func(h orchestrator.SnapshotHold) Entry {
+		return Entry{Held: &orchestrator.SnapshotHeldEntry{IssueID: "id-1", Identifier: key, Hold: h}}
+	}
+	slots := func(slot orchestrator.SnapshotSlotHold) Entry {
+		return holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipAgentSlotsFull, Slot: &slot})
+	}
+	spend := func(reason orchestrator.SkipReason, resetsAt time.Time) Entry {
+		return holding(orchestrator.SnapshotHold{Reason: reason, ResetsAt: resetsAt})
+	}
+
+	awaitingApproval := &orchestrator.ReactionCheck{Comments: &orchestrator.CommentCheck{AwaitingApproval: true}}
 
 	tests := []struct {
 		name  string
@@ -153,6 +165,8 @@ func TestFor(t *testing.T) {
 			short: "2 new review comments on #7; next check in 40s",
 		},
 		{"review wait", reaction("review", nil), "Waiting on review of #7", ""},
+		{"review awaiting approval", reaction("review", awaitingApproval), "Waiting on approval of #7", ""},
+		{"escalated review awaiting approval", escalated(reaction("review", awaitingApproval)), "Review comments escalated on #7", ""},
 		{"bot review wait", reaction("bot-review", nil), "Waiting on bot review of #7", ""},
 		{"bot review handled", reaction("bot-review", &orchestrator.ReactionCheck{Comments: &orchestrator.CommentCheck{Handled: true}}), "Bot review of #7 handled", ""},
 		{"auto-merge wait", reaction("merge", nil), "Auto-merge waiting on #7", ""},
@@ -167,6 +181,40 @@ func TestFor(t *testing.T) {
 			entry: Entry{BetweenStages: &orchestrator.SnapshotStageHop{Identifier: key, SourceRule: "implement", TargetRule: "review"}},
 			short: "Between stages: implement to review",
 		},
+
+		{
+			name: "held by one blocker",
+			entry: holding(orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipBlockedBy, Blockers: []orchestrator.SnapshotBlocker{{Identifier: "MT-9", State: "In Progress"}},
+			}),
+			short: "Blocked by MT-9 (In Progress)",
+		},
+		{
+			name: "held by several blockers",
+			entry: holding(orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipBlockedBy,
+				Blockers: []orchestrator.SnapshotBlocker{
+					{Identifier: "MT-8", DisplayID: "acme/web#8", State: "To Do"},
+					{Identifier: "MT-9"},
+				},
+			}),
+			short: "Blocked by acme/web#8 (To Do), MT-9 (state unknown)",
+		},
+		{name: "held, blockers not read after a failure", entry: holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipBlockersUnresolved}), short: "Blockers not read: a tracker request failed"},
+		{name: "held, blockers not reached on this poll", entry: holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipBlockersNotRead}), short: "Blockers not read on this poll"},
+		{name: "held, blocker list incomplete", entry: holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipBlockersIncomplete}), short: "Blocker list incomplete"},
+		{name: "held by the global slot limit", entry: slots(orchestrator.SnapshotSlotHold{Scope: orchestrator.SlotScopeGlobal, Used: 1, Limit: 1}), short: "No free agent slot: 1 of 1 running"},
+		{
+			name:  "held by a per-state slot limit",
+			entry: slots(orchestrator.SnapshotSlotHold{Scope: orchestrator.SlotScopeState, State: "In Progress", Used: 2, Limit: 2}),
+			short: "No free agent slot for In Progress: 2 of 2 running",
+		},
+		{name: "held with no free SSH host", entry: holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipSSHHostsFull}), short: "No free SSH host"},
+		{name: "held by the daily spend ceiling", entry: spend(orchestrator.SkipDailySpendCeiling, now.Add(5*time.Minute)), short: "Daily spend ceiling reached, resets in 5m"},
+		{name: "held by the weekly spend ceiling", entry: spend(orchestrator.SkipWeeklySpendCeiling, now.Add(5*time.Minute)), short: "Weekly spend ceiling reached, resets in 5m"},
+		{name: "held by the monthly spend ceiling", entry: spend(orchestrator.SkipMonthlySpendCeiling, now.Add(5*time.Minute)), short: "Monthly spend ceiling reached, resets in 5m"},
+		{name: "spend ceiling whose reset is not ahead", entry: spend(orchestrator.SkipDailySpendCeiling, now), short: "Daily spend ceiling reached"},
+		{name: "held waiting for the stage move", entry: holding(orchestrator.SnapshotHold{Reason: orchestrator.SkipStageHopUnconfirmed}), short: "Waiting to confirm the stage move"},
 
 		{"finished without an ending", finished(Finished{}), "Not active; no ending recorded", ""},
 		{"finished merged", finished(Finished{Outcome: &Outcome{Kind: "merged", MergePath: "auto_merge", PRNumber: 88}}), "Merged #88", ""},
@@ -196,6 +244,46 @@ func TestFor(t *testing.T) {
 			}
 			if !strings.HasSuffix(got.Long, ".") || strings.HasSuffix(got.Short, ".") {
 				t.Errorf("For(%s) = %+v, want a long form ending in a period and a short form without", tt.name, got)
+			}
+			if tt.entry.Held != nil {
+				words := Hold(&tt.entry.Held.Hold, Context{Now: now})
+				if words.Reason != got.Short || !strings.HasSuffix(words.Release, ".") || strings.Contains(got.Long+words.Release, key) {
+					t.Errorf("Hold(%s) = %+v, want Reason %q and a release ending in a period that does not name %q", tt.name, words, got.Short, key)
+				}
+			}
+		})
+	}
+}
+
+func TestToolLine(t *testing.T) {
+	t.Parallel()
+
+	tool := func(name string, kind domain.ToolKind, argument string) orchestrator.RunEvent {
+		return orchestrator.RunEvent{Event: domain.EventToolResult, ToolName: name, ToolKind: kind, ToolArgument: argument}
+	}
+
+	tests := []struct {
+		name  string
+		event orchestrator.RunEvent
+		want  string
+	}{
+		{"named shell call reads as its command", tool("Bash", domain.ToolKindShell, "git status"), "git status"},
+		{"named read call", tool("Read", domain.ToolKindRead, "internal/foo.go"), "Read internal/foo.go"},
+		{"nameless edit call", tool("", domain.ToolKindEdit, "internal/foo.go"), "Edit internal/foo.go"},
+		{"nameless shell call without an argument", tool("", domain.ToolKindShell, ""), "Command"},
+		{"name without a kind", tool("github.get_issue", "", ""), "github.get_issue"},
+		{"neither name nor kind", tool("", "", ""), "Tool"},
+		{"another event type", orchestrator.RunEvent{Event: domain.EventNotification, ToolName: "Bash"}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ToolLine(tt.event)
+
+			if got != tt.want {
+				t.Errorf("ToolLine(%+v) = %q, want %q", tt.event, got, tt.want)
 			}
 		})
 	}

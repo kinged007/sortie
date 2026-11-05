@@ -28,8 +28,9 @@ const (
 	EventOtherMessage AgentEventType = "other_message"
 	EventMalformed    AgentEventType = "malformed"
 
-	// EventToolResult indicates a tool call completed, with ToolName and
-	// ToolDurationMS populated when the adapter can observe them.
+	// EventToolResult indicates a tool call completed, with ToolName,
+	// ToolKind, ToolArgument, and ToolDurationMS populated when the adapter
+	// can observe them.
 	EventToolResult AgentEventType = "tool_result"
 )
 
@@ -67,6 +68,30 @@ func (u TokenUsage) Uncached() int64 {
 	return max(u.TotalTokens-u.CacheReadTokens, 0)
 }
 
+// FreshInput returns InputTokens less CacheReadTokens and CacheWriteTokens,
+// floored at zero.
+func (u TokenUsage) FreshInput() int64 {
+	return max(u.InputTokens-u.CacheReadTokens-u.CacheWriteTokens, 0)
+}
+
+// ToolKind is the kind of work a tool call does. It picks the call's icon and
+// fold phrase and whether the call has a main argument; empty for any other
+// tool.
+type ToolKind string
+
+const (
+	ToolKindShell ToolKind = "shell"
+	ToolKindRead  ToolKind = "read"
+	ToolKindEdit  ToolKind = "edit"
+	ToolKindSkill ToolKind = "skill"
+)
+
+// SkillCall is one skill call of a run.
+type SkillCall struct {
+	Skill     string `json:"skill"`
+	ToolError bool   `json:"tool_error,omitempty"`
+}
+
 // AgentEvent is a normalized event emitted by an agent adapter over the
 // lifetime of an agent session, including startup and individual turns.
 type AgentEvent struct {
@@ -82,6 +107,11 @@ type AgentEvent struct {
 	// event. The zero value means the event carries no usage information,
 	// not that the session has consumed no tokens.
 	Usage TokenUsage
+
+	// ReportedAmounts carries the run-cumulative amounts the runtime reported
+	// as of this event, sorted by Unit then Model; nil when the event carries
+	// none.
+	ReportedAmounts []ReportedAmount
 
 	// UsageByModel is the per-model split of Usage, in the same scope and
 	// covering at most its totals. Nil when the event names the model only
@@ -101,17 +131,31 @@ type AgentEvent struct {
 	// or empty when unknown.
 	Model string
 
-	// RateLimits is the latest adapter-defined rate-limit payload, opaque
-	// to the orchestrator. Nil when unavailable.
-	RateLimits map[string]any
+	// UsageWindows carries the provider usage windows this event reports;
+	// nil when it reports none. A window the event does not carry keeps its
+	// earlier report.
+	UsageWindows []UsageWindow
 
 	// APIDurationMS is the LLM API wait time in milliseconds for this
 	// event; a value > 0 contributes to the session's cumulative API
 	// time. Zero when unavailable.
 	APIDurationMS int64
 
-	// ToolName is the tool that completed, for tool_result events.
+	// ToolName is the name the runtime gives the tool that completed, or
+	// "{server}.{tool}" for an MCP or dynamic tool, for tool_result events.
+	// Empty when the runtime names none; never argument text or a protocol
+	// item type.
 	ToolName string
+
+	// ToolKind is the kind of work the completed tool call did, for
+	// tool_result events. Empty for any other tool.
+	ToolKind ToolKind
+
+	// ToolArgument is the call's one main argument as the runtime sent it: a
+	// shell call's command, a read or edit call's path (several joined by
+	// ", "), a skill call's skill. Empty for any other tool and when the
+	// runtime gives none.
+	ToolArgument string
 
 	// ToolDurationMS is the tool call's wall-clock time in milliseconds,
 	// for tool_result events. Zero when unavailable.
@@ -119,6 +163,107 @@ type AgentEvent struct {
 
 	// ToolError reports whether a tool_result call returned an error.
 	ToolError bool
+}
+
+// UsageSource is the vendor-neutral category of a channel through which a
+// runtime reports spend. The usage component declares its members; the zero
+// value names none.
+type UsageSource string
+
+// UsageStrategy is how a source's reports reach the usage component. The
+// usage component declares its members; read it only beside a non-empty
+// UsageSource.
+type UsageStrategy int
+
+// UsageProvenance names the source and strategy that settled one turn's
+// figure. An empty Source states that the usage component settled none.
+type UsageProvenance struct {
+	Source   UsageSource
+	Strategy UsageStrategy
+}
+
+// UnitUSD is the unit of an amount in US dollars, the only unit that prices a
+// share.
+const UnitUSD = "USD"
+
+// ReportedAmount is an amount a runtime reported for a run's spend,
+// cumulative over the run, in the unit it was reported in and never
+// converted.
+type ReportedAmount struct {
+	// Unit is UnitUSD, another ISO 4217 code, or a vendor unit's plural
+	// display name.
+	Unit string
+
+	// Model is the model the source attributes the amount to; empty when it
+	// names none.
+	Model string
+
+	// Amount is finite and not negative.
+	Amount float64
+
+	// LowerBound is true when the run may have spent more in Unit than
+	// Amount.
+	LowerBound bool
+}
+
+// UsageWindowStatus is how near a usage window is to its limit, as the
+// runtime reported it.
+type UsageWindowStatus string
+
+const (
+	// UsageWindowAllowed means the window is under its limit.
+	UsageWindowAllowed UsageWindowStatus = "allowed"
+	// UsageWindowWarning means the window is near its limit.
+	UsageWindowWarning UsageWindowStatus = "warning"
+	// UsageWindowExhausted means the window is used up until it resets.
+	UsageWindowExhausted UsageWindowStatus = "exhausted"
+)
+
+// UsageWindow is one provider usage window in runtime-neutral form, as
+// the usage component normalized it. Immutable once emitted.
+type UsageWindow struct {
+	// Key is the window's identifier as its source reported it, its
+	// identity within one agent kind. Empty when the report names none.
+	Key string
+
+	// Label is the display name, for example "5-hour limit".
+	Label string
+
+	// Minutes is the window length; 0 when not reported.
+	Minutes int64
+
+	// Model is the model the window meters, as its source names it; empty
+	// when the source names none.
+	Model string
+
+	// UsedPercent is the share used in percent and may exceed 100. Nil
+	// when not reported.
+	UsedPercent *float64
+
+	// Status is empty when not reported.
+	Status UsageWindowStatus
+
+	// ResetsAt is in UTC; zero when not reported.
+	ResetsAt time.Time
+
+	// ReportedAt is the UTC instant the adapter observed the report.
+	ReportedAt time.Time
+
+	// Amount is nil when the window reports no amount.
+	Amount *UsageWindowAmount
+}
+
+// UsageWindowAmount is a window's use in its vendor's own unit, never
+// converted.
+type UsageWindowAmount struct {
+	// Used is in Unit and not negative.
+	Used float64
+
+	// Limit is in Unit and above 0.
+	Limit float64
+
+	// Unit is a plural display name, for example "credits".
+	Unit string
 }
 
 // AgentCommand is an agent launch command in one of two forms: the
@@ -198,6 +343,16 @@ type Session struct {
 	// adapters.
 	AgentPID string
 
+	// NoToolChannel reports that the runtime cannot reach Sortie's tool
+	// server, so the worker withholds the tool advertisement.
+	NoToolChannel bool
+
+	// CarriedHistory reports that the session continues, with its history, the
+	// conversation StartSessionParams.ResumeSessionID names. A session started
+	// without that identifier, or started new in place of it, reports false, and
+	// its ID is never that identifier.
+	CarriedHistory bool
+
 	// Internal holds adapter-specific state the orchestrator must not
 	// read or modify.
 	Internal any
@@ -214,17 +369,9 @@ type StartSessionParams struct {
 	AgentConfig AgentConfig
 
 	// ResumeSessionID, when non-empty, resumes the existing conversation
-	// from a previous worker attempt instead of starting fresh. Adapters
-	// without session continuity ignore it.
+	// from a previous worker attempt instead of starting fresh. The returned
+	// [Session.CarriedHistory] answers whether the adapter continued it.
 	ResumeSessionID string
-
-	// ResumeUsage is the figure the newest run on ResumeSessionID ended
-	// with; nil when ResumeSessionID is empty or that run recorded none.
-	// Adapters whose runtime keeps no such figure ignore it.
-	ResumeUsage *TokenUsage
-
-	// ResumeUsageByModel is the per-model split of ResumeUsage; nil when none.
-	ResumeUsageByModel map[string]TokenUsage
 
 	// SSHHost, when non-empty, launches the agent on that host via SSH
 	// instead of as a local subprocess.
@@ -252,8 +399,21 @@ type StartSessionParams struct {
 	Settings map[string]any
 
 	// CredentialVerification marks a session that carries only the
-	// request proving the runtime's credential works.
+	// request proving the runtime's credential works. The session runs
+	// under the contract its kind declares in
+	// `registry.AgentMeta.VerificationContext`.
 	CredentialVerification bool
+
+	// VerificationFullContext is set only together with
+	// CredentialVerification. It asks for a verification session
+	// without the switches that drop agent context.
+	VerificationFullContext bool
+}
+
+// ReducedVerificationContext reports whether the session is a
+// credential-verification session that drops agent context.
+func (p StartSessionParams) ReducedVerificationContext() bool {
+	return p.CredentialVerification && !p.VerificationFullContext
 }
 
 // RunTurnParams contains the inputs for [AgentAdapter.RunTurn].
@@ -307,16 +467,17 @@ type TurnResult struct {
 	// the session spent, read or not.
 	CoversSession bool
 
-	// ResumeUsage is the usage the agent runtime itself holds for the
-	// session at this turn's end, earlier runs on the session included,
-	// which a later run resuming the session receives as
-	// StartSessionParams.ResumeUsage. Nil when the runtime keeps no such
-	// figure or the adapter cannot state it exactly.
-	ResumeUsage *TokenUsage
+	// UsageProvenance lists every source whose readings settled this turn's
+	// token figure, each once, the session's own settling source first; nil
+	// when the turn settled no figure or its adapter does not account through
+	// the usage component. Completeness stays in UsageMeasured and
+	// SpendUnaccounted.
+	UsageProvenance []UsageProvenance
 
-	// ResumeUsageByModel is the per-model split of ResumeUsage, handed to a
-	// later run as StartSessionParams.ResumeUsageByModel; nil when none.
-	ResumeUsageByModel map[string]TokenUsage
+	// ReportedAmounts carries the run-cumulative amounts the runtime reported
+	// as of this turn's end, sorted by Unit then Model; nil when the turn
+	// applied no settlement.
+	ReportedAmounts []ReportedAmount
 }
 
 // AgentAdapter is the contract every coding-agent integration must

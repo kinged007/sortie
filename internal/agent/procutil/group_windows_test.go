@@ -5,6 +5,7 @@ package procutil
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func failJobAssignment(t *testing.T) {
@@ -52,7 +54,7 @@ func startHeldLaunch(t *testing.T, grace time.Duration) *heldLaunch {
 		cmd:           cmd,
 		group:         g,
 		cancel:        cancel,
-		descendantPID: pollCaptureWinPIDFile(t, pidPath, 5*time.Second),
+		descendantPID: waittest.PIDFile(t, pidPath),
 	}
 }
 
@@ -63,7 +65,7 @@ func TestReap_ReleasesRecordAndZeroesJobHandle(t *testing.T) {
 	_, g := startOwned(t, cmd)
 
 	r := StartReaper(cmd, nil)
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	if got := lookupGroup(cmd); got != nil {
 		t.Errorf("lookupGroup(cmd) after Done = %p, want nil", got)
@@ -85,7 +87,7 @@ func TestReapWithoutJobObjectReportsNoLeftover(t *testing.T) {
 	startOwned(t, cmd)
 
 	r := StartReaper(cmd, slog.New(slog.DiscardHandler))
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	if r.Leftover() {
 		t.Error("Leftover() = true, want false (no Job Object, so nothing further is reachable)")
@@ -105,7 +107,7 @@ func TestKillWithoutJobObjectReachesDirectChild(t *testing.T) {
 		t.Fatalf("Kill() without a Job Object = %v, want nil", err)
 	}
 
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 	if err := g.Kill(); err != nil {
 		t.Errorf("Kill() after the reap = %v, want nil (os.ErrProcessDone maps to nil)", err)
 	}
@@ -157,7 +159,7 @@ func TestWindowsReleasedRecordMakesNoSend(t *testing.T) {
 			cmd := exec.CommandContext(t.Context(), "cmd.exe", "/C", "exit 0") //nolint:gosec // fixed literal script
 			_, g := startOwned(t, cmd)
 			r := StartReaper(cmd, nil)
-			awaitDone(t, r, 5*time.Second)
+			waittest.Receive(t, r.Done(), "reaper Done()")
 			groups.Store(cmd, g)
 			t.Cleanup(func() { groups.Delete(cmd) })
 			terminations, _ := armEscalationForceSendProbe(t, 0)
@@ -205,7 +207,7 @@ func TestWindowsEscalationArmedBeforeReleaseUsesOwnDuplicate(t *testing.T) {
 	if err := target.terminateAll(); err != nil {
 		t.Errorf("terminateAll() through the duplicate = %v, want nil", err)
 	}
-	assertCaptureWinProcessGone(t, member.Process.Pid, 3*time.Second)
+	waittest.ProcessGone(t, member.Process.Pid)
 }
 
 func TestTeardownLeavesSameIdentifierRecordUntouched(t *testing.T) {
@@ -251,9 +253,9 @@ func TestTeardownLeavesSameIdentifierRecordUntouched(t *testing.T) {
 
 			r := StartReaper(first.cmd, slog.New(slog.DiscardHandler))
 			tt.teardown(t, first, r)
-			awaitDone(t, r, 15*time.Second)
+			waittest.Receive(t, r.Done(), "reaper Done()")
 
-			assertCaptureWinProcessGone(t, first.descendantPID, 5*time.Second)
+			waittest.ProcessGone(t, first.descendantPID)
 			if tt.wantLeftover && !r.Leftover() {
 				t.Error("Leftover() = false, want true from the first launch's own job")
 			}
@@ -264,21 +266,9 @@ func TestTeardownLeavesSameIdentifierRecordUntouched(t *testing.T) {
 			if err := second.Kill(); err != nil {
 				t.Errorf("second record Kill() = %v, want nil", err)
 			}
-			assertCaptureWinProcessGone(t, secondMember.Process.Pid, 3*time.Second)
+			waittest.ProcessGone(t, secondMember.Process.Pid)
 		})
 	}
-}
-
-func awaitChildExit(t *testing.T, cmd *exec.Cmd) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if !directChildRunning(cmd) {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("process %d did not exit within 5s", cmd.Process.Pid)
 }
 
 func TestCancellationAfterOwnExitIsNotAStop(t *testing.T) {
@@ -294,11 +284,16 @@ func TestCancellationAfterOwnExitIsNotAStop(t *testing.T) {
 		t.Run(in.name, func(t *testing.T) {
 			cmd, p := newCancelProbe(t, in.install, "cmd.exe", "/C", "exit 0")
 			startOwned(t, cmd)
-			awaitChildExit(t, cmd)
+			waittest.Until(t, func() error {
+				if directChildRunning(cmd) {
+					return fmt.Errorf("process %d is still running", cmd.Process.Pid)
+				}
+				return nil
+			})
 			p.fire()
 
 			r := StartReaper(cmd, slog.New(slog.DiscardHandler))
-			awaitDone(t, r, 10*time.Second)
+			waittest.Receive(t, r.Done(), "reaper Done()")
 
 			if !p.observed.Load() {
 				t.Fatal("the cancellation did not run before the reaper started, want it to have run")

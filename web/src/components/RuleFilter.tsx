@@ -9,22 +9,22 @@ import {
   ComboboxItem,
   ComboboxList,
 } from "@/components/ui/combobox";
+import { MONO } from "@/components/ui/mono";
 import { Popover, PopoverPopup, PopoverTrigger } from "@/components/ui/popover";
+import { SELECT_TRIGGER } from "@/components/ui/select-trigger";
 import { ruleOptions } from "@/lib/active-rows";
+import { cn } from "@/lib/cn";
 
 import type { Filterable, RuleOption } from "@/lib/active-rows";
 import type { ConfigResponse } from "@/api/types.gen";
 
 const RULE_PARAM = "rule";
 
-const TRIGGER =
-  "inline-flex h-(--size-chip) items-center gap-xs rounded-full border border-line-medium bg-surface-raised px-sm text-body-sm font-medium whitespace-nowrap text-ink-body select-none cursor-pointer transition-colors duration-(--duration-feedback) focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring hover:bg-[image:linear-gradient(var(--color-state-hover),var(--color-state-hover))] active:bg-[image:linear-gradient(var(--color-state-pressed),var(--color-state-pressed))]";
-
 const CAPTION = "px-md pt-xs pb-xxs text-label-caps font-medium text-ink-muted";
 
 function describe(value: string, options: readonly RuleOption[]): string {
   if (value === "") {
-    return "Any";
+    return "Any rule";
   }
   const option = options.find((candidate) => candidate.value === value);
   if (option !== undefined) {
@@ -36,19 +36,12 @@ function describe(value: string, options: readonly RuleOption[]): string {
   return value.slice(value.indexOf(":") + 1);
 }
 
-/** Props of {@link RuleFilter}. */
 export interface RuleFilterProps {
   config: ConfigResponse | undefined;
   /** Every row before any filter; the option counts read them. */
   rows: readonly Filterable[];
 }
 
-/**
- * Renders the Rule menu: a chip that opens a searchable list of the workflow's
- * rules grouped by stage chain, each with its row count. It renders nothing
- * while the workflow holds no rules. The choice lives in the `rule` search
- * parameter.
- */
 export function RuleFilter({ config, rows }: RuleFilterProps) {
   const [params, setParams] = useSearchParams();
   const [isOpen, setIsOpen] = useState(false);
@@ -98,12 +91,17 @@ export function RuleFilter({ config, rows }: RuleFilterProps) {
 
   return (
     <Popover open={isOpen} onOpenChange={handleOpenChange}>
-      <PopoverTrigger className={TRIGGER}>
+      <PopoverTrigger className={SELECT_TRIGGER}>
         Rule
-        <span className="text-ink">{describe(chosen, selectable)}</span>
+        <span className="text-ink wrap-anywhere">{describe(chosen, selectable)}</span>
         <ChevronDownIcon />
       </PopoverTrigger>
-      <PopoverPopup aria-label="Rule" align="end" className="w-80 max-w-[calc(100vw-2rem)]">
+      <PopoverPopup
+        aria-label="Rule"
+        align="end"
+        isOnPanelContent
+        className="w-80 max-w-[calc(100vw-2rem)]"
+      >
         <Combobox
           items={selectable}
           filteredItems={visible}
@@ -137,7 +135,7 @@ export function RuleFilter({ config, rows }: RuleFilterProps) {
                         ? "font-semibold wrap-anywhere"
                         : option.kind === "any" || option.kind === "none"
                           ? "wrap-anywhere"
-                          : "font-mono text-body-sm wrap-anywhere"
+                          : cn(MONO, "wrap-anywhere")
                     }
                   >
                     {option.label}

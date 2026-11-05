@@ -1,10 +1,12 @@
 package main
 
 import (
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -77,5 +79,18 @@ func TestWorkflowValidate_StartupRejectsUnconstructibleDestination(t *testing.T)
 
 	if err == nil {
 		t.Fatal("NewManager() error = nil, want the unconstructible destination to fail the load")
+	}
+}
+
+func TestRunOnceWithDryRun(t *testing.T) {
+	t.Parallel()
+
+	var stderr lockedBuf
+	args := []string{"--once", "--dry-run", filepath.Join(t.TempDir(), "missing", "WORKFLOW.md")}
+
+	code := run(t.Context(), args, io.Discard, &stderr)
+
+	if want := "--once and --dry-run cannot be used together"; code != 1 || !strings.Contains(stderr.String(), want) {
+		t.Errorf("run(%q) = %d, stderr %q, want 1 and stderr containing %q", args, code, stderr.String(), want)
 	}
 }

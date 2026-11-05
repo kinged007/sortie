@@ -1,11 +1,12 @@
 // Package route selects the destinations of an outbound event and
 // delivers it to them. A [Router] turns the notifications configuration
 // and the deprecated tracker comment settings into one subscription
-// table, owns the Slack and webhook destinations the main process
-// builds, and wraps the tracker adapter as the built-in tracker_comment
-// destination.
+// table, owns the notifier destinations the main process builds, and
+// wraps the tracker adapter as the built-in tracker_comment destination,
+// which posts the public rendering of an event and records the identity
+// of the comment it created.
 //
-// The package registers no notifier kind and imports no notifier
+// The package registers no notifier kind and imports no notifier kind
 // package: the caller supplies a [NotifierLookup], so the orchestrator
 // can publish events without resolving a kind itself. Start with
 // [NewRouter], then call [Router.Update] on every configuration
@@ -17,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"sync"
@@ -27,6 +29,11 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+// PostedCommentRecorder stores the identity of a comment posted on an issue.
+type PostedCommentRecorder interface {
+	AddPostedComment(ctx context.Context, issueID, commentID string) error
+}
 
 // NotifierLookup resolves a notifications kind to its constructor.
 type NotifierLookup func(kind string) (registry.NotifierConstructor, error)
@@ -76,16 +83,87 @@ type snapshot struct {
 // Update must be called from a single goroutine.
 type Router struct {
 	tracker domain.TrackerAdapter
+	posted  PostedCommentRecorder
+	posting *postingRegister
 	lookup  NotifierLookup
+	logger  *slog.Logger
 	source  string
 	state   atomic.Pointer[snapshot]
 }
 
+// postingRegister counts the tracker-comment sends in flight per issue so a
+// reader of the posted-comment record can wait for the rows those sends are
+// about to write. It is safe for concurrent use.
+type postingRegister struct {
+	mu       sync.Mutex
+	inFlight map[string]int // guarded by mu
+	// released is closed and replaced whenever any count reaches zero;
+	// waiters recheck their own issue after it closes. Guarded by mu.
+	released chan struct{}
+}
+
+func newPostingRegister() *postingRegister {
+	return &postingRegister{inFlight: make(map[string]int), released: make(chan struct{})}
+}
+
+func (p *postingRegister) begin(issueID string) {
+	p.mu.Lock()
+	p.inFlight[issueID]++
+	p.mu.Unlock()
+}
+
+func (p *postingRegister) end(issueID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.inFlight[issueID]--; p.inFlight[issueID] > 0 {
+		return
+	}
+	delete(p.inFlight, issueID)
+	close(p.released)
+	p.released = make(chan struct{})
+}
+
+// await returns nil once no send for issueID is in flight, or ctx.Err() when
+// ctx ends first.
+func (p *postingRegister) await(ctx context.Context, issueID string) error {
+	for {
+		p.mu.Lock()
+		if p.inFlight[issueID] == 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		released := p.released
+		p.mu.Unlock()
+
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// AwaitTrackerComments returns nil once no tracker_comment send for issueID
+// is in flight, at once when none is, and the context's error when ctx ends
+// first. A nil Router returns nil.
+func (r *Router) AwaitTrackerComments(ctx context.Context, issueID string) error {
+	if r == nil {
+		return nil
+	}
+	return r.posting.await(ctx, issueID)
+}
+
 // NewRouter returns a Router with empty inputs installed. A nil tracker
-// means no tracker_comment destination exists. The host name is read
-// once and stamps every event that carries no source.
-func NewRouter(tracker domain.TrackerAdapter, lookup NotifierLookup) *Router {
-	r := &Router{tracker: tracker, lookup: lookup}
+// means no tracker_comment destination exists. The tracker_comment
+// destination records the identity of each comment it posts through posted;
+// a nil posted records nothing. A nil logger falls back to
+// [slog.Default]. The host name is read once and stamps every event that
+// carries no source.
+func NewRouter(tracker domain.TrackerAdapter, posted PostedCommentRecorder, lookup NotifierLookup, logger *slog.Logger) *Router {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	r := &Router{tracker: tracker, posted: posted, posting: newPostingRegister(), lookup: lookup, logger: logger}
 	if host, err := os.Hostname(); err == nil {
 		r.source = host
 	}
@@ -179,7 +257,7 @@ func (r *Router) Route(n domain.Notification) Delivery {
 		targets = append(targets, target{
 			destination: domain.TrackerCommentKind,
 			kind:        domain.TrackerCommentKind,
-			notifier:    trackerComment{adapter: r.tracker},
+			notifier:    trackerComment{adapter: r.tracker, posted: r.posted, register: r.posting, logger: r.logger},
 		})
 	}
 	for i, destination := range snap.destinations {

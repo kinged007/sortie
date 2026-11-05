@@ -11,7 +11,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // controlledSCMAdapter is a full SCMAdapter where each method is individually
@@ -472,8 +472,8 @@ func TestReconcileAutoMerge_MergedActions(t *testing.T) {
 					store.markDispatchedCalls, store.deleteFingerprintCalls)
 			}
 
-			if len(store.outcomes) != 1 || store.outcomes[0].Kind != persistence.IssueOutcomeMerged || store.outcomes[0].IssueID != issueID {
-				t.Errorf("RecordIssueOutcome calls = %+v, want one %q outcome for %q", store.outcomes, persistence.IssueOutcomeMerged, issueID)
+			if len(store.outcomes) != 1 || store.outcomes[0].Kind != storage.IssueOutcomeMerged || store.outcomes[0].IssueID != issueID {
+				t.Errorf("RecordIssueOutcome calls = %+v, want one %q outcome for %q", store.outcomes, storage.IssueOutcomeMerged, issueID)
 			}
 
 			sent := slack.notifications()
@@ -1199,40 +1199,6 @@ func TestBuildAutoMergeFingerprint(t *testing.T) {
 	fp3 := buildAutoMergeFingerprint("cafebabe", domain.ReviewDecisionApproved)
 	if fp1 == fp3 {
 		t.Error("fingerprint collision between different SHA values; want distinct")
-	}
-}
-
-func TestBuildAutoMergeComment(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		sha  string
-		want string
-	}{
-		{
-			name: "merge commit line follows the strategy",
-			sha:  "abc123def",
-			want: "Sortie auto-merged PR #99 (myorg/myrepo).\nStrategy: squash.\nMerge commit: abc123def.",
-		},
-		{
-			name: "empty merge commit omits the line",
-			want: "Sortie auto-merged PR #99 (myorg/myrepo).\nStrategy: squash.",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			data := &AutoMergeReactionData{PRNumber: 99, Owner: "myorg", Repo: "myrepo"}
-
-			got := buildAutoMergeComment(data, domain.MergeResult{SHA: tt.sha}, domain.StrategySquash)
-
-			if got != tt.want {
-				t.Errorf("buildAutoMergeComment(sha %q) = %q, want %q", tt.sha, got, tt.want)
-			}
-		})
 	}
 }
 

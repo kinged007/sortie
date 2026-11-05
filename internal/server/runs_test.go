@@ -117,6 +117,7 @@ func TestRunsMaskRegisteredValues(t *testing.T) {
 		Status:         "failed",
 		Error:          &failure,
 		ReviewMetadata: &review,
+		AgentText:      "Need " + secret,
 	}}})
 
 	status, got := getJSON[runsResponse](t, ts, "/api/v1/runs")
@@ -125,13 +126,14 @@ func TestRunsMaskRegisteredValues(t *testing.T) {
 		t.Fatalf("GET /api/v1/runs = status %d with %d runs, want 200 with 1", status, len(got.Runs))
 	}
 	run := got.Runs[0]
-	if run.Error == nil || run.SelfReview == nil {
-		t.Fatalf("GET /api/v1/runs run error, self_review = %v, %v, want both present", run.Error, run.SelfReview)
+	if run.Error == nil || run.SelfReview == nil || run.AgentText == nil {
+		t.Fatalf("GET /api/v1/runs run error, self_review, agent_text = %v, %v, %v, want all present", run.Error, run.SelfReview, run.AgentText)
 	}
 	served := map[string]string{
 		"issue_title":               run.IssueTitle,
 		"issue_url":                 run.IssueURL,
 		"error":                     *run.Error,
+		"agent_text":                *run.AgentText,
 		"self_review.final_verdict": run.SelfReview.FinalVerdict,
 	}
 	for field, value := range served {
@@ -142,6 +144,13 @@ func TestRunsMaskRegisteredValues(t *testing.T) {
 			t.Errorf("GET /api/v1/runs %s = %q, want it to hold %q", field, value, redact.Marker)
 		}
 	}
+}
+
+func withEmptyProvenance(w historyTotalsResponse) historyTotalsResponse {
+	w.UnmeasuredUnits = []string{}
+	w.VendorAmounts = []unitAmountResponse{}
+	w.AgentPricedModels = []string{}
+	return w
 }
 
 func TestHistoryTotalsOf(t *testing.T) {
@@ -163,7 +172,7 @@ func TestHistoryTotalsOf(t *testing.T) {
 				Usage:  orchestrator.SnapshotIssueUsage{Sessions: 2, TotalTokens: 1_100_000, UncachedTokens: 850_000, RecordedCostUSD: 27, PricedSessions: 2},
 				Tokens: domain.TokenUsage{InputTokens: 1_000_000, OutputTokens: 100_000, CacheReadTokens: 300_000},
 			},
-			want: historyTotalsResponse{
+			want: withEmptyProvenance(historyTotalsResponse{
 				RunCount: 2,
 				Tokens: tokenInfo{
 					InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
@@ -173,7 +182,7 @@ func TestHistoryTotalsOf(t *testing.T) {
 				TokensComplete:   true,
 				EstimatedCostUSD: new(27.0),
 				CostStatus:       costStatusEstimated,
-			},
+			}),
 		},
 		{
 			name: "unmeasured run beside priced spend",
@@ -181,19 +190,49 @@ func TestHistoryTotalsOf(t *testing.T) {
 				Usage:  orchestrator.SnapshotIssueUsage{Sessions: 3, UnmeasuredSessions: 1, TotalTokens: 1_100_000, UncachedTokens: 1_100_000, RecordedCostUSD: 27, PricedSessions: 2},
 				Tokens: spend,
 			},
-			want: historyTotalsResponse{
+			want: withEmptyProvenance(historyTotalsResponse{
 				RunCount:         3,
 				UnmeasuredRuns:   1,
 				Tokens:           partialTokens,
 				UncachedTokens:   new(int64(1_100_000)),
 				EstimatedCostUSD: new(27.0),
 				CostStatus:       costStatusPartial,
-			},
+			}),
 		},
 		{
 			name: "unmeasured run and nothing else",
 			in:   IssueRunTotals{Usage: orchestrator.SnapshotIssueUsage{Sessions: 1, UnmeasuredSessions: 1}},
-			want: historyTotalsResponse{RunCount: 1, UnmeasuredRuns: 1, CostStatus: costStatusUnmeasured},
+			want: withEmptyProvenance(historyTotalsResponse{RunCount: 1, UnmeasuredRuns: 1, CostStatus: costStatusUnmeasured}),
+		},
+		{
+			name: "vendor amounts and an agent-priced share leave the figures unchanged",
+			in: IssueRunTotals{
+				Usage:  orchestrator.SnapshotIssueUsage{Sessions: 2, TotalTokens: 1_100_000, UncachedTokens: 850_000, RecordedCostUSD: 27, PricedSessions: 2},
+				Tokens: domain.TokenUsage{InputTokens: 1_000_000, OutputTokens: 100_000, CacheReadTokens: 300_000},
+				Provenance: IssueProvenance{
+					UnmeasuredCause:   "amounts_only",
+					UnmeasuredUnits:   []string{"credits"},
+					VendorAmounts:     []UnitAmount{{Unit: "credits", Amount: 3.62}, {Unit: "premium_requests", Amount: 2, LowerBound: true}},
+					AgentPricedUSD:    new(0.4),
+					AgentPricedModels: []string{"", "model-a"},
+				},
+			},
+			want: historyTotalsResponse{
+				RunCount: 2,
+				Tokens: tokenInfo{
+					InputTokens: new(int64(1_000_000)), OutputTokens: new(int64(100_000)), TotalTokens: new(int64(1_100_000)),
+					CacheReadTokens: new(int64(300_000)), CacheWriteTokens: new(int64(0)),
+				},
+				UncachedTokens:    new(int64(850_000)),
+				TokensComplete:    true,
+				EstimatedCostUSD:  new(27.0),
+				CostStatus:        costStatusEstimated,
+				UnmeasuredCause:   new("amounts_only"),
+				UnmeasuredUnits:   []string{"credits"},
+				VendorAmounts:     []unitAmountResponse{{Unit: "credits", Amount: 3.62}, {Unit: "premium_requests", Amount: 2, LowerBound: true}},
+				AgentPricedUSD:    new(0.4),
+				AgentPricedModels: []string{"", "model-a"},
+			},
 		},
 	}
 
@@ -225,17 +264,22 @@ func TestToRunResponseModelUsage(t *testing.T) {
 		{
 			"part recorded without a price",
 			[]RunModelUsage{{Model: "model-a", Tokens: spend}},
-			`[{"model":"model-a","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":null,"cost_status":"unpriced","unrated_classes":null}]`,
+			`[{"model":"model-a","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":null,"cost_status":"unpriced","unrated_classes":null,"price_source":null}]`,
 		},
 		{
 			"priced part with no unrated class recorded",
 			[]RunModelUsage{{Model: "model-a", Tokens: spend, EstimatedCostUSD: new(1.5), CostStatus: "estimated", UnratedRecorded: true}},
-			`[{"model":"model-a","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":1.5,"cost_status":"estimated","unrated_classes":[]}]`,
+			`[{"model":"model-a","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":1.5,"cost_status":"estimated","unrated_classes":[],"price_source":null}]`,
 		},
 		{
 			"partial part with an unrated class",
 			[]RunModelUsage{{Model: "model-b", Tokens: spend, EstimatedCostUSD: new(0.2), CostStatus: "partial", UnratedClasses: []string{"cache_write"}, UnratedRecorded: true}},
-			`[{"model":"model-b","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":0.2,"cost_status":"partial","unrated_classes":["cache_write"]}]`,
+			`[{"model":"model-b","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":0.2,"cost_status":"partial","unrated_classes":["cache_write"],"price_source":null}]`,
+		},
+		{
+			"part priced from an agent-reported amount",
+			[]RunModelUsage{{Model: "model-a", Tokens: spend, EstimatedCostUSD: new(1.5), CostStatus: "estimated", PriceSource: "agent"}},
+			`[{"model":"model-a","tokens":` + spendJSON + `,"uncached_tokens":110,"estimated_cost_usd":1.5,"cost_status":"estimated","unrated_classes":null,"price_source":"agent"}]`,
 		},
 	}
 
@@ -251,6 +295,65 @@ func TestToRunResponseModelUsage(t *testing.T) {
 			}
 			if string(got) != tt.want {
 				t.Errorf("toRunResponse(%q).model_usage = %s, want %s", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToRunResponseUsageMembers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   RunHistoryEntry
+		want string
+	}{
+		{
+			"recorded before provenance was kept",
+			RunHistoryEntry{UsageCompleteness: "unmeasured", UnmeasuredCause: "unknown"},
+			`{"unmeasured_cause":"unknown","unmeasured_units":[],"usage_completeness":"unmeasured","usage_provenance":null,"vendor_amounts":null}`,
+		},
+		{
+			"provenance known and empty",
+			RunHistoryEntry{UsageCompleteness: "complete", UsageProvenance: []UsagePair{}, VendorAmounts: []VendorAmount{}},
+			`{"unmeasured_cause":null,"unmeasured_units":[],"usage_completeness":"complete","usage_provenance":[],"vendor_amounts":[]}`,
+		},
+		{
+			"run that reported only vendor units",
+			RunHistoryEntry{
+				UsageCompleteness: "unmeasured",
+				UsageProvenance:   []UsagePair{{Source: "protocol", Strategy: "live"}, {Source: "journal", Strategy: "records"}},
+				VendorAmounts:     []VendorAmount{{Unit: "credits", Model: "model-a", Amount: 3.62, LowerBound: true}},
+				UnmeasuredCause:   "amounts_only",
+				UnmeasuredUnits:   []string{"credits"},
+			},
+			`{"unmeasured_cause":"amounts_only","unmeasured_units":["credits"],"usage_completeness":"unmeasured",` +
+				`"usage_provenance":[{"source":"protocol","strategy":"live"},{"source":"journal","strategy":"records"}],` +
+				`"vendor_amounts":[{"unit":"credits","model":"model-a","amount":3.62,"lower_bound":true}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var served map[string]json.RawMessage
+			data, err := json.Marshal(toRunResponse(tt.in, nil))
+			if err == nil {
+				err = json.Unmarshal(data, &served)
+			}
+			if err != nil {
+				t.Fatalf("round-tripping toRunResponse(%q): %v", tt.name, err)
+			}
+			picked := map[string]json.RawMessage{}
+			for _, key := range []string{"unmeasured_cause", "unmeasured_units", "usage_completeness", "usage_provenance", "vendor_amounts"} {
+				picked[key] = served[key]
+			}
+
+			got, _ := json.Marshal(picked)
+
+			if string(got) != tt.want {
+				t.Errorf("toRunResponse(%q) usage members = %s, want %s", tt.name, got, tt.want)
 			}
 		})
 	}

@@ -14,7 +14,8 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
 )
 
 type handoffLabelCall struct {
@@ -52,10 +53,10 @@ func (t *recordingHandoffTracker) labels() []handoffLabelCall {
 
 func seedMockHandoffAbsences(store *mockExitStore, issueID string, count int) {
 	for range count {
-		store.runHistories = append(store.runHistories, persistence.RunHistory{
+		store.runHistories = append(store.runHistories, storage.RunHistory{
 			IssueID: issueID,
 			Status:  "failed",
-			Error:   new(persistence.HandoffAbsenceErrorPrefix + "absence of work observed under observed policy"),
+			Error:   new(storage.HandoffAbsenceErrorPrefix + "absence of work observed under observed policy"),
 		})
 	}
 }
@@ -354,7 +355,7 @@ func TestParkExhaustedAbsencesRecordsFollowedRun(t *testing.T) {
 
 	const issueID = "TICK-RUN"
 	dispatchedAt := time.Date(2026, 3, 15, 11, 0, 0, 0, time.UTC)
-	latest := map[string]persistence.RunHistory{issueID: {
+	latest := map[string]storage.RunHistory{issueID: {
 		IssueID: issueID, AgentAdapter: "claude-code", RuleName: "implement", ConfiguredModel: "sonnet",
 		StagePrevious: "triage", StagePreviousOutcome: "succeeded", ChainID: "chain-1", DispatchedAt: "2026-03-15T11:00:00Z",
 	}}
@@ -927,8 +928,8 @@ func TestUnparkIssueAgentBlockedResetsAbsenceSequence(t *testing.T) {
 	if len(store.absenceResetOf) != 1 || store.absenceResetOf[0] != issueID {
 		t.Errorf("ResetHandoffAbsenceSequence calls = %v, want [%s] for an agent_blocked park", store.absenceResetOf, issueID)
 	}
-	if len(store.deletedParkedIDs) != 1 || store.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", store.deletedParkedIDs, issueID)
+	if len(store.parkedIssues) != 1 || store.parkedIssues[0].ReleaseGesture != unparkTriggerStateChanged || len(store.deletedParkedIDs) != 0 {
+		t.Errorf("upserted rows = %+v, DeleteParkedIssue calls = %v, want one release row with gesture %q and no delete", store.parkedIssues, store.deletedParkedIDs, unparkTriggerStateChanged)
 	}
 }
 
@@ -944,9 +945,9 @@ func TestHandleTickAbsenceReleaseOrdering(t *testing.T) {
 
 	const issueID = "ORD-1"
 	ctx := context.Background()
-	store, err := persistence.Open(ctx, ":memory:")
+	store, err := sqlite.Open(ctx, ":memory:")
 	if err != nil {
-		t.Fatalf("persistence.Open: %v", err)
+		t.Fatalf("sqlite.Open: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
@@ -958,7 +959,7 @@ func TestHandleTickAbsenceReleaseOrdering(t *testing.T) {
 	}
 
 	for range 3 {
-		if _, err := store.AppendRunHistory(ctx, persistence.RunHistory{
+		if _, err := store.AppendRunHistory(ctx, storage.RunHistory{
 			IssueID:      issueID,
 			Identifier:   "PROJ-ORD",
 			Attempt:      1,
@@ -967,13 +968,13 @@ func TestHandleTickAbsenceReleaseOrdering(t *testing.T) {
 			StartedAt:    "2026-08-17T00:00:00Z",
 			CompletedAt:  "2026-08-17T00:01:00Z",
 			Status:       "failed",
-			Error:        new(persistence.HandoffAbsenceErrorPrefix + "absence of work observed under observed policy"),
+			Error:        new(storage.HandoffAbsenceErrorPrefix + "absence of work observed under observed policy"),
 		}); err != nil {
 			t.Fatalf("AppendRunHistory: %v", err)
 		}
 	}
 
-	if err := store.UpsertParkedIssue(ctx, persistence.ParkedIssue{
+	if err := store.UpsertParkedIssue(ctx, storage.ParkedIssue{
 		IssueID:     issueID,
 		Identifier:  "PROJ-ORD",
 		Reason:      parkReasonHandoffAbsence,
@@ -1097,7 +1098,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 			return func(context.Context, domain.Issue, *int) {}
 		},
 		AgentAdapterByKind: func(string) (domain.AgentAdapter, error) { return &mockAgentAdapter{}, nil },
-		ResolveAttemptSettings: func(_ DispatchResolution, _ string) AttemptSettings {
+		ResolveAttemptSettings: func(_ DispatchResolution) AttemptSettings {
 			return AttemptSettings{}
 		},
 		OnRetryFire: noopRetryFire,
@@ -1148,9 +1149,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change observed after the backfill did not release the park")
 	}
-	if len(store.deletedParkedIDs) != 1 || store.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", store.deletedParkedIDs, issueID)
-	}
+	assertReleaseKept(t, store, unparkTriggerStateChanged)
 }
 
 // TestParkSingleLogRecordPerTrigger verifies that one park emits exactly
@@ -1301,7 +1300,5 @@ func TestHandleWorkerExitAbsenceParkRecordsObservedStateAndReleasesWithoutBackfi
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change did not release the worker-exit absence park")
 	}
-	if len(tickStore.deletedParkedIDs) != 1 || tickStore.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", tickStore.deletedParkedIDs, issueID)
-	}
+	assertReleaseKept(t, tickStore, unparkTriggerStateChanged)
 }

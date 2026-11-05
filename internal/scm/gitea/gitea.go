@@ -22,12 +22,15 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/scmcore"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -44,6 +47,9 @@ func init() {
 
 // Compile-time interface satisfaction check.
 var _ domain.TrackerAdapter = (*GiteaAdapter)(nil)
+var _ domain.CommentChangeReader = (*GiteaAdapter)(nil)
+var _ domain.CommentAuthorAccessReader = (*GiteaAdapter)(nil)
+var _ domain.ProjectLinker = (*GiteaAdapter)(nil)
 
 // maxPages is the upper bound on paginated fetches. At 50 items per page this
 // allows up to 10,000 results before the adapter stops and returns what it has.
@@ -58,10 +64,12 @@ type GiteaAdapter struct {
 	client      *httpkit.Client
 	owner       string
 	repo        string
+	projectURL  string
 	model       *issuekit.LabelStateModel
 	queryFilter url.Values // parsed tracker.query_filter; nil or empty when unset
 	log         *slog.Logger
 	metrics     domain.Metrics
+	access      *scmcore.WriteAccessCache
 }
 
 // NewGiteaAdapter creates a [GiteaAdapter] from adapter configuration and runs a
@@ -164,10 +172,12 @@ func NewGiteaAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		client:      client,
 		owner:       owner,
 		repo:        repo,
+		projectURL:  strings.TrimSuffix(parsedEndpoint.Base, "/api/v1") + "/" + owner + "/" + repo,
 		model:       issuekit.NewLabelStateModel(source, slog.Default()),
 		queryFilter: filter,
 		log:         slog.Default(),
 	}
+	adapter.access = scmcore.NewWriteAccessCache(adapter.lookupWriteAccess)
 
 	warnUnrecognizedFilterKeys(adapter.log, filter)
 	if hasNonEmptyLabel(filter["labels"]) {
@@ -181,6 +191,11 @@ func NewGiteaAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	return adapter, nil
+}
+
+// ProjectURL returns the web address of the configured repository.
+func (a *GiteaAdapter) ProjectURL() string {
+	return a.projectURL
 }
 
 // parseGiteaQueryFilter parses the operator tracker.query_filter into url.Values.
@@ -663,9 +678,19 @@ func (a *GiteaAdapter) FetchIssueComments(ctx context.Context, issueID string) (
 // [domain.ErrTrackerNotFound]; an issue with no comments yields a non-nil empty
 // slice.
 func (a *GiteaAdapter) fetchComments(ctx context.Context, index string) ([]domain.Comment, error) {
+	raw, err := a.getComments(ctx, index, nil)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeComments(raw), nil
+}
+
+// getComments issues the one comments request with params and decodes the
+// response.
+func (a *GiteaAdapter) getComments(ctx context.Context, index string, params url.Values) ([]giteaComment, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(index) + "/comments"
 
-	body, _, err := a.client.Get(ctx, path, nil)
+	body, _, err := a.client.Get(ctx, path, params)
 	if err != nil {
 		if domain.IsNotFound(err) {
 			return nil, &domain.TrackerError{
@@ -684,8 +709,69 @@ func (a *GiteaAdapter) fetchComments(ctx context.Context, index string) ([]domai
 			Err:     err,
 		}
 	}
+	return raw, nil
+}
 
-	return normalizeComments(raw), nil
+// FetchIssueCommentChanges reads the comments in one request carrying the
+// route's since filter. The point is the newest update time seen, so the
+// filter's whole-second resolution re-reads the comments updated in that
+// second.
+func (a *GiteaAdapter) FetchIssueCommentChanges(ctx context.Context, issueID string, since domain.CommentReadPoint) (domain.CommentChanges, error) {
+	var changes domain.CommentChanges
+	err := trackermetrics.Track(a.metrics, "fetch_comments", func() error {
+		point := decodeCommentPoint(since)
+		var params url.Values
+		if !point.IsZero() {
+			params = url.Values{"since": {point.Truncate(time.Second).Format(time.RFC3339)}}
+		}
+
+		raw, err := a.getComments(ctx, issueID, params)
+		if err != nil {
+			return err
+		}
+
+		comments := normalizeComments(raw)
+		newest := point
+		for _, c := range comments {
+			updated, err := c.UpdatedTime()
+			if err != nil {
+				return &domain.TrackerError{
+					Kind:    domain.ErrTrackerPayload,
+					Message: fmt.Sprintf("comment %s has an unparseable updated_at", c.ID),
+					Err:     err,
+				}
+			}
+			if updated.After(newest) {
+				newest = updated
+			}
+		}
+
+		changes = domain.CommentChanges{Comments: comments, Next: encodeCommentPoint(newest)}
+		return nil
+	})
+	if err != nil {
+		return domain.CommentChanges{}, err
+	}
+	return changes, nil
+}
+
+// decodeCommentPoint returns the instant a point names, or the zero time for
+// an empty or foreign point.
+func decodeCommentPoint(p domain.CommentReadPoint) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, string(p))
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
+}
+
+// encodeCommentPoint is the inverse of [decodeCommentPoint]; the zero time
+// encodes as the zero point.
+func encodeCommentPoint(t time.Time) domain.CommentReadPoint {
+	if t.IsZero() {
+		return ""
+	}
+	return domain.CommentReadPoint(t.UTC().Format(time.RFC3339Nano))
 }
 
 // FetchIssueStatesByIDs returns the derived state for each requested issue
@@ -920,36 +1006,54 @@ func (a *GiteaAdapter) setIssueClosed(ctx context.Context, issuePath string, clo
 	return err
 }
 
-// CommentIssue posts text as a Markdown comment on the issue. The text is sent
-// verbatim with no conversion, and the created-comment response is ignored.
-func (a *GiteaAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, text)
+// CommentIssue posts text as a Markdown comment on the issue and returns the
+// created comment's identity, the decimal form of its numeric id. The text is
+// sent verbatim with no conversion.
+func (a *GiteaAdapter) CommentIssue(ctx context.Context, issueID, text string) (string, error) {
+	var commentID string
+	err := trackermetrics.Track(a.metrics, "comment", func() error {
+		var postErr error
+		commentID, postErr = a.postComment(ctx, issueID, text)
+		return postErr
 	})
+	if err != nil {
+		return "", err
+	}
+	return commentID, nil
 }
 
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GiteaAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
-	})
-}
-
-func (a *GiteaAdapter) postComment(ctx context.Context, issueID, body string) error {
+func (a *GiteaAdapter) postComment(ctx context.Context, issueID, body string) (string, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(issueID) + "/comments"
 
 	payload, err := json.Marshal(map[string]string{"body": body})
 	if err != nil {
-		return &domain.TrackerError{
+		return "", &domain.TrackerError{
 			Kind:    domain.ErrTrackerPayload,
 			Message: "failed to marshal comment payload",
 			Err:     err,
 		}
 	}
 
-	_, err = a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
-	return err
+	respBody, err := a.client.Send(ctx, "POST", path, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+
+	var created giteaComment
+	if err := json.Unmarshal(respBody, &created); err != nil {
+		return "", &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to parse comment creation response",
+			Err:     err,
+		}
+	}
+	if created.ID == 0 {
+		return "", &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "comment creation response carries no id",
+		}
+	}
+	return strconv.FormatInt(created.ID, 10), nil
 }
 
 // AddLabel attaches label to the issue, resolving or creating the label id

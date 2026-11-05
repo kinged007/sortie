@@ -218,10 +218,8 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 		}
 	}
 
-	// remote decides the launch mode every kind's usage disposition is
-	// resolved under: worker.ssh_hosts is the one configuration key
-	// that can produce a remote session, so its presence decides the
-	// mode for every session this configuration can produce.
+	// worker.ssh_hosts is the one configuration key that can produce a
+	// remote session, which launches the remote command line of a kind.
 	remote := len(ParseWorkerConfig(cfg.ExtensionSection("worker"), cfg.ExtensionEnvRefPaths("worker")).SSHHosts) > 0
 
 	// Adapter-specific agent config validation, for every distinct kind
@@ -269,10 +267,9 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 			}
 		}
 
-		// A kind whose declared disposition delivers no channel on a
-		// local launch can neither call nor be told about Sortie's
-		// tools for any of its sessions.
-		if registered && !agentMeta.MCPInjection.DeliversTools(false) {
+		// A kind that delivers no tool channel can neither call nor be told
+		// about Sortie's tools.
+		if registered && !agentMeta.MCPDialect.DeliversTools() {
 			warns = append(warns, PreflightWarning{
 				Check:   "agent.kind.no_tool_channel",
 				Message: "agent kind " + strconv.Quote(ref.Kind) + " has no tool execution channel: Sortie's tools are neither advertised nor callable for it",
@@ -282,7 +279,7 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 		if blockOnly {
 			continue
 		}
-		settingsErrs, settingsWarns := settingsDiagnostics(cfg, agentMeta, registered, settings, remote)
+		settingsErrs, settingsWarns := settingsDiagnostics(cfg, agentMeta, registered, settings)
 		errs = append(errs, settingsErrs...)
 		warns = append(warns, settingsWarns...)
 	}
@@ -295,7 +292,7 @@ func ValidateDispatchConfig(params PreflightParams) PreflightResult {
 		settings := config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: rule.SettingsKind, RuleName: rule.Name}, "")
 		prefix := ruleSettingsPrefix(i, rule)
 
-		ruleErrs, ruleWarns := settingsDiagnostics(cfg, agentMeta, registered, settings, remote)
+		ruleErrs, ruleWarns := settingsDiagnostics(cfg, agentMeta, registered, settings)
 		for _, e := range ruleErrs {
 			errs = append(errs, PreflightError{Check: e.Check, Message: prefix + e.Message})
 		}
@@ -337,7 +334,7 @@ type moneyCeilingSetting struct {
 }
 
 // moneyCeilingSettings returns each money setting of agent above 0, in the
-// order per-issue, daily, monthly.
+// order per-issue, daily, weekly, monthly.
 func moneyCeilingSettings(agent config.AgentConfig) []moneyCeilingSetting {
 	var settings []moneyCeilingSetting
 	if agent.MaxCostUSD > 0 {
@@ -346,17 +343,13 @@ func moneyCeilingSettings(agent config.AgentConfig) []moneyCeilingSetting {
 			NoUsage: "the per-issue money ceiling can never be reached for it",
 		})
 	}
-	if agent.MaxDailyCostUSD > 0 {
-		settings = append(settings, moneyCeilingSetting{
-			Key:     "agent.max_daily_cost_usd",
-			NoUsage: "the daily spend ceiling counts none of its spend",
-		})
-	}
-	if agent.MaxMonthlyCostUSD > 0 {
-		settings = append(settings, moneyCeilingSetting{
-			Key:     "agent.max_monthly_cost_usd",
-			NoUsage: "the monthly spend ceiling counts none of its spend",
-		})
+	for _, def := range spendWindowDefs {
+		if def.ceiling(agent) > 0 {
+			settings = append(settings, moneyCeilingSetting{
+				Key:     def.setting,
+				NoUsage: "the " + string(def.window) + " spend ceiling counts none of its spend",
+			})
+		}
 	}
 	return settings
 }

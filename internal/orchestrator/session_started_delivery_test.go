@@ -9,12 +9,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/render"
 	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/prompt"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 type dispatchCommentProbe struct {
@@ -112,27 +113,13 @@ func startSessionStartedRun(t *testing.T, cancelAtTransition bool) *sessionStart
 	return run
 }
 
-func (r *sessionStartedRun) waitForWorker(t *testing.T) {
-	t.Helper()
-
-	select {
-	case <-r.done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunWorkerAttempt did not return while the detached delivery was blocked")
-	}
-}
-
 func TestSessionStartedDelivery_DetachedSendDoesNotBlockTheWorker(t *testing.T) {
 	t.Parallel()
 
 	run := startSessionStartedRun(t, false)
-	run.waitForWorker(t)
+	waittest.Receive(t, run.done, "RunWorkerAttempt return while the detached delivery was blocked")
 
-	select {
-	case <-run.slack.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the subscriber's Send never started")
-	}
+	waittest.Receive(t, run.slack.entered, "the subscriber's Send to start")
 	if !dirExists(filepath.Join(run.root, workerTestIssue().Identifier)) {
 		t.Error("workspace not prepared by the time RunWorkerAttempt returned, want it reached while the Send was blocked")
 	}
@@ -148,14 +135,10 @@ func TestSessionStartedDelivery_DetachedSendDoesNotBlockTheWorker(t *testing.T) 
 	default:
 	}
 	run.release()
-	select {
-	case <-waited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("TrackerOpsWg.Wait did not return after the Send was released")
-	}
+	waittest.Receive(t, waited, "TrackerOpsWg.Wait return after the Send was released")
 
 	sent := run.slack.notifications()
-	if len(sent) != 1 || sent[0].Envelope.EventType != domain.EventTypeSessionStarted || sent[0].Message.Body != dispatchComment {
+	if len(sent) != 1 || sent[0].Envelope.EventType != domain.EventTypeSessionStarted || render.Notification(sent[0]).Body != sessionStartedText {
 		t.Fatalf("subscriber notifications = %+v, want one session.started carrying the dispatch comment", sent)
 	}
 	if sent[0].Envelope.IssueID != workerTestIssue().ID || sent[0].Envelope.Identifier != workerTestIssue().Identifier {
@@ -167,13 +150,13 @@ func TestSessionStartedDelivery_TrackerCommentLoggedAndCountedBeforeWorkspacePre
 	t.Parallel()
 
 	run := startSessionStartedRun(t, false)
-	run.waitForWorker(t)
+	waittest.Receive(t, run.done, "RunWorkerAttempt return while the detached delivery was blocked")
 	run.release()
 
 	run.tracker.commentMu.Lock()
 	comments := slices.Clone(run.tracker.commentCalls)
 	run.tracker.commentMu.Unlock()
-	if len(comments) != 1 || comments[0].Text != dispatchComment {
+	if len(comments) != 1 || comments[0].Text != sessionStartedText {
 		t.Fatalf("tracker comments = %+v, want exactly one dispatch comment", comments)
 	}
 	if got := run.metrics.existedAtCount(); !slices.Equal(got, []bool{false}) {
@@ -194,18 +177,14 @@ func TestSessionStartedDelivery_CancelledWorkerStartsNoDetachedSend(t *testing.T
 	t.Parallel()
 
 	run := startSessionStartedRun(t, true)
-	run.waitForWorker(t)
+	waittest.Receive(t, run.done, "RunWorkerAttempt return while the detached delivery was blocked")
 
 	waited := make(chan struct{})
 	go func() {
 		run.wg.Wait()
 		close(waited)
 	}()
-	select {
-	case <-waited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("TrackerOpsWg.Wait blocked, want no detached delivery counted for a cancelled worker")
-	}
+	waittest.Receive(t, waited, "TrackerOpsWg.Wait return with no detached delivery counted for a cancelled worker")
 	run.release()
 
 	if sent := run.slack.notifications(); len(sent) != 0 {

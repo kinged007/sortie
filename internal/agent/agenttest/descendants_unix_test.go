@@ -12,9 +12,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 type detachParams struct {
@@ -63,7 +63,7 @@ func TestMainRecordsWhatAScenarioLeftRunning(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	child := awaitReported(t, reported)
+	child := waittest.PIDFile(t, reported)
 	recorded := readRecord(t, agenttest.DescendantReceipt(exe))
 	if !slices.Contains(recorded, child) {
 		t.Errorf("descendant receipt = %v, want the detached child %d the scenario left running", recorded, child)
@@ -82,7 +82,7 @@ func TestWriteRecordingScriptRecordsItsBackgroundJob(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	child := awaitReported(t, reported)
+	child := waittest.PIDFile(t, reported)
 	recorded := readRecord(t, agenttest.DescendantReceipt(script))
 	if !slices.Contains(recorded, child) {
 		t.Errorf("descendant receipt = %v, want the background job %d the script left running", recorded, child)
@@ -130,26 +130,6 @@ func requireSleeper(t *testing.T) string {
 		t.Skipf("skipping: no sleeper to detach: %v", err)
 	}
 	return sleeper
-}
-
-// awaitReported reads the pid the launched program wrote to path. The trailing
-// newline distinguishes a short read from a complete one.
-func awaitReported(t *testing.T, path string) int {
-	t.Helper()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		reported, err := os.ReadFile(path) //nolint:gosec // path is under t.TempDir()
-		if err == nil && strings.HasSuffix(string(reported), "\n") {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(reported))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		if !time.Now().Before(deadline) {
-			t.Fatalf("no process id was reported to %s", path)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 }
 
 func readRecord(t *testing.T, receipt string) []int {

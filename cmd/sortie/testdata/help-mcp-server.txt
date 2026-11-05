@@ -9,6 +9,9 @@ Usage:
 
 Flags:
   --workflow PATH   Absolute path to workflow file (required)
+  --http            Serve MCP over streamable HTTP on a loopback port
+                    instead of stdio; requires SORTIE_TOOL_SERVER_BEARER
+                    and exits when standard input closes
 
 Global flags:
   -h, --help        Print this help message and quit

@@ -1,120 +1,296 @@
+import { NotedFigure } from "@/components/NotedFigure";
 import { Pair, Pairs, Panel } from "@/components/Panel";
-import { costText, costTitle, NOT_MEASURED } from "@/lib/figures";
-import { fmtCount, fmtDuration } from "@/lib/format";
-import { unratedText } from "@/lib/rates";
+import { StatusMark } from "@/components/StatusMark";
+import { NameText } from "@/components/NameText";
+import { KIND_ORDER, KindLabel, cacheHitRate, freshInputOf } from "@/components/TokenKinds";
+import { MONO } from "@/components/ui/mono";
+import {
+  LABEL_AGENT_REPORTED,
+  LABEL_CACHE_HIT_RATE,
+  LABEL_EST_COST,
+  LABEL_MEASURED_FROM,
+  LABEL_MODEL,
+  LABEL_PRICED_FROM,
+  LABEL_TOKENS,
+  MODEL_NOT_REPORTED,
+  NOT_MEASURED,
+  liveCostFigure,
+  NOT_RECORDED,
+  PROVENANCE_UNKNOWN,
+  RUN_TOKENS_LOWER_BOUND,
+  partCostFigure,
+  priceSourceFigure,
+  provenanceLines,
+  runBaseCostFigure,
+  runTokensFigure,
+  vendorAmountFigure,
+} from "@/lib/figures";
+import { fmtCount, fmtDuration, fmtPercent } from "@/lib/format";
 
-import type { ConfigResponse, ModelUsageResponse, TokenInfo } from "@/api/types.gen";
+import { ToolText } from "./ToolLine";
+
+import type {
+  ConfigResponse,
+  ModelUsageResponse,
+  RunResponse,
+  RunningEntryResponse,
+  SkillCall,
+  TokenInfo,
+  VendorAmountResponse,
+} from "@/api/types.gen";
+import type { TokenKind } from "@/components/TokenKinds";
 import type { SessionRun } from "@/components/use-session-run";
 import type { ReactNode } from "react";
 
-/** A session that resolved, live or finished. */
 export type ResolvedSession = Extract<SessionRun, { kind: "live" | "finished" }>;
 
 function figureText(n: number | null): string {
   return n === null ? NOT_MEASURED : fmtCount(n);
 }
 
-function tokensOf(session: ResolvedSession): ReactNode {
-  const total = (session.kind === "live" ? session.running : session.run).uncached_tokens;
-  if (total === null) {
-    return NOT_MEASURED;
+function counterOf(tokens: TokenInfo, key: TokenKind["key"]): number | null {
+  switch (key) {
+    case "input":
+      return freshInputOf(tokens);
+    case "output":
+      return tokens.output_tokens;
+    case "cache_write":
+      return tokens.cache_write_tokens;
+    case "cache_read":
+      return tokens.cache_read_tokens;
   }
-  return session.kind === "live" ? (
+}
+
+interface KindPairsProps {
+  tokens: TokenInfo;
+  total: ReactNode;
+}
+
+function KindPairs({ tokens, total }: KindPairsProps) {
+  const rate = cacheHitRate(tokens.input_tokens, tokens.cache_read_tokens);
+  return (
     <>
-      <strong className="font-bold">{fmtCount(total)}</strong> so far
+      {KIND_ORDER.map((kind) => (
+        <Pair key={kind.key} label={<KindLabel kind={kind} />}>
+          {figureText(counterOf(tokens, kind.key))}
+        </Pair>
+      ))}
+      {rate === null ? undefined : <Pair label={LABEL_CACHE_HIT_RATE}>{fmtPercent(rate)}</Pair>}
+      <Pair label={LABEL_TOKENS}>{total}</Pair>
     </>
-  ) : (
-    <strong className="font-bold">{fmtCount(total)}</strong>
   );
 }
 
-/** Input arrives cache-inclusive, so the fresh input leaves out both cache counters. */
-function freshInputOf(tokens: TokenInfo): number | null {
-  const { input_tokens: input, cache_read_tokens: read, cache_write_tokens: write } = tokens;
-  if (input === null || read === null || write === null) {
-    return null;
-  }
-  return Math.max(0, input - read - write);
+interface PricedFromPairProps {
+  part: ModelUsageResponse;
 }
 
-/** Props of {@link UsagePanel}. */
+function PricedFromPair({ part }: PricedFromPairProps) {
+  const pricedFrom = priceSourceFigure(part);
+  return pricedFrom === null ? undefined : (
+    <Pair label={LABEL_PRICED_FROM}>
+      <span className={part.price_source === null ? "text-ink-muted" : undefined}>
+        <NotedFigure figure={pricedFrom} />
+      </span>
+    </Pair>
+  );
+}
+
+/** Amounts of one unit sum; a model split of the served list is not shown here. */
+function amountsByUnit(amounts: readonly VendorAmountResponse[]): VendorAmountResponse[] {
+  const byUnit = new Map<string, VendorAmountResponse>();
+  for (const entry of amounts) {
+    const before = byUnit.get(entry.unit);
+    byUnit.set(entry.unit, {
+      unit: entry.unit,
+      model: "",
+      amount: (before?.amount ?? 0) + entry.amount,
+      lower_bound: (before?.lower_bound ?? false) || entry.lower_bound,
+    });
+  }
+  return [...byUnit.values()];
+}
+
+interface FinishedUsagePairsProps {
+  run: RunResponse;
+}
+
+function FinishedUsagePairs({ run }: FinishedUsagePairsProps) {
+  const total = run.uncached_tokens;
+  const lines = provenanceLines(run);
+  const reported = amountsByUnit(run.vendor_amounts ?? []);
+  const tokens = runTokensFigure(run);
+  const parts = run.model_usage ?? [];
+  const onlyPart = parts.length === 1 ? parts[0] : undefined;
+
+  return (
+    <>
+      {run.usage_completeness === "unmeasured" || total === null ? (
+        <Pair label={LABEL_TOKENS}>
+          <NotedFigure figure={tokens} />
+        </Pair>
+      ) : (
+        <KindPairs
+          tokens={run.tokens}
+          total={
+            <NotedFigure
+              figure={{
+                text: fmtCount(total),
+                note: run.usage_completeness === "lower_bound" ? RUN_TOKENS_LOWER_BOUND : undefined,
+              }}
+            />
+          }
+        />
+      )}
+      <Pair label={LABEL_EST_COST}>
+        <NotedFigure figure={runBaseCostFigure(run)} />
+      </Pair>
+      {onlyPart === undefined ? undefined : <PricedFromPair part={onlyPart} />}
+      {lines === null ? (
+        <Pair label={LABEL_MEASURED_FROM}>
+          <span className="text-ink-muted">
+            <NotedFigure figure={{ text: NOT_RECORDED, note: PROVENANCE_UNKNOWN }} />
+          </span>
+        </Pair>
+      ) : lines.length === 0 ? undefined : (
+        <Pair label={LABEL_MEASURED_FROM}>
+          <span className="flex flex-col">
+            {lines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </span>
+        </Pair>
+      )}
+      {reported.length === 0 ? undefined : (
+        <Pair label={LABEL_AGENT_REPORTED}>
+          <span className="flex flex-col">
+            {reported.map((amount) => (
+              <span key={amount.unit}>
+                <NotedFigure figure={vendorAmountFigure(amount, "full")} />
+              </span>
+            ))}
+          </span>
+        </Pair>
+      )}
+    </>
+  );
+}
+
+interface LiveUsagePairsProps {
+  running: RunningEntryResponse;
+}
+
+function LiveUsagePairs({ running }: LiveUsagePairsProps) {
+  return (
+    <>
+      {running.tokens_measured ? (
+        <KindPairs
+          tokens={running.tokens}
+          total={
+            running.uncached_tokens === null
+              ? NOT_MEASURED
+              : `${fmtCount(running.uncached_tokens)} so far`
+          }
+        />
+      ) : (
+        <Pair label={LABEL_TOKENS}>{NOT_MEASURED}</Pair>
+      )}
+      <Pair label={LABEL_EST_COST}>
+        <NotedFigure
+          figure={liveCostFigure(running.cost_status, running.estimated_cost_usd, "session")}
+        />
+      </Pair>
+    </>
+  );
+}
+
 export interface UsagePanelProps {
   session: ResolvedSession;
 }
 
-/** Renders the tokens and the estimated cost of one session. */
 export function UsagePanel({ session }: UsagePanelProps) {
-  const source = session.kind === "live" ? session.running : session.run;
-  const { tokens } = source;
-
   return (
-    <Panel title="Usage">
+    <Panel isRuled title="Usage">
       <Pairs>
-        {source.tokens_measured ? (
-          <>
-            <Pair label="Input">{figureText(freshInputOf(tokens))}</Pair>
-            <Pair label="Output">{figureText(tokens.output_tokens)}</Pair>
-            <Pair label="Cache read">{figureText(tokens.cache_read_tokens)}</Pair>
-            <Pair label="Cache write">{figureText(tokens.cache_write_tokens)}</Pair>
-            <Pair label="Tokens">{tokensOf(session)}</Pair>
-          </>
+        {session.kind === "finished" ? (
+          <FinishedUsagePairs run={session.run} />
         ) : (
-          <Pair label="Tokens">{NOT_MEASURED}</Pair>
+          <LiveUsagePairs running={session.running} />
         )}
-        <Pair label="Est. cost">
-          <span title={costTitle(source.cost_status, source.estimated_cost_usd)}>
-            {costText(source.cost_status, source.estimated_cost_usd)}
-          </span>
-        </Pair>
       </Pairs>
     </Panel>
   );
 }
 
-/** Props of {@link ModelCostPanel}. */
 export interface ModelCostPanelProps {
   parts: readonly ModelUsageResponse[];
 }
 
-/** Renders the tokens and the estimated cost of a finished run for each model it spent tokens on. */
 export function ModelCostPanel({ parts }: ModelCostPanelProps) {
   return (
-    <Panel title="Cost per model">
-      {parts.map((part) => (
-        <div key={part.model} className="flex flex-col gap-xs">
-          {part.model === "" ? (
-            <p className="text-body-md font-medium text-ink">Model not reported</p>
-          ) : (
-            <p className="font-mono text-body-sm text-ink wrap-anywhere">{part.model}</p>
-          )}
-          <Pairs>
-            <Pair label="Tokens">{fmtCount(part.uncached_tokens)}</Pair>
-            <Pair label="Est. cost">
-              <span title={costTitle(part.cost_status, part.estimated_cost_usd)}>
-                {costText(part.cost_status, part.estimated_cost_usd)}
-              </span>
-            </Pair>
-            {part.unrated_classes === null || part.unrated_classes.length === 0 ? undefined : (
-              <Pair label="No rate for">{unratedText(part.unrated_classes)}</Pair>
-            )}
-          </Pairs>
-        </div>
-      ))}
+    <Panel isRuled title="Cost per model">
+      <div className="flex flex-col gap-lg">
+        {parts.map((part) => (
+          <div key={part.model}>
+            <Pairs>
+              <Pair label={LABEL_MODEL}>
+                {part.model === "" ? (
+                  MODEL_NOT_REPORTED
+                ) : (
+                  <span className={`${MONO} wrap-anywhere`}>{part.model}</span>
+                )}
+              </Pair>
+              <KindPairs tokens={part.tokens} total={fmtCount(part.uncached_tokens)} />
+              <Pair label={LABEL_EST_COST}>
+                <NotedFigure figure={partCostFigure(part)} />
+              </Pair>
+              <PricedFromPair part={part} />
+            </Pairs>
+          </div>
+        ))}
+      </div>
     </Panel>
   );
 }
 
-/** Props of {@link SessionPanel}. */
+export interface SkillsPanelProps {
+  skills: readonly SkillCall[];
+}
+
+export function SkillsPanel({ skills }: SkillsPanelProps) {
+  return (
+    <Panel isRuled title="Skills">
+      <ol className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-md gap-y-xs text-body-md">
+        {skills.map((call, index) => (
+          <li key={index} className="contents">
+            <span className="text-right text-ink-muted tabular-nums">{index + 1}</span>
+            {call.tool_error === true ? (
+              <StatusMark
+                mark="failed"
+                label={<ToolText text={call.skill} isMono />}
+                className="min-w-0 *:min-w-0"
+              />
+            ) : (
+              <span className="min-w-0 text-ink">
+                <ToolText text={call.skill} isMono />
+              </span>
+            )}
+          </li>
+        ))}
+      </ol>
+    </Panel>
+  );
+}
+
 export interface SessionPanelProps {
   session: ResolvedSession;
   /** The state's configuration; absent until the state loads. */
   config: ConfigResponse | undefined;
 }
 
-/** Renders a long identifier by its tail or head in mono, the whole value on hover. */
 function ShortValue({ full, shown }: { full: string; shown: string }) {
   return (
-    <span title={full} className="font-mono text-body-sm">
+    <span title={full} className={MONO}>
       {shown}
     </span>
   );
@@ -124,17 +300,20 @@ function lastSegmentOf(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
-/** Renders the models, host, workspace, session ID, workflow, and stall timeout of one session. */
 export function SessionPanel({ session, config }: SessionPanelProps) {
   const isLive = session.kind === "live";
   const source = isLive ? session.running : session.run;
   const stallTimeoutMs = config?.agent.stall_timeout_ms ?? null;
 
   return (
-    <Panel title="Session">
+    <Panel isRuled title="Details">
       <Pairs>
-        <Pair label="Configured">{source.configured_model || "agent default"}</Pair>
-        <Pair label="Reported model">{source.model_name || "not reported"}</Pair>
+        <Pair label="Configured">
+          {source.configured_model ? <NameText name={source.configured_model} /> : "agent default"}
+        </Pair>
+        <Pair label="Reported model">
+          {source.model_name ? <NameText name={source.model_name} /> : MODEL_NOT_REPORTED}
+        </Pair>
         {source.ssh_host ? <Pair label="Host">{`${source.ssh_host} (SSH)`}</Pair> : undefined}
         {isLive ? (
           <Pair label="Workspace">

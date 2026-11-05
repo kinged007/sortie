@@ -5,14 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
 
-	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
@@ -35,7 +33,6 @@ type permissionAction string
 
 const (
 	permissionAllow permissionAction = "allow"
-	permissionAsk   permissionAction = "ask"
 	permissionDeny  permissionAction = "deny"
 )
 
@@ -175,22 +172,6 @@ func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	return args
 }
 
-// buildTurnStdin returns the reader a turn's subprocess reads from:
-// prompt, preceded by preamble (nil on a local launch, the SSH preamble
-// otherwise).
-func buildTurnStdin(prompt string, preamble io.Reader) io.Reader {
-	promptReader := strings.NewReader(prompt)
-	if preamble == nil {
-		return promptReader
-	}
-	return io.MultiReader(preamble, promptReader)
-}
-
-// exportArgs returns the usage-recovery invocation's argument vector.
-func exportArgs(sessionID string) []string {
-	return []string{"session", "export", "--standalone", "--sanitize", sessionID}
-}
-
 // deleteArgs returns the session-deletion invocation's argument vector.
 func deleteArgs(sessionID string) []string {
 	return []string{"session", "delete", "--standalone", sessionID}
@@ -232,10 +213,9 @@ func buildTurnEnv(state *sessionState) []string {
 	return env
 }
 
-// auxiliaryCommand builds a one-shot opencode subcommand through the
-// session's launch target, carrying the same environment and managed
-// variables every working turn carries, so a delete and an export query
-// never diverge in what they run with.
+// auxiliaryCommand builds the one-shot subcommand that deletes a credential
+// verification session, through the session's launch target and with the
+// environment and managed variables every working turn carries.
 func auxiliaryCommand(ctx context.Context, state *sessionState, args []string) (*exec.Cmd, error) {
 	cmd, agentErr := state.target.AuxiliaryCommand(ctx, args, nil, buildRunEnv(os.Environ()), sortedEnvVars(buildManagedEnv())...)
 	if agentErr != nil {
@@ -337,25 +317,15 @@ func titleAgentDisabled() *agentConfigDocument {
 	return &agentConfigDocument{Title: agentSwitch{Disable: true}}
 }
 
-// mcpConfigDocumentEntry is one server entry of [inlineConfigDocument].
-type mcpConfigDocumentEntry struct {
-	Type        string            `json:"type"`
-	Command     []string          `json:"command,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	URL         string            `json:"url,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Enabled     bool              `json:"enabled"`
-}
-
 // inlineConfigDocument is the OPENCODE_CONFIG_CONTENT value: the
 // runtime's own inline configuration document, carrying the tool
 // policy, sharing, compaction, and tool servers.
 type inlineConfigDocument struct {
-	Permission permissionPolicy                  `json:"permission,omitempty"`
-	Share      string                            `json:"share"`
-	Compaction *inlineCompaction                 `json:"compaction,omitempty"`
-	Agent      *agentConfigDocument              `json:"agent,omitempty"`
-	MCP        map[string]mcpConfigDocumentEntry `json:"mcp,omitempty"`
+	Permission permissionPolicy     `json:"permission,omitempty"`
+	Share      string               `json:"share"`
+	Compaction *inlineCompaction    `json:"compaction,omitempty"`
+	Agent      *agentConfigDocument `json:"agent,omitempty"`
+	MCP        json.RawMessage      `json:"mcp,omitempty"`
 }
 
 // inlineCompaction is [inlineConfigDocument]'s compaction member.
@@ -363,89 +333,58 @@ type inlineCompaction struct {
 	Auto bool `json:"auto"`
 }
 
-// translateMCPServers parses mcpConfigPath into the runtime's own MCP
-// server entries, or returns nil for a remote launch, an empty path,
-// or a configuration declaring no server. A nil Server.Enabled renders
-// true, matching the runtime's own default.
-func translateMCPServers(mcpConfigPath string, remote bool) (map[string]mcpConfigDocumentEntry, error) {
-	if mcpConfigPath == "" || remote {
-		return nil, nil
-	}
-
-	servers, err := mcpconfig.Parse(mcpConfigPath)
-	if err != nil {
-		return nil, err
-	}
-	if len(servers) == 0 {
-		return nil, nil
-	}
-	return buildMCPConfigEntries(servers)
-}
-
-// buildInlineConfig returns the OPENCODE_CONFIG_CONTENT document:
-// the session's tool policy, sharing fixed to disabled, autocompaction
-// disabled when pt asks for it, the title agent disabled, and servers
-// when non-empty. Unless pt skips permissions, the policy sets
-// external_directory to ask when the tool lists leave it undecided,
-// because OpenCode 2.x applies no default for it.
-func buildInlineConfig(pt passthroughConfig, servers map[string]mcpConfigDocumentEntry) (string, error) {
-	doc := inlineConfigDocument{Share: "disabled", Agent: titleAgentDisabled()}
+// buildInlineConfig returns the OPENCODE_CONFIG_CONTENT document: the
+// session's tool policy, sharing fixed to disabled, autocompaction disabled
+// when pt asks for it, the title agent disabled, and mcp, the tool-server
+// delivery, when non-empty. Unless pt skips permissions, the policy sets the
+// "*" key to deny when the tool lists leave it undecided, because OpenCode's own
+// default allows every tool, and a project's saved approvals override any
+// configured rule except a deny. The runtime applies the last matching rule and
+// the JSON encoder orders map keys bytewise, which puts "*" ahead of every
+// tool name, so each rule the lists produce still decides its own key.
+func buildInlineConfig(pt passthroughConfig, mcp []byte) (string, error) {
 	policy, _ := buildPermissionPolicy(pt)
 	if !pt.DangerousSkipPermissions {
 		if policy == nil {
 			policy = permissionPolicy{}
 		}
-		if _, decided := policy["external_directory"]; !decided {
-			policy["external_directory"] = permissionAsk
+		if _, decided := policy["*"]; !decided {
+			policy["*"] = permissionDeny
 		}
 	}
-	doc.Permission = policy
+	return marshalInlineConfig(pt, policy, mcp)
+}
+
+// buildVerificationInlineConfig denies every tool because the runtime offers no
+// other switch that removes tool definitions without touching its provider or
+// model resolution, and denied tools also end the tool calls that wrote a file
+// into the workspace. The runtime appends its own skill rule after the
+// configuration, so that one tool stays declared but unusable.
+func buildVerificationInlineConfig(pt passthroughConfig, mcp []byte) (string, error) {
+	return marshalInlineConfig(pt, permissionPolicy{"*": permissionDeny}, mcp)
+}
+
+// buildTurnConfig returns the reduced verification document when reduced, the
+// working one otherwise, with mcp as its "mcp" member.
+func buildTurnConfig(pt passthroughConfig, reduced bool, mcp []byte) (string, error) {
+	if reduced {
+		return buildVerificationInlineConfig(pt, mcp)
+	}
+	return buildInlineConfig(pt, mcp)
+}
+
+func marshalInlineConfig(pt passthroughConfig, policy permissionPolicy, mcp []byte) (string, error) {
+	doc := inlineConfigDocument{Share: "disabled", Agent: titleAgentDisabled(), Permission: policy}
 	if pt.DisableAutocompact {
 		doc.Compaction = &inlineCompaction{Auto: false}
 	}
-	if len(servers) > 0 {
-		doc.MCP = servers
-	}
+	doc.MCP = mcp
 
 	encoded, err := json.Marshal(doc)
 	if err != nil {
 		return "", fmt.Errorf("marshal opencode inline configuration: %w", err)
 	}
 	return string(encoded), nil
-}
-
-// buildMCPConfigEntries translates servers into the runtime's own MCP
-// server-entry shape.
-func buildMCPConfigEntries(servers []mcpconfig.Server) (map[string]mcpConfigDocumentEntry, error) {
-	entries := make(map[string]mcpConfigDocumentEntry, len(servers))
-
-	for _, server := range servers {
-		enabled := true
-		if server.Enabled != nil {
-			enabled = *server.Enabled
-		}
-
-		switch server.Transport {
-		case mcpconfig.TransportStdio:
-			entries[server.Name] = mcpConfigDocumentEntry{
-				Type:        "local",
-				Command:     append([]string{server.Command}, server.Args...),
-				Environment: server.Env,
-				Enabled:     enabled,
-			}
-		case mcpconfig.TransportHTTP:
-			entries[server.Name] = mcpConfigDocumentEntry{
-				Type:    "remote",
-				URL:     server.URL,
-				Headers: server.Headers,
-				Enabled: enabled,
-			}
-		default:
-			return nil, fmt.Errorf("mcp server %q: entry carries neither command nor url", server.Name)
-		}
-	}
-
-	return entries, nil
 }
 
 func logUnknownPermissionKey(key string) {

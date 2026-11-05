@@ -1,143 +1,120 @@
 // Package opencode implements [domain.AgentAdapter] for the OpenCode CLI.
 // It launches one `opencode run --format json` subprocess per turn,
-// normalizes stdout envelopes into domain events, and recovers final token
-// usage with `opencode session export --standalone --sanitize`.
+// normalizes stdout envelopes into domain events, and settles token usage
+// through the usage ledger from the run's step reports and the session export
+// (`opencode session export --standalone --sanitize`).
 //
-// The CLI accepts no MCP configuration path as an argument, so on a local
-// launch the adapter translates the file named by
-// [domain.StartSessionParams] MCPConfigPath into OpenCode's own
-// configuration form and delivers it in the turn's environment.
+// The CLI accepts no MCP configuration path, so the adapter places the
+// session's tool-server delivery as the "mcp" member of the inline
+// configuration document in the turn's environment; a remote launch with a
+// tool relay carries it as a late SSH preamble entry.
 package opencode
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
+	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/agent/opencode/sessionexport"
+	"github.com/sortie-ai/sortie/internal/agent/opencode/usagelimits"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
-// defaultCommand is what a session launches when it is given no command.
 const defaultCommand = "opencode"
+
+// usageSources: each step_finish report carries one request's token counts,
+// and the session export holds the counts per model for every finished
+// message. Older releases usually drop the report of the turn's final text
+// step; the reports then fall short of the turn and the export settles it.
+var usageSources = usage.Sources{
+	Live: usage.Source{
+		Category: usage.SourceOutput,
+		Strategy: usage.StrategyLive,
+		Spend:    usage.SpendDeclaration{Shape: usage.SpendPerRequest},
+	},
+	Records: sessionexport.Records,
+}
 
 func init() {
 	registry.Agents.RegisterWithMeta("opencode", NewOpenCodeAdapter, registry.AgentMeta{
-		RequiresCommand:     true,
-		DefaultCommand:      defaultCommand,
-		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionTranslated,
-		UsageArrival:        registry.UsageArrivalTurnEnd,
-		UsageAttribution:    registry.UsageAttributionPerModel,
-		CredentialEnv:       registry.DeclareCredentialEnv(),
-		EffortForwarding:    registry.EffortForwarded,
+		RequiresCommand:       true,
+		DefaultCommand:        defaultCommand,
+		ValidateAgentConfig:   validateConfig,
+		MCPDialect:            registry.MCPDialectMCPMemberJSON,
+		UsageSources:          usageSources,
+		CredentialEnv:         registry.DeclareCredentialEnv(),
+		Deprecation:           &registry.AgentDeprecation{Replacement: "agent-client-protocol"},
+		EffortForwarding:      registry.EffortForwarded,
+		UsageLimitRecognition: registry.UsageLimitRecognized,
+		VerificationContext: registry.DeclareVerificationContext(
+			registry.VerificationKeepsSomeTools,
+			registry.VerificationKeepsProjectInstructions,
+			registry.VerificationKeepsUserInstructions,
+			registry.VerificationKeepsSystemPrompt,
+		),
 	})
 }
 
 var _ domain.AgentAdapter = (*OpenCodeAdapter)(nil)
 
+// OpenCodeAdapter satisfies [domain.AgentAdapter] for the OpenCode CLI. One
+// instance serves all concurrent sessions.
 type OpenCodeAdapter struct{}
 
 type sessionState struct {
-	target         agentcore.LaunchTarget
-	agentConfig    domain.AgentConfig
-	passthrough    passthroughConfig
-	sessionID      string
-	turnCount      int
-	sessionOpened  bool
-	closed         bool
-	baseLogger     *slog.Logger
-	createdSession bool
-	runStartedAtMS int64
-	usage          *agentcore.TurnEndUsage
-	mu             sync.Mutex
-	active         *turnRuntime
+	target        agentcore.LaunchTarget
+	agentConfig   domain.AgentConfig
+	passthrough   passthroughConfig
+	sessionID     string
+	sessionOpened bool
+	baseLogger    *slog.Logger
+	tools         *agentcore.ToolSession
+	usage         *agentcore.TurnEndUsage
+	mu            sync.Mutex
 
-	// drainGrace bounds every post-exit wait a turn performs on its
-	// stdout reader once the subprocess has been reaped. Written once by
-	// StartSession, or by a test before a session's first turn; RunTurn
-	// reads it when it builds each turn's own turnRuntime.
-	drainGrace time.Duration
+	// ledger settles every turn; built in StartSession and never reset.
+	ledger *usage.Ledger
 
-	// firstEventTimeout bounds each turn's wait for its first JSON event.
-	// opencode prints nothing before the model starts answering, so the
-	// wait carries the provider's latency. Written once by StartSession,
-	// or by a test before a session's first turn.
-	firstEventTimeout time.Duration
+	fork *agentcore.ForkPerTurnSession
 
 	// turnConfigContent is the inline configuration document every turn
 	// carries through OPENCODE_CONFIG_CONTENT. Never empty, because the
-	// document always carries the title-agent switch. Set once in
-	// StartSession and never mutated after.
+	// document always carries the title-agent switch.
 	turnConfigContent string
 
 	credentialVerification bool
-}
 
-type turnRuntime struct {
-	pid             string
-	group           *procutil.Group
-	waitCh          chan waitResult
-	reapedCh        chan struct{}
-	reader          *procutil.StdoutReader
-	stderrCollector *procutil.StderrCollector
-	output          agentcore.OutputWatch
-	firstJSONSeen   bool
-	turnFinished    bool
-	terminalError   *rawRunError
-	terminalOutcome domain.AgentEventType
-	waitMu          sync.Mutex
-	waitRes         waitResult
+	reducedVerificationContext bool
 
-	// drainGrace is the bound startWait and every post-exit reader wait
-	// applies once the subprocess has been reaped. Recorded from
-	// sessionState.drainGrace when the turn is launched.
-	drainGrace time.Duration
+	// Per-turn state, reset by RunTurn and touched only from the hooks,
+	// which run on RunTurn's goroutine.
+	work         *agentcore.WorkObserver
+	runtimeError *rawRunError
+	outcome      domain.AgentEventType
 
-	// work is the per-turn work-evidence observer for the shared
-	// turn-disposition decision.
-	work *agentcore.WorkObserver
+	// settling is the report of the step that ended the turn; nil when none
+	// arrived.
+	settling *usage.SpendReading
 
-	// spend is the turn's evidence for the shared spend rule, created
-	// with the runtime.
-	spend agentcore.TurnSpend
+	// children are the subagent calls the turn showed, in first-sighting
+	// order.
+	children []childSession
 
-	// exitedCleanly records that the process ended on its own with
-	// status 0. The runtime does not always print a closing step_finish,
-	// and the export read after such an exit is final.
-	exitedCleanly bool
-}
-
-// spendFor returns the turn's spend evidence given the figure its
-// recovery produced. The export spans the run window, so a figure read
-// after a finished turn or a clean exit settles the whole session total.
-func (r *turnRuntime) spendFor(recovered *agentcore.RecoveredUsage) agentcore.TurnSpend {
-	spend := r.spend
-	if recovered != nil && (r.turnFinished || r.exitedCleanly) {
-		spend.MarkSettled()
-		spend.MarkSessionTotal()
-	}
-	return spend
-}
-
-type waitResult struct {
-	exitCode int
-	err      error
-	// stopped is the launch record's verdict: a stop began while the
-	// subprocess was still running.
-	stopped bool
+	runtimeErrorAtMS int64
 }
 
 // NewOpenCodeAdapter creates an [OpenCodeAdapter].
@@ -164,35 +141,55 @@ func (a *OpenCodeAdapter) StartSession(ctx context.Context, params domain.StartS
 		return domain.Session{}, agentErr
 	}
 
-	servers, translateErr := translateMCPServers(params.MCPConfigPath, target.RemoteCommand != "")
-	if translateErr != nil {
+	baseLogger := slog.Default().With(slog.String("component", "opencode-adapter"))
+
+	ledger, ledgerErr := usage.NewLedger(usageSources.Live, usageSources.Records)
+	if ledgerErr != nil {
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("translate MCP config: %v", translateErr),
-			Err:     translateErr,
+			Message: "usage ledger refused the kind's sources",
+			Err:     ledgerErr,
 		}
+	}
+
+	tools, toolsErr := agentcore.ResolveToolDelivery(ctx, params, target, registry.MCPDialectMCPMemberJSON, baseLogger)
+	if toolsErr != nil {
+		return domain.Session{}, toolsErr
 	}
 
 	state := &sessionState{
 		target:                 target,
 		agentConfig:            params.AgentConfig,
 		passthrough:            pt,
-		sessionID:              params.ResumeSessionID,
-		baseLogger:             slog.Default().With(slog.String("component", "opencode-adapter")),
-		createdSession:         params.ResumeSessionID == "",
-		runStartedAtMS:         time.Now().UnixMilli(),
+		baseLogger:             baseLogger,
+		tools:                  tools,
 		usage:                  agentcore.NewTurnEndUsage(),
-		drainGrace:             procutil.DefaultDrainGrace,
-		firstEventTimeout:      agentcore.FirstResponseTimeout(params.AgentConfig),
+		ledger:                 ledger,
 		credentialVerification: params.CredentialVerification,
+
+		reducedVerificationContext: params.ReducedVerificationContext(),
 	}
 
 	if versionErr := checkRuntimeVersion(ctx, state); versionErr != nil {
+		_ = tools.Close()
 		return domain.Session{}, versionErr
 	}
 
-	turnConfigContent, buildErr := buildInlineConfig(state.passthrough, servers)
+	start, startErr := agentcore.ResolveSessionStart(ctx, params.ResumeSessionID, state, baseLogger)
+	if startErr != nil {
+		_ = tools.Close()
+		return domain.Session{}, startErr
+	}
+	state.sessionID = start.ResumeID()
+	ledger.BeginSession(start.CarriedHistory(), start.Answer)
+
+	var mcp []byte
+	if tools.Configured() {
+		mcp = tools.Delivery(sshutil.ForwardOutcome{}).Document
+	}
+	turnConfigContent, buildErr := buildTurnConfig(state.passthrough, state.reducedVerificationContext, mcp)
 	if buildErr != nil {
+		_ = tools.Close()
 		return domain.Session{}, &domain.AgentError{
 			Kind:    domain.ErrResponseError,
 			Message: "build opencode environment",
@@ -200,16 +197,19 @@ func (a *OpenCodeAdapter) StartSession(ctx context.Context, params domain.StartS
 		}
 	}
 	state.turnConfigContent = turnConfigContent
+	state.fork = newForkSession(state)
 
 	return domain.Session{
-		ID:       state.sessionID,
-		AgentPID: "",
-		Internal: state,
+		ID:             state.sessionID,
+		AgentPID:       "",
+		Internal:       state,
+		NoToolChannel:  tools.NoToolChannel(),
+		CarriedHistory: start.CarriedHistory(),
 	}, nil
 }
 
-// RunTurn executes one OpenCode turn by starting a subprocess, reading its
-// stdout through a single reader goroutine, and relaying normalized events via
+// RunTurn executes one OpenCode turn on the session's
+// [agentcore.ForkPerTurnSession] and relays normalized events via
 // params.OnEvent.
 func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 	if params.OnEvent == nil {
@@ -224,400 +224,18 @@ func (a *OpenCodeAdapter) RunTurn(ctx context.Context, session domain.Session, p
 		}
 	}
 
-	env := buildTurnEnv(state)
-	managedEnv := buildManagedEnv()
+	state.work = agentcore.NewWorkObserver(agentcore.WorkSignals{AssistantOutput: true, ToolActivity: true})
+	state.runtimeError = nil
+	state.runtimeErrorAtMS = 0
+	state.outcome = domain.EventTurnCompleted
+	state.settling = nil
+	state.children = nil
 
-	state.mu.Lock()
-	if state.closed {
-		state.mu.Unlock()
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "session already stopped",
-		}
-	}
-	if state.active != nil {
-		state.mu.Unlock()
-		return domain.TurnResult{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: "session already has an active turn",
-		}
-	}
-	state.turnCount++
-	cmdArgs := buildRunArgs(state, state.passthrough)
-	logger := state.loggerLocked()
-
-	var cmd *exec.Cmd
-	var launch sshutil.SSHLaunch
-	if state.target.RemoteCommand != "" {
-		managedEnv["OPENCODE_CONFIG_CONTENT"] = state.turnConfigContent
-		launch = sshutil.BuildSSHLaunch(
-			state.target.SSHHost,
-			state.target.WorkspacePath,
-			state.target.RemoteCommand,
-			cmdArgs,
-			state.target.SSHOptions(sortedEnvVars(managedEnv)...),
-		)
-		cmd = exec.CommandContext(ctx, state.target.Command, launch.Args...) //nolint:gosec // args are constructed programmatically with shell quoting
-	} else {
-		allArgs := append(slices.Clone(state.target.Args), cmdArgs...)
-		cmd = exec.CommandContext(ctx, state.target.Command, allArgs...) //nolint:gosec // args are constructed programmatically
-	}
-	procutil.SetGroupCancel(cmd, procutil.StopGrace(state.agentConfig.StopGraceMS))
-	cmd.Env = env
-	if bindErr := state.target.BindWorkspace(cmd); bindErr != nil {
-		state.mu.Unlock()
-		return domain.TurnResult{}, bindErr
-	}
-	cmd.Stdin = buildTurnStdin(params.Prompt, launch.StdinReader())
-
-	pipes, group, err := procutil.StartWithOwnedPipes(ctx, cmd, logger)
-	if err != nil {
-		state.mu.Unlock()
-
-		var startErr *procutil.StartError
-		if !errors.As(err, &startErr) {
-			return domain.TurnResult{}, &domain.AgentError{
-				Kind:    domain.ErrResponseError,
-				Message: "start opencode subprocess",
-				Err:     err,
-			}
-		}
-		switch startErr.Stage {
-		case procutil.StageStdoutPipe:
-			return domain.TurnResult{}, &domain.AgentError{
-				Kind:    domain.ErrResponseError,
-				Message: "create stdout pipe",
-				Err:     startErr.Err,
-			}
-		case procutil.StageStderrPipe:
-			return domain.TurnResult{}, &domain.AgentError{
-				Kind:    domain.ErrResponseError,
-				Message: "create stderr pipe",
-				Err:     startErr.Err,
-			}
-		default: // procutil.StageProcessStart, procutil.StageProcessResume
-			if startErr.Cancelled {
-				ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-				return state.usage.Finalize(params.OnEvent, state.logger(), ev, state.currentSessionID(), 0, nil, agentcore.TurnSpend{})
-			}
-			return domain.TurnResult{}, &domain.AgentError{
-				Kind:    domain.ErrResponseError,
-				Message: "start opencode subprocess",
-				Err:     startErr.Err,
-			}
-		}
-	}
-	// The package's only close of either pipe end: covers all five
-	// return paths this turn can take, none of which precedes it.
-	defer pipes.Close() //nolint:errcheck,gosec // best-effort cleanup
-
-	runtime := &turnRuntime{
-		pid:             strconv.Itoa(cmd.Process.Pid),
-		group:           group,
-		waitCh:          make(chan waitResult, 1),
-		reapedCh:        make(chan struct{}),
-		drainGrace:      state.drainGrace,
-		terminalOutcome: domain.EventTurnCompleted,
-		work:            agentcore.NewWorkObserver(agentcore.WorkSignals{AssistantOutput: true, ToolActivity: true}),
-	}
-	state.active = runtime
-	state.mu.Unlock()
-
-	runtime.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, logger)
-	runtime.reader = procutil.NewStdoutReader(pipes.Stdout, logger)
-	startWait(runtime, cmd, logger)
-
-	emit := func(event domain.AgentEvent) {
-		if state.target.RemoteCommand == "" {
-			event.AgentPID = runtime.pid
-		}
-		params.OnEvent(event)
-	}
-
-	readTimer := time.NewTimer(state.firstEventTimeout)
-	defer stopTimer(readTimer)
-
-	readTimeoutC := readTimer.C
-	lineCh := runtime.reader.Stream()
-	waitCh := runtime.waitCh
-	reapedCh := runtime.reapedCh
-	var postExitC <-chan time.Time
-	var postExitAt time.Time
-	var exit waitResult
-	processExited := false
-	ctxDone := ctx.Done()
-
-	// handleLine applies one raw stdout line's per-event path: parsing,
-	// the first-JSON latch, and the event switch. It is shared between
-	// the turn's primary select loop and the post-exit drain below, so a
-	// line arriving in either place is processed identically. done
-	// reports that the turn's own result is ready to return.
-	handleLine := func(line []byte) (domain.TurnResult, error, bool) {
-		event, parseErr := parseRunEvent(line)
-		var parsed parsedLine
-		if parseErr != nil {
-			parsed.PlainText = string(line)
-		} else {
-			parsed.Event = &event
-		}
-
-		if parsed.PlainText != "" {
-			if readTimeoutC != nil {
-				resetTimer(readTimer, state.firstEventTimeout)
-			}
-
-			plainText := redact.Truncate(parsed.PlainText, 500)
-			emit(domain.AgentEvent{
-				Type:      domain.EventMalformed,
-				Timestamp: time.Now().UTC(),
-				Message:   plainText,
-			})
-			return domain.TurnResult{}, nil, false
-		}
-
-		rawEvent := parsed.Event
-		if rawEvent == nil {
-			return domain.TurnResult{}, nil, false
-		}
-
-		runtime.output.Observe(line)
-		runtime.firstJSONSeen = true
-		if readTimeoutC != nil {
-			stopTimer(readTimer)
-			readTimeoutC = nil
-		}
-
-		started, mismatch := state.applySessionEvent(rawEvent.SessionID)
-		if mismatch {
-			message := fmt.Sprintf("session id mismatch: expected %q, got %q", state.currentSessionID(), rawEvent.SessionID)
-			killTurnProcess(runtime)
-			_ = waitForProcess(runtime)
-			drainReaderBounded(runtime.reader, runtime.drainGrace)
-			procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
-			clearActive(state, runtime)
-			ev := agentcore.TurnEvidence{
-				Terminal:          agentcore.TerminalFailure,
-				TerminalErrorKind: domain.ErrResponseError,
-				TerminalMessage:   message,
-			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, nil, runtime.spendFor(nil))
-			return result, agentErr, true
-		}
-		if started {
-			emit(domain.AgentEvent{
-				Type:      domain.EventSessionStarted,
-				Timestamp: time.Now().UTC(),
-				SessionID: state.currentSessionID(),
-				Message:   "session started",
-			})
-		}
-
-		now := time.Now().UTC()
-		switch rawEvent.Type {
-		case "step_start":
-			if _, err := parseStepStartPart(rawEvent.Part); err != nil {
-				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid step_start payload"})
-				return domain.TurnResult{}, nil, false
-			}
-			agentcore.EmitNotification(emit, "")
-
-		case "text":
-			part, err := parseTextPart(rawEvent.Part)
-			if err != nil {
-				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid text payload"})
-				return domain.TurnResult{}, nil, false
-			}
-			runtime.work.ObserveAssistantOutput()
-			runtime.spend.MarkModelReached()
-			agentcore.EmitNotification(emit, redact.Truncate(part.Text, 500))
-
-		case "reasoning":
-			if _, err := parseReasoningPart(rawEvent.Part); err != nil {
-				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid reasoning payload"})
-				return domain.TurnResult{}, nil, false
-			}
-			runtime.work.ObserveAssistantOutput()
-			runtime.spend.MarkModelReached()
-			agentcore.EmitNotification(emit, "")
-
-		case "tool_use":
-			part, err := parseToolPart(rawEvent.Part)
-			if err != nil {
-				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid tool_use payload"})
-				return domain.TurnResult{}, nil, false
-			}
-			runtime.work.ObserveToolActivity()
-			runtime.spend.MarkModelReached()
-			emit(domain.AgentEvent{
-				Type:           domain.EventToolResult,
-				Timestamp:      now,
-				ToolName:       part.Tool,
-				ToolDurationMS: toolDuration(part.State.Time),
-				ToolError:      strings.EqualFold(part.State.Status, "error"),
-				Message:        redact.Truncate(part.State.Error, 500),
-			})
-
-		case "step_finish":
-			part, err := parseStepFinishPart(rawEvent.Part)
-			if err != nil {
-				emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid step_finish payload"})
-				return domain.TurnResult{}, nil, false
-			}
-			runtime.spend.MarkModelReached()
-			if stepFinishEndsTurn(part.Reason) {
-				runtime.turnFinished = true
-			}
-			agentcore.EmitNotification(emit, "")
-
-		case "error":
-			runtime.terminalOutcome = domain.EventTurnFailed
-			// One failure can surface as two error events: the
-			// actionable diagnostic the session publishes, and the
-			// generic placeholder the run command reports when the
-			// failure is not in its API error schema. Their order on
-			// the stream is not guaranteed, so keep whichever event
-			// carries detail rather than whichever arrives last.
-			if runtime.terminalError == nil || !isMaskedServerError(rawRunErrorMessage(rawEvent.Error)) {
-				runtime.terminalError = rawEvent.Error
-			}
-
-		default:
-			emit(domain.AgentEvent{
-				Type:      domain.EventMalformed,
-				Timestamp: now,
-				Message:   fmt.Sprintf("unknown event type: %s", rawEvent.Type),
-			})
-		}
-
-		return domain.TurnResult{}, nil, false
-	}
-
-	for {
-		// Checked ahead of the select, not as one of its arms: a
-		// descendant that keeps writing holds the line arm ready, and
-		// the choice among ready arms is random, so the post-exit arm
-		// could be passed over for as long as that descendant talks.
-		if !postExitAt.IsZero() && !time.Now().Before(postExitAt) {
-			if result, agentErr, done := drainLinesBounded(lineCh, runtime, postExitAt, handleLine); done {
-				return result, agentErr
-			}
-			return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
-		}
-
-		select {
-		case line, ok := <-lineCh:
-			if !ok {
-				lineCh = nil
-				if readErr := runtime.reader.Err(); readErr != nil && !errors.Is(readErr, procutil.ErrStdoutAbandoned) {
-					stoppedBeforeKill := runtime.group.Stopped()
-					killTurnProcess(runtime)
-					_ = waitForProcess(runtime)
-					recovered := recoverUsage(ctx, state, runWindow(state))
-					clearActive(state, runtime)
-
-					ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-					if !stoppedBeforeKill {
-						procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
-						ev = agentcore.TurnEvidence{
-							Terminal:          agentcore.TerminalFailure,
-							TerminalErrorKind: domain.ErrResponseError,
-							TerminalMessage:   "stdout read error",
-							Cause:             readErr,
-						}
-					}
-					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered, runtime.spendFor(recovered))
-					if agentErr != nil {
-						return result, agentErr
-					}
-					return result, nil
-				}
-				if processExited {
-					return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
-				}
-				continue
-			}
-
-			if result, agentErr, done := handleLine(line); done {
-				return result, agentErr
-			}
-
-		case <-reapedCh:
-			// Disabled once taken: the channel stays ready after it
-			// closes, and a live arm would spin for as long as the
-			// stderr bound runs.
-			reapedCh = nil
-			stopTimer(readTimer)
-			readTimeoutC = nil
-
-		case <-waitCh:
-			exit = waitForProcess(runtime)
-			processExited = true
-			waitCh = nil
-			postExitC = time.After(runtime.drainGrace)
-			postExitAt = time.Now().Add(runtime.drainGrace)
-			if lineCh == nil {
-				return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
-			}
-
-		case <-postExitC:
-			if result, agentErr, done := drainLinesBounded(lineCh, runtime, postExitAt, handleLine); done {
-				return result, agentErr
-			}
-			return a.finalizeExitedTurn(ctx, state, runtime, emit, exit)
-
-		case <-ctxDone:
-			killTurnProcess(runtime)
-			if !waitForProcess(runtime).stopped {
-				// The subprocess had exited on its own before the stop
-				// reached it, so the turn finishes like one whose context
-				// is live: the closed wait channel takes the exit arm next.
-				ctxDone = nil
-				continue
-			}
-			drainReaderBounded(runtime.reader, runtime.drainGrace)
-			recovered := recoverUsage(ctx, state, runWindow(state))
-			clearActive(state, runtime)
-			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered, runtime.spendFor(recovered))
-			if agentErr != nil {
-				return result, agentErr
-			}
-			return result, nil
-
-		case <-readTimeoutC:
-			// Both arms can be ready at once, and the choice between
-			// them is random: the reap wins on the merits, because a
-			// subprocess already gone did not time out.
-			select {
-			case <-reapedCh:
-				reapedCh = nil
-				stopTimer(readTimer)
-				readTimeoutC = nil
-				continue
-			default:
-			}
-
-			killTurnProcess(runtime)
-			_ = waitForProcess(runtime)
-			drainReaderBounded(runtime.reader, runtime.drainGrace)
-			procutil.EmitWarnLines(runtime.stderrCollector.Lines(), state.logger())
-			recovered := recoverUsage(ctx, state, runWindow(state))
-			clearActive(state, runtime)
-			ev := agentcore.TurnEvidence{
-				Terminal:          agentcore.TerminalFailure,
-				TerminalErrorKind: domain.ErrResponseTimeout,
-				TerminalMessage:   "timed out waiting for first opencode json event",
-			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, recovered, runtime.spendFor(recovered))
-			if agentErr != nil {
-				return result, agentErr
-			}
-			return result, nil
-		}
-	}
+	return state.fork.RunTurn(ctx, params.Prompt, params.OnEvent)
 }
 
-// StopSession marks the session closed and terminates any active subprocess.
+// StopSession terminates any active subprocess and, for a credential
+// verification session, deletes the session the run created.
 func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Session) error {
 	state, ok := session.Internal.(*sessionState)
 	if !ok {
@@ -627,13 +245,7 @@ func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Sessio
 		}
 	}
 
-	state.mu.Lock()
-	state.closed = true
-	active := state.active
-	state.active = nil
-	state.mu.Unlock()
-
-	stopErr := stopActiveTurn(ctx, active, procutil.StopGrace(state.agentConfig.StopGraceMS), state.logger())
+	stopErr := state.fork.Stop(ctx)
 
 	if state.credentialVerification {
 		if sessionID := state.currentSessionID(); sessionID != "" {
@@ -642,6 +254,70 @@ func (a *OpenCodeAdapter) StopSession(ctx context.Context, session domain.Sessio
 	}
 
 	return stopErr
+}
+
+// newForkSession builds the skeleton that runs state's turns.
+func newForkSession(state *sessionState) *agentcore.ForkPerTurnSession {
+	hooks := agentcore.ForkPerTurnHooks{
+		BuildArgs: func(_ int, _ string) []string {
+			return buildRunArgs(state, state.passthrough)
+		},
+		ParseLine: state.parseLine,
+		GetUsage: func() (domain.TokenUsage, map[string]domain.TokenUsage, bool) {
+			return state.usage.Snapshot(), state.usage.ByModel(), state.usage.Measured()
+		},
+		GetSessionID:      state.currentSessionID,
+		OnFinalize:        state.finalizeTurn,
+		PromptOnStdin:     true,
+		FirstEventTimeout: agentcore.FirstResponseTimeout(state.agentConfig),
+		SettleUsage:       state.settleUsage,
+		TurnEnv:           state.turnEnv,
+		Tools:             state.tools,
+		ToolPlacement:     state.placeTools,
+	}
+	hooks.PullWindows = usage.NewPuller(usagelimits.Source, agentcore.AuxiliaryTimeout(state.agentConfig), state.credentialVerification, opencodePull(state)).Pull
+	hooks.RefusalWindowReset = state.refusalReadsWindows
+	return agentcore.NewForkPerTurnSession(&state.target, hooks, state.baseLogger, state.agentConfig.StopGraceMS)
+}
+
+// opencodePull returns the session's usage-limits pull, which runs the usage
+// command through the same host-command operation as the session export.
+func opencodePull(state *sessionState) func(context.Context) ([]usage.WindowReading, error) {
+	return func(ctx context.Context) ([]usage.WindowReading, error) {
+		return usagelimits.Pull(ctx, func(ctx context.Context, args []string) ([]byte, error) {
+			return state.target.RunHostCommand(ctx, buildRunEnv(os.Environ()), state.runtimeCommand(args, 0))
+		})
+	}
+}
+
+// turnEnv returns the environment every turn runs with and the settings an
+// SSH launch carries. A launch that places the inline configuration late
+// omits it here.
+func (s *sessionState) turnEnv() ([]string, []sshutil.EnvVar) {
+	managedEnv := buildManagedEnv()
+	if !s.declaresLate() {
+		managedEnv["OPENCODE_CONFIG_CONTENT"] = s.turnConfigContent
+	}
+	return buildTurnEnv(s), sortedEnvVars(managedEnv)
+}
+
+// declaresLate reports whether the skeleton places a late entry: a remote
+// launch whose relay announced a listener. Without one the document must travel
+// with the static settings or the runtime would start without its tool policy.
+func (s *sessionState) declaresLate() bool {
+	return s.tools != nil && s.target.RemoteCommand != "" && s.tools.Forward(nil) != nil
+}
+
+// placeTools carries the whole inline configuration as a late entry, because
+// its tool-server entry names a remote port known only once the forward is
+// allocated.
+func (s *sessionState) placeTools(d mcpconfig.Delivery) sshutil.LatePreamble {
+	document, err := buildTurnConfig(s.passthrough, s.reducedVerificationContext, d.Document)
+	if err != nil {
+		s.logger().Error("failed to render late opencode configuration", slog.Any("error", err))
+		return sshutil.LatePreamble{}
+	}
+	return sshutil.LatePreamble{Env: []sshutil.EnvVar{{Name: "OPENCODE_CONFIG_CONTENT", Value: document}}}
 }
 
 // deleteVerificationSession only logs a failure, exit 1 for an unknown
@@ -665,19 +341,146 @@ func deleteVerificationSession(ctx context.Context, state *sessionState, session
 	}
 }
 
-// finalizeExitedTurn builds and emits the turn's terminal disposition once
-// the subprocess has exited. It also scans the turn's stderr lines for a
-// denied-permission warning, which the runtime writes to stderr rather than
-// stdout; recognizing it here rather than mid-turn means the corresponding
-// notification arrives at turn end rather than as it happens, and it does
-// not reset the read timer the way a stdout line does, neither of which is
-// a regression because the warning has never actually reached stdout.
-func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState, runtime *turnRuntime, emit func(domain.AgentEvent), exit waitResult) (domain.TurnResult, error) {
-	recovered := recoverUsage(ctx, state, runWindow(state))
-	runtime.exitedCleanly = !exit.stopped && exit.err == nil && exit.exitCode == 0
+// parseLine handles one stdout line as the skeleton's ParseLine hook. It
+// returns a non-nil result for an event that ends the run's output: a
+// turn-ending step_finish or an error event.
+func (s *sessionState) parseLine(line []byte, emit func(domain.AgentEvent), _ string, spend *agentcore.TurnSpend) (any, error) {
+	event, err := parseRunEvent(line)
+	if err != nil {
+		return nil, err
+	}
 
-	clearActive(state, runtime)
-	stderrLines := runtime.stderrCollector.Lines()
+	started, mismatch := s.applySessionEvent(event.SessionID)
+	if mismatch {
+		return nil, agentcore.EndTurn(domain.ErrResponseError,
+			fmt.Sprintf("session id mismatch: expected %q, got %q", s.currentSessionID(), event.SessionID))
+	}
+	if started {
+		emit(domain.AgentEvent{
+			Type:      domain.EventSessionStarted,
+			Timestamp: time.Now().UTC(),
+			SessionID: s.currentSessionID(),
+			Message:   "session started",
+		})
+	}
+
+	now := time.Now().UTC()
+	switch event.Type {
+	case "step_start":
+		if _, err := parseStepStartPart(event.Part); err != nil {
+			emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid step_start payload"})
+			return nil, nil
+		}
+		agentcore.EmitNotification(emit, "")
+
+	case "text":
+		part, err := parseTextPart(event.Part)
+		if err != nil {
+			emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid text payload"})
+			return nil, nil
+		}
+		s.work.ObserveAssistantOutput()
+		spend.MarkModelReached()
+		agentcore.EmitNotification(emit, redact.Truncate(part.Text, 500))
+
+	case "reasoning":
+		if _, err := parseReasoningPart(event.Part); err != nil {
+			emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid reasoning payload"})
+			return nil, nil
+		}
+		s.work.ObserveAssistantOutput()
+		spend.MarkModelReached()
+		agentcore.EmitNotification(emit, "")
+
+	case "tool_use":
+		part, err := parseToolPart(event.Part)
+		if err != nil {
+			emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid tool_use payload"})
+			return nil, nil
+		}
+		s.work.ObserveToolActivity()
+		spend.MarkModelReached()
+		s.noteSubagentCall(part)
+		call := agentcore.MapToolCall(toolMappings, part.Tool, part.State.Input)
+		emit(domain.AgentEvent{
+			Type:           domain.EventToolResult,
+			Timestamp:      now,
+			ToolName:       call.Name,
+			ToolKind:       call.Kind,
+			ToolArgument:   call.Argument,
+			ToolDurationMS: toolDuration(part.State.Time),
+			ToolError:      strings.EqualFold(part.State.Status, "error"),
+			Message:        redact.Truncate(part.State.Error, 500),
+		})
+
+	case "step_finish":
+		part, err := parseStepFinishPart(event.Part)
+		if err != nil {
+			emit(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: now, Message: "invalid step_finish payload"})
+			return nil, nil
+		}
+		spend.MarkModelReached()
+		reading := sessionexport.Tokens(part.Tokens)
+		reading.Identity = part.ID
+		s.ledger.ObserveRequest(reading)
+		agentcore.EmitNotification(emit, "")
+		if stepFinishEndsTurn(part.Reason) {
+			s.settling = &reading
+			return &event, nil
+		}
+
+	case "error":
+		s.outcome = domain.EventTurnFailed
+		if readings := freeLimitReadings(event.Error, event.Timestamp); len(readings) > 0 {
+			agentcore.EmitUsageWindows(emit, now, usage.Windows(freeLimitSource, readings, now))
+		}
+		// One failure can surface as two error events, the session's
+		// diagnostic and the run command's generic placeholder, in either
+		// order; keep the one that carries detail.
+		if s.runtimeError == nil || !isMaskedServerError(rawRunErrorMessage(event.Error)) {
+			s.runtimeError = event.Error
+			s.runtimeErrorAtMS = event.Timestamp
+		}
+		return &event, nil
+
+	default:
+		emit(domain.AgentEvent{
+			Type:      domain.EventMalformed,
+			Timestamp: now,
+			Message:   fmt.Sprintf("unknown event type: %s", event.Type),
+		})
+	}
+
+	return nil, nil
+}
+
+// settleUsage hands the turn's step reports and session export to the ledger.
+// The runtime ends a turn itself when its finishing step reports or its process
+// exits clean; an error envelope leaves the turn unsettled.
+func (s *sessionState) settleUsage(ctx context.Context, emit func(domain.AgentEvent), spend *agentcore.TurnSpend, exitedClean bool) {
+	end := usage.TurnEnd{
+		Replied:         s.runtimeError == nil && (s.settling != nil || exitedClean),
+		ModelReached:    spend.ModelReached(),
+		Children:        len(s.children) > 0,
+		ChildrenSettled: s.childrenSettled(),
+	}
+	recovered := agentcore.SettleSpend(ctx, s.ledger, end, s.settling, s.readRecords, agentcore.ReadTimeout(s.agentConfig), spend)
+	s.usage.Settle(emit, recovered)
+}
+
+// noteSubagentCall records the turn's first sighting of a subagent call.
+func (s *sessionState) noteSubagentCall(part rawToolPart) {
+	child, ok := subagentCall(part, s.currentSessionID())
+	if !ok || slices.ContainsFunc(s.children, func(seen childSession) bool { return seen.call == child.call }) {
+		return
+	}
+	s.children = append(s.children, child)
+}
+
+// finalizeTurn builds the disposition of a turn whose process exited. The
+// runtime writes a denied-permission warning to stderr rather than stdout,
+// so its notification arrives here, at turn end.
+func (s *sessionState) finalizeTurn(emit func(domain.AgentEvent), _ any, exitCode int, waitErr error, stderrLines []string, earlyExit *domain.AgentError, spend *agentcore.TurnSpend) (domain.TurnResult, *domain.AgentError) {
 	for _, line := range stderrLines {
 		if !isPermissionWarning(line) {
 			continue
@@ -685,53 +488,46 @@ func (a *OpenCodeAdapter) finalizeExitedTurn(ctx context.Context, state *session
 		posture := agentcore.DecideHumanRequest(agentcore.ClassPermission, false, agentcore.AnswerRuntimeRefused)
 		agentcore.EmitNotification(emit, posture.Notice)
 	}
-	sessionID := state.currentSessionID()
 
 	ev := agentcore.TurnEvidence{
 		ExitObserved: true,
-		ExitCode:     exit.exitCode,
-		WaitErr:      exit.err,
+		ExitCode:     exitCode,
+		WaitErr:      waitErr,
+		EarlyExit:    earlyExit,
 	}
-	ev.Work, ev.WorkDetail = runtime.work.Report()
+	ev.Work, ev.WorkDetail = s.work.Report()
 
-	if !exit.stopped {
-		ev.EarlyExit = runtime.output.ExitedBeforeOutput(state.target, exit.err).Report(runtime.stderrCollector)
-	}
-
-	sshFailed := state.target.RemoteCommand != "" && sshutil.ConnectionFailed(exit.exitCode)
-	hasTerminalResult := runtime.terminalOutcome == domain.EventTurnFailed || runtime.turnFinished
-
-	switch {
-	case agentcore.ConnectionFailedForRequest(sshFailed, hasTerminalResult):
-		connErr := agentcore.ConnectionFailedError()
-		ev.Terminal = agentcore.TerminalFailure
-		ev.TerminalErrorKind = connErr.Kind
-		ev.TerminalMessage = connErr.Message
-		ev.Cause = connErr.Err
-
-	case runtime.terminalOutcome == domain.EventTurnFailed:
+	if s.outcome == domain.EventTurnFailed {
 		ev.Terminal = agentcore.TerminalFailure
 		ev.TerminalErrorKind = domain.ErrTurnFailed
-		ev.TerminalMessage = rawRunErrorMessage(runtime.terminalError)
-		ev.TerminalMessage += freeTierRefusalClause(runtime.terminalError, state.passthrough)
-		procutil.EmitWarnLines(stderrLines, state.logger())
-
-	case exit.stopped:
-		ev.Terminal = agentcore.TerminalCancelled
-		ev.TerminalMessage = "turn cancelled"
-
-	case !runtime.firstJSONSeen:
-		procutil.EmitWarnLines(stderrLines, state.logger())
-
-	case exit.err != nil || exit.exitCode != 0:
-		procutil.EmitWarnLines(stderrLines, state.logger())
+		ev.TerminalMessage = rawRunErrorMessage(s.runtimeError) + freeTierRefusalClause(s.runtimeError, s.passthrough)
+		if limit, ok := s.refusal(); ok {
+			ev.TerminalErrorKind = domain.ErrUsageLimit
+			ev.UsageLimit = &limit
+		}
 	}
 
-	result, agentErr := state.usage.Finalize(emit, state.logger(), ev, sessionID, 0, recovered, runtime.spendFor(recovered))
-	if agentErr != nil {
-		return result, agentErr
+	return s.usage.Finalize(emit, s.logger(), ev, s.currentSessionID(), 0, nil, *spend)
+}
+
+// refusal returns the usage limit the turn's runtime error is, with the reset
+// the error's own delay gives; ok is false for any other error.
+func (s *sessionState) refusal() (domain.UsageLimit, bool) {
+	if s.runtimeError == nil {
+		return domain.UsageLimit{}, false
 	}
-	return result, nil
+	limit, ok := usagelimits.Refusal(s.runtimeError.Type)
+	if !ok {
+		return domain.UsageLimit{}, false
+	}
+	limit.ResetsAt = usagelimits.RetryAt(s.runtimeErrorAtMS, s.runtimeError.RetryAfterMs)
+	return limit, true
+}
+
+// refusalReadsWindows reports whether the turn's runtime error is a refusal the
+// OpenCode console meters, so an exhausted console window may supply its reset.
+func (s *sessionState) refusalReadsWindows() bool {
+	return s.runtimeError != nil && usagelimits.ConsoleMetered(s.runtimeError.Type)
 }
 
 func (s *sessionState) logger() *slog.Logger {
@@ -740,15 +536,6 @@ func (s *sessionState) logger() *slog.Logger {
 		return s.baseLogger
 	}
 	return logging.WithSession(s.baseLogger, sessionID)
-}
-
-// loggerLocked returns a logger for s, reading sessionID without acquiring
-// s.mu. Callers must already hold s.mu.
-func (s *sessionState) loggerLocked() *slog.Logger {
-	if s.sessionID == "" {
-		return s.baseLogger
-	}
-	return logging.WithSession(s.baseLogger, s.sessionID)
 }
 
 func (s *sessionState) currentSessionID() string {
@@ -778,133 +565,6 @@ func (s *sessionState) applySessionEvent(eventSessionID string) (bool, bool) {
 	return true, false
 }
 
-// startWait reaps the turn's subprocess independently of its stdout
-// reader and, once the reap and group kill have run, bounds the wait
-// for the turn's stderr drain before reading it.
-func startWait(runtime *turnRuntime, cmd *exec.Cmd, logger *slog.Logger) {
-	go func() {
-		reaper := procutil.StartReaper(cmd, logger)
-		<-reaper.Done()
-
-		// The turn's exit is published below, behind a stderr bound that
-		// can spend the whole drain grace. Anything that must react to
-		// the subprocess being gone rather than to its result reads this
-		// channel instead, so the delay cannot be mistaken for a turn
-		// still running.
-		close(runtime.reapedCh)
-
-		runtime.stderrCollector.FinishAndCollect(runtime.drainGrace)
-
-		runtime.waitMu.Lock()
-		runtime.waitRes = waitResult{
-			exitCode: procutil.ExtractExitCode(reaper.Err()),
-			err:      reaper.Err(),
-			stopped:  reaper.Stopped(),
-		}
-		runtime.waitMu.Unlock()
-
-		close(runtime.waitCh)
-	}()
-}
-
-// drainReaderBounded discards every line still receivable from reader
-// until its scan ends or grace elapses. Stream is unbuffered, so a
-// reader parked on a send finishes only once something receives; this
-// keeps the group kill's release of that reader from being confused
-// with an abandonment, because Abandon is called only when the timer
-// wins.
-func drainReaderBounded(reader *procutil.StdoutReader, grace time.Duration) {
-	timer := time.NewTimer(grace)
-	defer stopTimer(timer)
-	for {
-		select {
-		case _, ok := <-reader.Stream():
-			if !ok {
-				return
-			}
-		case <-timer.C:
-			reader.Abandon(grace)
-			return
-		}
-	}
-}
-
-func waitForProcess(runtime *turnRuntime) waitResult {
-	<-runtime.waitCh
-	runtime.waitMu.Lock()
-	defer runtime.waitMu.Unlock()
-	return runtime.waitRes
-}
-
-func clearActive(state *sessionState, runtime *turnRuntime) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.active == runtime {
-		state.active = nil
-	}
-}
-
-// stopActiveTurn signals runtime's subprocess to exit gracefully and
-// waits up to grace for it to do so on its own before force-terminating
-// its process group. logger receives the graceful phase's outcome.
-func stopActiveTurn(ctx context.Context, runtime *turnRuntime, grace time.Duration, logger *slog.Logger) error {
-	if runtime == nil {
-		return nil
-	}
-
-	if runtime.group == nil {
-		return nil
-	}
-
-	_ = runtime.group.SignalGraceful() //nolint:errcheck // best-effort signal; process may already be dead
-
-	started := time.Now()
-	graceTimer := time.NewTimer(grace)
-	defer stopTimer(graceTimer)
-
-	select {
-	case <-runtime.waitCh:
-		logger.Debug("agent exited during the graceful phase", slog.String("outcome", "exited"))
-		return nil
-	case <-graceTimer.C:
-		logger.Warn("agent did not exit inside the graceful period and was force-terminated",
-			slog.String("outcome", "grace elapsed"), slog.Duration("grace", grace),
-			slog.Duration("elapsed", time.Since(started)))
-		killTurnProcess(runtime)
-		return nil
-	case <-ctx.Done():
-		logger.Warn("agent did not exit inside the graceful period and was force-terminated",
-			slog.String("outcome", "caller deadline"), slog.Duration("grace", grace),
-			slog.Duration("elapsed", time.Since(started)))
-		killTurnProcess(runtime)
-		return ctx.Err()
-	}
-}
-
-func killTurnProcess(runtime *turnRuntime) {
-	if runtime == nil || runtime.group == nil {
-		return
-	}
-	runtime.group.Kill() //nolint:errcheck,gosec // best-effort cleanup
-}
-
-func stopTimer(timer *time.Timer) {
-	if timer == nil {
-		return
-	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-}
-
-func resetTimer(timer *time.Timer, timeout time.Duration) {
-	stopTimer(timer)
-	timer.Reset(timeout)
-}
-
 func isPermissionWarning(line string) bool {
 	return strings.HasPrefix(strings.TrimSpace(agentcore.SanitizeLine(line)), "! permission requested:")
 }
@@ -916,19 +576,12 @@ func toolDuration(partTime rawPartTime) int64 {
 	return partTime.End - partTime.Start
 }
 
-// rawRunErrorMessage returns the first non-empty of runErr's message or
-// type, falling back to a generic message when neither carries text.
 func rawRunErrorMessage(runErr *rawRunError) string {
+	const unknown = "opencode reported an unknown error"
 	if runErr == nil {
-		return "opencode reported an unknown error"
+		return unknown
 	}
-	if runErr.Message != "" {
-		return runErr.Message
-	}
-	if runErr.Type != "" {
-		return runErr.Type
-	}
-	return "opencode reported an unknown error"
+	return cmp.Or(runErr.Message, runErr.Type, unknown)
 }
 
 // maskedServerErrorMessage is the placeholder opencode emits on the run
@@ -936,8 +589,6 @@ func rawRunErrorMessage(runErr *rawRunError) string {
 // failure, hiding the underlying cause from the JSON events.
 const maskedServerErrorMessage = "Unexpected server error. Check server logs for details."
 
-// isMaskedServerError reports whether message carries no failure detail
-// beyond opencode's generic server-error placeholder.
 func isMaskedServerError(message string) bool {
 	return strings.TrimSpace(message) == maskedServerErrorMessage
 }
@@ -946,91 +597,4 @@ func isMaskedServerError(message string) bool {
 // continuing with another step after tool calls.
 func stepFinishEndsTurn(reason string) bool {
 	return reason != "tool-calls"
-}
-
-// recoverUsage runs the session export and returns what it recovered, or
-// nil when it recovered nothing.
-//
-// A turn that ends by exit, cancellation, read timeout or stdout read error
-// runs this: by the time it gets here the process has been waited for, and
-// its session export is just as readable in each case. Leaving it out of one
-// meant the same completed work reported a figure or reported nothing
-// depending only on which case of the select won. A session mismatch does
-// not run it, because the work ran in a session other than the one the
-// export would read.
-func recoverUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) *agentcore.RecoveredUsage {
-	// WithoutCancel: this runs after the turn is over, and on the cancel path
-	// `ctx` is the thing that just fired -- deriving the export's own timeout
-	// from it cancels the query before it starts, and the work whose cost is
-	// being recovered has already happened. The other terminal paths reach
-	// here with a context that CAN be cancelled too (the caller may cancel
-	// while the read timeout or the process exit is being handled), so the
-	// detach belongs here rather than at each call site, where the next
-	// terminal path added would have to remember it. Still bounded:
-	// `queryExportUsage` applies its own `agentcore.AuxiliaryTimeout`.
-	usage := queryExportUsage(context.WithoutCancel(ctx), state, sinceUnixMS)
-	if !hasUsage(usage) {
-		return nil
-	}
-	return &agentcore.RecoveredUsage{
-		Run: domain.TokenUsage{
-			InputTokens:      usage.InputTokens,
-			OutputTokens:     usage.OutputTokens,
-			CacheReadTokens:  usage.CacheReadTokens,
-			CacheWriteTokens: usage.CacheWriteTokens,
-		},
-		Model:   usage.Model,
-		ByModel: usage.ByModel,
-	}
-}
-
-// runWindow is the timestamp the export filters messages by: the run's start
-// for a session this adapter did not create, so the history a resumed
-// session brought with it stays out while every turn of this run stays in,
-// and none at all for one it did, where every message belongs to this run.
-func runWindow(state *sessionState) int64 {
-	if state.createdSession {
-		return 0
-	}
-	return state.runStartedAtMS
-}
-
-// hasUsage reports whether the export recovered a figure, not whether that
-// figure is non-zero. The value-based test it replaces threw away a
-// successful recovery whose messages all reported zero tokens, and with it
-// the model the export named -- so a KNOWN zero spend was reported as an
-// UNKNOWN one, which is the distinction the measured verdict exists to make.
-func hasUsage(usage exportUsage) bool {
-	return usage.Recovered
-}
-
-// drainLinesBounded takes whatever the reader has already produced and
-// gives up on it at capAt, the one deadline the post-exit wait carries:
-// starting a fresh grace here would let a descendant that keeps writing
-// spend two of them. The deadline is tested before each line for the
-// same reason the caller tests it before its select: a descendant that
-// keeps writing holds the channel ready, so an arm that merely competes
-// with it can be passed over indefinitely.
-func drainLinesBounded(
-	lineCh <-chan []byte,
-	runtime *turnRuntime,
-	capAt time.Time,
-	handleLine func([]byte) (domain.TurnResult, error, bool),
-) (domain.TurnResult, error, bool) {
-	for time.Now().Before(capAt) {
-		select {
-		case line, ok := <-lineCh:
-			if !ok {
-				return domain.TurnResult{}, nil, false
-			}
-			if result, agentErr, done := handleLine(line); done {
-				return result, agentErr, true
-			}
-		default:
-			runtime.reader.Abandon(runtime.drainGrace)
-			return domain.TurnResult{}, nil, false
-		}
-	}
-	runtime.reader.Abandon(runtime.drainGrace)
-	return domain.TurnResult{}, nil, false
 }

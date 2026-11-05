@@ -155,8 +155,17 @@
         "text": {
           "type": "string"
         },
+        "tool_argument": {
+          "type": "string"
+        },
         "tool_error": {
           "type": "boolean"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "tool_line": {
+          "type": "string"
         },
         "tool_name": {
           "type": "string"
@@ -179,6 +188,32 @@
         "event",
         "message",
         "text"
+      ],
+      "type": "object"
+    },
+    "AgentUsageWindowsResponse": {
+      "properties": {
+        "reported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "windows": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UsageWindowResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "reported_at",
+        "windows"
       ],
       "type": "object"
     },
@@ -546,6 +581,19 @@
     },
     "ChainGroup": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
         "cost_partial_runs": {
           "type": "integer"
         },
@@ -629,8 +677,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -647,6 +724,12 @@
         "tokens_unmeasured_runs",
         "cost_unpriced_runs",
         "cost_partial_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units",
         "issue",
         "stages",
         "last_hop"
@@ -969,6 +1052,19 @@
     },
     "Group": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
         "cost_partial_runs": {
           "type": "integer"
         },
@@ -1033,8 +1129,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1050,7 +1175,13 @@
         "cost_per_succeeded_run_usd",
         "tokens_unmeasured_runs",
         "cost_unpriced_runs",
-        "cost_partial_runs"
+        "cost_partial_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units"
       ],
       "type": "object"
     },
@@ -1119,8 +1250,79 @@
       ],
       "type": "object"
     },
+    "HeldIssueResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "hold": {
+          "$ref": "#/$defs/HoldResponse"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "hold",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
     "HistoryTotalsResponse": {
       "properties": {
+        "agent_priced_models": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cost_status": {
           "type": "string"
         },
@@ -1153,8 +1355,44 @@
             }
           ]
         },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vendor_amounts": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UnitAmountResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1164,7 +1402,139 @@
         "uncached_tokens",
         "tokens_complete",
         "estimated_cost_usd",
-        "cost_status"
+        "cost_status",
+        "unmeasured_cause",
+        "unmeasured_units",
+        "vendor_amounts",
+        "agent_priced_usd",
+        "agent_priced_models"
+      ],
+      "type": "object"
+    },
+    "HoldBlockerResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier"
+      ],
+      "type": "object"
+    },
+    "HoldResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "blockers": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/HoldBlockerResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "held_since": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "model_only": {
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "agent_slots_full",
+            "ssh_hosts_full",
+            "blockers_not_read",
+            "blockers_unresolved",
+            "blockers_incomplete",
+            "blocked_by",
+            "daily_spend_ceiling",
+            "weekly_spend_ceiling",
+            "monthly_spend_ceiling",
+            "stage_hop_unconfirmed",
+            "usage_limit",
+            "park_comments_unread"
+          ],
+          "type": "string"
+        },
+        "reason_text": {
+          "type": "string"
+        },
+        "release_text": {
+          "type": "string"
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldSlotResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "reason",
+        "held_since",
+        "blockers",
+        "slot",
+        "resets_at",
+        "reason_text",
+        "release_text"
+      ],
+      "type": "object"
+    },
+    "HoldSlotResponse": {
+      "properties": {
+        "limit": {
+          "type": "integer"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "used": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope",
+        "used",
+        "limit"
       ],
       "type": "object"
     },
@@ -1632,6 +2002,29 @@
       "required": [],
       "type": "object"
     },
+    "KindCosts": {
+      "properties": {
+        "cache_read_usd": {
+          "type": "number"
+        },
+        "cache_write_usd": {
+          "type": "number"
+        },
+        "fresh_input_usd": {
+          "type": "number"
+        },
+        "output_usd": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "fresh_input_usd",
+        "output_usd",
+        "cache_write_usd",
+        "cache_read_usd"
+      ],
+      "type": "object"
+    },
     "LastStageResponse": {
       "properties": {
         "chain": {
@@ -1772,6 +2165,16 @@
         "model": {
           "type": "string"
         },
+        "price_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tokens": {
           "$ref": "#/$defs/TokenInfo"
         },
@@ -1798,7 +2201,8 @@
         "uncached_tokens",
         "estimated_cost_usd",
         "cost_status",
-        "unrated_classes"
+        "unrated_classes",
+        "price_source"
       ],
       "type": "object"
     },
@@ -2265,6 +2669,9 @@
         "actionable_comments": {
           "type": "integer"
         },
+        "awaiting_approval": {
+          "type": "boolean"
+        },
         "failing": {
           "type": "integer"
         },
@@ -2437,6 +2844,19 @@
             }
           ]
         },
+        "by_provenance": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "by_rule": {
           "anyOf": [
             {
@@ -2531,15 +2951,18 @@
             }
           ]
         },
-        "spend": {
+        "skill_calls": {
           "anyOf": [
             {
-              "$ref": "#/$defs/Spend"
+              "$ref": "#/$defs/SkillCallReport"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "spend": {
+          "$ref": "#/$defs/Spend"
         },
         "summary": {
           "$ref": "#/$defs/Summary"
@@ -2590,6 +3013,8 @@
         "chain_funnels",
         "by_trigger",
         "by_origin",
+        "by_provenance",
+        "skill_calls",
         "self_review"
       ],
       "type": "object"
@@ -2778,8 +3203,17 @@
         "text": {
           "type": "string"
         },
+        "tool_argument": {
+          "type": "string"
+        },
         "tool_error": {
           "type": "boolean"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "tool_line": {
+          "type": "string"
         },
         "tool_name": {
           "type": "string"
@@ -2863,6 +3297,16 @@
         "agent_kind": {
           "type": "string"
         },
+        "agent_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "attempt": {
           "type": "integer"
         },
@@ -2880,6 +3324,16 @@
         },
         "cost_status": {
           "type": "string"
+        },
+        "declared_outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "dispatch_id": {
           "anyOf": [
@@ -3024,6 +3478,12 @@
             }
           ]
         },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/SkillCall"
+          },
+          "type": "array"
+        },
         "ssh_host": {
           "anyOf": [
             {
@@ -3068,9 +3528,6 @@
         "tokens": {
           "$ref": "#/$defs/TokenInfo"
         },
-        "tokens_measured": {
-          "type": "boolean"
-        },
         "trigger": {
           "anyOf": [
             {
@@ -3084,13 +3541,62 @@
         "turns_completed": {
           "type": "integer"
         },
-        "unaccounted_turns": {
-          "type": "integer"
-        },
         "uncached_tokens": {
           "anyOf": [
             {
               "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_completeness": {
+          "type": "string"
+        },
+        "usage_provenance": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UsageSourceResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vendor_amounts": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/VendorAmountResponse"
+              },
+              "type": "array"
             },
             {
               "type": "null"
@@ -3108,14 +3614,14 @@
         "attempt",
         "status",
         "error",
+        "declared_outcome",
+        "agent_text",
         "started_at",
         "completed_at",
         "dispatched_at",
         "turns_completed",
         "tokens",
         "uncached_tokens",
-        "tokens_measured",
-        "unaccounted_turns",
         "estimated_cost_usd",
         "cost_status",
         "self_review",
@@ -3125,6 +3631,11 @@
         "reaction_config_key",
         "session_id",
         "ssh_host",
+        "usage_completeness",
+        "usage_provenance",
+        "vendor_amounts",
+        "unmeasured_cause",
+        "unmeasured_units",
         "dispatch_id",
         "model_usage",
         "stage_chain",
@@ -3338,6 +3849,12 @@
         },
         "session_id": {
           "type": "string"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/SkillCall"
+          },
+          "type": "array"
         },
         "ssh_host": {
           "type": "string"
@@ -4222,6 +4739,12 @@
         "no_change_state": {
           "type": "string"
         },
+        "project": {
+          "type": "string"
+        },
+        "project_url": {
+          "type": "string"
+        },
         "terminal_states": {
           "anyOf": [
             {
@@ -4275,6 +4798,68 @@
       ],
       "type": "object"
     },
+    "SkillCall": {
+      "properties": {
+        "skill": {
+          "type": "string"
+        },
+        "tool_error": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "skill"
+      ],
+      "type": "object"
+    },
+    "SkillCallReport": {
+      "properties": {
+        "by_skill": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SkillCount"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unrecorded_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "unrecorded_runs",
+        "by_skill"
+      ],
+      "type": "object"
+    },
+    "SkillCount": {
+      "properties": {
+        "calls": {
+          "type": "integer"
+        },
+        "failed_calls": {
+          "type": "integer"
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "skill": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "runs",
+        "calls",
+        "failed_calls"
+      ],
+      "type": "object"
+    },
     "SnapshotAgentTotals": {
       "properties": {
         "cache_read_tokens": {
@@ -4318,6 +4903,161 @@
       ],
       "type": "object"
     },
+    "SpanReport": {
+      "properties": {
+        "generated_at": {
+          "type": "string"
+        },
+        "period": {
+          "enum": [
+            "five_minutes",
+            "quarter_hour",
+            "hour",
+            "day",
+            "month"
+          ],
+          "type": "string"
+        },
+        "sessions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SpanSession"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "since": {
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/$defs/SpendBucket"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "generated_at",
+        "since",
+        "until",
+        "period",
+        "totals",
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "SpanSession": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "cost_share": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_unpriced": {
+          "type": "boolean"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dispatch_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_identifier": {
+          "type": "string"
+        },
+        "identifier": {
+          "type": "string"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "rule_name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_share": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "identifier",
+        "issue_title",
+        "dispatch_id",
+        "rule_name",
+        "agent_kind",
+        "status",
+        "turns",
+        "tokens",
+        "cost_usd",
+        "cost_unpriced",
+        "cost_share",
+        "tokens_share"
+      ],
+      "type": "object"
+    },
     "Spend": {
       "properties": {
         "buckets": {
@@ -4334,6 +5074,13 @@
           ]
         },
         "period": {
+          "enum": [
+            "five_minutes",
+            "quarter_hour",
+            "hour",
+            "day",
+            "month"
+          ],
           "type": "string"
         }
       },
@@ -4345,6 +5092,29 @@
     },
     "SpendBucket": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_by_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KindCosts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
         "cost_partial_runs": {
           "type": "integer"
         },
@@ -4361,23 +5131,65 @@
             }
           ]
         },
+        "errors": {
+          "type": "integer"
+        },
+        "in_progress": {
+          "type": "boolean"
+        },
         "runs": {
           "type": "integer"
         },
         "start": {
           "type": "string"
         },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tokens"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
+          "type": "integer"
+        },
+        "tool_calls": {
+          "type": "integer"
+        },
+        "turns": {
+          "type": "integer"
+        },
+        "turns_unrecorded_runs": {
           "type": "integer"
         }
       },
       "required": [
         "start",
         "runs",
+        "turns",
+        "tool_calls",
+        "errors",
+        "turns_unrecorded_runs",
+        "tokens",
         "cost_usd",
+        "cost_by_kind",
         "tokens_unmeasured_runs",
         "cost_unpriced_runs",
-        "cost_partial_runs"
+        "cost_partial_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "in_progress"
       ],
       "type": "object"
     },
@@ -4402,10 +5214,21 @@
               "type": "null"
             }
           ]
+        },
+        "weekly": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpendWindowResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "daily",
+        "weekly",
         "monthly"
       ],
       "type": "object"
@@ -4459,6 +5282,16 @@
         },
         "display_identifier": {
           "type": "string"
+        },
+        "hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "hopped_at": {
           "anyOf": [
@@ -4533,6 +5366,7 @@
         "hopped_at",
         "dispatched_at",
         "stage_position",
+        "hold",
         "status_text",
         "status_text_full"
       ],
@@ -4597,6 +5431,9 @@
         "budget_exhausted": {
           "type": "integer"
         },
+        "held": {
+          "type": "integer"
+        },
         "parked": {
           "type": "integer"
         },
@@ -4617,6 +5454,7 @@
         "parked",
         "pending_reactions",
         "between_stages",
+        "held",
         "attention"
       ],
       "type": "object"
@@ -4731,6 +5569,19 @@
         "health": {
           "$ref": "#/$defs/StateHealthResponse"
         },
+        "held": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/HeldIssueResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "parked": {
           "anyOf": [
             {
@@ -4758,15 +5609,10 @@
           ]
         },
         "rate_limits": {
-          "anyOf": [
-            {
-              "additionalProperties": {},
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentUsageWindowsResponse"
+          },
+          "type": "object"
         },
         "retrying": {
           "anyOf": [
@@ -4824,6 +5670,7 @@
         "pending_reactions",
         "between_stages",
         "active",
+        "held",
         "attention",
         "agent_totals",
         "rate_limits"
@@ -4832,8 +5679,21 @@
     },
     "Summary": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cancelled": {
           "type": "integer"
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
         },
         "cost_partial_runs": {
           "type": "integer"
@@ -4905,8 +5765,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "zero_duration_runs": {
           "type": "integer"
@@ -4929,7 +5818,13 @@
         "duration_excluded_runs",
         "cost_unpriced_runs",
         "cost_partial_runs",
-        "tokens_unmeasured_runs"
+        "tokens_unmeasured_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units"
       ],
       "type": "object"
     },
@@ -5225,6 +6120,9 @@
         "cache_write": {
           "type": "integer"
         },
+        "fresh_input": {
+          "type": "integer"
+        },
         "input": {
           "type": "integer"
         },
@@ -5244,7 +6142,150 @@
         "total",
         "cache_read",
         "cache_write",
-        "uncached"
+        "uncached",
+        "fresh_input"
+      ],
+      "type": "object"
+    },
+    "UnitAmountResponse": {
+      "properties": {
+        "amount": {
+          "type": "number"
+        },
+        "lower_bound": {
+          "type": "boolean"
+        },
+        "unit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "amount",
+        "lower_bound"
+      ],
+      "type": "object"
+    },
+    "UsageSourceResponse": {
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "UsageWindowAmountResponse": {
+      "properties": {
+        "limit": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "used": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "used",
+        "limit",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "UsageWindowResponse": {
+      "properties": {
+        "amount": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageWindowAmountResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "reported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "allowed",
+                "warning",
+                "exhausted"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_percent": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "used_percent",
+        "status",
+        "resets_at",
+        "reported_at",
+        "amount"
+      ],
+      "type": "object"
+    },
+    "VendorAmountResponse": {
+      "properties": {
+        "amount": {
+          "type": "number"
+        },
+        "lower_bound": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "unit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "model",
+        "amount",
+        "lower_bound"
       ],
       "type": "object"
     },

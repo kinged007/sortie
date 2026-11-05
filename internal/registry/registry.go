@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -30,9 +31,13 @@ var Trackers = NewRegistry[TrackerConstructor, TrackerMeta]("tracker")
 type AgentConstructor func() (domain.AgentAdapter, error)
 
 // Agents is the default agent adapter registry. Adapter packages
-// register themselves via [Registry.Register] in their init functions;
-// the orchestrator resolves adapters via [Registry.Get] at runtime.
-var Agents = NewRegistry[AgentConstructor, AgentMeta]("agent")
+// register themselves via [Registry.RegisterWithMeta] in their init
+// functions; the orchestrator resolves adapters via [Registry.Get] at
+// runtime. A registration whose [AgentMeta.UsageSources] fails its check
+// panics, so [Registry.Register] without metadata always panics here.
+var Agents = NewCheckedRegistry("agent", func(_ AgentConstructor, meta AgentMeta) error {
+	return meta.UsageSources.Check()
+})
 
 // CIProviderConstructor creates a [domain.CIStatusProvider] from
 // a maximum log-line count and opaque adapter-specific configuration.
@@ -161,9 +166,8 @@ type AgentDeprecation struct {
 	Replacement string
 }
 
-// AgentMeta holds optional agent-adapter-declared properties queried
-// by the orchestrator at preflight time. Zero value means no special
-// requirements.
+// AgentMeta holds the agent-adapter-declared properties queried by the
+// orchestrator at preflight time.
 type AgentMeta struct {
 	// Deprecation is nil when the kind is not deprecated. Non-nil
 	// declares the kind deprecated in favor of Deprecation.Replacement:
@@ -184,10 +188,13 @@ type AgentMeta struct {
 	// means no adapter-specific validation.
 	ValidateAgentConfig func(fields AgentConfigFields) []ValidationDiag
 
-	// MCPInjection declares what this adapter does with the
-	// worker-generated MCP config path today, not what the underlying
-	// CLI is capable of. The empty value means undeclared.
-	MCPInjection MCPInjection
+	// MCPDialect declares the tool-server configuration syntax this kind's
+	// runtime reads. Required.
+	MCPDialect MCPDialect
+
+	// MCPDialectNoneReason is required with MCPDialectNone and empty
+	// otherwise.
+	MCPDialectNoneReason string
 
 	// SessionResumeBlockedBy reports which of this adapter's own
 	// operator-visible config keys, under the given passthrough,
@@ -204,21 +211,10 @@ type AgentMeta struct {
 	// safe for concurrent use.
 	SessionResumeBlockedBy func(passthrough map[string]any) string
 
-	// UsageArrival and UsageAttribution declare the disposition of a
-	// locally launched session of this kind, constructed from an
-	// empty passthrough. The empty values mean undeclared.
-	UsageArrival     UsageArrival
-	UsageAttribution UsageAttribution
-
-	// UsageSessionRules are evaluated in order; the first rule whose
-	// When reports true supplies the pair. Empty means the declared
-	// pair holds for every session of this kind. UsageSessionRules
-	// MUST leave the declared pair reachable: at least one
-	// (passthrough, remote) combination MUST match none of the
-	// rules. This is what keeps a conformance assertion's coverage
-	// requirement satisfiable for every registry-conformant kind,
-	// including one whose rules are numerous.
-	UsageSessionRules []UsageSessionRule
+	// UsageSources declares the usage sources every session of this kind
+	// attaches, local or remote. The kind's arrival and attribution derive
+	// from it. Required.
+	UsageSources usage.Sources
 
 	// CredentialEnv declares the environment variable names this
 	// kind's runtime reads as the credential for its default
@@ -228,7 +224,54 @@ type AgentMeta struct {
 	// EffortForwarding declares what this adapter does with the effort
 	// key of its own settings block. The empty value means undeclared.
 	EffortForwarding EffortForwarding
+
+	// VerificationContext declares which agent context components the
+	// kind's credential-verification request still carries. The zero
+	// value means undeclared.
+	VerificationContext VerificationContext
+
+	// UsageLimitRecognition declares whether the adapter recognizes a
+	// provider usage-limit refusal. Required.
+	UsageLimitRecognition UsageLimitRecognition
+
+	// UsageLimitNotRecognizedReason is required with
+	// UsageLimitNotRecognized and empty otherwise.
+	UsageLimitNotRecognizedReason string
+
+	// LiteralSettings lists the keys of the kind's settings block whose
+	// string values load as written: no $VAR resolves under them.
+	// Optional; nil means every key resolves.
+	LiteralSettings []string
 }
+
+// LiteralSettingsOf returns the LiteralSettings the registered agent
+// kind declares, and nil for a name [Agents] does not register. Safe
+// for concurrent use.
+func LiteralSettingsOf(kind string) []string {
+	meta, ok := Agents.Meta(kind)
+	if !ok {
+		return nil
+	}
+	return meta.LiteralSettings
+}
+
+// UsageLimitRecognition declares whether a kind's adapter returns
+// [domain.ErrUsageLimit] for a provider usage-limit refusal. The empty
+// value means undeclared.
+type UsageLimitRecognition string
+
+const (
+	// UsageLimitRecognitionUndeclared is the zero value.
+	UsageLimitRecognitionUndeclared UsageLimitRecognition = ""
+
+	// UsageLimitRecognized declares that the adapter returns
+	// [domain.ErrUsageLimit] for a provider usage-limit refusal.
+	UsageLimitRecognized UsageLimitRecognition = "recognized"
+
+	// UsageLimitNotRecognized declares that the adapter does not
+	// recognize the refusal and states why.
+	UsageLimitNotRecognized UsageLimitRecognition = "not_recognized"
+)
 
 // CredentialEnv declares the environment variable names an agent
 // kind's runtime reads as the credential for its default provider.
@@ -262,162 +305,149 @@ func (c CredentialEnv) Names() []string {
 	return slices.Clone(c.names)
 }
 
-// UsageArrival declares when a usage figure for the agent session
-// becomes available to the orchestrator. The empty value means
-// undeclared.
-type UsageArrival string
+// VerificationResidual names one context component that a kind's
+// credential-verification request still carries, because its runtime
+// offers no qualifying switch that drops it.
+type VerificationResidual string
 
 const (
-	// UsageArrivalUndeclared is the zero value: the adapter has not
-	// declared when its usage figures arrive.
-	UsageArrivalUndeclared UsageArrival = ""
+	// VerificationKeepsSomeTools declares that the request carries
+	// strictly fewer tool definitions than a working request.
+	VerificationKeepsSomeTools VerificationResidual = "some_tools"
 
-	// UsageArrivalIncremental declares that the adapter emits one
-	// domain.EventTokenUsage carrying the run-cumulative figure per
-	// model API request the turn makes, while the turn's work is
-	// still in flight. A turn making N requests delivers N events.
-	// api_request_count is a request count for a session of this
-	// arrival once a figure has arrived, and for one that has not
-	// yet begun a turn, which has genuinely issued no request. In
-	// between, a runtime that stops delivering the per-request
-	// event leaves the count at zero while the declaration still
-	// promises one, and that zero measures nothing.
-	UsageArrivalIncremental UsageArrival = "incremental"
+	// VerificationKeepsAllTools declares that the request carries no
+	// more tool definitions than a working request.
+	VerificationKeepsAllTools VerificationResidual = "all_tools"
 
-	// UsageArrivalTurnEnd declares that the adapter emits at most
-	// one domain.EventTokenUsage per turn, and only after the
-	// turn's work is over and before the turn's terminal event.
-	// api_request_count is not a count of API requests for a kind
-	// declaring this value.
-	UsageArrivalTurnEnd UsageArrival = "turn_end"
+	// VerificationKeepsProjectInstructions declares that the request
+	// carries the instruction files read from the workspace.
+	VerificationKeepsProjectInstructions VerificationResidual = "project_instructions"
 
-	// UsageArrivalNone declares that no usage figure is ever
-	// produced: no domain.EventTokenUsage event, no non-zero
-	// domain.TokenUsage on any event, domain.TurnResult.UsageMeasured
-	// false on every turn.
-	UsageArrivalNone UsageArrival = "none"
+	// VerificationKeepsUserInstructions declares that the request
+	// carries the instruction files and skill catalogues read from the
+	// operator's home.
+	VerificationKeepsUserInstructions VerificationResidual = "user_instructions"
+
+	// VerificationKeepsSystemPrompt declares that the request carries
+	// the runtime's built-in system prompt.
+	VerificationKeepsSystemPrompt VerificationResidual = "system_prompt"
 )
 
-// UsageAttribution declares what a usage figure from this adapter
-// attributes to. The empty value means undeclared.
-type UsageAttribution string
-
-const (
-	// UsageAttributionUndeclared is the zero value: the adapter has
-	// not declared what its usage figures attribute to.
-	UsageAttributionUndeclared UsageAttribution = ""
-
-	// UsageAttributionPerModel declares that at least one event
-	// carrying a non-zero Usage also carries a non-empty Model, so a
-	// figure can be attributed to the model that produced it.
-	UsageAttributionPerModel UsageAttribution = "per_model"
-
-	// UsageAttributionSessionTotal declares that no event carrying a
-	// non-zero Usage carries a Model: figures are session-level
-	// totals with no model attribution.
-	UsageAttributionSessionTotal UsageAttribution = "session_total"
-
-	// UsageAttributionNone declares that there is no figure to
-	// attribute.
-	UsageAttributionNone UsageAttribution = "none"
-)
-
-// UsageSessionRule states the pair in force for a session that meets
-// a condition the declared pair does not describe. When reads only
-// the resolved adapter passthrough and the launch mode; it reaches no
-// adapter state and performs no I/O, MUST NOT retain or mutate the
-// passthrough map, and MUST NOT close over adapter state.
-type UsageSessionRule struct {
-	When        func(passthrough map[string]any, remote bool) bool
-	Arrival     UsageArrival
-	Attribution UsageAttribution
-}
-
-// UsageDisposition returns the arrival and attribution in force for
-// one session of this kind, given its launch mode and its resolved
-// adapter passthrough. remote is true when the session runs over SSH.
-// It applies the first UsageSessionRules entry whose When reports
-// true, and returns the declared pair when no rule matches.
+// VerificationContext declares the residuals of a kind's
+// credential-verification request: the context components it still
+// carries. The zero value is undeclared; construct a declared value
+// with [DeclareVerificationContext].
 //
-// A resolved pair MUST satisfy INV-1 (arrival is UsageArrivalNone if
-// and only if attribution is UsageAttributionNone) and MUST satisfy
-// INV-3 (every resolvable pair, declared or ruled, names a value
-// inside the declared set). A declaration reflects the code path
-// that always runs, not one a runtime release can starve (INV-2).
-func (m AgentMeta) UsageDisposition(passthrough map[string]any, remote bool) (UsageArrival, UsageAttribution) {
-	for _, rule := range m.UsageSessionRules {
-		if rule.When != nil && rule.When(passthrough, remote) {
-			return rule.Arrival, rule.Attribution
-		}
+// Tool definitions of every origin count toward the tool components:
+// built-in, skill, and tool-server tools.
+type VerificationContext struct {
+	residuals []VerificationResidual
+	declared  bool
+}
+
+// DeclareVerificationContext returns a declared [VerificationContext]
+// keeping the given residuals. Called with no arguments, it declares a
+// request that keeps nothing. It panics when given both
+// [VerificationKeepsSomeTools] and [VerificationKeepsAllTools], which
+// bound the same component differently.
+func DeclareVerificationContext(residuals ...VerificationResidual) VerificationContext {
+	if slices.Contains(residuals, VerificationKeepsSomeTools) && slices.Contains(residuals, VerificationKeepsAllTools) {
+		panic("registry: verification context declares both some_tools and all_tools")
 	}
-	return m.UsageArrival, m.UsageAttribution
+	return VerificationContext{residuals: slices.Clone(residuals), declared: true}
 }
 
-// ReportsDuringTurn reports whether a figure of this arrival reaches
-// the orchestrator while a turn is running. True for
-// UsageArrivalIncremental; false for every other value, including a
-// value outside the declared set.
-func (a UsageArrival) ReportsDuringTurn() bool {
-	return a == UsageArrivalIncremental
+// Declared reports whether v was built by [DeclareVerificationContext].
+// The zero value reports false.
+func (v VerificationContext) Declared() bool {
+	return v.declared
 }
 
-// ReportsAnyFigure reports whether a session of this arrival ever
-// produces a usage figure. True for UsageArrivalIncremental and
-// UsageArrivalTurnEnd; false for every other value, including a value
-// outside the declared set.
-func (a UsageArrival) ReportsAnyFigure() bool {
-	return a == UsageArrivalIncremental || a == UsageArrivalTurnEnd
+// Keeps reports whether v declares that the request carries r. An
+// undeclared value keeps nothing.
+func (v VerificationContext) Keeps(r VerificationResidual) bool {
+	return slices.Contains(v.residuals, r)
 }
 
-// NamesModel reports whether a figure of this attribution names the
-// model that produced it. True for UsageAttributionPerModel; false
-// for every other value, including a value outside the declared set.
-func (t UsageAttribution) NamesModel() bool {
-	return t == UsageAttributionPerModel
-}
+// UsageArrival is when a session's token figure reaches the orchestrator.
+type UsageArrival = usage.Arrival
 
-// MCPInjection declares what an agent adapter does with the
-// worker-generated MCP config path. The value describes what the
-// adapter does with the path today, not what the underlying CLI is
-// capable of, and the empty value means undeclared.
-type MCPInjection string
+// UsageAttribution is what a session's token figure names.
+type UsageAttribution = usage.Attribution
 
 const (
-	// MCPInjectionUndeclared is the zero value: the adapter has not
-	// declared a disposition toward the generated MCP config path.
-	MCPInjectionUndeclared MCPInjection = ""
+	// UsageArrivalUndeclared is the zero value.
+	UsageArrivalUndeclared = usage.ArrivalUndeclared
 
-	// MCPInjectionSupported declares that the adapter hands the
-	// generated MCP config path to the agent process.
-	MCPInjectionSupported MCPInjection = "supported"
+	// UsageArrivalIncremental is a figure reported after each model request
+	// while the turn runs.
+	UsageArrivalIncremental = usage.ArrivalIncremental
 
-	// MCPInjectionTranslated declares that the adapter re-expresses
-	// the servers declared in the generated configuration in the
-	// form its runtime parses, and delivers that to the agent
-	// process.
-	MCPInjectionTranslated MCPInjection = "translated"
+	// UsageArrivalTurnEnd is at most one figure per turn, settled after the
+	// turn's work is over.
+	UsageArrivalTurnEnd = usage.ArrivalTurnEnd
 
-	// MCPInjectionUnsupported declares that the adapter never hands
-	// the generated MCP config path to the agent process.
-	MCPInjectionUnsupported MCPInjection = "unsupported"
+	// UsageArrivalNone is no attached source counting tokens.
+	UsageArrivalNone = usage.ArrivalNone
+
+	// UsageAttributionUndeclared is the zero value.
+	UsageAttributionUndeclared = usage.AttributionUndeclared
+
+	// UsageAttributionPerModel is a session at least one of whose usage
+	// events names a model.
+	UsageAttributionPerModel = usage.AttributionPerModel
+
+	// UsageAttributionSessionTotal is a session whose kind guarantees no
+	// model name.
+	UsageAttributionSessionTotal = usage.AttributionSessionTotal
+
+	// UsageAttributionNone is no figure to attribute.
+	UsageAttributionNone = usage.AttributionNone
 )
 
-// DeliversTools reports whether a session of this disposition,
-// launched in the given mode, can reach the servers declared in the
-// generated configuration. remote is true when the session runs over
-// SSH. It is total over the value set: true for
-// MCPInjectionSupported; true for MCPInjectionTranslated only when
-// remote is false; false for every other value, including a value
-// outside the declared set.
-func (m MCPInjection) DeliversTools(remote bool) bool {
-	switch m {
-	case MCPInjectionSupported:
-		return true
-	case MCPInjectionTranslated:
-		return !remote
-	default:
-		return false
-	}
+// UsageDisposition returns the arrival and attribution derived from the
+// kind's UsageSources.
+func (m AgentMeta) UsageDisposition() (UsageArrival, UsageAttribution) {
+	return m.UsageSources.Disposition()
+}
+
+// MCPDialect names the tool-server configuration syntax the shared delivery
+// renders for a kind's runtime. The empty value means undeclared.
+type MCPDialect string
+
+const (
+	// MCPDialectUndeclared is the zero value.
+	MCPDialectUndeclared MCPDialect = ""
+
+	// MCPDialectNone declares that the kind's runtime receives no tool server.
+	MCPDialectNone MCPDialect = "none"
+
+	// MCPDialectMCPServersJSON is an {"mcpServers":{...}} document with ${VAR}
+	// header references.
+	MCPDialectMCPServersJSON MCPDialect = "mcp_servers_json"
+
+	// MCPDialectMCPServersJSONAlwaysLoad is mcp_servers_json with Sortie's own
+	// member marked "alwaysLoad".
+	MCPDialectMCPServersJSONAlwaysLoad MCPDialect = "mcp_servers_json_always_load"
+
+	// MCPDialectMCPServersTOML is one "-c mcp_servers.<name>=<inline table>"
+	// argument pair per server.
+	MCPDialectMCPServersTOML MCPDialect = "mcp_servers_toml"
+
+	// MCPDialectMCPMemberJSON is the "mcp" member of the runtime's inline JSON
+	// configuration, with {env:VAR} header references.
+	MCPDialectMCPMemberJSON MCPDialect = "mcp_member_json"
+
+	// MCPDialectACPSession is one Agent Client Protocol McpServer object per
+	// server, sent in the session-creation request.
+	MCPDialectACPSession MCPDialect = "acp_session"
+)
+
+// DeliversTools reports whether a kind declaring this dialect can reach
+// Sortie's tool server. It is true for every dialect but MCPDialectUndeclared
+// and MCPDialectNone, including a value outside the declared set.
+func (d MCPDialect) DeliversTools() bool {
+	return d != MCPDialectUndeclared && d != MCPDialectNone
 }
 
 // AgentConfigFields holds the config values passed to agent adapter
@@ -445,6 +475,7 @@ type AgentConfigFields struct {
 type Registry[T any, M any] struct {
 	name     string
 	reserved []string
+	check    func(value T, meta M) error
 	mu       sync.RWMutex
 	adapters map[string]T
 	meta     map[string]M
@@ -463,8 +494,19 @@ func NewRegistry[T any, M any](name string, reserved ...string) *Registry[T, M] 
 	}
 }
 
+// NewCheckedRegistry creates an empty [Registry] like [NewRegistry] whose
+// [Registry.Register] and [Registry.RegisterWithMeta] also run check on the
+// value and metadata being registered. A nil check accepts every
+// registration.
+func NewCheckedRegistry[T any, M any](name string, check func(value T, meta M) error, reserved ...string) *Registry[T, M] {
+	r := NewRegistry[T, M](name, reserved...)
+	r.check = check
+	return r
+}
+
 // Register associates a kind string with a constructor function.
-// Panics if kind is empty, reserved, or already registered. Registration is
+// Panics if kind is empty, reserved, already registered, or refused by the
+// registry's check, which receives the zero metadata. Registration is
 // expected during init(); duplicate registration is a programming
 // error. The zero value of M is stored as metadata so that [Meta]
 // returns (zero, true) for kinds registered without explicit metadata.
@@ -481,13 +523,15 @@ func (r *Registry[T, M]) Register(kind string, constructor T) {
 	if _, exists := r.adapters[kind]; exists {
 		panic(fmt.Sprintf("registry: duplicate registration for kind %q", kind))
 	}
-	r.adapters[kind] = constructor
 	var zero M
+	r.panicIfRefused(kind, constructor, zero)
+	r.adapters[kind] = constructor
 	r.meta[kind] = zero
 }
 
 // RegisterWithMeta associates a kind string with a constructor and
-// declared metadata. Panics on the same conditions as [Register].
+// declared metadata. Panics on the same conditions as [Registry.Register],
+// the check receiving meta.
 func (r *Registry[T, M]) RegisterWithMeta(kind string, constructor T, meta M) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -501,8 +545,19 @@ func (r *Registry[T, M]) RegisterWithMeta(kind string, constructor T, meta M) {
 	if _, exists := r.adapters[kind]; exists {
 		panic(fmt.Sprintf("registry: duplicate registration for kind %q", kind))
 	}
+	r.panicIfRefused(kind, constructor, meta)
 	r.adapters[kind] = constructor
 	r.meta[kind] = meta
+}
+
+// panicIfRefused panics when the registry's check rejects the registration.
+func (r *Registry[T, M]) panicIfRefused(kind string, value T, meta M) {
+	if r.check == nil {
+		return
+	}
+	if err := r.check(value, meta); err != nil {
+		panic(fmt.Sprintf("registry: %s kind %q refused: %v", r.name, kind, err))
+	}
 }
 
 // Meta returns the metadata for the given kind and a boolean

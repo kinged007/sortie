@@ -17,9 +17,6 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// fakeSSHDir builds a no-op fake runtime named "ssh" in a temp directory and
-// returns the directory path. The directory should be prepended to PATH via
-// t.Setenv.
 func fakeSSHDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -41,7 +38,6 @@ func unsetEnvForTest(t *testing.T, name string) {
 	}
 }
 
-// emptyDir returns a temp directory that contains no binaries.
 func emptyDir(t *testing.T) string {
 	t.Helper()
 	return t.TempDir()
@@ -375,100 +371,6 @@ func TestResolveLaunchTarget_CommandArgvRemote(t *testing.T) {
 	}
 }
 
-func TestAppendCommandArgs(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		command domain.AgentCommand
-		remote  bool
-		args    []string
-		want    domain.AgentCommand
-	}{
-		{
-			name:    "list stays a list locally",
-			command: domain.AgentCommand{Argv: []string{"agent", "x y"}},
-			args:    []string{"acp", "-a"},
-			want:    domain.AgentCommand{Argv: []string{"agent", "x y", "acp", "-a"}},
-		},
-		{
-			name:    "list stays a list remotely",
-			command: domain.AgentCommand{Argv: []string{"agent"}},
-			remote:  true,
-			args:    []string{"acp", "-a"},
-			want:    domain.AgentCommand{Argv: []string{"agent", "acp", "-a"}},
-		},
-		{
-			name:    "local string with plain arguments stays a string",
-			command: domain.AgentCommand{Line: "agent --fast"},
-			args:    []string{"acp", "--model", "m-1"},
-			want:    domain.AgentCommand{Line: "agent --fast acp --model m-1"},
-		},
-		{
-			name:    "local string drops trailing whitespace before the arguments",
-			command: domain.AgentCommand{Line: "agent \t\n"},
-			args:    []string{"acp"},
-			want:    domain.AgentCommand{Line: "agent acp"},
-		},
-		{
-			name:    "local string with a spaced argument becomes the list of its words",
-			command: domain.AgentCommand{Line: "agent  --fast"},
-			args:    []string{"acp", "--agent", "space name"},
-			want:    domain.AgentCommand{Argv: []string{"agent", "--fast", "acp", "--agent", "space name"}},
-		},
-		{
-			name:    "local string with an empty argument becomes a list",
-			command: domain.AgentCommand{Line: "agent"},
-			args:    []string{"--agent", ""},
-			want:    domain.AgentCommand{Argv: []string{"agent", "--agent", ""}},
-		},
-		{
-			name:    "local string with a tab in an argument becomes a list",
-			command: domain.AgentCommand{Line: "agent"},
-			args:    []string{"a\tb"},
-			want:    domain.AgentCommand{Argv: []string{"agent", "a\tb"}},
-		},
-		{
-			name:    "local string with a non-breaking space in an argument becomes a list",
-			command: domain.AgentCommand{Line: "agent"},
-			args:    []string{"a b"},
-			want:    domain.AgentCommand{Argv: []string{"agent", "a b"}},
-		},
-		{
-			name:    "remote string places arguments in front of the terminator",
-			command: domain.AgentCommand{Line: "agent;"},
-			remote:  true,
-			args:    []string{"acp", "--agent", "space name", ""},
-			want:    domain.AgentCommand{Line: `agent acp --agent 'space name' '' ;`},
-		},
-		{
-			name:    "remote string keeps a spaced argument in one word",
-			command: domain.AgentCommand{Line: "agent"},
-			remote:  true,
-			args:    []string{"--agent", "it's"},
-			want:    domain.AgentCommand{Line: `agent --agent 'it'\''s'`},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := AppendCommandArgs(tt.command, tt.remote, tt.args...)
-
-			if got.Line != tt.want.Line || !slices.Equal(got.Argv, tt.want.Argv) {
-				t.Errorf("AppendCommandArgs(%+v, remote=%v, %q) = %+v, want %+v", tt.command, tt.remote, tt.args, got, tt.want)
-			}
-			if !tt.remote && got.Line != "" {
-				wantWords := append(strings.Fields(tt.command.Line), tt.args...)
-				if gotWords := strings.Fields(got.Line); !slices.Equal(gotWords, wantWords) {
-					t.Errorf("strings.Fields(AppendCommandArgs(%+v, %q).Line) = %q, want the base words then the arguments %q", tt.command, tt.args, gotWords, wantWords)
-				}
-			}
-		})
-	}
-}
-
 // TestResolveLaunchTarget_SSHEnvNames asserts that ResolveLaunchTarget
 // sets LaunchTarget.SSHEnvNames from params.SSHEnvNames in SSH mode and
 // leaves it nil in local mode, even when the caller sets it.
@@ -508,12 +410,6 @@ func TestResolveLaunchTarget_SSHEnvNames(t *testing.T) {
 	})
 }
 
-// TestLaunchTarget_SSHOptions asserts the resolution order:
-// t.SSHEnvNames is walked in order, a name already claimed by
-// settings or already carried is skipped, each remaining name is
-// looked up and carried only when its value holds a non-whitespace
-// character, then every settings entry whose Value is non-empty is
-// appended, keeping the first entry for a name a later entry repeats.
 func TestLaunchTarget_SSHOptions(t *testing.T) {
 	// Not parallel: sets process environment via t.Setenv.
 	t.Setenv("SSH_OPTIONS_TEST_B", "b-value")
@@ -597,6 +493,66 @@ func TestLaunchTarget_SSHOptions_WithheldEnv(t *testing.T) {
 			t.Errorf("SSHOptions() Unset = %v, want nil", got.Unset)
 		}
 	})
+}
+
+func TestLaunchTarget_Environ(t *testing.T) {
+	// Not parallel: sets process environment via t.Setenv.
+	t.Setenv("ENVIRON_TEST_REPLACED", "inherited")
+	target := LaunchTarget{ConfiguredEnv: []sshutil.EnvVar{
+		{Name: "ENVIRON_TEST_REPLACED", Value: "configured"},
+		{Name: "ENVIRON_TEST_EMPTY"},
+	}}
+
+	got := target.Environ()
+
+	want := []string{"ENVIRON_TEST_REPLACED=configured", "ENVIRON_TEST_EMPTY="}
+	if tail := got[len(got)-len(want):]; !slices.Equal(tail, want) || slices.Contains(got, "ENVIRON_TEST_REPLACED=inherited") {
+		t.Errorf("Environ() = ... %v, want the inherited entry replaced and %v last", tail, want)
+	}
+}
+
+func TestLaunchTarget_RuntimeEnv_RemoteConfigured(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		value    string
+		withheld []string
+		visible  bool
+	}{
+		{name: "configured value", value: "configured", visible: true},
+		{name: "empty configured value is set", visible: true},
+		{name: "withheld name is invisible", value: "configured", withheld: []string{"RUNTIME_ENV_TEST"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := LaunchTarget{RemoteCommand: "agent", WithheldEnv: tt.withheld, ConfiguredEnv: []sshutil.EnvVar{{Name: "RUNTIME_ENV_TEST", Value: tt.value}}}
+
+			got, visible := target.RuntimeEnv([]string{}, "RUNTIME_ENV_TEST")
+
+			if visible != tt.visible || visible && got != tt.value {
+				t.Errorf("RuntimeEnv(%q) = %q, %t, want %q, %t", "RUNTIME_ENV_TEST", got, visible, tt.value, tt.visible)
+			}
+		})
+	}
+}
+
+func TestLaunchTarget_remoteHostCommand_ListFormKeepsSpacedLauncher(t *testing.T) {
+	t.Parallel()
+
+	argv := []string{"/opt/my tools/opencode", "acp"}
+	target := LaunchTarget{RemoteArgv: argv, RemoteCommand: sshutil.QuoteArgv(argv)}
+
+	for _, words := range []int{1, len(argv)} {
+		got, _ := target.remoteHostCommand(HostCommand{LaunchWords: words})
+
+		if want := sshutil.QuoteArgv(argv[:words]); got != want {
+			t.Errorf("remoteHostCommand(LaunchWords %d) = %q, want %q", words, got, want)
+		}
+	}
 }
 
 func TestLaunchTarget_BindWorkspace(t *testing.T) {
@@ -685,7 +641,7 @@ func TestLaunchTarget_BindWorkspace(t *testing.T) {
 			t.Fatalf("BindWorkspace() error = %v, want nil", agentErr)
 		}
 
-		if slices.ContainsFunc(cmd.Env, func(entry string) bool { return isEnvEntryNamed(entry, name) }) {
+		if slices.ContainsFunc(cmd.Env, func(entry string) bool { return IsEnvEntryNamed(entry, name) }) {
 			t.Errorf("BindWorkspace().Env still holds an entry named %s", name)
 		}
 	})
@@ -806,11 +762,15 @@ func TestLaunchTarget_AuxiliaryCommand_Remote(t *testing.T) {
 		RemoteCommand: "kiro-cli",
 		SSHHost:       "worker-host",
 		SSHEnvNames:   []string{"AUX_CARRIED_VAR"},
+		ConfiguredEnv: []sshutil.EnvVar{{Name: "SSH_AUTH_SOCK", Value: "/remote/agent.sock"}},
 	}
 
 	cmd, agentErr := target.AuxiliaryCommand(context.Background(), []string{"whoami"}, strings.NewReader("aux-stdin"), nil)
 	if agentErr != nil {
 		t.Fatalf("AuxiliaryCommand() error = %v, want nil", agentErr)
+	}
+	if slices.Contains(cmd.Env, "SSH_AUTH_SOCK=/remote/agent.sock") {
+		t.Errorf("AuxiliaryCommand().Env carries the configured SSH_AUTH_SOCK, want the local ssh client on Sortie's own environment")
 	}
 
 	joined := strings.Join(cmd.Args, " ")
@@ -871,8 +831,8 @@ func TestIsEnvEntryNamed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := isEnvEntryNamed(tt.entry, "HELD"); got != tt.want {
-				t.Errorf("isEnvEntryNamed(%q, %q) = %v, want %v", tt.entry, "HELD", got, tt.want)
+			if got := IsEnvEntryNamed(tt.entry, "HELD"); got != tt.want {
+				t.Errorf("IsEnvEntryNamed(%q, %q) = %v, want %v", tt.entry, "HELD", got, tt.want)
 			}
 		})
 	}

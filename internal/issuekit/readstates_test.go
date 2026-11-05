@@ -7,16 +7,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestReadStates_runsReadsConcurrently(t *testing.T) {
 	t.Parallel()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
 
 	keys := make([]string, 2*maxConcurrentReads)
 	for i := range keys {
@@ -25,7 +22,7 @@ func TestReadStates_runsReadsConcurrently(t *testing.T) {
 	var inFlight, peak atomic.Int32
 	full := make(chan struct{})
 	var fullOnce sync.Once
-	reads, err := ReadStates(ctx, keys, func(ctx context.Context, key string) (domain.IssueStateAndLabels, bool, error) {
+	reads, err := ReadStates(waittest.Context(t), keys, func(ctx context.Context, key string) (domain.IssueStateAndLabels, bool, error) {
 		n := inFlight.Add(1)
 		defer inFlight.Add(-1)
 		if n > peak.Load() {

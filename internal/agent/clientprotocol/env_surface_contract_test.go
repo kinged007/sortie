@@ -10,30 +10,34 @@ import (
 	"testing"
 )
 
-// envSurfaceOwnedNames is the complete set of SORTIE_-prefixed
-// environment variable names this package owns. A string literal in an
-// environment-name position naming a value outside this set is a
-// violation, whether the value sits outside the transport family
-// entirely or inside it while still carrying a runtime token.
-// envSurfaceAllowlistFile is this file, whose envSurfaceOwnedNames
-// declaration spells every owned name as a string literal. Counting
-// those literals toward the staleness direction would satisfy it from
-// the allowlist itself, leaving a deleted coordinate undetected.
+// The literal scan skips this file: counting its own literals would satisfy
+// the staleness check from the allowlist itself, leaving a deleted name
+// undetected.
 const envSurfaceAllowlistFile = "env_surface_contract_test.go"
 
 var envSurfaceOwnedNames = map[string]bool{
-	"SORTIE_CLIENTPROTOCOL_TEST":               true,
-	"SORTIE_CLIENTPROTOCOL_COMMAND":            true,
-	"SORTIE_CLIENTPROTOCOL_PROFILE":            true,
-	"SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV":     true,
-	"SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV": true,
-	"SORTIE_CLIENTPROTOCOL_ASKING_COMMAND":     true,
+	"SORTIE_CLIENTPROTOCOL_TEST":                  true,
+	"SORTIE_CLIENTPROTOCOL_COMMAND":               true,
+	"SORTIE_CLIENTPROTOCOL_PROFILE":               true,
+	"SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV":        true,
+	"SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV":    true,
+	"SORTIE_CLIENTPROTOCOL_ASKING_COMMAND":        true,
+	"SORTIE_CLIENTPROTOCOL_USER_INSTRUCTIONS":     true,
+	"SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT":        true,
+	"SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH":   true,
+	"SORTIE_CLIENTPROTOCOL_HTTP_TOOLS":            true,
+	"SORTIE_CLIENTPROTOCOL_SSH_COMMAND":           true,
+	"SORTIE_CLIENTPROTOCOL_SSH_INSTALL":           true,
+	"SORTIE_CLIENTPROTOCOL_SPEND_DECLARATION":     true,
+	"SORTIE_CLIENTPROTOCOL_REPORTED_MODEL_PREFIX": true,
+	"SORTIE_CLIENTPROTOCOL_STATUS_CALL":           true,
+	"SORTIE_CLIENTPROTOCOL_USAGE_LIMIT_ANSWER":    true,
+	"SORTIE_CLIENTPROTOCOL_EFFORT":                true,
+	"SORTIE_CLIENTPROTOCOL_CONFIG_OPTION":         true,
 }
 
-// envSurfaceCallSelectors are the selector names an environment-access
-// call's first argument is checked under. Matching the selector alone,
-// with no type resolution, covers os.Getenv, os.LookupEnv, os.Setenv,
-// os.Unsetenv, and t.Setenv regardless of the receiver's static type.
+// Matching the selector name alone covers t.Setenv as well as os.Setenv
+// without type resolution.
 var envSurfaceCallSelectors = map[string]bool{
 	"Getenv":    true,
 	"LookupEnv": true,
@@ -41,23 +45,11 @@ var envSurfaceCallSelectors = map[string]bool{
 	"Unsetenv":  true,
 }
 
-// envSurfaceViolation is one string literal found in an environment-name
-// position whose value begins with SORTIE_ but is not a member of
-// envSurfaceOwnedNames.
 type envSurfaceViolation struct {
 	pos     token.Position
 	literal string
 }
 
-// envSurfaceViolations reports every violation in file's two
-// environment-name positions: the value a declaration binds to a name,
-// and the first argument of a call whose callee selects Getenv,
-// LookupEnv, Setenv, or Unsetenv. The first position covers a const or
-// var specification, a short variable declaration, and an assignment
-// alike, including each string element of a slice literal in any of
-// them, because a name's spelling is what the rule is about and the
-// syntax that binds it is not. A literal elsewhere in the file, however
-// it spells a SORTIE_ name, is not inspected.
 func envSurfaceViolations(fset *token.FileSet, file *ast.File) []envSurfaceViolation {
 	var violations []envSurfaceViolation
 	report := func(lit *ast.BasicLit) {
@@ -77,10 +69,8 @@ func envSurfaceViolations(fset *token.FileSet, file *ast.File) []envSurfaceViola
 		})
 	}
 
-	// reportBound inspects the values a declaration binds, and only
-	// those written directly as a literal there. It never descends into
-	// a call on the right-hand side, whose arguments are the other
-	// position's business.
+	// A call on the right-hand side is not descended into: its arguments
+	// belong to the call position.
 	reportBound := func(values []ast.Expr) {
 		for _, value := range values {
 			switch expr := value.(type) {
@@ -118,10 +108,6 @@ func envSurfaceViolations(fset *token.FileSet, file *ast.File) []envSurfaceViola
 	return violations
 }
 
-// envSurfaceLiterals returns every SORTIE_-prefixed string literal
-// found anywhere in file, in either environment-name position or not,
-// for the staleness-direction check: an owned name that appears
-// nowhere in the package has moved out from under this allowlist.
 func envSurfaceLiterals(file *ast.File) map[string]bool {
 	found := map[string]bool{}
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -141,17 +127,10 @@ func envSurfaceLiterals(file *ast.File) map[string]bool {
 	return found
 }
 
-// envSurfaceReporter is the subset of *testing.T
-// checkEnvSurfaceOwnedNamesCurrent calls, factored out so it can be
-// driven by a fake reporter against synthetic input.
 type envSurfaceReporter interface {
 	Errorf(format string, args ...any)
 }
 
-// checkEnvSurfaceOwnedNamesCurrent reports the staleness direction: an
-// owned-set entry no literal in literals names. The scan that supplies
-// literals skips this file, so an entry survives only while some other
-// file in the package still spells it.
 func checkEnvSurfaceOwnedNamesCurrent(r envSurfaceReporter, owned map[string]bool, literals map[string]bool) {
 	for name := range owned {
 		if !literals[name] {
@@ -160,8 +139,6 @@ func checkEnvSurfaceOwnedNamesCurrent(r envSurfaceReporter, owned map[string]boo
 	}
 }
 
-// envSurfaceFakeReporter records Errorf calls instead of failing the
-// enclosing test.
 type envSurfaceFakeReporter struct {
 	errors []string
 }
@@ -170,11 +147,6 @@ func (f *envSurfaceFakeReporter) Errorf(format string, _ ...any) {
 	f.errors = append(f.errors, format)
 }
 
-// scanEnvSurface parses every .go file directly inside this package's
-// own directory, test files included, and aggregates the violations
-// envSurfaceViolations reports for each and every SORTIE_-prefixed
-// literal envSurfaceLiterals finds. It does not descend into a
-// subdirectory.
 func scanEnvSurface(t *testing.T) ([]envSurfaceViolation, map[string]bool) {
 	t.Helper()
 
@@ -205,8 +177,6 @@ func scanEnvSurface(t *testing.T) ([]envSurfaceViolation, map[string]bool) {
 	return violations, literals
 }
 
-// envSurfaceScanInline parses src as a single fixture file and returns
-// the violations envSurfaceViolations reports for it.
 func envSurfaceScanInline(t *testing.T, src string) []envSurfaceViolation {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -217,32 +187,14 @@ func envSurfaceScanInline(t *testing.T, src string) []envSurfaceViolation {
 	return envSurfaceViolations(fset, file)
 }
 
-// TestEnvSurfaceIsTransportNamed proves, by construction, that every
-// SORTIE_-prefixed literal this package declares or hands to an
-// environment call belongs to envSurfaceOwnedNames, and that the check
-// itself cannot pass vacuously.
-//
-// The guard scans this package's own directory only; a second runtime's
-// profile placed in a sibling package passes unseen. It reads a literal
-// only where that literal is written directly into a value a
-// declaration binds, whether a const or var specification, a short
-// variable declaration or an assignment, or into a slice literal in
-// any of those, or passed as a literal to an os or testing environment
-// call; a name assembled by
-// concatenation, or handed as a bare literal to a lookup function this
-// package injects rather than to os or testing directly, escapes both
-// positions and is not caught. It does not catch a stale literal from a
-// prior naming family sitting outside those two positions, such as a
-// map key or an error-message assertion that quotes the old name as
-// plain text; a repository-wide text search is what catches those. And
-// it mechanizes only two of three ways a runtime name could appear in
-// this surface, the name or value of a declared variable and the
-// identifier holding one; it does not mechanize the third, a runtime
-// name written into an operator-facing message that also carries an
-// owned name, which stays a matter for a separate pinned-text
-// assertion.
 func TestEnvSurfaceIsTransportNamed(t *testing.T) {
 	t.Parallel()
+
+	// Blind spots: a sibling package's profile, a name built by concatenation
+	// or handed to an injected lookup function, a stale name quoted as plain
+	// text (map key, error-message assertion), and a runtime name in an
+	// operator-facing message that also carries an owned name. Each needs a
+	// text search or a pinned-text assertion instead.
 
 	t.Run("package directory carries no non-owned SORTIE_ literal", func(t *testing.T) {
 		t.Parallel()

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
@@ -15,6 +16,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
+
+const postedCommentID = "comment-1"
 
 type commentRecorder struct {
 	domain.TrackerAdapter
@@ -30,20 +33,27 @@ type trackerComment struct {
 	text    string
 }
 
-func (r *commentRecorder) CommentIssue(_ context.Context, issueID, text string) error {
+func (r *commentRecorder) CommentIssue(_ context.Context, issueID, text string) (string, error) {
 	r.mu.Lock()
 	r.comments = append(r.comments, trackerComment{issueID: issueID, text: text})
 	r.mu.Unlock()
 	if r.posted != nil {
 		r.posted <- struct{}{}
 	}
-	return r.err
+	return postedCommentID, r.err
 }
 
 func (r *commentRecorder) recorded() []trackerComment {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.comments)
+}
+
+type countingRecorder struct{ rows atomic.Int32 }
+
+func (c *countingRecorder) AddPostedComment(context.Context, string, string) error {
+	c.rows.Add(1)
+	return nil
 }
 
 type recordingNotifier struct {
@@ -329,7 +339,7 @@ func TestRouter_Route_Targets(t *testing.T) {
 			if tt.tracker {
 				tracker = &commentRecorder{}
 			}
-			router := route.NewRouter(tracker, lookup.lookup)
+			router := route.NewRouter(tracker, nil, lookup.lookup, nil)
 			mustUpdate(t, router, tt.in)
 
 			delivery := router.Route(notificationOf(tt.event))
@@ -349,7 +359,7 @@ func TestRouter_Route_OldKeyAndMatchingSubscriptionPostOnce(t *testing.T) {
 	t.Parallel()
 
 	tracker := &commentRecorder{}
-	router := route.NewRouter(tracker, nil)
+	router := route.NewRouter(tracker, nil, nil, nil)
 	mustUpdate(t, router, route.Inputs{
 		Entries:  []config.NotificationBackend{entry(domain.TrackerCommentKind, domain.EventTypeSessionStarted)},
 		Comments: config.TrackerCommentsConfig{OnDispatch: true},
@@ -371,7 +381,7 @@ func TestRouter_Route_StampsEnvelope(t *testing.T) {
 
 	host, hostErr := os.Hostname()
 	lookup := newFakeLookup("webhook")
-	router := route.NewRouter(nil, lookup.lookup)
+	router := route.NewRouter(nil, nil, lookup.lookup, nil)
 	mustUpdate(t, router, route.Inputs{Entries: []config.NotificationBackend{entry("webhook", domain.EventBudgetHeld)}})
 
 	router.Route(notificationOf(domain.EventBudgetHeld)).Deliver(context.Background())
@@ -407,7 +417,7 @@ func TestRouter_Route_EmptyDeliveries(t *testing.T) {
 	t.Parallel()
 
 	tracker := &commentRecorder{}
-	router := route.NewRouter(tracker, nil)
+	router := route.NewRouter(tracker, nil, nil, nil)
 	mustUpdate(t, router, route.Inputs{Comments: config.TrackerCommentsConfig{OnDispatch: true}})
 	var nilRouter *route.Router
 
@@ -483,7 +493,7 @@ func TestDelivery_SplitTrackerComment(t *testing.T) {
 			if tt.tracker {
 				tracker = recorder
 			}
-			router := route.NewRouter(tracker, lookup.lookup)
+			router := route.NewRouter(tracker, nil, lookup.lookup, nil)
 			mustUpdate(t, router, route.Inputs{Entries: tt.entries})
 
 			trackerPart, others := router.Route(notificationOf(domain.EventBudgetHeld)).SplitTrackerComment()
@@ -506,7 +516,7 @@ func TestDelivery_SplitTrackerComment_SharesOneStampedNotification(t *testing.T)
 	t.Parallel()
 
 	lookup := newFakeLookup("webhook")
-	router := route.NewRouter(&commentRecorder{}, lookup.lookup)
+	router := route.NewRouter(&commentRecorder{}, nil, lookup.lookup, nil)
 	mustUpdate(t, router, route.Inputs{Entries: []config.NotificationBackend{entry("webhook", domain.EventBudgetHeld)}})
 
 	trackerPart, others := router.Route(notificationOf(domain.EventBudgetHeld)).SplitTrackerComment()
@@ -547,7 +557,7 @@ func TestRouter_Update_Failure(t *testing.T) {
 			t.Parallel()
 
 			lookup := newFakeLookup("webhook", "slack")
-			router := route.NewRouter(nil, lookup.lookup)
+			router := route.NewRouter(nil, nil, lookup.lookup, nil)
 			installed := route.Inputs{Entries: []config.NotificationBackend{entry("webhook", domain.EventBudgetHeld)}}
 			mustUpdate(t, router, installed)
 			tt.setup(lookup)
@@ -579,7 +589,7 @@ func TestRouter_Update_RebuildsDestinationsOnlyWhenEntriesDiffer(t *testing.T) {
 	t.Parallel()
 
 	lookup := newFakeLookup("webhook")
-	router := route.NewRouter(nil, lookup.lookup)
+	router := route.NewRouter(nil, nil, lookup.lookup, nil)
 	entries := func(events ...domain.EventType) route.Inputs {
 		return route.Inputs{Entries: []config.NotificationBackend{entry("webhook", events...)}}
 	}
@@ -616,7 +626,7 @@ func TestDelivery_Deliver_JoinsEverySend(t *testing.T) {
 	failing := lookup.notifiers["webhook"]
 	failing.err = errors.New("endpoint refused")
 	tracker := &commentRecorder{posted: make(chan struct{}, 1)}
-	router := route.NewRouter(tracker, lookup.lookup)
+	router := route.NewRouter(tracker, nil, lookup.lookup, nil)
 	mustUpdate(t, router, route.Inputs{Entries: []config.NotificationBackend{
 		entry("slack", domain.EventBudgetHeld),
 		entry("webhook", domain.EventBudgetHeld),
@@ -654,6 +664,63 @@ func TestDelivery_Deliver_JoinsEverySend(t *testing.T) {
 	}
 	if outcomes[2].Kind != "webhook" {
 		t.Errorf("Deliver() webhook outcome Kind = %q, want %q", outcomes[2].Kind, "webhook")
+	}
+}
+
+func TestRouter_AwaitTrackerCommentsWaitsForAPostInFlight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		endWaitFirst bool
+		wantErr      error
+		wantRows     int32
+	}{
+		{name: "the post returns after its row is recorded", wantRows: 1},
+		{name: "the context ends before the post returns", endWaitFirst: true, wantErr: context.Canceled},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				tracker := &commentRecorder{posted: make(chan struct{})}
+				recorder := &countingRecorder{}
+				router := route.NewRouter(tracker, recorder, nil, nil)
+				mustUpdate(t, router, route.Inputs{Entries: []config.NotificationBackend{entry(domain.TrackerCommentKind, domain.EventSessionStopped)}})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go router.Route(notificationOf(domain.EventSessionStopped)).Deliver(context.Background())
+				synctest.Wait()
+				awaited := make(chan error, 1)
+				go func() { awaited <- router.AwaitTrackerComments(ctx, "ISS-1") }()
+				synctest.Wait()
+
+				select {
+				case err := <-awaited:
+					t.Fatalf("AwaitTrackerComments(ISS-1) = %v while a post is in flight, want it pending", err)
+				default:
+				}
+				if tt.endWaitFirst {
+					cancel()
+				} else {
+					<-tracker.posted
+				}
+				err := <-awaited
+				gotRows := recorder.rows.Load()
+				if tt.endWaitFirst {
+					<-tracker.posted
+				}
+
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("AwaitTrackerComments(ISS-1) = %v, want %v", err, tt.wantErr)
+				}
+				if gotRows != tt.wantRows {
+					t.Errorf("posted rows when AwaitTrackerComments(ISS-1) returned = %d, want %d", gotRows, tt.wantRows)
+				}
+			})
+		})
 	}
 }
 
@@ -708,7 +775,7 @@ func TestRouter_RouteDuringUpdate(t *testing.T) {
 	t.Parallel()
 
 	lookup := newFakeLookup("webhook")
-	router := route.NewRouter(&commentRecorder{}, lookup.lookup)
+	router := route.NewRouter(&commentRecorder{}, nil, lookup.lookup, nil)
 	mustUpdate(t, router, route.Inputs{})
 
 	var wg sync.WaitGroup

@@ -16,45 +16,51 @@ type AttemptSettings struct {
 	UsageArrival     registry.UsageArrival
 	UsageAttribution registry.UsageAttribution
 
+	// CarriesTokenFigure reports whether the kind's sources can carry a
+	// token figure.
+	CarriesTokenFigure bool
+
 	// Refusals are the error-severity checks the block fails; an attempt
 	// with any starts no session.
 	Refusals []PreflightError
 }
 
 // resolveAttemptSettings resolves the settings an attempt of selection
-// runs with from cfg; sshHost is empty for a local launch. Call it once
+// runs with from cfg. Call it once
 // per attempt on the event loop, so a reload reaches a claim already held.
-func (o *Orchestrator) resolveAttemptSettings(cfg config.ServiceConfig, selection DispatchResolution, sshHost string) AttemptSettings {
+func (o *Orchestrator) resolveAttemptSettings(cfg config.ServiceConfig, selection DispatchResolution) AttemptSettings {
 	settings := config.ResolveAgentSettings(cfg,
 		config.SettingsSelection{Kind: selection.AgentKind, RuleName: selection.RuleName},
 		filepath.Dir(o.workflowManager.WorkflowAbsPath()))
 	meta, registered := o.preflightParams.AgentRegistry.Meta(selection.AgentKind)
 
-	arrival, attribution := usageDisposition(meta, registered, settings.Passthrough, sshHost != "")
-	refusals, _ := settingsDiagnostics(cfg, meta, registered, settings, sshHost != "")
+	arrival, attribution, carriesTokenFigure := usageDisposition(meta, registered)
+	refusals, _ := settingsDiagnostics(cfg, meta, registered, settings)
 
 	return AttemptSettings{
-		Settings:         settings,
-		UsageArrival:     arrival,
-		UsageAttribution: attribution,
-		Refusals:         refusals,
+		Settings:           settings,
+		UsageArrival:       arrival,
+		UsageAttribution:   attribution,
+		CarriesTokenFigure: carriesTokenFigure,
+		Refusals:           refusals,
 	}
 }
 
-// usageDisposition returns the usage arrival and attribution a session of
-// meta reports under passthrough, the undeclared pair for a kind the
-// registry does not hold.
-func usageDisposition(meta registry.AgentMeta, registered bool, passthrough map[string]any, remote bool) (registry.UsageArrival, registry.UsageAttribution) {
+// usageDisposition returns the usage arrival and attribution derived from
+// meta's sources and whether a session can carry a token figure, the
+// undeclared pair and false for a kind the registry does not hold.
+func usageDisposition(meta registry.AgentMeta, registered bool) (registry.UsageArrival, registry.UsageAttribution, bool) {
 	if !registered {
-		return registry.UsageArrivalUndeclared, registry.UsageAttributionUndeclared
+		return registry.UsageArrivalUndeclared, registry.UsageAttributionUndeclared, false
 	}
-	return meta.UsageDisposition(passthrough, remote)
+	arrival, attribution := meta.UsageDisposition()
+	return arrival, attribution, meta.UsageSources.CarriesTokenFigure()
 }
 
 // settingsDiagnostics runs every check that reads a resolved settings
 // block. Preflight and every attempt share it, so they cannot disagree
 // about a block. An unregistered kind draws nothing.
-func settingsDiagnostics(cfg config.ServiceConfig, meta registry.AgentMeta, registered bool, settings config.AgentSettings, remote bool) ([]PreflightError, []PreflightWarning) {
+func settingsDiagnostics(cfg config.ServiceConfig, meta registry.AgentMeta, registered bool, settings config.AgentSettings) ([]PreflightError, []PreflightWarning) {
 	if !registered {
 		return nil, nil
 	}
@@ -63,15 +69,14 @@ func settingsDiagnostics(cfg config.ServiceConfig, meta registry.AgentMeta, regi
 	var warns []PreflightWarning
 	kind := settings.Kind
 
-	if meta.MCPInjection == registry.MCPInjectionUnsupported && settings.MCPConfigPath != "" {
+	if meta.MCPDialect == registry.MCPDialectNone && settings.MCPConfigPath != "" {
 		warns = append(warns, PreflightWarning{
 			Check:   "agent.mcp_config",
 			Message: "mcp_config in the " + strconv.Quote(kind) + " block cannot reach the agent: this agent kind receives no MCP configuration",
 		})
 	}
 
-	arrival, _ := meta.UsageDisposition(settings.Passthrough, remote)
-	if !arrival.ReportsAnyFigure() {
+	if !meta.UsageSources.CarriesTokenFigure() {
 		if cfg.Agent.MaxTokens != 0 {
 			warns = append(warns, PreflightWarning{
 				Check: "agent.kind.no_usage_reporting",
@@ -95,15 +100,16 @@ func settingsDiagnostics(cfg config.ServiceConfig, meta registry.AgentMeta, regi
 		}
 	}
 
-	// A continuation, including one restored after a restart, and a stall
-	// retry that fires before any restart resume the earlier session, so a
-	// kind that cannot resume fails every such turn.
+	// A continuation, including one restored after a restart, a stall retry
+	// that fires before any restart, and the first run after a person
+	// releases a park resume the earlier session, so a kind that cannot
+	// resume fails every such turn.
 	if meta.SessionResumeBlockedBy != nil {
 		if key := meta.SessionResumeBlockedBy(settings.Passthrough); key != "" {
 			errs = append(errs, PreflightError{
 				Check: "agent.kind.session_resume",
 				Message: kind + "." + key + " stops this agent kind from resuming a session across separate agent launches, " +
-					"but Sortie resumes an issue's earlier session on a continuation, including one queued before a restart, and on the retry after a stall while Sortie keeps running, " +
+					"but Sortie resumes an issue's earlier session on a continuation, including one queued before a restart, on the retry after a stall while Sortie keeps running, and on the first run after a person releases a park, " +
 					"and every such turn fails. Change " + kind + "." + key + ", or use an agent kind that can resume a session.",
 			})
 		}

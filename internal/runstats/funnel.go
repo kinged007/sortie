@@ -4,13 +4,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
-
-// funnelBreakdownWarning explains the missing chain_funnels.
-const funnelBreakdownWarning = "this database was written before sortie recorded which runs stopped to wait for a person, " +
-	"so the report leaves out the funnel of each stage chain. " +
-	"Run sortie once with this workflow to add it."
 
 const (
 	stageResultAdvanced = "advanced"
@@ -23,6 +18,7 @@ const (
 	reasonRunFailed       = "run_failed"
 	reasonNeedsPerson     = "needs_person"
 	reasonBudgetHeld      = "budget_held"
+	reasonUsageLimited    = "usage_limited"
 	reasonOperatorStopped = "operator_stopped"
 	reasonVerdictWithheld = "verdict_withheld"
 )
@@ -32,6 +28,7 @@ var noHopReasonOrder = []string{
 	reasonRunFailed,
 	reasonNeedsPerson,
 	reasonBudgetHeld,
+	reasonUsageLimited,
 	reasonOperatorStopped,
 	reasonVerdictWithheld,
 }
@@ -59,7 +56,7 @@ type passAccum struct {
 // foldPass folds row into the pass of its chain and rule. A reaction run
 // takes part only with a hop result; without one it counts in by_rule alone.
 // Rows arrive in ascending id order, so the last folded run decides.
-func (a *Aggregator) foldPass(row persistence.RunStatsRow) {
+func (a *Aggregator) foldPass(row storage.RunStatsRow) {
 	if row.ChainID == "" || row.RuleName == "" {
 		return
 	}
@@ -296,6 +293,8 @@ func (stage *FunnelStage) countOutcome(p *passAccum, held, budget bool) string {
 		return stage.noHop(reasonNeedsPerson)
 	case latest.status == "budget_stopped":
 		return stage.noHop(reasonBudgetHeld)
+	case latest.status == "usage_limited":
+		return stage.noHop(reasonUsageLimited)
 	case latest.status == "cancelled":
 		return stage.noHop(reasonOperatorStopped)
 	default:

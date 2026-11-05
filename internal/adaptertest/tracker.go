@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -40,15 +41,48 @@ func AssertIssueNormalized(t *testing.T, issue domain.Issue) {
 }
 
 // AssertCommentsAscending pins the ordering clause a fetched comment list
-// must satisfy: entries are sorted oldest first by CreatedAt.
+// must satisfy: every CreatedAt parses through [domain.Comment.CreatedTime]
+// and the instants are sorted oldest first.
 func AssertCommentsAscending(t *testing.T, comments []domain.Comment) {
 	t.Helper()
 
-	for i := 1; i < len(comments); i++ {
-		if comments[i-1].CreatedAt > comments[i].CreatedAt {
-			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q sorts after comment[%d].CreatedAt %q, want ascending order",
-				i-1, comments[i-1].CreatedAt, i, comments[i].CreatedAt)
+	var prev time.Time
+	for i, c := range comments {
+		created, err := c.CreatedTime()
+		if err != nil {
+			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q does not parse: %v", i, c.CreatedAt, err)
+			return
 		}
+		if i > 0 && created.Before(prev) {
+			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q is before comment[%d].CreatedAt %q, want oldest first",
+				i, c.CreatedAt, i-1, comments[i-1].CreatedAt)
+		}
+		prev = created
+	}
+}
+
+// AssertPostedCommentListed pins the [domain.TrackerAdapter.CommentIssue]
+// clause that a nil-error call returns a non-empty identity equal to the
+// Comment.ID the tracker's read path reports for the created comment.
+// commentID is the value CommentIssue returned and comments is the list
+// fetched afterwards; exactly one entry must carry that ID.
+func AssertPostedCommentListed(t *testing.T, commentID string, comments []domain.Comment) {
+	t.Helper()
+
+	ids := make([]string, len(comments))
+	n := 0
+	for i, c := range comments {
+		ids[i] = c.ID
+		if c.ID == commentID {
+			n++
+		}
+	}
+	if commentID == "" {
+		t.Errorf("AssertPostedCommentListed: CommentIssue returned an empty identity, want non-empty (listed IDs %q)", ids)
+		return
+	}
+	if n != 1 {
+		t.Errorf("AssertPostedCommentListed: identity %q appears %d times among listed IDs %q, want exactly 1", commentID, n, ids)
 	}
 }
 

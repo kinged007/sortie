@@ -17,5 +17,5 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_scripted_1","type":"function_call","status":"completed","call_id":"call_scripted_1","name":"read_file","arguments":"{\"path\":\"/workspace/nonce.txt\"}"}}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_scripted_1","object":"response","status":"completed","output":[{"id":"fc_scripted_1","type":"function_call","status":"completed","call_id":"call_scripted_1","name":"read_file","arguments":"{\"path\":\"/workspace/nonce.txt\"}"}],"model":"scripted-model","usage":{"input_tokens":500,"input_tokens_details":{"cached_tokens":100},"output_tokens":52,"output_tokens_details":{"reasoning_tokens":12},"total_tokens":552}}}
+data: {"type":"response.completed","response":{"id":"resp_scripted_1","object":"response","status":"completed","output":[{"id":"fc_scripted_1","type":"function_call","status":"completed","call_id":"call_scripted_1","name":"read_file","arguments":"{\"path\":\"/workspace/nonce.txt\"}"}],"model":"scripted-model","usage":{"input_tokens":500,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":30},"output_tokens":52,"output_tokens_details":{"reasoning_tokens":12},"total_tokens":552}}}
 

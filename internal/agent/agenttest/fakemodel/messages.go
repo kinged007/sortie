@@ -27,7 +27,7 @@ func (messagesCodec) credentialHeaders() []string {
 	return []string{"x-api-key", "Authorization"}
 }
 
-func (messagesCodec) route(method, path string) (route, bool) {
+func (messagesCodec) route(method, path string, _ http.Header) (route, bool) {
 	return route{}, method == http.MethodPost && path == "/v1/messages"
 }
 
@@ -163,6 +163,9 @@ func (messagesCodec) render(r reply) rendered {
 		start = messagesContent{Type: "tool_use", ID: callID, Name: r.call.Name, Input: json.RawMessage("{}")}
 		delta = messagesBlockDelta{Type: "input_json_delta", PartialJSON: string(r.call.Arguments)}
 	} else {
+		if r.truncated {
+			stopReason = "max_tokens"
+		}
 		empty := ""
 		start = messagesContent{Type: "text", Text: &empty}
 		delta = messagesBlockDelta{Type: "text_delta", Text: r.text}

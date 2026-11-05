@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
@@ -15,18 +16,13 @@ import (
 	"github.com/sortie-ai/sortie/internal/logging"
 )
 
-// errConnectionLost is the sentinel a startup handshake step's returned
-// error carries, recoverable with errors.Is, when the app-server
-// connection ended without answering: a Call or Notify failure that is
-// neither a cancelled nor an elapsed context, or the login wait seeing
-// the inbox close or a scanner error.
+// errConnectionLost marks a startup handshake error, for errors.Is, when
+// the app-server connection ended without answering.
 var errConnectionLost = errors.New("codex: connection lost during startup")
 
-// connectionLossErr wraps a handshake step's own error so errors.Is
-// recognizes errConnectionLost while Error() renders exactly the
-// wrapped error's own text: a caller that falls through to today's
-// transport message, because the runtime stayed alive past the
-// observation grace, must see it unchanged.
+// connectionLossErr renders exactly the wrapped error's text: when the
+// runtime outlives the early-exit observation, the caller reports that
+// text unchanged.
 type connectionLossErr struct {
 	err error
 }
@@ -36,8 +32,7 @@ func (e *connectionLossErr) Unwrap() error        { return e.err }
 func (e *connectionLossErr) Is(target error) bool { return target == errConnectionLost }
 
 // wrapConnectionLoss marks err as a connection loss unless it is a
-// cancelled or elapsed context, which are not: the caller already
-// knows why the request ended in either case.
+// cancelled or elapsed context, whose cause the caller already knows.
 func wrapConnectionLoss(err error) error {
 	if err == nil {
 		return nil
@@ -91,10 +86,9 @@ func initializeHandshake(ctx context.Context, state *sessionState) error {
 	return nil
 }
 
-// authenticateIfNeeded checks the app-server auth state and performs
-// API key login if needed. logger reports a message observed while
-// waiting for the login to complete; the thread id is not yet known at
-// this point in the handshake, so logger carries no session scope.
+// authenticateIfNeeded logs in with CODEX_API_KEY when the app-server
+// holds no account and the key is set. logger carries no session scope:
+// no thread exists yet.
 func authenticateIfNeeded(ctx context.Context, state *sessionState, logger *slog.Logger) error {
 	readCtx, cancel := context.WithTimeout(ctx, agentcore.ReadTimeout(state.agentConfig))
 	defer cancel()
@@ -111,10 +105,7 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState, logger *slog
 		return fmt.Errorf("account/read unmarshal: %w", err)
 	}
 
-	// Account is non-null when the app-server already has valid
-	// credentials. The JSON null literal unmarshals to a nil
-	// RawMessage.
-	if len(acct.Account) > 0 && string(acct.Account) != "null" {
+	if hasAccount(acct) {
 		return nil
 	}
 
@@ -139,8 +130,14 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState, logger *slog
 		}
 		return agentcore.CredentialRefusedError(text, nil)
 	}
+	return awaitLoginCompleted(ctx, state, logger)
+}
 
-	// Wait for account/login/completed notification.
+func hasAccount(acct accountResult) bool {
+	return len(acct.Account) > 0 && string(acct.Account) != "null"
+}
+
+func awaitLoginCompleted(ctx context.Context, state *sessionState, logger *slog.Logger) error {
 	deadline := time.After(agentcore.ReadTimeout(state.agentConfig))
 	for {
 		select {
@@ -178,13 +175,67 @@ func authenticateIfNeeded(ctx context.Context, state *sessionState, logger *slog
 	}
 }
 
-// startThread sends thread/start and waits for the thread/started
-// notification. Returns the thread ID and the effective model the
-// response reported, empty when the response omitted it. An empty
-// model is never an error. logger reports a message observed while
-// waiting for that notification, scoped to the thread id this call
-// resolves.
-func startThread(ctx context.Context, state *sessionState, pt passthroughConfig, logger *slog.Logger) (threadID string, model string, err error) {
+// verificationDisabledFeatures are flags from the runtime's published
+// configuration reference; a build that does not know one ignores it.
+var verificationDisabledFeatures = []string{
+	"shell_tool", "unified_exec", "multi_agent", "apps", "plugins", "goals",
+	"browser_use", "computer_use", "hooks", "in_app_browser",
+}
+
+// verificationThreadConfig uses flat, dotted keys and gives each value the JSON
+// type the configuration reference gives it: a wrong type fails thread/start,
+// where an unknown key is only ignored.
+func verificationThreadConfig(serverIDs []string) map[string]any {
+	config := map[string]any{
+		"project_doc_max_bytes": 0,
+		"web_search":            "disabled",
+	}
+	for _, name := range verificationDisabledFeatures {
+		config["features."+name] = false
+	}
+	for _, id := range serverIDs {
+		config["mcp_servers."+id+".enabled"] = false
+	}
+	return config
+}
+
+// readConfiguredServerIDs reads the MCP server ids from the app-server's
+// configuration because thread/start fails on an id the configuration does not
+// hold. Any failure or unexpected shape yields no ids, so an older build saves
+// less and the session still starts.
+func readConfiguredServerIDs(ctx context.Context, state *sessionState, logger *slog.Logger) []string {
+	callCtx, cancel := context.WithTimeout(ctx, agentcore.ReadTimeout(state.agentConfig))
+	defer cancel()
+	resp, err := state.conn.Call(callCtx, "config/read", map[string]any{
+		"cwd":           state.target.WorkspacePath,
+		"includeLayers": false,
+	})
+	if err != nil {
+		logger.Debug("config/read failed, no MCP servers disabled", slog.Any("error", err))
+		return nil
+	}
+	if resp.Error != nil {
+		logger.Debug("config/read refused, no MCP servers disabled",
+			slog.Int("code", resp.Error.Code), slog.String("message", resp.Error.Message))
+		return nil
+	}
+
+	var result struct {
+		Config struct {
+			MCPServers map[string]json.RawMessage `json:"mcp_servers"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		logger.Debug("config/read result not decoded, no MCP servers disabled", slog.Any("error", err))
+		return nil
+	}
+	return slices.Sorted(maps.Keys(result.Config.MCPServers))
+}
+
+// startThread starts a thread and returns its id, plus the effective
+// model and on-disk path the response reported; an omitted model or
+// path is empty, never an error.
+func startThread(ctx context.Context, state *sessionState, pt passthroughConfig, logger *slog.Logger) (threadID string, model string, path string, err error) {
 	approvalPolicy := pt.ApprovalPolicy
 	if approvalPolicy == "" {
 		approvalPolicy = "never"
@@ -209,7 +260,10 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig,
 	if pt.Model != "" {
 		params["model"] = pt.Model
 	}
-	if pt.Personality != "" {
+	if state.reducedVerificationContext {
+		params["baseInstructions"] = agentcore.VerificationSystemPrompt
+		params["config"] = verificationThreadConfig(readConfiguredServerIDs(ctx, state, logger))
+	} else if pt.Personality != "" {
 		params["personality"] = pt.Personality
 	}
 
@@ -217,81 +271,89 @@ func startThread(ctx context.Context, state *sessionState, pt passthroughConfig,
 	resp, callErr := state.conn.Call(callCtx, "thread/start", params)
 	cancel()
 	if callErr != nil {
-		return "", "", wrapConnectionLoss(fmt.Errorf("thread/start: %w", callErr))
+		return "", "", "", wrapConnectionLoss(fmt.Errorf("thread/start: %w", callErr))
 	}
 	if resp.Error != nil {
-		return "", "", fmt.Errorf("thread/start error: code=%d message=%s", resp.Error.Code, resp.Error.Message)
+		return "", "", "", fmt.Errorf("thread/start error: code=%d message=%s", resp.Error.Code, resp.Error.Message)
 	}
 
 	var result threadResult
 	if unmarshalErr := json.Unmarshal(resp.Result, &result); unmarshalErr != nil {
-		return "", "", fmt.Errorf("thread/start unmarshal: %w", unmarshalErr)
+		return "", "", "", fmt.Errorf("thread/start unmarshal: %w", unmarshalErr)
 	}
 	threadID = result.Thread.ID
 	if threadID == "" {
-		return "", "", fmt.Errorf("thread/start returned empty thread ID")
+		return "", "", "", fmt.Errorf("thread/start returned empty thread ID")
 	}
-	threadLogger := logging.WithSession(logger, threadID)
+	if err := awaitThreadStarted(ctx, state, logging.WithSession(logger, threadID)); err != nil {
+		return "", "", "", err
+	}
+	return threadID, result.Model, result.path(), nil
+}
 
-	// Wait for thread/started notification.
+// awaitThreadStarted fails only when ctx ends: some app-server versions
+// never send thread/started, so the deadline and a closed stream accept
+// the thread without it.
+func awaitThreadStarted(ctx context.Context, state *sessionState, logger *slog.Logger) error {
 	deadline := time.After(agentcore.ReadTimeout(state.agentConfig))
 	for {
 		select {
 		case <-ctx.Done():
-			return "", "", ctx.Err()
+			return ctx.Err()
 		case <-deadline:
-			// Accept the thread ID even without the notification.
-			// Some app-server versions may not emit it.
-			return threadID, result.Model, nil
+			return nil
 		case <-state.inbox.Ready():
 			msg, ok := state.inbox.Take()
 			if !ok {
-				return threadID, result.Model, nil
+				return nil
 			}
 			if msg.Kind == jsonrpc.KindStreamEnd {
-				threadLogger.Debug("scanner error waiting for thread/started", slog.Any("error", msg.Err))
-				return threadID, result.Model, nil
+				logger.Debug("scanner error waiting for thread/started", slog.Any("error", msg.Err))
+				return nil
 			}
 			if msg.Kind == jsonrpc.KindMalformed {
 				continue
 			}
 			if msg.Kind == jsonrpc.KindNotification && msg.Method == "thread/started" {
-				return threadID, result.Model, nil
+				return nil
 			}
-			handleOutOfTurnMessage(state, msg, threadLogger)
+			handleOutOfTurnMessage(state, msg, logger)
 		}
 	}
 }
 
-// resumeThread sends thread/resume for an existing thread. It returns
-// the effective model the response reported. A response whose result
-// fails to unmarshal does not turn a successful resume into a
-// failure: it returns an empty model and a nil error.
-func resumeThread(ctx context.Context, state *sessionState, threadID string) (model string, err error) {
+// errResumeRejected marks resumeThread's error, for errors.Is, when the
+// app-server answered thread/resume with an error response.
+var errResumeRejected = errors.New("thread/resume error")
+
+// resumeThread resumes threadID and returns the effective model and
+// on-disk path the response reported, both empty when its result does
+// not decode: that does not fail a successful resume. An error response
+// wraps errResumeRejected, a lost connection errConnectionLost, and an
+// elapsed read bound context.DeadlineExceeded.
+func resumeThread(ctx context.Context, state *sessionState, threadID string) (model, path string, err error) {
 	callCtx, cancel := context.WithTimeout(ctx, agentcore.ReadTimeout(state.agentConfig))
 	defer cancel()
 	resp, callErr := state.conn.Call(callCtx, "thread/resume", map[string]any{
 		"threadId": threadID,
 	})
 	if callErr != nil {
-		return "", wrapConnectionLoss(fmt.Errorf("thread/resume: %w", callErr))
+		return "", "", wrapConnectionLoss(fmt.Errorf("thread/resume: %w", callErr))
 	}
 	if resp.Error != nil {
-		return "", fmt.Errorf("thread/resume error: code=%d message=%s", resp.Error.Code, resp.Error.Message)
+		return "", "", fmt.Errorf("%w: code=%d message=%s", errResumeRejected, resp.Error.Code, resp.Error.Message)
 	}
 
 	var result threadResult
 	if unmarshalErr := json.Unmarshal(resp.Result, &result); unmarshalErr != nil {
-		return "", nil
+		return "", "", nil
 	}
-	return result.Model, nil
+	return result.Model, result.path(), nil
 }
 
-// buildSandboxPolicy constructs the sandboxPolicy for turn/start.
-// writableRoots defaults to the workspace path and networkAccess
-// defaults to false. Operator overrides from TurnSandboxPolicy
-// (WORKFLOW.md turn_sandbox_policy) are merged on top and may
-// replace any key, including writableRoots and networkAccess.
+// buildSandboxPolicy returns turn/start's sandboxPolicy. The operator's
+// turn_sandbox_policy may replace any key, writableRoots and
+// networkAccess included.
 func buildSandboxPolicy(state *sessionState, pt passthroughConfig) map[string]any {
 	if state.credentialVerification {
 		return map[string]any{
@@ -318,10 +380,8 @@ func buildSandboxPolicy(state *sessionState, pt passthroughConfig) map[string]an
 	return policy
 }
 
-// normalizeSandbox maps user-friendly camelCase sandbox values from
-// WORKFLOW.md to the kebab-case wire format expected by the app-server
-// thread/start sandbox field. Values already in kebab-case are passed
-// through unchanged.
+// normalizeSandbox maps a camelCase WORKFLOW.md sandbox value to the
+// kebab-case thread/start expects; any other value passes unchanged.
 func normalizeSandbox(s string) string {
 	switch s {
 	case "workspaceWrite":
@@ -337,9 +397,8 @@ func normalizeSandbox(s string) string {
 	}
 }
 
-// denormalizeSandbox maps kebab-case sandbox values to the camelCase wire
-// format expected by the app-server turn/start sandboxPolicy.type field.
-// Values already in camelCase are passed through unchanged.
+// denormalizeSandbox maps a kebab-case sandbox value to the camelCase
+// turn/start sandboxPolicy.type expects; any other value passes unchanged.
 func denormalizeSandbox(s string) string {
 	switch s {
 	case "workspace-write":

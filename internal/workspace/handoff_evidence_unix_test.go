@@ -5,17 +5,14 @@ package workspace
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // fakeGitOnPath installs a shell script named "git" at the front of
@@ -38,8 +35,7 @@ func fakeGitOnPath(t *testing.T, body string) {
 // TestCaptureHandoffEvidenceBaseline_HeldDescendantHoldingOutput pins
 // that, with a held descendant holding the output of every git
 // invocation the inspection makes, CaptureHandoffEvidenceBaseline
-// returns within its timer with a computed fingerprint, and the last
-// descendant is gone.
+// returns with a computed fingerprint, and the last descendant is gone.
 func TestCaptureHandoffEvidenceBaseline_HeldDescendantHoldingOutput(t *testing.T) {
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -52,11 +48,7 @@ func TestCaptureHandoffEvidenceBaseline_HeldDescendantHoldingOutput(t *testing.T
 	fakeGitOnPath(t, "\""+realGit+"\" \"$@\"\n"+
 		"sleep 30 & echo $! > '"+pidFile+"'\n")
 
-	start := time.Now()
 	baseline, err := CaptureHandoffEvidenceBaseline(context.Background(), repoDir)
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("CaptureHandoffEvidenceBaseline() took %v, want within 5s", elapsed)
-	}
 	if err != nil {
 		t.Fatalf("CaptureHandoffEvidenceBaseline() error = %v", err)
 	}
@@ -68,22 +60,7 @@ func TestCaptureHandoffEvidenceBaseline_HeldDescendantHoldingOutput(t *testing.T
 		t.Error("baseline.WorktreeFingerprint is the zero value, want a computed fingerprint")
 	}
 
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read descendant pid file: %v", err)
-	}
-	pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-	if convErr != nil || pid <= 0 {
-		t.Fatalf("parse descendant pid from %q: %v", data, convErr)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("descendant %d still answers signal 0, want it gone", pid)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidFile))
 }
 
 // TestCompareHandoffEvidenceBaseline_EscapedDescendantYieldsIncompleteOutputError

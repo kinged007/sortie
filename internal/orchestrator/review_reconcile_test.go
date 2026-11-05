@@ -16,7 +16,8 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -31,6 +32,13 @@ type mockSCMAdapter struct {
 	botCalls    int
 
 	mergeURL string
+	merged   bool
+	mergeErr error
+
+	decision      domain.ReviewDecision
+	decisionErr   error
+	decisionCalls int
+	mergeCalls    int
 }
 
 var _ domain.SCMAdapter = (*mockSCMAdapter)(nil)
@@ -52,7 +60,8 @@ func (m *mockSCMAdapter) FetchBotReviewComments(_ context.Context, _ int, _, _ s
 }
 
 func (m *mockSCMAdapter) GetReviewDecision(_ context.Context, _ int, _, _ string) (domain.ReviewDecision, error) {
-	return "", nil
+	m.decisionCalls++
+	return m.decision, m.decisionErr
 }
 
 func (m *mockSCMAdapter) GetCIStatus(_ context.Context, _ int, _, _ string) (string, error) {
@@ -60,7 +69,11 @@ func (m *mockSCMAdapter) GetCIStatus(_ context.Context, _ int, _, _ string) (str
 }
 
 func (m *mockSCMAdapter) GetMergeability(_ context.Context, _ int, _, _ string) (domain.PRMergeStatus, error) {
-	return domain.PRMergeStatus{URL: m.mergeURL}, nil
+	m.mergeCalls++
+	if m.mergeErr != nil {
+		return domain.PRMergeStatus{}, m.mergeErr
+	}
+	return domain.PRMergeStatus{URL: m.mergeURL, Merged: m.merged}, nil
 }
 
 func (m *mockSCMAdapter) MergePR(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
@@ -79,15 +92,17 @@ func (m *mockSCMAdapter) RemoveLabel(_ context.Context, _ int, _, _, _ string) e
 	return nil
 }
 
-// reviewReconcileStore is a self-contained ReconcileStore for review tests.
 type reviewReconcileStore struct {
+	storage.RetryEntryStore
+	storage.StageHopStore
+	storage.IssueOutcomeStore
 	reactionActivityLog
 	noEscalationRecords
 	unsupportedReactionObservationStore
 
-	savedEntries    []persistence.RetryEntry
+	savedEntries    []storage.RetryEntry
 	deletedIssueIDs []string
-	outcomes        []persistence.IssueOutcome
+	outcomes        []storage.IssueOutcome
 
 	saveRetryEntryErr   error
 	deleteRetryEntryErr error
@@ -107,7 +122,7 @@ type reviewReconcileStore struct {
 
 var _ ReconcileStore = (*reviewReconcileStore)(nil)
 
-func (s *reviewReconcileStore) SaveRetryEntry(_ context.Context, entry persistence.RetryEntry) error {
+func (s *reviewReconcileStore) SaveRetryEntry(_ context.Context, entry storage.RetryEntry) error {
 	s.savedEntries = append(s.savedEntries, entry)
 	return s.saveRetryEntryErr
 }
@@ -117,12 +132,12 @@ func (s *reviewReconcileStore) DeleteRetryEntry(_ context.Context, issueID strin
 	return s.deleteRetryEntryErr
 }
 
-func (s *reviewReconcileStore) RecordIssueOutcome(_ context.Context, outcome persistence.IssueOutcome) error {
+func (s *reviewReconcileStore) RecordIssueOutcome(_ context.Context, outcome storage.IssueOutcome) error {
 	s.outcomes = append(s.outcomes, outcome)
 	return nil
 }
 
-func (s *reviewReconcileStore) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (s *reviewReconcileStore) AppendRunHistory(_ context.Context, run storage.RunHistory) (storage.RunHistory, error) {
 	return run, nil
 }
 
@@ -189,12 +204,9 @@ func (s *reviewTrackerStub) FetchIssueComments(_ context.Context, _ string) ([]d
 func (s *reviewTrackerStub) TransitionIssue(_ context.Context, _ string, _ string) error {
 	return nil
 }
-func (s *reviewTrackerStub) CommentIssue(_ context.Context, _ string, _ string) error {
+func (s *reviewTrackerStub) CommentIssue(_ context.Context, _ string, _ string) (string, error) {
 	s.commentIssueCalls++
-	return nil
-}
-func (s *reviewTrackerStub) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
-	return nil
+	return testCommentID, nil
 }
 func (s *reviewTrackerStub) AddLabel(_ context.Context, _ string, _ string) error {
 	s.addLabelCalled++
@@ -319,7 +331,13 @@ func reviewParams(store *reviewReconcileStore, scm domain.SCMAdapter, tracker do
 }
 
 type fingerprintModelStore struct {
+	storage.AggregateMetricsStore
+	storage.SessionMetadataStore
+	storage.ParkedIssueStore
+	storage.RunEventStore
+	storage.BudgetHoldNoticeStore
 	livePassLog
+	noUsageLimitHolds
 	reviewReconcileStore
 	fingerprints map[string]*modelFingerprint
 	rows         map[string]map[string]struct{}
@@ -379,7 +397,7 @@ func (s *fingerprintModelStore) storedIDs(issueID, kind string) []string {
 	return slices.Sorted(maps.Keys(s.rows[ReactionKey(issueID, kind)]))
 }
 
-func (s *fingerprintModelStore) AppendRunHistoryWithEvents(_ context.Context, run persistence.RunHistory, _ []persistence.RunEvent, _ persistence.RunEventLimits) (persistence.RunHistory, error) {
+func (s *fingerprintModelStore) AppendRunHistoryWithEvents(_ context.Context, run storage.RunHistory, _ []storage.RunEvent, _ storage.RunEventLimits) (storage.RunHistory, error) {
 	return run, nil
 }
 
@@ -391,15 +409,19 @@ func (s *fingerprintModelStore) QueryConsecutiveHandoffAbsenceCounts(_ context.C
 	return make(map[string]int, len(issueIDs)), nil
 }
 
-func (s *fingerprintModelStore) TokenUsageByIssue(context.Context, string) (persistence.IssueTokenUsage, error) {
-	return persistence.IssueTokenUsage{}, nil
+func (s *fingerprintModelStore) LatestAgentRuns(context.Context, []string) (map[string]storage.RunHistory, error) {
+	return nil, nil
 }
 
-func (s *fingerprintModelStore) UsageCompletedBetween(context.Context, time.Time, time.Time) (persistence.IssueTokenUsage, error) {
-	return persistence.IssueTokenUsage{}, nil
+func (s *fingerprintModelStore) TokenUsageByIssue(context.Context, string) (storage.IssueTokenUsage, error) {
+	return storage.IssueTokenUsage{}, nil
 }
 
-func (s *fingerprintModelStore) UpsertParkedIssue(context.Context, persistence.ParkedIssue) error {
+func (s *fingerprintModelStore) UsageCompletedBetween(context.Context, time.Time, time.Time) (storage.IssueTokenUsage, error) {
+	return storage.IssueTokenUsage{}, nil
+}
+
+func (s *fingerprintModelStore) UpsertParkedIssue(context.Context, storage.ParkedIssue) error {
 	return nil
 }
 
@@ -409,15 +431,15 @@ func (s *fingerprintModelStore) ResetHandoffAbsenceSequence(context.Context, str
 	return nil
 }
 
-func (s *fingerprintModelStore) UpsertBudgetHoldNotice(context.Context, persistence.BudgetHoldNotice) error {
+func (s *fingerprintModelStore) UpsertBudgetHoldNotice(context.Context, storage.BudgetHoldNotice) error {
 	return nil
 }
 
-func (s *fingerprintModelStore) UpsertAggregateMetrics(context.Context, persistence.AggregateMetrics) error {
+func (s *fingerprintModelStore) UpsertAggregateMetrics(context.Context, storage.AggregateMetrics) error {
 	return nil
 }
 
-func (s *fingerprintModelStore) UpsertSessionMetadata(context.Context, persistence.SessionMetadata) error {
+func (s *fingerprintModelStore) UpsertSessionMetadata(context.Context, storage.SessionMetadata) error {
 	return nil
 }
 
@@ -754,30 +776,6 @@ func TestReconcileReviewComments_PollThrottle(t *testing.T) {
 	}
 }
 
-func TestReconcileReviewComments_TTLExpired(t *testing.T) {
-	t.Parallel()
-
-	state := stateWithReviewReaction(t, "ISS-R-3", 10)
-	rkey := ReactionKey("ISS-R-3", ReactionKindReview)
-	// Set CreatedAt 31 minutes before NowFunc.
-	state.PendingReactions[rkey].CreatedAt = reviewBaseTime.Add(-31 * time.Minute)
-
-	store := &reviewReconcileStore{}
-	metrics := newReviewMetricsSpy()
-	scm := &mockSCMAdapter{}
-	params := reviewParams(store, scm, nil)
-	params.ReviewPendingTTL = 30 * time.Minute
-
-	reconcileReviewComments(state, params, discardLogger(), context.Background(), metrics)
-
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions entry retained after TTL expiry; want dropped")
-	}
-	if scm.calls != 0 {
-		t.Errorf("FetchPendingReviews calls = %d, want 0 (TTL exceeded)", scm.calls)
-	}
-}
-
 func TestReconcileReviewComments_DropOnAgeReleasesCounter(t *testing.T) {
 	t.Parallel()
 
@@ -824,9 +822,6 @@ func TestReconcileReviewComments_DropOnAgeReleasesCounter(t *testing.T) {
 	}
 }
 
-// TestReconcileReviewComments_WatchWindowZeroNeverDrops verifies that a
-// ReviewPendingTTL of 0 (watch_window_ms: 0) never drops an entry on age,
-// however old it is.
 func TestReconcileReviewComments_WatchWindowZeroNeverDrops(t *testing.T) {
 	t.Parallel()
 
@@ -847,63 +842,38 @@ func TestReconcileReviewComments_WatchWindowZeroNeverDrops(t *testing.T) {
 	}
 }
 
-// TestReconcileReviewComments_WatchWindowNonDefaultTakesEffect verifies that
-// a configured window other than the default threshold actually gates the
-// drop, not a hardcoded default: an entry older than the configured window
-// is dropped with its attempt counter released, and one younger survives.
 func TestReconcileReviewComments_WatchWindowNonDefaultTakesEffect(t *testing.T) {
 	t.Parallel()
 
-	t.Run("older than configured window is dropped and counter released", func(t *testing.T) {
-		t.Parallel()
+	tests := []struct {
+		name     string
+		age      time.Duration
+		wantKept bool
+	}{
+		{"older than the configured window is dropped", 6 * time.Minute, false},
+		{"younger than the configured window survives", 4 * time.Minute, true},
+	}
 
-		rkey := ReactionKey("ISS-R-WWN-OLD", ReactionKindReview)
-		state := stateWithReviewReaction(t, "ISS-R-WWN-OLD", 10)
-		state.PendingReactions[rkey].CreatedAt = reviewBaseTime.Add(-6 * time.Minute)
-		state.ReactionAttempts[rkey] = 2
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		store := &reviewReconcileStore{}
-		metrics := newReviewMetricsSpy()
-		scm := &mockSCMAdapter{}
-		params := reviewParams(store, scm, nil)
-		params.ReviewPendingTTL = 5 * time.Minute
+			rkey := ReactionKey("ISS-R-WWN", ReactionKindReview)
+			state := stateWithReviewReaction(t, "ISS-R-WWN", 10)
+			state.PendingReactions[rkey].CreatedAt = reviewBaseTime.Add(-tt.age)
+			params := reviewParams(&reviewReconcileStore{}, &mockSCMAdapter{}, nil)
+			params.ReviewPendingTTL = 5 * time.Minute
 
-		reconcileReviewComments(state, params, discardLogger(), context.Background(), metrics)
+			reconcileReviewComments(state, params, discardLogger(), context.Background(), newReviewMetricsSpy())
 
-		if _, ok := state.PendingReactions[rkey]; ok {
-			t.Error("PendingReactions entry present past configured 5m window; want dropped")
-		}
-		if _, ok := state.ReactionAttempts[rkey]; ok {
-			t.Error("ReactionAttempts present past configured 5m window; want released")
-		}
-	})
-
-	t.Run("younger than configured window survives", func(t *testing.T) {
-		t.Parallel()
-
-		rkey := ReactionKey("ISS-R-WWN-NEW", ReactionKindReview)
-		state := stateWithReviewReaction(t, "ISS-R-WWN-NEW", 10)
-		state.PendingReactions[rkey].CreatedAt = reviewBaseTime.Add(-4 * time.Minute)
-
-		store := &reviewReconcileStore{}
-		metrics := newReviewMetricsSpy()
-		scm := &mockSCMAdapter{}
-		params := reviewParams(store, scm, nil)
-		params.ReviewPendingTTL = 5 * time.Minute
-
-		reconcileReviewComments(state, params, discardLogger(), context.Background(), metrics)
-
-		if _, ok := state.PendingReactions[rkey]; !ok {
-			t.Error("PendingReactions entry dropped inside configured 5m window; want kept")
-		}
-	})
+			if _, kept := state.PendingReactions[rkey]; kept != tt.wantKept {
+				t.Errorf("PendingReactions entry kept at age %v with a 5m window = %v, want %v", tt.age, kept, tt.wantKept)
+			}
+		})
+	}
 }
 
-// TestReconcileReviewComments_WatchWindowElapsedLogsRenamedAttribute pins the
-// drop-on-age log record: message text and the window_ms attribute name
-// (renamed from ttl_ms). A regression that reverts the rename or the wording
-// must fail this test.
-func TestReconcileReviewComments_WatchWindowElapsedLogsRenamedAttribute(t *testing.T) {
+func TestReconcileReviewComments_WatchWindowElapsedLogsWindow(t *testing.T) {
 	t.Parallel()
 
 	rkey := ReactionKey("ISS-R-WWLOG", ReactionKindReview)
@@ -919,14 +889,112 @@ func TestReconcileReviewComments_WatchWindowElapsedLogsRenamedAttribute(t *testi
 
 	reconcileReviewComments(state, params, log, context.Background(), metrics)
 
-	output := buf.String()
-	const msg = "review watch window elapsed, dropping"
-	assertLogLineHasIntAttr(t, output, msg, "window_ms", int(30*time.Minute/time.Millisecond))
-	if strings.Contains(output, "ttl_ms") {
-		t.Errorf("log output contains stale attribute %q: %s", "ttl_ms", output)
+	assertLogLineHasIntAttr(t, buf.String(), "review watch window elapsed, dropping", "window_ms", int(30*time.Minute/time.Millisecond))
+}
+
+func TestReconcileReviewComments_ApprovalHold(t *testing.T) {
+	t.Parallel()
+
+	awaitingCheck := &ReactionCheck{ObservedAt: reviewBaseTime.Add(-time.Minute), Comments: &CommentCheck{AwaitingApproval: true}}
+	quietCheck := &ReactionCheck{ObservedAt: reviewBaseTime.Add(-time.Minute), Comments: &CommentCheck{}}
+	const pastWindow, insideWindow = 31 * time.Minute, 5 * time.Minute
+
+	tests := []struct {
+		name        string
+		age         time.Duration
+		check       *ReactionCheck
+		comments    []domain.ReviewComment
+		decision    domain.ReviewDecision
+		decisionErr error
+		merged      bool
+
+		wantKept          bool
+		wantAwaiting      bool
+		wantMergeCalls    int
+		wantDecisionCalls int
+	}{
+		{
+			name: "an entry awaiting approval survives the window", age: pastWindow, check: awaitingCheck,
+			decision: domain.ReviewDecisionReviewRequired,
+			wantKept: true, wantAwaiting: true, wantMergeCalls: 1, wantDecisionCalls: 1,
+		},
+		{
+			name: "an entry not awaiting approval is dropped at the window", age: pastWindow, check: quietCheck,
+			decision: domain.ReviewDecisionReviewRequired,
+		},
+		{
+			name: "an approved pull request is dropped past the window", age: pastWindow, check: awaitingCheck,
+			decision:       domain.ReviewDecisionApproved,
+			wantMergeCalls: 1, wantDecisionCalls: 1,
+		},
+		{
+			name: "a merged pull request drops an entry awaiting approval", age: insideWindow, check: awaitingCheck,
+			decision: domain.ReviewDecisionReviewRequired, merged: true,
+			wantMergeCalls: 1,
+		},
+		{
+			name: "a turn-on pass on a merged pull request drops the entry and writes no check", age: insideWindow,
+			decision: domain.ReviewDecisionReviewRequired, merged: true,
+			wantMergeCalls: 1, wantDecisionCalls: 1,
+		},
+		{
+			name: "a turn-on pass on an open pull request records the wait", age: insideWindow,
+			decision: domain.ReviewDecisionReviewRequired,
+			wantKept: true, wantAwaiting: true, wantMergeCalls: 1, wantDecisionCalls: 1,
+		},
+		{
+			name: "a failed decision read keeps the reading past the window", age: pastWindow, check: awaitingCheck,
+			decisionErr: errors.New("connection reset"),
+			wantKept:    true, wantAwaiting: true, wantMergeCalls: 1, wantDecisionCalls: 1,
+		},
+		{
+			name: "actionable comments past the window drop the entry and dispatch nothing", age: pastWindow, check: awaitingCheck,
+			comments:       []domain.ReviewComment{summaryComment("c1")},
+			decision:       domain.ReviewDecisionReviewRequired,
+			wantMergeCalls: 1,
+		},
 	}
-	if strings.Contains(output, "exceeded ttl") {
-		t.Errorf("log output contains stale message wording %q: %s", "exceeded ttl", output)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rkey := ReactionKey("ISS-R-HOLD", ReactionKindReview)
+			state := stateWithReviewReaction(t, "ISS-R-HOLD", 10)
+			entry := state.PendingReactions[rkey]
+			entry.CreatedAt = reviewBaseTime.Add(-tt.age)
+			entry.LastCheck = tt.check
+			store := &reviewReconcileStore{}
+			scm := &mockSCMAdapter{comments: tt.comments, decision: tt.decision, decisionErr: tt.decisionErr, merged: tt.merged}
+			params := reviewParams(store, scm, nil)
+			params.ReviewPendingTTL = 30 * time.Minute
+
+			reconcileReviewComments(state, params, discardLogger(), context.Background(), newReviewMetricsSpy())
+
+			_, kept := state.PendingReactions[rkey]
+			if kept != tt.wantKept {
+				t.Fatalf("PendingReactions entry kept = %v, want %v", kept, tt.wantKept)
+			}
+			if scm.mergeCalls != tt.wantMergeCalls || scm.decisionCalls != tt.wantDecisionCalls {
+				t.Errorf("GetMergeability, GetReviewDecision calls = %d, %d, want %d, %d",
+					scm.mergeCalls, scm.decisionCalls, tt.wantMergeCalls, tt.wantDecisionCalls)
+			}
+			if len(state.RetryAttempts) != 0 || store.upsertFingerprintCalls != 0 {
+				t.Errorf("retries, fingerprint upserts = %d, %d, want a pass that dispatches nothing", len(state.RetryAttempts), store.upsertFingerprintCalls)
+			}
+			if !kept {
+				if tt.check == nil && entry.LastCheck != nil {
+					t.Errorf("dropped entry LastCheck = %+v, want none written", entry.LastCheck)
+				}
+				return
+			}
+			if got := awaits(entry.LastCheck); got != tt.wantAwaiting {
+				t.Errorf("awaiting approval after the pass = %v, want %v", got, tt.wantAwaiting)
+			}
+			if entry.PendingAttempts != 0 || entry.Wait != waitPollInterval {
+				t.Errorf("PendingAttempts, Wait = %d, %q, want 0, %q", entry.PendingAttempts, entry.Wait, waitPollInterval)
+			}
+		})
 	}
 }
 
@@ -1920,7 +1988,7 @@ func runReviewTriageToCompletion(t *testing.T, state *State, params ReconcilePar
 	if !ok || entry.Triage == nil {
 		t.Fatalf("PendingReactions[%s] = %+v, want a started triage run", rkey, entry)
 	}
-	waitTriageRunDone(t, entry.Triage)
+	waittest.Receive(t, entry.Triage.Done, "triage run to finish")
 	entry.PendingRetryAt = time.Time{}
 }
 
@@ -3852,7 +3920,7 @@ func (s *reviewReconcileStore) DeleteStageHop(context.Context, string) error { r
 
 func (s *reviewReconcileStore) MarkStageHopDispatched(context.Context, string) error { return nil }
 
-func (s *reviewReconcileStore) RecordStageHop(context.Context, persistence.StageHop) error {
+func (s *reviewReconcileStore) RecordStageHop(context.Context, storage.StageHop) error {
 	return nil
 }
 

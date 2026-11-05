@@ -1,12 +1,16 @@
-/** Props of {@link TrackerLabel}. */
+import { cn } from "@/lib/cn";
+
+/** The shape every tracker label takes, a state included; its colors come on top. */
+export const LABEL_SHAPE =
+  "inline-flex h-5 max-w-full items-center rounded-full border px-xs align-top text-body-sm whitespace-nowrap";
+
 export interface TrackerLabelProps {
   children: string;
 }
 
-/** Renders a tracker label as a rounded tag, distinct from a state badge. */
 export function TrackerLabel({ children }: TrackerLabelProps) {
   return (
-    <span className="inline-flex h-5 max-w-full items-center rounded-full border border-line-medium bg-canvas px-xs align-middle text-body-sm whitespace-nowrap text-ink-body">
+    <span className={cn(LABEL_SHAPE, "border-line-medium bg-canvas text-ink-body")}>
       <span className="truncate">{children}</span>
     </span>
   );

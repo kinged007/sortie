@@ -15,9 +15,10 @@ An agent orchestrator that ships as one statically-linked binary with no runtime
 - **`internal/scm/` is an adapter family.** Apply the same boundary rules as `internal/tracker/*/`: no cross-adapter imports, must not import the orchestrator, normalize external responses to domain types at the boundary.
 - **Shared adapter helpers go in an `internal/` package named for the concern it serves**, never duplicated per adapter and never in `internal/domain/`. Logic scoped to one adapter family nests under that family instead.
 - **Integration tests are env-gated** by a per-adapter `SORTIE_<ADAPTER>_TEST=1`. Without the gate set they must skip cleanly — never fail.
+- **Tests wait on events, never on a clock.** A test stops the code after its readiness or completion signal (for `run()`, `runUntilStarted` on the `startupDone` hook), never by handing it a short deadline, and proves a fast path by its result or under `testing/synctest`, not by timing it. Every wait goes through `internal/waittest`: `HangGuard` is the one hang guard, and a live suite passes its measured bound to the same waits. No `time.Sleep` for ordering. A raised timeout or a rerun job does not fix a flake.
 - **`workflow.Manager.Reload()` is fail-safe.** On parse or validation error the previous `currentConfig` and `currentPrompt` are retained and `LastLoadError()` reports the failure. Preserve that invariant; never `os.Exit` on a bad WORKFLOW.md.
 - **Prompt templates render with `Option("missingkey=error")`.** Adding a template variable without wiring its data field is a runtime error, not an empty string.
-- **The dashboard draws structure with layout, never with characters.** No Unicode arrows, check marks, bullets or box glyphs to connect or mark values (`a → b`, `✓ done`), and no ` · ` separator where a column, a second line, a chip or a stepper can carry the split. Glyphs come from `web/src/components/icons.tsx`.
+- **The dashboard draws structure with layout, never with characters.** No Unicode arrows, check marks, bullets or box glyphs to connect or mark values (`a → b`, `✓ done`). A middle dot separates only the parts of one metadata line, and only through `Parts`; anywhere else a column, a second line, a chip or a stepper carries the split. Glyphs come from `web/src/components/icons.tsx`.
 - **The dashboard's build output under `internal/server/ui/dist` is committed.** `make ui-build` regenerates it from `web/`; commit it with the sources it was built from, and resolve a conflict in it by rebuilding, never by hand.
 
 ## Boundaries
@@ -25,7 +26,7 @@ An agent orchestrator that ships as one statically-linked binary with no runtime
 ### Always
 
 - Read the architecture section your task touches before implementing. Drift from the spec is a bug.
-- Implement adapter integrations as new packages behind the existing Go interface — additive only.
+- Implement adapter integrations as new packages behind the existing Go interface — additive only. When a shared mechanism lacks what the adapter needs, extend it with an optional hook (for a per-turn kind, an `agentcore.ForkPerTurnHooks` field) instead of copying it.
 - Keep documentation true in the same change. Whenever a spec, plan or code change alters the API or behavior (a feature, a fix, a refactor that changes a contract), find every document it makes wrong (architecture sections, `docs/workflow-reference.md`, adapter notes, guides, env and config references, event and API schemas, `CHANGELOG.md`) and update it in that change. A task that never mentions docs, or names only some of them, does not exempt the rest. Accepted ADRs in `docs/decisions/*.md` keep their Ask-first protection: report them as stale instead of editing them.
 
 ### Ask first
@@ -51,3 +52,4 @@ Consult these for the area you are working on, not as a blanket prerequisite:
 - `docs/decisions/*.md` - accepted ADRs. Read when discussing or revising a prior design choice.
 - `docs/workflow-reference.md` - WORKFLOW.md syntax.
 - `docs/*-adapter-notes.md` - API details, response examples and implementation tips per integration.
+- `RELEASING.md` - the ordered checklist for cutting a release.

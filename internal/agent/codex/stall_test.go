@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // TestRunTurn_EndsOnCtxDeadlineAgainstAStalledWriter drives RunTurn
@@ -21,58 +23,58 @@ import (
 func TestRunTurn_EndsOnCtxDeadlineAgainstAStalledWriter(t *testing.T) {
 	t.Parallel()
 
-	outR, outW := io.Pipe()
-	inR, inW := io.Pipe()
-	t.Cleanup(func() {
-		_ = outR.Close()
-		_ = outW.Close()
-		_ = inR.Close()
-		_ = inW.Close()
-	})
-
-	inbox := jsonrpc.NewInbox[jsonrpc.Message]()
-	state := &sessionState{
-		threadID:   "thread-001",
-		target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
-		waitCh:     make(chan struct{}),
-		inbox:      inbox,
-		readerDone: make(chan struct{}),
-		acc:        agentcore.NewRunUsage(),
-	}
-	state.conn = jsonrpc.NewConn(outW, inR, jsonrpc.Deliver(inbox, identity))
-	go watchTermination(state)
-
-	adapter, _ := NewCodexAdapter()
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	done := make(chan struct {
-		result domain.TurnResult
-		err    error
-	}, 1)
-	go func() {
-		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
-			Prompt:  "go",
-			OnEvent: func(domain.AgentEvent) {},
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 200 * time.Millisecond
+		outR, outW := io.Pipe()
+		inR, inW := io.Pipe()
+		t.Cleanup(func() {
+			_ = outR.Close()
+			_ = outW.Close()
+			_ = inR.Close()
+			_ = inW.Close()
 		})
-		done <- struct {
+
+		inbox := jsonrpc.NewInbox[jsonrpc.Message]()
+		state := &sessionState{
+			threadID:   "thread-001",
+			target:     agentcore.LaunchTarget{WorkspacePath: "/tmp"},
+			waitCh:     make(chan struct{}),
+			inbox:      inbox,
+			readerDone: make(chan struct{}),
+			acc:        agentcore.NewRunUsage(),
+			ledger:     adaptNewLedger(t),
+		}
+		state.conn = jsonrpc.NewConn(outW, inR, jsonrpc.Deliver(inbox, identity))
+		t.Cleanup(state.conn.Close)
+		go watchTermination(state)
+
+		adapter, _ := NewCodexAdapter()
+		ctx, cancel := context.WithTimeout(context.Background(), bound)
+		defer cancel()
+
+		start := time.Now()
+		done := make(chan struct {
 			result domain.TurnResult
 			err    error
-		}{result, err}
-	}()
+		}, 1)
+		go func() {
+			result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
+				Prompt:  "go",
+				OnEvent: func(domain.AgentEvent) {},
+			})
+			done <- struct {
+				result domain.TurnResult
+				err    error
+			}{result, err}
+		}()
 
-	select {
-	case got := <-done:
-		elapsed := time.Since(start)
+		got := waittest.Receive(t, done, "RunTurn outcome")
 		requireAgentError(t, got.err, domain.ErrPortExit)
 		if got.result.UsageMeasured {
 			t.Error("RunTurn().UsageMeasured = true, want false")
 		}
-		if elapsed > 5*time.Second {
-			t.Errorf("RunTurn() took %v, want close to the 200ms ctx deadline (the stalled write must never be what it waits on)", elapsed)
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Errorf("RunTurn() took %v, want within the %v ctx deadline (the stalled write must never be what it waits on)", elapsed, bound)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunTurn() did not return within 10s against a stalled writer, want it ended by its own ctx deadline")
-	}
+	})
 }

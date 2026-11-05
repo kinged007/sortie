@@ -4,11 +4,13 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // alwaysFailWriter fails every Write with err.
@@ -19,13 +21,13 @@ func (w alwaysFailWriter) Write(p []byte) (int, error) { return 0, w.err }
 // newFailWriteSession is newTestSession with its connection's writer replaced
 // by one that fails every write, so a turn's prompt send fails asynchronously
 // after handleStartTurn's SendRequest has enqueued and returned.
-func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr error, opts ...func(*sessionState)) (*sessionState, *io.PipeWriter) {
+func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr error) (*sessionState, *io.PipeWriter) {
 	t.Helper()
 
 	inPr, inPw := io.Pipe()
 	state := &sessionState{
 		agentConfig: agentConfig,
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 		usage:       agentcore.NewTurnEndUsage(),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
@@ -36,15 +38,12 @@ func newFailWriteSession(t *testing.T, agentConfig domain.AgentConfig, writeErr 
 	state.conn = jsonrpc.NewConn(alwaysFailWriter{err: writeErr}, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
 		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
-	for _, opt := range opts {
-		opt(state)
-	}
-
 	go runPump(state)
 	t.Cleanup(func() {
 		_ = inPw.Close()
 		state.stopOnce.Do(func() { close(state.stopCh) })
 		<-state.pumpDone
+		state.conn.Close()
 		_ = inPr.Close()
 	})
 
@@ -62,15 +61,11 @@ func TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound(t *testing.T) {
 
 	// Wait for the write to fail before ending the stream, so the turn is
 	// genuinely active when the stream ends rather than racing acceptance.
-	select {
-	case <-state.conn.WriteFailed():
-	case <-time.After(awaitTimeout):
-		t.Fatal("timed out waiting for the prompt send's write to fail")
-	}
+	waittest.Receive(t, state.conn.WriteFailed(), "the prompt send's write to fail")
 
 	_ = inPw.Close()
 
-	outcome := awaitOutcome(t, turnCh)
+	outcome := waittest.Receive(t, turnCh, "turn outcome")
 	var agentErr *domain.AgentError
 	if !errors.As(outcome.err, &agentErr) {
 		t.Fatalf("runTurn() error = %v (%T), want *domain.AgentError", outcome.err, outcome.err)
@@ -86,33 +81,32 @@ func TestPump_WriteFailureDuringTurn_StreamEndWinsWithinBound(t *testing.T) {
 func TestPump_WriteFailureDuringTurn_SendFailureWinsAfterBound(t *testing.T) {
 	t.Parallel()
 
-	const bound = 300 * time.Millisecond
-	writeErr := errors.New("boom")
-	state, _ := newFailWriteSession(t, domain.AgentConfig{ReadTimeoutMS: int(bound.Milliseconds())}, writeErr)
-	markSessionKnown(state)
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 300 * time.Millisecond
+		writeErr := errors.New("boom")
+		state, _ := newFailWriteSession(t, domain.AgentConfig{ReadTimeoutMS: int(bound.Milliseconds())}, writeErr)
+		markSessionKnown(state)
 
-	start := time.Now()
-	turnCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: func(domain.AgentEvent) {}})
+		start := time.Now()
+		turnCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: func(domain.AgentEvent) {}})
 
-	outcome := awaitOutcome(t, turnCh)
-	elapsed := time.Since(start)
+		outcome := waittest.Receive(t, turnCh, "turn outcome")
+		elapsed := time.Since(start)
 
-	var agentErr *domain.AgentError
-	if !errors.As(outcome.err, &agentErr) {
-		t.Fatalf("runTurn() error = %v (%T), want *domain.AgentError", outcome.err, outcome.err)
-	}
-	if agentErr.Kind != domain.ErrPortExit {
-		t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
-	}
-	if agentErr.Message != promptSendFailedMessage {
-		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, promptSendFailedMessage)
-	}
-	if elapsed < bound/2 {
-		t.Errorf("runTurn() ended after %v, want it to wait close to the %v bound rather than finalizing at once", elapsed, bound)
-	}
-	if elapsed > awaitTimeout {
-		t.Errorf("runTurn() took %v, want under %v", elapsed, awaitTimeout)
-	}
+		var agentErr *domain.AgentError
+		if !errors.As(outcome.err, &agentErr) {
+			t.Fatalf("runTurn() error = %v (%T), want *domain.AgentError", outcome.err, outcome.err)
+		}
+		if agentErr.Kind != domain.ErrPortExit {
+			t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
+		}
+		if agentErr.Message != promptSendFailedMessage {
+			t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, promptSendFailedMessage)
+		}
+		if elapsed < bound {
+			t.Errorf("runTurn() ended after %v, want it to wait the full %v bound rather than finalizing at once", elapsed, bound)
+		}
+	})
 }
 
 func TestPumpState_WriteFailureWithNoActiveTurn(t *testing.T) {

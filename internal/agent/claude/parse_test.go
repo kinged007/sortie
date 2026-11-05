@@ -2,15 +2,15 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
-	"maps"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
-	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -100,15 +100,6 @@ func TestParseEvent(t *testing.T) {
 				if ev.IsError {
 					t.Error("IsError = true, want false")
 				}
-				if ev.Usage == nil {
-					t.Fatal("Usage is nil")
-				}
-				if ev.Usage.InputTokens != 15000 {
-					t.Errorf("InputTokens = %d, want 15000", ev.Usage.InputTokens)
-				}
-				if ev.Usage.OutputTokens != 3200 {
-					t.Errorf("OutputTokens = %d, want 3200", ev.Usage.OutputTokens)
-				}
 				if ev.NumTurns != 3 {
 					t.Errorf("NumTurns = %d, want 3", ev.NumTurns)
 				}
@@ -123,12 +114,6 @@ func TestParseEvent(t *testing.T) {
 				t.Helper()
 				if !ev.IsError {
 					t.Error("IsError = false, want true")
-				}
-				if ev.Usage == nil {
-					t.Fatal("Usage is nil")
-				}
-				if ev.Usage.InputTokens != 50000 {
-					t.Errorf("InputTokens = %d, want 50000", ev.Usage.InputTokens)
 				}
 			},
 		},
@@ -200,6 +185,29 @@ func TestParseEvent(t *testing.T) {
 	}
 }
 
+func TestLiveReadingCostUSD(t *testing.T) {
+	t.Parallel()
+
+	var captured rawEvent
+	for line := range bytes.SplitSeq(loadFixture(t, "journal/subagent_stream.jsonl"), []byte("\n")) {
+		if ev, err := parseEvent(line); err == nil && ev.Type == "result" {
+			captured = ev
+		}
+	}
+	members := rawMembers(`{"a":{"costUSD":1.0},"b":{},"c":{"costUSD":"0.5"},"d":{"costUSD":-1}}`, string(captured.ModelUsageSinceLastResult))
+
+	got := ""
+	for _, entry := range liveReading(members).ByModel {
+		if amount := entry.Amounts[0].Amount; amount != nil {
+			got += fmt.Sprintf(" %s=%v", entry.Model, *amount)
+		}
+	}
+
+	if want := " a=1 claude-haiku-5-5=0.012703265"; got != want {
+		t.Errorf("liveReading(captured and edge members) costs =%q, want %q", got, want)
+	}
+}
+
 func TestParseEvent_Malformed(t *testing.T) {
 	t.Parallel()
 
@@ -208,185 +216,6 @@ func TestParseEvent_Malformed(t *testing.T) {
 	if err == nil {
 		t.Fatal("parseEvent(malformed) did not return error")
 	}
-}
-
-func TestUsageFromAssistant(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		raw  *rawUsage
-		want domain.TokenUsage
-	}{
-		{
-			name: "nil usage",
-			raw:  nil,
-			want: domain.TokenUsage{},
-		},
-		{
-			name: "valid usage",
-			raw: &rawUsage{
-				InputTokens:  15000,
-				OutputTokens: 3200,
-			},
-			want: domain.TokenUsage{
-				InputTokens:  15000,
-				OutputTokens: 3200,
-				TotalTokens:  18200,
-			},
-		},
-		{
-			name: "zero usage",
-			raw:  &rawUsage{},
-			want: domain.TokenUsage{},
-		},
-		{
-			name: "cache read and cache creation input tokens",
-			raw: &rawUsage{
-				InputTokens:          12000,
-				OutputTokens:         3000,
-				CacheReadInputTokens: 8000,
-			},
-			want: domain.TokenUsage{
-				InputTokens:     20000,
-				OutputTokens:    3000,
-				TotalTokens:     23000,
-				CacheReadTokens: 8000,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := usageFromAssistant(tt.raw)
-			if got != tt.want {
-				t.Errorf("usageFromAssistant() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestUsageFromResult(t *testing.T) {
-	t.Parallel()
-
-	sonnet := domain.TokenUsage{InputTokens: 6200, OutputTokens: 800, TotalTokens: 7000, CacheReadTokens: 1000, CacheWriteTokens: 200}
-	haiku := domain.TokenUsage{InputTokens: 3600, OutputTokens: 1200, TotalTokens: 4800, CacheReadTokens: 500, CacheWriteTokens: 100}
-
-	tests := []struct {
-		name        string
-		event       rawEvent
-		wantUsage   domain.TokenUsage
-		wantByModel map[string]domain.TokenUsage
-	}{
-		{
-			name: "modelUsage single entry preferred over usage",
-			event: rawEvent{
-				Usage: &rawUsage{InputTokens: 1, OutputTokens: 1},
-				ModelUsage: map[string]rawModelUsage{
-					"claude-haiku-4-5-20251001": {
-						InputTokens: 10, OutputTokens: 64,
-						CacheReadInputTokens: 17706, CacheCreationInputTokens: 15933,
-					},
-				},
-			},
-			wantUsage: domain.TokenUsage{
-				InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706, CacheWriteTokens: 15933,
-			},
-			wantByModel: map[string]domain.TokenUsage{
-				"claude-haiku-4-5-20251001": {
-					InputTokens: 33649, OutputTokens: 64, TotalTokens: 33713, CacheReadTokens: 17706, CacheWriteTokens: 15933,
-				},
-			},
-		},
-		{
-			name: "modelUsage two entries split by model and sum to the total",
-			event: rawEvent{
-				ModelUsage: map[string]rawModelUsage{
-					"claude-sonnet-4-5-20250929": {InputTokens: 5000, OutputTokens: 800, CacheReadInputTokens: 1000, CacheCreationInputTokens: 200},
-					"claude-haiku-4-5-20251001":  {InputTokens: 3000, OutputTokens: 1200, CacheReadInputTokens: 500, CacheCreationInputTokens: 100},
-				},
-			},
-			wantUsage: domain.TokenUsage{
-				InputTokens: 9800, OutputTokens: 2000, TotalTokens: 11800, CacheReadTokens: 1500, CacheWriteTokens: 300,
-			},
-			wantByModel: map[string]domain.TokenUsage{"claude-sonnet-4-5-20250929": sonnet, "claude-haiku-4-5-20251001": haiku},
-		},
-		{
-			name: "modelUsage absent falls back to usage",
-			event: rawEvent{
-				Usage: &rawUsage{InputTokens: 200, OutputTokens: 80, CacheReadInputTokens: 8000, CacheCreationInputTokens: 2000},
-			},
-			wantUsage: domain.TokenUsage{InputTokens: 10200, OutputTokens: 80, TotalTokens: 10280, CacheReadTokens: 8000, CacheWriteTokens: 2000},
-		},
-		{
-			name:      "modelUsage empty map falls back to usage",
-			event:     rawEvent{Usage: &rawUsage{InputTokens: 5, OutputTokens: 2}, ModelUsage: map[string]rawModelUsage{}},
-			wantUsage: domain.TokenUsage{InputTokens: 5, OutputTokens: 2, TotalTokens: 7},
-		},
-		{
-			name:      "neither modelUsage nor usage present",
-			event:     rawEvent{},
-			wantUsage: domain.TokenUsage{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			gotUsage, gotByModel := usageFromResult(tt.event)
-			if gotUsage != tt.wantUsage {
-				t.Errorf("usageFromResult() usage = %+v, want %+v", gotUsage, tt.wantUsage)
-			}
-			if !maps.Equal(gotByModel, tt.wantByModel) {
-				t.Errorf("usageFromResult() byModel = %+v, want %+v", gotByModel, tt.wantByModel)
-			}
-		})
-	}
-}
-
-// TestCacheWriteTokensMapping drives a non-zero cache-write count
-// through every path that maps claude-code's raw usage into
-// domain.TokenUsage: the assistant event's own usage object, the
-// result event's modelUsage map, and the result event's usage
-// fallback. Each event carries its own turn-cumulative usage, rising
-// across the sequence, so agenttest.AssertUsageContract also exercises
-// the shared monotonicity and cache-sum invariants against real
-// mapping output rather than a hand-built fixture.
-func TestCacheWriteTokensMapping(t *testing.T) {
-	t.Parallel()
-
-	assistantUsage := usageFromAssistant(&rawUsage{
-		InputTokens: 12000, OutputTokens: 3000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 4000,
-	})
-	if assistantUsage.CacheWriteTokens != 4000 {
-		t.Errorf("usageFromAssistant().CacheWriteTokens = %d, want 4000", assistantUsage.CacheWriteTokens)
-	}
-
-	modelUsageResult, _ := usageFromResult(rawEvent{
-		ModelUsage: map[string]rawModelUsage{
-			"claude-sonnet-4-5-20250929": {
-				InputTokens: 20000, OutputTokens: 5000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 6000,
-			},
-		},
-	})
-	if modelUsageResult.CacheWriteTokens != 6000 {
-		t.Errorf("usageFromResult() modelUsage path CacheWriteTokens = %d, want 6000", modelUsageResult.CacheWriteTokens)
-	}
-
-	fallbackResult, _ := usageFromResult(rawEvent{
-		Usage: &rawUsage{InputTokens: 30000, OutputTokens: 7000, CacheReadInputTokens: 8000, CacheCreationInputTokens: 9000},
-	})
-	if fallbackResult.CacheWriteTokens != 9000 {
-		t.Errorf("usageFromResult() usage-fallback path CacheWriteTokens = %d, want 9000", fallbackResult.CacheWriteTokens)
-	}
-
-	events := []domain.AgentEvent{
-		{Type: domain.EventTokenUsage, Usage: assistantUsage},
-		{Type: domain.EventTokenUsage, Usage: modelUsageResult},
-		{Type: domain.EventTurnCompleted, Usage: fallbackResult},
-	}
-	agenttest.AssertUsageContract(t, events)
 }
 
 func TestSummarizeAssistant(t *testing.T) {
@@ -496,8 +325,6 @@ func TestContentBlocks_InvalidJSON(t *testing.T) {
 	}
 }
 
-// TestRawAssistantMessageMeta_FromFixture verifies that model and
-// per-request usage can be extracted from the assistant_message fixture.
 func TestRawAssistantMessageMeta_FromFixture(t *testing.T) {
 	t.Parallel()
 
@@ -513,28 +340,6 @@ func TestRawAssistantMessageMeta_FromFixture(t *testing.T) {
 	}
 	if meta.Model != "claude-sonnet-4-20250514" {
 		t.Errorf("Model = %q, want %q", meta.Model, "claude-sonnet-4-20250514")
-	}
-	if meta.Usage == nil {
-		t.Fatal("Usage is nil, want non-nil")
-	}
-	if meta.Usage.InputTokens != 12500 {
-		t.Errorf("Usage.InputTokens = %d, want 12500", meta.Usage.InputTokens)
-	}
-	if meta.Usage.OutputTokens != 350 {
-		t.Errorf("Usage.OutputTokens = %d, want 350", meta.Usage.OutputTokens)
-	}
-	if meta.Usage.CacheReadInputTokens != 8000 {
-		t.Errorf("Usage.CacheReadInputTokens = %d, want 8000", meta.Usage.CacheReadInputTokens)
-	}
-
-	// usageFromAssistant must map CacheReadInputTokens to CacheReadTokens
-	// and fold both cache fields into InputTokens (12500 + 8000 + 1500).
-	normalized := usageFromAssistant(meta.Usage)
-	if normalized.CacheReadTokens != 8000 {
-		t.Errorf("usageFromAssistant().CacheReadTokens = %d, want 8000", normalized.CacheReadTokens)
-	}
-	if normalized.InputTokens != 22000 {
-		t.Errorf("usageFromAssistant().InputTokens = %d, want 22000", normalized.InputTokens)
 	}
 }
 
@@ -688,7 +493,6 @@ func TestEmitToolResult_ErrorResult(t *testing.T) {
 		t.Fatalf("parseEvent() error = %v", err)
 	}
 
-	// Empty tracker simulates orphaned tool_result.
 	tracker := agentcore.NewToolTracker()
 	now := time.Now().UTC()
 	events := collectToolEvents(t, ev, tracker, now)
@@ -698,8 +502,8 @@ func TestEmitToolResult_ErrorResult(t *testing.T) {
 	}
 
 	got := events[0]
-	if got.ToolName != "unknown" {
-		t.Errorf("event.ToolName = %q, want %q", got.ToolName, "unknown")
+	if got.ToolName != "" {
+		t.Errorf("event.ToolName = %q, want empty for an orphaned result", got.ToolName)
 	}
 	if !got.ToolError {
 		t.Error("event.ToolError = false, want true")
@@ -722,33 +526,27 @@ func TestEmitToolResult_ParallelToolUse(t *testing.T) {
 	now := time.Now().UTC()
 	events := collectToolEvents(t, ev, tracker, now)
 
-	// No tool_result blocks -> no EventToolResult events.
 	if len(events) != 0 {
 		t.Errorf("collectToolEvents() = %d events, want 0", len(events))
 	}
 
-	// Tracker should have both tool_use entries; verify via End.
-	name1, _, ok1 := tracker.End("toolu_par_01")
+	call1, _, ok1 := tracker.End("toolu_par_01")
 	if !ok1 {
 		t.Fatal("tracker missing entry \"toolu_par_01\"")
 	}
-	if name1 != "Read" {
-		t.Errorf("tracker[\"toolu_par_01\"].Name = %q, want %q", name1, "Read")
+	if call1.Name != "Read" {
+		t.Errorf("tracker[\"toolu_par_01\"].Name = %q, want %q", call1.Name, "Read")
 	}
 
-	name2, _, ok2 := tracker.End("toolu_par_02")
+	call2, _, ok2 := tracker.End("toolu_par_02")
 	if !ok2 {
 		t.Fatal("tracker missing entry \"toolu_par_02\"")
 	}
-	if name2 != "Read" {
-		t.Errorf("tracker[\"toolu_par_02\"].Name = %q, want %q", name2, "Read")
+	if call2.Name != "Read" {
+		t.Errorf("tracker[\"toolu_par_02\"].Name = %q, want %q", call2.Name, "Read")
 	}
 }
 
-// TestEmitToolResult_UserEventCorrelation verifies that tool_result blocks
-// in user-type events correlate correctly with tool_use blocks from
-// preceding assistant events. This is a regression test for the bug where
-// user-event tool_result blocks were silently dropped.
 func TestEmitToolResult_UserEventCorrelation(t *testing.T) {
 	t.Parallel()
 
@@ -770,7 +568,6 @@ func TestEmitToolResult_UserEventCorrelation(t *testing.T) {
 		if parseErr != nil {
 			t.Fatalf("parseEvent() error = %v", parseErr)
 		}
-		// Process both assistant and user events to mirror RunTurn logic.
 		switch ev.Type {
 		case "assistant", "user":
 			now := base.Add(time.Duration(msgIndex) * time.Second)
@@ -782,7 +579,6 @@ func TestEmitToolResult_UserEventCorrelation(t *testing.T) {
 		t.Fatalf("scanner error: %v", err)
 	}
 
-	// Exactly one tool_result expected (Read, from user event).
 	if len(toolEvents) != 1 {
 		t.Fatalf("total EventToolResult events = %d, want 1", len(toolEvents))
 	}
@@ -801,7 +597,6 @@ func TestEmitToolResult_UserEventCorrelation(t *testing.T) {
 		t.Errorf("toolEvents[0].Message = %q, want %q", got.Message, "tool_result: Read")
 	}
 
-	// Tracker should be empty after correlation (toolu_u01 was resolved).
 	_, _, stillTracked := tracker.End("toolu_u01")
 	if stillTracked {
 		t.Error("tracker still has entry \"toolu_u01\" after correlation")

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -17,30 +18,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/pricing"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
 	"github.com/sortie-ai/sortie/internal/tool/mcpserver"
 	"github.com/sortie-ai/sortie/internal/tool/notify"
 	"github.com/sortie-ai/sortie/internal/tool/status"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 var agentMessageEvents = []domain.EventType{domain.EventAgentMessage}
-
-func TestRunMCPServer_Help_ReturnsZero(t *testing.T) {
-	t.Parallel()
-
-	var stdout, stderr bytes.Buffer
-	code := runMCPServer(context.Background(), []string{"--help"}, &stdout, &stderr)
-	if code != 0 {
-		t.Errorf("runMCPServer(--help) = %d, want 0", code)
-	}
-	if !strings.Contains(stdout.String(), "--workflow PATH") {
-		t.Errorf("stdout = %q, want to contain %q", stdout.String(), "--workflow PATH")
-	}
-}
 
 func TestRunMCPServer_MissingWorkflow_ReturnsOne(t *testing.T) {
 	t.Parallel()
@@ -64,6 +55,36 @@ func TestRunMCPServer_InvalidWorkflowPath_ReturnsOne(t *testing.T) {
 	}
 }
 
+func TestRunMCPServer_HTTPWithoutBearer_ReturnsOne(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		unset bool
+	}{
+		{"bearer unset", true},
+		{"bearer empty", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(mcpconfig.BearerEnv, "")
+			if tt.unset {
+				os.Unsetenv(mcpconfig.BearerEnv) //nolint:errcheck // t.Setenv restores the original value on cleanup
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := runMCPServer(context.Background(), []string{"--http", "--workflow", filepath.Join(t.TempDir(), "WORKFLOW.md")}, &stdout, &stderr)
+
+			if code != 1 {
+				t.Errorf("runMCPServer(--http, %s) = %d, want 1", tt.name, code)
+			}
+			if !strings.Contains(stderr.String(), mcpconfig.BearerEnv) {
+				t.Errorf("runMCPServer(--http, %s) stderr = %q, want to contain %q", tt.name, stderr.String(), mcpconfig.BearerEnv)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("runMCPServer(--http, %s) stdout = %q, want empty", tt.name, stdout.String())
+			}
+		})
+	}
+}
+
 // writeMCPStateFile writes a state.json file to <dir>/.sortie/ for use in
 // MCP server smoke tests.
 func writeMCPStateFile(t *testing.T, dir string, data map[string]any) {
@@ -82,38 +103,58 @@ func writeMCPStateFile(t *testing.T, dir string, data map[string]any) {
 	}
 }
 
-// buildMCPRequest constructs a newline-terminated JSON-RPC 2.0 request string.
-func buildMCPRequest(t *testing.T, method string, id any, params any) string {
+func serveMCP(t *testing.T, reg *domain.ToolRegistry, method string, params any) map[string]any {
 	t.Helper()
-	type req struct {
-		JSONRPC string `json:"jsonrpc"`
-		ID      any    `json:"id"`
-		Method  string `json:"method"`
-		Params  any    `json:"params,omitempty"`
-	}
-	b, err := json.Marshal(req{JSONRPC: "2.0", ID: id, Method: method, Params: params})
-	if err != nil {
-		t.Fatalf("buildMCPRequest(%q): %v", method, err)
-	}
-	return string(b) + "\n"
-}
 
-// parseMCPResponses splits newline-delimited JSON into a slice of maps.
-func parseMCPResponses(t *testing.T, data []byte) []map[string]any {
-	t.Helper()
-	var results []map[string]any
-	for line := range bytes.SplitSeq(data, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	lines := make(chan []byte, 2)
+	go func() {
+		done <- mcpserver.NewServer(reg, slog.New(slog.DiscardHandler), "test").Serve(waittest.Context(t), inR, outW)
+		_ = outW.Close()
+	}()
+	go func() {
+		for scanner := bufio.NewScanner(outR); scanner.Scan(); {
+			lines <- bytes.Clone(scanner.Bytes())
 		}
-		var m map[string]any
-		if err := json.Unmarshal(line, &m); err != nil {
-			t.Fatalf("parseMCPResponses: unmarshal %q: %v", line, err)
+	}()
+	t.Cleanup(func() {
+		_ = inW.Close()
+		if err := waittest.Receive(t, done, "Serve to return"); err != nil {
+			t.Errorf("Serve() = %v, want nil on end of input", err)
 		}
-		results = append(results, m)
+	})
+
+	write := func(request map[string]any) {
+		t.Helper()
+		b, err := json.Marshal(request)
+		if err != nil {
+			t.Fatalf("marshal %v: %v", request, err)
+		}
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatalf("write %v: %v", request, err)
+		}
 	}
-	return results
+	write(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test", "version": "1"},
+	}})
+	waittest.Receive(t, lines, "initialize response")
+	write(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	write(map[string]any{"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
+
+	var resp struct {
+		Result map[string]any
+		Error  json.RawMessage
+	}
+	line := waittest.Receive(t, lines, method+" response")
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("decode %q: %v", line, err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("%s error = %s, want a result", method, resp.Error)
+	}
+	return resp.Result
 }
 
 func TestMCPServer_StatusTool_Dispatch(t *testing.T) {
@@ -137,32 +178,11 @@ func TestMCPServer_StatusTool_Dispatch(t *testing.T) {
 		return workspacekit.ReadSortieFile(dir, name, maxBytes)
 	}))
 
-	input := buildMCPRequest(t, "tools/call", 1, map[string]any{
+	result := serveMCP(t, reg, "tools/call", map[string]any{
 		"name":      "sortie_status",
 		"arguments": map[string]any{},
 	})
 
-	var outBuf bytes.Buffer
-	logger := slog.New(slog.DiscardHandler)
-	srv := mcpserver.NewServer(reg, strings.NewReader(input), &outBuf, logger, "test")
-	if err := srv.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
-
-	resps := parseMCPResponses(t, outBuf.Bytes())
-	if len(resps) != 1 {
-		t.Fatalf("response count = %d, want 1", len(resps))
-	}
-	resp := resps[0]
-
-	if resp["error"] != nil {
-		t.Fatalf("JSON-RPC error: %v", resp["error"])
-	}
-
-	result, ok := resp["result"].(map[string]any)
-	if !ok {
-		t.Fatalf("result is not an object: %v", resp["result"])
-	}
 	content, ok := result["content"].([]any)
 	if !ok || len(content) == 0 {
 		t.Fatalf("content = %v, want non-empty array", result["content"])
@@ -231,12 +251,12 @@ func TestMCPServerShortHelp(t *testing.T) {
 // session_metadata row for the live session "sess-live" carrying 150
 // total tokens and the given dispatch ID, then reopens it read-only as
 // the sidecar does.
-func seedBudgetStore(t *testing.T, dispatchID string) *persistence.Store {
+func seedBudgetStore(t *testing.T, dispatchID string) *sqlite.Store {
 	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "budget.db")
 
-	rw, err := persistence.Open(ctx, dbPath)
+	rw, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
 	}
@@ -245,7 +265,7 @@ func seedBudgetStore(t *testing.T, dispatchID string) *persistence.Store {
 	}
 
 	for i, total := range []int64{400, 200} {
-		run := persistence.RunHistory{
+		run := storage.RunHistory{
 			IssueID:      "iss-1",
 			Identifier:   "PROJ-1",
 			Attempt:      i + 1,
@@ -261,7 +281,7 @@ func seedBudgetStore(t *testing.T, dispatchID string) *persistence.Store {
 		}
 	}
 
-	meta := persistence.SessionMetadata{
+	meta := storage.SessionMetadata{
 		IssueID:     "iss-1",
 		SessionID:   "sess-live",
 		DispatchID:  dispatchID,
@@ -279,7 +299,7 @@ func seedBudgetStore(t *testing.T, dispatchID string) *persistence.Store {
 		t.Fatalf("Close read-write store: %v", err)
 	}
 
-	ro, err := persistence.OpenReadOnly(ctx, dbPath)
+	ro, err := sqlite.OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("OpenReadOnly(%q): %v", dbPath, err)
 	}
@@ -388,12 +408,12 @@ func TestBuildBudgetQuery(t *testing.T) {
 	})
 }
 
-func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
+func seedBudgetMeasurementStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "budget-measurement.db")
 
-	rw, err := persistence.Open(ctx, dbPath)
+	rw, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
 	}
@@ -401,7 +421,7 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	runs := []persistence.RunHistory{
+	runs := []storage.RunHistory{
 		{
 			IssueID: "iss-mixed", Identifier: "PROJ-MIXED", Attempt: 1, AgentAdapter: "mock",
 			Workspace: "/tmp/ws/PROJ-MIXED", StartedAt: "2026-03-19T10:00:00Z", CompletedAt: "2026-03-19T10:00:30Z",
@@ -439,7 +459,7 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 		}
 	}
 
-	metas := []persistence.SessionMetadata{
+	metas := []storage.SessionMetadata{
 		{IssueID: "iss-mixed", SessionID: "sess-mixed-live", DispatchID: "dispatch-mixed-live", TotalTokens: 50, UpdatedAt: "2026-03-19T10:02:00Z"},
 		{IssueID: "iss-zero", SessionID: "sess-zero-live", DispatchID: "dispatch-zero-live", TotalTokens: 0, UpdatedAt: "2026-03-19T10:02:00Z"},
 		{IssueID: "iss-priced", SessionID: "sess-priced-live", DispatchID: "dispatch-priced-live", TotalTokens: 100, EstimatedCostUSD: new(0.125), CostStatus: "estimated", UpdatedAt: "2026-03-19T10:02:00Z"},
@@ -455,7 +475,7 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 		t.Fatalf("Close read-write store: %v", err)
 	}
 
-	ro, err := persistence.OpenReadOnly(ctx, dbPath)
+	ro, err := sqlite.OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("OpenReadOnly(%q): %v", dbPath, err)
 	}
@@ -995,6 +1015,22 @@ func mcpServerWorkflow(notificationsYAML string) []byte {
 	return []byte(base)
 }
 
+// emptyStdin gives Serve its own handle, as it closes stdin. Not for parallel
+// tests: it swaps the process-wide os.Stdin.
+func emptyStdin(t *testing.T) {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	orig := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = orig
+		_ = f.Close()
+	})
+}
+
 // TestRunMCPServer_SuccessPath exercises the section of runMCPServer
 // starting at line 106: SORTIE_ATTEMPT parsing, env-to-SessionToolParams
 // mapping, BuildSessionToolRegistry call, and the final Serve invocation.
@@ -1019,6 +1055,8 @@ func TestRunMCPServer_SuccessPath_ReturnsZero(t *testing.T) {
 	t.Setenv("SORTIE_ISSUE_ID", "issue-99")
 	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "PROJ-99")
 	t.Setenv("SORTIE_SESSION_AGENT_KIND", "mock")
+
+	emptyStdin(t)
 
 	var stdout, stderr bytes.Buffer
 	code := runMCPServer(context.Background(), []string{"--workflow", wfPath}, &stdout, &stderr)
@@ -1068,6 +1106,8 @@ func TestRunMCPServer_InvalidAttemptIgnored_ReturnsZero(t *testing.T) {
 	}
 
 	t.Setenv("SORTIE_ATTEMPT", "not-a-number")
+
+	emptyStdin(t)
 
 	var stdout, stderr bytes.Buffer
 	code := runMCPServer(context.Background(), []string{"--workflow", wfPath}, &stdout, &stderr)

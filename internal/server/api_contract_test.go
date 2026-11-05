@@ -6,15 +6,22 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/runstats"
 )
 
@@ -52,10 +59,106 @@ type jsonField struct {
 	depth    int
 }
 
+var contractEnums = map[reflect.Type]map[string][]string{
+	reflect.TypeFor[holdResponse]():        {"reason": holdReasonValues()},
+	reflect.TypeFor[usageWindowResponse](): {"status": usageWindowStatusValues()},
+	reflect.TypeFor[runstats.Spend]():      {"period": spendPeriodValues()},
+	reflect.TypeFor[runstats.SpanReport](): {"period": spendPeriodValues()},
+}
+
+var contractNeverNull = map[reflect.Type][]string{
+	reflect.TypeFor[stateResponse](): {"rate_limits"},
+}
+
 var dateTime = contractNode{"string", map[string]any{"type": "string", "format": "date-time"}}
 
 func primitive(ts, jsonType string) contractNode {
 	return contractNode{ts, map[string]any{"type": jsonType}}
+}
+
+func enumNode(values []string) contractNode {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = strconv.Quote(v)
+	}
+	return contractNode{strings.Join(quoted, " | "), map[string]any{"type": "string", "enum": values}}
+}
+
+func holdReasonValues() []string {
+	reasons := orchestrator.HoldReasons()
+	values := make([]string, len(reasons))
+	for i, r := range reasons {
+		values[i] = string(r)
+	}
+	return values
+}
+
+func spendPeriodValues() []string {
+	return []string{
+		string(runstats.PeriodFiveMinutes),
+		string(runstats.PeriodQuarterHour),
+		string(runstats.PeriodHour),
+		string(runstats.PeriodDay),
+		string(runstats.PeriodMonth),
+	}
+}
+
+func usageWindowStatusValues() []string {
+	return []string{
+		string(domain.UsageWindowAllowed),
+		string(domain.UsageWindowWarning),
+		string(domain.UsageWindowExhausted),
+	}
+}
+
+func declaredHoldReasons(t *testing.T) []string {
+	t.Helper()
+
+	const dir = "../orchestrator"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dir, err)
+	}
+	var values []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("ParseFile(%q): %v", e.Name(), err)
+		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || len(vs.Names) != len(vs.Values) {
+					continue
+				}
+				if typ, ok := vs.Type.(*ast.Ident); !ok || typ.Name != "SkipReason" {
+					continue
+				}
+				for i, name := range vs.Names {
+					if name.Name == "SkipNone" || name.Name == "SkipIneligible" {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						t.Fatalf("%s is not a string literal", name.Name)
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("Unquote(%s): %v", lit.Value, err)
+					}
+					values = append(values, value)
+				}
+			}
+		}
+	}
+	return values
 }
 
 func nullable(n contractNode) contractNode {
@@ -146,7 +249,10 @@ func (c *contract) addStruct(t reflect.Type) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if k := f.typ.Kind(); !f.optional && (k == reflect.Pointer || k == reflect.Slice || k == reflect.Map || k == reflect.Interface) {
+		if values, ok := contractEnums[t][f.name]; ok {
+			n = enumNode(values)
+		}
+		if k := f.typ.Kind(); !f.optional && !slices.Contains(contractNeverNull[t], f.name) && (k == reflect.Pointer || k == reflect.Slice || k == reflect.Map || k == reflect.Interface) {
 			n = nullable(n)
 		}
 		members = append(members, contractMember{f.name, n, f.optional})
@@ -168,6 +274,7 @@ func reactionCheckMembers() []contractMember {
 		{"actionable_comments", num, true},
 		{"new_comments", num, true},
 		{"handled", primitive("boolean", "boolean"), true},
+		{"awaiting_approval", primitive("boolean", "boolean"), true},
 		{"mergeable", nullable(primitive("boolean", "boolean")), true},
 	}
 }
@@ -180,8 +287,11 @@ func runEventMembers(usage contractNode) []contractMember {
 		{"event", str, false},
 		{"message", str, false},
 		{"text", str, false},
+		{"tool_line", str, true},
 		{"session_id", str, true},
 		{"tool_name", str, true},
+		{"tool_kind", str, true},
+		{"tool_argument", str, true},
 		{"duration_ms", num, true},
 		{"tool_error", primitive("boolean", "boolean"), true},
 		{"usage", nullable(usage), true},
@@ -279,9 +389,14 @@ func (c *contract) jsonSchema() ([]byte, error) {
 }
 
 func TestAPIContract(t *testing.T) {
+	declared := slices.Sorted(slices.Values(declaredHoldReasons(t)))
+	if served := slices.Sorted(slices.Values(holdReasonValues())); !slices.Equal(served, declared) {
+		t.Fatalf("sorted HoldReasons() = %v, want the SkipReason constants less SkipNone and SkipIneligible, each once: %v", served, declared)
+	}
+
 	c, err := newContract(
 		reflect.TypeFor[stateResponse](), reflect.TypeFor[issueDetailResponse](), reflect.TypeFor[runsResponse](), reflect.TypeFor[issueGroupsResponse](),
-		reflect.TypeFor[runstats.Report](), reflect.TypeFor[refreshResponse](), reflect.TypeFor[retryNowResponse](), reflect.TypeFor[checkNowResponse](),
+		reflect.TypeFor[runstats.Report](), reflect.TypeFor[runstats.SpanReport](), reflect.TypeFor[refreshResponse](), reflect.TypeFor[retryNowResponse](), reflect.TypeFor[checkNowResponse](),
 		reflect.TypeFor[acknowledgeResponse](), reflect.TypeFor[errorResponse](),
 		reflect.TypeFor[healthResponse](), reflect.TypeFor[readyResponse](), reflect.TypeFor[runEventsResponse](),
 		agentEventType, reflect.TypeFor[runEndedFrame](), reflect.TypeFor[runResetFrame](),

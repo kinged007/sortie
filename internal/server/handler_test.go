@@ -1089,7 +1089,7 @@ func TestEntryResponses_KeysJSON(t *testing.T) {
 
 				IssueType: "Story", IssueLabels: []string{"backend", "stage:implement"}, State: "In Progress",
 				RuleName: "implement", StagePosition: position, AgentKind: "claude-code", ConfiguredModel: "opus",
-			}),
+			}, sentence.Context{}),
 			want: map[string]any{
 				"issue_id":           "id-5",
 				"issue_identifier":   "PROJ-5",
@@ -1112,9 +1112,72 @@ func TestEntryResponses_KeysJSON(t *testing.T) {
 		},
 		{
 			name:   "between stages without times or identity serves null times",
-			body:   toStageHopResponse(orchestrator.SnapshotStageHop{IssueID: "id-6", Identifier: "PROJ-6"}),
-			want:   map[string]any{"hopped_at": nil, "dispatched_at": nil},
+			body:   toStageHopResponse(orchestrator.SnapshotStageHop{IssueID: "id-6", Identifier: "PROJ-6"}, sentence.Context{}),
+			want:   map[string]any{"hopped_at": nil, "dispatched_at": nil, "hold": nil},
 			absent: []string{"display_identifier", "issue_title", "issue_url"},
+		},
+		{
+			name: "hold by a blocker serves its blockers and no slot or reset",
+			body: toHoldResponse(&orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipBlockedBy, Since: startedAt,
+				Blockers: []orchestrator.SnapshotBlocker{{IssueID: "b-1", Identifier: "PROJ-9", DisplayID: "acme/web#9"}},
+			}, sentence.Context{}),
+			want: map[string]any{
+				"reason":     "blocked_by",
+				"held_since": "2026-03-24T12:00:00Z",
+				"blockers":   []any{map[string]any{"issue_id": "b-1", "issue_identifier": "PROJ-9", "display_identifier": "acme/web#9"}},
+				"slot":       nil,
+				"resets_at":  nil,
+			},
+		},
+		{
+			name: "hold by a state slot limit serves its slot and no blockers or reset",
+			body: toHoldResponse(&orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipAgentSlotsFull, Since: startedAt,
+				Slot: &orchestrator.SnapshotSlotHold{Scope: orchestrator.SlotScopeState, State: "In Progress", Used: 2, Limit: 2},
+			}, sentence.Context{}),
+			want: map[string]any{
+				"slot":      map[string]any{"scope": "state", "state": "In Progress", "used": 2, "limit": 2},
+				"blockers":  nil,
+				"resets_at": nil,
+			},
+		},
+		{
+			name: "hold by the global slot limit serves a slot without a state",
+			body: toHoldResponse(&orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipAgentSlotsFull, Since: startedAt,
+				Slot: &orchestrator.SnapshotSlotHold{Scope: orchestrator.SlotScopeGlobal, Used: 1, Limit: 1},
+			}, sentence.Context{}),
+			want: map[string]any{"slot": map[string]any{"scope": "global", "used": 1, "limit": 1}},
+		},
+		{
+			name: "hold by a spend ceiling serves its reset in UTC and no blockers or slot",
+			body: toHoldResponse(&orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipDailySpendCeiling, Since: passAt, ResetsAt: passAt,
+			}, sentence.Context{}),
+			want: map[string]any{"held_since": "2026-03-24T09:00:00Z", "resets_at": "2026-03-24T09:00:00Z", "blockers": nil, "slot": nil},
+		},
+		{
+			name: "hold by a usage limit serves its reset and the model scope it covers",
+			body: toHoldResponse(&orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipUsageLimit, Since: passAt, ResetsAt: passAt,
+				AgentKind: "claude-code", ModelOnly: true, Model: "opus",
+			}, sentence.Context{}),
+			want: map[string]any{"reason": "usage_limit", "resets_at": "2026-03-24T09:00:00Z", "agent_kind": "claude-code", "model_only": true, "model": "opus"},
+		},
+		{
+			name:   "hold by a kind-wide usage limit omits the model scope",
+			body:   toHoldResponse(&orchestrator.SnapshotHold{Reason: orchestrator.SkipUsageLimit, Since: passAt, ResetsAt: passAt, AgentKind: "codex"}, sentence.Context{}),
+			want:   map[string]any{"agent_kind": "codex"},
+			absent: []string{"model_only", "model"},
+		},
+		{
+			name: "held issue without labels serves an empty list",
+			body: toHeldIssueResponse(orchestrator.SnapshotHeldEntry{
+				IssueID: "id-8", Identifier: "PROJ-8", IssueLabels: []string{},
+				Hold: orchestrator.SnapshotHold{Reason: orchestrator.SkipSSHHostsFull, Since: startedAt},
+			}, sentence.Context{}),
+			want: map[string]any{"issue_labels": []any{}},
 		},
 		{
 			name: "parked record",
@@ -1367,6 +1430,9 @@ func TestToStateResponse(t *testing.T) {
 		if got.RateLimits == nil {
 			t.Fatal("RateLimits = nil, want non-nil empty map")
 		}
+		if len(got.RateLimits) != 0 {
+			t.Errorf("len(RateLimits) = %d, want 0", len(got.RateLimits))
+		}
 	})
 
 	t.Run("counts match entries", func(t *testing.T) {
@@ -1390,6 +1456,36 @@ func TestToStateResponse(t *testing.T) {
 		}
 		if got.Counts.Retrying != 1 {
 			t.Errorf("Counts.Retrying = %d, want 1", got.Counts.Retrying)
+		}
+	})
+
+	t.Run("held rows are counted and leave active and attention as they were", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+		base := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: now,
+			Running:     []orchestrator.SnapshotRunningEntry{{IssueID: "id-1", Identifier: "MT-1", StartedAt: now}},
+			Parked:      []orchestrator.SnapshotParkedEntry{{IssueID: "id-2", Identifier: "MT-2", Reason: "agent_blocked", Label: "needs-human"}},
+		}
+		withHeld := base
+		withHeld.Held = []orchestrator.SnapshotHeldEntry{
+			{IssueID: "id-3", Identifier: "MT-3", Hold: orchestrator.SnapshotHold{Reason: orchestrator.SkipSSHHostsFull, Since: now}},
+			{IssueID: "id-4", Identifier: "MT-4", Hold: orchestrator.SnapshotHold{Reason: orchestrator.SkipSSHHostsFull, Since: now}},
+		}
+
+		want := toStateResponse(base, sentence.Context{Now: now}, nil)
+		got := toStateResponse(withHeld, sentence.Context{Now: now}, nil)
+
+		if want.Held == nil || len(want.Held) != 0 || want.Counts.Held != 0 {
+			t.Errorf("toStateResponse(no held).Held, Counts.Held = %v, %d, want an empty non-nil list and 0", want.Held, want.Counts.Held)
+		}
+		if got.Counts.Held != len(got.Held) || len(got.Held) != 2 {
+			t.Errorf("toStateResponse(2 held).Counts.Held, len(Held) = %d, %d, want 2, 2", got.Counts.Held, len(got.Held))
+		}
+		if !reflect.DeepEqual(got.Active, want.Active) || !reflect.DeepEqual(got.Attention, want.Attention) || got.Counts.Attention != want.Counts.Attention {
+			t.Errorf("toStateResponse(held).Active, Attention, Counts.Attention = %+v, %+v, %d, want %+v, %+v, %d",
+				got.Active, got.Attention, got.Counts.Attention, want.Active, want.Attention, want.Counts.Attention)
 		}
 	})
 
@@ -1434,7 +1530,7 @@ func TestToStateResponse(t *testing.T) {
 
 		assertJSONKeys(t, got, map[string]any{
 			"counts": map[string]any{
-				"running": 0, "retrying": 0, "budget_exhausted": 0, "parked": 0, "pending_reactions": 2, "between_stages": 0, "attention": 1,
+				"running": 0, "retrying": 0, "budget_exhausted": 0, "parked": 0, "pending_reactions": 2, "between_stages": 0, "held": 0, "attention": 1,
 			},
 			"pending_reactions": json.RawMessage(wantPendingReactionsJSON),
 		})
@@ -1451,14 +1547,31 @@ func TestToStateResponse(t *testing.T) {
 
 		assertJSONKeys(t, got, map[string]any{
 			"counts": map[string]any{
-				"running": 0, "retrying": 0, "budget_exhausted": 0, "parked": 0, "pending_reactions": 0, "between_stages": 1, "attention": 0,
+				"running": 0, "retrying": 0, "budget_exhausted": 0, "parked": 0, "pending_reactions": 0, "between_stages": 1, "held": 0, "attention": 0,
 			},
 			"between_stages": json.RawMessage(`[{"issue_id": "id-1", "issue_identifier": "MT-1", "source_rule": "specify",
-				"target_rule": "implement", "target_label": "stage:implement", "hopped_at": null, "dispatched_at": null, "stage_position": null,
+				"target_rule": "implement", "target_label": "stage:implement", "hopped_at": null, "dispatched_at": null, "stage_position": null, "hold": null,
 				"status_text": "Between stages: specify to implement",
 				"status_text_full": "Moved from stage specify to stage implement, and Sortie added \u0060stage:implement\u0060; implement starts when a poll tick reads that label on the issue."}]`),
 		})
 	})
+
+	for _, window := range orchestrator.SpendWindows() {
+		t.Run("spend window "+string(window)+" serves under its own member", func(t *testing.T) {
+			t.Parallel()
+
+			snap := orchestrator.RuntimeSnapshotResult{SpendCeilings: []orchestrator.SpendCeilingStatus{{Window: window, BudgetUSD: 7}}}
+
+			got := jsonObject(t, toStateResponse(snap, sentence.Context{}, nil))
+
+			members, _ := got["spend_ceiling"].(map[string]any)
+			for _, member := range orchestrator.SpendWindows() {
+				if served := members[string(member)] != nil; served != (member == window) {
+					t.Errorf("toStateResponse(%s only).spend_ceiling[%q] = %v, want an object only under %q", window, member, members[string(member)], window)
+				}
+			}
+		})
+	}
 
 	t.Run("tokens_measured reflects each running entry's own flag", func(t *testing.T) {
 		t.Parallel()
@@ -1823,7 +1936,7 @@ func TestBuildIssueDetail(t *testing.T) {
 		if got.BetweenStages == nil {
 			t.Fatal("buildIssueDetail(MT-4).BetweenStages = nil, want non-nil")
 		}
-		want := toStageHopResponse(hop)
+		want := toStageHopResponse(hop, sentence.Context{})
 		want.StatusText, want.StatusTextFull = got.BetweenStages.StatusText, got.BetweenStages.StatusTextFull
 		if !reflect.DeepEqual(*got.BetweenStages, want) {
 			t.Errorf("buildIssueDetail(MT-4).BetweenStages = %+v, want %+v", got.BetweenStages, want)
@@ -2106,8 +2219,79 @@ func TestHandleState(t *testing.T) {
 		if string(rawMap["retrying"]) == "null" {
 			t.Error("retrying = null in JSON, want []")
 		}
-		if string(rawMap["rate_limits"]) == "null" {
-			t.Error("rate_limits = null in JSON, want {}")
+		if got := string(rawMap["rate_limits"]); got != "{}" {
+			t.Errorf("rate_limits = %s in JSON, want {}", got)
+		}
+	})
+
+	t.Run("rate limits serve unknown values as null", func(t *testing.T) {
+		t.Parallel()
+
+		reset := time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
+		share := 82.0
+		snap := orchestrator.RuntimeSnapshotResult{
+			GeneratedAt: fixedTime,
+			UsageWindows: map[string]orchestrator.SnapshotUsageWindows{
+				"claude-code": {
+					ReportedAt: fixedTime,
+					Windows: []domain.UsageWindow{
+						{Key: "seven_day", Label: "Weekly limit", UsedPercent: &share, Status: domain.UsageWindowWarning, ResetsAt: reset, ReportedAt: fixedTime, Amount: &domain.UsageWindowAmount{Used: 410, Limit: 500, Unit: "credits"}},
+						{Key: "five_hour", Label: "5-hour limit", ReportedAt: fixedTime},
+					},
+				},
+				"codex": {ReportedAt: fixedTime, Windows: []domain.UsageWindow{}},
+			},
+		}
+
+		ts := testServer(t, fixedSnapshot(snap), acceptingRefresh())
+		_, body := getJSON[struct {
+			RateLimits map[string]struct {
+				Windows []struct {
+					Label       string          `json:"label"`
+					UsedPercent *float64        `json:"used_percent"`
+					Status      *string         `json:"status"`
+					ResetsAt    *time.Time      `json:"resets_at"`
+					Amount      json.RawMessage `json:"amount"`
+				} `json:"windows"`
+			} `json:"rate_limits"`
+		}](t, ts, "/api/v1/state")
+
+		claude := body.RateLimits["claude-code"].Windows
+		if len(claude) != 2 {
+			t.Fatalf("len(rate_limits[claude-code].windows) = %d, want 2", len(claude))
+		}
+		known, unknown := claude[0], claude[1]
+		if known.UsedPercent == nil || *known.UsedPercent != 82 {
+			t.Errorf("known window used_percent = %v, want 82", known.UsedPercent)
+		}
+		if known.Status == nil || *known.Status != "warning" {
+			t.Errorf("known window status = %v, want %q", known.Status, "warning")
+		}
+		if known.ResetsAt == nil || !known.ResetsAt.Equal(reset) {
+			t.Errorf("known window resets_at = %v, want %v", known.ResetsAt, reset)
+		}
+		if unknown.UsedPercent != nil {
+			t.Errorf("unknown window used_percent = %v, want null", *unknown.UsedPercent)
+		}
+		if unknown.Status != nil {
+			t.Errorf("unknown window status = %q, want null", *unknown.Status)
+		}
+		if unknown.ResetsAt != nil {
+			t.Errorf("unknown window resets_at = %v, want null", *unknown.ResetsAt)
+		}
+		if got, want := string(known.Amount), `{"used":410,"limit":500,"unit":"credits"}`; got != want {
+			t.Errorf("known window amount = %s, want %s", got, want)
+		}
+		if got := string(unknown.Amount); got != "null" {
+			t.Errorf("unknown window amount = %s, want null", got)
+		}
+
+		codex, ok := body.RateLimits["codex"]
+		if !ok {
+			t.Fatal("rate_limits[codex] missing, want a member with no current window")
+		}
+		if codex.Windows == nil {
+			t.Error("rate_limits[codex].windows = null, want []")
 		}
 	})
 
@@ -2164,18 +2348,28 @@ func TestHandleState_EveryRowCarriesBothForms(t *testing.T) {
 		Parked:           []orchestrator.SnapshotParkedEntry{{IssueID: "id-5", Identifier: "MT-55", Reason: "agent_blocked", Label: "needs-human"}},
 		PendingReactions: []orchestrator.SnapshotPendingReaction{{IssueID: "id-6", Identifier: "MT-66", Kind: "ci", NextPollAt: now.Add(time.Minute), PullRequest: orchestrator.SnapshotPullRequest{Number: 7}}},
 		BetweenStages:    []orchestrator.SnapshotStageHop{{IssueID: "id-7", Identifier: "MT-77", SourceRule: "specify", TargetRule: "implement", TargetLabel: "stage:implement"}},
+		Held: []orchestrator.SnapshotHeldEntry{{
+			IssueID: "id-8", Identifier: "MT-88",
+			Hold: orchestrator.SnapshotHold{
+				Reason: orchestrator.SkipBlockedBy, Since: now,
+				Blockers: []orchestrator.SnapshotBlocker{{IssueID: "id-9", Identifier: "MT-99", State: "In Progress"}},
+			},
+		}},
 	}
 	ts := testServer(t, fixedSnapshot(snap), acceptingRefresh())
 
 	_, body := getJSON[map[string]json.RawMessage](t, ts, "/api/v1/state")
 
-	lists := []string{"running", "retrying", "budget_exhausted", "parked", "pending_reactions", "between_stages"}
+	lists := []string{"running", "retrying", "budget_exhausted", "parked", "pending_reactions", "between_stages", "held"}
 	served := 0
 	for _, list := range lists {
 		var rows []struct {
 			Identifier string `json:"issue_identifier"`
 			Short      string `json:"status_text"`
 			Long       string `json:"status_text_full"`
+			Hold       *struct {
+				ReasonText string `json:"reason_text"`
+			} `json:"hold"`
 		}
 		if err := json.Unmarshal(body[list], &rows); err != nil {
 			t.Fatalf("GET /api/v1/state %s: %v", list, err)
@@ -2185,10 +2379,13 @@ func TestHandleState_EveryRowCarriesBothForms(t *testing.T) {
 			if row.Short == "" || row.Long == "" || strings.Contains(row.Long, row.Identifier) {
 				t.Errorf("GET /api/v1/state %s %s status_text, status_text_full = %q, %q, want a short form and a long form that does not repeat the issue key", list, row.Identifier, row.Short, row.Long)
 			}
+			if list == "held" && (row.Hold == nil || row.Hold.ReasonText != row.Short) {
+				t.Errorf("GET /api/v1/state held %s status_text = %q, want hold.reason_text %+v", row.Identifier, row.Short, row.Hold)
+			}
 		}
 	}
-	if served != 7 {
-		t.Errorf("GET /api/v1/state served %d rows with a sentence, want 7", served)
+	if served != 8 {
+		t.Errorf("GET /api/v1/state served %d rows with a sentence, want 8", served)
 	}
 }
 
@@ -3720,10 +3917,11 @@ func TestLastStageOf(t *testing.T) {
 }
 
 type servedEvent struct {
-	Seq     int64  `json:"seq"`
-	Event   string `json:"event"`
-	Message string `json:"message"`
-	Text    string `json:"text"`
+	Seq      int64  `json:"seq"`
+	Event    string `json:"event"`
+	Message  string `json:"message"`
+	Text     string `json:"text"`
+	ToolLine string `json:"tool_line"`
 }
 
 type servedEventsBody struct {
@@ -3810,6 +4008,27 @@ func TestRunEventsServed(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunEventsServeToolLine(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	retained := func(string) ([]orchestrator.RunEvent, bool) {
+		return []orchestrator.RunEvent{
+			{Seq: 1, At: at, Event: domain.EventToolResult, ToolName: "Bash", ToolKind: domain.ToolKindShell, ToolArgument: "go test ./..."},
+		}, true
+	}
+	ts := eventsServer(t, orchestrator.RuntimeSnapshotResult{}, &fakeRunHistory{}, retained)
+
+	status, body := getJSON[servedEventsBody](t, ts, "/api/v1/runs/d-1/events")
+
+	if status != http.StatusOK || len(body.Events) != 1 {
+		t.Fatalf("GET /api/v1/runs/d-1/events = %d with %d events, want 200 with 1", status, len(body.Events))
+	}
+	if got, want := body.Events[0].ToolLine, "go test ./..."; got != want {
+		t.Errorf("GET /api/v1/runs/d-1/events tool_line = %q, want %q", got, want)
 	}
 }
 

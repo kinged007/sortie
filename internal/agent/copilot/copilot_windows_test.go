@@ -9,14 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"golang.org/x/sys/windows"
-
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const versionHeldDescendantScenario = "copilot.version-held-descendant"
@@ -52,43 +51,6 @@ func init() {
 	fakeScenarios[versionHeldDescendantScenario] = agenttest.Typed(runVersionHeldDescendant)
 }
 
-// pollCopilotWinPIDAndAssertGone polls path for a positive PID, then
-// polls until the process can no longer be opened or reports exited,
-// failing t if either bound is exceeded.
-func pollCopilotWinPIDAndAssertGone(t *testing.T, path string) {
-	t.Helper()
-
-	deadline := time.Now().Add(5 * time.Second)
-	var pid int
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if v, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && v > 0 {
-				pid = v
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if pid == 0 {
-		t.Fatalf("pid file %q never populated", path)
-	}
-
-	goneDeadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(goneDeadline) {
-		handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, uint32(pid)) //nolint:gosec // G115: pid was read back from an os.Process.Pid
-		if err != nil {
-			return
-		}
-		event, waitErr := windows.WaitForSingleObject(handle, 0)
-		_ = windows.CloseHandle(handle)
-		if waitErr == nil && event == uint32(windows.WAIT_OBJECT_0) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Errorf("descendant %d still running after 3s, want gone", pid)
-}
-
 func TestStartSession_VersionCanaryHeldDescendantHoldingOutput(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -116,18 +78,13 @@ func TestStartSession_VersionCanaryHeldDescendantHoldingOutput(t *testing.T) {
 		done <- outcome{startErr}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("StartSession() did not return within 5s, want a bounded return despite the held descendant")
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartSession() took %v, want within 3s", elapsed)
+	oc := waittest.Receive(t, done, "StartSession return despite the held descendant")
+	if elapsed := time.Since(start); elapsed > procutil.DefaultDrainGrace {
+		t.Errorf("StartSession() took %v, want under the default drain grace %v", elapsed, procutil.DefaultDrainGrace)
 	}
 	if oc.err != nil {
 		t.Fatalf("StartSession() error = %v, want nil", oc.err)
 	}
 
-	pollCopilotWinPIDAndAssertGone(t, pidPath)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidPath))
 }

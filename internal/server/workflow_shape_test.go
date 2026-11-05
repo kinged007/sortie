@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
@@ -35,15 +36,15 @@ tracker:
   active_states: [To Do, In Progress]
   terminal_states: [Done]
   handoff_state: In Review
-agent: {kind: claude-code, command: claude --token SENTINEL-COMMAND, max_turns: 12, stall_timeout_ms: 240000, max_retry_backoff_ms: 120000}
-claude-code: {api_token: SENTINEL-KINDBLOCK}
+agent: {kind: journaled, command: claude --token SENTINEL-COMMAND, max_turns: 12, stall_timeout_ms: 240000, max_retry_backoff_ms: 120000}
+journaled: {api_token: SENTINEL-KINDBLOCK}
 worker: {ssh_hosts: [build01.internal, build02.internal], max_concurrent_agents_per_host: 2}
 hooks: {after_create: echo SENTINEL-HOOK}
 dispatch:
   max_consecutive_hops: 15
   rules:
     - name: quiet
-      claude-code: {api_token: SENTINEL-RULEBLOCK}
+      journaled: {api_token: SENTINEL-RULEBLOCK}
 token_rates:
   claude-code: {input_per_mtok: 3.0, output_per_mtok: 15.0, cache_read_per_mtok: 0.3, cache_write_per_mtok: 3.75}
   codex: {input_per_mtok: 2.5}
@@ -73,20 +74,26 @@ type shapeCIProvider struct{ domain.CIStatusProvider }
 type shapeSCMAdapter struct{ domain.SCMAdapter }
 
 func reportingAgentMeta() registry.AgentMeta {
-	silent := func(when func(map[string]any, bool) bool) registry.UsageSessionRule {
-		return registry.UsageSessionRule{When: when, Arrival: registry.UsageArrivalNone, Attribution: registry.UsageAttributionNone}
-	}
-	return registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalIncremental,
-		UsageAttribution: registry.UsageAttributionSessionTotal,
-		UsageSessionRules: []registry.UsageSessionRule{
-			silent(func(_ map[string]any, remote bool) bool { return remote }),
-			silent(func(passthrough map[string]any, _ bool) bool {
-				reports, ok := passthrough["report_token_usage"].(bool)
-				return ok && !reports
-			}),
+	return registry.AgentMeta{UsageSources: usage.Sources{Live: usage.Source{
+		Category: usage.SourceOutput,
+		Strategy: usage.StrategyLive,
+		Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, DuringTurn: true},
+	}}}
+}
+
+func journaledAgentMeta() registry.AgentMeta {
+	return registry.AgentMeta{UsageSources: usage.Sources{
+		Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Amounts: []usage.AmountDeclaration{{Unit: "premium requests", Shape: usage.AmountSessionCumulative}}},
 		},
-	}
+		Records: usage.Source{
+			Category: usage.SourceJournal,
+			Strategy: usage.StrategyRecords,
+			Spend:    usage.SpendDeclaration{Shape: usage.SpendPerRequest, ServedModel: true},
+		},
+	}}
 }
 
 func buildReaction[T any](t *testing.T, cfg config.ServiceConfig, key string, build func(config.ReactionConfig) (T, error)) (T, bool) {
@@ -143,7 +150,9 @@ func newShapeHarness(t *testing.T, frontMatter string) *shapeHarness {
 		State:                             orchestrator.NewState(cfg.Polling.IntervalMS, cfg.Agent.MaxConcurrentAgents, 0, nil, orchestrator.AgentTotals{}),
 		Logger:                            logger,
 		WorkflowManager:                   mgr,
-		PreflightParams:                   orchestrator.PreflightParams{AgentRegistry: shapeAgentRegistry{"claude-code": reportingAgentMeta(), "codex": reportingAgentMeta()}},
+		TrackerKind:                       cfg.Tracker.Kind,
+		TrackerProject:                    cfg.Tracker.Project,
+		PreflightParams:                   orchestrator.PreflightParams{AgentRegistry: shapeAgentRegistry{"claude-code": reportingAgentMeta(), "codex": reportingAgentMeta(), "journaled": journaledAgentMeta()}},
 		SCMAdapter:                        shapeSCMAdapter{},
 		ReviewConfig:                      review,
 		ReviewConfigured:                  hasReview,
@@ -246,6 +255,7 @@ func TestStateConfig_DispatchShape(t *testing.T) {
 		{
 			name: "no rules and no reaction",
 			want: map[string]string{
+				"tracker.project":               pathAbsent,
 				"dispatch.rules":                "[]",
 				"dispatch.chains":               "[]",
 				"dispatch.default":              "null",
@@ -339,12 +349,12 @@ func TestStateConfig_LimitsAndReactions(t *testing.T) {
 				"agent.max_turns":                              "12",
 				"agent.stall_timeout_ms":                       "240000",
 				"agent.max_retry_backoff_ms":                   "120000",
-				"agent.usage_arrival":                          `"none"`,
+				"agent.usage_arrival":                          `"turn_end"`,
 				"worker.ssh_hosts":                             `["build01.internal","build02.internal"]`,
 				"worker.max_concurrent_agents_per_host":        "2",
 				"dispatch.max_consecutive_hops":                "15",
 				"dispatch.hop_ceiling":                         "15",
-				"dispatch.rules":                               `[{"name":"quiet","selected_by":"catch_all","agent_kind":"claude-code","usage_arrival":"none"}]`,
+				"dispatch.rules":                               `[{"name":"quiet","selected_by":"catch_all","agent_kind":"journaled","usage_arrival":"turn_end"}]`,
 				"token_rates.claude-code.input_per_mtok":       "3.0",
 				"token_rates.claude-code.output_per_mtok":      "15.0",
 				"token_rates.claude-code.cache_read_per_mtok":  "0.3",
@@ -373,12 +383,12 @@ func TestStateConfig_LimitsAndReactions(t *testing.T) {
 			},
 		},
 		{
-			name: "local workers with a silent rule and unlimited budgets",
+			name: "local workers with a journaled rule and unlimited budgets",
 			yaml: shapeBaseYAML + `
 agent: {stall_timeout_ms: 0}
 dispatch:
   rules:
-    - {name: silent, claude-code: {report_token_usage: false}}
+    - {name: journaled-rule, agent: journaled}
 `,
 			want: map[string]string{
 				"agent.usage_arrival":                   `"incremental"`,
@@ -387,7 +397,7 @@ dispatch:
 				"agent.max_tokens":                      "null",
 				"worker.ssh_hosts":                      "[]",
 				"worker.max_concurrent_agents_per_host": "null",
-				"dispatch.rules":                        `[{"name":"silent","selected_by":"catch_all","agent_kind":"claude-code","usage_arrival":"none"}]`,
+				"dispatch.rules":                        `[{"name":"journaled-rule","selected_by":"catch_all","agent_kind":"journaled","usage_arrival":"turn_end"}]`,
 			},
 		},
 		{
@@ -421,15 +431,17 @@ reactions:
 	}
 }
 
-func TestStateConfig_ReloadKeepsConstructedReactions(t *testing.T) {
+func TestStateConfig_ReloadKeepsConstructedShape(t *testing.T) {
 	t.Parallel()
 
-	h := newShapeHarness(t, shapeBaseYAML+`
+	h := newShapeHarness(t, `
+tracker: {kind: jira, project: PROJ, active_states: [To Do, In Progress], terminal_states: [Done], handoff_state: In Review}
 reactions:
   ci_failure: {provider: github, max_retries: 1}
   bot_review: {provider: github, poll_interval_ms: 45000}
 `)
-	writeShapeWorkflow(t, h.path, shapeBaseYAML+`
+	writeShapeWorkflow(t, h.path, `
+tracker: {kind: github, project: acme/widgets, active_states: [Open], terminal_states: [Closed], handoff_state: In Review}
 reactions:
   ci_failure: {provider: github, max_retries: 5}
   merge_conflicts: {provider: github}
@@ -441,6 +453,9 @@ reactions:
 	_, cfg := h.state(t)
 
 	assertConfigPaths(t, cfg, map[string]string{
+		"tracker.kind":                          `"jira"`,
+		"tracker.project":                       `"PROJ"`,
+		"tracker.active_states":                 `["Open"]`,
 		"reactions.bot_review.poll_interval_ms": "45000",
 		"reactions.ci_failure.max_retries":      "5",
 		"reactions.merge_conflicts":             pathAbsent,

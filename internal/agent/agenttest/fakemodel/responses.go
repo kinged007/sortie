@@ -28,7 +28,7 @@ func (responsesCodec) credentialHeaders() []string {
 	return []string{"Authorization"}
 }
 
-func (responsesCodec) route(method, path string) (route, bool) {
+func (responsesCodec) route(method, path string, _ http.Header) (route, bool) {
 	return route{}, method == http.MethodPost && path == "/v1/responses"
 }
 
@@ -135,6 +135,12 @@ type responsesBody struct {
 	Output []json.RawMessage `json:"output"`
 	Model  string            `json:"model"`
 	Usage  *responsesUsage   `json:"usage,omitempty"`
+
+	IncompleteDetails *responsesIncomplete `json:"incomplete_details,omitempty"`
+}
+
+type responsesIncomplete struct {
+	Reason string `json:"reason"`
 }
 
 type responsesMessageItem struct {
@@ -164,7 +170,8 @@ type responsesPart struct {
 type responsesUsage struct {
 	InputTokens        int64 `json:"input_tokens"`
 	InputTokensDetails struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
 	} `json:"input_tokens_details"`
 	OutputTokens        int64 `json:"output_tokens"`
 	OutputTokensDetails struct {
@@ -181,6 +188,7 @@ func (responsesCodec) render(r reply) rendered {
 		TotalTokens:  r.usage.Prompt + output,
 	}
 	usage.InputTokensDetails.CachedTokens = r.usage.CachedContent
+	usage.InputTokensDetails.CacheWriteTokens = r.usage.CacheWrite
 	usage.OutputTokensDetails.ReasoningTokens = r.usage.Thoughts
 
 	responseID := fmt.Sprintf("resp_scripted_%d", r.seq)
@@ -215,6 +223,9 @@ func (responsesCodec) render(r reply) rendered {
 		started := responsesMessageItem{ID: itemID, Type: "message", Role: "assistant", Status: "in_progress", Content: []responsesPart{}}
 		finished := started
 		finished.Status, finished.Content = "completed", []responsesPart{full}
+		if r.truncated {
+			finished.Status = "incomplete"
+		}
 		final = encodeJSON(finished)
 		events = append(events,
 			responsesEvent{Type: "response.output_item.added", OutputIndex: &index, Item: encodeJSON(started)},
@@ -225,17 +236,20 @@ func (responsesCodec) render(r reply) rendered {
 			responsesEvent{Type: "response.output_item.done", OutputIndex: &index, Item: final},
 		)
 	}
-	completed := responsesBody{ID: responseID, Object: "response", Status: "completed", Output: []json.RawMessage{final}, Model: r.model, Usage: usage}
-	events = append(events, responsesEvent{Type: "response.completed", Response: &completed})
+	closing := responsesEvent{Type: "response.completed", Response: &responsesBody{ID: responseID, Object: "response", Status: "completed", Output: []json.RawMessage{final}, Model: r.model, Usage: usage}}
+	if r.truncated {
+		closing.Type = "response.incomplete"
+		closing.Response.Status = "incomplete"
+		closing.Response.IncompleteDetails = &responsesIncomplete{Reason: "max_output_tokens"}
+	}
+	events = append(events, closing)
 
 	var stream strings.Builder
 	for _, event := range events {
 		fmt.Fprintf(&stream, "event: %s\ndata: %s\n\n", event.Type, encodeJSON(event))
 	}
 
-	reported := r.usage
-	reported.CacheWrite = 0
-	return rendered{contentType: "text/event-stream", body: []byte(stream.String()), callID: callID, usage: reported}
+	return rendered{contentType: "text/event-stream", body: []byte(stream.String()), callID: callID, usage: r.usage}
 }
 
 type responsesError struct {

@@ -51,7 +51,7 @@ type TrackerAdapter interface {
 	FetchCandidateIssues(ctx context.Context) ([]Issue, error)
 
 	// FetchIssueByID returns a single fully-populated issue including
-	// comments.
+	// comments, oldest first.
 	//
 	// Used for pre-dispatch revalidation and prompt rendering. Returns
 	// a [*TrackerError] with Kind [ErrTrackerNotFound] if the issue
@@ -72,7 +72,7 @@ type TrackerAdapter interface {
 	// The returned map is keyed by issue ID with the value being the
 	// current state name. Issues not found in the tracker are omitted
 	// from the map (not an error). An empty state means the issue reads no
-	// configured state. Used for active-run reconciliation.
+	// configured state.
 	FetchIssueStatesByIDs(ctx context.Context, issueIDs []string) (map[string]string, error)
 
 	// FetchIssueStatesAndLabelsByIDs returns the current state and labels of
@@ -84,8 +84,7 @@ type TrackerAdapter interface {
 	// query filter is not applied. It sends no request FetchIssueStatesByIDs
 	// would not send for the same IDs, except for further pages of an issue's
 	// labels. An empty issueIDs returns an empty map and sends no request; on
-	// error the map is nil. Used to release parked issues the candidate query
-	// omits.
+	// error the map is nil.
 	FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]IssueStateAndLabels, error)
 
 	// FetchIssueStatesByIdentifiers returns the current state for each
@@ -97,10 +96,12 @@ type TrackerAdapter interface {
 	// cleanup.
 	FetchIssueStatesByIdentifiers(ctx context.Context, identifiers []string) (map[string]string, error)
 
-	// FetchIssueComments returns comments for the specified issue.
+	// FetchIssueComments returns comments for the specified issue, oldest
+	// first.
 	//
-	// Used for continuation runs and the agent workpad pattern.
-	// Returns an empty non-nil slice when no comments exist.
+	// Used for continuation runs, the first run after a person releases a
+	// park, and the agent workpad pattern. Returns an empty non-nil slice
+	// when no comments exist.
 	// Returns a [*TrackerError] with Kind [ErrTrackerNotFound]
 	// if the issue does not exist.
 	FetchIssueComments(ctx context.Context, issueID string) ([]Comment, error)
@@ -130,26 +131,27 @@ type TrackerAdapter interface {
 	// The text parameter is plain text; adapters convert to their native
 	// format internally (e.g. ADF wrapping for Jira).
 	//
-	// Returns nil on success. Returns a [*TrackerError] on tracker failure:
+	// On success it returns the created comment's identity and a nil
+	// error. The identity is non-empty and equals the [Comment.ID] that
+	// [TrackerAdapter.FetchIssueComments] and [TrackerAdapter.FetchIssueByID]
+	// report for that comment. It comes from the response of the one create
+	// request the call sends; the call sends no other request (no read-back,
+	// no search).
+	//
+	// Returns an empty commentID and a [*TrackerError] on tracker failure:
 	//   - [ErrTrackerTransport]: network or server failure.
 	//   - [ErrTrackerAuth]: insufficient permissions.
 	//   - [ErrTrackerAPI]: non-success response (rate limit, unexpected status).
 	//   - [ErrTrackerNotFound]: the issue does not exist.
-	//   - [ErrTrackerPayload]: malformed request or response.
+	//   - [ErrTrackerPayload]: malformed request or response, including a
+	//     successful create response that does not carry the identity.
 	//
 	// When ctx is canceled or its deadline is exceeded, implementations
 	// may return ctx.Err() directly (e.g. [context.Canceled] or
 	// [context.DeadlineExceeded]) instead of a [*TrackerError].
 	//
 	// All errors are non-fatal; the orchestrator logs WARN and continues.
-	CommentIssue(ctx context.Context, issueID string, text string) error
-
-	// CommentIssueWithLiteral posts text followed by literal rendered as the
-	// tracker's literal block, so the tracker shows literal verbatim and acts
-	// on nothing in it. literal is non-empty valid UTF-8 holding no C0
-	// control character other than tab and line feed, and no DEL. Errors and
-	// cancellation behave as [TrackerAdapter.CommentIssue] documents.
-	CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error
+	CommentIssue(ctx context.Context, issueID string, text string) (commentID string, err error)
 
 	// AddLabel adds a label to the specified issue and removes no other
 	// label. A tracker that models a label group as single-select may
@@ -213,6 +215,13 @@ type TrackerAdapter interface {
 	SetTrackerStates(current func() TrackerStates)
 }
 
+// ProjectLinker is the optional capability a tracker adapter implements
+// when the project it reads has a web page a person can open.
+type ProjectLinker interface {
+	// ProjectURL returns the web address of the configured project.
+	ProjectURL() string
+}
+
 // BlockerReader is the optional capability a tracker adapter
 // implements when its candidate fetch cannot carry blockers.
 type BlockerReader interface {
@@ -226,3 +235,71 @@ type BlockerReader interface {
 // blocker source and does not implement [BlockerReader]. Callers
 // treat it as a condition the next attempt will not fix.
 var ErrNoBlockerReader = errors.New("tracker adapter declares per-issue blockers and implements no reader")
+
+// CommentReadPoint is the opaque position a [CommentChangeReader] returns
+// so the next read of the same issue covers only what changed since. Its
+// text means nothing to a caller, and it is meaningful only for the issue
+// whose read returned it. The zero value reads the full list.
+type CommentReadPoint string
+
+// CommentChanges is the result of one [CommentChangeReader] read.
+type CommentChanges struct {
+	// Comments are the comments the read returns, oldest first by creation
+	// time with ties by ascending ID, each ID at most once. It is never
+	// nil on success.
+	Comments []Comment
+
+	// Next is the point the next read of the same issue passes.
+	Next CommentReadPoint
+}
+
+// CommentChangeReader is the optional capability a tracker adapter
+// implements to read an issue's comments created or edited since an
+// earlier read.
+type CommentChangeReader interface {
+	// FetchIssueCommentChanges returns the comments of one issue created
+	// or edited since the read that returned since; a zero or undecodable
+	// since reads the full list. Comments may also hold unchanged
+	// comments, so the caller decides what changed by identity and body.
+	// Next can move without a changed comment. Errors are those of
+	// [TrackerAdapter.FetchIssueComments].
+	//
+	// An adapter whose tracker cannot filter comments by update time may
+	// leave out an edit to a comment older than every comment its read
+	// returns, and that adapter's method godoc names the limit.
+	//
+	// A read from Next can omit every unchanged comment this read
+	// returned, so the caller passes Next only once each of them is
+	// recorded as given or left out by selection, and passes since again
+	// when it discards the result before then.
+	FetchIssueCommentChanges(ctx context.Context, issueID string, since CommentReadPoint) (CommentChanges, error)
+}
+
+// CommentAuthorAccessReader is the optional capability a tracker adapter
+// implements when anyone who can read a project may comment on it.
+type CommentAuthorAccessReader interface {
+	// CommentAuthorCanWrite reports whether the author of c has write
+	// access to the configured project: true is granted, false with a nil
+	// error is refused, and false with an error is a failed lookup. It
+	// reads c.AuthorID and c.ID only.
+	//
+	// An adapter remembers a grant for its lifetime and a refusal for
+	// that comment only; an edit keeps the comment's ID, so an edited
+	// comment is not asked about again. An empty AuthorID is refused
+	// without a request. The error is [ErrTrackerAuth] when the token
+	// cannot ask, and nothing is remembered on error.
+	CommentAuthorCanWrite(ctx context.Context, c Comment) (bool, error)
+}
+
+// CommentAuthorKindReader is the optional capability a tracker adapter
+// implements when its full comment reads report no author kind.
+type CommentAuthorKindReader interface {
+	// LookupCommentAuthorKind reports the kind that
+	// [CommentChangeReader.FetchIssueCommentChanges] reports for the author
+	// of c. It reads c.AuthorID only; an empty AuthorID is
+	// [CommentAuthorUnknown] without a request.
+	//
+	// An adapter remembers an answer for its lifetime and nothing on
+	// error. The errors are those of [TrackerAdapter.FetchIssueComments].
+	LookupCommentAuthorKind(ctx context.Context, c Comment) (CommentAuthorKind, error)
+}

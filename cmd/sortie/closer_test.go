@@ -2,15 +2,14 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -46,7 +45,13 @@ var closeTokenSeq atomic.Int64
 func registerCloseableAdapters() {
 	closeableOnce.Do(func() {
 		registry.Trackers.Register("closeable-file", newCloseableFileTracker)
-		registry.Agents.Register("closeable-mock", newCloseableMockAgent)
+		registry.Agents.RegisterWithMeta("closeable-mock", newCloseableMockAgent, registry.AgentMeta{
+			UsageSources: usage.Sources{Live: usage.Source{
+				Category: usage.SourceOutput,
+				Strategy: usage.StrategyLive,
+				Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative},
+			}},
+		})
 	})
 }
 
@@ -165,10 +170,7 @@ func TestRunAdapterCloseOnShutdown(t *testing.T) {
 	wfPath := writeCloseableWorkflow(t, dir, "issues.json", token)
 
 	var stdout, stderr bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	code := run(ctx, []string{wfPath}, &stdout, &stderr)
+	code := runUntilStarted(t, []string{wfPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
 	}

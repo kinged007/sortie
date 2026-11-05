@@ -1,6 +1,5 @@
 import { fmtRate } from "@/lib/format";
 
-/** The wording of a rate no layer sets. */
 export const UNSET_RATE = "not set";
 
 /** The wording of a kind entry's cache rate that is left unset and priced at its input rate. */
@@ -19,19 +18,6 @@ const LAYER_LABELS: Readonly<Record<string, string>> = {
   embedded: "Built-in prices",
 };
 
-/** Words a rate layer; a layer the client has no wording for reads as served. */
 export function layerLabel(layer: string): string {
   return LAYER_LABELS[layer] ?? layer;
-}
-
-const CLASS_WORDS: Readonly<Record<string, string>> = {
-  input: "input",
-  output: "output",
-  cache_read: "cache read",
-  cache_write: "cache write",
-};
-
-/** Words the token classes a cost has no rate for, joined by commas; a class the client has no wording for reads as served. */
-export function unratedText(classes: readonly string[]): string {
-  return classes.map((name) => CLASS_WORDS[name] ?? name).join(", ");
 }

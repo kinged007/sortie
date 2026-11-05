@@ -3,23 +3,21 @@
 package procutil
 
 import (
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func awaitUnreapedExit(t *testing.T, pid int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if isReaperTestZombie(pid) {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	waittest.ProcessGone(t, pid)
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("kill(%d, 0) = %v, want the exited child still unreaped", pid, err)
 	}
-	t.Fatalf("process %d did not become an unreaped zombie within 5s", pid)
 }
 
 func TestObserveLeaderExitBlocksWhileRunning(t *testing.T) {
@@ -29,22 +27,13 @@ func TestObserveLeaderExitBlocksWhileRunning(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- observeLeaderExit(cmd.Process.Pid) }()
 
-	select {
-	case err := <-done:
-		t.Fatalf("observeLeaderExit(%d) = %v while the direct child still runs, want it blocked", cmd.Process.Pid, err)
-	case <-time.After(300 * time.Millisecond):
-	}
+	waittest.Never(t, done, 300*time.Millisecond, "observeLeaderExit() while the direct child still runs")
 
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("cmd.Process.Kill() = %v", err)
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("observeLeaderExit(%d) after the exit = %v, want nil", cmd.Process.Pid, err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("observeLeaderExit(%d) did not return within 5s of the exit", cmd.Process.Pid)
+	if err := waittest.Receive(t, done, "observeLeaderExit() return after the exit"); err != nil {
+		t.Errorf("observeLeaderExit(%d) after the exit = %v, want nil", cmd.Process.Pid, err)
 	}
 	if err := cmd.Wait(); !killedBySignal(err) {
 		t.Errorf("cmd.Wait() = %v, want the exit status of a child that stayed unreaped", err)
@@ -84,13 +73,8 @@ func TestObserveLeaderExitReturnsForExitAfterAndBeforeCall(t *testing.T) {
 				}
 			}
 
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Errorf("observeLeaderExit(%d) = %v, want nil", pid, err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatalf("observeLeaderExit(%d) did not return within 5s", pid)
+			if err := waittest.Receive(t, done, "observeLeaderExit() return"); err != nil {
+				t.Errorf("observeLeaderExit(%d) = %v, want nil", pid, err)
 			}
 
 			err := cmd.Wait()
@@ -145,18 +129,16 @@ func TestHasLiveMemberOneOtherMember(t *testing.T) {
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill(-%d, SIGKILL) = %v", pid, err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for live && time.Now().Before(deadline) {
-		if live, err = hasLiveMember(pid, pid); err != nil {
+	waittest.Until(t, func() error {
+		live, err := hasLiveMember(pid, pid)
+		if err != nil {
 			t.Fatalf("hasLiveMember(%d, %d) = %v", pid, pid, err)
 		}
 		if live {
-			time.Sleep(5 * time.Millisecond)
+			return fmt.Errorf("hasLiveMember(%d, %d) = true after the group was killed, want false", pid, pid)
 		}
-	}
-	if live {
-		t.Errorf("hasLiveMember(%d, %d) = true 5s after the group was killed, want false", pid, pid)
-	}
+		return nil
+	})
 }
 
 func TestParseProcStat(t *testing.T) {

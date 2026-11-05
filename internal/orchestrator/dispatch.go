@@ -269,8 +269,36 @@ const (
 	SkipBlockersIncomplete SkipReason = "blockers_incomplete"
 
 	SkipDailySpendCeiling   SkipReason = "daily_spend_ceiling"
+	SkipWeeklySpendCeiling  SkipReason = "weekly_spend_ceiling"
 	SkipMonthlySpendCeiling SkipReason = "monthly_spend_ceiling"
+
+	// The reasons below describe a hold only. [EvaluateCandidate] never
+	// returns them and the candidate-hold counter never receives them.
+	SkipAgentSlotsFull      SkipReason = "agent_slots_full"
+	SkipSSHHostsFull        SkipReason = "ssh_hosts_full"
+	SkipStageHopUnconfirmed SkipReason = "stage_hop_unconfirmed"
+	SkipUsageLimit          SkipReason = "usage_limit"
+	SkipParkCommentsUnread  SkipReason = "park_comments_unread"
 )
+
+// HoldReasons returns every reason a [HeldEntry] can carry, in the order of
+// the hold precedence. The slice is new on each call.
+func HoldReasons() []SkipReason {
+	return []SkipReason{
+		SkipAgentSlotsFull,
+		SkipSSHHostsFull,
+		SkipBlockersNotRead,
+		SkipBlockersUnresolved,
+		SkipBlockersIncomplete,
+		SkipBlockedBy,
+		SkipDailySpendCeiling,
+		SkipWeeklySpendCeiling,
+		SkipMonthlySpendCeiling,
+		SkipStageHopUnconfirmed,
+		SkipUsageLimit,
+		SkipParkCommentsUnread,
+	}
+}
 
 // CandidateDecision is the outcome of evaluating one candidate.
 type CandidateDecision struct {
@@ -548,6 +576,10 @@ type ScheduleRetryParams struct {
 	LastSSHHost   string // Runtime-only: SSH host from previous attempt for retry affinity.
 	SessionID     string // Session identifier from previous attempt for cross-retry resume.
 
+	// DueAtMS is the absolute due time in Unix epoch milliseconds. A non-zero
+	// value replaces DelayMS; the timer fires max(DueAtMS-now, 0) later.
+	DueAtMS int64
+
 	// Logger receives the displacement warning when ScheduleRetry finds
 	// the retry slot occupied. Nil selects slog.Default().
 	Logger *slog.Logger
@@ -571,6 +603,12 @@ type ScheduleRetryParams struct {
 	// an existing retry passes it; [ScheduleRetry] ignores it on every
 	// schedule whose Trigger is not the timer label.
 	OriginTrigger string
+
+	// UsageLimitNotified reports that the run this retry follows ended in a
+	// provider usage-limit refusal, so the next run publishes no session.started
+	// event and, if refused, no session.failed event. Propagated verbatim into
+	// the new [RetryEntry].
+	UsageLimitNotified bool
 
 	// AgentKind is the adapter kind of the dispatch. Propagated verbatim
 	// into the new [RetryEntry].
@@ -643,11 +681,14 @@ func ScheduleRetry(state *State, params ScheduleRetryParams, onFire func(issueID
 	// above reports when that happens.
 	CancelRetry(state, params.IssueID)
 
-	delayMS := max(params.DelayMS, 0)
-
 	// A timer that has fired must not look premature after a scheduling pause.
 	scheduledAt := time.Now()
+	delayMS := max(params.DelayMS, 0)
 	dueAtMS := scheduledAt.UnixMilli() + delayMS
+	if params.DueAtMS != 0 {
+		delayMS = max(params.DueAtMS-scheduledAt.UnixMilli(), 0)
+		dueAtMS = params.DueAtMS
+	}
 
 	timer := time.AfterFunc(time.Duration(delayMS)*time.Millisecond, func() {
 		onFire(params.IssueID)
@@ -673,6 +714,7 @@ func ScheduleRetry(state *State, params ScheduleRetryParams, onFire func(issueID
 		ReactionKind:        params.ReactionKind,
 		Trigger:             params.Trigger,
 		OriginTrigger:       originTrigger,
+		UsageLimitNotified:  params.UsageLimitNotified,
 		RuleName:            params.RuleName,
 		StageLineage:        params.StageLineage,
 		RuleSettingsApplied: params.RuleSettingsApplied,
@@ -761,7 +803,7 @@ func DispatchIssue(ctx context.Context, state *State, issue domain.Issue, attemp
 		panic("DispatchIssue: nil WorkerFunc")
 	}
 
-	runCtx, cancelFn := context.WithCancel(ctx) //nolint:gosec // G118: cancelFn is stored in RunningEntry.CancelFunc for later use
+	runCtx, cancelRunCause := context.WithCancelCause(ctx) //nolint:gosec // G118: cancelRunCause is stored in RunningEntry.CancelCauseFunc for later use
 	workerCtx, cancelWorkerCause := context.WithCancelCause(runCtx)
 	ceilingCancelFn := func() {
 		cancelWorkerCause(errCeilingStop)
@@ -781,10 +823,12 @@ func DispatchIssue(ctx context.Context, state *State, issue domain.Issue, attemp
 	state.Running[issue.ID] = &RunningEntry{
 		Identifier:        issue.Identifier,
 		Issue:             issue,
+		DispatchLabels:    slices.Clone(issue.Labels),
 		DispatchID:        dispatchID,
 		RetryAttempt:      attemptCopy,
 		StartedAt:         time.Now().UTC(),
-		CancelFunc:        cancelFn,
+		CancelFunc:        func() { cancelRunCause(nil) },
+		CancelCauseFunc:   cancelRunCause,
 		CeilingCancelFunc: ceilingCancelFn,
 		WorkerDone:        workerCtx.Done(),
 		SSHHost:           sshHost,

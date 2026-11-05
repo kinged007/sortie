@@ -11,32 +11,35 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
-const mcpConfigKey = "mcp_config"
+const (
+	// kindName repeats the registered kind because the registration keeps its
+	// own literal, which the kind-completeness scan reads syntactically.
+	kindName     = "agent-client-protocol"
+	mcpConfigKey = "mcp_config"
+	variantKey   = "variant"
+)
 
 func init() {
 	registry.Agents.RegisterWithMeta("agent-client-protocol", NewClientProtocolAdapter, registry.AgentMeta{
-		RequiresCommand:     true,
-		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionTranslated,
-		UsageArrival:        registry.UsageArrivalTurnEnd,
-		UsageAttribution:    registry.UsageAttributionPerModel,
-		CredentialEnv:       registry.DeclareCredentialEnv(),
-		EffortForwarding:    registry.EffortNotForwarded,
-		UsageSessionRules: []registry.UsageSessionRule{
-			{
-				// The measurement source reads a local filesystem, while a
-				// worker over SSH writes its measurements on the far host. This
-				// pins what a remote session reports today, not what it can ever
-				// report.
-				When:        func(passthrough map[string]any, remote bool) bool { return remote },
-				Arrival:     registry.UsageArrivalNone,
-				Attribution: registry.UsageAttributionNone,
-			},
-		},
+		RequiresCommand:       true,
+		ValidateAgentConfig:   validateConfig,
+		MCPDialect:            registry.MCPDialectACPSession,
+		LiteralSettings:       []string{envKey},
+		UsageSources:          usage.Sources{Live: usagesource.Default.Live},
+		CredentialEnv:         registry.DeclareCredentialEnv(),
+		EffortForwarding:      registry.EffortForwarded,
+		UsageLimitRecognition: registry.UsageLimitRecognized,
+		VerificationContext: registry.DeclareVerificationContext(
+			registry.VerificationKeepsAllTools,
+			registry.VerificationKeepsProjectInstructions,
+			registry.VerificationKeepsUserInstructions,
+			registry.VerificationKeepsSystemPrompt,
+		),
 	})
 }
 
@@ -56,17 +59,16 @@ type ClientProtocolAdapter struct {
 	// at its zero value.
 	drainGrace time.Duration
 
-	// sources is the registry StartSession offers a launch to. Nil means
-	// usagesource.Sources. Set by a test before StartSession, as drainGrace is;
-	// every production caller reaches only NewClientProtocolAdapter, which
-	// leaves it at its zero value.
-	sources *registry.Registry[usagesource.Constructor, struct{}]
+	// declarations is the registry finishSession selects a usage declaration
+	// from. Nil means usagesource.Declarations. Set by a test before
+	// StartSession, as drainGrace is.
+	declarations *registry.Registry[usagesource.Declaration, struct{}]
 }
 
-// NewClientProtocolAdapter constructs a [ClientProtocolAdapter]. The kind's
-// settings arrive per session; the only one it reads is mcp_config, and only
-// to check its type: the path a session uses arrives through
-// StartSessionParams.MCPConfigPath.
+// NewClientProtocolAdapter constructs a [ClientProtocolAdapter]; the kind's
+// settings arrive per session, config_options among them. The env values load
+// as written, because a runtime's own configuration document carries "$"
+// characters that variable resolution would corrupt.
 func NewClientProtocolAdapter() (domain.AgentAdapter, error) {
 	return &ClientProtocolAdapter{}, nil
 }

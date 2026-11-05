@@ -4,6 +4,7 @@ package procutil
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // The exit is observed through the test's own kqueue, registered before the
@@ -22,7 +24,6 @@ func awaitExitUnreaped(t *testing.T, cmd *exec.Cmd) {
 	if err != nil {
 		t.Fatalf("unix.Kqueue() = %v", err)
 	}
-	defer func() { _ = unix.Close(kq) }()
 
 	register := []unix.Kevent_t{{
 		Ident:  uint64(cmd.Process.Pid), //nolint:gosec // G115: a process identifier is never negative
@@ -31,35 +32,40 @@ func awaitExitUnreaped(t *testing.T, cmd *exec.Cmd) {
 		Fflags: unix.NOTE_EXIT,
 	}}
 	if _, err := unix.Kevent(kq, register, nil, nil); err != nil {
+		_ = unix.Close(kq)
 		t.Fatalf("registering for the exit of process %d = %v", cmd.Process.Pid, err)
 	}
 	if err := cmd.Process.Kill(); err != nil {
+		_ = unix.Close(kq)
 		t.Fatalf("cmd.Process.Kill() = %v", err)
 	}
 
-	events := make([]unix.Kevent_t, 1)
-	timeout := unix.NsecToTimespec((10 * time.Second).Nanoseconds())
-	for {
-		n, err := unix.Kevent(kq, nil, events, &timeout)
-		if errors.Is(err, unix.EINTR) {
-			continue
+	notified := make(chan error, 1)
+	go func() {
+		defer func() { _ = unix.Close(kq) }()
+		events := make([]unix.Kevent_t, 1)
+		for {
+			n, err := unix.Kevent(kq, nil, events, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if err != nil || n != 1 {
+				notified <- fmt.Errorf("%d events, %v, want 1", n, err)
+				return
+			}
+			notified <- nil
+			return
 		}
-		if err != nil || n != 1 {
-			t.Fatalf("waiting for the exit of process %d = %d events, %v, want 1", cmd.Process.Pid, n, err)
-		}
-		return
+	}()
+	if err := waittest.Receive(t, notified, "exit notification of the direct child"); err != nil {
+		t.Fatalf("waiting for the exit of process %d = %v", cmd.Process.Pid, err)
 	}
 }
 
-func awaitObservation(t *testing.T, done <-chan error, pid int, within time.Duration) {
+func awaitObservation(t *testing.T, done <-chan error, pid int) {
 	t.Helper()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("observeLeaderExit(%d) = %v, want nil", pid, err)
-		}
-	case <-time.After(within):
-		t.Fatalf("observeLeaderExit(%d) did not return within %v", pid, within)
+	if err := waittest.Receive(t, done, "observeLeaderExit() return"); err != nil {
+		t.Errorf("observeLeaderExit(%d) = %v, want nil", pid, err)
 	}
 }
 
@@ -71,16 +77,12 @@ func TestObserveLeaderExitDoesNotReturnWhileRunning(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- observeLeaderExit(pid) }()
 
-	select {
-	case err := <-done:
-		t.Fatalf("observeLeaderExit(%d) = %v while the direct child still runs, want it blocked past one probe interval", pid, err)
-	case <-time.After(darwinExitProbeInterval + 500*time.Millisecond):
-	}
+	waittest.Never(t, done, darwinExitProbeInterval+500*time.Millisecond, "observeLeaderExit() while the direct child still runs")
 
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("cmd.Process.Kill() = %v", err)
 	}
-	awaitObservation(t, done, pid, 10*time.Second)
+	awaitObservation(t, done, pid)
 	if err := cmd.Wait(); !killedBySignal(err) {
 		t.Errorf("cmd.Wait() = %v, want the signal status of a child that stayed unreaped", err)
 	}
@@ -114,7 +116,7 @@ func TestObserveLeaderExitReturnsForExitAfterAndBeforeCall(t *testing.T) {
 				}
 			}
 
-			awaitObservation(t, done, pid, 10*time.Second)
+			awaitObservation(t, done, pid)
 
 			if err := cmd.Wait(); !killedBySignal(err) {
 				t.Errorf("cmd.Wait() = %v, want the signal status of a child that stayed unreaped", err)

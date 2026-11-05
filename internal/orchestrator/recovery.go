@@ -10,7 +10,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -28,7 +28,7 @@ import (
 //
 // Must be called before [NewOrchestrator] so the retry timer channel
 // buffer can be sized to accommodate immediate-fire entries.
-func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog.Logger) {
+func PopulateRetries(state *State, entries []storage.PendingRetry, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -74,6 +74,8 @@ func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog
 			Trigger:          e.Trigger,
 			OriginTrigger:    e.OriginTrigger,
 			scheduledDelayMS: pending.RemainingMs,
+
+			UsageLimitNotified: e.UsageLimitNotified,
 		}
 		state.Claimed[e.IssueID] = struct{}{}
 
@@ -86,6 +88,19 @@ func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog
 	}
 }
 
+// PopulateUsageLimitHolds loads persisted usage-limit holds into the state.
+// An expired hold loads and stays inert until a refusal replaces it or a
+// run started after it clears it.
+func PopulateUsageLimitHolds(state *State, holds []storage.UsageLimitHold) {
+	for _, hold := range holds {
+		key := UsageLimitHoldKey{AgentKind: hold.AgentKind, ModelOnly: hold.ModelOnly, Model: hold.Model}
+		state.UsageLimitHolds[key] = UsageLimitHold{
+			ResetsAt: time.UnixMilli(hold.ResetsAtMs).UTC(),
+			Since:    time.UnixMilli(hold.HeldSinceMs).UTC(),
+		}
+	}
+}
+
 // PendingReactionRecoveryLookback is the maximum age of a run_history row or
 // SCM activity timestamp considered eligible for pending reaction recovery on
 // startup.
@@ -94,12 +109,6 @@ const PendingReactionRecoveryLookback = 30 * 24 * time.Hour
 // PendingReactionRecoveryMaxCandidates is the maximum number of unique issues
 // considered for pending reaction recovery in a single startup pass.
 const PendingReactionRecoveryMaxCandidates = 200
-
-// ReactionRecoveryRunStore is the persistence contract consumed by startup
-// wiring and orchestrator tests.
-type ReactionRecoveryRunStore interface {
-	LoadLatestSuccessfulRunsForReactionRecovery(ctx context.Context, completedAfter time.Time, limit int) ([]persistence.RunHistory, error)
-}
 
 // PendingReactionRecoveryParams holds all inputs for [RecoverPendingReactions].
 type PendingReactionRecoveryParams struct {
@@ -147,7 +156,7 @@ type PendingReactionRecoveryResult struct {
 // Recovery is best-effort: per-candidate invalid data is skipped, while a
 // tracker state fetch failure aborts recovery for this startup and returns a
 // zero result with the fetch error.
-func RecoverPendingReactions(ctx context.Context, state *State, runs []persistence.RunHistory, params PendingReactionRecoveryParams) (PendingReactionRecoveryResult, error) {
+func RecoverPendingReactions(ctx context.Context, state *State, runs []storage.RunHistory, params PendingReactionRecoveryParams) (PendingReactionRecoveryResult, error) {
 	if params.HandoffState == "" || (params.SCMAdapter == nil && params.CIProvider == nil && !params.AutoMergeReactionConfigured) {
 		return PendingReactionRecoveryResult{}, nil
 	}
@@ -248,8 +257,8 @@ func RecoverPendingReactions(ctx context.Context, state *State, runs []persisten
 	return outcome, nil
 }
 
-func filterReactionRecoveryRuns(state *State, runs []persistence.RunHistory, outcome *PendingReactionRecoveryResult) []persistence.RunHistory {
-	eligibleRuns := make([]persistence.RunHistory, 0, len(runs))
+func filterReactionRecoveryRuns(state *State, runs []storage.RunHistory, outcome *PendingReactionRecoveryResult) []storage.RunHistory {
+	eligibleRuns := make([]storage.RunHistory, 0, len(runs))
 	for _, run := range runs {
 		if _, exists := state.Running[run.IssueID]; exists {
 			outcome.Skipped++
@@ -268,8 +277,8 @@ func filterReactionRecoveryRuns(state *State, runs []persistence.RunHistory, out
 	return eligibleRuns
 }
 
-func validReactionRecoveryRuns(runs []persistence.RunHistory, log *slog.Logger, outcome *PendingReactionRecoveryResult) ([]persistence.RunHistory, []string) {
-	validRuns := make([]persistence.RunHistory, 0, len(runs))
+func validReactionRecoveryRuns(runs []storage.RunHistory, log *slog.Logger, outcome *PendingReactionRecoveryResult) ([]storage.RunHistory, []string) {
+	validRuns := make([]storage.RunHistory, 0, len(runs))
 	issueIDs := make([]string, 0, len(runs))
 	seen := make(map[string]struct{}, len(runs))
 
@@ -306,7 +315,7 @@ func validReactionRecoveryRuns(runs []persistence.RunHistory, log *slog.Logger, 
 
 // stageLineageOf returns the lineage frozen with the dispatch that wrote
 // run.
-func stageLineageOf(run persistence.RunHistory) StageLineage {
+func stageLineageOf(run storage.RunHistory) StageLineage {
 	return StageLineage{
 		PreviousRule:    run.StagePrevious,
 		PreviousOutcome: run.StagePreviousOutcome,
@@ -317,13 +326,13 @@ func stageLineageOf(run persistence.RunHistory) StageLineage {
 
 // issueIdentityOfRun returns the identity run recorded at dispatch: a title
 // and link with nil Labels, because run history keeps no other fact.
-func issueIdentityOfRun(run persistence.RunHistory) IssueIdentity {
+func issueIdentityOfRun(run storage.RunHistory) IssueIdentity {
 	return IssueIdentity{Title: run.IssueTitle, URL: run.IssueURL}
 }
 
 func recoverPendingReactionKinds(
 	state *State,
-	run persistence.RunHistory,
+	run storage.RunHistory,
 	meta domain.SCMMetadata,
 	now time.Time,
 	params PendingReactionRecoveryParams,
@@ -414,7 +423,7 @@ func reactionKindConfigured(params PendingReactionRecoveryParams, kind string) b
 // query, so the first pass after a restart records a baseline and
 // classifies it unknown rather than resetting a counter against a boundary
 // this process never observed.
-func recoveredPendingReaction(run persistence.RunHistory, kind string, pr pullRequestRef, now time.Time) *PendingReaction {
+func recoveredPendingReaction(run storage.RunHistory, kind string, pr pullRequestRef, now time.Time) *PendingReaction {
 	return &PendingReaction{
 		IssueID:    run.IssueID,
 		Identifier: run.Identifier,
@@ -459,7 +468,7 @@ func recoveredKindData(kind string, pr pullRequestRef) any {
 	}
 }
 
-func freshReactionRecoveryActivity(run persistence.RunHistory, meta domain.SCMMetadata, cutoff time.Time) bool {
+func freshReactionRecoveryActivity(run storage.RunHistory, meta domain.SCMMetadata, cutoff time.Time) bool {
 	activity := meta.PushedAt
 	if activity == "" {
 		activity = run.CompletedAt
@@ -471,7 +480,7 @@ func freshReactionRecoveryActivity(run persistence.RunHistory, meta domain.SCMMe
 	return !parsed.UTC().Before(cutoff)
 }
 
-func warnReactionRecoverySkip(log *slog.Logger, run persistence.RunHistory, reason string, attrs ...slog.Attr) {
+func warnReactionRecoverySkip(log *slog.Logger, run storage.RunHistory, reason string, attrs ...slog.Attr) {
 	entryLog := logging.WithIssue(log, run.IssueID, run.Identifier)
 	logAttrs := []any{
 		slog.Int64("run_history_id", run.ID),

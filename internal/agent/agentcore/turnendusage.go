@@ -52,19 +52,35 @@ func (u *TurnEndUsage) ByModel() map[string]domain.TokenUsage {
 	return u.acc.ByModel()
 }
 
-// Measured reports whether a Finalize call has received a non-nil
-// recovered figure yet. It is false for a value from NewTurnEndUsage
-// until then, and true from that call on.
+// Measured reports whether Settle has reported a non-nil recovered figure
+// yet. It is false for a value from NewTurnEndUsage until then, and true
+// from that call on.
 func (u *TurnEndUsage) Measured() bool {
 	return u.measured
 }
 
+// Settle folds recovered into the session's run-cumulative snapshot, latches
+// the measured verdict, and emits exactly one [domain.EventTokenUsage] event
+// carrying that snapshot, its per-model figure, and the trimmed model name.
+// A nil recovered does nothing.
+func (u *TurnEndUsage) Settle(emit func(domain.AgentEvent), recovered *RecoveredUsage) {
+	if recovered == nil {
+		return
+	}
+	snapshot := u.acc.SetRunCumulative(recovered.Run, recovered.ByModel)
+	u.measured = true
+	emit(domain.AgentEvent{
+		Type:         domain.EventTokenUsage,
+		Timestamp:    time.Now().UTC(),
+		Usage:        snapshot,
+		UsageByModel: u.acc.ByModel(),
+		Model:        strings.TrimSpace(recovered.Model),
+	})
+}
+
 // Finalize ends one turn. recovered is nil when the turn produced no
-// figure. When recovered is non-nil, Finalize settles it into the
-// session's run-cumulative snapshot, latches the measured verdict, and
-// emits exactly one domain.EventTokenUsage event carrying that snapshot,
-// its per-model figure, and the trimmed model name, before delegating to
-// [FinalizeTurn] for the turn's terminal event.
+// figure; otherwise Finalize reports it through [TurnEndUsage.Settle]
+// before delegating to [FinalizeTurn] for the turn's terminal event.
 //
 // spend is the turn's spend evidence and is handed to [FinalizeTurn].
 //
@@ -84,17 +100,7 @@ func (u *TurnEndUsage) Finalize(
 		panic("agentcore: TurnEndUsage.Finalize: emit must be non-nil")
 	}
 
-	if recovered != nil {
-		snapshot := u.acc.SetRunCumulative(recovered.Run, recovered.ByModel)
-		u.measured = true
-		emit(domain.AgentEvent{
-			Type:         domain.EventTokenUsage,
-			Timestamp:    time.Now().UTC(),
-			Usage:        snapshot,
-			UsageByModel: u.acc.ByModel(),
-			Model:        strings.TrimSpace(recovered.Model),
-		})
-	}
+	u.Settle(emit, recovered)
 
 	meta := TurnMeta{
 		SessionID:     sessionID,

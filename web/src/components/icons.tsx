@@ -77,7 +77,6 @@ function Svg({ children, className, strokeWidth = 1.8, ...rest }: SvgProps) {
   );
 }
 
-/** Draws the Lucide `activity` glyph. */
 export function ActivityIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -86,7 +85,6 @@ export function ActivityIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `arrow-down` glyph. */
 export function ArrowDownIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -96,7 +94,6 @@ export function ArrowDownIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `arrow-right` glyph. */
 export function ArrowRightIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -106,7 +103,6 @@ export function ArrowRightIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `arrow-up` glyph. */
 export function ArrowUpIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -116,7 +112,6 @@ export function ArrowUpIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `book-open` glyph. */
 export function BookOpenIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -126,7 +121,6 @@ export function BookOpenIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `bot` glyph. */
 export function BotIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -140,7 +134,6 @@ export function BotIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `chart-column` glyph. */
 export function ChartColumnIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -152,7 +145,6 @@ export function ChartColumnIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `chart-gantt` glyph. */
 export function ChartGanttIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -164,7 +156,6 @@ export function ChartGanttIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `check` glyph. */
 export function CheckIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -173,7 +164,6 @@ export function CheckIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `chevron-down` glyph. */
 export function ChevronDownIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -182,7 +172,6 @@ export function ChevronDownIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `chevrons-up-down` glyph. */
 export function ChevronsUpDownIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -192,7 +181,6 @@ export function ChevronsUpDownIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `circle-alert` glyph. */
 export function CircleAlertIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -203,7 +191,6 @@ export function CircleAlertIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `circle-dot` glyph. */
 export function CircleDotIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -213,7 +200,6 @@ export function CircleDotIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `circle-help` glyph. */
 export function CircleHelpIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -224,7 +210,6 @@ export function CircleHelpIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `circle-pause` glyph. */
 export function CirclePauseIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -235,7 +220,15 @@ export function CirclePauseIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `circle-x` glyph. */
+export function CircleSlashIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="12" cy="12" r="10" />
+      <line x1="9" x2="15" y1="15" y2="9" />
+    </Svg>
+  );
+}
+
 export function CircleXIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -246,7 +239,6 @@ export function CircleXIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `clock` glyph. */
 export function ClockIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -256,7 +248,6 @@ export function ClockIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `external-link` glyph. */
 export function ExternalLinkIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -267,7 +258,25 @@ export function ExternalLinkIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `github` glyph. */
+export function FileIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" />
+      <path d="M14 2v5a1 1 0 0 0 1 1h5" />
+    </Svg>
+  );
+}
+
+export function FilePenIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12.659 22H18a2 2 0 0 0 2-2V8a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 14 2H6a2 2 0 0 0-2 2v9.34" />
+      <path d="M14 2v5a1 1 0 0 0 1 1h5" />
+      <path d="M10.378 12.622a1 1 0 0 1 3 3.003L8.36 20.637a2 2 0 0 1-.854.506l-2.867.837a.5.5 0 0 1-.62-.62l.836-2.869a2 2 0 0 1 .506-.853z" />
+    </Svg>
+  );
+}
+
 export function GithubIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -277,7 +286,6 @@ export function GithubIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `history` glyph. */
 export function HistoryIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -288,7 +296,6 @@ export function HistoryIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `inbox` glyph. */
 export function InboxIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -298,7 +305,6 @@ export function InboxIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `loader-circle` glyph. */
 export function LoaderCircleIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -307,7 +313,6 @@ export function LoaderCircleIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `minus` glyph. */
 export function MinusIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -316,7 +321,6 @@ export function MinusIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `monitor` glyph. */
 export function MonitorIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -327,7 +331,6 @@ export function MonitorIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `moon` glyph. */
 export function MoonIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -336,7 +339,6 @@ export function MoonIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `rotate-cw` glyph. */
 export function RotateCwIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -346,7 +348,6 @@ export function RotateCwIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `search` glyph. */
 export function SearchIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -356,7 +357,6 @@ export function SearchIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `sliders-horizontal` glyph. */
 export function SlidersHorizontalIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -373,7 +373,6 @@ export function SlidersHorizontalIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `sun` glyph. */
 export function SunIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -390,7 +389,6 @@ export function SunIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `tag` glyph. */
 export function TagIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -400,7 +398,15 @@ export function TagIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `triangle-alert` glyph. */
+export function TerminalIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 19h8" />
+      <path d="m4 17 6-6-6-6" />
+    </Svg>
+  );
+}
+
 export function TriangleAlertIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -411,7 +417,14 @@ export function TriangleAlertIcon(props: IconProps) {
   );
 }
 
-/** Draws the Lucide `x` glyph. */
+export function WrenchIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.22.983.218a6 6 0 0 1-8.259 7.057l-7.91 7.91a1 1 0 0 1-2.999-3l7.91-7.91a6 6 0 0 1 7.057-8.259c.438.12.54.662.219.984z" />
+    </Svg>
+  );
+}
+
 export function XIcon(props: IconProps) {
   return (
     <Svg {...props}>
@@ -421,16 +434,12 @@ export function XIcon(props: IconProps) {
   );
 }
 
-/**
- * Draws the needs-attention disc: filled so the one mark the operator must not
- * miss clears 3:1 where an amber outline measures 1.9:1.
- */
 export function CircleAlertFilledIcon(props: IconProps) {
   return (
     <Svg {...props}>
-      <circle cx="12" cy="12" r="10" className="fill-warning-fill stroke-warning-fill" />
-      <line x1="12" x2="12" y1="8" y2="12" className="stroke-on-warning-fill" />
-      <line x1="12" x2="12.01" y1="16" y2="16" className="stroke-on-warning-fill" />
+      <circle cx="12" cy="12" r="10" className="fill-warning-container stroke-warning" />
+      <line x1="12" x2="12" y1="8" y2="12" className="stroke-warning" />
+      <line x1="12" x2="12.01" y1="16" y2="16" className="stroke-warning" />
     </Svg>
   );
 }

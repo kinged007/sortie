@@ -379,12 +379,11 @@ func (f *dryRunFakeTracker) FetchIssueStatesByIdentifiers(context.Context, []str
 	return nil, nil
 }
 func (f *dryRunFakeTracker) FetchIssueComments(context.Context, string) ([]domain.Comment, error) {
-	return nil, nil
+	return []domain.Comment{}, nil
 }
 func (f *dryRunFakeTracker) TransitionIssue(context.Context, string, string) error { return nil }
-func (f *dryRunFakeTracker) CommentIssue(context.Context, string, string) error    { return nil }
-func (f *dryRunFakeTracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
-	return nil
+func (f *dryRunFakeTracker) CommentIssue(context.Context, string, string) (string, error) {
+	return "comment-1", nil
 }
 func (f *dryRunFakeTracker) AddLabel(context.Context, string, string) error { return nil }
 

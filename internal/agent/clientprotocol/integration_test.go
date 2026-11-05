@@ -1,47 +1,112 @@
-// Integration tests for the Agent Client Protocol transport, driven
-// against a real, locally installed protocol-speaking binary.
+// Integration tests for the Agent Client Protocol transport against a locally
+// installed protocol-speaking binary.
 //
 // Required environment variables:
 //
 //	SORTIE_CLIENTPROTOCOL_TEST=1     enable this suite
-//	SORTIE_CLIENTPROTOCOL_COMMAND    the protocol-speaking binary's launch
-//	                                  command, including whatever flag
-//	                                  puts it into Agent Client Protocol
-//	                                  mode
+//	SORTIE_CLIENTPROTOCOL_COMMAND    the binary's launch command, including the
+//	                                 flag that puts it into Agent Client
+//	                                 Protocol mode
 //
-// This suite names no default binary: the kind is generic, with no
-// runtime of its own, and naming one would make a single vendor the
-// implicit reference for it. Without SORTIE_CLIENTPROTOCOL_TEST=1, or
-// without SORTIE_CLIENTPROTOCOL_COMMAND, every test in this file skips
-// rather than failing.
+// The suite names no default binary, so no single vendor becomes the implicit
+// reference for the generic kind. Without both variables every test skips.
+// The runtime must complete a turn, answer it with stop reason end_turn,
+// stream at least one text message chunk, and report agentInfo in its
+// initialize response.
 //
-// The runtime SORTIE_CLIENTPROTOCOL_COMMAND names must complete a turn,
-// answer it with a stop reason of end_turn, stream at least one text
-// message chunk, and report agentInfo in its initialize response. The
-// example commands above illustrate command shape only; neither is
-// known to satisfy that contract, since both were driven through the
-// handshake alone.
-//
-// The scripted-model cases launch the same runtime against a loopback
-// scripted model endpoint, replace every named credential with a
-// sentinel, spend no quota, and skip when either coordinate is unset.
-// They also resume a session the runtime created, so the runtime must
-// continue it through session/load or session/resume; a runtime that
-// cannot gets no scripted case:
+// The scripted-model cases launch the same runtime against a loopback scripted
+// model endpoint, replace every named credential with a sentinel, spend no
+// quota, and skip unless the model endpoint and the credential names are
+// given. They also resume a session the runtime created, so the runtime must
+// continue it through session/load or session/resume; a runtime that cannot
+// gets no scripted case:
 //
 //	SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV
-//	                                  the name of the environment variable
-//	                                  through which the runtime takes its
-//	                                  model base address
+//	                                  name of the environment variable through
+//	                                  which the runtime takes its model base
+//	                                  address
 //	SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV
-//	                                  comma-separated names of the
-//	                                  environment variables the runtime
-//	                                  reads its credential from
+//	                                  comma-separated names of the environment
+//	                                  variables the runtime reads its
+//	                                  credential from
 //	SORTIE_CLIENTPROTOCOL_ASKING_COMMAND
-//	                                  the same runtime's launch command
-//	                                  in a posture that asks before
-//	                                  running a tool; unset skips the
-//	                                  refusal case with a logged reason
+//	                                  the launch command in a posture that asks
+//	                                  before running a tool; unset skips the
+//	                                  refusal case
+//	SORTIE_CLIENTPROTOCOL_USER_INSTRUCTIONS
+//	                                  path of the user-level instruction file
+//	                                  relative to the scenario home, for a
+//	                                  runtime whose verification request keeps
+//	                                  no user instructions
+//	SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT
+//	                                  provider document for a runtime that
+//	                                  takes its model endpoint from a file;
+//	                                  {url} stands for the endpoint, and the
+//	                                  path of the file written from it goes to
+//	                                  the model base address variable
+//	SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH
+//	                                  path relative to the scenario home where
+//	                                  the model document is written, for a
+//	                                  runtime that reads its endpoint from a
+//	                                  fixed location; it replaces the model
+//	                                  base address variable. A remote launch
+//	                                  also carries HOME set to the scenario
+//	                                  home, because the runtime reads the file
+//	                                  from there on the lab host
+//	SORTIE_CLIENTPROTOCOL_HTTP_TOOLS  1 when the runtime advertises
+//	                                  mcpCapabilities.http: the local tool-server
+//	                                  case must then reach the relay over
+//	                                  loopback HTTP, and the tool-server SSH
+//	                                  cases run
+//	SORTIE_CLIENTPROTOCOL_SSH_COMMAND the launch command on the SSH lab host,
+//	                                  which has only what
+//	                                  SORTIE_CLIENTPROTOCOL_SSH_INSTALL
+//	                                  installs; the SSH cases skip without it
+//	SORTIE_CLIENTPROTOCOL_SSH_INSTALL POSIX shell script that installs the
+//	                                  runtime into the lab image as root, for
+//	                                  instance with npm install -g
+//	SORTIE_CLIENTPROTOCOL_SPEND_DECLARATION
+//	                                  the handshake name of the usage declaration
+//	                                  whose spend sources the scripted model
+//	                                  cases prove: exact figure, settling source
+//	                                  and strategy, and the kill; unset leaves
+//	                                  spend unproven; "default" proves the
+//	                                  declaration a runtime with none of its own
+//	                                  is measured under, whose figure is a lower
+//	                                  bound
+//	SORTIE_CLIENTPROTOCOL_REPORTED_MODEL_PREFIX
+//	                                  text the runtime puts before a served
+//	                                  model's name in the model name it
+//	                                  reports; unset when it reports the
+//	                                  served name
+//	SORTIE_CLIENTPROTOCOL_STATUS_CALL
+//	                                  JSON {"name": ..., "arguments": {...}}
+//	                                  of the call that reaches sortie_status,
+//	                                  for a runtime that offers server tools
+//	                                  only through another tool; unset calls
+//	                                  the declared sortie_status tool
+//	SORTIE_CLIENTPROTOCOL_USAGE_LIMIT_ANSWER
+//	                                  path of a JSON document {"status", "header",
+//	                                  "body", "model_only", "requests"} holding
+//	                                  the refusal the scripted endpoint answers
+//	                                  with, the model scope the turn must
+//	                                  report, and how many requests the runtime
+//	                                  makes before it gives up (default 1); unset
+//	                                  skips the usage-limit case
+//	SORTIE_CLIENTPROTOCOL_EFFORT      a reasoning level the runtime offers on
+//	                                  its thought_level option, such as high;
+//	                                  unset skips the effort case, which runs
+//	                                  one scripted turn under that level and
+//	                                  holds the runtime to applying it
+//	SORTIE_CLIENTPROTOCOL_CONFIG_OPTION
+//	                                  path of a JSON document {"option", "value",
+//	                                  "files", "marker"}: a session option the
+//	                                  runtime offers once the files (work tree
+//	                                  path to content) exist, the value to set,
+//	                                  and a word the value's instructions make
+//	                                  the model request carry; unset skips the
+//	                                  session option case, which runs one
+//	                                  scripted turn with that option set
 //
 // Run:
 //
@@ -52,11 +117,15 @@ package clientprotocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -65,7 +134,15 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
+	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/registry"
+)
+
+const (
+	realModelTurnTimeoutMS = 300000
+	realModelReadTimeoutMS = 30000
 )
 
 type liveProtocolCapture struct {
@@ -76,12 +153,6 @@ type liveProtocolCapture struct {
 	events     func() []domain.AgentEvent // nil for expectHandshakeOnly
 }
 
-// skipUnlessClientProtocolIntegration skips the current test unless
-// SORTIE_CLIENTPROTOCOL_TEST=1 is set and SORTIE_CLIENTPROTOCOL_COMMAND
-// names a launch command. The command variable is a fixture coordinate
-// rather than a second gate: its own absence skips exactly like an
-// absent credential does in the sibling agent packages' suites, never
-// failing.
 func skipUnlessClientProtocolIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("SORTIE_CLIENTPROTOCOL_TEST") != "1" {
@@ -92,9 +163,6 @@ func skipUnlessClientProtocolIntegration(t *testing.T) {
 	}
 }
 
-// integrationAgentConfig returns the [domain.AgentConfig] every test in
-// this suite launches with. Timeouts are deliberately generous to
-// accommodate a real model's latency.
 func integrationAgentConfig(t *testing.T, expect captureExpectation, events func() []domain.AgentEvent) domain.AgentConfig {
 	t.Helper()
 	config, _ := captureAgentConfig(t, os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND"), expect, events)
@@ -112,7 +180,7 @@ func captureAgentConfig(t *testing.T, command string, expect captureExpectation,
 		events:     events,
 	}
 	wrapperPath := filepath.Join(dir, "capture.sh")
-	wrapper := fmt.Sprintf("#!/bin/sh\nset -eu\ntee %q | \"$@\" | tee %q\n", capture.clientPath, capture.agentPath)
+	wrapper := fmt.Sprintf("#!/bin/sh\nset -eu\ncase \"$*\" in %[1]q|%[1]q\" \"*) ;; *) exec \"$@\" ;; esac\ntee %[2]q | \"$@\" | tee %[3]q\n", command, capture.clientPath, capture.agentPath)
 	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0o700); err != nil {
 		t.Fatalf("integrationAgentConfig() write capture wrapper: %v", err)
 	}
@@ -120,8 +188,8 @@ func captureAgentConfig(t *testing.T, command string, expect captureExpectation,
 
 	return domain.AgentConfig{
 		Command:       wrapperPath + " " + command,
-		TurnTimeoutMS: 300000,
-		ReadTimeoutMS: 30000,
+		TurnTimeoutMS: realModelTurnTimeoutMS,
+		ReadTimeoutMS: realModelReadTimeoutMS,
 	}, capture
 }
 
@@ -246,9 +314,6 @@ func assertLiveProtocolConformance(t *testing.T, capture liveProtocolCapture) {
 	t.Logf("live shape observation: %+v", observed)
 }
 
-// logCapturedFrames logs every frame one side of the capture recorded, and
-// when that side last wrote relative to started, so a failed handshake shows
-// which request went unanswered and how long the runtime had been silent.
 func logCapturedFrames(t *testing.T, side, path string, started time.Time) {
 	t.Helper()
 	if info, err := os.Stat(path); err == nil {
@@ -268,12 +333,9 @@ func logCapturedFrames(t *testing.T, side, path string, started time.Time) {
 	}
 }
 
-// gitInitWorkspace creates a temp directory and runs git init inside
-// it, matching the sibling agent packages' own integration fixture:
-// several protocol-speaking runtimes expect a git repository by
-// default.
 func gitInitWorkspace(t *testing.T) string {
 	t.Helper()
+	// Several protocol-speaking runtimes expect a git repository by default.
 	dir := t.TempDir()
 	cmd := exec.CommandContext(context.Background(), "git", "-C", dir, "init")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -291,9 +353,6 @@ func mustNewClientProtocolAdapter(t *testing.T) *ClientProtocolAdapter {
 	return a.(*ClientProtocolAdapter)
 }
 
-// mustStartClientProtocolSession calls StartSession with the standard
-// integration config and registers a StopSession cleanup. It fails the
-// test immediately on error.
 func mustStartClientProtocolSession(t *testing.T, ctx context.Context, adapter *ClientProtocolAdapter, workspace string, expect captureExpectation, events func() []domain.AgentEvent) domain.Session {
 	t.Helper()
 	session, err := adapter.StartSession(ctx, domain.StartSessionParams{
@@ -307,9 +366,6 @@ func mustStartClientProtocolSession(t *testing.T, ctx context.Context, adapter *
 	return session
 }
 
-// makeEventCollector returns an OnEvent callback and a snapshot
-// function. The snapshot function returns a copy of every event
-// collected so far and is safe to call from any goroutine.
 func makeEventCollector(t *testing.T) (onEvent func(domain.AgentEvent), collected func() []domain.AgentEvent) {
 	t.Helper()
 	var mu sync.Mutex
@@ -372,9 +428,6 @@ func TestIntegration_StartSession(t *testing.T) {
 	}
 }
 
-// TestIntegration_StopSession verifies that StopSession terminates the
-// subprocess cleanly when called after a successful StartSession but
-// before any RunTurn, and that a second call is idempotent.
 func TestIntegration_StopSession(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
@@ -453,8 +506,8 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 			WorkspacePath: gitInitWorkspace(t),
 			AgentConfig: domain.AgentConfig{
 				Command:       os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND"),
-				TurnTimeoutMS: 300000,
-				ReadTimeoutMS: 30000,
+				TurnTimeoutMS: realModelTurnTimeoutMS,
+				ReadTimeoutMS: realModelReadTimeoutMS,
 			},
 		}
 	}
@@ -464,7 +517,6 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 	})
 
 	t.Run("refused credential ends credential_unverified", func(t *testing.T) {
-		// Not parallel: t.Setenv carries the invalid credential.
 		credentialtest.SetRefusedCredential(t, "SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV")
 
 		_, err := credentialtest.VerifyLive(adapter, params(t))
@@ -481,8 +533,8 @@ func TestIntegration_EarlyExit(t *testing.T) {
 	}
 	unknownSwitchConfig := domain.AgentConfig{
 		Command:       os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND") + " --sortie-unknown-switch",
-		TurnTimeoutMS: 300000,
-		ReadTimeoutMS: 30000,
+		TurnTimeoutMS: realModelTurnTimeoutMS,
+		ReadTimeoutMS: realModelReadTimeoutMS,
 	}
 
 	t.Run("verification session with an unknown switch", func(t *testing.T) {
@@ -514,18 +566,332 @@ func TestIntegration_EarlyExit(t *testing.T) {
 
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+func claimedVerificationContext(command string) registry.VerificationContext {
+	words := strings.Fields(command)
+	if len(words) == 0 {
+		return registry.VerificationContext{}
+	}
+	addition, _, claimed := usagesource.ClaimVerification(agentcore.LaunchTarget{Command: words[0], Args: words[1:]}, os.Environ())
+	if !claimed {
+		return registry.VerificationContext{}
+	}
+	defer addition.Close()
+	return addition.Context()
+}
+
+func writeModelDocument(t *testing.T, path, template, url string) string {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(template, "{url}", url)), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+func sshVariant() *fakemodel.SSHVariant {
+	variant := &fakemodel.SSHVariant{
+		Install: os.Getenv("SORTIE_CLIENTPROTOCOL_SSH_INSTALL"),
+		RemoteCommand: func(fakemodel.Environment) string {
+			return os.Getenv("SORTIE_CLIENTPROTOCOL_SSH_COMMAND")
+		},
+	}
+	if os.Getenv("SORTIE_CLIENTPROTOCOL_SSH_COMMAND") == "" {
+		variant.Skip = "the runtime's launch command on the lab host is unset: set SORTIE_CLIENTPROTOCOL_SSH_COMMAND"
+	}
+	if os.Getenv("SORTIE_CLIENTPROTOCOL_HTTP_TOOLS") != "1" {
+		variant.ToolServerSkip = "set SORTIE_CLIENTPROTOCOL_HTTP_TOOLS=1 when the runtime advertises mcpCapabilities.http; without the advertisement Sortie declares a tool-server gap and delivers nothing"
+	}
+	return variant
+}
+
+const (
+	protocolKind          = "agent-client-protocol"
+	emptyDeclarationsKind = "agent-client-protocol-empty-declarations"
+)
+
+// The binding builds its adapter from the kind registry, which leaves a test no
+// way to set the adapter's declarations; a kind of its own is the only route to
+// an adapter that selects the default declaration whatever the handshake names.
+var registerEmptyDeclarationsKind = sync.OnceFunc(func() {
+	meta, _ := registry.Agents.Meta(protocolKind)
+	registry.Agents.RegisterWithMeta(emptyDeclarationsKind, func() (domain.AgentAdapter, error) {
+		return &ClientProtocolAdapter{declarations: registry.NewRegistry[usagesource.Declaration, struct{}]("usage declaration")}, nil
+	}, meta)
+})
+
+func bindingKind() string {
+	if os.Getenv(spendDeclarationEnv) != usagesource.DefaultName {
+		return protocolKind
+	}
+	registerEmptyDeclarationsKind()
+	return emptyDeclarationsKind
+}
+
+func statusCall(t *testing.T) fakemodel.ToolChoice {
+	t.Helper()
+	raw := os.Getenv("SORTIE_CLIENTPROTOCOL_STATUS_CALL")
+	if raw == "" {
+		return nil
+	}
+	var call fakemodel.FunctionCall
+	if err := json.Unmarshal([]byte(raw), &call); err != nil {
+		t.Fatalf("SORTIE_CLIENTPROTOCOL_STATUS_CALL = %q, want a JSON object with name and arguments: %v", raw, err)
+	}
+	return fakemodel.Named(call.Name, call.Arguments)
+}
+
+type usageLimitAnswer struct {
+	Status    int               `json:"status"`
+	Header    map[string]string `json:"header"`
+	Body      json.RawMessage   `json:"body"`
+	ModelOnly bool              `json:"model_only"`
+	Requests  int               `json:"requests"`
+}
+
+func usageLimitAnswerFromEnv(t *testing.T) usageLimitAnswer {
+	t.Helper()
+
+	const variable = "SORTIE_CLIENTPROTOCOL_USAGE_LIMIT_ANSWER"
+	path := os.Getenv(variable)
+	if path == "" {
+		t.Skipf("skipping usage-limit refusal: %s must name the JSON document of the refusal the endpoint answers with", variable)
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator names the document
+	if err != nil {
+		t.Fatalf("%s = %q: %v", variable, path, err)
+	}
+	var answer usageLimitAnswer
+	if err := json.Unmarshal(raw, &answer); err != nil {
+		t.Fatalf("%s = %q, want a JSON object with status, header, body and model_only: %v", variable, path, err)
+	}
+	return answer
+}
+
+func spendSources(t *testing.T) *fakemodel.SpendSources {
+	t.Helper()
+
+	const variable = spendDeclarationEnv
+	name := os.Getenv(variable)
+	if name == "" {
+		return nil
+	}
+	defaultSources := &fakemodel.SpendSources{
+		Live:       domain.UsageProvenance{Source: usage.SourceProtocol, Strategy: usage.StrategyLive},
+		LowerBound: true,
+	}
+	if name == usagesource.DefaultName {
+		return defaultSources
+	}
+	declaration, err := usagesource.Declarations.Get(name)
+	if err != nil {
+		t.Fatalf("%s = %q, want the handshake name of a registered usage declaration: %v", variable, name, err)
+	}
+	liveSpend := declaration.Live.Spend.Shape != usage.SpendUndeclared
+	recordsSpend := declaration.Records.Spend.Shape != usage.SpendUndeclared
+	if !liveSpend && !recordsSpend && len(declaration.Live.Spend.Amounts) > 0 {
+		return &fakemodel.SpendSources{
+			Live:        domain.UsageProvenance{Source: declaration.Live.Category, Strategy: declaration.Live.Strategy},
+			AmountsOnly: true,
+		}
+	}
+	if !liveSpend || !recordsSpend {
+		t.Fatalf("%s = %q, want a declaration whose live and records sources both declare a token shape, or whose live source declares amounts alone", variable, name)
+	}
+	return &fakemodel.SpendSources{
+		Live:             domain.UsageProvenance{Source: declaration.Live.Category, Strategy: declaration.Live.Strategy},
+		Records:          domain.UsageProvenance{Source: declaration.Records.Category, Strategy: declaration.Records.Strategy},
+		RecordsAtTurnEnd: declaration.Records.WrittenAtTurnEnd,
+	}
+}
+
+type effortOption struct {
+	ID           string `json:"id"`
+	Type         string `json:"type"`
+	Category     string `json:"category"`
+	CurrentValue string `json:"currentValue"`
+}
+
+type effortBody struct {
+	SessionID     string         `json:"sessionId"`
+	ConfigID      string         `json:"configId"`
+	Value         string         `json:"value"`
+	StopReason    string         `json:"stopReason"`
+	ConfigOptions []effortOption `json:"configOptions"`
+	Update        struct {
+		SessionUpdate string         `json:"sessionUpdate"`
+		ConfigOptions []effortOption `json:"configOptions"`
+	} `json:"update"`
+}
+
+type optionCapture struct {
+	sets                       int
+	sentAfterPrompt            bool
+	sent, opened, applied, end effortBody
+	updates                    []effortBody
+}
+
+func readOptionCapture(t *testing.T, streams []string) optionCapture {
+	t.Helper()
+
+	var got optionCapture
+	var newID, setID, promptID json.RawMessage
+	for _, line := range capturedJSONLines(t, streams[0]) {
+		var frame liveEnvelope
+		_ = json.Unmarshal(line, &frame)
+		switch frame.Method {
+		case methodSessionNew:
+			newID = frame.ID
+		case methodSessionPrompt:
+			if promptID == nil {
+				promptID = frame.ID
+			}
+		case methodSessionSetConfigOption:
+			got.sets++
+			setID = frame.ID
+			_ = json.Unmarshal(frame.Params, &got.sent)
+			got.sentAfterPrompt = got.sentAfterPrompt || promptID != nil
+		}
+	}
+
+	var answered bool
+	for _, line := range capturedJSONLines(t, streams[1]) {
+		var frame liveEnvelope
+		_ = json.Unmarshal(line, &frame)
+		switch {
+		case frame.Method == methodSessionUpdate && answered && got.end.StopReason == "":
+			var update effortBody
+			_ = json.Unmarshal(frame.Params, &update)
+			got.updates = append(got.updates, update)
+		case frame.Method != "":
+		case string(frame.ID) == string(newID):
+			_ = json.Unmarshal(frame.Result, &got.opened)
+		case string(frame.ID) == string(setID):
+			answered = true
+			_ = json.Unmarshal(frame.Result, &got.applied)
+		case string(frame.ID) == string(promptID):
+			_ = json.Unmarshal(frame.Result, &got.end)
+		}
+	}
+	return got
+}
+
+func assertOptionForwarded(t *testing.T, got optionCapture, configID, value string) {
+	t.Helper()
+
+	if got.sets != 1 {
+		t.Fatalf("session/set_config_option requests = %d, want 1", got.sets)
+	}
+	if got.sentAfterPrompt {
+		t.Errorf("session/set_config_option sent after the first session/prompt, want before")
+	}
+	if got.sent.ConfigID != configID || got.sent.Value != value {
+		t.Errorf("session/set_config_option = {configId %q, value %q}, want {configId %q, value %q}", got.sent.ConfigID, got.sent.Value, configID, value)
+	}
+	if !slices.ContainsFunc(got.applied.ConfigOptions, func(option effortOption) bool { return option.ID == configID && option.CurrentValue == value }) {
+		t.Errorf("session/set_config_option result options = %+v, want %q at %q", got.applied.ConfigOptions, configID, value)
+	}
+	for _, update := range got.updates {
+		if update.SessionID == got.opened.SessionID && update.Update.SessionUpdate == sessionUpdateConfigOptionUpdate &&
+			slices.ContainsFunc(update.Update.ConfigOptions, func(option effortOption) bool { return option.ID == configID && option.CurrentValue != value }) {
+			t.Errorf("config_option_update options = %+v before the turn ended, want %q at %q", update.Update.ConfigOptions, configID, value)
+		}
+	}
+	if got.end.StopReason != "end_turn" {
+		t.Errorf("session/prompt stopReason = %q, want %q", got.end.StopReason, "end_turn")
+	}
+}
+
+func assertEffortForwarded(t *testing.T, streams []string, level string) {
+	t.Helper()
+
+	got := readOptionCapture(t, streams)
+	target := slices.IndexFunc(got.opened.ConfigOptions, func(option effortOption) bool {
+		return option.Type == "select" && option.Category == "thought_level"
+	})
+	if target < 0 {
+		t.Fatalf("session/new configOptions = %+v, want a thought_level select option", got.opened.ConfigOptions)
+	}
+
+	assertOptionForwarded(t, got, got.opened.ConfigOptions[target].ID, level)
+}
+
+type sessionOptionDocument struct {
+	Option string            `json:"option"`
+	Value  string            `json:"value"`
+	Files  map[string]string `json:"files"`
+	Marker string            `json:"marker"`
+}
+
+func sessionOptionDocumentFromEnv(t *testing.T) sessionOptionDocument {
+	t.Helper()
+
+	const variable = "SORTIE_CLIENTPROTOCOL_CONFIG_OPTION"
+	path := os.Getenv(variable)
+	if path == "" {
+		t.Skipf("skipping session option case: %s must name the JSON document of the option, its value, the files that make the value available and the marker the instructions produce", variable)
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator names the document
+	if err != nil {
+		t.Fatalf("%s = %q: %v", variable, path, err)
+	}
+	var doc sessionOptionDocument
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("%s = %q, want a JSON object with option, value, files and marker: %v", variable, path, err)
+	}
+	if doc.Option == "" || doc.Value == "" || doc.Marker == "" {
+		t.Fatalf("%s = %q holds option %q, value %q, marker %q, want all three non-empty", variable, path, doc.Option, doc.Value, doc.Marker)
+	}
+	return doc
+}
+
+func writeWorkspaceFiles(t *testing.T, workspace string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		if !filepath.IsLocal(name) {
+			t.Fatalf("writeWorkspaceFiles: %q is not a path inside the work tree", name)
+		}
+		path := filepath.Join(workspace, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("writeWorkspaceFiles: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("writeWorkspaceFiles: %v", err)
+		}
+	}
+}
+
+func assertSessionOptionApplied(t *testing.T, run fakemodel.Run, doc sessionOptionDocument) {
+	t.Helper()
+
+	got := readOptionCapture(t, run.Streams)
+	if !slices.ContainsFunc(got.opened.ConfigOptions, func(option effortOption) bool { return option.ID == doc.Option }) {
+		t.Fatalf("session/new configOptions = %+v, want an option %q", got.opened.ConfigOptions, doc.Option)
+	}
+
+	assertOptionForwarded(t, got, doc.Option, doc.Value)
+	if !slices.ContainsFunc(run.Exchanges, func(ex fakemodel.Exchange) bool {
+		return ex.Kind == fakemodel.ExchangeTurn && strings.Contains(string(ex.Body), doc.Marker)
+	}) {
+		t.Errorf("model requests of the turn = %d, want one carrying %q", len(run.Exchanges), doc.Marker)
+	}
+}
+
 func TestIntegration_ScriptedModel(t *testing.T) {
 	skipUnlessClientProtocolIntegration(t)
 
 	baseURLEnv := os.Getenv("SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV")
-	if baseURLEnv == "" {
-		t.Skip("skipping scripted model cases: SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV must name the variable through which the runtime takes its model base address")
+	documentPath := os.Getenv("SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH")
+	if baseURLEnv == "" && documentPath == "" {
+		t.Skip("skipping scripted model cases: SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV must name the variable through which the runtime takes its model base address, or SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH the file it reads it from")
 	}
 	credentialNames := credentialtest.CredentialNames("SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV")
 	if len(credentialNames) == 0 {
 		t.Skip("skipping scripted model cases: SORTIE_CLIENTPROTOCOL_CREDENTIAL_ENV must name the credential variables, or a real key in the environment would reach the endpoint")
 	}
-	if !environmentNamePattern.MatchString(baseURLEnv) {
+	if baseURLEnv != "" && !environmentNamePattern.MatchString(baseURLEnv) {
 		t.Fatalf("SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV = %q, want a name matching %s", baseURLEnv, environmentNamePattern)
 	}
 
@@ -535,11 +901,25 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 		skipRefusal = "skipping permission refusal: SORTIE_CLIENTPROTOCOL_ASKING_COMMAND must name the runtime's launch command in a posture that asks before running a tool"
 	}
 
-	fakemodel.AssertConformance(t, fakemodel.Binding{
-		Kind:          "agent-client-protocol",
-		Passthrough:   map[string]any{},
-		CredentialEnv: credentialNames,
-		Read:          fakemodel.ReadFile,
+	modelDocument := os.Getenv("SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT")
+	if documentPath != "" && (modelDocument == "" || !filepath.IsLocal(documentPath)) {
+		t.Fatalf("SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH = %q, want a path inside the scenario home and a non-empty SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT", documentPath)
+	}
+
+	turnExpect := expectScriptedToolTurn
+	binding := fakemodel.Binding{
+		SortieStatus:         statusCall(t),
+		Kind:                 bindingKind(),
+		RuntimeFailureFolded: namedProfileFoldsRuntimeFailure(t),
+		LocalToolsOverHTTP:   os.Getenv("SORTIE_CLIENTPROTOCOL_HTTP_TOOLS") == "1",
+		SSH:                  sshVariant(),
+		Spend:                spendSources(t),
+		ReportedModelPrefix:  os.Getenv("SORTIE_CLIENTPROTOCOL_REPORTED_MODEL_PREFIX"),
+		Passthrough:          map[string]any{},
+		CredentialEnv:        credentialNames,
+		UserInstructions:     os.Getenv("SORTIE_CLIENTPROTOCOL_USER_INSTRUCTIONS"),
+		VerificationContext:  claimedVerificationContext(os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND")),
+		Read:                 fakemodel.ReadFile,
 		PermissionRefusal: &fakemodel.PermissionRefusal{
 			Guarded: fakemodel.CatFile,
 			Notice:  agentcore.DecideHumanRequest(agentcore.ClassPermission, true, agentcore.AnswerPending).Notice,
@@ -547,21 +927,135 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 		},
 		Launch: func(t *testing.T, env fakemodel.Environment) fakemodel.Launch {
 			command := os.Getenv("SORTIE_CLIENTPROTOCOL_COMMAND")
-			expect := expectScriptedToolTurn
+			expect := turnExpect
 			switch env.Scenario {
-			case fakemodel.ScenarioExhaustion, fakemodel.ScenarioCancellation, fakemodel.ScenarioCancellationAfterOutput, fakemodel.ScenarioStop:
+			case fakemodel.ScenarioExhaustion, fakemodel.ScenarioCancellation, fakemodel.ScenarioCancellationAfterOutput, fakemodel.ScenarioKill, fakemodel.ScenarioStop:
 				expect = expectHandshakeOnly
-			case fakemodel.ScenarioContinuation:
+			case fakemodel.ScenarioContinuation, fakemodel.ScenarioVerificationContext:
 				expect = expectCompletedTurn
 			case fakemodel.ScenarioPermissionRefusal:
 				command = askingCommand
 			}
+			launchEnv := map[string]string{}
+			switch {
+			case documentPath != "":
+				writeModelDocument(t, filepath.Join(env.Home, documentPath), modelDocument, env.URL)
+			case modelDocument != "":
+				launchEnv[baseURLEnv] = writeModelDocument(t, filepath.Join(env.Home, "model-document.json"), modelDocument, env.URL)
+			default:
+				launchEnv[baseURLEnv] = env.URL
+			}
+			if env.Remote {
+				if documentPath != "" {
+					launchEnv["HOME"] = env.Home
+				}
+				return fakemodel.Launch{
+					Config: domain.AgentConfig{TurnTimeoutMS: realModelTurnTimeoutMS, ReadTimeoutMS: realModelReadTimeoutMS},
+					Env:    launchEnv,
+				}
+			}
 			config, capture := captureAgentConfig(t, command, expect, env.Events)
 			return fakemodel.Launch{
 				Config:  config,
-				Env:     map[string]string{baseURLEnv: env.URL},
+				Env:     launchEnv,
 				Streams: []string{capture.clientPath, capture.agentPath},
 			}
 		},
+	}
+
+	fakemodel.AssertConformance(t, binding)
+
+	t.Run("tool-forcing turn", func(t *testing.T) {
+		turnExpect = expectToolForcingTurn
+		workspace := gitInitWorkspace(t)
+		target := filepath.Join(workspace, "greeting.txt")
+		usage := fakemodel.Usage{Prompt: 101, Candidates: 7}
+
+		run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{
+			Script: []fakemodel.Response{
+				{Call: fakemodel.WriteFile(target, "hello from sortie"), Usage: usage},
+				{Call: fakemodel.ReadFile(target), Usage: usage},
+				{Text: "The file holds: hello from sortie", Usage: usage},
+			},
+			Prompt:    "Create a file at " + target + " containing exactly the text: hello from sortie. After writing it, read the file back and report exactly what it contains.",
+			Workspace: workspace,
+		})
+
+		assertCapabilityGapLabelsMatchProfile(t, run.Events, run.Result)
+		if run.Result.SessionID != run.Session.ID {
+			t.Errorf("TurnResult.SessionID = %q, want %q", run.Result.SessionID, run.Session.ID)
+		}
+		if run.Result.ExitReason != domain.EventTurnCompleted {
+			t.Errorf("TurnResult.ExitReason = %q, want %q", run.Result.ExitReason, domain.EventTurnCompleted)
+		}
+		assertContainsEventType(t, run.Events, domain.EventSessionStarted)
+	})
+	t.Run("usage_limit_refusal", func(t *testing.T) {
+		answer := usageLimitAnswerFromEnv(t)
+		turnExpect = expectHandshakeOnly
+		header := http.Header{}
+		for name, value := range answer.Header {
+			header.Set(name, value)
+		}
+
+		for _, remote := range []bool{false, true} {
+			t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+				start := time.Now().Truncate(time.Millisecond)
+
+				run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{
+					Script: slices.Repeat([]fakemodel.Response{{Status: answer.Status, Header: header, Body: answer.Body}}, max(1, answer.Requests)),
+					Prompt: "Reply with the word ok.",
+					Remote: remote,
+				})
+
+				end := time.Now()
+				var agentErr *domain.AgentError
+				if !errors.As(run.Err, &agentErr) || agentErr.Kind != domain.ErrUsageLimit || agentErr.UsageLimit == nil {
+					t.Fatalf("RunTurn() error = %v, want a usage_limit AgentError carrying a UsageLimit", run.Err)
+				}
+				if agentErr.UsageLimit.ModelOnly != answer.ModelOnly {
+					t.Errorf("UsageLimit.ModelOnly = %v, want %v", agentErr.UsageLimit.ModelOnly, answer.ModelOnly)
+				}
+				seconds, err := strconv.Atoi(answer.Header["Retry-After"])
+				if err != nil {
+					return
+				}
+				retryAfter := time.Duration(seconds) * time.Second
+				if resetsAt := agentErr.UsageLimit.ResetsAt; resetsAt.Before(start.Add(retryAfter)) || resetsAt.After(end.Add(retryAfter)) {
+					t.Errorf("UsageLimit.ResetsAt = %v, want within [%v, %v]", resetsAt, start.Add(retryAfter), end.Add(retryAfter))
+				}
+			})
+		}
+	})
+
+	t.Run("effort_forwarding", func(t *testing.T) {
+		level := os.Getenv("SORTIE_CLIENTPROTOCOL_EFFORT")
+		if level == "" {
+			t.Skip("skipping effort case: SORTIE_CLIENTPROTOCOL_EFFORT must name a reasoning level the runtime offers")
+		}
+		turnExpect = expectCompletedTurn
+
+		run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{
+			Script:   []fakemodel.Response{{Text: "ok", Usage: fakemodel.Usage{Prompt: 101, Candidates: 7}}},
+			Prompt:   "Reply with the word ok.",
+			Settings: map[string]any{registry.EffortKey: level},
+		})
+
+		assertEffortForwarded(t, run.Streams, level)
+	})
+	t.Run("session_option", func(t *testing.T) {
+		doc := sessionOptionDocumentFromEnv(t)
+		turnExpect = expectCompletedTurn
+		workspace := gitInitWorkspace(t)
+		writeWorkspaceFiles(t, workspace, doc.Files)
+
+		run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{
+			Script:    []fakemodel.Response{{Text: "ok", Usage: fakemodel.Usage{Prompt: 101, Candidates: 7}}},
+			Prompt:    "Reply with the word ok.",
+			Settings:  map[string]any{configOptionsKey: map[string]any{doc.Option: doc.Value}},
+			Workspace: workspace,
+		})
+
+		assertSessionOptionApplied(t, run, doc)
 	})
 }

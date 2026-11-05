@@ -1,0 +1,4 @@
+>> {"jsonrpc": "2.0", "id": 1, "method": "connect", "params": {}}
+<< {"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "protocolVersion": 3, "version": "1.0.104", "taskKinds": ["agent", "shell"]}}
+>> {"jsonrpc": "2.0", "id": 2, "method": "account.getQuota", "params": {}}
+<< {"jsonrpc": "2.0", "id": 2, "result": {"quotaSnapshots": {"chat": {"isUnlimitedEntitlement": true, "remainingPercentage": 100, "resetDate": "2026-10-28T00:15:43.579Z"}, "premium_interactions": {"isUnlimitedEntitlement": false, "remainingPercentage": 0, "resetDate": "2026-10-28T00:15:43.579Z"}}}}

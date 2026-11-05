@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/sentence"
@@ -16,21 +18,22 @@ import (
 
 // stateResponse is the JSON wire format for GET /api/v1/state.
 type stateResponse struct {
-	GeneratedAt            time.Time                        `json:"generated_at"`
-	Version                string                           `json:"version"`
-	StartedAt              *time.Time                       `json:"started_at"`
-	Counts                 stateCounts                      `json:"counts"`
-	Running                []runningEntryResponse           `json:"running"`
-	Retrying               []retryEntryResponse             `json:"retrying"`
-	BudgetExhausted        []budgetExhaustedResponse        `json:"budget_exhausted"`
-	Parked                 []parkedEntryResponse            `json:"parked"`
-	PendingReactions       []pendingReactionResponse        `json:"pending_reactions"`
-	BetweenStages          []stageHopResponse               `json:"between_stages"`
-	Active                 []activeIssueResponse            `json:"active"`
-	Attention              []attentionItemResponse          `json:"attention"`
-	AgentTotals            orchestrator.SnapshotAgentTotals `json:"agent_totals"`
-	RateLimits             map[string]any                   `json:"rate_limits"`
-	ActiveEstimatedCostUSD *float64                         `json:"active_estimated_cost_usd,omitempty"`
+	GeneratedAt            time.Time                            `json:"generated_at"`
+	Version                string                               `json:"version"`
+	StartedAt              *time.Time                           `json:"started_at"`
+	Counts                 stateCounts                          `json:"counts"`
+	Running                []runningEntryResponse               `json:"running"`
+	Retrying               []retryEntryResponse                 `json:"retrying"`
+	BudgetExhausted        []budgetExhaustedResponse            `json:"budget_exhausted"`
+	Parked                 []parkedEntryResponse                `json:"parked"`
+	PendingReactions       []pendingReactionResponse            `json:"pending_reactions"`
+	BetweenStages          []stageHopResponse                   `json:"between_stages"`
+	Active                 []activeIssueResponse                `json:"active"`
+	Held                   []heldIssueResponse                  `json:"held"`
+	Attention              []attentionItemResponse              `json:"attention"`
+	AgentTotals            orchestrator.SnapshotAgentTotals     `json:"agent_totals"`
+	RateLimits             map[string]agentUsageWindowsResponse `json:"rate_limits"`
+	ActiveEstimatedCostUSD *float64                             `json:"active_estimated_cost_usd,omitempty"`
 
 	// CostUnpricedRunning counts running, measured sessions
 	// ActiveEstimatedCostUSD excludes for lacking a configured rate.
@@ -38,8 +41,8 @@ type stateResponse struct {
 	// configured; omitted otherwise.
 	CostUnpricedRunning *int `json:"cost_unpriced_running,omitempty"`
 
-	// SpendCeiling carries the instance spend windows. Omitted while
-	// neither agent.max_daily_cost_usd nor agent.max_monthly_cost_usd is set.
+	// SpendCeiling carries the instance spend windows. Omitted while no
+	// instance spend window is set.
 	SpendCeiling *spendCeilingResponse `json:"spend_ceiling,omitempty"`
 
 	Config *configResponse `json:"config,omitempty"`
@@ -54,6 +57,7 @@ type stateCounts struct {
 	Parked           int `json:"parked"`
 	PendingReactions int `json:"pending_reactions"`
 	BetweenStages    int `json:"between_stages"`
+	Held             int `json:"held"`
 	Attention        int `json:"attention"`
 }
 
@@ -93,6 +97,7 @@ type runningEntryResponse struct {
 	PullRequest         *pullRequestResponse   `json:"pull_request,omitempty"`
 	APIRequestCount     *int                   `json:"api_request_count"`
 	RequestsByModel     map[string]int         `json:"requests_by_model,omitempty"`
+	Skills              []domain.SkillCall     `json:"skills,omitempty"`
 	ToolTimePercent     *float64               `json:"tool_time_percent"`
 	APITimePercent      *float64               `json:"api_time_percent"`
 	TokensMeasured      bool                   `json:"tokens_measured"`
@@ -223,8 +228,91 @@ type stageHopResponse struct {
 	AgentKind       string                 `json:"agent_kind,omitempty"`
 	ConfiguredModel string                 `json:"configured_model,omitempty"`
 
+	Hold *holdResponse `json:"hold"`
+
 	StatusText     string `json:"status_text"`
 	StatusTextFull string `json:"status_text_full"`
+}
+
+// holdBlockerResponse is the JSON wire format for one blocker that holds a
+// candidate.
+type holdBlockerResponse struct {
+	IssueID           string `json:"issue_id"`
+	IssueIdentifier   string `json:"issue_identifier"`
+	DisplayIdentifier string `json:"display_identifier,omitempty"`
+	State             string `json:"state,omitempty"`
+}
+
+// holdSlotResponse is the JSON wire format for the agent slot limit that held
+// a candidate.
+type holdSlotResponse struct {
+	Scope string `json:"scope"`
+	State string `json:"state,omitempty"`
+	Used  int    `json:"used"`
+	Limit int    `json:"limit"`
+}
+
+// holdResponse is the JSON wire format for why a candidate is held back.
+// Reason is one of the values of [orchestrator.HoldReasons]. Blockers is
+// non-null exactly for a blocked_by hold, Slot exactly for an agent_slots_full
+// hold, and ResetsAt exactly for a spend ceiling hold or a usage_limit hold.
+// AgentKind, ModelOnly, and Model are served for a usage_limit hold only. A
+// client MUST tolerate a Reason it does not know and show the served texts.
+// Used by GET /api/v1/state and GET /api/v1/{identifier}.
+type holdResponse struct {
+	Reason      string                `json:"reason"`
+	HeldSince   time.Time             `json:"held_since"`
+	Blockers    []holdBlockerResponse `json:"blockers"`
+	Slot        *holdSlotResponse     `json:"slot"`
+	ResetsAt    *time.Time            `json:"resets_at"`
+	AgentKind   string                `json:"agent_kind,omitempty"`
+	ModelOnly   bool                  `json:"model_only,omitempty"`
+	Model       string                `json:"model,omitempty"`
+	ReasonText  string                `json:"reason_text"`
+	ReleaseText string                `json:"release_text"`
+}
+
+// agentUsageWindowsResponse is the JSON wire format for one agent kind's
+// usage windows.
+type agentUsageWindowsResponse struct {
+	ReportedAt time.Time             `json:"reported_at"`
+	Windows    []usageWindowResponse `json:"windows"`
+}
+
+// usageWindowResponse is the JSON wire format for one provider usage window.
+// A figure the agent did not report serves as null, never as zero.
+type usageWindowResponse struct {
+	Label       string     `json:"label"`
+	UsedPercent *float64   `json:"used_percent"`
+	Status      *string    `json:"status"`
+	ResetsAt    *time.Time `json:"resets_at"`
+	ReportedAt  time.Time  `json:"reported_at"`
+
+	Amount *usageWindowAmountResponse `json:"amount"`
+}
+
+// usageWindowAmountResponse is the JSON wire format for a window's use in the
+// vendor's own unit, never converted.
+type usageWindowAmountResponse struct {
+	Used  float64 `json:"used"`
+	Limit float64 `json:"limit"`
+	Unit  string  `json:"unit"`
+}
+
+// heldIssueResponse is the JSON wire format for an eligible candidate the
+// latest dispatch pass held back. Used by GET /api/v1/state.
+type heldIssueResponse struct {
+	IssueID           string       `json:"issue_id"`
+	IssueIdentifier   string       `json:"issue_identifier"`
+	DisplayIdentifier string       `json:"display_identifier,omitempty"`
+	IssueTitle        string       `json:"issue_title,omitempty"`
+	IssueURL          string       `json:"issue_url,omitempty"`
+	IssueType         string       `json:"issue_type,omitempty"`
+	IssueLabels       []string     `json:"issue_labels,omitzero"`
+	State             string       `json:"state,omitempty"`
+	Hold              holdResponse `json:"hold"`
+	StatusText        string       `json:"status_text"`
+	StatusTextFull    string       `json:"status_text_full"`
 }
 
 // parkedEntryResponse is the JSON wire format for one issue held out of
@@ -318,6 +406,7 @@ type attentionActionResponse struct {
 // a window whose setting is 0 is null.
 type spendCeilingResponse struct {
 	Daily   *spendWindowResponse `json:"daily"`
+	Weekly  *spendWindowResponse `json:"weekly"`
 	Monthly *spendWindowResponse `json:"monthly"`
 }
 
@@ -401,7 +490,8 @@ func (c reactionCheckResponse) MarshalJSON() ([]byte, error) {
 			ActionableComments int  `json:"actionable_comments"`
 			NewComments        int  `json:"new_comments"`
 			Handled            bool `json:"handled,omitempty"`
-		}{header, c.Comments.Actionable, c.Comments.New, c.Comments.Handled})
+			AwaitingApproval   bool `json:"awaiting_approval,omitempty"`
+		}{header, c.Comments.Actionable, c.Comments.New, c.Comments.Handled, c.Comments.AwaitingApproval})
 	case c.Mergeability != nil:
 		return json.Marshal(struct {
 			reactionCheckHeader
@@ -594,6 +684,7 @@ func toRunningEntryResponse(e orchestrator.SnapshotRunningEntry, nowArgs ...time
 		ReactionKind:        e.ReactionKind,
 		ReactionConfigKey:   e.ReactionConfigKey,
 		RequestsByModel:     e.RequestsByModel,
+		Skills:              e.Skills,
 		TokensMeasured:      e.UsageMeasured,
 		UsageArrival:        string(e.UsageArrival),
 		UsageAttribution:    string(e.UsageAttribution),
@@ -718,7 +809,7 @@ func toStagePositionResponse(p *orchestrator.SnapshotStagePosition) *stagePositi
 	}
 }
 
-func toStageHopResponse(e orchestrator.SnapshotStageHop) stageHopResponse {
+func toStageHopResponse(e orchestrator.SnapshotStageHop, words sentence.Context) stageHopResponse {
 	return stageHopResponse{
 		IssueID:           e.IssueID,
 		IssueIdentifier:   e.Identifier,
@@ -738,7 +829,63 @@ func toStageHopResponse(e orchestrator.SnapshotStageHop) stageHopResponse {
 		StagePosition:   toStagePositionResponse(e.StagePosition),
 		AgentKind:       e.AgentKind,
 		ConfiguredModel: e.ConfiguredModel,
+
+		Hold: toHoldResponse(e.Hold, words),
 	}
+}
+
+// toHoldResponse returns the served view of a hold with its operator texts,
+// or nil for no hold.
+func toHoldResponse(h *orchestrator.SnapshotHold, words sentence.Context) *holdResponse {
+	if h == nil {
+		return nil
+	}
+	resp := &holdResponse{
+		Reason:    string(h.Reason),
+		HeldSince: h.Since.UTC(),
+		ResetsAt:  utcOrNil(h.ResetsAt),
+		AgentKind: h.AgentKind,
+		ModelOnly: h.ModelOnly,
+		Model:     h.Model,
+	}
+	if h.Blockers != nil {
+		resp.Blockers = make([]holdBlockerResponse, 0, len(h.Blockers))
+		for _, blocker := range h.Blockers {
+			resp.Blockers = append(resp.Blockers, holdBlockerResponse{
+				IssueID:           blocker.IssueID,
+				IssueIdentifier:   blocker.Identifier,
+				DisplayIdentifier: blocker.DisplayID,
+				State:             blocker.State,
+			})
+		}
+	}
+	if h.Slot != nil {
+		resp.Slot = &holdSlotResponse{
+			Scope: string(h.Slot.Scope),
+			State: h.Slot.State,
+			Used:  h.Slot.Used,
+			Limit: h.Slot.Limit,
+		}
+	}
+	text := sentence.Hold(h, words)
+	resp.ReasonText, resp.ReleaseText = text.Reason, text.Release
+	return resp
+}
+
+func toHeldIssueResponse(e orchestrator.SnapshotHeldEntry, words sentence.Context) heldIssueResponse {
+	row := heldIssueResponse{
+		IssueID:           e.IssueID,
+		IssueIdentifier:   e.Identifier,
+		DisplayIdentifier: e.DisplayID,
+		IssueTitle:        e.IssueTitle,
+		IssueURL:          e.IssueURL,
+		IssueType:         e.IssueType,
+		IssueLabels:       e.IssueLabels,
+		State:             e.State,
+		Hold:              *toHoldResponse(&e.Hold, words),
+	}
+	row.StatusText, row.StatusTextFull = sentencesOf(sentence.Entry{Held: &e}, words)
+	return row
 }
 
 func toRetryEntryResponse(e orchestrator.SnapshotRetryEntry) retryEntryResponse {
@@ -991,6 +1138,35 @@ func heldUsedTokens(e orchestrator.SnapshotBudgetEntry) *int64 {
 	return e.UsedTokens
 }
 
+// toAgentUsageWindowsResponse maps one kind's snapshot windows to wire form.
+func toAgentUsageWindowsResponse(member orchestrator.SnapshotUsageWindows) agentUsageWindowsResponse {
+	windows := make([]usageWindowResponse, 0, len(member.Windows))
+	for _, w := range member.Windows {
+		resp := usageWindowResponse{
+			Label:       w.Label,
+			UsedPercent: w.UsedPercent,
+			ReportedAt:  w.ReportedAt.UTC(),
+		}
+		if w.Status != "" {
+			status := string(w.Status)
+			resp.Status = &status
+		}
+		if !w.ResetsAt.IsZero() {
+			resetsAt := w.ResetsAt.UTC()
+			resp.ResetsAt = &resetsAt
+		}
+		if w.Amount != nil {
+			resp.Amount = &usageWindowAmountResponse{
+				Used:  w.Amount.Used,
+				Limit: w.Amount.Limit,
+				Unit:  w.Amount.Unit,
+			}
+		}
+		windows = append(windows, resp)
+	}
+	return agentUsageWindowsResponse{ReportedAt: member.ReportedAt.UTC(), Windows: windows}
+}
+
 func toStateResponse(snap orchestrator.RuntimeSnapshotResult, words sentence.Context, health *orchestrator.SnapshotHealth) stateResponse {
 	running := make([]runningEntryResponse, 0, len(snap.Running))
 	for _, e := range snap.Running {
@@ -1024,16 +1200,21 @@ func toStateResponse(snap orchestrator.RuntimeSnapshotResult, words sentence.Con
 
 	betweenStages := make([]stageHopResponse, 0, len(snap.BetweenStages))
 	for _, e := range snap.BetweenStages {
-		row := toStageHopResponse(e)
+		row := toStageHopResponse(e, words)
 		row.StatusText, row.StatusTextFull = sentencesOf(sentence.Entry{BetweenStages: &e}, words)
 		betweenStages = append(betweenStages, row)
 	}
 
+	held := make([]heldIssueResponse, 0, len(snap.Held))
+	for _, e := range snap.Held {
+		held = append(held, toHeldIssueResponse(e, words))
+	}
+
 	attention := toAttentionResponses(sentence.Attention(snap, health, words))
 
-	rateLimits := snap.RateLimits
-	if rateLimits == nil {
-		rateLimits = map[string]any{}
+	rateLimits := make(map[string]agentUsageWindowsResponse, len(snap.UsageWindows))
+	for kind, member := range snap.UsageWindows {
+		rateLimits[kind] = toAgentUsageWindowsResponse(member)
 	}
 
 	resp := stateResponse{
@@ -1045,6 +1226,7 @@ func toStateResponse(snap orchestrator.RuntimeSnapshotResult, words sentence.Con
 			Parked:           len(parked),
 			PendingReactions: len(pendingReactions),
 			BetweenStages:    len(betweenStages),
+			Held:             len(held),
 			Attention:        countUnacknowledged(attention),
 		},
 		Running:          running,
@@ -1053,6 +1235,7 @@ func toStateResponse(snap orchestrator.RuntimeSnapshotResult, words sentence.Con
 		Parked:           parked,
 		PendingReactions: pendingReactions,
 		BetweenStages:    betweenStages,
+		Held:             held,
 		Attention:        attention,
 		AgentTotals:      snap.AgentTotals,
 		RateLimits:       rateLimits,
@@ -1084,10 +1267,15 @@ func spendCeilingOf(statuses []orchestrator.SpendCeilingStatus) *spendCeilingRes
 			HoldsDispatch:   status.Holding,
 			ResetsAt:        status.ResetsAt.UTC(),
 		}
-		if status.Window == orchestrator.SpendWindowMonthly {
-			ceiling.Monthly = window
-		} else {
+		switch status.Window {
+		case orchestrator.SpendWindowDaily:
 			ceiling.Daily = window
+		case orchestrator.SpendWindowWeekly:
+			ceiling.Weekly = window
+		case orchestrator.SpendWindowMonthly:
+			ceiling.Monthly = window
+		default:
+			panic("server: no spend ceiling member for window " + string(status.Window))
 		}
 	}
 	return &ceiling
@@ -1733,7 +1921,7 @@ func buildIssueDetail(identifier, issueID string, snap orchestrator.RuntimeSnaps
 	for _, e := range snap.BetweenStages {
 		if matches(e.Identifier, e.IssueID) {
 			situation.BetweenStages = &e
-			hopEntry = new(toStageHopResponse(e))
+			hopEntry = new(toStageHopResponse(e, words))
 			hopEntry.StatusText, hopEntry.StatusTextFull = sentencesOf(sentence.Entry{BetweenStages: &e}, words)
 			break
 		}
@@ -1887,15 +2075,50 @@ func buildIssueDetail(identifier, issueID string, snap orchestrator.RuntimeSnaps
 }
 
 // decidingPendingReaction returns the first escalated row of a non-empty
-// list, else its first row: the row that decides what the issue is waiting
-// on.
+// list; else the review row awaiting approval when no other row reports an
+// outstanding condition; else its first row: the row that decides what the
+// issue is waiting on.
 func decidingPendingReaction(rows []pendingReactionResponse) pendingReactionResponse {
 	for _, row := range rows {
 		if row.EscalatedAt != nil {
 			return row
 		}
 	}
-	return rows[0]
+	awaiting := slices.IndexFunc(rows, awaitsApproval)
+	if awaiting < 0 {
+		return rows[0]
+	}
+	for i, row := range rows {
+		if i != awaiting && !reportsNothingOutstanding(row) {
+			return rows[0]
+		}
+	}
+	return rows[awaiting]
+}
+
+func awaitsApproval(row pendingReactionResponse) bool {
+	return row.Kind == orchestrator.ReactionKindReview && row.LastCheck != nil &&
+		row.LastCheck.Comments != nil && row.LastCheck.Comments.AwaitingApproval
+}
+
+// reportsNothingOutstanding reports whether row waits on no merge condition.
+// The kinds that record no check wait on the merge or a label, so they never
+// hold the approval reading back; a kind this does not know is assumed busy.
+func reportsNothingOutstanding(row pendingReactionResponse) bool {
+	check := row.LastCheck
+	switch row.Kind {
+	case orchestrator.ReactionKindCI:
+		return check != nil && check.CI != nil && check.CI.Status == "passing"
+	case orchestrator.ReactionKindBotReview:
+		return check != nil && check.Comments != nil && (check.Comments.Actionable == 0 || check.Comments.Handled)
+	case orchestrator.ReactionKindMergeConflict:
+		return check != nil && check.Mergeability != nil && check.Mergeability.Mergeable != nil && *check.Mergeability.Mergeable
+	case orchestrator.ReactionKindAutoMerge, orchestrator.ReactionKindMergeCompletion,
+		orchestrator.ReactionKindLabelReview, orchestrator.ReactionKindLabelFix:
+		return true
+	default:
+		return false
+	}
 }
 
 // healthResponse is the JSON wire format for GET /livez.

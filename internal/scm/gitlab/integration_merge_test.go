@@ -17,6 +17,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // gitlabMergeFixture is a minimal GitLab REST client used only to build
@@ -261,20 +262,18 @@ func (f *gitlabMergeFixture) awaitMergeability(t *testing.T, project string, iid
 	}
 
 	var status string
-	for attempt := range maxAttempts {
+	_ = waittest.UntilWithin(maxAttempts*pollInterval, pollInterval, func() error {
 		resp := f.do(t, http.MethodGet, "/projects/"+project+"/merge_requests/"+strconv.Itoa(iid), nil)
 		var mr gitlabFixtureMergeRequest
 		if err := json.Unmarshal(resp, &mr); err != nil {
 			t.Fatalf("unmarshal merge request response: %v", err)
 		}
 		status = mr.DetailedMergeStatus
-		if !computing[status] && (wantSHA == "" || mr.SHA == wantSHA) {
-			return status
+		if computing[status] || (wantSHA != "" && mr.SHA != wantSHA) {
+			return fmt.Errorf("detailed_merge_status %q has not settled", status)
 		}
-		if attempt < maxAttempts-1 {
-			time.Sleep(pollInterval)
-		}
-	}
+		return nil
+	})
 	return status
 }
 

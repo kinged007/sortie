@@ -2,23 +2,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/tool/budget"
 	"github.com/sortie-ai/sortie/internal/tool/history"
 	"github.com/sortie-ai/sortie/internal/tool/mcpserver"
@@ -40,6 +43,7 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 	fs := flag.NewFlagSet("sortie mcp-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	workflowFlag := fs.String("workflow", "", "Absolute path to the WORKFLOW.md file (required)")
+	httpFlag := fs.Bool("http", false, "Serve MCP over streamable HTTP on a loopback port instead of stdio")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -60,8 +64,28 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		return 1
 	}
 
+	bearer := os.Getenv(mcpconfig.BearerEnv)
+	if *httpFlag && bearer == "" {
+		fmt.Fprintf(stderr, "sortie mcp-server: --http requires the %s environment variable to be non-empty\n", mcpconfig.BearerEnv) //nolint:errcheck // stderr write failure is unrecoverable
+		return 1
+	}
+
+	var ln net.Listener
+	if *httpFlag {
+		var listenErr error
+		ln, listenErr = listenMCPHTTP(ctx, stdout)
+		if listenErr != nil {
+			fmt.Fprintf(stderr, "sortie mcp-server: %s\n", listenErr) //nolint:errcheck // stderr write failure is unrecoverable
+			return 1
+		}
+		defer ln.Close() //nolint:errcheck // ServeStreamableHTTP closes it first; this covers the early exits
+	}
+
 	logger := logging.Setup(stderr, slog.LevelInfo, logging.FormatText)
 	redact.AddEnviron(os.Environ())
+	if bearer != "" {
+		redact.Add("tool server bearer", bearer)
+	}
 
 	wf, err := workflow.Load(*workflowFlag)
 	if err != nil {
@@ -69,7 +93,7 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		return 1
 	}
 
-	cfg, err := config.NewServiceConfig(wf.Config)
+	cfg, err := config.NewServiceConfig(wf.Config, config.WithLiteralSettings(registry.LiteralSettingsOf))
 	if err != nil {
 		logger.Error("failed to parse config", slog.Any("error", err))
 		return 1
@@ -112,13 +136,61 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		defer sessionTools.Store.Close() //nolint:errcheck // best-effort cleanup at shutdown
 	}
 
-	srv := mcpserver.NewServer(sessionTools.Registry, os.Stdin, stdout, logger, Version)
-	if err := srv.Serve(ctx); err != nil {
+	srv := mcpserver.NewServer(sessionTools.Registry, logger, Version)
+	if ln != nil {
+		if err := serveMCPHTTP(ctx, srv, ln, bearer, os.Stdin, stdout); err != nil {
+			logger.Error("MCP server error", slog.Any("error", err))
+			return 1
+		}
+		return 0
+	}
+	if err := srv.Serve(ctx, os.Stdin, writerOnly{stdout}); err != nil {
 		logger.Error("MCP server error", slog.Any("error", err))
 		return 1
 	}
 
 	return 0
+}
+
+// writerOnly keeps the transport from closing the caller's writer.
+type writerOnly struct{ io.Writer }
+
+func (writerOnly) Close() error { return nil }
+
+// listenMCPHTTP announces the port before the workflow loads, so the spawning
+// process need not wait for startup work.
+func listenMCPHTTP(ctx context.Context, stdout io.Writer) (net.Listener, error) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen on loopback: %w", err)
+	}
+	line, err := json.Marshal(mcpserver.HTTPEvent{Listening: ln.Addr().String()})
+	if err != nil {
+		ln.Close() //nolint:errcheck,gosec // best-effort; the marshal error is what the caller needs
+		return nil, fmt.Errorf("encode listening event: %w", err)
+	}
+	if _, err := stdout.Write(append(line, '\n')); err != nil {
+		ln.Close() //nolint:errcheck,gosec // best-effort; the write error is what the caller needs
+		return nil, fmt.Errorf("write listening event: %w", err)
+	}
+	return ln, nil
+}
+
+// serveMCPHTTP serves until ctx ends or stdin closes, which is how the
+// spawning process ends the server's life.
+func serveMCPHTTP(ctx context.Context, srv *mcpserver.Server, ln net.Listener, bearer string, stdin io.Reader, stdout io.Writer) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The copy may stay blocked in a read nothing can interrupt; the process
+	// exits right after.
+	go func() {
+		io.Copy(io.Discard, stdin) //nolint:errcheck,gosec // any read error ends the server the same way as end of file
+		cancel()
+	}()
+
+	return srv.ServeStreamableHTTP(ctx, ln, mcpserver.HTTPOptions{Bearer: bearer, Events: stdout})
 }
 
 // sessionToolParamsFromEnv builds the per-session tool registry inputs
@@ -194,7 +266,14 @@ func resolveNotificationCap(backends []config.NotificationBackend) int {
 	return maxCap
 }
 
-func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
+// budgetSource is what the budget query reads: the run history and the
+// running session's stored usage.
+type budgetSource interface {
+	storage.RunHistoryStore
+	storage.SessionMetadataStore
+}
+
+func buildBudgetQuery(store budgetSource) budget.BudgetQueryFunc {
 	return func(ctx context.Context, issueID string, runningDispatchID string) (budget.BudgetUsage, error) {
 		completed, err := store.TokenUsageByIssue(ctx, issueID)
 		if err != nil {
@@ -236,7 +315,7 @@ func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
 
 // recordedOf maps the cost aggregates of an issue's usage read onto the input
 // of [pricing.IssueCost].
-func recordedOf(usage persistence.IssueTokenUsage) pricing.RecordedCost {
+func recordedOf(usage storage.IssueTokenUsage) pricing.RecordedCost {
 	return pricing.RecordedCost{
 		USD:      usage.RecordedCostUSD,
 		Priced:   usage.PricedSessions,
@@ -247,7 +326,7 @@ func recordedOf(usage persistence.IssueTokenUsage) pricing.RecordedCost {
 
 // sessionCostOf reads the running session's stored estimate; a row recorded
 // without a status reads as unmeasured.
-func sessionCostOf(meta persistence.SessionMetadata) pricing.SessionCost {
+func sessionCostOf(meta storage.SessionMetadata) pricing.SessionCost {
 	status := pricing.CostStatus(meta.CostStatus)
 	if status == "" {
 		status = pricing.CostUnmeasured
@@ -260,7 +339,7 @@ func sessionCostOf(meta persistence.SessionMetadata) pricing.SessionCost {
 	}
 }
 
-func buildHistoryQuery(store *persistence.Store) history.QueryFunc {
+func buildHistoryQuery(store storage.RunHistoryStore) history.QueryFunc {
 	return func(ctx context.Context, issueID string, limit int) ([]history.Entry, error) {
 		rows, err := store.QueryRunHistoryByIssue(ctx, issueID)
 		if err != nil {

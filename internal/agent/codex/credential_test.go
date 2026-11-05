@@ -28,6 +28,12 @@ func serveCredentialFullTurn(client *bufio.Scanner, out io.Writer, status string
 		return 1
 	}
 	threadStart, ok := nextFrame(client)
+	for ok && threadStart.Method == "config/read" {
+		if !answerConfigRead(out, threadStart.ID, recordFramesParams{}) {
+			return 1
+		}
+		threadStart, ok = nextFrame(client)
+	}
 	if !ok {
 		return 1
 	}

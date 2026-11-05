@@ -1,0 +1,15 @@
+[
+  {
+    "id": 311,
+    "state": "APPROVED",
+    "body": "Looks good to me.",
+    "user": { "login": "carol" },
+    "dismissed": false,
+    "official": false,
+    "stale": false,
+    "submitted_at": "2026-07-14T10:00:00Z",
+    "commit_id": "sha-a",
+    "comments_count": 0,
+    "html_url": "https://git.example.com/acme/widgets/pulls/6#pullrequestreview-311"
+  }
+]

@@ -2,31 +2,13 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
-	"github.com/sortie-ai/sortie/internal/pricing"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
-
-// budgetHoldNoticeStore is the persistence contract [postBudgetHoldNotice]
-// needs. Both the rebuild and the retry lane call it.
-type budgetHoldNoticeStore interface {
-	UpsertBudgetHoldNotice(ctx context.Context, notice persistence.BudgetHoldNotice) error
-}
-
-// budgetHoldNoticeReleaseStore is the persistence contract the rebuild's
-// release paths need. Only the rebuild ever releases a notice; the retry
-// lane posts notices and never releases one.
-type budgetHoldNoticeReleaseStore interface {
-	DeleteBudgetHoldNotice(ctx context.Context, issueID string) error
-	DeleteAllBudgetHoldNotices(ctx context.Context) error
-}
 
 // budgetHoldNoticeParams carries the inputs of one notice, in the shape
 // parkIssueParams uses for one park.
@@ -34,20 +16,11 @@ type budgetHoldNoticeParams struct {
 	IssueID string
 	Entry   *BudgetExhaustedEntry
 
-	Store    budgetHoldNoticeStore
+	Store    storage.BudgetHoldNoticeStore
 	Delivery route.Delivery // non-empty: the caller routed the event and found a destination
 	Metrics  domain.Metrics
 	Logger   *slog.Logger
 	Ctx      context.Context
-}
-
-// budgetHoldCeilingWords names each budget-hold reason in the words the
-// notice uses. A reason absent from this map renders no Ceiling: line at
-// all, rather than a machine value or an invented phrase.
-var budgetHoldCeilingWords = map[string]string{
-	budgetReasonSession: "session budget",
-	budgetReasonToken:   "token budget",
-	budgetReasonMoney:   "money budget",
 }
 
 // Pacing constants for the budget hold notice. At most
@@ -90,7 +63,7 @@ func postBudgetHoldNotice(state *State, params budgetHoldNoticeParams) {
 		log = slog.Default()
 	}
 
-	row := persistence.BudgetHoldNotice{
+	row := storage.BudgetHoldNotice{
 		IssueID:   params.IssueID,
 		Reason:    params.Entry.Reason,
 		NoticedAt: params.Entry.ExhaustedAt.Format(time.RFC3339),
@@ -118,45 +91,12 @@ func postBudgetHoldNotice(state *State, params budgetHoldNoticeParams) {
 	})
 }
 
-// budgetHoldTokenSpend words the entry's token sum for the notice: unknown
-// spend is never printed as zero, and a sum that leaves spend out is marked
-// as a lower bound. The entry's UsedTokens must be non-nil.
-func budgetHoldTokenSpend(entry *BudgetExhaustedEntry) string {
-	used := *entry.UsedTokens
-	var unmeasured int
-	if entry.UnmeasuredSessions != nil {
-		unmeasured = *entry.UnmeasuredSessions
-	}
-	switch {
-	case !SpendIncomplete(unmeasured, entry.UnaccountedTurns):
-		return strconv.FormatInt(used, 10)
-	case used == 0:
-		return "not measured"
-	default:
-		return fmt.Sprintf("at least %d", used)
-	}
-}
-
-// budgetHoldMoneySpend renders the entry's estimated cost: exact when the
-// figure is complete, else a lower bound, or unknown when nothing priced.
-func budgetHoldMoneySpend(entry *BudgetExhaustedEntry) string {
-	used := *entry.UsedUSD
-	switch {
-	case entry.UsedUSDComplete != nil && *entry.UsedUSDComplete:
-		return pricing.FormatUSD(used)
-	case used == 0:
-		return "unknown"
-	default:
-		return "at least " + pricing.FormatUSD(used)
-	}
-}
-
 // releaseBudgetHoldNotice deletes the durable row and the memory entry for
 // one issue. It returns without a store call when the memory holds no
 // reason for the issue. The memory entry is dropped only once the durable
 // delete succeeds, so a failed delete leaves the entry in place and the
 // next release pass retries it rather than stranding the row.
-func releaseBudgetHoldNotice(ctx context.Context, state *State, store budgetHoldNoticeReleaseStore, issueID string, log *slog.Logger) {
+func releaseBudgetHoldNotice(ctx context.Context, state *State, store storage.BudgetHoldNoticeStore, issueID string, log *slog.Logger) {
 	if _, ok := state.BudgetHoldNoticed[issueID]; !ok {
 		return
 	}
@@ -172,7 +112,7 @@ func releaseBudgetHoldNotice(ctx context.Context, state *State, store budgetHold
 // memory is already empty. The memory is cleared only once the durable
 // delete succeeds, so a failed delete leaves the entries in place and the
 // next release pass retries it rather than stranding the rows.
-func releaseAllBudgetHoldNotices(ctx context.Context, state *State, store budgetHoldNoticeReleaseStore, log *slog.Logger) {
+func releaseAllBudgetHoldNotices(ctx context.Context, state *State, store storage.BudgetHoldNoticeStore, log *slog.Logger) {
 	if len(state.BudgetHoldNoticed) == 0 {
 		return
 	}
@@ -183,51 +123,10 @@ func releaseAllBudgetHoldNotices(ctx context.Context, state *State, store budget
 	state.BudgetHoldNoticed = make(map[string]string)
 }
 
-// buildBudgetHoldComment renders the plain-text notice body from the
-// entry alone. Pure: no clock, no config lookup, no tracker call. The
-// body is a past-tense event record and MUST NOT assert a present state,
-// use imperative or sufficiency-claiming phrasing, or interpolate the
-// issue's identifier, which the comment is already attached to.
-func buildBudgetHoldComment(entry *BudgetExhaustedEntry) string {
-	lines := []string{
-		"Sortie stopped dispatching this issue.",
-		fmt.Sprintf("Recorded: %s", entry.ExhaustedAt.Format(time.RFC3339)),
-	}
-
-	word, hasWord := budgetHoldCeilingWords[entry.Reason]
-	setting, hasSetting := ceilingSettingByBudgetReason[entry.Reason]
-	if hasWord && hasSetting {
-		lines = append(lines, fmt.Sprintf("Ceiling: %s (%s)", word, setting))
-	}
-
-	if entry.BudgetUSD > 0 && entry.UsedUSD != nil {
-		lines = append(lines, fmt.Sprintf("Estimated cost: %s of %s", budgetHoldMoneySpend(entry), pricing.FormatUSD(entry.BudgetUSD)))
-	}
-	if entry.BudgetTokens > 0 && entry.UsedTokens != nil {
-		lines = append(lines, fmt.Sprintf("Tokens: %s of %d", budgetHoldTokenSpend(entry), entry.BudgetTokens))
-	}
-	if entry.BudgetSessions > 0 {
-		lines = append(lines, fmt.Sprintf("Sessions: %d of %d", entry.UsedSessions, entry.BudgetSessions))
-	}
-	if entry.StoppedInFlight != nil && *entry.StoppedInFlight > 0 {
-		word := "session"
-		if *entry.StoppedInFlight != 1 {
-			word = "sessions"
-		}
-		lines = append(lines, fmt.Sprintf("Stopped in flight: %d %s", *entry.StoppedInFlight, word))
-	}
-
-	if hasSetting {
-		lines = append(lines, fmt.Sprintf("Raising %s raises this ceiling.", setting))
-	}
-
-	return strings.Join(lines, "\n")
-}
-
 // PopulateBudgetHoldNotices loads persisted budget hold notice records
 // into state.BudgetHoldNoticed. Called during startup recovery, before the
 // event loop starts, beside [PopulateParked].
-func PopulateBudgetHoldNotices(state *State, rows []persistence.BudgetHoldNotice, log *slog.Logger) {
+func PopulateBudgetHoldNotices(state *State, rows []storage.BudgetHoldNotice, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}

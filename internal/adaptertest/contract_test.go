@@ -1,6 +1,7 @@
 package adaptertest
 
 import (
+	"cmp"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -43,12 +44,15 @@ const contractProcutilImportPath = "github.com/sortie-ai/sortie/internal/agent/p
 // because persistent JSON-RPC framing has no alternative.
 var contractBanTable = map[string]string{
 	"classifyTransportError": "httpkit.ClassifyTransport",
+	"transportCategory":      "notifyhttp.NewClient",
 	"withRetry":              "httpkit.RetryWithBackoff",
 	"sleepContext":           "httpkit.RetryWithBackoff",
 	"isRetryable":            "httpkit.RetryWithBackoff",
 	"toLowerSet":             "typeutil.LowerSet",
 	"lowerSet":               "typeutil.LowerSet",
 	"containsWhitespace":     "typeutil.HasWhitespace",
+	"intFromConfig":          "typeutil.IntFrom",
+	"boolFromConfig":         "typeutil.BoolFrom",
 	"validateStateLabels":    "registry.DiagStateLabelElements",
 	"validateStateOverlap":   "registry.DiagStateOverlap",
 	"sortableEventID":        "scmcore.SortableEventID",
@@ -86,6 +90,7 @@ var contractBanTable = map[string]string{
 	"subtractUsage":          "agentcore.SubtractUsage",
 	"maxUsage":               "agentcore.MaxUsage",
 	"componentwiseMaxUsage":  "agentcore.MaxUsage",
+	"sumTurnMessages":        "usage.Sum",
 	"truncateLog":            "cilog.Builder",
 	"traceExcerpt":           "cilog.Builder",
 	"truncateLines":          "cilog.TailLines",
@@ -107,7 +112,6 @@ var contractTrackerAdapterMethods = map[string]bool{
 	"FetchIssueBlockers":             true,
 	"TransitionIssue":                true,
 	"CommentIssue":                   true,
-	"CommentIssueWithLiteral":        true,
 	"AddLabel":                       true,
 	"RemoveLabel":                    true,
 }
@@ -122,6 +126,7 @@ const (
 	ruleIMPORT    contractRule = "IMPORT"
 	ruleTEARDOWN  contractRule = "TEARDOWN"
 	ruleBLOCKER   contractRule = "BLOCKER"
+	ruleLINKER    contractRule = "LINKER"
 	ruleIDENTITY  contractRule = "IDENTITY"
 	ruleSTOPGRACE contractRule = "STOPGRACE"
 	ruleCAPTURE   contractRule = "CAPTURE"
@@ -130,6 +135,14 @@ const (
 	ruleANCHOR    contractRule = "ANCHOR"
 	ruleWORKDIR   contractRule = "WORKDIR"
 	ruleHANDLER   contractRule = "HANDLER"
+
+	ruleLIFECYCLE   contractRule = "LIFECYCLE"
+	ruleREADTIMEOUT contractRule = "READTIMEOUT"
+	ruleUSAGESUM    contractRule = "USAGESUM"
+
+	ruleGROUPSIGNAL contractRule = "GROUPSIGNAL"
+
+	ruleMCPMODEL contractRule = "MCPMODEL"
 )
 
 // contractWorkspacekitImportPath is resolved per file so an aliased or
@@ -181,14 +194,24 @@ var contractSharedFamilyPackages = map[string]contractSharedPackage{
 	"github.com/sortie-ai/sortie/internal/scm/cilog":                       {reason: "shared CI log excerpt assembly for the forge CI providers; registers no kind and holds no adapter", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/procutil":                  {reason: "shared subprocess group handling, Windows process containment, and bounded output capture; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agentcore":                 {reason: "shared agent session, event, and disposition core; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/agent/usage":                     {reason: "shared usage normalization and merge for provider usage windows, and spend accounting; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/agent/copilot/sessionstate":      {reason: "shared Copilot CLI journal location, read caps, records declaration, and the record and checkpoint parsers; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/opencode/sessionexport":    {reason: "shared OpenCode session export arguments and document parser; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/copilot/quota":             {reason: "shared Copilot CLI quota windows read from its endpoint or headless server; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/copilot/usagelimits":       {reason: "shared Copilot CLI session-error refusal vocabulary; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/opencode/usagelimits":      {reason: "shared OpenCode console usage limits read from the runtime usage command; registers no kind and holds no adapter", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/mcpconfig":                 {reason: "shared MCP configuration parsing; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/sshutil":                   {reason: "shared SSH invocation helpers; registers no kind and holds no adapter", coreImportable: true},
-	"github.com/sortie-ai/sortie/internal/agent/jsonrpc":                   {reason: "shared newline-delimited JSON-RPC framing and message delivery; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay":                 {reason: "shared HTTP tool-server relay lifecycle and delivery decision; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/jsonrpc":                   {reason: "shared JSON-RPC framing (newline-delimited and Content-Length) and message delivery; registers no kind and holds no adapter", coreImportable: true},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest":                 {reason: "shared agent-adapter test support; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest": {reason: "shared turn-disposition conformance assertion, keyed separately because keys match exactly; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest":  {reason: "shared credential-verification conformance assertion, keyed separately because keys match exactly; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/launchtest":      {reason: "shared launch-record bind, kill and release verdict for tests and the qualification tool, keyed separately because keys match exactly; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel":       {reason: "shared scripted model endpoint and scripted-model conformance driver; registers no kind and holds no adapter; its non-test files import testing, so production code must not reach it", coreImportable: false},
 	"github.com/sortie-ai/sortie/internal/notify/route":                    {reason: "shared notification routing for orchestrator events; registers no kind and holds no adapter", coreImportable: true},
+	"github.com/sortie-ai/sortie/internal/notify/notifyhttp":               {reason: "shared JSON-over-HTTP transport for the notifier kinds; registers no kind and holds no adapter", coreImportable: false},
+	"github.com/sortie-ai/sortie/internal/notify/render":                   {reason: "shared notification text rendering for every destination; registers no kind and holds no adapter", coreImportable: false},
 }
 
 // contractPackageBannedImports maps one package's import path to the
@@ -204,18 +227,32 @@ var contractPackageBannedImports = map[string]map[string]string{
 // one rule and states why; it stays subject to every other rule.
 var contractAllowlist = map[string]map[contractRule]string{
 	"file": {
-		ruleHOOK: "no HTTP, no credential, no remote project, and no config to validate",
+		ruleHOOK:   "no HTTP, no credential, no remote project, and no config to validate",
+		ruleLINKER: "a file tracker has no web page to link to",
 	},
 	"procutil": {
 		ruleTEARDOWN:  "owns SetGroupCancel and SetGroupKill, the helpers every other launcher calls",
 		ruleSTOPGRACE: "owns DefaultStopGrace, the fallback every other family reaches through StopGrace",
 		ruleCAPTURE:   "owns StartCapture and RunCapture, the capture every other launcher calls",
+		ruleLIFECYCLE: "owns the process-start primitives every other launcher calls",
+
+		ruleGROUPSIGNAL: "owns Group, which signals a launch's process group only while its unreaped direct child pins the number",
+	},
+	"agentcore": {
+		ruleLIFECYCLE:   "owns the fork-per-turn lifecycle built on the process-start primitives",
+		ruleREADTIMEOUT: "owns ReadTimeout and FirstResponseTimeout, the readers of the field",
+		ruleUSAGESUM:    "owns AddUsage, the one place the counters are summed",
+	},
+	"usage": {
+		ruleUSAGESUM: "owns Add, the one place the counters are summed; agentcore.AddUsage delegates to it",
 	},
 	"agenttest": {
-		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+		ruleCAPTURE:  "test-support package that cmd/sortie does not link",
+		ruleMCPMODEL: "test-support package that cmd/sortie does not link",
 	},
 	"fakemodel": {
-		ruleCAPTURE: "test-support package that cmd/sortie does not link",
+		ruleCAPTURE:     "test-support package that cmd/sortie does not link",
+		ruleGROUPSIGNAL: "test-support package that cmd/sortie does not link; it kills a held launch's group to simulate a crash, which Group's own signals would record as a requested stop",
 	},
 	"probe": {
 		ruleCAPTURE: "test-support package that cmd/sortie does not link",
@@ -227,6 +264,12 @@ var contractAllowlist = map[string]map[contractRule]string{
 	},
 	"workspacekit": {
 		ruleANCHOR: "owns the workspace-anchoring mechanism",
+	},
+	"copilot": {
+		ruleIDENTITY: "declares its own registered deprecation, naming its replacement kind",
+	},
+	"opencode": {
+		ruleIDENTITY: "declares its own registered deprecation, naming its replacement kind",
 	},
 }
 
@@ -252,7 +295,7 @@ type contractWalkedPackage struct {
 }
 
 // contractPackage carries one package's identity and parsed files.
-// Non-test files feed rules BAN, METRICS, and HOOK; test files are parsed
+// Non-test files feed the BAN, METRICS, and HOOK rules; test files are parsed
 // imports-only and feed rule IMPORT alone.
 type contractPackage struct {
 	dirName    string
@@ -538,6 +581,7 @@ var contractBoundedSinkTypes = map[string]string{
 	"bytes.Buffer":        "grows in memory and never blocks on Write",
 	"procutil.TailBuffer": "drops the earliest bytes once its cap is exceeded",
 	"cappedWriter":        "discards bytes past its cap and always reports success",
+	"pipeSink":            "blocks only until its reader consumes or closes the pipe, and scanRemote closes the reader on every return",
 }
 
 // contractSinkTypeOwner is the map rule SINK directs a caller to extend
@@ -1362,11 +1406,11 @@ func bodyCallsTrackermetricsTrack(file *ast.File, body *ast.BlockStmt) bool {
 }
 
 // contractTrackerAdapterType returns the type a non-test file names in
-// "var _ domain.TrackerAdapter = (*T)(nil)", with the domain qualifier
+// "var _ domain.<iface> = (*T)(nil)", with the domain qualifier
 // resolved from the file's own imports, or "" when no file asserts one.
 // A package that also holds a source-control adapter declares its tracker
 // adapter this way, which is how rule METRICS tells the two apart.
-func contractTrackerAdapterType(files []*ast.File) string {
+func contractTrackerAdapterType(files []*ast.File, iface string) string {
 	for _, file := range files {
 		domainIdent := resolveContractImportName(file, contractDomainImportPath)
 		if domainIdent == "" {
@@ -1378,7 +1422,7 @@ func contractTrackerAdapterType(files []*ast.File) string {
 				continue
 			}
 			for _, spec := range gen.Specs {
-				if name := contractTrackerAssertionType(spec, domainIdent); name != "" {
+				if name := contractTrackerAssertionType(spec, domainIdent, iface); name != "" {
 					return name
 				}
 			}
@@ -1387,13 +1431,13 @@ func contractTrackerAdapterType(files []*ast.File) string {
 	return ""
 }
 
-func contractTrackerAssertionType(spec ast.Spec, domainIdent string) string {
+func contractTrackerAssertionType(spec ast.Spec, domainIdent, iface string) string {
 	value, ok := spec.(*ast.ValueSpec)
 	if !ok || len(value.Names) != 1 || value.Names[0].Name != "_" || len(value.Values) != 1 {
 		return ""
 	}
 	typ, ok := value.Type.(*ast.SelectorExpr)
-	if !ok || typ.Sel.Name != "TrackerAdapter" {
+	if !ok || typ.Sel.Name != iface {
 		return ""
 	}
 	if qualifier, ok := typ.X.(*ast.Ident); !ok || qualifier.Name != domainIdent {
@@ -1483,6 +1527,20 @@ func checkContractMetrics(fset *token.FileSet, file *ast.File, registersTracker 
 	})
 
 	return violations
+}
+
+// A new tracker kind must not ship without a project page; the file kind
+// is exempt through the allowlist.
+func checkContractProjectLinker(fset *token.FileSet, pkg contractPackage) []contractViolation {
+	registers, _, _, _, _, pos := contractRegistrationFacts(fset, pkg.files)
+	if !registers || contractExempt(pkg.dirName, ruleLINKER) {
+		return nil
+	}
+	trackerType := contractTrackerAdapterType(pkg.files, "TrackerAdapter")
+	if trackerType != "" && contractTrackerAdapterType(pkg.files, "ProjectLinker") == trackerType {
+		return nil
+	}
+	return []contractViolation{{pos: pos, text: "tracker adapter does not assert domain.ProjectLinker"}}
 }
 
 // contractPathIsUnder reports whether importPath is prefix or a path
@@ -1631,7 +1689,7 @@ func checkContractImports(fset *token.FileSet, file *ast.File, pkg contractPacka
 // identity rule always treats as identity tokens, in addition to the kind
 // strings extracted from the tree. It is a floor, not a closed world.
 var contractAgentIdentityFloorTable = []string{
-	"claude", "codex", "copilot", "kiro", "opencode", "mock",
+	"claude", "codex", "copilot", "kiro", "opencode", "pi", "mock",
 	"gemini", "amp", "goose", "zed", "cursor", "aider", "qwen", "crush",
 }
 
@@ -1836,7 +1894,10 @@ func contractIdentityWordsFromIdent(name string) []string {
 		// An uppercase run ending in a lowercase rune starts a new word at
 		// that run's last uppercase rune, so useCLAUDEFlag yields "use",
 		// "claude" and "flag" rather than gluing the token to "flag".
-		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 {
+		// A short initialism followed by a plural s stays one word: PIDs
+		// is not the identity token pi followed by ds.
+		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 &&
+			(len(current) > 3 || r != 's') {
 			last := current[len(current)-1]
 			current = current[:len(current)-1]
 			flush()
@@ -1898,18 +1959,8 @@ func contractPackageUnderKindPackage(checkedImportPath, kindPackageImportPath st
 	return contractPathIsUnder(checkedImportPath, kindPackageImportPath)
 }
 
-// contractIdentityExcludedTokens returns the tokens the identity rule does
-// not enforce against pkg: its own directory name, and the directory name
-// and registered kinds of any kind package that is pkg's import path or an
-// ancestor. The ancestor case lets a package nested under a kind package
-// name that kind.
-func contractIdentityExcludedTokens(pkg contractPackage, kindImportPaths map[string][]string) map[string]bool {
+func contractIdentityKindExcludedTokens(pkg contractPackage, kindImportPaths map[string][]string) map[string]bool {
 	excluded := map[string]bool{strings.ToLower(pkg.dirName): true}
-	if contractIdentitySeamImportPath(pkg.importPath) {
-		for _, tok := range contractWideScopedTokens(contractAgentIdentitySnapshotData()) {
-			excluded[strings.ToLower(tok)] = true
-		}
-	}
 	for kindImportPath, kinds := range kindImportPaths {
 		if !contractPackageUnderKindPackage(pkg.importPath, kindImportPath) {
 			continue
@@ -1917,6 +1968,16 @@ func contractIdentityExcludedTokens(pkg contractPackage, kindImportPaths map[str
 		excluded[strings.ToLower(path.Base(kindImportPath))] = true
 		for _, kind := range kinds {
 			excluded[strings.ToLower(kind)] = true
+		}
+	}
+	return excluded
+}
+
+func contractIdentityExcludedTokens(pkg contractPackage, kindImportPaths map[string][]string) map[string]bool {
+	excluded := contractIdentityKindExcludedTokens(pkg, kindImportPaths)
+	if contractIdentitySeamImportPath(pkg.importPath) {
+		for _, tok := range contractSeamLegalTokens(contractAgentIdentitySnapshotData()) {
+			excluded[strings.ToLower(tok)] = true
 		}
 	}
 	return excluded
@@ -2096,24 +2157,39 @@ func contractWideScopedTokens(snapshot contractAgentIdentitySnapshot) []string {
 	return wide
 }
 
+func contractAnchoredTokens(snapshot contractAgentIdentitySnapshot) []string {
+	var anchored []string
+	for _, tok := range snapshot.tokens {
+		if contractTokenIsKindAnchored(tok, snapshot.kindImportPaths) {
+			anchored = append(anchored, tok)
+		}
+	}
+	return anchored
+}
+
+func contractSeamLegalTokens(snapshot contractAgentIdentitySnapshot) []string {
+	return append(contractWideScopedTokens(snapshot), contractAnchoredTokens(snapshot)...)
+}
+
 // contractWideIdentityRoots are the roots the wide scope walks beyond the
 // per-family walks the two contract tests already cover.
 var contractWideIdentityRoots = []string{filepath.Join("..", "..", "cmd"), filepath.Join("..", "..", "internal")}
 
-// contractIdentityMeasurementSeam is the one directory where a
-// profile-declared, unanchored token is legal: the transport's
-// measurement sources, which read a runtime's own output format and are
-// vendor-specific by construction. Every other directory under the wide
-// roots stays bound by the rule.
+// contractIdentityMeasurementSeam is the one directory where both a
+// profile-declared token no kind package anchors and a token a kind package
+// anchors are legal: the transport's per-runtime usage declarations and
+// verification additions read a runtime's own output and settings, so they are
+// vendor-specific by construction. Every other directory under the wide roots
+// stays bound by the rule.
 var contractIdentityMeasurementSeam = filepath.Join("internal", "agent", "clientprotocol", "usagesource")
 
 // contractIdentitySeamImportPath reports whether importPath is the
-// measurement seam's own package.
+// per-runtime seam's own package.
 func contractIdentitySeamImportPath(importPath string) bool {
 	return strings.HasSuffix(importPath, "/"+filepath.ToSlash(contractIdentityMeasurementSeam))
 }
 
-// contractIdentitySeamDir reports whether walkPath is the measurement
+// contractIdentitySeamDir reports whether walkPath is the per-runtime
 // seam, under whatever root the walk started from.
 func contractIdentitySeamDir(walkPath string) bool {
 	return contractPathIsDir(walkPath, contractIdentityMeasurementSeam)
@@ -2319,6 +2395,116 @@ func TestContractIdentitySeamIsNarrow(t *testing.T) {
 	}
 }
 
+func TestContractIdentitySeamAnchoredExemptionIsNarrow(t *testing.T) {
+	fset := token.NewFileSet()
+	snapshot := contractAgentIdentitySnapshotData()
+	anchored := contractAnchoredTokens(snapshot)
+	if len(anchored) == 0 {
+		t.Fatal("contractAnchoredTokens() returned none, want the kind-anchored tokens the seam exemption widens to")
+	}
+
+	walked, _ := contractWalkRoot(t, fset, filepath.Join("..", "agent"), contractAgentFamilyPath)
+
+	var inSeam, outsideSeam []contractViolation
+	for _, w := range walked {
+		if contractExempt(w.pkg.dirName, ruleIDENTITY) {
+			continue
+		}
+		excluded := contractIdentityKindExcludedTokens(w.pkg, snapshot.kindImportPaths)
+		for _, file := range w.pkg.files {
+			violations := contractIdentityArm1Violations(fset, file, anchored, excluded)
+			if contractIdentitySeamImportPath(w.pkg.importPath) {
+				inSeam = append(inSeam, violations...)
+			} else {
+				outsideSeam = append(outsideSeam, violations...)
+			}
+		}
+	}
+
+	if len(inSeam) == 0 {
+		t.Fatal("removing the seam exemption for anchored tokens produced no violation, so the widened exemption is dead and this check proves nothing")
+	}
+	for _, v := range outsideSeam {
+		t.Errorf("%s: %s, outside the one exempted seam", v.pos, v.text)
+	}
+}
+
+func TestContractIdentityRule_SeamScopeOfAnchoredTokens(t *testing.T) {
+	t.Parallel()
+
+	const src = `package fixture
+
+const runtime = "copilot-cli"
+`
+	const unprofiledSrc = `package fixture
+
+const runtime = "cursor"
+`
+	const seamImportPath = "github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
+
+	tests := []struct {
+		name       string
+		dirName    string
+		importPath string
+		src        string
+		wantAny    bool
+	}{
+		{
+			name:       "the seam may name an anchored runtime",
+			dirName:    "usagesource",
+			importPath: seamImportPath,
+			src:        src,
+		},
+		{
+			name:       "the seam stays bound for a token no profile declares",
+			dirName:    "usagesource",
+			importPath: seamImportPath,
+			src:        unprofiledSrc,
+			wantAny:    true,
+		},
+		{
+			name:       "a package beside the seam may not name an anchored runtime",
+			dirName:    "procutil",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/procutil",
+			src:        src,
+			wantAny:    true,
+		},
+		{
+			name:       "clientprotocol itself may not name an anchored runtime",
+			dirName:    "clientprotocol",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/clientprotocol",
+			src:        src,
+			wantAny:    true,
+		},
+		{
+			name:       "a package nested under the seam may not name an anchored runtime",
+			dirName:    "nested",
+			importPath: seamImportPath + "/nested",
+			src:        src,
+			wantAny:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", tt.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse fixture: %v", err)
+			}
+			pkg := contractPackage{dirName: tt.dirName, importPath: tt.importPath, files: []*ast.File{file}}
+
+			got := checkContractIdentity(fset, pkg)
+
+			if (len(got) > 0) != tt.wantAny {
+				t.Errorf("checkContractIdentity(%s) = %v, want violations: %t", tt.importPath, got, tt.wantAny)
+			}
+		})
+	}
+}
+
 func TestContractIdentityWideScope(t *testing.T) {
 	fset := token.NewFileSet()
 	snapshot := contractAgentIdentitySnapshotData()
@@ -2494,8 +2680,8 @@ func contractExempt(dirName string, rule contractRule) bool {
 	return ok
 }
 
-// checkAdapterContractPackage evaluates rules BAN, METRICS, HOOK, IMPORT,
-// and (for an agent-family package) IDENTITY and STOPGRACE against pkg,
+// checkAdapterContractPackage evaluates the BAN, METRICS, HOOK, IMPORT,
+// and (for an agent-family package) IDENTITY and STOPGRACE rules against pkg,
 // honoring pkg.dirName's allowlist entries. Only IMPORT reads test files.
 //
 // A ruleIMPORT allowlist entry is all-or-nothing: it lifts the
@@ -2514,7 +2700,7 @@ func checkAdapterContractPackage(fset *token.FileSet, pkg contractPackage) []con
 	registers, usedMeta, hasHook, hasBlockerSource, blockerSourceIsPerIssue, factsPos := contractRegistrationFacts(fset, pkg.files)
 
 	if !contractExempt(pkg.dirName, ruleMETRICS) {
-		trackerType := contractTrackerAdapterType(pkg.files)
+		trackerType := contractTrackerAdapterType(pkg.files, "TrackerAdapter")
 		for _, file := range pkg.files {
 			violations = append(violations, checkContractMetrics(fset, file, registers, trackerType)...)
 		}
@@ -2646,7 +2832,7 @@ func contractWalkRoot(t *testing.T, fset *token.FileSet, dir, importPath string)
 
 // TestCheckAdapterContract walks internal/tracker, internal/scm,
 // internal/agent, and internal/notify and fails when any package breaks
-// rules BAN, METRICS, HOOK, IMPORT, IDENTITY, or STOPGRACE.
+// the BAN, METRICS, HOOK, IMPORT, IDENTITY, or STOPGRACE rule.
 func TestCheckAdapterContract(t *testing.T) {
 	fset := token.NewFileSet()
 
@@ -2672,6 +2858,9 @@ func TestCheckAdapterContract(t *testing.T) {
 	sort.Slice(walked, func(i, j int) bool { return walked[i].dir < walked[j].dir })
 	for _, w := range walked {
 		for _, v := range checkAdapterContractPackage(fset, w.pkg) {
+			t.Errorf("%s: %s", v.pos, v.text)
+		}
+		for _, v := range checkContractProjectLinker(fset, w.pkg) {
 			t.Errorf("%s: %s", v.pos, v.text)
 		}
 	}
@@ -2804,7 +2993,10 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/orchestrator", name: "RunWorkerAttempt", reason: "exported summary path"},
 	{importPath: "github.com/sortie-ai/sortie/tools/qualify/probe", name: "writeToolServerMCPConfig", reason: "fixture path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "NewSortieTools", reason: "returned path"},
-	{importPath: "github.com/sortie-ai/sortie/internal/agent/claude", name: "alwaysLoadToolServer", reason: "location check and returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/claude", name: "writeDerivedConfig", reason: "returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/copilot", name: "writeDerivedConfig", reason: "returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "WriteSeededMCPConfig", reason: "returned path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "assertMalformedMCPConfigRejected", reason: "fixture path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR
@@ -2814,6 +3006,10 @@ var contractWorkdirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/workspace", name: "GitCommand", reason: "workspace verified before launch"},
 	{importPath: "github.com/sortie-ai/sortie/internal/workspace", name: "RunHook", reason: "workspace verified before launch"},
 	{importPath: "github.com/sortie-ai/sortie/internal/orchestrator", name: "runSingleVerification", reason: "workspace verified before launch"},
+}
+
+var contractLifecycleSites = []contractSiteEntry{
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/copilot", name: "deleteVerificationSession", reason: "auxiliary launch answering one framed request on standard input"},
 }
 
 // contractAnchorOwner is the package rule ANCHOR directs every .sortie
@@ -3200,9 +3396,329 @@ func checkContractWorkdirFile(fset *token.FileSet, file *ast.File, importPath st
 	return violations
 }
 
-// TestContractCaptureAndTeardown walks every non-test Go file under cmd/
-// and internal/ and fails on rules CAPTURE, SINK, TEARDOWN, REAPER,
-// ANCHOR, and WORKDIR.
+const (
+	contractLifecycleRemedy   = "build a one-process-per-turn kind on agentcore.NewForkPerTurnSession and add what it lacks as a hook; only a persistent session that releases its output through procutil.StartOutputRelease starts its own process"
+	contractReadTimeoutRemedy = "call agentcore.ReadTimeout or agentcore.FirstResponseTimeout"
+	contractUsageSumRemedy    = "call agentcore.AddUsage"
+)
+
+var contractLifecyclePrimitives = map[string]bool{
+	"StartWithOwnedPipes": true,
+	"StartReaper":         true,
+	"NewStdoutReader":     true,
+}
+
+var contractUsageSumFields = map[string]bool{
+	"InputTokens":      true,
+	"OutputTokens":     true,
+	"CacheReadTokens":  true,
+	"CacheWriteTokens": true,
+}
+
+// contractGroupSignalPaths are the import paths whose Kill rule GROUPSIGNAL
+// matches.
+var contractGroupSignalPaths = []string{"syscall", "golang.org/x/sys/unix"}
+
+const contractGroupSignalRemedy = "signal the launch's procutil.Group, obtained from the launch or through procutil.HeldGroup"
+
+// checkContractGroupSignalFile reports every rule GROUPSIGNAL violation in
+// file, and none when dirName is exempt. Resolution is by import path and
+// syntax only: a local shadowing a qualifier or Kill reads as the import.
+func checkContractGroupSignalFile(fset *token.FileSet, file *ast.File, dirName string) []contractViolation {
+	if contractExempt(dirName, ruleGROUPSIGNAL) {
+		return nil
+	}
+	qualifiers := map[string]string{}
+	dotPath := ""
+	for _, imp := range file.Imports {
+		importPath, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || !slices.Contains(contractGroupSignalPaths, importPath) {
+			continue
+		}
+		switch {
+		case imp.Name == nil:
+			qualifiers[path.Base(importPath)] = importPath
+		case imp.Name.Name == ".":
+			if dotPath == "" {
+				dotPath = importPath
+			}
+		case imp.Name.Name != "_":
+			qualifiers[imp.Name.Name] = importPath
+		}
+	}
+	if len(qualifiers) == 0 && dotPath == "" {
+		return nil
+	}
+
+	// referenceName returns the Kill name expr references, or "".
+	referenceName := func(expr ast.Expr) string {
+		switch e := expr.(type) {
+		case *ast.SelectorExpr:
+			if ident, ok := e.X.(*ast.Ident); ok && e.Sel.Name == "Kill" {
+				if importPath, ok := qualifiers[ident.Name]; ok {
+					return path.Base(importPath) + ".Kill"
+				}
+			}
+		case *ast.Ident:
+			if dotPath != "" && e.Name == "Kill" {
+				return path.Base(dotPath) + ".Kill"
+			}
+		}
+		return ""
+	}
+
+	var violations []contractViolation
+	handled := map[ast.Expr]bool{}
+	notReference := map[*ast.Ident]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			notReference[node.Name] = true
+		case *ast.CallExpr:
+			fun := ast.Unparen(node.Fun)
+			name := referenceName(fun)
+			if name == "" {
+				return true
+			}
+			handled[fun] = true
+			if contractGroupSignalArgument(node) {
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(fun.Pos()),
+					text: "signals a process group or a set of processes by a raw number through " + name + "; " + contractGroupSignalRemedy,
+				})
+			}
+		case *ast.SelectorExpr:
+			notReference[node.Sel] = true
+			if name := referenceName(node); name != "" && !handled[node] {
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(node.Pos()),
+					text: "references " + name + " without calling it, so its process argument cannot be checked; " + contractGroupSignalRemedy,
+				})
+			}
+		case *ast.Ident:
+			if name := referenceName(node); name != "" && !notReference[node] && !handled[node] {
+				violations = append(violations, contractViolation{
+					pos:  fset.Position(node.Pos()),
+					text: "references " + name + " without calling it, so its process argument cannot be checked; " + contractGroupSignalRemedy,
+				})
+			}
+		}
+		return true
+	})
+	return violations
+}
+
+// contractGroupSignalArgument reports whether call's first argument is a
+// negated, subtracted, or zero process number.
+func contractGroupSignalArgument(call *ast.CallExpr) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+	switch arg := ast.Unparen(call.Args[0]).(type) {
+	case *ast.UnaryExpr:
+		return arg.Op == token.SUB
+	case *ast.BinaryExpr:
+		return arg.Op == token.SUB
+	case *ast.BasicLit:
+		if arg.Kind != token.INT {
+			return false
+		}
+		n, err := strconv.ParseInt(arg.Value, 0, 64)
+		return err == nil && n == 0
+	}
+	return false
+}
+
+// checkContractLifecycleFile counts only a StartOutputRelease call as
+// releasing, and only for the function that makes it: a func value naming
+// it releases nothing, and a release elsewhere in the file cannot excuse a
+// private turn loop beside it.
+func checkContractLifecycleFile(fset *token.FileSet, file *ast.File, importPath string) []contractViolation {
+	procutilIdent := resolveContractImportName(file, contractProcutilImportPath)
+	if procutilIdent == "" {
+		return nil
+	}
+	if procutilIdent == "." {
+		return []contractViolation{{
+			pos:  fset.Position(importPos(file, contractProcutilImportPath)),
+			text: "dot-imports procutil, which hides a process-start primitive from this rule; import it by name",
+		}}
+	}
+
+	var refs []*ast.SelectorExpr
+	releases := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			sel, ok := node.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "StartOutputRelease" {
+				return true
+			}
+			if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == procutilIdent {
+				releases[contractEnclosingFuncName(file, node.Pos())] = true
+			}
+		case *ast.SelectorExpr:
+			ident, ok := node.X.(*ast.Ident)
+			if ok && ident.Name == procutilIdent && contractLifecyclePrimitives[node.Sel.Name] {
+				refs = append(refs, node)
+			}
+		}
+		return true
+	})
+	var violations []contractViolation
+	for _, ref := range refs {
+		fn := contractEnclosingFuncName(file, ref.Pos())
+		if releases[fn] {
+			continue
+		}
+		if contractSiteAllows(contractLifecycleSites, importPath, fn) {
+			continue
+		}
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(ref.Pos()),
+			text: "references procutil." + ref.Sel.Name + " in a function that never calls procutil.StartOutputRelease; " + contractLifecycleRemedy,
+		})
+	}
+	return violations
+}
+
+func checkContractReadTimeoutFile(fset *token.FileSet, file *ast.File) []contractViolation {
+	var violations []contractViolation
+	ast.Inspect(file, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "ReadTimeoutMS" {
+			violations = append(violations, contractViolation{
+				pos:  fset.Position(sel.Pos()),
+				text: "reads ReadTimeoutMS directly; " + contractReadTimeoutRemedy,
+			})
+		}
+		return true
+	})
+	return violations
+}
+
+// contractSameUsageField returns the counter name when both operands are
+// selectors of the same tracked field, seen through a numeric conversion.
+// An operand wrapped in any other call is not a sum of two counters.
+func contractSameUsageField(left, right ast.Expr) string {
+	l, lok := contractUnwrapConversion(left).(*ast.SelectorExpr)
+	r, rok := contractUnwrapConversion(right).(*ast.SelectorExpr)
+	if !lok || !rok || l.Sel.Name != r.Sel.Name || !contractUsageSumFields[l.Sel.Name] {
+		return ""
+	}
+	return l.Sel.Name
+}
+
+var contractNumericTypes = map[string]bool{
+	"int": true, "int32": true, "int64": true, "uint": true, "uint32": true, "uint64": true, "float64": true,
+}
+
+func contractUnwrapConversion(expr ast.Expr) ast.Expr {
+	expr = ast.Unparen(expr)
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return expr
+	}
+	if ident, ok := call.Fun.(*ast.Ident); ok && contractNumericTypes[ident.Name] {
+		return ast.Unparen(call.Args[0])
+	}
+	return expr
+}
+
+func checkContractUsageSumFile(fset *token.FileSet, file *ast.File) []contractViolation {
+	var violations []contractViolation
+	report := func(pos token.Pos, field string) {
+		violations = append(violations, contractViolation{
+			pos:  fset.Position(pos),
+			text: "sums " + field + " by hand; " + contractUsageSumRemedy,
+		})
+	}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.BinaryExpr:
+			if node.Op == token.ADD {
+				if field := contractSameUsageField(node.X, node.Y); field != "" {
+					report(node.Pos(), field)
+				}
+			}
+		case *ast.AssignStmt:
+			if node.Tok == token.ADD_ASSIGN && len(node.Lhs) == 1 && len(node.Rhs) == 1 {
+				if field := contractSameUsageField(node.Lhs[0], node.Rhs[0]); field != "" {
+					report(node.Pos(), field)
+				}
+			}
+		}
+		return true
+	})
+	return violations
+}
+
+// contractCheckLifecycleSitesContainConstruct is
+// contractCheckAnchorSitesContainConstruct for contractLifecycleSites and
+// checkContractLifecycleFile.
+func contractCheckLifecycleSitesContainConstruct(r contractIdentityReporter, walked []contractWalkedPackage) {
+	fset := token.NewFileSet()
+	original := contractLifecycleSites
+	defer func() { contractLifecycleSites = original }()
+
+	for _, entry := range original {
+		contractLifecycleSites = slices.DeleteFunc(slices.Clone(original), func(e contractSiteEntry) bool { return e == entry })
+
+		fires := false
+		for _, w := range walked {
+			if w.pkg.importPath != entry.importPath {
+				continue
+			}
+			for _, file := range w.pkg.files {
+				if len(checkContractLifecycleFile(fset, file, w.pkg.importPath)) > 0 {
+					fires = true
+				}
+			}
+		}
+		if !fires {
+			r.Errorf("removing the LIFECYCLE exemption for %s.%s reported no violation, want its construct still present", entry.importPath, entry.name)
+		}
+	}
+}
+
+func TestContractLifecycleReadTimeoutUsageSumRules_AppliesAndStaysCurrent(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+
+	found := map[string]bool{}
+	for _, w := range walked {
+		found[w.pkg.dirName] = true
+	}
+
+	for _, rule := range []contractRule{ruleLIFECYCLE, ruleREADTIMEOUT, ruleUSAGESUM} {
+		contractCheckWideRuleEvaluated(t, rule, walked)
+		contractCheckWideRuleAllowlist(t, rule, found)
+	}
+	contractCheckSiteTableFunctionsExist(t, string(ruleLIFECYCLE), contractLifecycleSites, walked)
+	contractCheckLifecycleSitesContainConstruct(t, walked)
+
+	for _, w := range walked {
+		inAgentFamily := contractPathIsUnder(w.pkg.importPath, contractAgentFamilyPath)
+		for _, file := range w.pkg.files {
+			var violations []contractViolation
+			if !contractExempt(w.pkg.dirName, ruleLIFECYCLE) {
+				violations = append(violations, checkContractLifecycleFile(fset, file, w.pkg.importPath)...)
+			}
+			if inAgentFamily && !contractExempt(w.pkg.dirName, ruleREADTIMEOUT) {
+				violations = append(violations, checkContractReadTimeoutFile(fset, file)...)
+			}
+			if inAgentFamily && !contractExempt(w.pkg.dirName, ruleUSAGESUM) {
+				violations = append(violations, checkContractUsageSumFile(fset, file)...)
+			}
+			for _, v := range violations {
+				t.Errorf("%s: %s", v.pos, v.text)
+			}
+		}
+	}
+}
+
+// TestContractCaptureAndTeardown walks every non-test Go file under cmd/,
+// internal/, and tools/qualify and fails on rules CAPTURE, SINK, TEARDOWN,
+// REAPER, ANCHOR, WORKDIR, HANDLER, and GROUPSIGNAL.
 func TestContractCaptureAndTeardown(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
@@ -3231,6 +3747,13 @@ func TestContractCaptureAndTeardown(t *testing.T) {
 		if !contractExempt(w.pkg.dirName, ruleANCHOR) {
 			for _, file := range w.pkg.files {
 				for _, v := range checkContractAnchorFile(fset, file, w.pkg.importPath) {
+					t.Errorf("%s: %s", v.pos, v.text)
+				}
+			}
+		}
+		if !contractExempt(w.pkg.dirName, ruleGROUPSIGNAL) {
+			for _, file := range w.pkg.files {
+				for _, v := range checkContractGroupSignalFile(fset, file, w.pkg.dirName) {
 					t.Errorf("%s: %s", v.pos, v.text)
 				}
 			}
@@ -5284,10 +5807,10 @@ func TestContractStopGraceRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
 }
 
 // TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent guards rules
-// CAPTURE, SINK, TEARDOWN, and REAPER against going stale: each fails when
-// evaluated for no non-exempt file under internal/agent,
-// internal/orchestrator, or internal/workspace, or when an allowlist entry
-// names a directory the walk did not find.
+// CAPTURE, SINK, TEARDOWN, REAPER, ANCHOR, WORKDIR, and GROUPSIGNAL against
+// going stale: each fails when evaluated for no non-exempt file under
+// internal/agent, internal/orchestrator, or internal/workspace, or when an
+// allowlist entry names a directory the walk did not find.
 func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 	fset := token.NewFileSet()
 	walked := contractWalkCaptureAndTeardown(t, fset)
@@ -5309,6 +5832,8 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 	contractCheckWideRuleAllowlist(t, ruleANCHOR, found)
 	contractCheckWideRuleEvaluated(t, ruleWORKDIR, walked)
 	contractCheckWideRuleAllowlist(t, ruleWORKDIR, found)
+	contractCheckWideRuleEvaluated(t, ruleGROUPSIGNAL, walked)
+	contractCheckWideRuleAllowlist(t, ruleGROUPSIGNAL, found)
 }
 
 // TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks
@@ -5317,7 +5842,7 @@ func TestContractCaptureAndTeardownRule_AppliesAndStaysCurrent(t *testing.T) {
 // package-level contractAllowlist a concurrent fixture test reads, so
 // neither runs in parallel.
 func TestContractCaptureAndTeardownRule_StalenessGuardCatchesRealBreaks(t *testing.T) {
-	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN, ruleREAPER, ruleANCHOR, ruleWORKDIR} {
+	for _, rule := range []contractRule{ruleCAPTURE, ruleSINK, ruleTEARDOWN, ruleREAPER, ruleANCHOR, ruleWORKDIR, ruleLIFECYCLE, ruleREADTIMEOUT, ruleUSAGESUM, ruleGROUPSIGNAL} {
 		t.Run(string(rule)+": zero files evaluated under a required root", func(t *testing.T) {
 			walked := []contractWalkedPackage{
 				{pkg: contractPackage{dirName: "fixture", importPath: "github.com/sortie-ai/sortie/internal/tracker/fixture"}},
@@ -5526,6 +6051,34 @@ func Clean(cmd *exec.Cmd) {
 
 		if len(reporter.errors) == 0 {
 			t.Fatal("staleness guard recorded no failure for a WORKDIR site entry whose construct is gone, want at least one")
+		}
+	})
+
+	t.Run("a LIFECYCLE site entry no longer contains its construct", func(t *testing.T) {
+		fset := token.NewFileSet()
+		const src = `package fixture
+
+func Clean() string { return "nothing to see here" }
+`
+		file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse fixture: %v", err)
+		}
+		walked := []contractWalkedPackage{{pkg: contractPackage{
+			dirName:    "fixture",
+			importPath: "example.com/fixture",
+			files:      []*ast.File{file},
+		}}}
+
+		original := contractLifecycleSites
+		contractLifecycleSites = []contractSiteEntry{{importPath: "example.com/fixture", name: "Clean", reason: "test"}}
+		t.Cleanup(func() { contractLifecycleSites = original })
+
+		reporter := &contractStalenessFakeReporter{}
+		contractCheckLifecycleSitesContainConstruct(reporter, walked)
+
+		if len(reporter.errors) == 0 {
+			t.Fatal("staleness guard recorded no failure for a LIFECYCLE site entry whose construct is gone, want at least one")
 		}
 	})
 }
@@ -5922,6 +6475,195 @@ func TestCheckContractWorkdir_AllowlistEntriesHold(t *testing.T) {
 		if !contractExempt(dirName, ruleWORKDIR) {
 			t.Errorf("contractExempt(%q, ruleWORKDIR) = false, want true", dirName)
 		}
+	}
+}
+
+func parseContractFixture(t *testing.T, src string) (*token.FileSet, *ast.File) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile: %v", err)
+	}
+	return fset, file
+}
+
+func TestCheckContractLifecycle_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		importPath string
+		src        string
+		wantCount  int
+	}{
+		{
+			name:       "an aliased call and func value of the primitives beside a release func value are rejected",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import pu "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+var start = pu.StartWithOwnedPipes
+var release = pu.StartOutputRelease
+
+func launch(cmd *exec.Cmd) {
+	pipes, _, _ := pu.StartWithOwnedPipes(ctx, cmd, nil)
+	pu.NewStdoutReader(pipes.Stdout, nil)
+	pu.StartReaper(cmd, nil)
+}
+`,
+			wantCount: 4,
+		},
+		{
+			name:       "a StartOutputRelease call in the same file releases the primitives",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import pu "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func launch(cmd *exec.Cmd) {
+	pipes, _, _ := pu.StartWithOwnedPipes(ctx, cmd, nil)
+	pu.NewStdoutReader(pipes.Stdout, nil)
+	pu.StartReaper(cmd, nil)
+	pu.StartOutputRelease(pu.OutputReleaseParams{})
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a release in another function does not excuse the primitives",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import pu "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func release() { pu.StartOutputRelease(pu.OutputReleaseParams{}) }
+
+func launch(cmd *exec.Cmd) {
+	pu.StartReaper(cmd, nil)
+}
+`,
+			wantCount: 1,
+		},
+		{
+			name:       "a site-table function is exempt",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/copilot",
+			src: `package copilot
+
+import "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func deleteVerificationSession(cmd *exec.Cmd) {
+	procutil.StartReaper(cmd, nil)
+}
+`,
+			wantCount: 0,
+		},
+		{
+			name:       "a dot import is rejected at the import",
+			importPath: "github.com/sortie-ai/sortie/internal/agent/fixture",
+			src: `package fixture
+
+import . "github.com/sortie-ai/sortie/internal/agent/procutil"
+
+func launch(cmd *exec.Cmd) {
+	StartReaper(cmd, nil)
+}
+`,
+			wantCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset, file := parseContractFixture(t, tt.src)
+
+			got := checkContractLifecycleFile(fset, file, tt.importPath)
+
+			if len(got) != tt.wantCount {
+				t.Errorf("checkContractLifecycleFile() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
+			}
+		})
+	}
+}
+
+func TestCheckContractGroupSignal_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		imp     string
+		stmt    string
+		dirName string
+		wantCol int
+	}{
+		{name: "a negated group id", imp: `"syscall"`, stmt: "syscall.Kill(-pgid, sig)", dirName: "fixture", wantCol: 2},
+		{name: "an aliased x/sys/unix import", imp: `u "golang.org/x/sys/unix"`, stmt: "u.Kill(-cmd.Process.Pid, sig)", dirName: "fixture", wantCol: 2},
+		{name: "a dot import", imp: `. "syscall"`, stmt: "Kill(-pid, sig)", dirName: "fixture", wantCol: 2},
+		{name: "a zero process set", imp: `"golang.org/x/sys/unix"`, stmt: "unix.Kill(0, sig)", dirName: "fixture", wantCol: 2},
+		{name: "a function value", imp: `"syscall"`, stmt: "k := syscall.Kill", dirName: "fixture", wantCol: 7},
+		{name: "a subtraction", imp: `"syscall"`, stmt: "syscall.Kill(0-pgid, sig)", dirName: "fixture", wantCol: 2},
+		{name: "a positive process id is left to other checks", imp: `"syscall"`, stmt: "syscall.Kill(pid, 0)", dirName: "fixture"},
+		{name: "procutil is exempt", imp: `"syscall"`, stmt: "syscall.Kill(-pgid, sig)", dirName: "procutil"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset, file := parseContractFixture(t, "package fixture\n\nimport "+tt.imp+"\n\nfunc f() {\n\t"+tt.stmt+"\n}\n")
+
+			got := checkContractGroupSignalFile(fset, file, tt.dirName)
+
+			if tt.wantCol == 0 {
+				if len(got) != 0 {
+					t.Errorf("checkContractGroupSignalFile(%q) = %+v, want no violation", tt.stmt, got)
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("checkContractGroupSignalFile(%q) returned %d violations, want 1: %+v", tt.stmt, len(got), got)
+			}
+			if got[0].pos.Line != 6 || got[0].pos.Column != tt.wantCol {
+				t.Errorf("checkContractGroupSignalFile(%q) reported at %d:%d, want 6:%d", tt.stmt, got[0].pos.Line, got[0].pos.Column, tt.wantCol)
+			}
+		})
+	}
+}
+
+func TestCheckContractReadTimeoutAndUsageSum_DetectViolations(t *testing.T) {
+	t.Parallel()
+
+	readTimeout, usageSum := checkContractReadTimeoutFile, checkContractUsageSumFile
+	tests := []struct {
+		name      string
+		check     func(*token.FileSet, *ast.File) []contractViolation
+		stmt      string
+		wantCount int
+	}{
+		{"a ReadTimeoutMS selector is rejected", readTimeout, "_ = cfg.ReadTimeoutMS", 1},
+		{"the shared read-timeout helper is legal", readTimeout, "_ = agentcore.ReadTimeout(cfg)", 0},
+		{"same counter added", usageSum, "_ = x.InputTokens + y.InputTokens", 1},
+		{"same counter accumulated", usageSum, "x.OutputTokens += y.OutputTokens", 1},
+		{"different counters are a total", usageSum, "_ = x.InputTokens + x.OutputTokens", 0},
+		{"an untracked field is legal", usageSum, "_ = x.Count + y.Count", 0},
+		{"a numeric conversion does not hide the sum", usageSum, "_ = x.InputTokens + int64(y.InputTokens)", 1},
+		{"an operand from another call is legal", usageSum, "_ = x.InputTokens + f(y.InputTokens)", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset, file := parseContractFixture(t, "package fixture\n\nfunc f() {\n\t"+tt.stmt+"\n}\n")
+
+			if got := tt.check(fset, file); len(got) != tt.wantCount {
+				t.Errorf("check(%q) returned %d violations, want %d: %+v", tt.stmt, len(got), tt.wantCount, got)
+			}
+		})
 	}
 }
 
@@ -6464,5 +7206,537 @@ func init() {
 	}
 	if !contractPackageRegistersKind([]*ast.File{file}) {
 		t.Error("contractPackageRegistersKind() = false for a package that registers only a retired kind, want true")
+	}
+}
+
+const (
+	contractMCPConfigImportPath = contractAgentFamilyPath + "/mcpconfig"
+	contractToolrelayImportPath = contractAgentFamilyPath + "/toolrelay"
+	contractAgentcoreImportPath = contractAgentFamilyPath + "/agentcore"
+	contractMCPConfigPathField  = "MCPConfigPath"
+	contractToolSessionReason   = "owns ToolSession"
+)
+
+type contractMCPModelSurface struct {
+	importPath   string
+	allowedNames []string
+	allowConsts  bool
+	exports      map[string]token.Token
+}
+
+func (s contractMCPModelSurface) base() string { return path.Base(s.importPath) }
+
+func (s contractMCPModelSurface) allows(name string) bool {
+	return slices.Contains(s.allowedNames, name) || (s.allowConsts && s.exports[name] == token.CONST)
+}
+
+var contractMCPModelGoverned = []contractMCPModelSurface{
+	{
+		importPath:   contractMCPConfigImportPath,
+		allowedNames: []string{"Delivery", "StdioLaunch", "Endpoint", "ErrUnknownDialect"},
+		allowConsts:  true,
+	},
+	{
+		importPath:   contractToolrelayImportPath,
+		allowedNames: []string{"GapNoticeStem", "ToolServersLabel"},
+	},
+}
+
+// contractMCPModelGrants widens the allowlist for one directory by
+// "<package>.<name>"; "<package>.*" grants every export. It lifts only the
+// use arm: an exported signature stays bound by the base allowlist.
+var contractMCPModelGrants = map[string]map[string]string{
+	"agentcore": {
+		"mcpconfig.Load":        contractToolSessionReason,
+		"mcpconfig.Config":      contractToolSessionReason,
+		"mcpconfig.RenderInput": contractToolSessionReason,
+		"toolrelay.*":           contractToolSessionReason,
+	},
+}
+
+func contractMCPModelGranted(grants map[string]string, s contractMCPModelSurface, name string) bool {
+	_, named := grants[s.base()+"."+name]
+	_, all := grants[s.base()+".*"]
+	return named || all
+}
+
+func contractMCPModelExports(files []*ast.File) map[string]token.Token {
+	exports := map[string]token.Token{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name.IsExported() {
+					exports[d.Name.Name] = token.FUNC
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if s.Name.IsExported() {
+							exports[s.Name.Name] = token.TYPE
+						}
+					case *ast.ValueSpec:
+						for _, name := range s.Names {
+							if name.IsExported() {
+								exports[name.Name] = d.Tok
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return exports
+}
+
+func contractMCPModelSurfaces(walked []contractWalkedPackage) []contractMCPModelSurface {
+	surfaces := slices.Clone(contractMCPModelGoverned)
+	for i := range surfaces {
+		for _, w := range walked {
+			if w.pkg.importPath == surfaces[i].importPath {
+				surfaces[i].exports = contractMCPModelExports(w.pkg.files)
+			}
+		}
+	}
+	return surfaces
+}
+
+func contractMCPModelWalkType(node ast.Node, onSel func(*ast.SelectorExpr), onIdent func(*ast.Ident)) {
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Field:
+			contractMCPModelWalkType(x.Type, onSel, onIdent)
+			return false
+		case *ast.SelectorExpr:
+			onSel(x)
+			return false
+		case *ast.Ident:
+			if onIdent != nil {
+				onIdent(x)
+			}
+		}
+		return true
+	})
+}
+
+func contractMCPModelExportedTypeNodes(expr ast.Expr) []ast.Node {
+	var fields *ast.FieldList
+	switch t := expr.(type) {
+	case *ast.StructType:
+		fields = t.Fields
+	case *ast.InterfaceType:
+		fields = t.Methods
+	default:
+		return []ast.Node{expr}
+	}
+	var nodes []ast.Node
+	for _, f := range fields.List {
+		if len(f.Names) == 0 || slices.ContainsFunc(f.Names, (*ast.Ident).IsExported) {
+			nodes = append(nodes, f.Type)
+		}
+	}
+	return nodes
+}
+
+func contractMCPModelSignatureNodes(decl ast.Decl, typeFilter func(name string) bool) []ast.Node {
+	var nodes []ast.Node
+	switch d := decl.(type) {
+	case *ast.FuncDecl:
+		base := contractReceiverBaseType(d)
+		switch {
+		case !d.Name.IsExported():
+		case d.Recv == nil && typeFilter == nil:
+			nodes = append(nodes, d.Type)
+		case d.Recv != nil && ast.IsExported(base) && (typeFilter == nil || typeFilter(base)):
+			nodes = append(nodes, d.Type)
+		}
+	case *ast.GenDecl:
+		for _, spec := range d.Specs {
+			switch s := spec.(type) {
+			case *ast.TypeSpec:
+				if s.Name.IsExported() && (typeFilter == nil || typeFilter(s.Name.Name)) {
+					nodes = append(nodes, contractMCPModelExportedTypeNodes(s.Type)...)
+				}
+			case *ast.ValueSpec:
+				if typeFilter == nil && s.Type != nil && slices.ContainsFunc(s.Names, (*ast.Ident).IsExported) {
+					nodes = append(nodes, s.Type)
+				}
+			}
+		}
+	}
+	return nodes
+}
+
+func checkContractMCPModelFile(fset *token.FileSet, file *ast.File, importPath string, surfaces []contractMCPModelSurface, grants map[string]string) []contractViolation {
+	var violations []contractViolation
+	reported := map[token.Pos]bool{}
+	report := func(pos token.Pos, text string) {
+		if reported[pos] {
+			return
+		}
+		reported[pos] = true
+		violations = append(violations, contractViolation{pos: fset.Position(pos), text: text})
+	}
+
+	locals := map[string]contractMCPModelSurface{}
+	self := -1
+	for i, s := range surfaces {
+		if s.importPath == importPath {
+			self = i
+			continue
+		}
+		switch name := resolveContractImportName(file, s.importPath); name {
+		case "", "_":
+		case ".":
+			report(importPos(file, s.importPath), "dot-imports "+s.importPath+"; a reference reached through it evades rule "+string(ruleMCPMODEL))
+		default:
+			locals[name] = s
+		}
+	}
+	governedSelector := func(sel *ast.SelectorExpr) (contractMCPModelSurface, bool) {
+		ident, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return contractMCPModelSurface{}, false
+		}
+		s, ok := locals[ident.Name]
+		return s, ok
+	}
+	namesBeyondAllowlist := func(sel *ast.SelectorExpr) {
+		if s, ok := governedSelector(sel); ok && !s.allows(sel.Sel.Name) {
+			report(sel.Pos(), "exported API names "+s.base()+"."+sel.Sel.Name+" in its type; only the allowlisted surface may appear in one")
+		}
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if s, ok := governedSelector(sel); ok && !s.allows(sel.Sel.Name) && !contractMCPModelGranted(grants, s, sel.Sel.Name) {
+			report(sel.Pos(), "uses "+s.base()+"."+sel.Sel.Name+", beyond the surface outside code may use; the session owner reaches it")
+		}
+		return true
+	})
+
+	for _, decl := range file.Decls {
+		for _, node := range contractMCPModelSignatureNodes(decl, nil) {
+			contractMCPModelWalkType(node, namesBeyondAllowlist, nil)
+		}
+	}
+
+	if self >= 0 {
+		own := surfaces[self]
+		isAllowlistedType := func(name string) bool { return slices.Contains(own.allowedNames, name) }
+		for _, decl := range file.Decls {
+			for _, node := range contractMCPModelSignatureNodes(decl, isAllowlistedType) {
+				contractMCPModelWalkType(node, namesBeyondAllowlist, func(id *ast.Ident) {
+					if _, exported := own.exports[id.Name]; exported && !own.allows(id.Name) {
+						report(id.Pos(), "allowlisted type names "+own.base()+"."+id.Name+" in an exported field or method; only the allowlisted surface may appear there")
+					}
+				})
+			}
+		}
+	}
+
+	if contractPathIsUnder(importPath, contractAgentFamilyPath) && !contractPathIsUnder(importPath, contractAgentcoreImportPath) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == contractMCPConfigPathField {
+				report(sel.Pos(), "selects "+contractMCPConfigPathField+"; only agentcore reads the generated config path")
+			}
+			return true
+		})
+	}
+
+	return violations
+}
+
+func checkContractMCPModelPackage(fset *token.FileSet, pkg contractPackage, surfaces []contractMCPModelSurface) []contractViolation {
+	if contractExempt(pkg.dirName, ruleMCPMODEL) {
+		return nil
+	}
+	var violations []contractViolation
+	for _, file := range pkg.files {
+		violations = append(violations, checkContractMCPModelFile(fset, file, pkg.importPath, surfaces, contractMCPModelGrants[pkg.dirName])...)
+	}
+	return violations
+}
+
+func contractDomainDeclaresField(walked []contractWalkedPackage, typeName, field string) bool {
+	for _, w := range walked {
+		if w.pkg.importPath != contractDomainImportPath {
+			continue
+		}
+		for _, file := range w.pkg.files {
+			for _, decl := range file.Decls {
+				gen, ok := decl.(*ast.GenDecl)
+				if !ok {
+					continue
+				}
+				for _, spec := range gen.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok || ts.Name.Name != typeName {
+						continue
+					}
+					st, isStruct := ts.Type.(*ast.StructType)
+					if !isStruct {
+						continue
+					}
+					for _, f := range st.Fields.List {
+						if slices.ContainsFunc(f.Names, func(n *ast.Ident) bool { return n.Name == field }) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func contractCheckMCPModelCurrent(r contractIdentityReporter, surfaces []contractMCPModelSurface, grants map[string]map[string]string, found map[string]bool) {
+	for _, s := range surfaces {
+		if len(s.exports) == 0 {
+			r.Errorf("rule %s governs %s, but the walk found no exported declaration in it", ruleMCPMODEL, s.importPath)
+		}
+		for _, name := range s.allowedNames {
+			if _, ok := s.exports[name]; !ok {
+				r.Errorf("rule %s allowlists %s.%s, which names no declaration", ruleMCPMODEL, s.base(), name)
+			}
+		}
+	}
+	for dirName, entries := range grants {
+		if !found[dirName] {
+			r.Errorf("contractMCPModelGrants[%q] names a directory the walk did not find", dirName)
+		}
+		for entry := range entries {
+			pkgName, name, _ := strings.Cut(entry, ".")
+			idx := slices.IndexFunc(surfaces, func(s contractMCPModelSurface) bool { return s.base() == pkgName })
+			if idx < 0 {
+				r.Errorf("contractMCPModelGrants[%q] grants %q, but no governed package is named %q", dirName, entry, pkgName)
+				continue
+			}
+			if _, ok := surfaces[idx].exports[name]; !ok && name != "*" {
+				r.Errorf("contractMCPModelGrants[%q] grants %q, which names no declaration", dirName, entry)
+			}
+		}
+	}
+	contractCheckWideRuleAllowlist(r, ruleMCPMODEL, found)
+}
+
+func TestContractMCPModel(t *testing.T) {
+	fset := token.NewFileSet()
+	walked := contractWalkCaptureAndTeardown(t, fset)
+	surfaces := contractMCPModelSurfaces(walked)
+
+	found := map[string]bool{}
+	for _, w := range walked {
+		found[w.pkg.dirName] = true
+	}
+
+	contractCheckMCPModelCurrent(t, surfaces, contractMCPModelGrants, found)
+	if !contractDomainDeclaresField(walked, "StartSessionParams", contractMCPConfigPathField) {
+		t.Errorf("domain.StartSessionParams declares no %s field, which rule %s keeps agent adapters from reading", contractMCPConfigPathField, ruleMCPMODEL)
+	}
+
+	for _, w := range walked {
+		for _, v := range checkContractMCPModelPackage(fset, w.pkg, surfaces) {
+			t.Errorf("%s: %s", v.pos, v.text)
+		}
+	}
+}
+
+const contractMCPModelFixtureMCPConfig = `package mcpconfig
+
+const ToolServerName = "sortie-tools"
+
+type Delivery struct{ Document []byte }
+type StdioLaunch struct{ Command string }
+type Endpoint struct{ URL string }
+type Config struct{}
+type RenderInput struct{}
+
+var ErrUnknownDialect error
+
+func Load(path string) (Config, error) { return Config{}, nil }
+`
+
+const contractMCPModelFixtureToolrelay = `package toolrelay
+
+const (
+	GapNoticeStem    = "stem"
+	ToolServersLabel = "label"
+)
+`
+
+func mustParseMCPModelFile(t *testing.T, fset *token.FileSet, src string) *ast.File {
+	t.Helper()
+
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parser.ParseFile: %v", err)
+	}
+	return file
+}
+
+func mustMCPModelSurfaces(t *testing.T, fset *token.FileSet, mcpconfigSrc string) []contractMCPModelSurface {
+	t.Helper()
+
+	return contractMCPModelSurfaces([]contractWalkedPackage{
+		{pkg: contractPackage{importPath: contractMCPConfigImportPath, files: []*ast.File{mustParseMCPModelFile(t, fset, mcpconfigSrc)}}},
+		{pkg: contractPackage{importPath: contractToolrelayImportPath, files: []*ast.File{mustParseMCPModelFile(t, fset, contractMCPModelFixtureToolrelay)}}},
+	})
+}
+
+func TestCheckContractMCPModel_DetectsViolations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		dirName      string
+		mcpconfigSrc string
+		src          string
+		wantCount    int
+		wantSubstr   string
+	}{
+		{
+			name: "an adapter loading the server model and rendering it",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+
+func place(p string) {
+	c, _ := mcpconfig.Load(p)
+	c.Render("", mcpconfig.RenderInput{})
+}
+`,
+			wantCount:  2,
+			wantSubstr: "mcpconfig.Load",
+		},
+		{
+			name: "an adapter reading MCPConfigPath",
+			src: `package fixture
+
+import (
+	"os"
+
+	"github.com/sortie-ai/sortie/internal/domain"
+)
+
+func read(params domain.StartSessionParams) { _, _ = os.ReadFile(params.MCPConfigPath) }
+`,
+			wantCount:  1,
+			wantSubstr: contractMCPConfigPathField,
+		},
+		{
+			name:         "an adapter using a renamed export",
+			mcpconfigSrc: "package mcpconfig\n\ntype Dispatch struct{}\n",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+
+var _ mcpconfig.Dispatch
+`,
+			wantCount:  1,
+			wantSubstr: "mcpconfig.Dispatch",
+		},
+		{
+			name:    "a granted package exporting a banned model type in a signature",
+			dirName: "agentcore",
+			src: `package fixture
+
+import "github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+
+func Open() mcpconfig.Config { return mcpconfig.Config{} }
+`,
+			wantCount:  1,
+			wantSubstr: "mcpconfig.Config",
+		},
+		{
+			name: "an adapter using only the allowlisted surface",
+			src: `package fixture
+
+import (
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay"
+)
+
+var (
+	_ mcpconfig.Delivery
+	_ = mcpconfig.ErrUnknownDialect
+	_ = toolrelay.GapNoticeStem
+)
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			surfaces := mustMCPModelSurfaces(t, fset, cmp.Or(tt.mcpconfigSrc, contractMCPModelFixtureMCPConfig))
+			pkg := contractPackage{
+				dirName:    cmp.Or(tt.dirName, "fixture"),
+				importPath: contractAgentFamilyPath + "/fixture",
+				files:      []*ast.File{mustParseMCPModelFile(t, fset, tt.src)},
+			}
+
+			got := checkContractMCPModelPackage(fset, pkg, surfaces)
+
+			if len(got) != tt.wantCount {
+				t.Fatalf("checkContractMCPModelPackage(%s) = %+v, want %d violations", tt.name, got, tt.wantCount)
+			}
+			if tt.wantSubstr != "" && !slices.ContainsFunc(got, func(v contractViolation) bool {
+				return strings.Contains(v.text, tt.wantSubstr)
+			}) {
+				t.Errorf("checkContractMCPModelPackage(%s) = %+v, want one containing %q", tt.name, got, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestContractMCPModel_StalenessGuardCatchesRealBreaks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		mcpconfigSrc string
+		grants       map[string]map[string]string
+		wantErrors   bool
+	}{
+		{
+			name:         "the fixture surfaces and the real grants",
+			mcpconfigSrc: contractMCPModelFixtureMCPConfig,
+			grants:       contractMCPModelGrants,
+		},
+		{
+			name:         "an allowlisted export was renamed",
+			mcpconfigSrc: strings.Replace(contractMCPModelFixtureMCPConfig, "type Delivery ", "type Dispatch ", 1),
+			grants:       contractMCPModelGrants,
+			wantErrors:   true,
+		},
+		{
+			name:         "a grant names no declaration",
+			mcpconfigSrc: contractMCPModelFixtureMCPConfig,
+			grants:       map[string]map[string]string{"agentcore": {"mcpconfig.Gone": "stale"}},
+			wantErrors:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			surfaces := mustMCPModelSurfaces(t, token.NewFileSet(), tt.mcpconfigSrc)
+			found := map[string]bool{"agentcore": true, "agenttest": true}
+
+			reporter := &contractStalenessFakeReporter{}
+			contractCheckMCPModelCurrent(reporter, surfaces, tt.grants, found)
+
+			if got := len(reporter.errors) > 0; got != tt.wantErrors {
+				t.Errorf("contractCheckMCPModelCurrent(%s) reported %v, want errors = %v", tt.name, reporter.errors, tt.wantErrors)
+			}
+		})
 	}
 }

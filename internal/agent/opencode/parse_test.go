@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
-	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
-	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// loadFixture reads testdata/<name> and returns its bytes.
 func loadFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", name))
@@ -22,7 +18,6 @@ func loadFixture(t *testing.T, name string) []byte {
 	return data
 }
 
-// loadFixtureLine returns the zero-based line at index from a fixture file.
 func loadFixtureLine(t *testing.T, name string, index int) []byte {
 	t.Helper()
 	data := loadFixture(t, name)
@@ -179,11 +174,6 @@ func TestParseRunEvent_InvalidJSON(t *testing.T) {
 	}
 }
 
-// TestIsPermissionWarning_AbandonedMarkerIsNotAWarning pins that the stderr
-// abandonment marker can never be mistaken for a permission-refusal
-// warning. It references [procutil.AbandonedMarker] rather than a copy of
-// its text, so a future change to the marker cannot leave this guard
-// passing on stale text.
 func TestIsPermissionWarning_AbandonedMarkerIsNotAWarning(t *testing.T) {
 	t.Parallel()
 
@@ -234,242 +224,6 @@ func TestScanLines(t *testing.T) {
 	})
 }
 
-func TestQueryExportUsage(t *testing.T) {
-	t.Parallel()
-
-	t.Run("parse_usage_extracted", func(t *testing.T) {
-		t.Parallel()
-
-		data := loadFixture(t, "export_usage.json")
-		usage := parseSessionExport(data, "ses_abc123", 0)
-
-		// InputTokens is tokens.input plus cache.read plus cache.write
-		// (1500 + 200 + 50); OutputTokens is tokens.output plus
-		// tokens.reasoning (300 + 0); TotalTokens is InputTokens plus
-		// OutputTokens, not the vendor tokens.total field.
-		if usage.InputTokens != 1750 {
-			t.Errorf("InputTokens = %d, want 1750", usage.InputTokens)
-		}
-		if usage.OutputTokens != 300 {
-			t.Errorf("OutputTokens = %d, want 300", usage.OutputTokens)
-		}
-		if usage.TotalTokens != 2050 {
-			t.Errorf("TotalTokens = %d, want 2050", usage.TotalTokens)
-		}
-		if usage.CacheReadTokens != 200 {
-			t.Errorf("CacheReadTokens = %d, want 200", usage.CacheReadTokens)
-		}
-		if usage.Model != "anthropic/claude-sonnet-4-5" {
-			t.Errorf("Model = %q, want %q", usage.Model, "anthropic/claude-sonnet-4-5")
-		}
-	})
-
-	t.Run("parse_missing_tokens_returns_zero", func(t *testing.T) {
-		t.Parallel()
-
-		data := loadFixture(t, "export_usage_missing_tokens.json")
-		usage := parseSessionExport(data, "ses_abc123", 0)
-
-		if usage.InputTokens != 0 {
-			t.Errorf("InputTokens = %d, want 0", usage.InputTokens)
-		}
-		if usage.OutputTokens != 0 {
-			t.Errorf("OutputTokens = %d, want 0", usage.OutputTokens)
-		}
-		if usage.CacheReadTokens != 0 {
-			t.Errorf("CacheReadTokens = %d, want 0", usage.CacheReadTokens)
-		}
-	})
-
-	t.Run("a_genuinely_zero_export_is_recovered_not_discarded", func(t *testing.T) {
-		t.Parallel()
-
-		// The runtime's assistant message carries `tokens` as a required
-		// object, so a turn that cost nothing exports the same shape as
-		// any other. Reading the VALUES to decide whether anything was
-		// recovered turned that known zero into an unknown spend, and
-		// threw away the model the export named along with it.
-		data := []byte(`{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop",` +
-			`"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
-			`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}]}`)
-		usage := parseSessionExport(data, "ses_abc123", 0)
-
-		if !usage.Recovered {
-			t.Error("Recovered = false, want true for an export that reported zero tokens")
-		}
-		if !hasUsage(usage) {
-			t.Error("hasUsage = false; a zero figure is a figure")
-		}
-		if usage.Model != "anthropic/claude-sonnet-4-5" {
-			t.Errorf("Model = %q, want the model the export named", usage.Model)
-		}
-		if usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.TotalTokens != 0 {
-			t.Errorf("a zero export must stay zero, got in=%d out=%d total=%d",
-				usage.InputTokens, usage.OutputTokens, usage.TotalTokens)
-		}
-	})
-
-	t.Run("nothing_kept_is_not_recovered", func(t *testing.T) {
-		t.Parallel()
-
-		// The accept control for the cell above: "no figure" must stay
-		// distinguishable from "a figure that happens to be zero", or the
-		// presence test is just a way of always saying yes.
-		for name, data := range map[string][]byte{
-			"empty_messages":  []byte(`{"info":{"id":"ses_abc123"},"messages":[]}`),
-			"invalid_json":    []byte("not valid json"),
-			"user_message":    []byte(`{"info":{"id":"ses_abc123"},"messages":[{"type":"user","tokens":{"input":100,"output":50}}]}`),
-			"missing_tokens":  []byte(`{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop"}]}`),
-			"other_session":   []byte(`{"info":{"id":"ses_other"},"messages":[{"type":"assistant","finish":"stop","tokens":{"input":1,"output":1}}]}`),
-			"unfinished_step": []byte(`{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}]}`),
-		} {
-			usage := parseSessionExport(data, "ses_abc123", 0)
-			if usage.Recovered {
-				t.Errorf("%s: Recovered = true, want false", name)
-			}
-			if hasUsage(usage) {
-				t.Errorf("%s: hasUsage = true, want false", name)
-			}
-		}
-	})
-
-	t.Run("by_model_splits_by_provider_and_model", func(t *testing.T) {
-		t.Parallel()
-
-		data := []byte(`{"info":{"id":"ses_abc123"},"messages":[` +
-			`{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
-			`"tokens":{"input":100,"output":10,"reasoning":5,"cache":{"read":20,"write":30}}},` +
-			`{"type":"assistant","finish":"stop","model":{"providerID":"openai","id":"gpt-5"},` +
-			`"tokens":{"input":200,"output":40}},` +
-			`{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
-			`"tokens":{"input":10,"output":2}}]}`)
-
-		usage := parseSessionExport(data, "ses_abc123", 0)
-
-		want := map[string]domain.TokenUsage{
-			"anthropic/claude-sonnet-4-5": {InputTokens: 160, OutputTokens: 17, TotalTokens: 177, CacheReadTokens: 20, CacheWriteTokens: 30},
-			"openai/gpt-5":                {InputTokens: 200, OutputTokens: 40, TotalTokens: 240},
-		}
-		if !reflect.DeepEqual(usage.ByModel, want) {
-			t.Errorf("ByModel = %+v, want %+v", usage.ByModel, want)
-		}
-	})
-
-	t.Run("parse_session_id_mismatch_returns_zero", func(t *testing.T) {
-		t.Parallel()
-
-		data := loadFixture(t, "export_usage.json")
-		usage := parseSessionExport(data, "ses_different_session", 0)
-
-		if usage.InputTokens != 0 {
-			t.Errorf("InputTokens = %d, want 0 for mismatched session", usage.InputTokens)
-		}
-	})
-}
-
-// TestCacheWriteTokensMapping drives a non-zero cache-write count
-// through parseSessionExport twice, once against the recorded fixture and
-// once against a document carrying its own figures. The two results form
-// a rising two-event sequence run through agenttest.AssertUsageContract,
-// so the shared cache-sum and monotonicity invariants are checked
-// against real mapping output rather than a hand-built
-// domain.TokenUsage.
-func TestCacheWriteTokensMapping(t *testing.T) {
-	t.Parallel()
-
-	exportOutput := parseSessionExport(loadFixture(t, "export_usage.json"), "ses_abc123", 0)
-	if exportOutput.CacheWriteTokens != 50 {
-		t.Errorf("parseSessionExport(export_usage.json).CacheWriteTokens = %d, want 50", exportOutput.CacheWriteTokens)
-	}
-
-	const sessionID = "ses_cache_write"
-	data := []byte(`{"info":{"id":"` + sessionID + `"},"messages":[{"type":"assistant","finish":"stop",` +
-		`"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
-		`"tokens":{"input":3000,"output":500,"reasoning":0,"cache":{"read":400,"write":900}}}]}`)
-	sessionExport := parseSessionExport(data, sessionID, 0)
-	if sessionExport.CacheWriteTokens != 900 {
-		t.Errorf("parseSessionExport().CacheWriteTokens = %d, want 900", sessionExport.CacheWriteTokens)
-	}
-
-	agenttest.AssertUsageContract(t, []domain.AgentEvent{
-		{Type: domain.EventTokenUsage, Usage: domain.TokenUsage{
-			InputTokens: exportOutput.InputTokens, OutputTokens: exportOutput.OutputTokens,
-			TotalTokens: exportOutput.TotalTokens, CacheReadTokens: exportOutput.CacheReadTokens,
-			CacheWriteTokens: exportOutput.CacheWriteTokens,
-		}},
-		{Type: domain.EventTurnCompleted, Usage: domain.TokenUsage{
-			InputTokens:      exportOutput.InputTokens + sessionExport.InputTokens,
-			OutputTokens:     exportOutput.OutputTokens + sessionExport.OutputTokens,
-			TotalTokens:      exportOutput.TotalTokens + sessionExport.TotalTokens,
-			CacheReadTokens:  exportOutput.CacheReadTokens + sessionExport.CacheReadTokens,
-			CacheWriteTokens: exportOutput.CacheWriteTokens + sessionExport.CacheWriteTokens,
-		}},
-	})
-}
-
-// TestParseSessionExport drives the export document fixture: input sums
-// tokens.input plus both cache figures, output sums tokens.output plus
-// reasoning, and a sinceUnixMS window keeps only messages created at or
-// after it.
-func TestParseSessionExport(t *testing.T) {
-	t.Parallel()
-
-	const sessionID = "ses_f23828cc8ffeXAmvklUEWnLCuA"
-	data := loadFixture(t, "export_usage_multi.json")
-
-	t.Run("sinceUnixMS zero sums every kept message", func(t *testing.T) {
-		t.Parallel()
-
-		usage := parseSessionExport(data, sessionID, 0)
-
-		if usage.InputTokens != 13058 {
-			t.Errorf("InputTokens = %d, want 13058", usage.InputTokens)
-		}
-		if usage.OutputTokens != 35 {
-			t.Errorf("OutputTokens = %d, want 35", usage.OutputTokens)
-		}
-		if usage.CacheReadTokens != 7010 {
-			t.Errorf("CacheReadTokens = %d, want 7010", usage.CacheReadTokens)
-		}
-		if usage.TotalTokens != 13093 {
-			t.Errorf("TotalTokens = %d, want 13093", usage.TotalTokens)
-		}
-		if usage.Model != "opencode/big-pickle" {
-			t.Errorf("Model = %q, want %q", usage.Model, "opencode/big-pickle")
-		}
-		if !usage.Recovered {
-			t.Error("Recovered = false, want true")
-		}
-	})
-
-	t.Run("a window keeps only messages created at or after it", func(t *testing.T) {
-		t.Parallel()
-
-		usage := parseSessionExport(data, sessionID, 1790405606000)
-
-		if usage.InputTokens != 6560 {
-			t.Errorf("InputTokens = %d, want 6560", usage.InputTokens)
-		}
-		if usage.OutputTokens != 8 {
-			t.Errorf("OutputTokens = %d, want 8", usage.OutputTokens)
-		}
-		if usage.CacheReadTokens != 6523 {
-			t.Errorf("CacheReadTokens = %d, want 6523", usage.CacheReadTokens)
-		}
-	})
-
-	t.Run("a session id mismatch returns zero", func(t *testing.T) {
-		t.Parallel()
-
-		usage := parseSessionExport(data, "ses_different_session", 0)
-		if !reflect.DeepEqual(usage, exportUsage{}) {
-			t.Errorf("usage = %+v, want zero value for a mismatched session", usage)
-		}
-	})
-}
-
-// loadFreeTierRunError decodes the error member of fixture's one line
-// into a *rawRunError.
 func loadFreeTierRunError(t *testing.T, fixture string) *rawRunError {
 	t.Helper()
 	ev, err := parseRunEvent(loadFixtureLine(t, fixture, 0))
@@ -482,9 +236,6 @@ func loadFreeTierRunError(t *testing.T, fixture string) *rawRunError {
 	return ev.Error
 }
 
-// TestFreeTierRefusalClause proves the denied-tool clause is drawn only
-// when the envelope matches a free-tier refusal and the session's own
-// tool policy denies bash, read, or both.
 func TestFreeTierRefusalClause(t *testing.T) {
 	t.Parallel()
 

@@ -107,7 +107,7 @@ else:
   mark observation dispatched                   // tracker accepted, or tracker_comment was not a destination
 ```
 
-A Slack or webhook outcome never confirms delivery and never blocks it, so a successful send to either never suppresses the retry of a failed tracker action. Under `none` with no subscriber the event has no destination, and the observation is marked dispatched at once, as it would be after a label that nothing retries.
+The outcome of a backend destination never confirms delivery and never blocks it, so a successful send to one never suppresses the retry of a failed tracker action. Under `none` with no subscriber the event has no destination, and the observation is marked dispatched at once, as it would be after a label that nothing retries.
 
 The pending entry stays pending with the escalation recorded on it, re-enqueued at the poll interval, whether or not the escalation call succeeds: a failure of the label or comment write itself changes nothing about the entry. The missing-identifier stop and any failure to deliver its operator signal are logged at error level. If the tracker write succeeds but the follow-up marker write itself fails, the notification has already reached the operator even though the observation is left recorded as undelivered, so the one delivery retry the first pass after a restart, or a pass of a fresh entry, performs redelivers rather than delivering for the first time: `label` repeats harmlessly, because re-applying a present label is a no-op, while a comment posts a second time. Neither failure mode restarts the grace period. Once marked, the same identity never repeats the operator signal.
 

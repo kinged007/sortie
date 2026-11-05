@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -596,19 +597,41 @@ func TestCommentIssue_V2RawStringBody(t *testing.T) {
 		gotMethod string
 		gotPath   string
 		gotBody   []byte
+		requests  atomic.Int32
 	)
+	list := loadFixture(t, "comments_v2.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodGet {
+			w.Write(list) //nolint:errcheck // test helper
+			return
+		}
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		gotBody, _ = io.ReadAll(r.Body)
-		w.WriteHeader(http.StatusCreated)
+		writeCommentCreated(w, "40002")
 	}))
 	defer srv.Close()
 
 	a := mustAdapter(t, v2Config(srv.URL))
 	const text = "h2. Heading\n\n*bold* body"
-	if err := a.CommentIssue(context.Background(), "SRV-1", text); err != nil {
+	id, err := a.CommentIssue(context.Background(), "SRV-1", text)
+	if err != nil {
 		t.Fatalf("CommentIssue (v2): %v", err)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests during CommentIssue (v2) = %d, want 1", n)
+	}
+	comments, err := a.FetchIssueComments(context.Background(), "SRV-1")
+	if err != nil {
+		t.Fatalf("FetchIssueComments (v2): %v", err)
+	}
+	adaptertest.AssertPostedCommentListed(t, id, comments)
+	if first := comments[0]; first.AuthorID != "bob.server" || first.AuthorKind != domain.CommentAuthorPerson || first.UpdatedAt != "2025-02-05T10:30:00.000+0000" {
+		t.Errorf("v2 comment without account type = %+v, want AuthorID bob.server, kind person, UpdatedAt 2025-02-05T10:30:00.000+0000", first)
+	}
+	if second := comments[1]; second.AuthorID != "" || second.AuthorKind != domain.CommentAuthorUnknown {
+		t.Errorf("v2 comment without author = %+v, want empty AuthorID and unknown kind", second)
 	}
 
 	if gotMethod != "POST" {
@@ -631,38 +654,6 @@ func TestCommentIssue_V2RawStringBody(t *testing.T) {
 	}
 	if bodyStr != text {
 		t.Errorf("body = %q, want verbatim %q", bodyStr, text)
-	}
-}
-
-func TestCommentIssueWithLiteral_V2SendsANoformatBlockTheStatementCannotClose(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked)."
-	raw := postedCommentBody(t, v2Config, func(a *JiraAdapter) error {
-		return a.CommentIssueWithLiteral(context.Background(), "SRV-9", text, adversarialStatement)
-	})
-
-	var payload struct {
-		Body string `json:"body"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		t.Fatalf("unmarshal request body %s: %v", raw, err)
-	}
-
-	const zwsp = "\u200b"
-	broken := strings.NewReplacer("{NoFormat}", "{"+zwsp+"NoFormat}", "{noformat:", "{"+zwsp+"noformat:", "[~", "["+zwsp+"~").Replace(adversarialStatement)
-	want := text + "\n\n{noformat}\n" + broken + "\n{noformat}"
-	if payload.Body != want {
-		t.Errorf("comment body = %q, want %q", payload.Body, want)
-	}
-	if got := strings.Count(strings.ToLower(payload.Body), "{noformat"); got != 2 {
-		t.Errorf("comment body holds %d noformat markers, want only the opening and closing one", got)
-	}
-	if strings.Contains(payload.Body, "[~") {
-		t.Errorf("comment body = %q, want no [~user] mention Jira Server would parse inside the block", payload.Body)
-	}
-	if !strings.HasSuffix(payload.Body, "\n{noformat}") {
-		t.Errorf("comment body = %q, want it to end at the closing marker", payload.Body)
 	}
 }
 

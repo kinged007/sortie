@@ -13,11 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/runstats"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
 )
 
-var fullCaps = persistence.RunHistoryCapabilities{
+var fullCaps = storage.RunHistoryCapabilities{
 	HasTurnsCompleted:   true,
 	HasReviewMetadata:   true,
 	HasRuleRouting:      true,
@@ -27,7 +28,7 @@ var fullCaps = persistence.RunHistoryCapabilities{
 
 var fixedNow = time.Date(2026, 8, 7, 9, 15, 0, 0, time.UTC)
 
-func addRows(t *testing.T, agg *runstats.Aggregator, rows ...persistence.RunStatsRow) {
+func addRows(t *testing.T, agg *runstats.Aggregator, rows ...storage.RunStatsRow) {
 	t.Helper()
 	for _, r := range rows {
 		if err := agg.Add(r); err != nil {
@@ -47,9 +48,6 @@ func findGroup(t *testing.T, groups []runstats.Group, name string) runstats.Grou
 	return runstats.Group{}
 }
 
-// statsWorkflow returns a minimal WORKFLOW.md whose front matter is
-// extended with extra, for stats tests that need a specific top-level
-// key such as db_path without a full tracker/agent configuration.
 func statsWorkflow(extra string) []byte {
 	return fmt.Appendf(nil, `---
 tracker:
@@ -65,22 +63,26 @@ Do {{ .issue.title }}.
 `, extra)
 }
 
-// createStatsDB creates a fully migrated SQLite database at dbPath and
-// appends each of runs, then closes the store so a later read-only open
-// sees committed data.
-func createStatsDB(t *testing.T, dbPath string, runs ...persistence.RunHistory) {
+// createStatsDB closes the store so a later read-only open sees committed data.
+func createStatsDB(t *testing.T, dbPath string, runs ...storage.RunHistory) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := persistence.Open(ctx, dbPath)
+	store, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
-		t.Fatalf("persistence.Open(%q): %v", dbPath, err)
+		t.Fatalf("sqlite.Open(%q): %v", dbPath, err)
 	}
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	for _, r := range runs {
-		if _, err := store.AppendRunHistory(ctx, r); err != nil {
-			t.Fatalf("AppendRunHistory: %v", err)
+		if len(r.ModelUsage) > 0 || len(r.ReportedAmounts) > 0 {
+			r.DispatchID = new("dispatch-" + r.IssueID)
+			_, err = store.AppendRunHistoryWithEvents(ctx, r, nil, storage.RunEventLimits{})
+		} else {
+			_, err = store.AppendRunHistory(ctx, r)
+		}
+		if err != nil {
+			t.Fatalf("append run history of %q: %v", r.IssueID, err)
 		}
 	}
 	if err := store.Close(); err != nil {
@@ -88,11 +90,6 @@ func createStatsDB(t *testing.T, dbPath string, runs ...persistence.RunHistory) 
 	}
 }
 
-// createLegacyStatsDB creates dbPath with only the migration-001
-// run_history columns (no schema_migrations tracking) and inserts one
-// row, matching a database written by a pre-migration-010 binary. The
-// modernc.org/sqlite driver is already registered process-wide via
-// internal/persistence's import.
 func createLegacyStatsDB(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)
@@ -128,11 +125,6 @@ func createLegacyStatsDB(t *testing.T, dbPath string) {
 	}
 }
 
-// createFullSchemaWithoutCacheWriteTokensDB builds dbPath with every
-// optional run_history column the full schema tier requires, except
-// cache_write_tokens, matching a database migration 020 has not yet
-// reached, and inserts one measured row with the given rate-relevant
-// token counts.
 func createFullSchemaWithoutCacheWriteTokensDB(t *testing.T, dbPath string, inputTokens, outputTokens, cacheReadTokens int64) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)
@@ -181,6 +173,14 @@ func createFullSchemaWithoutCacheWriteTokensDB(t *testing.T, dbPath string, inpu
 	); err != nil {
 		t.Fatalf("insert pre-migration-020 row: %v", err)
 	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO run_history (issue_id, identifier, attempt, agent_adapter, workspace, started_at, completed_at,
+			status, tokens_measured)
+		 VALUES ('ISS-UM', 'PROJ-UM', 1, 'claude-code', '/tmp/ws', '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z',
+			'succeeded', 0)`,
+	); err != nil {
+		t.Fatalf("insert pre-migration-020 unmeasured row: %v", err)
+	}
 }
 
 // newStatsWorkspace creates a temp directory holding a minimal
@@ -213,7 +213,7 @@ func TestStatsCostDerivation(t *testing.T) {
 	t.Parallel()
 
 	wfPath := newStatsWorkspace(t, func(t *testing.T, dbPath string) {
-		createStatsDB(t, dbPath, persistence.RunHistory{
+		createStatsDB(t, dbPath, storage.RunHistory{
 			IssueID: "ISS-1", Identifier: "PROJ-1", Attempt: 1, AgentAdapter: "claude-code", Workspace: "/tmp/ws",
 			StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
 			TurnsCompleted: 1, InputTokens: 1_000_000, TotalTokens: 1_000_000, TokensMeasured: true, CostStatus: "unpriced",
@@ -227,7 +227,7 @@ func TestStatsCostDerivation(t *testing.T) {
 		t.Fatalf("run(stats) = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	for _, want := range []string{
-		"cost (measured runs)    -   per succeeded run -",
+		"cost                    -   per succeeded run -",
 		"note: the cost figures skip 1 of these runs, because Sortie had no price for the models they used when they were recorded.",
 	} {
 		if !strings.Contains(stdout.String(), want) {
@@ -243,7 +243,7 @@ func TestStatsTokenReporting(t *testing.T) {
 		t.Parallel()
 
 		agg := runstats.New(fullCaps)
-		addRows(t, agg, persistence.RunStatsRow{
+		addRows(t, agg, storage.RunStatsRow{
 			Status: "succeeded", AgentAdapter: "mock",
 			StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z",
 			InputTokens: 100, OutputTokens: 50, CacheReadTokens: 10,
@@ -262,8 +262,8 @@ func TestStatsTokenReporting(t *testing.T) {
 		}
 	})
 
-	measuredUnmeasuredRows := func() []persistence.RunStatsRow {
-		return []persistence.RunStatsRow{
+	measuredUnmeasuredRows := func() []storage.RunStatsRow {
+		return []storage.RunStatsRow{
 			{
 				Status: "succeeded", AgentAdapter: "claude-code",
 				StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z",
@@ -306,7 +306,7 @@ func TestStatsTokenReporting(t *testing.T) {
 		}
 	})
 
-	t.Run("text form labels the measured-runs lines and dashes the unmeasured adapter row", func(t *testing.T) {
+	t.Run("text form marks the tokens line a lower bound and dashes the unmeasured adapter row", func(t *testing.T) {
 		t.Parallel()
 
 		agg := runstats.New(fullCaps)
@@ -317,14 +317,10 @@ func TestStatsTokenReporting(t *testing.T) {
 		renderStatsText(&stdout, &stderr, report)
 		out := stdout.String()
 
-		if !strings.Contains(out, "tokens (measured runs)") {
-			t.Errorf("stdout = %q, want the %q label", out, "tokens (measured runs)")
-		}
-		if !strings.Contains(out, "cost (measured runs)") {
-			t.Errorf("stdout = %q, want the %q label", out, "cost (measured runs)")
-		}
-		if strings.Contains(out, "tokens (all runs)") || strings.Contains(out, "cost (all runs)") {
-			t.Errorf("stdout = %q, want no trace of the old \"(all runs)\" labels", out)
+		for _, want := range []string{"tokens (lower bound)    input", "cost                    -   per succeeded run -"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("stdout = %q, want to contain %q", out, want)
+			}
 		}
 
 		unmeasuredLine := ""
@@ -381,9 +377,9 @@ func TestStatsTokenReporting(t *testing.T) {
 	t.Run("base tier reports zero unmeasured runs", func(t *testing.T) {
 		t.Parallel()
 
-		baseCaps := persistence.RunHistoryCapabilities{}
+		baseCaps := storage.RunHistoryCapabilities{}
 		agg := runstats.New(baseCaps)
-		addRows(t, agg, persistence.RunStatsRow{
+		addRows(t, agg, storage.RunStatsRow{
 			Status: "succeeded", AgentAdapter: "kiro",
 			StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z",
 		})
@@ -402,7 +398,7 @@ func TestRunStatsEmptyRange(t *testing.T) {
 	newWorkspace := func(t *testing.T) string {
 		t.Helper()
 		return newStatsWorkspace(t, func(t *testing.T, dbPath string) {
-			createStatsDB(t, dbPath, persistence.RunHistory{
+			createStatsDB(t, dbPath, storage.RunHistory{
 				IssueID: "ISS-1", Identifier: "PROJ-1", Attempt: 1, AgentAdapter: "mock", Workspace: "/tmp/ws",
 				StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
 			})
@@ -531,9 +527,9 @@ func TestRunStatsAgainstLiveWriter(t *testing.T) {
 	dbPath := filepath.Join(dir, ".sortie.db")
 
 	ctx := context.Background()
-	store, err := persistence.Open(ctx, dbPath)
+	store, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
-		t.Fatalf("persistence.Open(%q): %v", dbPath, err)
+		t.Fatalf("sqlite.Open(%q): %v", dbPath, err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
@@ -543,7 +539,7 @@ func TestRunStatsAgainstLiveWriter(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if _, err := store.AppendRunHistory(ctx, persistence.RunHistory{
+	if _, err := store.AppendRunHistory(ctx, storage.RunHistory{
 		IssueID: "ISS-1", Identifier: "PROJ-1", Attempt: 1, AgentAdapter: "mock", Workspace: "/tmp/ws",
 		StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
 	}); err != nil {
@@ -605,7 +601,7 @@ func TestRunStatsDegradedSchema(t *testing.T) {
 				stdout.String())
 		}
 		out := stdout.String()
-		for _, absent := range []string{"by dispatch rule", "by prompt template", "self review", "turns (succeeded)", "tokens (measured runs)"} {
+		for _, absent := range []string{"by dispatch rule", "by prompt template", "self review", "turns (succeeded)", "tokens (lower bound)", "LOWER BOUND", "by usage provenance"} {
 			if strings.Contains(out, absent) {
 				t.Errorf("stdout contains %q, want it absent on the base tier", absent)
 			}
@@ -655,6 +651,9 @@ func TestRunStatsDegradedSchema(t *testing.T) {
 		}
 		if report.Summary.TokensUnmeasuredRuns != 0 {
 			t.Errorf("Summary.TokensUnmeasuredRuns = %d, want 0 on the base tier", report.Summary.TokensUnmeasuredRuns)
+		}
+		if len(report.ByProvenance) != 0 {
+			t.Errorf("ByProvenance = %v, want empty on the base tier", report.ByProvenance)
 		}
 	})
 }
@@ -743,7 +742,7 @@ func TestRunStats_MissingCacheWriteTokensColumnReadsAsZero(t *testing.T) {
 
 	migratedDir := t.TempDir()
 	migratedWfPath := writeCustomWorkflowFile(t, migratedDir, statsWorkflow(""))
-	createStatsDB(t, filepath.Join(migratedDir, ".sortie.db"), persistence.RunHistory{
+	createStatsDB(t, filepath.Join(migratedDir, ".sortie.db"), storage.RunHistory{
 		IssueID: "ISS-CW", Identifier: "PROJ-CW", Attempt: 1, AgentAdapter: "claude-code", Workspace: "/tmp/ws",
 		StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
 		TurnsCompleted: 1, InputTokens: inputTokens, OutputTokens: outputTokens,
@@ -765,15 +764,18 @@ func TestRunStats_MissingCacheWriteTokensColumnReadsAsZero(t *testing.T) {
 			t.Errorf("%s: Summary.Tokens.CacheWrite = %v, want 0", tt.label, tt.report.Summary.Tokens)
 		}
 	}
+	if cause := missingColumn.Summary.UnmeasuredCause; cause == nil || *cause != "unknown" || len(missingColumn.ByProvenance) != 0 {
+		t.Errorf("pre-provenance database: Summary.UnmeasuredCause = %v, ByProvenance = %v, want %q and no rows", cause, missingColumn.ByProvenance, "unknown")
+	}
 }
 
 func TestRunStatsDBPathResolution(t *testing.T) {
 	// No t.Parallel: the SORTIE_DB_PATH subtest uses t.Setenv, which
 	// requires the calling test and every ancestor to be non-parallel.
 
-	oneRun := func(t *testing.T) []persistence.RunHistory {
+	oneRun := func(t *testing.T) []storage.RunHistory {
 		t.Helper()
-		return []persistence.RunHistory{{
+		return []storage.RunHistory{{
 			IssueID: "ISS-1", Identifier: "PROJ-1", Attempt: 1, AgentAdapter: "mock", Workspace: "/tmp/ws",
 			StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: "succeeded",
 		}}
@@ -852,13 +854,13 @@ func TestRunStatsDBPathResolution(t *testing.T) {
 	})
 }
 
-func withModelBreakdown(caps persistence.RunHistoryCapabilities) persistence.RunHistoryCapabilities {
+func withModelBreakdown(caps storage.RunHistoryCapabilities) storage.RunHistoryCapabilities {
 	caps.HasConfiguredSettings = true
 	return caps
 }
 
-func modelRow(adapter, model, status string, input int64) persistence.RunStatsRow {
-	return persistence.RunStatsRow{
+func modelRow(adapter, model, status string, input int64) storage.RunStatsRow {
+	return storage.RunStatsRow{
 		Status: status, AgentAdapter: adapter, ConfiguredModel: model,
 		StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z",
 		InputTokens: input, TokensMeasured: true,
@@ -898,7 +900,7 @@ func TestStatsByModel_WithoutTheBreakdown(t *testing.T) {
 	}
 }
 
-func chainRow(chain, rule, previous, result, status string) persistence.RunStatsRow {
+func chainRow(chain, rule, previous, result, status string) storage.RunStatsRow {
 	row := modelRow("claude-code", "model-a", status, 1_000)
 	row.Identifier, row.ChainID, row.RuleName, row.StagePrevious, row.StageResult = "PROJ-"+chain, chain, rule, previous, result
 	row.TurnsCompleted = 2
@@ -926,9 +928,9 @@ func TestStatsByChain_TextListsTheBusiestChainsOnly(t *testing.T) {
 func TestRunStatsByModelAgainstDatabases(t *testing.T) {
 	t.Parallel()
 
-	const warning = "this database was written before sortie recorded the model of each run, so the report leaves out the breakdown by model. Run sortie once with this workflow to add it. The report also leaves out cost until then."
-	runOf := func(adapter, model, status string) persistence.RunHistory {
-		return persistence.RunHistory{IssueID: "I-" + status, Identifier: "P-" + status, Attempt: 1, AgentAdapter: adapter, Workspace: "/tmp/ws", StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: status, ConfiguredModel: model}
+	const warningStart = "this database was written before sortie recorded the model of each run"
+	runOf := func(adapter, model, status string) storage.RunHistory {
+		return storage.RunHistory{IssueID: "I-" + status, Identifier: "P-" + status, Attempt: 1, AgentAdapter: adapter, Workspace: "/tmp/ws", StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:10:00Z", Status: status, ConfiguredModel: model}
 	}
 	tests := []struct {
 		name        string
@@ -960,7 +962,7 @@ func TestRunStatsByModelAgainstDatabases(t *testing.T) {
 					t.Errorf("by_model group %q Runs = %d, want %d", name, got, runs)
 				}
 			}
-			if len(report.ByModel) != len(tt.wantRuns) || report.ByModel == nil || slices.Contains(report.Warnings, warning) != tt.wantWarning {
+			if len(report.ByModel) != len(tt.wantRuns) || report.ByModel == nil || slices.ContainsFunc(report.Warnings, func(w string) bool { return strings.HasPrefix(w, warningStart) }) != tt.wantWarning {
 				t.Errorf("ByModel, Warnings = %#v, %q, want %d groups (non-nil) and the configured-model warning present: %v", report.ByModel, report.Warnings, len(tt.wantRuns), tt.wantWarning)
 			}
 		})
@@ -979,10 +981,10 @@ const funnelDispatch = `dispatch:
       stage: implement
 `
 
-func funnelRuns() []persistence.RunHistory {
-	var runs []persistence.RunHistory
+func funnelRuns() []storage.RunHistory {
+	var runs []storage.RunHistory
 	add := func(chain, rule, previous, status, result string) {
-		runs = append(runs, persistence.RunHistory{
+		runs = append(runs, storage.RunHistory{
 			IssueID: "ISS-" + chain, Identifier: "PROJ-" + chain, Attempt: 1, AgentAdapter: "mock", Workspace: "/tmp/ws",
 			StartedAt: "2026-01-10T10:00:00Z", CompletedAt: "2026-01-10T10:10:00Z",
 			Status: status, RuleName: rule, ChainID: chain, StagePrevious: previous, StageResult: result,
@@ -1003,18 +1005,18 @@ func funnelRuns() []persistence.RunHistory {
 func holdFunnelPasses(t *testing.T, dbPath string) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := persistence.Open(ctx, dbPath)
+	store, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
-		t.Fatalf("persistence.Open(%q): %v", dbPath, err)
+		t.Fatalf("sqlite.Open(%q): %v", dbPath, err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	retry := persistence.RetryEntry{IssueID: "ISS-c4", Identifier: "PROJ-c4", Attempt: 1, DueAtMs: 1, RuleName: "plan", ChainID: "c4", StagePrevious: "specify"}
+	retry := storage.RetryEntry{IssueID: "ISS-c4", Identifier: "PROJ-c4", Attempt: 1, DueAtMs: 1, RuleName: "plan", ChainID: "c4", StagePrevious: "specify"}
 	if err := store.SaveRetryEntry(ctx, retry); err != nil {
 		t.Fatalf("SaveRetryEntry: %v", err)
 	}
-	for _, pass := range []persistence.LivePass{
-		{IssueID: "ISS-c5", Kind: persistence.LivePassRunning, ChainID: "c5", RuleName: "implement", StagePrevious: "plan"},
-		{IssueID: "ISS-c6", Kind: persistence.LivePassBudget, ChainID: "c6", RuleName: "plan", StagePrevious: "specify"},
+	for _, pass := range []storage.LivePass{
+		{IssueID: "ISS-c5", Kind: storage.LivePassRunning, ChainID: "c5", RuleName: "implement", StagePrevious: "plan"},
+		{IssueID: "ISS-c6", Kind: storage.LivePassBudget, ChainID: "c6", RuleName: "plan", StagePrevious: "specify"},
 	} {
 		if err := store.UpsertLivePass(ctx, pass); err != nil {
 			t.Fatalf("UpsertLivePass(%+v): %v", pass, err)

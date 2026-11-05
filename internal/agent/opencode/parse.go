@@ -1,22 +1,13 @@
 package opencode
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
-	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
-
-type parsedLine struct {
-	Event     *rawRunEvent
-	PlainText string
-}
 
 type rawRunEvent struct {
 	Type      string          `json:"type"`
@@ -30,6 +21,10 @@ type rawRunError struct {
 	Type    string `json:"type,omitempty"`
 	Message string `json:"message,omitempty"`
 	Status  any    `json:"status,omitempty"` // a JSON number when present
+
+	// RetryAfterMs is the delay in milliseconds after the failure at which
+	// the runtime expects a retry to succeed.
+	RetryAfterMs *int64 `json:"retryAfterMs"`
 }
 
 const (
@@ -88,57 +83,69 @@ type rawToolPart struct {
 	State     rawToolState `json:"state"`
 }
 
+// toolMappings gives the kind and main-argument member of each OpenCode 2.x
+// tool the adapter reports an argument for.
+var toolMappings = map[string]agentcore.ToolMapping{
+	"shell": {Kind: domain.ToolKindShell, Key: "command"},
+	"read":  {Kind: domain.ToolKindRead, Key: "path"},
+	"write": {Kind: domain.ToolKindEdit, Key: "path"},
+	"edit":  {Kind: domain.ToolKindEdit, Key: "path"},
+	"skill": {Kind: domain.ToolKindSkill, Key: "id"},
+}
+
 type rawToolState struct {
-	Status   string      `json:"status"`
-	Input    any         `json:"input,omitempty"`
-	Output   any         `json:"output,omitempty"`
-	Metadata any         `json:"metadata,omitempty"`
-	Error    string      `json:"error,omitempty"`
-	Title    string      `json:"title,omitempty"`
-	Time     rawPartTime `json:"time,omitempty"`
+	Status   string          `json:"status"`
+	Input    json.RawMessage `json:"input,omitempty"`
+	Output   any             `json:"output,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Title    string          `json:"title,omitempty"`
+	Time     rawPartTime     `json:"time,omitempty"`
 }
 
 type rawStepFinishPart struct {
-	ID        string         `json:"id"`
-	MessageID string         `json:"messageID"`
-	SessionID string         `json:"sessionID"`
-	Type      string         `json:"type"`
-	Reason    string         `json:"reason"`
-	Tokens    *rawStepTokens `json:"tokens,omitempty"`
+	ID        string          `json:"id"`
+	MessageID string          `json:"messageID"`
+	SessionID string          `json:"sessionID"`
+	Type      string          `json:"type"`
+	Reason    string          `json:"reason"`
+	Tokens    json.RawMessage `json:"tokens,omitempty"`
 }
 
-type rawStepTokens struct {
-	Total     int64         `json:"total,omitempty"`
-	Input     int64         `json:"input,omitempty"`
-	Output    int64         `json:"output,omitempty"`
-	Reasoning int64         `json:"reasoning,omitempty"`
-	Cache     rawCacheUsage `json:"cache,omitempty"`
+// childSession is one subagent call a turn's stream showed.
+type childSession struct {
+	// call is the tool part's id.
+	call string
+
+	// session is the child session's id; empty when the stream named none.
+	session string
+
+	// completed is true when the part's state.status is "completed".
+	completed bool
 }
 
-type rawCacheUsage struct {
-	Read  int64 `json:"read,omitempty"`
-	Write int64 `json:"write,omitempty"`
-}
-
-type exportUsage struct {
-	InputTokens      int64
-	OutputTokens     int64
-	TotalTokens      int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	Model            string
-
-	// ByModel splits the totals by each kept message's `providerID/modelID`;
-	// a message missing either part adds to no entry.
-	ByModel map[string]domain.TokenUsage
-
-	// Recovered reports whether the export produced a figure at all,
-	// which is not the same question as whether that figure is non-zero.
-	// The runtime's assistant message carries `tokens` as a required
-	// object rather than one present only when something was spent, so a
-	// turn that genuinely cost zero exports the same shape as any other
-	// and must not read back as "nothing was recovered".
-	Recovered bool
+// subagentCall reports whether part is a subagent call and, when it is, the
+// child session it started. The members read are the ones the protocol route
+// reads from the same tool output: input.agent names the call, and the tool's
+// output object, carried as the state's metadata, holds the child's id.
+func subagentCall(part rawToolPart, ownSessionID string) (childSession, bool) {
+	var input struct {
+		Agent string `json:"agent"`
+	}
+	if json.Unmarshal(part.State.Input, &input) != nil || input.Agent == "" {
+		return childSession{}, false
+	}
+	var output struct {
+		Metadata struct {
+			SessionID string `json:"sessionID"`
+		} `json:"metadata"`
+	}
+	_ = json.Unmarshal(part.State.Metadata, &output)
+	child := childSession{call: part.ID, completed: part.State.Status == "completed"}
+	if id := output.Metadata.SessionID; id != ownSessionID {
+		child.session = id
+	}
+	return child, true
 }
 
 func parseRunEvent(line []byte) (rawRunEvent, error) {
@@ -191,8 +198,7 @@ func parseStepFinishPart(raw json.RawMessage) (rawStepFinishPart, error) {
 
 // freeTierRefusalClause returns a clause naming the free-tier-required
 // tools state's policy denies, or "" when runErr does not match the
-// free-tier refusal envelope, or the policy denies neither tool. It reads no member of runErr beyond what identifies the
-// refusal shape, starts no subprocess, and emits no event.
+// free-tier refusal envelope, or the policy denies neither tool.
 func freeTierRefusalClause(runErr *rawRunError, pt passthroughConfig) string {
 	if runErr == nil || !isFreeTierRefusal(runErr) {
 		return ""
@@ -233,183 +239,4 @@ func isFreeTierRefusal(runErr *rawRunError) bool {
 		return false
 	}
 	return strings.Contains(runErr.Message, freeTierMessageMarker)
-}
-
-// parseSessionExport extracts run-cumulative token usage from the
-// `session export --standalone --sanitize` document, summing over every
-// finished assistant message. When sinceUnixMS is non-zero, only messages
-// created at or after it are counted. A message without a tokens object
-// is skipped. The reported model comes from the last kept message.
-// Returns the zero exportUsage unless the document decodes and its
-// info.id equals sessionID.
-func parseSessionExport(data []byte, sessionID string, sinceUnixMS int64) exportUsage {
-	var payload struct {
-		Info struct {
-			ID string `json:"id"`
-		} `json:"info"`
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return exportUsage{}
-	}
-	if payload.Info.ID != sessionID {
-		return exportUsage{}
-	}
-
-	var sum exportUsage
-	kept := false
-	for _, message := range payload.Messages {
-		if stringFromAny(message["type"]) != "assistant" {
-			continue
-		}
-		if stringFromAny(message["finish"]) == "" {
-			continue
-		}
-		if sinceUnixMS != 0 {
-			created, ok := messageCreatedMS(message)
-			if !ok || created < sinceUnixMS {
-				continue
-			}
-		}
-		tokens := mapFromAny(message["tokens"])
-		if tokens == nil {
-			continue
-		}
-
-		inputTokens, _ := int64FromAny(tokens["input"])
-		outputTokens, _ := int64FromAny(tokens["output"])
-		var reasoningTokens int64
-		if reasoning, ok := int64FromAny(tokens["reasoning"]); ok {
-			reasoningTokens = reasoning
-		}
-		var cacheReadTokens, cacheWriteTokens int64
-		if cache := mapFromAny(tokens["cache"]); cache != nil {
-			if read, ok := int64FromAny(cache["read"]); ok {
-				cacheReadTokens = read
-			}
-			if write, ok := int64FromAny(cache["write"]); ok {
-				cacheWriteTokens = write
-			}
-		}
-
-		messageUsage := domain.TokenUsage{
-			InputTokens:      inputTokens + cacheReadTokens + cacheWriteTokens,
-			OutputTokens:     outputTokens + reasoningTokens,
-			CacheReadTokens:  cacheReadTokens,
-			CacheWriteTokens: cacheWriteTokens,
-		}
-		sum.InputTokens += messageUsage.InputTokens
-		sum.OutputTokens += messageUsage.OutputTokens
-		sum.CacheReadTokens += messageUsage.CacheReadTokens
-		sum.CacheWriteTokens += messageUsage.CacheWriteTokens
-		kept = true
-
-		model := mapFromAny(message["model"])
-		providerID := stringFromAny(model["providerID"])
-		modelID := stringFromAny(model["id"])
-		if providerID != "" && modelID != "" {
-			sum.Model = providerID + "/" + modelID
-			if sum.ByModel == nil {
-				sum.ByModel = map[string]domain.TokenUsage{}
-			}
-			sum.ByModel[sum.Model] = agentcore.AddUsage(sum.ByModel[sum.Model], messageUsage)
-		}
-	}
-	if !kept {
-		return exportUsage{}
-	}
-
-	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
-	sum.Recovered = true
-	return sum
-}
-
-func queryExportUsage(ctx context.Context, state *sessionState, sinceUnixMS int64) exportUsage {
-	sessionID := state.currentSessionID()
-	if sessionID == "" {
-		return exportUsage{}
-	}
-
-	queryCtx, cancel := context.WithTimeout(ctx, agentcore.AuxiliaryTimeout(state.agentConfig))
-	defer cancel()
-
-	cmd, err := auxiliaryCommand(queryCtx, state, exportArgs(sessionID))
-	if err != nil {
-		state.logger().Warn("failed to build opencode export environment", slog.Any("error", err))
-		return exportUsage{}
-	}
-
-	var stdout bytes.Buffer
-	result, startErr := procutil.RunCapture(queryCtx, cmd, procutil.StopGrace(state.agentConfig.StopGraceMS), procutil.CaptureParams{
-		Stdout: &stdout,
-		Logger: state.logger(),
-	})
-	if startErr != nil || result.WaitErr != nil {
-		err := startErr
-		if err == nil {
-			err = result.WaitErr
-		}
-		state.logger().Warn("failed to export opencode usage", slog.Any("error", err))
-		return exportUsage{}
-	}
-
-	usage := parseSessionExport(stdout.Bytes(), sessionID, sinceUnixMS)
-	if !usage.Recovered {
-		state.logger().Warn("no assistant token usage found in opencode export")
-	}
-	return usage
-}
-
-// messageCreatedMS extracts time.created (Unix milliseconds) from an
-// assistant message. ok is false when the field is absent
-// or not parseable as a number.
-func messageCreatedMS(info map[string]any) (createdMS int64, ok bool) {
-	t := mapFromAny(info["time"])
-	if t == nil {
-		return 0, false
-	}
-	return int64FromAny(t["created"])
-}
-
-func mapFromAny(value any) map[string]any {
-	if value == nil {
-		return nil
-	}
-	typed, ok := value.(map[string]any)
-	if !ok {
-		return nil
-	}
-	return typed
-}
-
-func stringFromAny(value any) string {
-	str, ok := value.(string)
-	if !ok {
-		return ""
-	}
-	return str
-}
-
-func int64FromAny(value any) (int64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return int64(typed), true
-	case int32:
-		return int64(typed), true
-	case int64:
-		return typed, true
-	case float64:
-		if typed != float64(int64(typed)) {
-			return 0, false
-		}
-		return int64(typed), true
-	case json.Number:
-		value, err := typed.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return value, true
-	default:
-		return 0, false
-	}
 }

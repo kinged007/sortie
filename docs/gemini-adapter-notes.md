@@ -6,7 +6,7 @@ Eligibility: qualified
 
 Product conformance: qualified
 
-The two verdicts are computed separately, and both turn on token accounting. The protocol wire itself carries no usable token figure, but a measurement source outside the protocol supplies one, which puts the protocol route level with the richest native reference. Product conformance holds too: a live run through Sortie's orchestrator with a one-token `agent.max_tokens` ceiling stopped at the ceiling and dispatched nothing after it.
+The two verdicts are computed separately, and both turn on token accounting. The protocol route's figure comes from the prompt result's per-turn counts and the runtime's chat journal, which puts it level with the richest native reference. Product conformance holds too: a live run through Sortie's orchestrator with a one-token `agent.max_tokens` ceiling stopped at the ceiling and dispatched nothing after it.
 
 ## Where to get the volatile facts
 
@@ -18,7 +18,7 @@ Upstream source lives in `google-gemini/gemini-cli`. When a symptom looks like a
 
 Gemini has no adapter package, no registered kind, and no adapter metadata. The operator points the generic `agent-client-protocol` kind's `agent.command` at `gemini --acp`; the older `--experimental-acp` spelling is deprecated. Everything below is how Gemini's protocol implementation meets the generic adapter. There is no place in the generic transport to special-case a Gemini quirk.
 
-The one exception is token accounting, which lives in Gemini's own measurement source. The source recognizes a command line that names the `gemini` executable, a path to it, or the `@google/gemini-cli` package, directly or as a wrapper's argument. A command line that hides its runtime is started a second time once the handshake names it, so a wrapped Gemini CLI still reports token usage.
+The one exception is token accounting, which lives in the usage declaration for `gemini-cli`. The handshake name selects the declaration, so a wrapped command line still reports token usage, with no second launch. The figure comes from the prompt result's `usage` and the chat journal, on a local launch and on an SSH worker. The journal is found by a name pattern under `GEMINI_CLI_HOME`, else the home directory, locally or through the shared remote read.
 
 ## Load-bearing capability observations
 
@@ -26,7 +26,7 @@ Token accounting is the one row that carries both verdicts. Session continuation
 
 On the protocol surface, retry classification excludes the human-input case as not applicable. The consent request the asking-posture launch raised offered a refusing option, the client refused it inside the protocol, and the turn went on. That exclusion does not cover a question addressed to a person. The native surfaces have no terminal vocabulary for the human-input outcome at all.
 
-The protocol wire has no token figure Sortie can use. The prompt result's extension block has input and output counts but no cache-read, reasoning, or tool counters, so it is only a presence signal and a lower bound. The figure that reaches the budget comes from the runtime's own telemetry and session journal. That figure carries a per-model split by each record's or message's model. Both native surfaces report token counts directly: the JSON surface per model, the streaming JSON surface in a flatter form.
+The prompt result's `usage` member carries the turn's input, output, reasoning, and cache-read counts, and its `totalTokens` leaves reasoning out, so Sortie never reads it. The `_meta.quota` block stays a presence signal, and its per-model block is unread, because after a tool call it names the requested model and not the one that served the request. The chat journal records each completed request with the model it was sent to, and the figure's per-model split comes from it; a model alias the API serves under another name appears as the alias. A session on a concrete model reports complete figures. A session on an auto selector (`auto`, `auto-gemini-3`, `auto-gemini-2.5`) or with no model named reports lower bounds, because the request that picks the model is in neither source. Web search and web fetch are requests outside the main chat that no source records, as are the loop check, history compression, invalid streams and subagents; dynamic routing escapes only when the operator adds a model definition with `tier: "auto"` under a name that does not start with `auto`; a turn containing one of these requests reads complete. Both native surfaces report token counts directly: the JSON surface per model, the streaming JSON surface in a flatter form.
 
 - protocol turn_disposition: Observed: usable
 - protocol retry_classification: Observed: usable
@@ -60,6 +60,45 @@ The second is more expensive. A `session/load` sent in the same UTC minute as th
 The third is the credential path. `session/load` needs an authentication type recorded in the runtime's own settings. With the API key only in the environment and no such setting, the load fails. If a load fails on a session this same process just created and drove correctly, check this first.
 
 The handshake advertises no `sessionCapabilities` object, so Sortie never closes a session here through the protocol.
+
+## Usage limits
+
+No usage window reaches the protocol as data. A `usage_update` carries context-window use, the `_meta.quota` block on a prompt result carries token counts despite its name, and a rate-limit failure arrives as an error with a message and no data, so its error code is the only structured member. The runtime does fetch its per-model quota from Google's Code Assist service, so Sortie asks that service when a turn ends, with the runtime's own Google sign-in. The declaration is selected by the handshake name `gemini-cli`.
+
+An error with code `429` ends the turn `usage_limit` on the `agent-client-protocol` kind and holds the configured model, because the runtime's quota buckets are per model. The runtime sets the code from the provider's HTTP status after its own retries, which can run for several minutes, so the refusal arrives late. A capacity refusal arrives as `503` and a quota hit during chat compression as `500`; both stay `response_error`. The pulled buckets supply the reset: with `agent-client-protocol.model` set, only that model's exhausted bucket counts, so a `429` after the retries of a per-minute throttle finds an unexhausted bucket and keeps no reset. Without a configured model the refused model is unknown, because a session on the `auto` model routes a request to another model than the session shows, so every exhausted bucket counts and the refusal waits for the latest reset among them. An API-key or Vertex session pulls no bucket, so its refusal carries no reset and retries on the exponential backoff.
+
+When both `GOOGLE_GENAI_USE_GCA` and `GOOGLE_CLOUD_ACCESS_TOKEN` are set in the runtime's environment, the runtime uses that access token before any store, with no expiry, and so does the pull. For a remote session the two come from the variables the launch forwards, else from the remote shell. Otherwise the pull reads the sign-in from the store the runtime itself reads, in the runtime's own order, and takes from it the access token and its expiry in Unix milliseconds. The rest of the bytes are dropped. Where that store sits depends on `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE`:
+
+- Not `true`: the plain file `oauth_creds.json` under `.gemini` in `GEMINI_CLI_HOME`, else in the home directory. It holds `access_token` and `expiry_date`.
+- `true`: the OS keychain first, then the encrypted file `gemini-credentials.json` in the same directory, then the plain file the runtime migrates away from. The first store that holds a sign-in wins.
+
+The keychain is skipped, as the runtime skips it, when `GEMINI_FORCE_FILE_STORAGE` is `true` or `WSL_DISTRO_NAME`, `WSLENV`, or `WSL_INTEROP` is set. A keychain entry and an encrypted-file entry both hold the JSON `{"token": {"accessToken": "...", "expiresAt": <Unix ms>, ...}}`. The keychain entry is service `gemini-cli-oauth`, account `main-account`; the encrypted file keeps the same pair under `{"gemini-cli-oauth": {"main-account": "<that JSON as a string>"}}`.
+
+The keychain is read with the host's own tool, on the machine that runs the agent: `secret-tool lookup service gemini-cli-oauth account main-account` for libsecret on Linux, `security find-generic-password -s gemini-cli-oauth -a main-account -w` on macOS, and the Credential Manager entry `gemini-cli-oauth/main-account` (a generic credential, secret stored as UTF-8) on Windows. A host without the tool, a locked keychain, and a missing entry all mean the keychain holds no sign-in. On macOS the first read of an entry that another program created can raise the system's access prompt; the pull's time bound ends the wait.
+
+The encrypted file is `<iv>:<tag>:<ciphertext>`, each part hex, sealed with AES-256-GCM (12-byte or 16-byte IV, 16-byte tag). The key is `scrypt("gemini-cli-oauth", "<host name>-<user name>-gemini-cli", N=16384, r=8, p=1)` at 32 bytes. The host name and user name belong to the machine that runs the agent, not to Sortie's, so a remote session reads them there (`uname -n` and `id -un`). The plaintext is JSON.
+
+A local session reads on this host and a remote session over its SSH launch. For a remote session the settings above come from the variables the launch forwards, else from the remote shell, which is where the runtime inherits them. Sortie reads these stores and never writes or refreshes them. The runtime confirms a working keychain by writing a probe entry, which the pull does not do, so a keychain that holds no entry sends the pull on to the encrypted file where the runtime would stop.
+
+An expiry at or before the current time means no request and no window; a session signed in with Google refreshes its store itself while it works. When no store holds a sign-in, the session's pulls end.
+
+API-key and Vertex sessions have no Code Assist sign-in, so they normally report no window. The pull looks only at the stores, not at the session's authentication type, so a Google sign-in that other runs on the same home keep fresh makes such a session report that account's quota.
+
+The base URL is `https://cloudcode-pa.googleapis.com`, or the `CODE_ASSIST_ENDPOINT` value in the runtime's launch environment. Both requests are POSTs to `{base}/v1internal:<method>` with `Authorization: Bearer <access_token>`. The token goes only to this host and is never logged.
+
+The project comes from `GOOGLE_CLOUD_PROJECT` in the launch environment, then `GOOGLE_CLOUD_PROJECT_ID`, the order the runtime's own user setup uses. With neither set, `loadCodeAssist` returns it as `cloudaicompanionProject`. The body is the one that user setup sends, which for an account with no project is only the client metadata.
+
+```json
+{"metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}
+```
+
+`retrieveUserQuota` takes `{"project": "<id>"}` and answers one bucket per model and token type, as the runtime's client types declare it:
+
+```json
+{"buckets": [{"modelId": "<model>", "tokenType": "<type>", "remainingFraction": 0.82, "remainingAmount": "<count>", "resetTime": "<RFC 3339>"}]}
+```
+
+`remainingFraction` runs from 0 to 1 and is the share left. A bucket without `modelId` or `remainingFraction` is skipped, as the runtime skips it, and `remainingAmount` is not read. Each bucket becomes one window named by the model, plus `/` and the token type when present, so a model with several token types shows several windows. A 403 means the account has no Code Assist access and ends the session's pulls.
 
 ## Native headless observations
 

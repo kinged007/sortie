@@ -1,0 +1,1055 @@
+package usage
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+
+	"github.com/sortie-ai/sortie/internal/domain"
+)
+
+// SpendShape is how a source's reports count spend.
+type SpendShape int
+
+const (
+	// SpendUndeclared leaves the source's spend unread.
+	SpendUndeclared SpendShape = iota
+	// SpendProcessCumulative is a running total since the runtime's process
+	// started.
+	SpendProcessCumulative
+	// SpendPerRequest is one model request's own counts, with its identity.
+	// On a live source no single reading covers a turn; the reading that
+	// settles one is the report of the request that ended it.
+	SpendPerRequest
+	// SpendPerTurn is one turn's own counts: a delta over the model requests
+	// of that turn and of no other.
+	SpendPerTurn
+	// SpendSessionCumulative is a running total over the runtime's session,
+	// across its processes and every run that resumed it. The total the
+	// session held when the run started is not the run's spend.
+	SpendSessionCumulative
+)
+
+// SpendReplay is the figure a source repeats when a session resumes.
+type SpendReplay int
+
+const (
+	// ReplayNone repeats no figure; under SpendSessionCumulative the ledger
+	// then starts a resumed session from the total of the records its
+	// boundary read fixes as history. It is the zero value.
+	ReplayNone SpendReplay = iota
+	// ReplayLastFigure repeats the session's last running figure once,
+	// outside any turn, before the run's first turn.
+	ReplayLastFigure
+	// ReplayEveryTurn repeats the report of every earlier turn of the
+	// session, each once, outside any turn, before the run's first turn.
+	ReplayEveryTurn
+)
+
+// MaxRecordsBytes is the largest records document a reader accepts.
+const MaxRecordsBytes = 64 << 20
+
+// MaxRecordLineBytes is the longest records line a reader accepts.
+const MaxRecordLineBytes = 10 << 20
+
+// SpendDeclaration is a source's declaration of what its spend counts
+// mean.
+type SpendDeclaration struct {
+	// Shape is how the source counts spend.
+	Shape SpendShape
+
+	// CacheInInput declares that cache reads and writes are inside the
+	// input count.
+	CacheInInput bool
+
+	// ReasoningInOutput declares that reasoning tokens are inside the
+	// output count.
+	ReasoningInOutput bool
+
+	// ServedModel declares that each reading names the model that served
+	// its request.
+	ServedModel bool
+
+	// DuringTurn declares that the source reports after each model request
+	// while the turn runs.
+	DuringTurn bool
+
+	// LowerBound declares that a figure the source settles is never
+	// complete: the runtime may spend more than it reports.
+	LowerBound bool
+
+	// Amounts declares the amounts the source reports beside or instead of
+	// token counts.
+	Amounts []AmountDeclaration
+
+	// Replay declares the figure the source repeats when a session resumes.
+	Replay SpendReplay
+}
+
+// SpendReading is one report of spend as a parser read it. A nil count is
+// absent, which is unknown, never zero.
+type SpendReading struct {
+	Input      *int64
+	Output     *int64
+	CacheRead  *int64
+	CacheWrite *int64
+
+	// Reasoning is the reasoning count a reading reports apart from Output.
+	// It is read only under a declaration whose reasoning sits outside
+	// output; nil there is unknown, never zero.
+	Reasoning *int64
+
+	// Model is the model that served the reading; empty when it names none.
+	Model string
+
+	// Identity is the request's identity; required for SpendPerRequest.
+	Identity string
+
+	// ByModel splits a live reading by the model that served it. Each entry
+	// carries one model's counts and names the model in Model; a reading with
+	// entries carries its counts in them only. It is read under SpendPerTurn,
+	// where each entry is the turn's share of one model, and under
+	// SpendSessionCumulative, where each entry is one model's running total.
+	ByModel []SpendReading
+
+	// Own is the part of a running reading the runtime attributes to the
+	// model request that produced it; nil when it attributes none. It is
+	// read only under SpendSessionCumulative.
+	Own *SpendReading
+
+	// Amounts are the amounts this reading, a ByModel entry, or a record
+	// carries for its own request, turn, or running total; they belong to the
+	// reading's Model and Identity.
+	Amounts []AmountReading
+}
+
+// TurnEnd is how a turn ended, as the transport knows it.
+type TurnEnd struct {
+	// Replied is true when a prompt result with a stop reason arrived.
+	Replied bool
+
+	// Cancelled is true when that result's stop reason is cancelled.
+	Cancelled bool
+
+	// ModelReached is true when the turn reached the model.
+	ModelReached bool
+
+	// Children is true when the turn showed a child session: a session the
+	// runtime ran part of the turn's work in, whose requests the live source
+	// does not count.
+	Children bool
+
+	// ChildrenSettled is true when every child session the turn showed
+	// completed and named its identifier.
+	ChildrenSettled bool
+}
+
+// RecordsRead is the outcome of reading a records source.
+type RecordsRead struct {
+	Readings []SpendReading
+
+	// OK is true when the read completed; false when not made, failed, or
+	// timed out.
+	OK bool
+
+	// ChildReadings are the records of the child sessions the turn named,
+	// each read from that session's own records, in session order.
+	// ChildrenOK is true when every one of those reads completed.
+	ChildReadings []SpendReading
+	ChildrenOK    bool
+}
+
+// Settlement is the ledger's account of one turn.
+type Settlement struct {
+	// Run is the run-cumulative usage after this turn.
+	Run domain.TokenUsage
+
+	// ByModel is the run-cumulative per-model split, a copy; nil when none.
+	ByModel map[string]domain.TokenUsage
+
+	// Model is the model of the largest share this settlement split; empty
+	// when none.
+	Model string
+
+	// Figure is true when the turn produced a figure.
+	Figure bool
+
+	// Spent is true when the figure added input or output tokens.
+	Spent bool
+
+	// Complete is true when the figure covers the whole turn.
+	Complete bool
+
+	// CoversSession is true when the figure holds every earlier turn of the
+	// session: a live figure of a source that counts the session, or the
+	// complete total of the runtime's session records. It is never set once
+	// the session is uncoverable.
+	CoversSession bool
+
+	// Provenance lists the Category and Strategy of every source whose
+	// readings settled the turn's token figure, each once, the session's own
+	// settling source first; nil when Figure is false.
+	Provenance []domain.UsageProvenance
+
+	// Amounts is the run-cumulative amounts after the turn, sorted by unit
+	// then model; nil when the ledger has counted none.
+	Amounts []domain.ReportedAmount
+
+	// Estimated is true when the figure rests on a history position the
+	// ledger re-derived from a running reading less its own part, and that
+	// position is non-zero.
+	Estimated bool
+}
+
+// ErrSpendUnsupported marks a spend declaration the ledger does not
+// implement.
+var ErrSpendUnsupported = errors.New("spend declaration unsupported")
+
+// Ledger counts one session's spend from a live source and an optional
+// records source, each request once. It is not safe for concurrent use.
+type Ledger struct {
+	live    SpendDeclaration
+	records SpendDeclaration
+	hasRecs bool
+
+	liveProvenance    domain.UsageProvenance
+	recordsProvenance domain.UsageProvenance
+
+	run     domain.TokenUsage
+	byModel map[string]domain.TokenUsage
+
+	lastLive domain.TokenUsage
+	covered  domain.TokenUsage
+	split    domain.TokenUsage
+
+	boundaryKnown bool
+	boundary      map[string]struct{}
+	base          domain.TokenUsage
+
+	childSeen map[string]struct{}
+
+	requests    map[string]domain.TokenUsage // the turn's largest during-turn reading per request identity
+	provisional domain.TokenUsage            // the sum of requests
+	turnUnknown bool                         // a per-request reading of this turn held no usable counts or identity
+
+	uncoverable bool // a turn left spend uncounted that no later read holds, so no turn covers the session again
+	open        bool // an interrupted turn may have left requests the records had not yet settled
+
+	history          ResumeBaseline               // live history position under SpendSessionCumulative; zero value unknown
+	historyEstimated bool                         // a committed reading of this session re-derived a non-zero history position
+	inTurnSeen       bool                         // a reading attributed to a turn arrived in this session
+	turnEstimated    bool                         // a reading of this turn re-derived a non-zero history position
+	turnSplit        map[string]domain.TokenUsage // this turn's increases per served model
+	turnUnnamed      bool                         // an increase of this turn named no model
+
+	amounts            map[amountKey]*amountState   // what the session counted per unit and served model
+	amountUnitsForever map[string]struct{}          // units whose every key, now and later, is a lower bound
+	amountHistory      amountHistory                // what the session held before this run, per key
+	held               []AmountReading              // ObserveAmounts readings the next Settle counts
+	settled            bool                         // Settle has run
+	turnRecords        []knownRecord                // the records this turn's settlement split by model
+	childShares        map[string]domain.TokenUsage // the models this turn's child records added tokens to
+}
+
+// NewLedger returns a ledger for a live source of SpendProcessCumulative,
+// SpendSessionCumulative, SpendPerTurn, or SpendPerRequest shape and, when
+// records is not the zero Source, a records source of SpendPerRequest shape.
+// Either source may place cache inside or outside input and reasoning inside
+// or outside output, and may declare amounts. With no records source, a live
+// source that declares amounts and no token shape is also accepted; its ledger
+// settles no token figure and counts only amounts. Any other declaration, a
+// Replay other than ReplayNone on a live source of another shape or on the
+// records source, and ReplayEveryTurn anywhere but on such an amounts-only
+// live source, return an error wrapping ErrSpendUnsupported.
+func NewLedger(live, records Source) (*Ledger, error) {
+	noRecords := reflect.ValueOf(records).IsZero()
+	if !declaresLive(live) && (!noRecords || !declaresAmountsOnly(live)) {
+		return nil, fmt.Errorf("live source: %w", ErrSpendUnsupported)
+	}
+	if !replayAccepted(live, noRecords) {
+		return nil, fmt.Errorf("live source replay: %w", ErrSpendUnsupported)
+	}
+	if err := checkAmounts(live.Spend.Amounts, false); err != nil {
+		return nil, fmt.Errorf("live source amounts: %w: %w", ErrSpendUnsupported, err)
+	}
+	l := &Ledger{live: live.Spend, liveProvenance: provenanceOf(live)}
+	if noRecords {
+		return l, nil
+	}
+	if !declaresRecords(records) || records.Spend.Replay != ReplayNone {
+		return nil, fmt.Errorf("records source: %w", ErrSpendUnsupported)
+	}
+	if err := checkAmounts(records.Spend.Amounts, true); err != nil {
+		return nil, fmt.Errorf("records source amounts: %w: %w", ErrSpendUnsupported, err)
+	}
+	l.records, l.hasRecs, l.recordsProvenance = records.Spend, true, provenanceOf(records)
+	return l, nil
+}
+
+func provenanceOf(src Source) domain.UsageProvenance {
+	return domain.UsageProvenance{Source: src.Category, Strategy: src.Strategy}
+}
+
+func declaresLive(src Source) bool {
+	return src.Strategy == StrategyLive &&
+		(src.Spend.Shape == SpendProcessCumulative || src.Spend.Shape == SpendPerTurn ||
+			src.Spend.Shape == SpendSessionCumulative || src.Spend.Shape == SpendPerRequest)
+}
+
+func replayAccepted(live Source, noRecords bool) bool {
+	switch live.Spend.Replay {
+	case ReplayNone:
+		return true
+	case ReplayEveryTurn:
+		return noRecords && declaresAmountsOnly(live)
+	default:
+		return live.Spend.Shape == SpendSessionCumulative
+	}
+}
+
+func declaresAmountsOnly(src Source) bool {
+	return src.Strategy == StrategyLive && src.Spend.Shape == SpendUndeclared && len(src.Spend.Amounts) > 0
+}
+
+func declaresRecords(src Source) bool {
+	return src.Strategy == StrategyRecords && src.Spend.Shape == SpendPerRequest
+}
+
+// Boundary fixes the identities already present in a records read as
+// history when the boundary is unknown and the read completed. It counts
+// nothing. A boundary that Settle fixes at a turn's end, on a per-turn or
+// per-request live source, makes the session uncoverable: the requests this
+// run counted before it become history.
+//
+// Under SpendSessionCumulative with ReplayNone it also fixes the live
+// history position at the total of those records, because a resumed
+// session's counter starts from them. A record that does not normalize
+// leaves that position unknown.
+//
+// A boundary that runs before the session's first Settle also fixes the
+// amount history of each unit and model from the records' amounts, each
+// identity once. A record whose amount does not read leaves its unit's
+// history unknown, and a boundary fixed later never sets amount history.
+func (l *Ledger) Boundary(read RecordsRead) {
+	if l.boundaryKnown || !read.OK {
+		return
+	}
+	l.boundary = make(map[string]struct{}, len(read.Readings))
+	for _, r := range read.Readings {
+		if r.Identity != "" {
+			l.boundary[r.Identity] = struct{}{}
+		}
+	}
+	l.boundaryKnown = true
+	l.base = l.covered
+	l.split = l.covered
+	if !l.settled {
+		l.fixAmountHistory(read)
+	}
+
+	if l.live.Shape != SpendSessionCumulative || l.live.Replay != ReplayNone || l.history.known {
+		return
+	}
+	if total, byModel, ok := l.historyTotal(read); ok {
+		l.history = *NewResumeBaseline(&total, byModel)
+	}
+}
+
+// historyTotal returns the total of the read's records, each identity once,
+// and their split by model when every record names one. It reports false when
+// any record does not normalize.
+func (l *Ledger) historyTotal(read RecordsRead) (domain.TokenUsage, map[string]domain.TokenUsage, bool) {
+	var total domain.TokenUsage
+	byModel := make(map[string]domain.TokenUsage)
+	named := true
+	seen := make(map[string]struct{}, len(read.Readings))
+	for _, r := range read.Readings {
+		u, ok := Normalize(r, l.records)
+		if !ok {
+			return domain.TokenUsage{}, nil, false
+		}
+		if _, repeat := seen[r.Identity]; repeat {
+			continue
+		}
+		seen[r.Identity] = struct{}{}
+		total = Add(total, u)
+		name := strings.TrimSpace(r.Model)
+		if name == "" {
+			named = false
+			continue
+		}
+		byModel[name] = Add(byModel[name], u)
+	}
+	if !named {
+		byModel = nil
+	}
+	return total, byModel, true
+}
+
+// SessionCreated records that the runtime created the session the ledger
+// counts, so no history exists: an unknown boundary becomes known and empty
+// without a read, and every amount history is 0. It is called once, before
+// the first Settle.
+func (l *Ledger) SessionCreated() {
+	l.Boundary(RecordsRead{OK: true})
+	l.amountHistory = amountHistory{fixed: true, created: true}
+	if l.live.Shape == SpendSessionCumulative {
+		l.history = *NewResumeBaseline(&domain.TokenUsage{}, nil)
+	}
+}
+
+// BeginSession sets the history boundary at session start: a session that
+// carried no history is created empty, and one that did takes its boundary from
+// history. A nil history leaves the boundary unknown.
+func (l *Ledger) BeginSession(carried bool, history func() RecordsRead) {
+	switch {
+	case !carried:
+		l.SessionCreated()
+	case history != nil:
+		l.Boundary(history())
+	}
+}
+
+// NeedsRecords reports whether Settle needs a records read for a turn that
+// ended as end with the live reading live. It changes no state. A read is also
+// needed while an earlier interrupted turn may have left requests uncounted,
+// because the records can settle them on a later turn.
+func (l *Ledger) NeedsRecords(end TurnEnd, live *SpendReading) bool {
+	if !l.hasRecs {
+		return false
+	}
+	if l.open || end.Children || interruptedAfterModel(end) {
+		return true
+	}
+	if !l.evalLive(end, live).settles {
+		return true
+	}
+	return !l.boundaryKnown || (!l.live.ServedModel && l.records.ServedModel)
+}
+
+// ObserveRequest holds the largest reading per request identity that the
+// live source reports while a turn runs and returns the sum of the held
+// readings and whether the identity is new to the turn. It changes nothing
+// when the live declaration has neither DuringTurn nor the SpendPerRequest
+// shape, the identity is empty, or the reading does not normalize; under
+// SpendPerRequest such a reading also leaves the turn unable to settle from
+// its live readings. It never moves the run total, the per-model split, or
+// the covered position; Settle ends the turn's held readings.
+func (l *Ledger) ObserveRequest(reading SpendReading) (provisional domain.TokenUsage, newRequest bool) {
+	perRequest := l.live.Shape == SpendPerRequest
+	if !l.live.DuringTurn && !perRequest {
+		return l.provisional, false
+	}
+	u, ok := Normalize(reading, l.live)
+	if !ok || reading.Identity == "" {
+		l.turnUnknown = l.turnUnknown || perRequest
+		return l.provisional, false
+	}
+	prior, seen := l.requests[reading.Identity]
+	next := Max(prior, u)
+	if l.requests == nil {
+		l.requests = make(map[string]domain.TokenUsage)
+	}
+	l.requests[reading.Identity] = next
+	l.provisional = Add(Subtract(l.provisional, prior), next)
+	return l.provisional, !seen
+}
+
+// ObserveCumulative takes one running reading of a SpendSessionCumulative
+// live source and returns the turn's provisional counts and whether the
+// reading added a request. inTurn is true when the runtime attributes the
+// reading to the turn in flight.
+//
+// A reading outside a turn counts nothing; under ReplayLastFigure the first
+// one before any in-turn reading, while the history position is unknown, is
+// taken as that position. It changes nothing when the live declaration is of
+// another shape or the reading does not normalize. It never moves the run
+// total, the per-model split, the covered position, or the boundary; Settle
+// ends the turn's provisional counts.
+func (l *Ledger) ObserveCumulative(reading SpendReading, inTurn bool) (provisional domain.TokenUsage, newRequest bool) {
+	if l.live.Shape != SpendSessionCumulative {
+		return l.provisional, false
+	}
+	counts, ok := Normalize(reading, l.live)
+	if !ok {
+		return l.provisional, false
+	}
+	if !inTurn {
+		if l.live.Replay == ReplayLastFigure && !l.inTurnSeen && !l.history.known {
+			l.history = *NewResumeBaseline(&counts, nil)
+		}
+		return l.provisional, false
+	}
+	l.inTurnSeen = true
+	run, _, estimated := l.history.Observe(counts, nil, l.own(reading))
+	l.turnEstimated = l.turnEstimated || estimated
+	increase := Subtract(Subtract(run, l.covered), l.provisional)
+	if increase.InputTokens == 0 && increase.OutputTokens == 0 {
+		return l.provisional, false
+	}
+	if name := strings.TrimSpace(reading.Model); name != "" {
+		if l.turnSplit == nil {
+			l.turnSplit = make(map[string]domain.TokenUsage)
+		}
+		l.turnSplit[name] = Add(l.turnSplit[name], increase)
+	} else {
+		l.turnUnnamed = true
+	}
+	l.provisional = Add(l.provisional, increase)
+	return l.provisional, true
+}
+
+// own returns the counts of r's own part, or nil when r has none or it does
+// not normalize.
+func (l *Ledger) own(r SpendReading) *domain.TokenUsage {
+	if r.Own == nil {
+		return nil
+	}
+	counts, ok := Normalize(*r.Own, l.live)
+	if !ok {
+		return nil
+	}
+	return &counts
+}
+
+// Settle accounts one turn from its live reading and records read. It
+// never lowers the run total or a per-model entry. When the turn showed
+// child sessions, the records of each child read count once per identity
+// and the turn is complete only if every child was settled and read.
+//
+// A turn short of child records, or one whose end fixed a late boundary on a
+// per-turn or per-request live source, leaves the session uncoverable: that
+// settlement and every later one withhold CoversSession.
+//
+// On a per-turn or per-request live source, an interrupted turn that reached
+// the model may leave requests no records read settled. A later turn whose
+// records hold them settles from the records, so the run total converges on
+// the records' figure.
+//
+// The amounts the turn's readings carry count beside the token figure, never
+// inside it. A ledger whose live source declares no token shape settles no
+// token figure and counts only amounts.
+func (l *Ledger) Settle(end TurnEnd, live *SpendReading, read RecordsRead) Settlement {
+	before := l.run
+	l.settled = true
+	var s Settlement
+	var added map[string]domain.TokenUsage
+	if l.countsTokens() {
+		s, added = l.settleSession(end, live, read)
+		if end.Children {
+			s, added = l.countChildren(s, added, end, read)
+		}
+		if l.uncoverable {
+			s.CoversSession = false
+		}
+	}
+	l.settleAmounts(end, live, s, added, Subtract(l.run, before))
+	l.requests, l.provisional, l.turnUnknown = nil, domain.TokenUsage{}, false
+	l.turnSplit, l.turnUnnamed, l.turnEstimated = nil, false, false
+	l.turnRecords, l.childShares, l.held = nil, nil, nil
+	s = l.settlement(s, added)
+	s.Amounts = l.reportedAmounts()
+	return s
+}
+
+func (l *Ledger) countsTokens() bool {
+	return l.live.Shape != SpendUndeclared
+}
+
+// settleSession settles the session's own spend and returns the shares it
+// added to the per-model split.
+func (l *Ledger) settleSession(end TurnEnd, live *SpendReading, read RecordsRead) (Settlement, map[string]domain.TokenUsage) {
+	l.open = l.open || (l.hasRecs && l.countsOwnTurnsOnly() && interruptedAfterModel(end))
+	if l.live.Shape == SpendPerRequest {
+		s, added := l.settlePerRequest(end, live, read)
+		l.fixBoundaryLate(read)
+		return s, added
+	}
+	arm := l.evalLive(end, live)
+	// The live reading of a cancelled or unreplied turn and the records cover
+	// the same requests, so the records replace the reading instead of adding
+	// to it. The same holds when the records hold requests an earlier
+	// interrupted turn left open, which this reading does not count.
+	if arm.normalized && !arm.reset {
+		recs := l.recordsView(read)
+		if recs.usable && ((interruptedAfterModel(end) && l.hasUncounted(recs)) || (l.open && l.recordsHoldMore(recs, arm.delta))) {
+			l.commitLive(arm)
+			return l.settleRecordsAnchored(end, recs, arm)
+		}
+	}
+	if arm.normalized {
+		l.commitLive(arm)
+		l.covered = arm.covered
+		if arm.reset {
+			l.boundaryKnown = false
+		}
+	}
+	recs := l.recordsView(read)
+	switch {
+	case arm.settles:
+		return l.settleLive(end, live, read, arm, recs)
+	case recs.usable:
+		return l.settleRecordsAnchored(end, recs, arm)
+	}
+	return Settlement{}, nil
+}
+
+// settlePerRequest settles a turn of a SpendPerRequest live source. The report
+// of the request that ended a replied turn settles it. Otherwise the records
+// count the same requests as the held readings and replace them; when the
+// records add nothing, the held readings stand as a lower bound.
+func (l *Ledger) settlePerRequest(end TurnEnd, live *SpendReading, read RecordsRead) (Settlement, map[string]domain.TokenUsage) {
+	arm := l.evalPerRequest(end, live)
+	if arm.settles && end.Replied && !end.Cancelled {
+		recs := l.recordsView(read)
+		if l.open && recs.usable && l.recordsHoldMore(recs, arm.delta) {
+			return l.settleRecordsAnchored(end, recs, arm)
+		}
+		l.commitLive(arm)
+		l.covered = arm.covered
+		return l.settleLive(end, live, read, arm, recs)
+	}
+	recs := l.recordsView(read)
+	if recs.usable && l.hasUncounted(recs) {
+		return l.settleRecordsAnchored(end, recs, arm)
+	}
+	if !arm.normalized {
+		return Settlement{}, nil
+	}
+	l.run = Add(l.run, arm.delta)
+	l.covered = arm.covered
+	return Settlement{Figure: true, Spent: true, Provenance: []domain.UsageProvenance{l.liveProvenance}}, nil
+}
+
+// commitLive moves the live position, and the history position under
+// SpendSessionCumulative, to the evaluated reading. An estimated history
+// position stays on record for the rest of the session.
+func (l *Ledger) commitLive(arm liveEval) {
+	l.lastLive = arm.reading
+	if l.live.Shape == SpendSessionCumulative {
+		l.history = arm.history
+		l.historyEstimated = l.historyEstimated || arm.estimated
+	}
+}
+
+func (l *Ledger) settleLive(end TurnEnd, live *SpendReading, read RecordsRead, arm liveEval, recs recordsView) (Settlement, map[string]domain.TokenUsage) {
+	l.run = Add(l.run, arm.delta)
+	complete := end.Replied && !end.Cancelled && !arm.reset && !arm.floored && !arm.estimated
+
+	var added map[string]domain.TokenUsage
+	from, fromOK := recs.at(l.split)
+	to, toOK := recs.at(l.covered)
+	if arm.split != nil {
+		added = arm.split
+		l.split = l.covered
+	} else if model := strings.TrimSpace(live.Model); recs.usable && fromOK && toOK && from <= to {
+		added = recs.byModel(from, to)
+		l.turnRecords = recs.known[from:to]
+		l.split = l.covered
+	} else if model != "" {
+		added = map[string]domain.TokenUsage{model: arm.delta}
+		l.split = l.covered
+	}
+	l.addByModel(added)
+
+	if complete {
+		l.fixBoundaryLate(read)
+	}
+	complete = complete && !l.live.LowerBound
+	return Settlement{
+		Figure:        true,
+		Spent:         arm.delta.InputTokens+arm.delta.OutputTokens > 0,
+		Complete:      complete,
+		CoversSession: complete && !l.historyEstimated && l.live.Shape != SpendPerTurn && l.live.Shape != SpendPerRequest,
+		Provenance:    []domain.UsageProvenance{l.liveProvenance},
+		Estimated:     arm.estimated,
+	}, added
+}
+
+// fixBoundaryLate fixes the boundary from read. On a live source that counts
+// only its own turns, a boundary fixed after the run began turns the requests
+// this run already counted into history, so no turn covers the session again.
+// A cumulative live reading counts the requests before the boundary, so those
+// shapes stay coverable.
+func (l *Ledger) fixBoundaryLate(read RecordsRead) {
+	late := !l.boundaryKnown && read.OK
+	l.Boundary(read)
+	if late && l.countsOwnTurnsOnly() {
+		l.uncoverable = true
+	}
+}
+
+// countsOwnTurnsOnly reports whether the live source's reading holds only the
+// turn's own requests, so a request it never reported stays uncounted.
+func (l *Ledger) countsOwnTurnsOnly() bool {
+	return l.live.Shape == SpendPerTurn || l.live.Shape == SpendPerRequest
+}
+
+func interruptedAfterModel(end TurnEnd) bool {
+	return (end.Cancelled || !end.Replied) && end.ModelReached
+}
+
+// recordsHoldMore reports whether the records' uncounted amount covers delta in
+// every class and exceeds it in input plus output, which means they also hold
+// requests the live reading never counted.
+func (l *Ledger) recordsHoldMore(recs recordsView, delta domain.TokenUsage) bool {
+	extra := Subtract(recs.positions[len(recs.known)], l.covered)
+	return !FellBelow(extra, delta) && extra.TotalTokens > delta.TotalTokens
+}
+
+// hasUncounted reports whether the known records hold input or output beyond
+// what the ledger already covers.
+func (l *Ledger) hasUncounted(recs recordsView) bool {
+	amount := Subtract(recs.positions[len(recs.known)], l.covered)
+	return amount.InputTokens != 0 || amount.OutputTokens != 0
+}
+
+// settleRecordsAnchored settles from the records and then repairs the history
+// position a re-derived live reading left behind. A replied turn's reading is
+// the runtime's final one, which counts everything the records hold, so the
+// position is anchored to the covered figure. Any other turn's last reading
+// can precede records the settlement counted, so the position becomes unknown
+// and the next turn re-derives it.
+func (l *Ledger) settleRecordsAnchored(end TurnEnd, recs recordsView, arm liveEval) (Settlement, map[string]domain.TokenUsage) {
+	s, added := l.settleRecords(end, recs)
+	if !s.Figure || l.live.Shape != SpendSessionCumulative || !arm.estimated {
+		return s, added
+	}
+	if end.Replied && !end.Cancelled {
+		l.history.anchor(l.covered, l.byModel)
+	} else {
+		l.history = ResumeBaseline{}
+	}
+	return s, added
+}
+
+func (l *Ledger) settleRecords(end TurnEnd, recs recordsView) (Settlement, map[string]domain.TokenUsage) {
+	top := recs.positions[len(recs.known)]
+	amount := Subtract(top, l.covered)
+	if !l.hasUncounted(recs) {
+		return Settlement{}, nil
+	}
+	l.open = false
+	_, exact := recs.at(l.covered)
+	exact = exact && len(recs.known) == recs.all
+	complete := end.Replied && !end.Cancelled && exact && !l.live.LowerBound
+	l.run = Add(l.run, amount)
+	l.covered = Add(l.covered, amount)
+
+	var added map[string]domain.TokenUsage
+	if from, ok := recs.at(l.split); ok {
+		added = recs.byModel(from, len(recs.known))
+		l.turnRecords = recs.known[from:]
+		l.split = top
+	}
+	l.addByModel(added)
+	return Settlement{
+		Figure:        true,
+		Spent:         true,
+		Complete:      complete,
+		CoversSession: complete && !l.historyEstimated,
+		Provenance:    []domain.UsageProvenance{l.recordsProvenance},
+	}, added
+}
+
+// countChildren adds the records of the turn's child sessions to s and
+// added. Child records move neither the live position nor the records
+// alignment, so the session's own readings and records stay one for one. The
+// records source joins the settlement's provenance after the source that
+// settled the session's own figure.
+func (l *Ledger) countChildren(s Settlement, added map[string]domain.TokenUsage, end TurnEnd, read RecordsRead) (Settlement, map[string]domain.TokenUsage) {
+	short := !end.ChildrenSettled || !read.ChildrenOK
+	var total domain.TokenUsage
+	var shares map[string]domain.TokenUsage
+	counted := false
+	for _, r := range read.ChildReadings {
+		u, ok := Normalize(r, l.records)
+		if !ok {
+			short = true
+			continue
+		}
+		if _, repeat := l.childSeen[r.Identity]; repeat {
+			continue
+		}
+		if l.childSeen == nil {
+			l.childSeen = make(map[string]struct{})
+		}
+		l.childSeen[r.Identity] = struct{}{}
+		counted = true
+		total = Add(total, u)
+		if model := strings.TrimSpace(r.Model); model != "" {
+			shares = AddByModel(shares, map[string]domain.TokenUsage{model: u})
+		}
+	}
+	if counted {
+		l.run = Add(l.run, total)
+		l.addByModel(shares)
+		l.childShares = shares
+		added = AddByModel(added, shares)
+		if !slices.Contains(s.Provenance, l.recordsProvenance) {
+			s.Provenance = append(s.Provenance, l.recordsProvenance)
+		}
+		s.Figure, s.Spent = true, true
+	}
+	if short {
+		s.Complete, s.CoversSession = false, false
+		l.uncoverable = true
+	}
+	return s, added
+}
+
+func (l *Ledger) addByModel(added map[string]domain.TokenUsage) {
+	if len(added) > 0 {
+		l.byModel = AddByModel(l.byModel, added)
+	}
+}
+
+// settlement completes s with the ledger's current totals and the model of
+// the largest share in added.
+func (l *Ledger) settlement(s Settlement, added map[string]domain.TokenUsage) Settlement {
+	s.Run = l.run
+	s.ByModel = maps.Clone(l.byModel)
+	var best int64
+	for name, u := range added {
+		if u.TotalTokens > best || (u.TotalTokens == best && s.Model != "" && name < s.Model) {
+			best, s.Model = u.TotalTokens, name
+		}
+	}
+	return s
+}
+
+// liveEval is the evaluation of one live reading against the ledger.
+type liveEval struct {
+	normalized bool // the reading is usable; the ledger state follows it
+	settles    bool // the reading also settles the turn
+	reading    domain.TokenUsage
+	split      map[string]domain.TokenUsage // the turn's share per model, when the reading carries one
+	covered    domain.TokenUsage
+	delta      domain.TokenUsage
+	reset      bool
+	floored    bool
+	history    ResumeBaseline // the history position after the reading, under SpendSessionCumulative
+	estimated  bool           // the history position rests on an estimate
+}
+
+// evalLive evaluates live without changing the ledger.
+func (l *Ledger) evalLive(end TurnEnd, live *SpendReading) liveEval {
+	if l.live.Shape == SpendPerRequest {
+		return l.evalPerRequest(end, live)
+	}
+	if live == nil {
+		return liveEval{}
+	}
+	reading, split, ok := l.normalizeLive(*live)
+	if !ok {
+		return liveEval{}
+	}
+	arm := liveEval{normalized: true, reading: reading, split: split}
+	switch {
+	case l.live.Shape == SpendPerTurn:
+		arm.delta, arm.covered = reading, Add(l.covered, reading)
+	case l.live.Shape == SpendSessionCumulative:
+		arm.history = l.history
+		running := arm.split
+		arm.split = nil
+		run, runByModel, estimated := arm.history.Observe(reading, running, l.own(*live))
+		arm.estimated = estimated || l.turnEstimated
+		arm.delta, arm.floored = Subtract(run, l.covered), FellBelow(run, l.covered)
+		arm.covered = Add(l.covered, arm.delta)
+		switch {
+		case running != nil:
+			if share := l.runShare(runByModel); sameCounted(Sum(share), arm.delta) {
+				arm.split = share
+			}
+		case !l.turnUnnamed && len(l.turnSplit) > 0 && sameCounted(Sum(l.turnSplit), arm.delta):
+			arm.split = maps.Clone(l.turnSplit)
+		}
+	case FellBelow(reading, l.lastLive):
+		arm.reset = true
+		arm.delta, arm.covered = reading, reading
+	default:
+		arm.delta = Subtract(reading, l.covered)
+		arm.floored = FellBelow(reading, l.covered)
+		arm.covered = Add(l.covered, arm.delta)
+	}
+	addedNothing := arm.delta.InputTokens == 0 && arm.delta.OutputTokens == 0
+	arm.settles = !end.ModelReached || !addedNothing
+	return arm
+}
+
+// evalPerRequest evaluates a SpendPerRequest live source: the sum of the
+// turn's held readings, with the settling report's request taken at the larger
+// of its held and settling counts. A turn that held an unknown reading, or
+// whose settling report does not normalize, cannot settle.
+func (l *Ledger) evalPerRequest(end TurnEnd, settling *SpendReading) liveEval {
+	sum, known := l.provisional, !l.turnUnknown
+	if settling != nil {
+		if counts, ok := Normalize(*settling, l.live); ok {
+			prior := l.requests[settling.Identity]
+			sum = Add(Subtract(sum, prior), Max(prior, counts))
+		} else {
+			known = false
+		}
+	}
+	addsTokens := sum.InputTokens != 0 || sum.OutputTokens != 0
+	return liveEval{
+		normalized: addsTokens,
+		reading:    sum,
+		delta:      sum,
+		covered:    Add(l.covered, sum),
+		settles:    settling != nil && known && (addsTokens || !end.ModelReached),
+	}
+}
+
+// runShare returns what the run so far added per model beyond what the ledger
+// has already split, leaving out models with nothing new.
+func (l *Ledger) runShare(runByModel map[string]domain.TokenUsage) map[string]domain.TokenUsage {
+	share := make(map[string]domain.TokenUsage, len(runByModel))
+	for name, run := range runByModel {
+		if added := Subtract(run, l.byModel[name]); !IsZero(added) {
+			share[name] = added
+		}
+	}
+	return share
+}
+
+// normalizeLive converts a live reading to counts and, when the reading
+// splits by model, to the share of each named model under SpendPerTurn or the
+// running total of each under SpendSessionCumulative. Any entry that does not
+// normalize makes the whole reading no figure.
+func (l *Ledger) normalizeLive(r SpendReading) (counts domain.TokenUsage, split map[string]domain.TokenUsage, ok bool) {
+	splits := l.live.Shape == SpendPerTurn || l.live.Shape == SpendSessionCumulative
+	if !splits || len(r.ByModel) == 0 {
+		counts, ok = Normalize(r, l.live)
+		return counts, nil, ok
+	}
+	for _, entry := range r.ByModel {
+		u, entryOK := Normalize(entry, l.live)
+		if !entryOK {
+			return domain.TokenUsage{}, nil, false
+		}
+		counts = Add(counts, u)
+		if name := strings.TrimSpace(entry.Model); name != "" {
+			if split == nil {
+				split = make(map[string]domain.TokenUsage)
+			}
+			split[name] = Add(split[name], u)
+		}
+	}
+	return counts, split, true
+}
+
+type knownRecord struct {
+	usage   domain.TokenUsage
+	model   string
+	amounts []AmountReading
+}
+
+// recordsView is the part of a records read that counts.
+type recordsView struct {
+	usable    bool
+	known     []knownRecord
+	all       int                 // readings left after dropping history and repeats
+	positions []domain.TokenUsage // positions[k] is the base plus the first k known records
+}
+
+func (l *Ledger) recordsView(read RecordsRead) recordsView {
+	if !l.hasRecs || !read.OK || !l.boundaryKnown {
+		return recordsView{}
+	}
+	v := recordsView{usable: true, positions: []domain.TokenUsage{l.base}}
+	seen := make(map[string]struct{}, len(read.Readings))
+	stillKnown := true
+	for i := range read.Readings {
+		r := &read.Readings[i]
+		if _, inside := l.boundary[r.Identity]; inside {
+			continue
+		}
+		if _, repeat := seen[r.Identity]; repeat {
+			continue
+		}
+		seen[r.Identity] = struct{}{}
+		v.all++
+		if !stillKnown {
+			continue
+		}
+		u, ok := Normalize(*r, l.records)
+		if !ok {
+			stillKnown = false
+			continue
+		}
+		v.known = append(v.known, knownRecord{usage: u, model: strings.TrimSpace(r.Model), amounts: r.Amounts})
+		v.positions = append(v.positions, Add(v.positions[len(v.positions)-1], u))
+	}
+	return v
+}
+
+// at returns the number of known records whose position is x in every
+// count. Positions are unique because every known record adds input or
+// output.
+func (v recordsView) at(x domain.TokenUsage) (int, bool) {
+	for k, p := range v.positions {
+		if p.InputTokens == x.InputTokens && p.OutputTokens == x.OutputTokens &&
+			p.CacheReadTokens == x.CacheReadTokens && p.CacheWriteTokens == x.CacheWriteTokens {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+// byModel sums known[from:to] per served model, leaving out records that
+// name none.
+func (v recordsView) byModel(from, to int) map[string]domain.TokenUsage {
+	var sum map[string]domain.TokenUsage
+	for _, r := range v.known[from:to] {
+		if r.model == "" {
+			continue
+		}
+		if sum == nil {
+			sum = make(map[string]domain.TokenUsage)
+		}
+		sum[r.model] = Add(sum[r.model], r.usage)
+	}
+	return sum
+}
+
+// Normalize converts a reading to counts under spend, reporting false when
+// any count the declaration maps is missing or negative, or the reading
+// contradicts the declaration. Input counts every input token and output
+// every output token whatever the source's placement; Total is their sum.
+func Normalize(reading SpendReading, spend SpendDeclaration) (domain.TokenUsage, bool) {
+	if reading.Input == nil || reading.Output == nil ||
+		reading.CacheRead == nil || reading.CacheWrite == nil {
+		return domain.TokenUsage{}, false
+	}
+	in, out, cr, cw := *reading.Input, *reading.Output, *reading.CacheRead, *reading.CacheWrite
+	if in < 0 || out < 0 || cr < 0 || cw < 0 {
+		return domain.TokenUsage{}, false
+	}
+	if !spend.ReasoningInOutput {
+		if reading.Reasoning == nil || *reading.Reasoning < 0 {
+			return domain.TokenUsage{}, false
+		}
+		out += *reading.Reasoning
+	}
+	if spend.CacheInInput {
+		if cr+cw > in {
+			return domain.TokenUsage{}, false
+		}
+	} else {
+		in += cr + cw
+	}
+	if spend.Shape == SpendPerRequest && (reading.Identity == "" || (in == 0 && out == 0)) {
+		return domain.TokenUsage{}, false
+	}
+	return domain.TokenUsage{
+		InputTokens:      in,
+		OutputTokens:     out,
+		CacheReadTokens:  cr,
+		CacheWriteTokens: cw,
+		TotalTokens:      in + out,
+	}, true
+}

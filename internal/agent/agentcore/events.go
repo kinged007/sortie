@@ -104,3 +104,13 @@ func EmitNotification(emit func(domain.AgentEvent), message string) {
 		Message:   message,
 	})
 }
+
+// EmitUsageWindows emits an EventNotification event with an empty message
+// that carries the given usage windows, observed at the given instant.
+func EmitUsageWindows(emit func(domain.AgentEvent), at time.Time, windows []domain.UsageWindow) {
+	emit(domain.AgentEvent{
+		Type:         domain.EventNotification,
+		Timestamp:    at,
+		UsageWindows: windows,
+	})
+}

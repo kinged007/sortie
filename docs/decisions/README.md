@@ -4,27 +4,27 @@ This directory contains architecturally significant decisions for Sortie, docume
 
 ## Decisions
 
-| ADR                                                  | Title                                                             | Status   |
-| ---------------------------------------------------- | ----------------------------------------------------------------- | -------- |
-| [0001](0001-use-go-as-core-runtime.md)               | Use Go as core runtime                                            | Accepted |
-| [0002](0002-use-sqlite-for-persistence.md)           | Use SQLite for persistence                                        | Accepted |
-| [0003](0003-adapter-based-integration.md)            | Use adapter interfaces for integration extensibility              | Accepted |
-| [0004](0004-workflow-file-format.md)                 | Use YAML Front Matter for Workflow Files                          | Accepted |
-| [0005](0005-prompt-template-engine.md)               | Use Go `text/template` for Prompt Rendering                       | Accepted |
-| [0006](0006-use-fsnotify-for-file-watching.md)       | Use `fsnotify` for Filesystem Event Watching                      | Accepted |
-| [0007](0007-handoff-state-and-tracker-writes.md)     | Use Handoff State Transitions to Signal Agent Completion          | Accepted |
-| [0008](0008-observability-model.md)                  | Use Embedded Dashboard with Prometheus Metrics for Observability  | Accepted |
-| [0009](0009-mcp-stdio-sidecar-for-tool-execution.md) | Use MCP stdio sidecar for agent tool execution                    | Accepted |
-| [0010](0010-keep-tracker-adapter-unified.md)         | Keep TrackerAdapter as a Unified Interface                        | Accepted |
-| [0011](0011-dispatch-rule-configuration.md)          | Use First-Match-Wins Dispatch Rules in `WORKFLOW.md` Front Matter | Superseded by 0031 |
-| [0012](0012-auto-merge-reaction.md)                  | Extend `SCMAdapter` with Write Methods for Auto-Merge Reactions   | Accepted |
-| [0013](0013-agent-cost-budget.md)                    | Use cumulative per-issue token counts for the agent cost budget   | Accepted |
-| [0014](0014-operator-notifications.md)               | Use an adapter family for operator notifications                  | Accepted |
-| [0015](0015-pr-label-command-detection.md)           | Detect PR Label Commands by Polling the Label-Event Journal       | Accepted |
-| [0016](0016-place-forge-integrations-in-one-package-per-forge.md) | Place Forge Integrations in One Package per Forge    | Accepted |
+| ADR | Title | Status |
+| --- | ----- | ------ |
+| [0001](0001-use-go-as-core-runtime.md) | Use Go as core runtime | Accepted |
+| [0002](0002-use-sqlite-for-persistence.md) | Use SQLite for persistence | Accepted |
+| [0003](0003-adapter-based-integration.md) | Use adapter interfaces for integration extensibility | Accepted |
+| [0004](0004-workflow-file-format.md) | Use YAML Front Matter for Workflow Files | Accepted |
+| [0005](0005-prompt-template-engine.md) | Use Go `text/template` for Prompt Rendering | Accepted |
+| [0006](0006-use-fsnotify-for-file-watching.md) | Use `fsnotify` for Filesystem Event Watching | Accepted |
+| [0007](0007-handoff-state-and-tracker-writes.md) | Use Handoff State Transitions to Signal Agent Completion | Accepted |
+| [0008](0008-observability-model.md) | Use Embedded Dashboard with Prometheus Metrics for Observability | Accepted |
+| [0009](0009-mcp-stdio-sidecar-for-tool-execution.md) | Use MCP stdio sidecar for agent tool execution | Accepted |
+| [0010](0010-keep-tracker-adapter-unified.md) | Keep TrackerAdapter as a Unified Interface | Accepted |
+| [0011](0011-dispatch-rule-configuration.md) | Use First-Match-Wins Dispatch Rules in `WORKFLOW.md` Front Matter | Superseded by 0031 |
+| [0012](0012-auto-merge-reaction.md) | Extend `SCMAdapter` with Write Methods for Auto-Merge Reactions | Accepted |
+| [0013](0013-agent-cost-budget.md) | Use cumulative per-issue token counts for the agent cost budget | Accepted |
+| [0014](0014-operator-notifications.md) | Use an adapter family for operator notifications | Accepted |
+| [0015](0015-pr-label-command-detection.md) | Detect PR Label Commands by Polling the Label-Event Journal | Accepted |
+| [0016](0016-place-forge-integrations-in-one-package-per-forge.md) | Place Forge Integrations in One Package per Forge | Accepted |
 | [0017](0017-close-tracker-issue-on-managed-pr-merge.md) | Close the Tracker Issue When a Managed Pull Request Merges | Accepted |
-| [0018](0018-bound-workspace-retention-by-age.md)        | Bound Workspace Retention by Age Independently of Tracker State | Accepted |
-| [0019](0019-keep-usage-data-on-the-host.md)             | Keep Usage Data on the Host and Aggregate Across Instances by Pull | Accepted |
+| [0018](0018-bound-workspace-retention-by-age.md) | Bound Workspace Retention by Age Independently of Tracker State | Accepted |
+| [0019](0019-keep-usage-data-on-the-host.md) | Keep Usage Data on the Host and Aggregate Across Instances by Pull | Accepted |
 | [0020](0020-withhold-handoff-on-observed-absence-of-work.md) | Withhold the Handoff Transition Only When Absence of Work Is Observed | Accepted |
 | [0021](0021-run-self-review-before-ending-on-the-completion-signal.md) | Run Self-Review Before Ending the Run on the Completion Signal | Accepted |
 | [0022](0022-release-a-parked-issue-on-a-human-gesture.md) | Release a Parked Issue on a Human Gesture in the Tracker | Accepted |
@@ -44,3 +44,7 @@ This directory contains architecturally significant decisions for Sortie, docume
 | [0036](0036-label-usage-runtime-and-exit-counters-by-model.md) | Label Usage, Runtime and Exit Counters by Model | Accepted |
 | [0037](0037-supply-a-built-in-prompt-for-every-reaction-run.md) | Supply a Built-In Prompt for Every Reaction Run | Accepted |
 | [0038](0038-price-runs-from-a-layered-rate-table-and-record-the-price-at-write.md) | Price Runs from a Layered Rate Table and Record the Price When the Run Is Written | Accepted |
+| [0039](0039-account-for-agent-spend-in-one-usage-component.md) | Account for Agent Spend in One Usage Component Fed by Each Runtime's Own Reports | Accepted |
+| [0040](0040-keep-the-codex-and-claude-code-kinds-as-the-routes-to-their-clis.md) | Keep the Codex and Claude Code Kinds as the Routes to Their CLIs | Accepted |
+| [0041](0041-reset-a-usage-limit-refusal-at-the-latest-reset-of-its-gating-windows.md) | Reset a Usage-Limit Refusal at the Latest Reset of Its Gating Windows | Accepted |
+| [0042](0042-hand-the-agent-every-unseen-issue-comment-through-one-shared-feed.md) | Hand the Agent Every Unseen Issue Comment Through One Shared Feed | Accepted |

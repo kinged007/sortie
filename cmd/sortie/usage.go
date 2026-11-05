@@ -25,6 +25,8 @@ Flags:
 
 Run options:
   --dry-run                 Run one poll cycle without spawning agents, then exit
+  --once                    Poll once, finish the issues found, then exit
+  --once-result PATH        With --once, write each issue's latest outcome to PATH as JSON
   --env-file PATH           Path to .env file for config overrides
   --log-level LEVEL         Log verbosity: debug, info, warn, error (default: info)
   --log-format FORMAT       Log output format: text, json (default: text)
@@ -34,8 +36,16 @@ Run options:
 Examples:
   sortie WORKFLOW.md                     Run orchestrator with a workflow
   sortie --dry-run WORKFLOW.md           Validate config and poll once without writing state
+  sortie --once WORKFLOW.md              Finish the issues ready now, then exit
   sortie validate --format json w.md     Check workflow syntax, output as JSON
   sortie stats --since 24h               Summarize the last 24 hours of runs
+
+Exit status:
+  0   Shut down normally; with --once, each issue's last run succeeded or
+      nothing was ready
+  1   Startup failed; with --once, also when the single poll failed
+  2   With --once, an issue's last run did not succeed, a spend ceiling held
+      an issue, or a signal stopped the work
 
 Learn more:
   https://docs.sortie-ai.com
@@ -73,9 +83,11 @@ command reads that history back and reports how many runs there were and
 on how many issues, how many succeeded, how long they took, and what they
 cost. The same figures are broken down by outcome, by coding agent, by
 dispatch rule, by prompt template, by the model each run was configured with,
-by stage chain, by retry trigger, and by what started each run. Each stage
-chain also gets a funnel: for every stage, the passes that reached it and how
-each one left it.
+by where each run's usage figures came from, by stage chain, by retry
+trigger, and by what started each run. A token or cost figure that counts
+only part of its runs is marked as a lower bound. Each stage chain also gets
+a funnel: for every stage, the passes that reached it and how each one left
+it.
 
 The database is opened read-only, so this is safe to run while the
 orchestrator is working.
@@ -118,6 +130,9 @@ Usage:
 
 Flags:
   --workflow PATH   Absolute path to workflow file (required)
+  --http            Serve MCP over streamable HTTP on a loopback port
+                    instead of stdio; requires SORTIE_TOOL_SERVER_BEARER
+                    and exits when standard input closes
 
 Global flags:
   -h, --help        Print this help message and quit

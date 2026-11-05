@@ -1,17 +1,17 @@
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router";
+import { useLocation } from "react-router";
 
 import { useHistoryRunsQuery, useIssueQuery } from "@/api/queries";
 import { useNow } from "@/app/live";
 import { storyRunsOf } from "@/components/IssueStory";
 import { Panel } from "@/components/Panel";
 import { StatusMark } from "@/components/StatusMark";
+import { Link } from "@/components/carried-links";
 import { Button } from "@/components/ui/button";
-import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import { fmtDuration, lowerFirst, parseInstant } from "@/lib/format";
 import { sessionLinkOf } from "@/lib/issue-link";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 
 import type { IssueDetailResponse, RunsResponse } from "@/api/types.gen";
 import type { Mark } from "@/lib/run-status";
@@ -40,7 +40,7 @@ function rowsOf(detail: IssueDetailResponse, pages: readonly RunsResponse[]): Se
   const finished = numberedRunsOf(storyRunsOf(history?.runs ?? [], pages), total)
     .reverse()
     .map(({ run, number }): SessionRow => {
-      const { word, mark } = runStatus(run.status);
+      const { word, mark } = runOutcome(run);
       return {
         key: String(run.run_id),
         number,
@@ -85,8 +85,8 @@ function SessionRowView({ row, identifier, isCurrent }: SessionRowViewProps) {
       : sessionLinkOf(identifier, row.dispatchId, location);
 
   return (
-    <TableRow>
-      <TableCell>
+    <li className="contents">
+      <span>
         {link === undefined ? (
           <strong className={isCurrent ? "font-bold text-ink" : "font-medium"}>{name}</strong>
         ) : (
@@ -94,33 +94,27 @@ function SessionRowView({ row, identifier, isCurrent }: SessionRowViewProps) {
             {name}
           </Link>
         )}
-      </TableCell>
-      <TableCell className="whitespace-normal">
+      </span>
+      <span className="min-w-0">
         {row.mark === null ? row.word : <StatusMark mark={row.mark} label={row.word} />}
-      </TableCell>
-      <TableCell look="number">
+      </span>
+      <span className="text-right text-ink-muted tabular-nums">
         {row.endedAt === null ? (
           <LiveDuration startedAt={row.startedAt} />
         ) : (
           fmtDuration(secondsBetween(row.startedAt, parseInstant(row.endedAt)))
         )}
-      </TableCell>
-    </TableRow>
+      </span>
+    </li>
   );
 }
 
-/** Props of {@link SessionsPanel}. */
 export interface SessionsPanelProps {
   identifier: string;
   /** The dispatch ID of the session on screen, whose row is not a link. */
   dispatchId: string;
 }
 
-/**
- * Renders every session of the issue, newest first, each named by the run
- * number the issue page gives it. It draws nothing while the issue has a
- * single session. Older runs load on request.
- */
 export function SessionsPanel({ identifier, dispatchId }: SessionsPanelProps) {
   const { data: detail } = useIssueQuery(identifier);
   const [wanted, setWanted] = useState(0);
@@ -161,19 +155,17 @@ export function SessionsPanel({ identifier, dispatchId }: SessionsPanelProps) {
   };
 
   return (
-    <Panel title="Sessions">
-      <Table aria-label="Sessions">
-        <TableBody>
-          {rows.map((row) => (
-            <SessionRowView
-              key={row.key}
-              row={row}
-              identifier={identifier}
-              isCurrent={row.dispatchId === dispatchId}
-            />
-          ))}
-        </TableBody>
-      </Table>
+    <Panel isRuled title="Sessions">
+      <ol className="grid grid-cols-[120px_minmax(0,1fr)_auto] items-baseline gap-x-md gap-y-xs text-body-md text-ink-body">
+        {rows.map((row) => (
+          <SessionRowView
+            key={row.key}
+            row={row}
+            identifier={identifier}
+            isCurrent={row.dispatchId === dispatchId}
+          />
+        ))}
+      </ol>
       {canShowOlder ? (
         <div className="flex flex-wrap items-center gap-x-sm gap-y-xs">
           <Button disabled={isFetching} onClick={handleShowOlder}>

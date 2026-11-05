@@ -1,5 +1,6 @@
-import { Link, useLocation } from "react-router";
+import { useLocation } from "react-router";
 
+import { Link } from "@/components/carried-links";
 import { BotIcon, ChartColumnIcon, ClockIcon, HistoryIcon } from "@/components/icons";
 import { StatusMark } from "@/components/StatusMark";
 import { hasSeveralTerminalStates } from "@/lib/ended";
@@ -12,7 +13,6 @@ import type { IconProps } from "@/components/icons";
 import type { EndedIssue } from "@/lib/ended";
 import type { Mark } from "@/lib/run-status";
 
-/** Props of {@link CalmState}. */
 export interface CalmStateProps {
   /** Whether nothing waits on a person, acknowledged items included; only then does the calm line show. */
   allClear: boolean;
@@ -20,7 +20,6 @@ export interface CalmStateProps {
   runningSince: readonly string[];
   /** The global agent cap, or `undefined` while the config is not served. */
   maxAgents: number | undefined;
-  /** Today's ended issues, newest first. */
   ended: readonly EndedIssue[];
   /** `config.tracker.terminal_states` as served; empty while the config is not served. */
   terminalStates: readonly string[];
@@ -131,7 +130,6 @@ function runsNote(runs: Summary): ReactNode {
   );
 }
 
-/** Renders the calm line and the stat tiles that follow the headline while nothing needs attention; each tile opens the screen that explains its figure. */
 export function CalmState({
   allClear,
   runningSince,
@@ -149,7 +147,7 @@ export function CalmState({
     <section aria-label="Calm" className="mb-md">
       {allClear ? (
         <p className="text-body-md text-ink-body">
-          Nothing is parked, held, escalated or stopped, and Sortie is healthy.
+          Nothing is parked, escalated, stopped or waiting on a person, and Sortie is healthy.
         </p>
       ) : undefined}
       <div className="mt-xl grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-md">

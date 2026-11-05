@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -23,6 +22,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func uintptrOf(v any) uintptr {
@@ -97,56 +97,6 @@ func closeJobHandle(g *Group) {
 	}
 }
 
-func pollCaptureWinPIDFile(t *testing.T, path string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("pollCaptureWinPIDFile(%q): no valid pid after %v", path, timeout)
-	return 0
-}
-
-func assertCaptureWinProcessGone(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	processID, convErr := dwordPID(pid)
-	if convErr != nil {
-		t.Fatalf("dwordPID(%d) error = %v", pid, convErr)
-	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, processID)
-		if err != nil {
-			return
-		}
-		event, waitErr := windows.WaitForSingleObject(handle, 0)
-		_ = windows.CloseHandle(handle)
-		if waitErr == nil && event == uint32(windows.WAIT_OBJECT_0) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Errorf("process %d still running after %v, want gone", pid, timeout)
-}
-
-func waitCaptureWinResult(t *testing.T, c *Capture, timeout time.Duration) CaptureResult {
-	t.Helper()
-	done := make(chan CaptureResult, 1)
-	go func() { done <- c.Wait() }()
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(timeout):
-		t.Fatalf("Capture.Wait() did not return within %v", timeout)
-		return CaptureResult{}
-	}
-}
-
 type captureWinLogRecord struct {
 	Level slog.Level
 	Msg   string
@@ -204,8 +154,7 @@ func TestCapture_HeldDescendantInheritedJobMembership(t *testing.T) {
 		ExitCode:     0,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := waittest.Context(t)
 	cmd := exec.CommandContext(ctx, leaderPath) //nolint:gosec // fake runtime path under t.TempDir()
 	var stdout bytes.Buffer
 
@@ -214,8 +163,8 @@ func TestCapture_HeldDescendantInheritedJobMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunCapture() error = %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("RunCapture() took %v, want within 3s", elapsed)
+	if elapsed := time.Since(start); elapsed >= DefaultDrainGrace {
+		t.Errorf("RunCapture() took %v, want less than the %v drain grace", elapsed, DefaultDrainGrace)
 	}
 	if result.WaitErr != nil {
 		t.Errorf("WaitErr = %v, want nil", result.WaitErr)
@@ -227,8 +176,7 @@ func TestCapture_HeldDescendantInheritedJobMembership(t *testing.T) {
 		t.Errorf("collected stdout = %q, want %q", got, "leader output\n")
 	}
 
-	childPID := pollCaptureWinPIDFile(t, pidPath, 5*time.Second)
-	assertCaptureWinProcessGone(t, childPID, 3*time.Second)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidPath))
 }
 
 func TestCapture_AssignSeamDelayDoesNotLowerJobMembership(t *testing.T) {
@@ -245,7 +193,7 @@ func TestCapture_AssignSeamDelayDoesNotLowerJobMembership(t *testing.T) {
 		if err != nil {
 			t.Fatalf("StartCapture() error = %v", err)
 		}
-		_ = waitCaptureWinResult(t, c, 10*time.Second)
+		awaitCapture(t, c)
 
 		record, ok := latestCaptureTeardownRecord(spy, before)
 		if !ok {
@@ -291,11 +239,7 @@ func TestStartWithOwnedPipes_AssignSeamDelayDoesNotLowerJobMembership(t *testing
 			_ = cmd.Wait()
 			close(done)
 		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("cmd.Wait() did not return within 10s")
-		}
+		waittest.Receive(t, done, "cmd.Wait() return")
 
 		var total int64
 		if job := jobHandleOf(g); job != 0 {
@@ -408,21 +352,12 @@ func TestStartCapture_ResumeSeamFailure(t *testing.T) {
 
 	type outcome struct{ err error }
 	done := make(chan outcome, 1)
-	start := time.Now()
 	go func() {
 		_, err := StartCapture(context.Background(), cmd, CaptureParams{Logger: logger})
 		done <- outcome{err}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("StartCapture() did not return within 5s, want the failed resume to fail the start")
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartCapture() took %v, want within 3s", elapsed)
-	}
+	oc := waittest.Receive(t, done, "StartCapture() result")
 
 	var stageErr *StartError
 	if !errors.As(oc.err, &stageErr) || stageErr.Stage != StageProcessResume {
@@ -435,7 +370,7 @@ func TestStartCapture_ResumeSeamFailure(t *testing.T) {
 	if cmd.Process == nil {
 		t.Fatal("cmd.Process = nil, want it set once cmd.Start succeeded")
 	}
-	assertCaptureWinProcessGone(t, cmd.Process.Pid, 3*time.Second)
+	waittest.ProcessGone(t, cmd.Process.Pid)
 
 	records := spy.snapshot()
 	var sawResumeFailed int
@@ -473,21 +408,12 @@ func TestStartWithOwnedPipes_ResumeSeamFailure(t *testing.T) {
 
 	type outcome struct{ err error }
 	done := make(chan outcome, 1)
-	start := time.Now()
 	go func() {
 		_, _, err := StartWithOwnedPipes(context.Background(), cmd, logger)
 		done <- outcome{err}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("StartWithOwnedPipes() did not return within 5s, want the failed resume to fail the start")
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartWithOwnedPipes() took %v, want within 3s", elapsed)
-	}
+	oc := waittest.Receive(t, done, "StartWithOwnedPipes() result")
 
 	var stageErr *StartError
 	if !errors.As(oc.err, &stageErr) || stageErr.Stage != StageProcessResume {
@@ -499,7 +425,7 @@ func TestStartWithOwnedPipes_ResumeSeamFailure(t *testing.T) {
 	if cmd.Process == nil {
 		t.Fatal("cmd.Process = nil, want it set once cmd.Start succeeded")
 	}
-	assertCaptureWinProcessGone(t, cmd.Process.Pid, 3*time.Second)
+	waittest.ProcessGone(t, cmd.Process.Pid)
 
 	var sawResumeFailed int
 	for _, r := range spy.snapshot() {
@@ -546,21 +472,12 @@ func TestStartCapture_AssignJobObjectFailure(t *testing.T) {
 		err error
 	}
 	done := make(chan outcome, 1)
-	start := time.Now()
 	go func() {
 		c, err := StartCapture(context.Background(), cmd, CaptureParams{Logger: logger})
 		done <- outcome{c, err}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("StartCapture() did not return within 5s")
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartCapture() took %v, want within 3s", elapsed)
-	}
+	oc := waittest.Receive(t, done, "StartCapture() result")
 	if oc.err != nil {
 		t.Fatalf("StartCapture() error = %v, want nil (a failed assignment is fail-open)", oc.err)
 	}
@@ -572,7 +489,7 @@ func TestStartCapture_AssignJobObjectFailure(t *testing.T) {
 		t.Errorf("registered job handle = %v, want 0 (zero job handle on a failed assignment)", recordedJob)
 	}
 
-	result := waitCaptureWinResult(t, oc.c, 10*time.Second)
+	result := awaitCapture(t, oc.c)
 	if result.WaitErr != nil {
 		t.Errorf("Wait() WaitErr = %v, want nil (the process must still be resumed)", result.WaitErr)
 	}
@@ -627,21 +544,12 @@ func TestStartWithOwnedPipes_AssignJobObjectFailure(t *testing.T) {
 		err   error
 	}
 	done := make(chan outcome, 1)
-	start := time.Now()
 	go func() {
 		pipes, group, err := StartWithOwnedPipes(context.Background(), cmd, logger)
 		done <- outcome{pipes, group, err}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("StartWithOwnedPipes() did not return within 5s")
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartWithOwnedPipes() took %v, want within 3s", elapsed)
-	}
+	oc := waittest.Receive(t, done, "StartWithOwnedPipes() result")
 	if oc.err != nil {
 		t.Fatalf("StartWithOwnedPipes() error = %v, want nil (a failed assignment is fail-open)", oc.err)
 	}
@@ -658,13 +566,8 @@ func TestStartWithOwnedPipes_AssignJobObjectFailure(t *testing.T) {
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
-	select {
-	case waitErr := <-waitDone:
-		if waitErr != nil {
-			t.Errorf("cmd.Wait() error = %v, want nil (the process must still be resumed)", waitErr)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("cmd.Wait() did not return within 5s")
+	if waitErr := waittest.Receive(t, waitDone, "cmd.Wait() return"); waitErr != nil {
+		t.Errorf("cmd.Wait() error = %v, want nil (the process must still be resumed)", waitErr)
 	}
 	_ = oc.group.Kill()
 
@@ -979,10 +882,7 @@ func TestStartRefusesResumeOfLaunchCancelledDuringAssignment(t *testing.T) {
 				assignSeam = cancel
 				resumeSeam = func() {
 					if hooked {
-						select {
-						case <-hookReturned:
-						case <-time.After(5 * time.Second):
-						}
+						waittest.ReceiveWithin(hookReturned, waittest.HangGuard)
 					}
 				}
 
@@ -995,13 +895,13 @@ func TestStartRefusesResumeOfLaunchCancelledDuringAssignment(t *testing.T) {
 				if cmd.Process == nil {
 					t.Fatalf("%s left cmd.Process nil, want the suspended process started", st.name)
 				}
-				assertCaptureWinProcessGone(t, cmd.Process.Pid, 5*time.Second)
-				for deadline := time.Now().Add(5 * time.Second); lookupGroup(cmd) != nil; time.Sleep(10 * time.Millisecond) {
-					if time.Now().After(deadline) {
-						t.Error("lookupGroup(cmd) != nil after 5s, want the refused launch's record forgotten")
-						break
+				waittest.ProcessGone(t, cmd.Process.Pid)
+				waittest.Until(t, func() error {
+					if lookupGroup(cmd) != nil {
+						return errors.New("lookupGroup(cmd) != nil, want the refused launch's record forgotten")
 					}
-				}
+					return nil
+				})
 				if _, statErr := os.Stat(markerPath); statErr == nil {
 					t.Errorf("%s ran the command: marker file exists, want the cancelled launch never resumed", st.name)
 				}

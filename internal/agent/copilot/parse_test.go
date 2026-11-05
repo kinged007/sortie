@@ -2,7 +2,6 @@ package copilot
 
 import (
 	"bufio"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +57,7 @@ func TestParseEvent(t *testing.T) {
 	}{
 		{
 			name:     "result event with sessionId and exit code 0",
-			line:     `{"type":"result","timestamp":"2026-01-01T00:00:00Z","sessionId":"aaa-bbb-ccc","exitCode":0,"usage":{"premiumRequests":5,"totalApiDurationMs":1000,"sessionDurationMs":2000}}`,
+			line:     `{"type":"result","timestamp":"2026-01-01T00:00:00Z","sessionId":"aaa-bbb-ccc","exitCode":0,"usage":{"totalApiDurationMs":1000,"sessionDurationMs":2000}}`,
 			wantType: "result",
 			check: func(t *testing.T, ev rawEvent) {
 				t.Helper()
@@ -73,9 +72,6 @@ func TestParseEvent(t *testing.T) {
 				}
 				if ev.Usage == nil {
 					t.Fatal("Usage is nil")
-				}
-				if ev.Usage.PremiumRequests != 5 {
-					t.Errorf("Usage.PremiumRequests = %d, want 5", ev.Usage.PremiumRequests)
 				}
 				if ev.Usage.TotalAPIDurMS != 1000 {
 					t.Errorf("Usage.TotalAPIDurMS = %d, want 1000", ev.Usage.TotalAPIDurMS)
@@ -409,9 +405,6 @@ func TestParseFixture_SimpleSession(t *testing.T) {
 	if result.Usage == nil {
 		t.Fatal("result.Usage is nil")
 	}
-	if result.Usage.PremiumRequests != 6 {
-		t.Errorf("result.Usage.PremiumRequests = %d, want 6", result.Usage.PremiumRequests)
-	}
 	if result.Usage.TotalAPIDurMS != 6866 {
 		t.Errorf("result.Usage.TotalAPIDurMS = %d, want 6866", result.Usage.TotalAPIDurMS)
 	}
@@ -629,39 +622,6 @@ func TestParseFixture_ResumeSession(t *testing.T) {
 	}
 	if *result.ExitCode != 0 {
 		t.Errorf("result.ExitCode = %d, want 0", *result.ExitCode)
-	}
-}
-
-// TestParseFixture_SessionShutdown parses session_shutdown.jsonl,
-// captured from Copilot CLI 1.0.78's session-state events journal, and
-// verifies both records decode into shutdownEvent with the
-// modelMetrics totals the fixture carries.
-func TestParseFixture_SessionShutdown(t *testing.T) {
-	t.Parallel()
-
-	lines := scanFixtureLines(t, "session_shutdown.jsonl")
-	if len(lines) != 2 {
-		t.Fatalf("session_shutdown.jsonl: got %d lines, want 2", len(lines))
-	}
-
-	events := make([]shutdownEvent, len(lines))
-	for i, line := range lines {
-		if err := json.Unmarshal(line, &events[i]); err != nil {
-			t.Fatalf("unmarshal shutdownEvent(line %d): %v", i+1, err)
-		}
-		if events[i].Type != "session.shutdown" {
-			t.Errorf("event[%d].Type = %q, want %q", i, events[i].Type, "session.shutdown")
-		}
-	}
-
-	first := events[0].Data.ModelMetrics["claude-sonnet-5"].Usage
-	if first.InputTokens != 193011 || first.OutputTokens != 596 || first.CacheReadTokens != 154053 {
-		t.Errorf("first record usage = %+v, want (193011, 596, cacheRead 154053)", first)
-	}
-
-	second := events[1].Data.ModelMetrics["claude-sonnet-5"].Usage
-	if second.InputTokens != 271924 || second.OutputTokens != 696 {
-		t.Errorf("second record usage = %+v, want (271924, 696)", second)
 	}
 }
 

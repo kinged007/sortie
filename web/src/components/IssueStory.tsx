@@ -1,28 +1,36 @@
 import { Collapsible } from "@base-ui/react/collapsible";
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router";
+import { useLocation } from "react-router";
 
 import { useHistoryRunsQuery, useStateQuery } from "@/api/queries";
 import { useNow } from "@/app/live";
+import { AgentStatement } from "@/components/AgentStatement";
+import { NotedFigure } from "@/components/NotedFigure";
+import { NameText } from "@/components/NameText";
 import { ServedText } from "@/components/ServedText";
+import { Parts } from "@/components/Parts";
 import { StatusMark } from "@/components/StatusMark";
+import { Beat, TIME_EDGE, Timeline } from "@/components/Timeline";
+import { KindsFigure, kindsOfTokenInfo } from "@/components/TokenKinds";
+import { Link } from "@/components/carried-links";
 import { Button, buttonStyles } from "@/components/ui/button";
+import { MONO } from "@/components/ui/mono";
 import { hasRateSource } from "@/lib/budget";
 import { cn } from "@/lib/cn";
 import {
-  costText,
   NOT_MEASURED,
-  costTitle,
-  runCostText,
+  liveCostFigure,
+  runCostFigure,
   runningTokensText,
-  runTokensText,
+  runTokensFigure,
+  tokensKindFigure,
 } from "@/lib/figures";
 import { closingClock } from "@/lib/ended";
 import { fmtClock, fmtDuration, lowerFirst, parseInstant, plural, pluralVerb } from "@/lib/format";
 import { sessionLinkOf } from "@/lib/issue-link";
-import { agentLabel, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
+import { agentLabel, hopLabel, hopReason, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { agentStatement, runOutcome } from "@/lib/run-status";
 
 import type { ReactNode } from "react";
 
@@ -36,8 +44,6 @@ import type { StagePosition, StageProgress } from "@/lib/lane";
 import type { Mark } from "@/lib/run-status";
 
 const PULL_REQUEST_KEY = "pull_request";
-
-const SEP = " · ";
 
 type StoryRun =
   | { kind: "run"; run: RunResponse; number: number }
@@ -62,10 +68,6 @@ function secondsBetween(from: number | null, to: number | null): number | null {
   return from === null || to === null || to < from ? null : (to - from) / 1000;
 }
 
-/**
- * Merges the served runs with the loaded older pages into one list without
- * repeats, oldest first.
- */
 export function storyRunsOf(
   served: readonly RunResponse[],
   pages: readonly RunsResponse[],
@@ -109,9 +111,9 @@ function chaptersOf(items: readonly StoryRun[]): Chapter[] {
   return chapters;
 }
 
-function agentLineOf(item: StoryRun | undefined): string | undefined {
+function agentPartsOf(item: StoryRun | undefined): ReactNode[] {
   if (item === undefined) {
-    return undefined;
+    return [];
   }
   const kind = item.kind === "live" ? item.running.agent_kind : item.run.agent_kind;
   const model =
@@ -119,37 +121,38 @@ function agentLineOf(item: StoryRun | undefined): string | undefined {
       ? item.running.model_name || item.running.configured_model
       : item.run.model_name || item.run.configured_model;
   if (!kind) {
-    return undefined;
+    return [];
   }
-  return model ? `${agentLabel(kind)}${SEP}${modelLabel(model)}` : agentLabel(kind);
+  const agent = <NameText key="agent" name={kind} label={agentLabel(kind)} />;
+  return model ? [agent, <NameText key="model" name={model} label={modelLabel(model)} />] : [agent];
 }
 
 function chapterHeadOf(
   chapter: Chapter,
   position: StagePosition | null,
-  pullRequest: number | undefined,
-): { title: string; sub: string | undefined } {
+): { title: string; sub: ReactNode[] } {
   if (chapter.key === PULL_REQUEST_KEY) {
-    return {
-      title: pullRequest === undefined ? "Pull request" : `Pull request #${pullRequest}`,
-      sub: undefined,
-    };
+    return { title: "PR loop", sub: [] };
   }
-  const agent = agentLineOf(chapter.items[0]);
+  const agent = agentPartsOf(chapter.items[0]);
   if (position !== null && position.chain.includes(chapter.key)) {
     const stage = `Stage ${position.chain.indexOf(chapter.key) + 1} of ${position.chain.length}`;
     return {
       title: `${ruleLabel(chapter.key)}${chapter.isAgain ? ", again" : ""}`,
-      sub: agent === undefined ? stage : `${stage}${SEP}${agent}`,
+      sub: [stage, ...agent],
     };
   }
   if (chapter.key === "") {
     return { title: "Work", sub: agent };
   }
-  const rule = `Rule ${ruleLabel(chapter.key)}`;
   return {
     title: "Work",
-    sub: agent === undefined ? rule : `${rule}${SEP}${agent}`,
+    sub: [
+      <span key="rule">
+        Rule <NameText name={chapter.key} label={ruleLabel(chapter.key)} />
+      </span>,
+      ...agent,
+    ],
   };
 }
 
@@ -157,25 +160,22 @@ function endWordOf(last: StoryRun): string {
   if (last.kind === "live") {
     return "running";
   }
-  const { stage_result: result, stage_target: target, status } = last.run;
-  if (target && (result === "advanced" || result === "partial")) {
-    return `moved to ${ruleLabel(target)}`;
+  const { stage_result: result, stage_target: target } = last.run;
+  if (target && result) {
+    return hopLabel(target, result);
   }
-  if (target && (result === "failed" || result === "ceiling")) {
-    return `hop to ${ruleLabel(target)} not made: ${result}`;
-  }
-  return runStatus(status).word.toLowerCase();
+  return lowerFirst(runOutcome(last.run).word);
 }
 
-function foldedLineOf(chapter: Chapter): string {
+function foldedPartsOf(chapter: Chapter): string[] {
   const first = chapter.items[0];
   const last = chapter.items.at(-1);
   if (first === undefined || last === undefined) {
-    return "";
+    return [];
   }
   const end = endOf(last);
   const span = `${fmtClock(startOf(first))} to ${end === null ? "now" : fmtClock(end)}`;
-  return [plural(chapter.items.length, "run", "runs"), span, endWordOf(last)].join(SEP);
+  return [plural(chapter.items.length, "run", "runs"), span, endWordOf(last)];
 }
 
 function originOf(item: StoryRun): string | undefined {
@@ -187,6 +187,7 @@ function originOf(item: StoryRun): string | undefined {
   return trigger === "error" ||
     trigger === "stall" ||
     trigger === "continuation" ||
+    trigger === "usage_limit" ||
     trigger === "ci_fix"
     ? startLabel(trigger, "trigger")
     : undefined;
@@ -202,108 +203,105 @@ interface RunCardProps {
 function RunCard({ item, identifier, now, hasEstimates }: RunCardProps) {
   const location = useLocation();
   const isLive = item.kind === "live";
-  const status = isLive ? { word: "Running", mark: "running" as Mark } : runStatus(item.run.status);
+  const status = isLive ? { word: "Running", mark: "running" as Mark } : runOutcome(item.run);
   const origin = originOf(item);
   const started = parseInstant(startOf(item));
   const end = endOf(item);
   const duration = fmtDuration(secondsBetween(started, end === null ? now : parseInstant(end)));
   const turns = isLive ? item.running.turn_count : item.run.turns_completed;
-  const tokens = isLive ? runningTokensText(item.running) : runTokensText(item.run);
+  const tokens = isLive ? (
+    <NotedFigure figure={{ text: runningTokensText(item.running) }} />
+  ) : (
+    <KindsFigure
+      figure={runTokensFigure(item.run)}
+      kinds={item.run.uncached_tokens === null ? null : kindsOfTokenInfo(item.run.tokens)}
+      figureOf={tokensKindFigure(item.run.usage_completeness === "lower_bound")}
+    />
+  );
   const cost = isLive
-    ? costText(item.running.cost_status, item.running.estimated_cost_usd)
-    : runCostText(item.run);
-  const costHover = isLive
-    ? costTitle(item.running.cost_status, item.running.estimated_cost_usd)
-    : costTitle(item.run.cost_status, item.run.estimated_cost_usd);
+    ? liveCostFigure(item.running.cost_status, item.running.estimated_cost_usd, "session")
+    : runCostFigure(item.run);
   const error = isLive ? null : item.run.error;
+  const statement = isLive ? null : agentStatement(item.run);
   const dispatchId = isLive ? item.running.dispatch_id : item.run.dispatch_id;
   const session = dispatchId ? sessionLinkOf(identifier, dispatchId, location) : undefined;
 
   return (
-    <div className="flex flex-col gap-xxs rounded-xl border border-line bg-canvas px-md py-sm">
+    <div className="@container flex flex-col gap-xxs">
       <div className="flex flex-wrap items-baseline gap-x-sm gap-y-xxs">
         <strong className="text-body-md font-bold text-ink">
           {item.kind === "live" ? "Live run" : `Run ${item.number}`}
         </strong>
-        {status.mark === null ? (
-          <span className="text-body-sm text-ink-body">{lowerFirst(status.word)}</span>
-        ) : (
-          <StatusMark mark={status.mark} label={lowerFirst(status.word)} className="text-body-sm" />
-        )}
-        {origin === undefined ? undefined : (
-          <span className="text-body-sm text-ink-muted">{lowerFirst(origin)}</span>
-        )}
-        <span className="ml-auto text-body-sm whitespace-nowrap text-ink-muted tabular-nums">
-          {`${fmtClock(startOf(item))} to ${end === null ? "now" : fmtClock(end)}${SEP}${duration}`}
-        </span>
+        <Parts
+          className="text-body-sm"
+          parts={[
+            status.mark === null ? (
+              <span key="status" className="text-ink-body">
+                {lowerFirst(status.word)}
+              </span>
+            ) : (
+              <StatusMark key="status" mark={status.mark} label={lowerFirst(status.word)} />
+            ),
+            ...(origin === undefined
+              ? []
+              : [
+                  <span key="origin" className="text-ink-muted">
+                    {lowerFirst(origin)}
+                  </span>,
+                ]),
+          ]}
+        />
+        <Parts
+          parts={[
+            `${fmtClock(startOf(item))} to ${end === null ? "now" : fmtClock(end)}`,
+            duration,
+          ]}
+          className="ml-auto text-body-sm whitespace-nowrap text-ink-muted tabular-nums @max-md:ml-0"
+        />
       </div>
       {error ? <p className="text-body-md text-ink-body">{error}</p> : undefined}
-      <p className="mt-xxs flex flex-wrap gap-x-md gap-y-xxs text-body-sm text-ink-muted">
-        <span>
-          Turns <b className="font-medium text-ink-body tabular-nums">{turns}</b>
-        </span>
-        <span>
-          Tokens{" "}
-          <b className="font-medium text-ink-body tabular-nums">
-            {tokens === NOT_MEASURED ? "not measured" : tokens}
-          </b>
-        </span>
-        {hasEstimates && cost !== NOT_MEASURED ? (
-          <span>
-            Est. cost{" "}
-            <b title={costHover} className="font-medium text-ink-body tabular-nums">
-              {cost}
-            </b>
-          </span>
-        ) : undefined}
-        {session === undefined ? undefined : (
-          <Link
-            to={session.to}
-            state={session.state}
-            className="text-link underline underline-offset-2 hover:text-link-hover focus-visible:outline-2 focus-visible:outline-focus-ring active:text-link-active"
-          >
-            Session timeline
-          </Link>
-        )}
+      {statement === null ? undefined : (
+        <AgentStatement text={statement} className="text-body-md" />
+      )}
+      <p className="mt-xxs text-body-sm text-ink-muted">
+        <Parts
+          parts={[
+            ...(turns > 0
+              ? [
+                  <span key="turns">
+                    Turns <b className="font-medium text-ink-body tabular-nums">{turns}</b>
+                  </span>,
+                ]
+              : []),
+            <span key="tokens">
+              Tokens <b className="font-medium text-ink-body tabular-nums">{tokens}</b>
+            </span>,
+            ...(hasEstimates && cost.text !== NOT_MEASURED
+              ? [
+                  <span key="cost">
+                    Est. cost{" "}
+                    <b className="font-medium text-ink-body tabular-nums">
+                      <NotedFigure figure={cost} />
+                    </b>
+                  </span>,
+                ]
+              : []),
+            ...(session === undefined
+              ? []
+              : [
+                  <Link
+                    key="session"
+                    to={session.to}
+                    state={session.state}
+                    className="text-link underline underline-offset-2 hover:text-link-hover focus-visible:outline-2 focus-visible:outline-focus-ring active:text-link-active"
+                  >
+                    Session timeline
+                  </Link>,
+                ]),
+          ]}
+        />
       </p>
     </div>
-  );
-}
-
-interface BeatProps {
-  time: string;
-  node: "open" | "solid" | "now" | "attention";
-  children: ReactNode;
-}
-
-const NODE: Record<BeatProps["node"], string> = {
-  open: "border-ink-muted bg-canvas",
-  solid: "border-ink-body bg-ink-body",
-  now: "border-primary bg-primary shadow-[0_0_0_3px_var(--color-surface-sunken)]",
-  attention: "border-warning-fill bg-warning-fill",
-};
-
-function Beat({ time, node, children }: BeatProps) {
-  return (
-    <li className="relative grid grid-cols-[48px_20px_minmax(0,1fr)] gap-x-sm py-xs text-body-md max-md:grid-cols-[40px_16px_minmax(0,1fr)]">
-      <span className="pt-xxs text-right text-body-sm text-ink-muted tabular-nums">{time}</span>
-      <span
-        aria-hidden="true"
-        className={cn(
-          "relative z-(--z-raised) mt-xs ml-xxs size-2.25 rounded-full border-[1.5px]",
-          NODE[node],
-        )}
-      />
-      <div className="min-w-0">{children}</div>
-    </li>
-  );
-}
-
-function Beats({ children }: { children: ReactNode }) {
-  return (
-    <ul className="relative before:absolute before:top-xs before:bottom-xs before:left-15 before:w-px before:bg-line max-md:before:left-13">
-      {children}
-    </ul>
   );
 }
 
@@ -337,7 +335,10 @@ function StageSummary({ position, progress, chapters }: StageSummaryProps) {
   if (focus?.kind === "current") {
     const label = (
       <>
-        <b className="font-bold text-ink">{ruleLabel(position.current)}</b> ({k} of {n})
+        <b className="font-bold text-ink">
+          <NameText name={position.current} label={ruleLabel(position.current)} />
+        </b>{" "}
+        ({k} of {n})
       </>
     );
     parts.push(<StatusMark key="focus" mark={focus.mark ?? "current"} label={label} />);
@@ -348,8 +349,10 @@ function StageSummary({ position, progress, chapters }: StageSummaryProps) {
         mark="handed"
         label={
           <>
-            <b className="font-bold text-ink">hop to {ruleLabel(focus.target)} not made</b>:{" "}
-            {focus.result}
+            <b className="font-bold text-ink">
+              hop to <NameText name={focus.target} label={ruleLabel(focus.target)} /> not made
+            </b>
+            : {hopReason(focus.result)}
           </>
         }
       />,
@@ -366,14 +369,7 @@ function StageSummary({ position, progress, chapters }: StageSummaryProps) {
       className="mb-lg rounded-xl border border-line px-md py-sm"
     >
       <div className="flex flex-wrap items-center justify-between gap-md text-body-md text-ink-body">
-        <span className="inline-flex flex-wrap items-baseline gap-xs">
-          {parts.map((part, index) => (
-            <span key={index} className="inline-flex items-baseline gap-xs">
-              {index > 0 ? <span className="text-ink-muted">·</span> : undefined}
-              {part}
-            </span>
-          ))}
-        </span>
+        <Parts parts={parts} className="gap-x-md" />
         <Collapsible.Trigger className={buttonStyles("secondary")}>
           {isOpen ? "Hide stages" : "All stages"}
         </Collapsible.Trigger>
@@ -402,7 +398,7 @@ function StageSummary({ position, progress, chapters }: StageSummaryProps) {
                     <StatusMark mark="current" />
                   ) : undefined}
                 </span>
-                <span className="font-mono">{ruleLabel(stage)}</span>
+                <span className={MONO}>{ruleLabel(stage)}</span>
                 <span className="font-normal text-ink-muted">{span}</span>
               </li>
             );
@@ -418,22 +414,28 @@ interface ChapterBodyProps {
   identifier: string;
   now: number;
   hasEstimates: boolean;
-  /** The served sentence the current chapter ends on. */
   nowLine?: { text: string; time: string; needsAttention: boolean };
 }
 
 function ChapterBeats({ chapter, identifier, now, hasEstimates, nowLine }: ChapterBodyProps) {
   return (
-    <Beats>
-      {chapter.items.map((item) => (
-        <Beat
-          key={item.kind === "live" ? "live" : item.run.run_id}
-          time={fmtClock(startOf(item))}
-          node={item.kind === "live" ? "now" : "solid"}
-        >
-          <RunCard item={item} identifier={identifier} now={now} hasEstimates={hasEstimates} />
-        </Beat>
-      ))}
+    <Timeline>
+      {chapter.items.map((item) =>
+        item.kind === "run" && item.run.status === "ci_failed" ? (
+          <Beat key={item.run.run_id} time={fmtClock(item.run.completed_at)} node="solid">
+            <StatusMark mark="failed" label="CI checks failed" />
+          </Beat>
+        ) : (
+          <Beat
+            key={item.kind === "live" ? "live" : item.run.run_id}
+            time={fmtClock(startOf(item))}
+            node={item.kind === "live" ? "now" : "solid"}
+            isFramed
+          >
+            <RunCard item={item} identifier={identifier} now={now} hasEstimates={hasEstimates} />
+          </Beat>
+        ),
+      )}
       {nowLine === undefined ? undefined : (
         <Beat time={nowLine.time} node={nowLine.needsAttention ? "attention" : "now"}>
           <p className="text-ink">
@@ -441,11 +443,10 @@ function ChapterBeats({ chapter, identifier, now, hasEstimates, nowLine }: Chapt
           </p>
         </Beat>
       )}
-    </Beats>
+    </Timeline>
   );
 }
 
-/** Props of {@link IssueStory}. */
 export interface IssueStoryProps {
   detail: IssueDetailResponse;
   position: StagePosition | null;
@@ -454,13 +455,6 @@ export interface IssueStoryProps {
   needsAttention: boolean;
 }
 
-/**
- * Renders the story of one issue as chapters, one per stage or per run of work
- * on its pull request, each a timeline of its run cards. A chained issue opens
- * with the stage summary and folds every chapter but the current one. The
- * current chapter closes on the issue's served sentence. Older runs load on
- * request.
- */
 export function IssueStory({ detail, position, progress, needsAttention }: IssueStoryProps) {
   const now = useNow();
   const { data: state } = useStateQuery();
@@ -508,14 +502,18 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
   }
 
   const chapters = chaptersOf(items);
-  const pullRequest =
-    detail.pending_reactions?.[0]?.pull_request.number ??
-    detail.history?.issue_outcome?.pull_request?.number;
   const closingTime = closingClock(detail, now);
-  const nowLine = { text: detail.status_text_full, time: closingTime, needsAttention };
+  const nowLine = {
+    text: detail.status_text_full,
+    time: closingTime,
+    needsAttention,
+  };
 
   return (
     <div className="flex min-w-0 flex-col">
+      {position === null ? undefined : (
+        <h2 className="mb-sm font-heading text-h7 font-semibold text-ink">Work</h2>
+      )}
       {position === null || progress === null ? undefined : (
         <StageSummary position={position} progress={progress} chapters={chapters} />
       )}
@@ -533,45 +531,60 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
         </div>
       ) : undefined}
       {chapters.length === 0 ? (
-        <Beats>
+        <Timeline>
           <Beat time={closingTime} node={needsAttention ? "attention" : "now"}>
             <p className="text-ink">
               <ServedText text={detail.status_text_full} />
             </p>
           </Beat>
-        </Beats>
+        </Timeline>
       ) : (
         chapters.map((chapter, index) => {
-          const head = chapterHeadOf(chapter, position, pullRequest);
+          const head = chapterHeadOf(chapter, position);
           const isCurrent = index === chapters.length - 1;
-          if (position !== null && !isCurrent) {
+          const isStage = position !== null && position.chain.includes(chapter.key);
+          if (position !== null && (isStage || !isCurrent)) {
             return (
-              <Collapsible.Root key={chapter.id} className="border-t border-line data-open:pb-md">
-                <Collapsible.Trigger className="group flex w-full cursor-pointer items-baseline gap-sm rounded py-xs text-left hover:bg-item-hover focus-visible:outline-2 focus-visible:outline-focus-ring">
+              <Collapsible.Root
+                key={chapter.id}
+                defaultOpen={isCurrent}
+                className="border-t border-line data-open:pb-md"
+              >
+                <Collapsible.Trigger
+                  className={cn(
+                    TIME_EDGE,
+                    "group flex w-full cursor-pointer items-baseline py-xs text-left hover:bg-item-hover focus-visible:outline-2 focus-visible:outline-focus-ring",
+                  )}
+                >
                   <span
                     aria-hidden="true"
-                    className="w-3 text-ink-muted tabular-nums group-data-panel-open:hidden"
+                    className="w-(--edge) shrink-0 text-ink-muted group-data-panel-open:hidden"
                   >
                     +
                   </span>
                   <span
                     aria-hidden="true"
-                    className="hidden w-3 text-ink-muted tabular-nums group-data-panel-open:inline"
+                    className="hidden w-(--edge) shrink-0 text-ink-muted group-data-panel-open:block"
                   >
                     −
                   </span>
-                  <span className="font-mono text-body-md font-bold text-ink">{head.title}</span>
-                  <span className="text-body-sm text-ink-muted">{foldedLineOf(chapter)}</span>
+                  <span className="mr-sm font-mono text-body-md font-bold text-ink">
+                    {head.title}
+                  </span>
+                  <Parts parts={foldedPartsOf(chapter)} className="text-body-sm text-ink-muted" />
                 </Collapsible.Trigger>
                 <Collapsible.Panel>
-                  {head.sub === undefined ? undefined : (
-                    <p className="mb-sm text-body-sm text-ink-muted">{head.sub}</p>
+                  {head.sub.length === 0 ? undefined : (
+                    <p className={cn(TIME_EDGE, "mb-sm pl-(--edge) text-ink-muted")}>
+                      <Parts parts={head.sub} />
+                    </p>
                   )}
                   <ChapterBeats
                     chapter={chapter}
                     identifier={detail.issue_identifier}
                     now={now}
                     hasEstimates={hasEstimates}
+                    {...(isCurrent ? { nowLine } : {})}
                   />
                 </Collapsible.Panel>
               </Collapsible.Root>
@@ -579,9 +592,11 @@ export function IssueStory({ detail, position, progress, needsAttention }: Issue
           }
           return (
             <section key={chapter.id} className={cn("mb-xl", index > 0 && "mt-lg")}>
-              <h2 className="font-heading text-h6 font-semibold text-ink">{head.title}</h2>
-              {head.sub === undefined ? undefined : (
-                <p className="mb-sm text-body-sm text-ink-muted">{head.sub}</p>
+              <h2 className="font-heading text-h7 font-semibold text-ink">{head.title}</h2>
+              {head.sub.length === 0 ? undefined : (
+                <p className="mb-sm text-body-sm text-ink-muted">
+                  <Parts parts={head.sub} />
+                </p>
               )}
               <ChapterBeats
                 chapter={chapter}

@@ -11,9 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // captureWriter records every Write call under a mutex so a test can
@@ -178,32 +178,24 @@ func TestConn_RoutesEveryNonMatchingMessageWhileCallInFlight(t *testing.T) {
 		jsonrpc.KindRequest,
 	}
 	for i, want := range wantKinds {
-		select {
-		case msg := <-tc.handled:
-			if msg.Kind != want {
-				t.Errorf("delivered message %d Kind = %v, want %v", i, msg.Kind, want)
-			}
-			if want == jsonrpc.KindMalformed && msg.Err == nil {
-				t.Errorf("delivered message %d Err = nil, want non-nil", i)
-			}
-			if want == jsonrpc.KindRequest && !msg.ID.Equal(jsonrpc.NumberID(7)) {
-				t.Errorf("delivered message %d ID = %s, want %s", i, msg.ID, jsonrpc.NumberID(7))
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for delivered message %d (Kind %v)", i, want)
+		msg := waittest.Receive(t, tc.handled, fmt.Sprintf("delivered message %d (Kind %v)", i, want))
+		if msg.Kind != want {
+			t.Errorf("delivered message %d Kind = %v, want %v", i, msg.Kind, want)
+		}
+		if want == jsonrpc.KindMalformed && msg.Err == nil {
+			t.Errorf("delivered message %d Err = nil, want non-nil", i)
+		}
+		if want == jsonrpc.KindRequest && !msg.ID.Equal(jsonrpc.NumberID(7)) {
+			t.Errorf("delivered message %d ID = %s, want %s", i, msg.ID, jsonrpc.NumberID(7))
 		}
 	}
 
-	select {
-	case outcome := <-done:
-		if outcome.err != nil {
-			t.Fatalf("Call() error = %v, want nil", outcome.err)
-		}
-		if !outcome.resp.ID.Equal(jsonrpc.NumberID(id)) {
-			t.Errorf("Call() response ID = %s, want %s", outcome.resp.ID, jsonrpc.NumberID(id))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to return its own response")
+	outcome := waittest.Receive(t, done, "Call() return its own response")
+	if outcome.err != nil {
+		t.Fatalf("Call() error = %v, want nil", outcome.err)
+	}
+	if !outcome.resp.ID.Equal(jsonrpc.NumberID(id)) {
+		t.Errorf("Call() response ID = %s, want %s", outcome.resp.ID, jsonrpc.NumberID(id))
 	}
 
 	select {
@@ -224,16 +216,12 @@ func TestConn_NotificationBeforeAnyCallReachesSink(t *testing.T) {
 
 	writeLine(t, tc.peerW, `{"method":"thread/started","params":{"threadId":"abc-123"}}`)
 
-	select {
-	case msg := <-tc.handled:
-		if msg.Kind != jsonrpc.KindNotification {
-			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
-		}
-		if msg.Method != "thread/started" {
-			t.Errorf("delivered message Method = %q, want %q", msg.Method, "thread/started")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("sink did not receive a notification delivered before any call")
+	msg := waittest.Receive(t, tc.handled, "the sink to receive a notification delivered before any call")
+	if msg.Kind != jsonrpc.KindNotification {
+		t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
+	}
+	if msg.Method != "thread/started" {
+		t.Errorf("delivered message Method = %q, want %q", msg.Method, "thread/started")
 	}
 }
 
@@ -246,13 +234,9 @@ func TestConn_CallContextDone(t *testing.T) {
 
 	cancel()
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, context.Canceled) {
-			t.Errorf("Call() error = %v, want error satisfying errors.Is(err, context.Canceled)", outcome.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to return after context cancellation")
+	outcome := waittest.Receive(t, done, "Call() return after context cancellation")
+	if !errors.Is(outcome.err, context.Canceled) {
+		t.Errorf("Call() error = %v, want error satisfying errors.Is(err, context.Canceled)", outcome.err)
 	}
 }
 
@@ -266,17 +250,13 @@ func TestConn_CallCleanEOF(t *testing.T) {
 		t.Fatalf("peerW.Close() error = %v", err)
 	}
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, io.EOF) {
-			t.Errorf("Call() error = %v, want error wrapping io.EOF", outcome.err)
-		}
-		want := fmt.Sprintf("unexpected EOF waiting for response id=%d", id)
-		if outcome.err.Error() != want {
-			t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to fail on a clean end of stream")
+	outcome := waittest.Receive(t, done, "Call() failure on a clean end of stream")
+	if !errors.Is(outcome.err, io.EOF) {
+		t.Errorf("Call() error = %v, want error wrapping io.EOF", outcome.err)
+	}
+	want := fmt.Sprintf("unexpected EOF waiting for response id=%d", id)
+	if outcome.err.Error() != want {
+		t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
 	}
 }
 
@@ -291,17 +271,13 @@ func TestConn_CallReadFailure(t *testing.T) {
 		t.Fatalf("peerW.CloseWithError() error = %v", err)
 	}
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, readErr) {
-			t.Errorf("Call() error = %v, want error wrapping %v", outcome.err, readErr)
-		}
-		want := fmt.Sprintf("scanner error waiting for response id=%d: %s", id, readErr)
-		if outcome.err.Error() != want {
-			t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to fail on a read error")
+	outcome := waittest.Receive(t, done, "Call() failure on a read error")
+	if !errors.Is(outcome.err, readErr) {
+		t.Errorf("Call() error = %v, want error wrapping %v", outcome.err, readErr)
+	}
+	want := fmt.Sprintf("scanner error waiting for response id=%d: %s", id, readErr)
+	if outcome.err.Error() != want {
+		t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
 	}
 }
 
@@ -313,17 +289,13 @@ func TestConn_CallErrClosed(t *testing.T) {
 
 	tc.conn.Close()
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, jsonrpc.ErrClosed) {
-			t.Errorf("Call() error = %v, want error wrapping jsonrpc.ErrClosed", outcome.err)
-		}
-		want := fmt.Sprintf("connection closed waiting for response id=%d", id)
-		if outcome.err.Error() != want {
-			t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to fail after Close")
+	outcome := waittest.Receive(t, done, "Call() failure after Close")
+	if !errors.Is(outcome.err, jsonrpc.ErrClosed) {
+		t.Errorf("Call() error = %v, want error wrapping jsonrpc.ErrClosed", outcome.err)
+	}
+	want := fmt.Sprintf("connection closed waiting for response id=%d", id)
+	if outcome.err.Error() != want {
+		t.Errorf("Call() error = %q, want %q", outcome.err.Error(), want)
 	}
 }
 
@@ -342,32 +314,20 @@ func TestConn_OverLongLineFailsRead(t *testing.T) {
 		_, _ = tc.peerW.Write(overLong)
 	}()
 
-	select {
-	case msg := <-tc.handled:
-		if msg.Kind != jsonrpc.KindStreamEnd {
-			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
-		}
-		if !errors.Is(msg.Err, bufio.ErrTooLong) {
-			t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for KindStreamEnd on an over-long line")
+	msg := waittest.Receive(t, tc.handled, "KindStreamEnd on an over-long line")
+	if msg.Kind != jsonrpc.KindStreamEnd {
+		t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
+	}
+	if !errors.Is(msg.Err, bufio.ErrTooLong) {
+		t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
 	}
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, bufio.ErrTooLong) {
-			t.Errorf("Call() error = %v, want error wrapping bufio.ErrTooLong", outcome.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Call to fail on an over-long line")
+	outcome := waittest.Receive(t, done, "Call() failure on an over-long line")
+	if !errors.Is(outcome.err, bufio.ErrTooLong) {
+		t.Errorf("Call() error = %v, want error wrapping bufio.ErrTooLong", outcome.err)
 	}
 
-	select {
-	case <-tc.conn.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() did not close after an over-long line")
-	}
+	waittest.Receive(t, tc.conn.Done(), "Done() close after an over-long line")
 }
 
 // TestConn_RespondError_WritesExactBytes checks the exact bytes
@@ -485,11 +445,7 @@ func TestConn_ConcurrentCallsGetUniqueIDsAndCompleteLines(t *testing.T) {
 	if err := reqW.Close(); err != nil {
 		t.Fatalf("reqW.Close() error = %v", err)
 	}
-	select {
-	case <-peerDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the fake peer to observe the closed pipe")
-	}
+	waittest.Receive(t, peerDone, "the fake peer to observe the closed pipe")
 	if peerErr != nil {
 		t.Errorf("fake peer read requests: %v", peerErr)
 	}
@@ -525,11 +481,7 @@ func TestConn_DoneClosesAfterCloseAndReaderClose(t *testing.T) {
 		t.Fatalf("pr.Close() error = %v", err)
 	}
 
-	select {
-	case <-conn.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() did not close after Close and reader close")
-	}
+	waittest.Receive(t, conn.Done(), "Done() close after Close and reader close")
 }
 
 // TestConn_VersionMember checks that WithVersionMember makes the
@@ -617,13 +569,9 @@ func TestConn_MaxLineBytesOptionIsPerConnection(t *testing.T) {
 		tc := newTestConn(t)
 		writeLine(t, tc.peerW, line)
 
-		select {
-		case msg := <-tc.handled:
-			if msg.Kind != jsonrpc.KindNotification {
-				t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for a line within the default MaxLineBytes")
+		msg := waittest.Receive(t, tc.handled, "a line within the default MaxLineBytes")
+		if msg.Kind != jsonrpc.KindNotification {
+			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindNotification)
 		}
 	})
 
@@ -641,16 +589,12 @@ func TestConn_MaxLineBytesOptionIsPerConnection(t *testing.T) {
 			_, _ = io.WriteString(tc.peerW, line+"\n")
 		}()
 
-		select {
-		case msg := <-tc.handled:
-			if msg.Kind != jsonrpc.KindStreamEnd {
-				t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
-			}
-			if !errors.Is(msg.Err, bufio.ErrTooLong) {
-				t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for KindStreamEnd on a line over the custom bound")
+		msg := waittest.Receive(t, tc.handled, "KindStreamEnd on a line over the custom bound")
+		if msg.Kind != jsonrpc.KindStreamEnd {
+			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindStreamEnd)
+		}
+		if !errors.Is(msg.Err, bufio.ErrTooLong) {
+			t.Errorf("delivered message Err = %v, want error wrapping bufio.ErrTooLong", msg.Err)
 		}
 	})
 }
@@ -668,16 +612,12 @@ func TestConn_UnmatchedStringIDResponseReachesSink(t *testing.T) {
 
 	writeLine(t, tc.peerW, `{"id":"unmatched-string","result":{"ok":true}}`)
 
-	select {
-	case msg := <-tc.handled:
-		if msg.Kind != jsonrpc.KindResponse {
-			t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindResponse)
-		}
-		if _, isNumber := msg.ID.Number(); isNumber {
-			t.Error("delivered message ID.Number() reported a number, want a non-numeric id")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the sink to receive the unmatched string-id response")
+	msg := waittest.Receive(t, tc.handled, "the sink to receive the unmatched string-id response")
+	if msg.Kind != jsonrpc.KindResponse {
+		t.Errorf("delivered message Kind = %v, want %v", msg.Kind, jsonrpc.KindResponse)
+	}
+	if _, isNumber := msg.ID.Number(); isNumber {
+		t.Error("delivered message ID.Number() reported a number, want a non-numeric id")
 	}
 }
 
@@ -772,21 +712,17 @@ func TestConn_ReadsALineLargerThanTheInitialBuffer(t *testing.T) {
 		wrote <- err
 	}()
 
+	ctx := waittest.Context(t)
 	select {
 	case err := <-wrote:
 		if err != nil {
 			t.Fatalf("write line: %v", err)
 		}
-		select {
-		case msg := <-tc.handled:
-			assertBigNotification(t, msg)
-		case <-time.After(5 * time.Second):
-			t.Fatal("no message reached the sink for a line above the initial buffer")
-		}
+		assertBigNotification(t, waittest.Receive(t, tc.handled, "a message at the sink for a line above the initial buffer"))
 	case msg := <-tc.handled:
 		assertBigNotification(t, msg)
-	case <-time.After(5 * time.Second):
-		t.Fatal("no message reached the sink for a line above the initial buffer")
+	case <-ctx.Done():
+		t.Fatalf("no message reached the sink for a line above the initial buffer within %v", waittest.HangGuard)
 	}
 }
 
@@ -879,17 +815,10 @@ func TestConn_CloseReturnsWithWriteParked(t *testing.T) {
 	t.Cleanup(func() {
 		_ = pr.Close()
 		_ = pw.Close()
-		select {
-		case <-written:
-		case <-time.After(2 * time.Second):
-		}
+		waittest.Receive(t, written, "the parked Notify to return")
 	})
 
-	select {
-	case <-sig.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the write to enter the wrapped writer")
-	}
+	waittest.Receive(t, sig.done, "the write to enter the wrapped writer")
 
 	closeReturned := make(chan struct{})
 	go func() {
@@ -897,11 +826,7 @@ func TestConn_CloseReturnsWithWriteParked(t *testing.T) {
 		close(closeReturned)
 	}()
 
-	select {
-	case <-closeReturned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close() did not return while a write was parked on a writer that does not accept bytes")
-	}
+	waittest.Receive(t, closeReturned, "Close() return while a write was parked on a writer that does not accept bytes")
 }
 
 // TestConn_WriteAfterCloseReportsErrClosedWithoutTouchingWriter checks

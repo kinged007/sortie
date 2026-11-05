@@ -2,10 +2,13 @@ package orchestrator
 
 import (
 	"maps"
-	"path/filepath"
+	"net/url"
 	"slices"
+	"strings"
 
 	"github.com/sortie-ai/sortie/internal/config"
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 // WorkflowShape reports the effective workflow shape served on the state API.
@@ -18,9 +21,13 @@ type WorkflowShape struct {
 	Reactions ShapeReactions `json:"reactions"`
 }
 
-// ShapeTracker reports the tracker kind and the states the workflow acts on.
+// ShapeTracker reports the tracker kind and project the poll loop's adapter was
+// built with, the project's web address when the adapter names one, and the
+// states the workflow acts on.
 type ShapeTracker struct {
 	Kind            string   `json:"kind"`
+	Project         string   `json:"project,omitempty"`
+	ProjectURL      string   `json:"project_url,omitempty"`
 	ActiveStates    []string `json:"active_states"`
 	InProgressState string   `json:"in_progress_state,omitempty"`
 	HandoffState    string   `json:"handoff_state,omitempty"`
@@ -174,14 +181,18 @@ type ShapeLabelCommands struct {
 // WorkflowShape returns the effective workflow shape. Safe for concurrent use.
 //
 // Reaction entries other than the CI failure members come from fields set at
-// construction, so a reload neither adds nor removes one.
+// construction, so a reload neither adds nor removes one. The tracker kind and
+// project are fixed at construction too, because the adapter is not rebuilt on
+// reload.
 func (o *Orchestrator) WorkflowShape() WorkflowShape {
 	cfg := o.workflowManager.Config()
-	worker, remote := o.shapeWorker(cfg)
+	worker := o.shapeWorker(cfg)
 
 	return WorkflowShape{
 		Tracker: ShapeTracker{
-			Kind:            cfg.Tracker.Kind,
+			Kind:            o.trackerKind,
+			Project:         o.trackerProject,
+			ProjectURL:      o.trackerProjectURL(),
 			ActiveStates:    copyStrings(cfg.Tracker.ActiveStates),
 			InProgressState: cfg.Tracker.InProgressState,
 			HandoffState:    cfg.Tracker.HandoffState,
@@ -191,7 +202,7 @@ func (o *Orchestrator) WorkflowShape() WorkflowShape {
 		Polling: ShapePolling{IntervalMS: cfg.Polling.IntervalMS},
 		Agent: ShapeAgent{
 			Kind:                       cfg.Agent.Kind,
-			UsageArrival:               o.usageArrival(cfg, cfg.Agent.Kind, "", remote),
+			UsageArrival:               o.usageArrival(cfg.Agent.Kind),
 			MaxTurns:                   cfg.Agent.TurnLimit(),
 			StallTimeoutMS:             positiveOrNil(cfg.Agent.StallTimeoutMS),
 			MaxRetryBackoffMS:          cfg.Agent.MaxRetryBackoffMS,
@@ -202,13 +213,13 @@ func (o *Orchestrator) WorkflowShape() WorkflowShape {
 			MaxConcurrentAgentsByState: copyCaps(cfg.Agent.MaxConcurrentByState),
 		},
 		Worker:    worker,
-		Dispatch:  o.shapeDispatch(cfg, remote),
+		Dispatch:  o.shapeDispatch(cfg),
 		Reactions: o.shapeReactions(cfg),
 	}
 }
 
-// shapeWorker reports the worker members and whether launches are remote.
-func (o *Orchestrator) shapeWorker(cfg config.ServiceConfig) (ShapeWorker, bool) {
+// shapeWorker reports the worker members.
+func (o *Orchestrator) shapeWorker(cfg config.ServiceConfig) ShapeWorker {
 	parsed := ParseWorkerConfig(cfg.ExtensionSection("worker"), cfg.ExtensionEnvRefPaths("worker"))
 
 	hosts := make([]string, 0, len(parsed.SSHHosts))
@@ -222,22 +233,22 @@ func (o *Orchestrator) shapeWorker(cfg config.ServiceConfig) (ShapeWorker, bool)
 	if len(hosts) > 0 {
 		worker.MaxConcurrentAgentsPerHost = positiveOrNil(parsed.MaxPerHost)
 	}
-	return worker, len(hosts) > 0
+	return worker
 }
 
-// usageArrival resolves the arrival a session of kind under ruleName starts
-// with, through the code an attempt uses. Only the arrival leaves: the
-// settings passthrough can hold credentials.
-func (o *Orchestrator) usageArrival(cfg config.ServiceConfig, kind, ruleName string, remote bool) string {
-	settings := config.ResolveAgentSettings(cfg,
-		config.SettingsSelection{Kind: kind, RuleName: ruleName},
-		filepath.Dir(o.workflowManager.WorkflowAbsPath()))
+// usageArrival resolves the arrival a session of kind starts with, through the
+// code an attempt uses. A session that can carry no token figure shows none, as
+// preflight warns.
+func (o *Orchestrator) usageArrival(kind string) string {
 	meta, registered := o.preflightParams.AgentRegistry.Meta(kind)
-	arrival, _ := usageDisposition(meta, registered, settings.Passthrough, remote)
+	arrival, _, carriesTokenFigure := usageDisposition(meta, registered)
+	if !carriesTokenFigure {
+		return string(registry.UsageArrivalNone)
+	}
 	return string(arrival)
 }
 
-func (o *Orchestrator) shapeDispatch(cfg config.ServiceConfig, remote bool) ShapeDispatch {
+func (o *Orchestrator) shapeDispatch(cfg config.ServiceConfig) ShapeDispatch {
 	dispatch := cfg.Dispatch
 
 	rules := make([]ShapeRule, 0, len(dispatch.Rules))
@@ -247,7 +258,7 @@ func (o *Orchestrator) shapeDispatch(cfg config.ServiceConfig, remote bool) Shap
 			Name:         rule.Name,
 			Next:         rule.Next,
 			AgentKind:    kind,
-			UsageArrival: o.usageArrival(cfg, kind, rule.Name, remote),
+			UsageArrival: o.usageArrival(kind),
 		}
 		switch {
 		case rule.Stage != "":
@@ -266,7 +277,7 @@ func (o *Orchestrator) shapeDispatch(cfg config.ServiceConfig, remote bool) Shap
 	if resolution, ok := defaultSelection(dispatch, cfg.Agent.Kind, ""); ok {
 		fallback = &ShapeSelection{
 			AgentKind:    resolution.AgentKind,
-			UsageArrival: o.usageArrival(cfg, resolution.AgentKind, resolution.RuleName, remote),
+			UsageArrival: o.usageArrival(resolution.AgentKind),
 		}
 	}
 
@@ -422,4 +433,33 @@ func positiveOrNil[T int | float64](n T) *T {
 		return nil
 	}
 	return &n
+}
+
+// trackerProjectURL returns the web address of the tracker's project, or ""
+// when the adapter names none or names one that is not an absolute http(s)
+// URL. Credentials, query and fragment never reach the state API, so no
+// adapter has to scrub its own address.
+func (o *Orchestrator) trackerProjectURL() string {
+	linker, ok := o.trackerAdapter.(domain.ProjectLinker)
+	if !ok {
+		return ""
+	}
+	return publicProjectURL(linker.ProjectURL())
+}
+
+// publicProjectURL reduces raw to scheme, host and path, or "" when raw is
+// not an absolute http(s) URL with a host.
+func publicProjectURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+		return ""
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	return parsed.String()
 }

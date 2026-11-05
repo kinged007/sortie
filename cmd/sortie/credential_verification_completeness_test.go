@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 const credentialCompletenessImportPath = "github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
@@ -68,5 +70,50 @@ func TestFixtureSomethingElse(t *testing.T) {}
 	want := []string{"credential-uncovered-kind", "credential-missing-kind"}
 	if !slices.Equal(got, want) {
 		t.Errorf("kindsMissingCoverage(%v, %q) = %v, want %v", kinds, root, got, want)
+	}
+}
+
+func kindsMissingVerificationContext(kinds []string, lookup func(kind string) (registry.AgentMeta, bool)) []string {
+	var missing []string
+	for _, kind := range kinds {
+		if meta, _ := lookup(kind); !meta.VerificationContext.Declared() {
+			missing = append(missing, kind)
+		}
+	}
+	return missing
+}
+
+func TestEveryAgentKindDeclaresVerificationContext(t *testing.T) {
+	t.Parallel()
+
+	if len(mcpCompletenessRegisteredKinds) == 0 {
+		t.Fatal("registry.Agents.Kinds() returned no kinds, want at least the built-in adapters main.go blank-imports")
+	}
+
+	missing := kindsMissingVerificationContext(mcpCompletenessRegisteredKinds, registry.Agents.Meta)
+	if len(missing) != 0 {
+		t.Errorf("agent kind(s) %v declare no AgentMeta.VerificationContext", missing)
+	}
+}
+
+func TestKindsMissingVerificationContext_NegativeControl(t *testing.T) {
+	t.Parallel()
+
+	declarations := map[string]registry.VerificationContext{
+		"declared-fixture":         registry.DeclareVerificationContext(),
+		"declared-partial-fixture": registry.DeclareVerificationContext(registry.VerificationKeepsSystemPrompt),
+		"undeclared-fixture":       {},
+	}
+	lookup := func(kind string) (registry.AgentMeta, bool) {
+		declared, ok := declarations[kind]
+		return registry.AgentMeta{VerificationContext: declared}, ok
+	}
+
+	kinds := []string{"declared-fixture", "undeclared-fixture", "declared-partial-fixture", "unregistered-fixture"}
+	got := kindsMissingVerificationContext(kinds, lookup)
+
+	want := []string{"undeclared-fixture", "unregistered-fixture"}
+	if !slices.Equal(got, want) {
+		t.Errorf("kindsMissingVerificationContext(%v) = %v, want %v", kinds, got, want)
 	}
 }

@@ -3,6 +3,7 @@ package scmcore_test
 import (
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/scm/scmcore"
 )
 
@@ -72,6 +73,38 @@ func TestIsBotAuthor(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("IsBotAuthor(%q, %v, %v) = %v, want %v",
 					tt.login, tt.platformBot, tt.allowlist, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFoldReviewDecision(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		facts scmcore.ReviewFacts
+		want  domain.ReviewDecision
+	}{
+		{
+			name:  "an unmet rule outranks an approval",
+			facts: scmcore.ReviewFacts{ApprovalRuleUnmet: true, Approved: true},
+			want:  domain.ReviewDecisionReviewRequired,
+		},
+		{
+			name:  "a reviewer request ranks below an approval",
+			facts: scmcore.ReviewFacts{Approved: true, ReviewerRequested: true},
+			want:  domain.ReviewDecisionApproved,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := scmcore.FoldReviewDecision(tt.facts)
+			if got != tt.want {
+				t.Errorf("FoldReviewDecision(%+v) = %q, want %q", tt.facts, got, tt.want)
 			}
 		})
 	}

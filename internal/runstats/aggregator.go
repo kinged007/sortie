@@ -4,18 +4,17 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // tier reports the report's schema_tier label for caps.
-func tier(caps persistence.RunHistoryCapabilities) string {
+func tier(caps storage.RunHistoryCapabilities) string {
 	if caps.Full() {
 		return "full"
 	}
@@ -46,7 +45,7 @@ func triggerLabel(t *string) string {
 // retry of a reaction run lands in the same group as in by_trigger. A
 // stage_hop is decided by FirstAfterHop alone: a later dispatch into a hopped
 // stage carries the same StagePrevious.
-func originLabel(row persistence.RunStatsRow) string {
+func originLabel(row storage.RunStatsRow) string {
 	switch {
 	case row.Trigger == nil:
 		return "<unknown>"
@@ -80,7 +79,7 @@ func outcomeOf(status string) outcome {
 	switch status {
 	case "succeeded":
 		return outcomeSucceeded
-	case "needs_person", "budget_stopped":
+	case "needs_person", "budget_stopped", "usage_limited":
 		return outcomeStopped
 	case "cancelled":
 		return outcomeCancelled
@@ -92,7 +91,7 @@ func outcomeOf(status string) outcome {
 // duration computes row's duration in seconds from its stored RFC3339
 // timestamps. ok is false when either timestamp fails to parse or the
 // resulting difference is negative.
-func duration(row persistence.RunStatsRow) (seconds float64, ok bool) {
+func duration(row storage.RunStatsRow) (seconds float64, ok bool) {
 	started, err := time.Parse(time.RFC3339, row.StartedAt)
 	if err != nil {
 		return 0, false
@@ -119,7 +118,7 @@ func percentile(sorted []float64, p float64) float64 {
 
 // spentTokens reports whether row used any token, in any counter. A row that
 // spent nothing is neither priced nor unpriced.
-func spentTokens(row persistence.RunStatsRow) bool {
+func spentTokens(row storage.RunStatsRow) bool {
 	return row.InputTokens != 0 || row.OutputTokens != 0 || row.TotalTokens != 0 ||
 		row.CacheReadTokens != 0 || row.CacheWriteTokens != 0
 }
@@ -132,6 +131,11 @@ type costOutcome struct {
 	unpriced bool
 	partial  bool
 	cost     float64
+
+	// agentUSD is the part of cost priced from an agent-reported amount;
+	// agentPriced is false when no such part counts.
+	agentUSD    float64
+	agentPriced bool
 }
 
 // classifyCost classifies a measured run's cost for every figure the report
@@ -155,12 +159,33 @@ func classifyCost(status string, spent bool, cost *float64, costStatus string) c
 	return out
 }
 
+// agentPricedOf sums the parts priced from an agent-reported amount.
+// ok is false when no part is.
+func agentPricedOf(parts []storage.RunModelPart) (usd float64, ok bool) {
+	for _, part := range parts {
+		if part.PriceSource != agentPriceSource {
+			continue
+		}
+		ok = true
+		if part.EstimatedCostUSD != nil {
+			usd += *part.EstimatedCostUSD
+		}
+	}
+	return usd, ok
+}
+
+// agentPriceSource is the recorded price source of a part priced from an
+// amount the agent reported.
+const agentPriceSource = "agent"
+
 // costAccum accumulates the folded [costOutcome] values of one figure.
 type costAccum struct {
 	costUSD          float64
 	pricedRuns       int
 	costUnpricedRuns int
 	costPartialRuns  int
+	agentPricedUSD   float64
+	hasAgentPriced   bool
 }
 
 func (c *costAccum) add(out costOutcome) {
@@ -168,11 +193,40 @@ func (c *costAccum) add(out costOutcome) {
 		c.costUSD += out.cost
 		c.pricedRuns++
 	}
+	if out.agentPriced {
+		c.agentPricedUSD += out.agentUSD
+		c.hasAgentPriced = true
+	}
 	if out.unpriced {
 		c.costUnpricedRuns++
 	}
 	if out.partial {
 		c.costPartialRuns++
+	}
+}
+
+// agentPriced returns the rounded agent-priced amount, or nil when no part
+// was added.
+func (c *costAccum) agentPriced() *float64 {
+	if !c.hasAgentPriced {
+		return nil
+	}
+	return new(round9(c.agentPricedUSD))
+}
+
+// provenanceAccum accumulates, for one figure, the runs whose token figure is
+// a lower bound or missing.
+type provenanceAccum struct {
+	lowerBoundRuns int
+	causes         storage.UnmeasuredCauses
+}
+
+func (p *provenanceAccum) addRun(row storage.RunStatsRow) {
+	switch {
+	case !row.TokensMeasured:
+		p.causes.Add(storage.UnmeasuredCauseOf(row.Status, row.UsageCompleteness, row.ReportedUnits), row.ReportedUnits)
+	case row.UnaccountedTurns > 0:
+		p.lowerBoundRuns++
 	}
 }
 
@@ -184,12 +238,16 @@ type modelShare struct {
 	cost       *float64
 	costStatus string
 	fromPart   bool
+
+	// priceSource is the part's recorded price source; empty for a share
+	// that carries the run's own figures.
+	priceSource string
 }
 
 // sharesOf splits row across the models it spent tokens on, one share per
 // spent part with the part's recorded cost. A run with no spent part, whatever
 // its age, is one share under [modelOf] carrying the run's own figures.
-func sharesOf(row persistence.RunStatsRow) []modelShare {
+func sharesOf(row storage.RunStatsRow) []modelShare {
 	var shares []modelShare
 	for _, part := range row.Parts {
 		t := part.Tokens
@@ -205,10 +263,11 @@ func sharesOf(row persistence.RunStatsRow) []modelShare {
 				CacheRead:  t.CacheReadTokens,
 				CacheWrite: t.CacheWriteTokens,
 			},
-			spent:      true,
-			cost:       part.EstimatedCostUSD,
-			costStatus: part.CostStatus,
-			fromPart:   true,
+			spent:       true,
+			cost:        part.EstimatedCostUSD,
+			costStatus:  part.CostStatus,
+			fromPart:    true,
+			priceSource: part.PriceSource,
 		})
 	}
 	if len(shares) > 0 {
@@ -274,6 +333,7 @@ type groupAccum struct {
 	succeededMeasured int
 	durationSamples   []float64
 	costAccum
+	provenanceAccum
 }
 
 // chainAccum accumulates the by_chain figures a groupAccum does
@@ -302,19 +362,17 @@ type totalAccum struct {
 	durationExcludedRuns int
 	succeededSamples     []float64
 	costAccum
+	provenanceAccum
 }
 
-// dayAccum accumulates the runs that completed within one UTC calendar day.
-type dayAccum struct {
-	runs       int
-	unmeasured int
-	costAccum
-}
-
-// withUncached returns t with Uncached derived from its Total and
-// CacheRead sums.
-func withUncached(t Tokens) Tokens {
+// withDerived returns t with Uncached and FreshInput derived from its sums.
+func withDerived(t Tokens) Tokens {
 	t.Uncached = domain.TokenUsage{TotalTokens: t.Total, CacheReadTokens: t.CacheRead}.Uncached()
+	t.FreshInput = domain.TokenUsage{
+		InputTokens:      t.Input,
+		CacheReadTokens:  t.CacheRead,
+		CacheWriteTokens: t.CacheWrite,
+	}.FreshInput()
 	return t
 }
 
@@ -381,7 +439,7 @@ func compareGroups(x, y Group) int {
 // groups this database does carry as well as the ones it never recorded.
 // Naming only the unrecorded groups would let a reader conclude the
 // remaining figures are present when they are not.
-func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
+func degradedSchemaWarning(caps storage.RunHistoryCapabilities) string {
 	groups := []struct {
 		recorded bool
 		name     string
@@ -395,7 +453,8 @@ func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
 		{caps.HasStageChains, "stage chains"},
 		{caps.HasTrigger, "what started each run"},
 		{caps.HasFirstAfterHop, "the first run after each stage hop"},
-		{caps.HasAgentBlocked, "which runs stopped to wait for a person"},
+		{caps.HasAgentBlocked, "which runs required action"},
+		{caps.HasSkills, "the skill calls of each run"},
 	}
 
 	var unrecorded, dropped []string
@@ -420,89 +479,138 @@ func degradedSchemaWarning(caps persistence.RunHistoryCapabilities) string {
 		strings.Join(unrecorded, ", "), strings.Join(dropped, ", "))
 }
 
+// provenanceLabel names the by_provenance group of row: the sources and
+// strategies that settled its token figure, or a sentinel for a run recorded
+// before provenance was kept or one with no source.
+func provenanceLabel(row storage.RunStatsRow) string {
+	switch {
+	case row.UsageCompleteness == "":
+		return "<unknown>"
+	case row.UsageProvenance == "":
+		return "<none>"
+	}
+	pairs := storage.ParseUsageProvenance(row.UsageProvenance)
+	names := make([]string, len(pairs))
+	for i, pair := range pairs {
+		names[i] = pair.Source + ":" + pair.Strategy
+	}
+	return strings.Join(names, ",")
+}
+
 // modelOf names the model a run is grouped under: the one the runtime
 // reported, else the configured one, because a run left to the runtime's
 // default configures none.
-func modelOf(row persistence.RunStatsRow) string {
+func modelOf(row storage.RunStatsRow) string {
 	return cmp.Or(row.ReportedModel, row.ConfiguredModel)
 }
 
-// modelBreakdownWarning explains the missing by_model breakdown.
-const modelBreakdownWarning = "this database was written before sortie recorded the model of each run, " +
-	"so the report leaves out the breakdown by model. " +
-	"Run sortie once with this workflow to add it."
+// laterTiers lists, oldest first, the columns added after the full tier and
+// what the report leaves out without each. The tiers are cumulative, so the
+// first missing column also takes every later part of the report with it.
+var laterTiers = []struct {
+	has      func(storage.RunHistoryCapabilities) bool
+	recorded string
+	leftOut  string
+	// chainsOnly marks a part the report holds only for a workflow with stage
+	// chains.
+	chainsOnly bool
+}{
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasConfiguredSettings }, recorded: "the model of each run", leftOut: "the breakdown by model"},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasStageChains }, recorded: "stage chains", leftOut: "the breakdown by stage chain"},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasTrigger }, recorded: "what started each run", leftOut: "the breakdown by retry trigger"},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasFirstAfterHop }, recorded: "the first run after each stage hop", leftOut: "the breakdown by run origin"},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasAgentBlocked }, recorded: "which runs required action", leftOut: "the funnel of each stage chain", chainsOnly: true},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasRecordedCost }, recorded: "the cost of each run", leftOut: "cost"},
+	{has: func(c storage.RunHistoryCapabilities) bool { return c.HasSkills }, recorded: "the skill calls of each run", leftOut: "the breakdown by skill"},
+}
 
-// chainBreakdownWarning explains the missing by_chain breakdown.
-const chainBreakdownWarning = "this database was written before sortie recorded stage chains, " +
-	"so the report leaves out the breakdown by stage chain. " +
-	"Run sortie once with this workflow to add it."
+// laterTiersWarning names every column of laterTiers the database lacks and
+// every part of the report that leaves out, or returns "" when none is missing.
+func laterTiersWarning(caps storage.RunHistoryCapabilities, hasChains bool) string {
+	var unrecorded, leftOut []string
+	for _, tier := range laterTiers {
+		if !tier.has(caps) {
+			unrecorded = append(unrecorded, tier.recorded)
+		}
+		if len(unrecorded) > 0 && (!tier.chainsOnly || hasChains) {
+			leftOut = append(leftOut, tier.leftOut)
+		}
+	}
+	if len(unrecorded) == 0 {
+		return ""
+	}
+	pronoun := "it"
+	if len(leftOut) > 1 {
+		pronoun = "them"
+	}
+	return fmt.Sprintf(
+		"this database was written before sortie recorded %s, so the report leaves out %s. "+
+			"Run sortie once with this workflow to add %s.",
+		englishList(unrecorded), englishList(leftOut), pronoun)
+}
 
-// triggerBreakdownWarning explains the missing by_trigger and by_origin
-// breakdowns.
-const triggerBreakdownWarning = "this database was written before sortie recorded what started each run, " +
-	"so the report leaves out the breakdowns by retry trigger and by run origin. " +
-	"Run sortie once with this workflow to add them."
+func englishList(items []string) string {
+	switch len(items) {
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+	}
+}
 
-// originBreakdownWarning explains the missing by_origin breakdown on a
-// database that does record what started each run.
-const originBreakdownWarning = "this database was written before sortie recorded the first run after each stage hop, " +
-	"so the report leaves out the breakdown by run origin. " +
-	"Run sortie once with this workflow to add it."
-
-const costBreakdownWarning = "this database was written before sortie recorded the cost of each run, " +
-	"so the report leaves out cost. " +
-	"Run sortie once with this workflow to add it."
-
-// costAlsoOmittedNotice closes the warning of an earlier missing group on a
-// database that also lacks the cost columns.
-const costAlsoOmittedNotice = "The report also leaves out cost until then."
-
-// Aggregator folds a stream of [persistence.RunStatsRow] values, via
+// Aggregator folds a stream of [storage.RunStatsRow] values, via
 // [Aggregator.Add], into the totals and per-dimension groups
 // [Aggregator.Report] renders into a [Report]. It is not safe for concurrent
 // use; a caller builds one per report.
 type Aggregator struct {
-	caps      persistence.RunHistoryCapabilities
+	caps      storage.RunHistoryCapabilities
 	tierLabel string
 
 	total totalAccum
-	days  map[time.Time]*dayAccum // keyed by the UTC midnight starting the day
+	spend *series // nil until SetSpend
 
-	byStatus   map[string]*groupAccum
-	byAdapter  map[string]*groupAccum
-	byRule     map[string]*groupAccum
-	byTemplate map[string]*groupAccum
-	byModel    map[string]*groupAccum
-	byChain    map[string]*groupAccum
-	byTrigger  map[string]*groupAccum
-	byOrigin   map[string]*groupAccum
-	chains     map[string]*chainAccum
-	issueIDs   map[string]struct{}
-	passes     map[passKey]*passAccum
-	stages     Stages
+	byStatus     map[string]*groupAccum
+	byAdapter    map[string]*groupAccum
+	byRule       map[string]*groupAccum
+	byTemplate   map[string]*groupAccum
+	byModel      map[string]*groupAccum
+	byChain      map[string]*groupAccum
+	byTrigger    map[string]*groupAccum
+	byOrigin     map[string]*groupAccum
+	byProvenance map[string]*groupAccum
+	chains       map[string]*chainAccum
+	issueIDs     map[string]struct{}
+	passes       map[passKey]*passAccum
+	stages       Stages
 
 	selfReview selfReviewAccum
+
+	unrecordedRuns int
+	bySkill        map[string]*SkillCount
 }
 
 // New constructs an [Aggregator] for caps. It reads each run's cost as
 // recorded and prices nothing.
-func New(caps persistence.RunHistoryCapabilities) *Aggregator {
+func New(caps storage.RunHistoryCapabilities) *Aggregator {
 	return &Aggregator{
-		caps:       caps,
-		tierLabel:  tier(caps),
-		days:       make(map[time.Time]*dayAccum),
-		byStatus:   make(map[string]*groupAccum),
-		byAdapter:  make(map[string]*groupAccum),
-		byRule:     make(map[string]*groupAccum),
-		byTemplate: make(map[string]*groupAccum),
-		byModel:    make(map[string]*groupAccum),
-		byChain:    make(map[string]*groupAccum),
-		byTrigger:  make(map[string]*groupAccum),
-		byOrigin:   make(map[string]*groupAccum),
-		chains:     make(map[string]*chainAccum),
-		passes:     make(map[passKey]*passAccum),
-		issueIDs:   make(map[string]struct{}),
-		selfReview: selfReviewAccum{byVerdict: make(map[string]int)},
+		caps:         caps,
+		tierLabel:    tier(caps),
+		byStatus:     make(map[string]*groupAccum),
+		byAdapter:    make(map[string]*groupAccum),
+		byRule:       make(map[string]*groupAccum),
+		byTemplate:   make(map[string]*groupAccum),
+		byModel:      make(map[string]*groupAccum),
+		byChain:      make(map[string]*groupAccum),
+		byTrigger:    make(map[string]*groupAccum),
+		byOrigin:     make(map[string]*groupAccum),
+		byProvenance: make(map[string]*groupAccum),
+		chains:       make(map[string]*chainAccum),
+		passes:       make(map[passKey]*passAccum),
+		issueIDs:     make(map[string]struct{}),
+		selfReview:   selfReviewAccum{byVerdict: make(map[string]int)},
+		bySkill:      make(map[string]*SkillCount),
 	}
 }
 
@@ -515,9 +623,9 @@ func (a *Aggregator) SetStages(stages Stages) {
 }
 
 // Add folds one row into the aggregator. It is the visit callback
-// [persistence.Store.ScanRunHistoryRange] calls once per row; it calls
+// [storage.RunHistoryStore.ScanRunHistoryRange] calls once per row; it calls
 // no Store method and always returns nil.
-func (a *Aggregator) Add(row persistence.RunStatsRow) error {
+func (a *Aggregator) Add(row storage.RunStatsRow) error {
 	isSucceeded := row.Status == "succeeded"
 	a.total.runs++
 	a.issueIDs[row.IssueID] = struct{}{}
@@ -538,7 +646,6 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 	}
 
 	seconds, hasDuration := duration(row)
-	var cost costOutcome
 
 	full := a.caps.Full()
 	if full {
@@ -562,12 +669,20 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 		if a.caps.OriginBreakdown() {
 			bumped = append(bumped, bumpGroup(a.byOrigin, originLabel(row), isSucceeded))
 		}
+		if a.caps.UsageProvenance() {
+			bumped = append(bumped, bumpGroup(a.byProvenance, provenanceLabel(row), isSucceeded))
+		}
 
 		for _, g := range bumped {
 			g.turnSum += row.TurnsCompleted
 		}
 		if isSucceeded {
 			a.total.succeededTurns += row.TurnsCompleted
+		}
+
+		a.total.addRun(row)
+		for _, g := range bumped {
+			g.addRun(row)
 		}
 
 		if !row.TokensMeasured {
@@ -598,7 +713,10 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 			}
 
 			if a.caps.RecordedCost() {
-				cost = classifyCost(row.Status, spentTokens(row), row.EstimatedCostUSD, row.CostStatus)
+				cost := classifyCost(row.Status, spentTokens(row), row.EstimatedCostUSD, row.CostStatus)
+				if cost.priced {
+					cost.agentUSD, cost.agentPriced = agentPricedOf(row.Parts)
+				}
 				a.total.add(cost)
 				for _, g := range bumped {
 					g.add(cost)
@@ -609,10 +727,10 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 		if row.ReviewMetadata != nil {
 			foldSelfReview(*row.ReviewMetadata, &a.selfReview)
 		}
-	}
 
-	if a.caps.RecordedCost() {
-		a.foldSpend(row, cost)
+		if a.caps.SkillBreakdown() {
+			a.foldSkills(row)
+		}
 	}
 
 	if !hasDuration {
@@ -632,16 +750,44 @@ func (a *Aggregator) Add(row persistence.RunStatsRow) error {
 	return nil
 }
 
+// foldSkills folds the skill calls row stores into the per-skill counts. A row
+// that stores none, or a value that does not decode, counts as unrecorded.
+func (a *Aggregator) foldSkills(row storage.RunStatsRow) {
+	var calls []domain.SkillCall
+	if row.Skills == nil || json.Unmarshal([]byte(*row.Skills), &calls) != nil {
+		a.unrecordedRuns++
+		return
+	}
+
+	counted := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		entry, ok := a.bySkill[call.Skill]
+		if !ok {
+			entry = &SkillCount{Skill: call.Skill}
+			a.bySkill[call.Skill] = entry
+		}
+		entry.Calls++
+		if call.ToolError {
+			entry.FailedCalls++
+		}
+		if _, seen := counted[call.Skill]; !seen {
+			counted[call.Skill] = struct{}{}
+			entry.Runs++
+		}
+	}
+}
+
 // foldModels folds row into the by_model group of every model share it
 // carries. Only the share's tokens and cost reach a group, never the run's
 // totals, so the rows of a multi-model run add up to the run.
-func (a *Aggregator) foldModels(row persistence.RunStatsRow, isSucceeded bool, seconds float64, hasDuration bool) {
+func (a *Aggregator) foldModels(row storage.RunStatsRow, isSucceeded bool, seconds float64, hasDuration bool) {
 	for _, share := range sharesOf(row) {
 		g := bumpGroup(a.byModel, label(share.model), isSucceeded)
 		g.turnSum += row.TurnsCompleted
 		if hasDuration {
 			g.durationSamples = append(g.durationSamples, seconds)
 		}
+		g.addRun(row)
 		if !row.TokensMeasured {
 			g.unmeasuredRuns++
 			continue
@@ -664,42 +810,18 @@ func (a *Aggregator) foldModels(row persistence.RunStatsRow, isSucceeded bool, s
 		if share.fromPart && status == "estimated" && row.UnaccountedTurns > 0 {
 			status = "partial"
 		}
-		g.add(classifyCost(row.Status, share.spent, share.cost, status))
+		out := classifyCost(row.Status, share.spent, share.cost, status)
+		if out.priced && share.priceSource == agentPriceSource {
+			out.agentUSD, out.agentPriced = *share.cost, true
+		}
+		g.add(out)
 	}
-}
-
-// utcDay returns the UTC midnight that starts the calendar day holding t.
-func utcDay(t time.Time) time.Time {
-	y, m, d := t.UTC().Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-}
-
-// foldSpend folds row into the accumulator of the UTC day it completed on. A
-// run whose completion time does not parse joins no day. cost is the zero
-// outcome for a run whose tokens were not measured.
-func (a *Aggregator) foldSpend(row persistence.RunStatsRow, cost costOutcome) {
-	completed, err := time.Parse(time.RFC3339, row.CompletedAt)
-	if err != nil {
-		return
-	}
-	day := utcDay(completed)
-	d, ok := a.days[day]
-	if !ok {
-		d = &dayAccum{}
-		a.days[day] = d
-	}
-	d.runs++
-	if !row.TokensMeasured {
-		d.unmeasured++
-		return
-	}
-	d.add(cost)
 }
 
 // foldChain folds row into its chain's by_chain accumulator. Rows arrive
 // in ascending id order, so the last non-empty value of a field is the
 // latest one.
-func (a *Aggregator) foldChain(row persistence.RunStatsRow) {
+func (a *Aggregator) foldChain(row storage.RunStatsRow) {
 	c, ok := a.chains[row.ChainID]
 	if !ok {
 		c = &chainAccum{}
@@ -755,7 +877,7 @@ func (a *Aggregator) Report(
 		SchemaTier:   a.tierLabel,
 		Warnings:     a.composeWarnings(),
 		Summary:      a.summary(full),
-		Spend:        a.spend(generatedAt, since, until),
+		Spend:        a.spendReport(generatedAt, since, until),
 		ByStatus:     a.groupSlice(a.byStatus, full),
 		ByAdapter:    a.groupSlice(a.byAdapter, full),
 		ByRule:       []Group{},
@@ -765,6 +887,7 @@ func (a *Aggregator) Report(
 		ChainFunnels: a.funnelReport(generatedAt, until),
 		ByTrigger:    []Group{},
 		ByOrigin:     []Group{},
+		ByProvenance: []Group{},
 	}
 	if since != nil {
 		rpt.Since = new(since.UTC().Format(time.RFC3339))
@@ -787,150 +910,80 @@ func (a *Aggregator) Report(
 		if a.caps.OriginBreakdown() {
 			rpt.ByOrigin = a.groupSlice(a.byOrigin, full)
 		}
+		if a.caps.UsageProvenance() {
+			rpt.ByProvenance = a.groupSlice(a.byProvenance, full)
+		}
 		rpt.SelfReview = a.selfReviewReport()
+	}
+	if a.caps.SkillBreakdown() {
+		rpt.SkillCalls = a.skillCallReport()
 	}
 
 	return rpt
 }
 
-// spendPeriods maps the length of a report's range to the period its spend is
-// bucketed by; the first entry whose limit holds the range names it.
-var spendPeriods = []struct {
-	limit  time.Duration
-	period string
-}{
-	{limit: 2160 * time.Hour, period: "day"},
+// SetSpend sets the range, period, report time, and running sessions the spend
+// series is built from. An empty p lets [SpendPeriodOf] pick the period. It
+// MUST run before the first [Aggregator.AddTurn] or
+// [Aggregator.AddUntrackedRun]. running is the snapshot taken before the stored
+// turns are read, and the aggregator does not modify it.
+func (a *Aggregator) SetSpend(r Range, p Period, generatedAt time.Time, running []RunningSession) {
+	a.spend = newSeries(a.caps, r, p, generatedAt, running)
 }
 
-// spendPeriod names the period a range from since to end is bucketed by. An
-// open range, and one longer than every entry of spendPeriods, takes months.
-func spendPeriod(since *time.Time, end time.Time) string {
-	if since == nil {
-		return "month"
+// SpendWindow returns the half-open instants the spend series counts, which
+// are the bounds to scan stored turns and untracked runs over; a nil bound is
+// open. Both are nil before [Aggregator.SetSpend].
+func (a *Aggregator) SpendWindow() (since, until *time.Time) {
+	if a.spend == nil {
+		return nil, nil
 	}
-	for _, rule := range spendPeriods {
-		if end.Sub(*since) <= rule.limit {
-			return rule.period
-		}
+	if a.spend.ws != nil {
+		since = new(*a.spend.ws)
 	}
-	return "month"
+	return since, new(a.spend.we)
 }
 
-// periodStart returns the UTC instant that starts the period holding t.
-func periodStart(t time.Time, period string) time.Time {
-	day := utcDay(t)
-	if period == "month" {
-		return day.AddDate(0, 0, 1-day.Day())
+// AddTurn folds one stored turn record into the spend series. It is the visit
+// callback [storage.RunTurnStore.ScanRunTurnsRange] calls once per record; it
+// calls no Store method and always returns nil.
+func (a *Aggregator) AddTurn(row storage.RunTurnRow) error {
+	if a.spend != nil {
+		a.spend.addTurn(row)
 	}
-	return day
+	return nil
 }
 
-// nextPeriod returns the start of the period after the one starting at start.
-func nextPeriod(start time.Time, period string) time.Time {
-	if period == "month" {
-		return start.AddDate(0, 1, 0)
+// AddUntrackedRun folds one run recorded without turn records into the spend
+// series at its completion instant. It is the visit callback
+// [storage.RunTurnStore.ScanUntrackedRunsRange] calls once per run; it calls no
+// Store method and always returns nil.
+func (a *Aggregator) AddUntrackedRun(row storage.UntrackedRunRow) error {
+	if a.spend != nil {
+		a.spend.addUntrackedRun(row)
 	}
-	return start.AddDate(0, 0, 1)
+	return nil
 }
 
-// spend lists the recorded cost of the folded runs per UTC period, every
-// period from the one holding the range's first instant to the one holding its
-// last, so a period without runs is listed with none. It is nil unless the
-// database records cost.
-func (a *Aggregator) spend(generatedAt time.Time, since, until *time.Time) *Spend {
-	if !a.caps.RecordedCost() {
-		return nil
+// spendReport serves the series set by SetSpend. Without one it lists the
+// buckets of the range the report received, every bucket empty.
+func (a *Aggregator) spendReport(generatedAt time.Time, since, until *time.Time) Spend {
+	if a.spend == nil {
+		return newSeries(a.caps, Range{Since: since, Until: until}, "", generatedAt, nil).report()
 	}
-	end := generatedAt
-	if until != nil {
-		end = *until
-	}
-	period := spendPeriod(since, end)
-	out := &Spend{Period: period, Buckets: []SpendBucket{}}
-	if len(a.days) == 0 {
-		return out
-	}
-
-	// Days are summed in ascending order so a bucket's cost does not depend
-	// on map iteration order.
-	days := slices.SortedFunc(maps.Keys(a.days), time.Time.Compare)
-	sums := make(map[time.Time]*dayAccum)
-	for _, day := range days {
-		start := periodStart(day, period)
-		sum, ok := sums[start]
-		if !ok {
-			sum = &dayAccum{}
-			sums[start] = sum
-		}
-		d := a.days[day]
-		sum.runs += d.runs
-		sum.unmeasured += d.unmeasured
-		sum.costUSD += d.costUSD
-		sum.pricedRuns += d.pricedRuns
-		sum.costUnpricedRuns += d.costUnpricedRuns
-		sum.costPartialRuns += d.costPartialRuns
-	}
-
-	firstAt := days[0]
-	if since != nil {
-		firstAt = *since
-	}
-	lastAt := generatedAt
-	if until != nil {
-		lastAt = until.Add(-time.Nanosecond)
-	}
-	first := periodStart(firstAt, period)
-	last := periodStart(lastAt, period)
-	if latest := periodStart(days[len(days)-1], period); latest.After(last) {
-		last = latest
-	}
-
-	for start := first; !start.After(last); start = nextPeriod(start, period) {
-		bucket := SpendBucket{Start: start.Format(time.RFC3339)}
-		if sum, ok := sums[start]; ok {
-			bucket.Runs = sum.runs
-			bucket.TokensUnmeasuredRuns = sum.unmeasured
-			bucket.CostUnpricedRuns = sum.costUnpricedRuns
-			bucket.CostPartialRuns = sum.costPartialRuns
-			if sum.pricedRuns > 0 {
-				bucket.CostUSD = new(round9(sum.costUSD))
-			}
-		}
-		out.Buckets = append(out.Buckets, bucket)
-	}
-	return out
+	return a.spend.report()
 }
 
-// composeWarnings returns the non-nil warning list: the one warning that
-// names what a's capabilities leave out, if any. A database that lacks the
-// cost columns together with an earlier group gets cost named on that
-// group's warning, so the list never holds two.
+// composeWarnings returns the non-nil warning list: at most one warning,
+// naming everything a's capabilities leave out.
 func (a *Aggregator) composeWarnings() []string {
-	list := []string{}
-	switch {
-	case !a.caps.Full():
-		list = append(list, degradedSchemaWarning(a.caps))
-	case !a.caps.ModelBreakdown():
-		list = append(list, a.withCostNotice(modelBreakdownWarning))
-	case !a.caps.ChainBreakdown():
-		list = append(list, a.withCostNotice(chainBreakdownWarning))
-	case !a.caps.TriggerBreakdown():
-		list = append(list, a.withCostNotice(triggerBreakdownWarning))
-	case !a.caps.OriginBreakdown():
-		list = append(list, a.withCostNotice(originBreakdownWarning))
-	case len(a.stages.Chains) > 0 && !a.caps.FunnelBreakdown():
-		list = append(list, a.withCostNotice(funnelBreakdownWarning))
-	case !a.caps.RecordedCost():
-		list = append(list, costBreakdownWarning)
+	if !a.caps.Full() {
+		return []string{degradedSchemaWarning(a.caps)}
 	}
-	return list
-}
-
-func (a *Aggregator) withCostNotice(warning string) string {
-	if a.caps.RecordedCost() {
-		return warning
+	if warning := laterTiersWarning(a.caps, len(a.stages.Chains) > 0); warning != "" {
+		return []string{warning}
 	}
-	return warning + " " + costAlsoOmittedNotice
+	return []string{}
 }
 
 // summary computes the report-wide [Summary].
@@ -947,6 +1000,7 @@ func (a *Aggregator) summary(full bool) Summary {
 		DurationExcludedRuns: a.total.durationExcludedRuns,
 		CostUnpricedRuns:     a.total.costUnpricedRuns,
 		CostPartialRuns:      a.total.costPartialRuns,
+		UnmeasuredUnits:      []string{},
 	}
 	if s.Runs > 0 {
 		s.SuccessRate = round4(float64(s.Succeeded) / float64(s.Runs))
@@ -958,7 +1012,7 @@ func (a *Aggregator) summary(full bool) Summary {
 		s.TokensUnmeasuredRuns = a.total.unmeasuredRuns
 	}
 	if full && a.total.measuredRuns > 0 {
-		s.Tokens = new(withUncached(a.total.tokens))
+		s.Tokens = new(withDerived(a.total.tokens))
 	}
 	if full && a.total.pricedRuns > 0 {
 		cost := round9(a.total.costUSD)
@@ -967,7 +1021,44 @@ func (a *Aggregator) summary(full bool) Summary {
 			s.CostPerSucceededRunUSD = new(round9(cost / float64(a.total.succeededMeasured)))
 		}
 	}
+	if full {
+		flags := lowerBoundFlagsOf(s.Tokens, s.CostUSD, a.total.unmeasuredRuns, &a.total.costAccum, &a.total.provenanceAccum)
+		s.TokensLowerBoundRuns = flags.tokensLowerBoundRuns
+		s.TokensLowerBound = flags.tokensLowerBound
+		s.CostLowerBound = flags.costLowerBound
+		s.AgentPricedUSD = flags.agentPricedUSD
+		s.UnmeasuredCause = flags.cause
+		s.UnmeasuredUnits = flags.units
+	}
 	return s
+}
+
+// lowerBoundFlags are the lower-bound members every figure of the report
+// serves, computed once here so no client derives them.
+type lowerBoundFlags struct {
+	tokensLowerBoundRuns int
+	tokensLowerBound     bool
+	costLowerBound       bool
+	agentPricedUSD       *float64
+	cause                *string
+	units                []string
+}
+
+// lowerBoundFlagsOf derives the flags of one figure from its served tokens and
+// cost and its folded counts.
+func lowerBoundFlagsOf(tokens *Tokens, costUSD *float64, unmeasuredRuns int, c *costAccum, p *provenanceAccum) lowerBoundFlags {
+	flags := lowerBoundFlags{
+		tokensLowerBoundRuns: p.lowerBoundRuns,
+		tokensLowerBound:     tokens != nil && (unmeasuredRuns > 0 || p.lowerBoundRuns > 0),
+		costLowerBound:       costUSD != nil && (c.costUnpricedRuns > 0 || c.costPartialRuns > 0 || unmeasuredRuns > 0),
+		agentPricedUSD:       c.agentPriced(),
+	}
+	cause, units := p.causes.Result()
+	if cause != "" {
+		flags.cause = new(string(cause))
+	}
+	flags.units = units
+	return flags
 }
 
 // groupSlice converts groups into a [Group] slice, sorted by
@@ -990,6 +1081,8 @@ func (a *Aggregator) groupStat(g *groupAccum, full bool) Group {
 		Runs:      g.runs,
 		Succeeded: g.succeeded,
 		Duration:  durationStats(g.durationSamples),
+
+		UnmeasuredUnits: []string{},
 	}
 	if g.runs > 0 {
 		stat.SuccessRate = round4(float64(g.succeeded) / float64(g.runs))
@@ -1003,7 +1096,7 @@ func (a *Aggregator) groupStat(g *groupAccum, full bool) Group {
 		stat.CostUnpricedRuns = g.costUnpricedRuns
 		stat.CostPartialRuns = g.costPartialRuns
 		if g.measuredRuns > 0 {
-			stat.Tokens = new(withUncached(g.tokens))
+			stat.Tokens = new(withDerived(g.tokens))
 		}
 		if g.pricedRuns > 0 {
 			cost := round9(g.costUSD)
@@ -1012,8 +1105,31 @@ func (a *Aggregator) groupStat(g *groupAccum, full bool) Group {
 				stat.CostPerSucceededRunUSD = new(round9(cost / float64(g.succeededMeasured)))
 			}
 		}
+		flags := lowerBoundFlagsOf(stat.Tokens, stat.CostUSD, g.unmeasuredRuns, &g.costAccum, &g.provenanceAccum)
+		stat.TokensLowerBoundRuns = flags.tokensLowerBoundRuns
+		stat.TokensLowerBound = flags.tokensLowerBound
+		stat.CostLowerBound = flags.costLowerBound
+		stat.AgentPricedUSD = flags.agentPricedUSD
+		stat.UnmeasuredCause = flags.cause
+		stat.UnmeasuredUnits = flags.units
 	}
 	return stat
+}
+
+// skillCallReport computes the [SkillCallReport] from a's folded skill state.
+// by_skill is sorted by descending runs, then by ascending skill in byte order.
+func (a *Aggregator) skillCallReport() *SkillCallReport {
+	report := &SkillCallReport{
+		UnrecordedRuns: a.unrecordedRuns,
+		BySkill:        make([]SkillCount, 0, len(a.bySkill)),
+	}
+	for _, entry := range a.bySkill {
+		report.BySkill = append(report.BySkill, *entry)
+	}
+	slices.SortFunc(report.BySkill, func(x, y SkillCount) int {
+		return cmp.Or(cmp.Compare(y.Runs, x.Runs), strings.Compare(x.Skill, y.Skill))
+	})
+	return report
 }
 
 // selfReviewReport computes the derived [SelfReview] from a's folded

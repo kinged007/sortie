@@ -8,7 +8,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // retrySlotCI is a controllable CIStatusProvider for the cross-pass
@@ -85,6 +85,8 @@ func (s *retrySlotSCM) RemoveLabel(_ context.Context, _ int, _, _, label string)
 // so "unchanged" and "advanced" assertions exercise real state rather than
 // a canned return value.
 type retrySlotStore struct {
+	storage.RetryEntryStore
+	storage.StageHopStore
 	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
@@ -93,8 +95,8 @@ type retrySlotStore struct {
 	marks      map[string]string
 	dispatched map[string]bool
 
-	runHistories []persistence.RunHistory
-	savedEntries []persistence.RetryEntry
+	runHistories []storage.RunHistory
+	savedEntries []storage.RetryEntry
 	deletedIDs   []string
 
 	upsertCalls   int
@@ -112,7 +114,7 @@ func newRetrySlotStore() *retrySlotStore {
 	}
 }
 
-func (s *retrySlotStore) SaveRetryEntry(_ context.Context, entry persistence.RetryEntry) error {
+func (s *retrySlotStore) SaveRetryEntry(_ context.Context, entry storage.RetryEntry) error {
 	s.savedEntries = append(s.savedEntries, entry)
 	return nil
 }
@@ -122,7 +124,7 @@ func (s *retrySlotStore) DeleteRetryEntry(_ context.Context, issueID string) err
 	return nil
 }
 
-func (s *retrySlotStore) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (s *retrySlotStore) AppendRunHistory(_ context.Context, run storage.RunHistory) (storage.RunHistory, error) {
 	s.runHistories = append(s.runHistories, run)
 	return run, nil
 }

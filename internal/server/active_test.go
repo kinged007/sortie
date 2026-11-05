@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,8 +50,13 @@ func snapshotOf(t *testing.T, tags ...string) orchestrator.RuntimeSnapshotResult
 			snap.BetweenStages = append(snap.BetweenStages, rowOf[orchestrator.SnapshotStageHop](t, tag))
 		default:
 			row := rowOf[orchestrator.SnapshotPendingReaction](t, tag)
-			if tag == "ci" {
+			switch tag {
+			case "ci":
 				row.EscalatedAt = new(row.DispatchedAt.Add(time.Hour))
+			case "ci_passing", "ci_pending":
+				row.Kind, row.LastCheck = "ci", &orchestrator.ReactionCheck{CI: &orchestrator.CICheck{Status: strings.TrimPrefix(tag, "ci_")}}
+			case "review_awaiting":
+				row.Kind, row.LastCheck = "review", &orchestrator.ReactionCheck{Comments: &orchestrator.CommentCheck{AwaitingApproval: true}}
 			}
 			snap.PendingReactions = append(snap.PendingReactions, row)
 		}
@@ -94,6 +100,8 @@ func TestActiveIssueServesOneEntryWithTheDecidingRowsFacts(t *testing.T) {
 		{name: "retrying beats a pending reaction", snap: snapshotOf(t, "review", "retrying"), status: "retrying"},
 		{name: "budget exhausted beats between stages", snap: snapshotOf(t, "between_stages", "budget_exhausted"), status: "budget_exhausted"},
 		{name: "escalated pending row decides two pending rows", snap: snapshotOf(t, "review", "ci"), status: "pending_reactions", reactionKind: "ci"},
+		{name: "awaiting review row decides beside a passing CI row", snap: snapshotOf(t, "ci_passing", "review_awaiting"), status: "pending_reactions", reactionKind: "review"},
+		{name: "pending CI row keeps the first row", snap: snapshotOf(t, "ci_pending", "review_awaiting"), status: "pending_reactions", reactionKind: "ci"},
 		{name: "running continuation alone", snap: snapshotOf(t, "running"), status: "running"},
 		{name: "retrying alone", snap: snapshotOf(t, "retrying"), status: "retrying"},
 		{name: "budget exhausted alone", snap: snapshotOf(t, "budget_exhausted"), status: "budget_exhausted"},

@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // Values of the trigger attribute on the stage hop count reset record.
@@ -36,7 +35,7 @@ const (
 	stageResultAdvanced = "advanced"
 	stageResultPartial  = "partial"
 	stageResultFailed   = "failed"
-	stageResultCeiling  = "ceiling"
+	stageResultCeiling  = domain.StageReasonCeiling
 )
 
 const stageChainSeparator = " -> "
@@ -57,17 +56,6 @@ type stageHopDecision struct {
 // made reports whether the decision added the target's stage label.
 func (d stageHopDecision) made() bool {
 	return d.Result == stageResultAdvanced || d.Result == stageResultPartial
-}
-
-// stageHopDeleter is the one store method [resetStageHop] needs.
-type stageHopDeleter interface {
-	DeleteStageHop(ctx context.Context, issueID string) error
-}
-
-// stageHopDispatchMarker is the one store method [markStageHopDispatched]
-// needs.
-type stageHopDispatchMarker interface {
-	MarkStageHopDispatched(ctx context.Context, issueID string) error
 }
 
 // hopRouteOf returns the rule and stage label of the issue's latest hop,
@@ -122,7 +110,7 @@ func stageCurrent(dispatch config.DispatchConfig, ruleName string) string {
 // resetStageHop drops the issue's hop record, in memory and in the store,
 // and logs the reset with trigger. It does nothing when the issue has no
 // record. log must already carry issue_id and issue_identifier.
-func resetStageHop(ctx context.Context, state *State, store stageHopDeleter, issueID, trigger string, log *slog.Logger) {
+func resetStageHop(ctx context.Context, state *State, store storage.StageHopStore, issueID, trigger string, log *slog.Logger) {
 	hop, ok := state.StageHops[issueID]
 	if !ok {
 		return
@@ -142,7 +130,7 @@ func resetStageHop(ctx context.Context, state *State, store stageHopDeleter, iss
 // its hop, in memory and in the store, and does nothing when the issue has no
 // record or the record already says so. A failed write leaves the runtime
 // value standing. log must already carry issue_id and issue_identifier.
-func markStageHopDispatched(ctx context.Context, state *State, store stageHopDispatchMarker, issueID string, log *slog.Logger) {
+func markStageHopDispatched(ctx context.Context, state *State, store storage.StageHopStore, issueID string, log *slog.Logger) {
 	hop := state.StageHops[issueID]
 	if hop == nil || hop.RunDispatched {
 		return
@@ -205,7 +193,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 	}
 
 	if err := params.TrackerAdapter.AddLabel(ctx, issueID, target.Stage); err != nil {
-		missing, readErr := missingStageLabels(ctx, params.TrackerAdapter, params.Dispatch, entry.Issue, issueID)
+		missing, readErr := missingStageLabels(ctx, params.TrackerAdapter, params.Dispatch, entry.DispatchLabels, issueID)
 		extra := []slog.Attr{slog.Any("error", err)}
 		if readErr != nil {
 			extra = append(extra, slog.Any("stage_label_read_error", readErr))
@@ -225,7 +213,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 		previousOutcome = stageOutcomeNoChange
 	}
 	identity := issueIdentityOf(entry.Issue)
-	identity.Labels = labelsAfterHop(entry.Issue.Labels, params.Dispatch.Rules, target.Stage)
+	identity.Labels = labelsAfterHop(entry.DispatchLabels, params.Dispatch.Rules, target.Stage)
 	state.StageHops[issueID] = &StageHopEntry{
 		Identifier:       result.Identifier,
 		Count:            count + 1,
@@ -240,7 +228,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 		IssueIdentity:    identity,
 		DispatchedAt:     entry.StageLineage.DispatchedAt,
 	}
-	row := persistence.StageHop{
+	row := storage.StageHop{
 		IssueID:          issueID,
 		Identifier:       result.Identifier,
 		HopCount:         count + 1,
@@ -267,7 +255,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 
 	var left []string
 	var firstErr error
-	for _, label := range carriedStageLabels(params.Dispatch.Rules, entry.Issue.Labels) {
+	for _, label := range carriedStageLabels(params.Dispatch.Rules, entry.DispatchLabels) {
 		if config.StageLabelsEqual(label, target.Stage) {
 			continue
 		}
@@ -313,7 +301,7 @@ func reportStageHop(ctx context.Context, state *State, params HandleWorkerExitPa
 		eventType = domain.EventStageAdvanced
 		reason = ""
 	}
-	notification := identity.notification(eventType, "", buildStageHopComment(hop))
+	notification := identity.notification(eventType, "", domain.StageFacts{})
 	notification.Envelope.Stage = domain.StageTransition{
 		SourceRule: hop.SourceRule,
 		TargetRule: hop.TargetRule,
@@ -332,31 +320,11 @@ func reportStageHop(ctx context.Context, state *State, params HandleWorkerExitPa
 	})
 }
 
-// buildStageHopComment returns the public text of a stage event. It names
-// no error, session, or agent, so a tracker comment may post it.
-func buildStageHopComment(d stageHopDecision) string {
-	headline := "Sortie advanced the issue to the next stage."
-	lines := []string{"From: " + d.SourceRule, "To: " + d.TargetRule}
-	if !d.made() {
-		headline = "Sortie did not advance the issue to the next stage."
-		lines = append(lines, "Reason: "+stageNotAdvancedPhrase(d.Result))
-	}
-	lines = append(lines, "Hop count: "+strconv.Itoa(d.HopCount), "Chain: "+d.ChainID)
-	return strings.Join(append([]string{headline}, lines...), "\n")
-}
-
-func stageNotAdvancedPhrase(result string) string {
-	if result == stageResultCeiling {
-		return "the issue reached its limit of consecutive stage moves (dispatch.max_consecutive_hops)"
-	}
-	return "the next stage's label could not be added to the issue"
-}
-
-// missingStageLabels returns the configured stage labels the snapshot
+// missingStageLabels returns the configured stage labels dispatchLabels
 // carried and a fresh read of the issue no longer shows. It reads only when
-// the snapshot carried one, and returns the read's error when it fails.
-func missingStageLabels(ctx context.Context, tracker domain.TrackerAdapter, dispatch config.DispatchConfig, snapshot domain.Issue, issueID string) ([]string, error) {
-	carried := carriedStageLabels(dispatch.Rules, snapshot.Labels)
+// dispatchLabels carried one, and returns the read's error when it fails.
+func missingStageLabels(ctx context.Context, tracker domain.TrackerAdapter, dispatch config.DispatchConfig, dispatchLabels []string, issueID string) ([]string, error) {
+	carried := carriedStageLabels(dispatch.Rules, dispatchLabels)
 	if len(carried) == 0 {
 		return nil, nil
 	}
@@ -413,18 +381,19 @@ func labelsAfterHop(labels []string, rules []config.DispatchRule, targetLabel st
 // holdForStageHop keeps an issue that was just hopped from dispatching on
 // any rule until a read shows the label the hop added. It returns the
 // issue to dispatch, carrying the labels of the direct read when one was
-// made, and false when the issue must wait or its hop record was reset.
+// made, the comments of that read (non-nil exactly when the read was made and
+// succeeded), and false when the issue must wait or its hop record was reset.
 // activeSet and terminalSet hold lowercased state names.
-func (o *Orchestrator) holdForStageHop(ctx context.Context, issue domain.Issue, activeSet, terminalSet map[string]struct{}) (domain.Issue, bool) {
+func (o *Orchestrator) holdForStageHop(ctx context.Context, issue domain.Issue, activeSet, terminalSet map[string]struct{}) (domain.Issue, []domain.Comment, bool) {
 	hop := o.state.StageHops[issue.ID]
 	if hop == nil || hop.TargetObserved {
-		return issue, true
+		return issue, nil, true
 	}
 	log := logging.WithIssue(o.logger, issue.ID, issue.Identifier)
 
 	if carriesLabel(issue.Labels, hop.TargetLabel) {
 		o.markObserved(ctx, issue.ID, hop, log)
-		return issue, true
+		return issue, nil, true
 	}
 
 	read, err := o.trackerAdapter.FetchIssueByID(ctx, issue.ID)
@@ -433,7 +402,7 @@ func (o *Orchestrator) holdForStageHop(ctx context.Context, issue domain.Issue, 
 			slog.String("target_label", hop.TargetLabel),
 			slog.Any("error", err),
 		)
-		return issue, false
+		return issue, nil, false
 	}
 
 	// Reconcile reads every hop-record issue each tick and resets the
@@ -443,18 +412,18 @@ func (o *Orchestrator) holdForStageHop(ctx context.Context, issue domain.Issue, 
 		log.Info("stage hop target read showed no state, holding issue",
 			slog.String("target_label", hop.TargetLabel),
 		)
-		return issue, false
+		return issue, nil, false
 	}
 
 	readState := strings.ToLower(read.State)
 	if _, terminal := terminalSet[readState]; terminal {
 		resetStageHop(ctx, o.state, o.store, issue.ID, stageResetTerminal, log)
 		recordIssueOutcome(ctx, o.store, terminalOutcome(issue.ID, read.State, time.Now()), log)
-		return issue, false
+		return issue, nil, false
 	}
 	if _, active := activeSet[readState]; !active {
 		resetStageHop(ctx, o.state, o.store, issue.ID, stageResetNotActive, log)
-		return issue, false
+		return issue, nil, false
 	}
 
 	o.markObserved(ctx, issue.ID, hop, log)
@@ -465,7 +434,7 @@ func (o *Orchestrator) holdForStageHop(ctx context.Context, issue domain.Issue, 
 		)
 	}
 	issue.Labels = read.Labels
-	return issue, true
+	return issue, nonNilComments(read.Comments), true
 }
 
 // markObserved latches the hold release in memory and persists it.
@@ -480,7 +449,7 @@ func (o *Orchestrator) markObserved(ctx context.Context, issueID string, hop *St
 // PopulateStageHops loads persisted hop records into state.StageHops.
 // Called during startup recovery, before the event loop starts, after
 // [PopulateParked].
-func PopulateStageHops(state *State, rows []persistence.StageHop, log *slog.Logger) {
+func PopulateStageHops(state *State, rows []storage.StageHop, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}

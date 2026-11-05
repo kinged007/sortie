@@ -1,6 +1,13 @@
-import { isRowKind, routeText, rowMark, timeBaseOf, timeText } from "@/lib/active-rows";
-import { fmtStamp, parseInstant, upperFirst } from "@/lib/format";
-import { reactionLabel, reactionShortLabel } from "@/lib/labels";
+import {
+  awaitsApproval,
+  isRowKind,
+  routeText,
+  rowMark,
+  timeBaseOf,
+  timeText,
+} from "@/lib/active-rows";
+import { fmtCount, fmtStamp, parseInstant, plural } from "@/lib/format";
+import { reactionLabel, reactionShortLabel, reactionWatchLabel } from "@/lib/labels";
 import { endingWord, hasSeveralTerminalStates } from "@/lib/ended";
 import { runStatus, stateWord } from "@/lib/run-status";
 
@@ -18,45 +25,61 @@ import type {
 } from "@/api/types.gen";
 import type { Mark, StateMark } from "@/lib/run-status";
 
-/** What a station stands for on the way from the tracker to the end of a pull request. */
 export type StationKind = "tracker" | "agent" | "handoff" | "reaction" | "end";
 
 /** One place an issue can stand; stations depend on the configuration alone, never on an issue. */
 export interface Station {
   key: string;
   kind: StationKind;
+  /** The station's role, the same in every workflow. */
   label: string;
+  /**
+   * What the station stands for in this workflow: the tracker state it configures, as configured,
+   * or what a reaction watches; absent when none applies.
+   */
+  detail?: string;
   /** The form a header too narrow for the label uses; absent when the label is already short. */
   short?: string;
   /** Set on the end station of a workflow that lists two or more terminal states. */
-  labelFromEnding?: true;
+  detailFromEnding?: true;
 }
 
 const AGENT_KEY = "agent";
 
+/** Words a station with its detail, as a title or a screen reader reads it. */
+export function stationName(station: Pick<Station, "label" | "detail">): string {
+  return station.detail === undefined ? station.label : `${station.label} (${station.detail})`;
+}
+
+/** Places a reaction as its station stands on the pipeline; a key outside the order comes after the others. */
+export function reactionRank(configKey: string): number {
+  const rank = (REACTION_ORDER as readonly string[]).indexOf(configKey);
+  return rank === -1 ? REACTION_ORDER.length : rank;
+}
+
 const REACTION_ORDER = [
   "ci_failure",
-  "review_comments",
   "bot_review",
+  "review_comments",
   "merge_conflicts",
   "auto_merge",
   "merge_completion",
   "label_commands",
 ] as const satisfies readonly (keyof ShapeReactions)[];
 
-/**
- * Lists the stations of a workflow in order: the tracker, one agent station
- * for all agent work, the handoff state, one station per configured reaction,
- * and the end once any reaction exists. Stage names never become stations.
- */
+/** One agent station holds all agent work; stage names never become stations. Each station is named by its role and carries the state or watch it stands for as its detail. */
 export function stationsOf(config: ConfigResponse): Station[] {
+  const { in_progress_state: inProgress } = config.tracker;
+  const queued = (config.tracker.active_states ?? []).find(
+    (state) => state !== "" && state !== inProgress,
+  );
   const stations: Station[] = [
-    { key: "tracker", kind: "tracker", label: "Tracker" },
-    { key: AGENT_KEY, kind: "agent", label: "Agent" },
+    { key: "tracker", kind: "tracker", label: "Tracker", ...detailOf(queued) },
+    { key: AGENT_KEY, kind: "agent", label: "Agent", ...detailOf(inProgress) },
   ];
   const handoff = config.tracker.handoff_state;
   if (handoff !== undefined && handoff !== "") {
-    stations.push({ key: "handoff", kind: "handoff", label: upperFirst(handoff) });
+    stations.push({ key: "handoff", kind: "handoff", label: "Handoff", detail: handoff });
   }
   const reactions = REACTION_ORDER.filter((key) => config.reactions[key] !== undefined);
   for (const key of reactions) {
@@ -66,29 +89,44 @@ export function stationsOf(config: ConfigResponse): Station[] {
       kind: "reaction",
       label: reactionLabel(key),
       ...(short === undefined ? {} : { short }),
+      ...detailOf(
+        key === "merge_completion"
+          ? config.reactions.merge_completion?.target_state
+          : reactionWatchLabel(key),
+      ),
     });
   }
   if (reactions.length > 0) {
+    const detail = endDetailOf(config);
     stations.push({
       key: "end",
       kind: "end",
-      label: endLabelOf(config),
+      label: "Terminal",
+      ...(detail === undefined ? {} : { detail }),
       ...(hasSeveralTerminalStates(config.tracker.terminal_states)
-        ? { labelFromEnding: true as const }
+        ? { detailFromEnding: true as const }
         : {}),
     });
   }
   return stations;
 }
 
+function detailOf(detail: string | undefined): Pick<Station, "detail"> {
+  return detail === undefined || detail === "" ? {} : { detail };
+}
+
 // Sortie records a terminal ending without a merge when an issue closes under an open pull
 // request, so a terminal state's name is true of the end station only when every merge Sortie
 // records moves the issue into it, which `merge_completion` does and `auto_merge` alone does not.
-function endLabelOf(config: ConfigResponse): string {
-  const terminal = config.tracker.terminal_states ?? [];
-  const isEveryMergeTerminal =
-    config.reactions.auto_merge === undefined || config.reactions.merge_completion !== undefined;
-  return terminal.length === 1 && isEveryMergeTerminal ? upperFirst(terminal[0] ?? "End") : "End";
+function endDetailOf(config: ConfigResponse): string | undefined {
+  const target = config.reactions.merge_completion?.target_state;
+  if (target !== undefined && target !== "") {
+    return target;
+  }
+  const terminal = (config.tracker.terminal_states ?? []).filter((state) => state !== "");
+  return terminal.length === 1 && config.reactions.auto_merge === undefined
+    ? terminal[0]
+    : undefined;
 }
 
 function pendingEntryOf(
@@ -102,11 +140,7 @@ function pendingEntryOf(
   );
 }
 
-/**
- * Picks the state row that decides where an issue stands, from the issue's
- * status and its entry in the state's `active` list. A finished issue, an
- * unknown status, and a status whose row is absent decide nothing.
- */
+/** A finished issue, an unknown status, and a status whose row is absent decide nothing. */
 export function decidingOf(
   detail: IssueDetailResponse,
   active: ActiveIssueResponse | undefined,
@@ -135,7 +169,6 @@ export function decidingOf(
   }
 }
 
-/** What {@link standingOf} reads: the deciding row, or the recorded ending when there is none. */
 export interface StandingInput {
   deciding: Deciding | null;
   outcome: IssueOutcomeResponse | null;
@@ -148,13 +181,12 @@ export interface StandingInput {
 /** What a lane draws at the station it stands on: a status mark, or the ring of an issue that ended today. */
 export type LaneMarker = StateMark | "ended";
 
-/** Where an issue stands: a station key, its mark, and the time shown beside it. */
 export interface Standing {
   station: string;
   mark: LaneMarker | null;
   time: string | null;
-  /** The name the station takes in this issue's lane only; null keeps the station's own. */
-  label: string | null;
+  /** The detail the station takes in this issue's lane only; null keeps the station's own. */
+  detail: string | null;
 }
 
 function reactionKeyOf(deciding: Deciding): string | undefined {
@@ -203,30 +235,24 @@ function outcomeStation(kind: string, stations: readonly Station[]): Station | u
     : (stations.find((s) => s.kind === wanted) ?? stations.at(-1));
 }
 
-function endingStationLabel(outcome: IssueOutcomeResponse): string | null {
+function endingStationDetail(outcome: IssueOutcomeResponse): string | null {
   if (outcome.kind === "merged") {
-    return "Merged";
+    return "merged";
   }
   return outcome.kind === "terminal" && outcome.state !== undefined && outcome.state !== ""
-    ? upperFirst(outcome.state)
+    ? outcome.state
     : null;
 }
 
-/**
- * Places an issue on the stations. The deciding row wins; an issue with none
- * stands where its recorded ending puts it. It returns `null` when neither
- * exists, so a finished issue without a recorded ending has no marker. The
- * `label` of the standing renames the station for this issue only, and only
- * when the station takes its name from the ending.
- */
+/** Returns `null` when neither a state row nor an ending exists, so a finished issue without a recorded ending has no marker. The standing's `detail` applies to this issue only. */
 export function standingOf(input: StandingInput, stations: readonly Station[]): Standing | null {
   const { deciding, outcome, issueId, attention, now } = input;
   if (deciding !== null) {
     return {
       station: decidingStation(deciding, stations),
-      mark: rowMark(deciding.kind, issueId, attention),
+      mark: rowMark(deciding.kind, issueId, attention, awaitsApproval(deciding)),
       time: timeText(deciding.kind, timeBaseOf(deciding), now),
-      label: null,
+      detail: null,
     };
   }
   if (outcome === null) {
@@ -239,11 +265,10 @@ export function standingOf(input: StandingInput, stations: readonly Station[]): 
         station: station.key,
         mark: endingMarker(outcome.kind),
         time: fmtStamp(outcome.observed_at),
-        label: station.labelFromEnding === true ? endingStationLabel(outcome) : null,
+        detail: station.detailFromEnding === true ? endingStationDetail(outcome) : null,
       };
 }
 
-/** Gives the marker of a recorded ending: a handed-off issue waits on a person, and a merged or closed one has ended. */
 export function endingMarker(kind: string | undefined): LaneMarker | null {
   switch (kind) {
     case "handed_off":
@@ -256,15 +281,12 @@ export function endingMarker(kind: string | undefined): LaneMarker | null {
   }
 }
 
-/**
- * Gives the marker and the one word of an issue from its served status: the
- * row mark while it is active, its ending once its status is `history`.
- */
 export function issueStanding(
   issueId: string,
   status: string,
   outcome: IssueOutcomeResponse | null,
   attention: readonly AttentionItemResponse[],
+  awaitingApproval: boolean,
 ): { marker: LaneMarker | null; word: string } {
   if (status === "history") {
     return {
@@ -275,26 +297,23 @@ export function issueStanding(
   if (!isRowKind(status)) {
     return { marker: null, word: "" };
   }
-  const mark = rowMark(status, issueId, attention);
+  const mark = rowMark(status, issueId, attention, awaitingApproval);
   return { marker: mark, word: stateWord(mark) };
 }
 
-/** How a station reads against the issue's standing. */
 export type StationState =
   | "passed"
   | "current"
   | "ahead"
   | "waiting"
+  | "approval"
   | "needs"
   | "escalated"
   | "acted"
   | "quiet"
   | "idle";
 
-/**
- * A {@link Station} with its state, and the mark and time of the issue standing on it.
- * On the current station, `label` is the standing's label when it has one.
- */
+/** On the current station, `label` is the standing's label when it has one. */
 export interface LaneStation extends Station {
   state: StationState;
   mark: LaneMarker | null;
@@ -307,6 +326,52 @@ type PrLoop = Record<string, PrLoopStationResponse> | null;
 
 type Reading = Pick<LaneStation, "state" | "continuations">;
 
+/**
+ * Words what the newest check of a reaction found, in the noun the header gives the station:
+ * failures, comments, or conflicts, counted or "no", or checks still pending. Returns `undefined`
+ * when no row holds a check the station can word.
+ */
+function checkDetailOf(key: string, pending: readonly PendingReading[]): string | undefined {
+  const check = pending.find(
+    (row) => row.config_key === key && row.last_check !== null,
+  )?.last_check;
+  if (check === undefined || check === null) {
+    return undefined;
+  }
+  switch (key) {
+    case "ci_failure":
+      if (check.failing !== undefined && check.failing > 0) {
+        return plural(check.failing, "failure", "failures");
+      }
+      if (check.pending !== undefined && check.pending > 0) {
+        return `${fmtCount(check.pending)} pending`;
+      }
+      return check.failing === undefined ? undefined : "no failures";
+    case "bot_review":
+    case "review_comments":
+      if (check.actionable_comments === undefined) {
+        return undefined;
+      }
+      return check.actionable_comments > 0
+        ? plural(check.actionable_comments, "comment", "comments")
+        : "no comments";
+    case "merge_conflicts":
+      if (check.mergeable === undefined || check.mergeable === null) {
+        return undefined;
+      }
+      return check.mergeable ? "no conflicts" : "conflicts";
+    default:
+      return undefined;
+  }
+}
+
+function holdingStateOf(rows: readonly PendingReading[]): StationState {
+  if (rows.some((r) => r.escalated_at !== null)) {
+    return "needs";
+  }
+  return rows.some((r) => r.last_check?.awaiting_approval === true) ? "approval" : "waiting";
+}
+
 function reactionReadingOf(
   station: Station,
   pending: readonly PendingReading[],
@@ -314,10 +379,7 @@ function reactionReadingOf(
 ): Reading {
   const rows = pending.filter((r) => r.config_key === station.key && holdsStation(r));
   if (rows.length > 0) {
-    return {
-      state: rows.some((r) => r.escalated_at !== null) ? "needs" : "waiting",
-      continuations: 0,
-    };
+    return { state: holdingStateOf(rows), continuations: 0 };
   }
   const served: PrLoopStationResponse | undefined =
     prLoop !== null && Object.hasOwn(prLoop, station.key) ? prLoop[station.key] : undefined;
@@ -349,15 +411,7 @@ function readingOf(
   return { state: index < current ? "passed" : "ahead", continuations: 0 };
 }
 
-/**
- * Gives each station its state against the standing: the current station
- * carries the standing's mark and time. A reaction station reads waiting, or
- * needs once its escalation stands, while a pull request row is pending on it;
- * with none, it reads from the served `prLoop` as escalated, acted, quiet, or
- * idle for no record.
- * The rest read passed or ahead. The current station takes the standing's
- * label over its own; no other station is renamed.
- */
+/** The current station takes the standing's detail, and a reaction station what its newest check found, read from the pending pull request row while one exists, else from `prLoop`. */
 export function laneOf(
   stations: readonly Station[],
   standing: Standing | null,
@@ -365,11 +419,11 @@ export function laneOf(
   prLoop: PrLoop,
 ): LaneStation[] {
   const current = standing === null ? -1 : stations.findIndex((s) => s.key === standing.station);
-  return stations.map((station, index) =>
-    standing !== null && index === current
+  return stations.map((station, index) => ({
+    ...(standing !== null && index === current
       ? {
           ...station,
-          label: standing.label ?? station.label,
+          ...(standing.detail === null ? {} : { detail: standing.detail }),
           state: "current",
           mark: standing.mark,
           time: standing.time,
@@ -380,11 +434,11 @@ export function laneOf(
           ...readingOf(station, index, current, pending, prLoop),
           mark: null,
           time: null,
-        },
-  );
+        }),
+    ...(station.kind === "reaction" ? detailOf(checkDetailOf(station.key, pending)) : {}),
+  }));
 }
 
-/** The stage chain an issue is on and the stage it stands at. */
 export interface StagePosition {
   chain: readonly string[];
   current: string;
@@ -404,10 +458,7 @@ function chainSourceOf(
   return { chain: last.chain, current: last.rule };
 }
 
-/**
- * Reads a place in a stage chain from a chain source. It returns `null` when
- * there is no source, no chain, or the current stage is not on the chain.
- */
+/** Returns `null` when there is no source, no chain, or the current stage is not on the chain. */
 export function positionFrom(
   source: { chain: readonly string[] | null; current: string } | null,
 ): StagePosition | null {
@@ -417,11 +468,7 @@ export function positionFrom(
   return { chain: source.chain, current: source.current };
 }
 
-/**
- * Reads the issue's place in its stage chain: from the deciding row while one
- * exists, from `history.last_stage` for a finished issue. It returns `null`
- * when the issue has no chain or its current stage is not on it.
- */
+/** Reads from the deciding row while one exists, from `history.last_stage` for a finished issue; `null` when the issue has no chain or its current stage is not on it. */
 export function positionOf(
   detail: IssueDetailResponse,
   deciding: Deciding | null,
@@ -429,10 +476,7 @@ export function positionOf(
   return positionFrom(chainSourceOf(detail, deciding));
 }
 
-/**
- * Picks the newest finished run of a stage that was not started by a pull
- * request reaction, from runs in any order.
- */
+/** Picks the newest finished run of a stage that was not started by a pull request reaction, from runs in any order. */
 export function lastStageRunOf(
   runs: readonly RunResponse[],
   current: string,
@@ -451,11 +495,7 @@ export function lastStageRunOf(
     );
 }
 
-/**
- * Reads a finished issue's place in the chain its last stage run stood on,
- * from one issue's runs served newest first. It returns `null` when the issue
- * has no stage run, or that run's chain is absent or does not hold its rule.
- */
+/** Runs are served newest first; `null` when the issue has no stage run, or that run's chain is absent or does not hold its rule. */
 export function lastStagePositionOf(runs: readonly RunResponse[]): StagePosition | null {
   const run = runs.find((candidate) => !candidate.reaction_kind && candidate.rule_name);
   return run === undefined
@@ -463,18 +503,15 @@ export function lastStagePositionOf(runs: readonly RunResponse[]): StagePosition
     : positionFrom({ chain: run.stage_chain, current: run.rule_name ?? "" });
 }
 
-/** Words a finished run's place in its chain, or its rule, as an Active row words a running one. */
 export function runRouteText(run: RunResponse, config: ConfigResponse | undefined): string | null {
   const position = lastStagePositionOf([run]);
   return routeText({ stage_position: position, rule_name: run.rule_name }, config);
 }
 
-/** What the stage summary and the meter single out. */
 export type StageFocus =
   | { kind: "current"; mark: Mark | null }
   | { kind: "hop_not_made"; target: string; result: string };
 
-/** Counts for the stage summary and the stage meter. */
 export interface StageProgress {
   /** The 1-based place of the current stage. */
   k: number;
@@ -496,12 +533,7 @@ function hopNotMade(run: RunResponse | undefined): StageFocus | null {
   };
 }
 
-/**
- * Counts the stages done and ahead and picks the focus of the summary.
- * `lastStageRun` is the newest finished non-reaction run of the current stage;
- * a `failed` or `ceiling` result on it means the hop to the next stage was
- * not made.
- */
+/** `lastStageRun` is the newest finished non-reaction run of the current stage; a `failed` or `ceiling` result on it means the hop to the next stage was not made. */
 export function stageProgressOf(
   position: StagePosition,
   live: boolean,

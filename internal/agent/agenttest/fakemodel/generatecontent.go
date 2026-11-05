@@ -28,7 +28,7 @@ func (generateContentCodec) credentialHeaders() []string {
 	return []string{"x-goog-api-key", "Authorization"}
 }
 
-func (generateContentCodec) route(method, path string) (route, bool) {
+func (generateContentCodec) route(method, path string, _ http.Header) (route, bool) {
 	if method != http.MethodPost {
 		return route{}, false
 	}
@@ -176,10 +176,14 @@ func (generateContentCodec) render(r reply) rendered {
 	if r.call != nil {
 		part = generateContentPart{FunctionCall: &generateContentFunctionCall{Name: r.call.Name, Args: r.call.Arguments}}
 	}
+	finishReason := "STOP"
+	if r.truncated {
+		finishReason = "MAX_TOKENS"
+	}
 	chunk := encodeJSON(generateContentChunk{
 		Candidates: []generateContentCandidate{{
 			Content:      generateContentContent{Role: "model", Parts: []generateContentPart{part}},
-			FinishReason: "STOP",
+			FinishReason: finishReason,
 		}},
 		UsageMetadata: generateContentUsage{
 			PromptTokenCount:        r.usage.Prompt,

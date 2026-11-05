@@ -105,6 +105,11 @@ type TurnEvidence struct {
 	// other Terminal value. The zero value selects domain.ErrTurnFailed.
 	TerminalErrorKind domain.AgentErrorKind
 
+	// UsageLimit carries the refusal's reset instant and model scope. It
+	// is read only when TerminalErrorKind is domain.ErrUsageLimit; nil
+	// then means the runtime reported neither.
+	UsageLimit *domain.UsageLimit
+
 	// TerminalMessage describes the outcome in the runtime's own words, or
 	// in the adapter's when the adapter ended the turn. Carried onto both
 	// the emitted event and the returned error for a cancelled, failed,
@@ -250,13 +255,6 @@ type TurnMeta struct {
 	// APIDurationMS is the LLM API response wait time in milliseconds for
 	// this turn, or 0 when unavailable.
 	APIDurationMS int64
-
-	// ResumeUsage is the runtime's own usage figure for the session at the
-	// end of this turn, or nil when the turn produced no exact reading.
-	ResumeUsage *domain.TokenUsage
-
-	// ResumeUsageByModel is ResumeUsage's per-model split, or nil.
-	ResumeUsageByModel map[string]domain.TokenUsage
 }
 
 // DecideTurn returns the normalized disposition for one agent turn. It is
@@ -400,7 +398,8 @@ func DecideTurn(ev TurnEvidence) TurnDisposition {
 //
 // spend is the turn's evidence for the shared spend rule: FinalizeTurn
 // sets the result's SpendUnaccounted, SpendCoverable, and CoversSession
-// from it and leaves Usage and UsageMeasured as meta carries them.
+// from it and leaves Usage and UsageMeasured as meta carries them. The
+// terminal event and the result carry the turn's reported amounts.
 //
 // FinalizeTurn panics when emit is nil. It substitutes slog.Default() when
 // logger is nil. It is not idempotent, because it emits; callers MUST call
@@ -421,15 +420,20 @@ func FinalizeTurn(
 
 	disposition := DecideTurn(ev)
 
+	emitTerminal := func(event domain.AgentEvent) {
+		event.ReportedAmounts = spend.amounts
+		emit(event)
+	}
+
 	switch disposition.ExitReason {
 	case domain.EventTurnCompleted:
-		EmitTurnCompleted(emit, disposition.EventMessage, meta.APIDurationMS, meta.Usage, meta.UsageByModel)
+		EmitTurnCompleted(emitTerminal, disposition.EventMessage, meta.APIDurationMS, meta.Usage, meta.UsageByModel)
 	case domain.EventTurnFailed:
-		EmitTurnFailed(emit, disposition.EventMessage, meta.APIDurationMS, meta.Usage, meta.UsageByModel)
+		EmitTurnFailed(emitTerminal, disposition.EventMessage, meta.APIDurationMS, meta.Usage, meta.UsageByModel)
 	case domain.EventTurnCancelled:
-		EmitTurnCancelled(emit, disposition.EventMessage, meta.Usage, meta.UsageByModel)
+		EmitTurnCancelled(emitTerminal, disposition.EventMessage, meta.Usage, meta.UsageByModel)
 	case domain.EventTurnInputRequired:
-		EmitTurnInputRequired(emit, disposition.EventMessage, meta.Usage, meta.UsageByModel)
+		EmitTurnInputRequired(emitTerminal, disposition.EventMessage, meta.Usage, meta.UsageByModel)
 	}
 
 	if disposition.Row == RowZeroWork {
@@ -446,12 +450,10 @@ func FinalizeTurn(
 	}
 
 	result := domain.TurnResult{
-		SessionID:          meta.SessionID,
-		Usage:              meta.Usage,
-		UsageMeasured:      meta.UsageMeasured,
-		ResumeUsage:        meta.ResumeUsage,
-		ResumeUsageByModel: meta.ResumeUsageByModel,
-		ExitReason:         disposition.ExitReason,
+		SessionID:     meta.SessionID,
+		Usage:         meta.Usage,
+		UsageMeasured: meta.UsageMeasured,
+		ExitReason:    disposition.ExitReason,
 	}
 	spend.applyTo(&result, disposition.ExitReason == domain.EventTurnCompleted)
 
@@ -465,11 +467,18 @@ func FinalizeTurn(
 	if disposition.Row == RowNonZeroExit {
 		cause = ev.WaitErr
 	}
-	return result, &domain.AgentError{
+	agentErr := &domain.AgentError{
 		Kind:    disposition.ErrorKind,
 		Message: disposition.ErrorMessage,
 		Err:     cause,
 	}
+	if disposition.ErrorKind == domain.ErrUsageLimit {
+		agentErr.UsageLimit = &domain.UsageLimit{}
+		if ev.UsageLimit != nil {
+			*agentErr.UsageLimit = *ev.UsageLimit
+		}
+	}
+	return result, agentErr
 }
 
 // CancelledOutcome reports whether a turn's result and error say the

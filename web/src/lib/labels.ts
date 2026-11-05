@@ -8,10 +8,11 @@ const ORIGIN_LABELS: Record<string, string> = {
   stage_hop: "Stage hop",
   error: "Retry after an error",
   stall: "Retry after a stall",
+  usage_limit: "Retry after a usage limit reset",
   continuation: "Continuation",
   ci_fix: "CI fix",
   ci: "CI fix",
-  review: "Review fix",
+  review: "Human review fix",
   "bot-review": "Bot review fix",
   "merge-conflict": "Merge conflict fix",
   "label-review": "Review command",
@@ -23,18 +24,24 @@ const ORIGIN_LABELS: Record<string, string> = {
 const TRIGGER_LABELS: Record<string, string> = {
   error: "Retry after an error",
   stall: "Retry after a stall",
+  usage_limit: "Retry after a usage limit reset",
   continuation: "Continuation",
   ci_fix: "CI fix",
   [NONE]: "Not a retry",
   [UNKNOWN]: "Not recorded",
 };
 
+const HOP_NOT_MADE_REASONS: Record<string, string> = {
+  failed: "the next stage's label could not be added",
+  ceiling: "the limit on automatic hops in a row was reached",
+};
+
 const REACTION_LABELS: Record<string, string> = {
-  ci_failure: "CI fix",
-  review_comments: "Review",
+  ci_failure: "CI",
   bot_review: "Bot review",
-  merge_conflicts: "Conflicts",
-  auto_merge: "Merge",
+  review_comments: "Human review",
+  merge_conflicts: "Merge",
+  auto_merge: "Auto-merge",
   merge_completion: "Merge completion",
   label_commands: "Label commands",
 };
@@ -95,7 +102,7 @@ export function reactionCountLabel(configKey: string, count: number): string {
 
 const REACTION_SHORT_LABELS: Record<string, string> = {
   bot_review: "Bot",
-  merge_conflicts: "Confl.",
+  review_comments: "Human",
   merge_completion: "Completion",
   label_commands: "Commands",
 };
@@ -105,4 +112,42 @@ export function reactionShortLabel(configKey: string): string | undefined {
   return Object.hasOwn(REACTION_SHORT_LABELS, configKey)
     ? REACTION_SHORT_LABELS[configKey]
     : undefined;
+}
+
+/** Words why a hop was not made; a result the client has no wording for reads as served. */
+export function hopReason(result: string): string {
+  return worded(HOP_NOT_MADE_REASONS, result);
+}
+
+/** Words a stage hop as a lower-case phrase, such as "moved to review"; a result the client has no wording for reads as served. */
+export function hopLabel(target: string, result: string | undefined): string {
+  const rule = ruleLabel(target);
+  switch (result) {
+    case undefined:
+    case "":
+      return `hop to ${rule}`;
+    case "advanced":
+      return `moved to ${rule}`;
+    case "partial":
+      return `moved to ${rule}, an old stage label was not removed`;
+    case "failed":
+    case "ceiling":
+      return `hop to ${rule} not made: ${hopReason(result)}`;
+    default:
+      return `hop to ${rule}: ${result}`;
+  }
+}
+
+const REACTION_WATCHES: Record<string, string> = {
+  ci_failure: "failures",
+  bot_review: "comments",
+  review_comments: "comments",
+  merge_conflicts: "conflicts",
+  auto_merge: "when ready",
+  label_commands: "labels",
+};
+
+/** Words what sets a reaction off, as a plural noun; a key without wording has none. */
+export function reactionWatchLabel(configKey: string): string | undefined {
+  return Object.hasOwn(REACTION_WATCHES, configKey) ? REACTION_WATCHES[configKey] : undefined;
 }

@@ -2,6 +2,7 @@ package gitlab
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -256,6 +257,65 @@ func registerPagedLabels(t *testing.T, s *fakeServer, srvURL *string) {
 		w.WriteHeader(http.StatusOK)
 		w.Write(loadFixture(t, "labels_page1.json")) //nolint:errcheck // test helper
 	})
+}
+
+type requestLog struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (l *requestLog) add(r *http.Request) {
+	entry := r.Method + " " + r.URL.RequestURI()
+	if r.Header.Get("If-None-Match") != "" {
+		entry += " (conditional)"
+	}
+	l.mu.Lock()
+	l.seen = append(l.seen, entry)
+	l.mu.Unlock()
+}
+
+func (l *requestLog) list() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.seen)
+}
+
+func (l *requestLog) withPrefix(prefix string) []string {
+	return slices.DeleteFunc(l.list(), func(entry string) bool { return !strings.HasPrefix(entry, prefix) })
+}
+
+func notesURI(iid string) string {
+	return "/api/v4/projects/" + testEscapedProject + "/issues/" + iid + "/notes"
+}
+
+func serveNotePages(t *testing.T, s *fakeServer, iid string, log *requestLog, fixtures ...string) {
+	t.Helper()
+	pages := make([][]byte, len(fixtures))
+	for i, name := range fixtures {
+		pages[i] = loadFixture(t, name)
+	}
+	s.handle(notesURI(iid), func(w http.ResponseWriter, r *http.Request) {
+		log.add(r)
+		page := 1
+		if raw := r.URL.Query().Get("page"); raw != "" {
+			page, _ = strconv.Atoi(raw)
+		}
+		if page < len(pages) {
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?page=%d>; rel="next"`, r.Host, notesURI(iid), page+1))
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(pages[page-1]) //nolint:errcheck // test helper
+	})
+}
+
+func serveUsers(s *fakeServer, log *requestLog, status int) {
+	for id, bot := range map[int]bool{11: false, 77: true} {
+		s.handle("/api/v4/users/"+strconv.Itoa(id), func(w http.ResponseWriter, r *http.Request) {
+			log.add(r)
+			w.WriteHeader(status)
+			fmt.Fprintf(w, `{"id":%d,"bot":%t}`, id, bot) //nolint:errcheck // test helper
+		})
+	}
 }
 
 // swapDefaultLogger installs a buffer-backed slog default logger and
@@ -837,59 +897,6 @@ func TestPaginateIssues(t *testing.T) {
 	})
 }
 
-func TestPaginateNotes(t *testing.T) {
-	t.Parallel()
-
-	t.Run("follows Link headers across pages accumulating raw notes", func(t *testing.T) {
-		t.Parallel()
-
-		page1 := loadFixture(t, "notes_page1.json") // 2 notes
-		page2 := loadFixture(t, "notes_page2.json") // 2 notes, final
-
-		s := newPreflightServer(t)
-		var srvURL string
-		var calls atomic.Int32
-		basePath := "/api/v4/projects/" + testEscapedProject + "/issues/42/notes"
-		s.handle(basePath, func(w http.ResponseWriter, r *http.Request) {
-			n := calls.Add(1)
-			first := fmt.Sprintf(`<%s%s?page=1>; rel="first"`, srvURL, basePath)
-			last := fmt.Sprintf(`<%s%s?page=2>; rel="last"`, srvURL, basePath)
-			if n == 1 {
-				next := fmt.Sprintf(`<%s%s?page=2>; rel="next"`, srvURL, basePath)
-				w.Header().Set("Link", strings.Join([]string{next, first, last}, ", "))
-				w.WriteHeader(http.StatusOK)
-				w.Write(page1) //nolint:errcheck // test helper
-				return
-			}
-			w.Header().Set("Link", strings.Join([]string{first, last}, ", "))
-			w.WriteHeader(http.StatusOK)
-			w.Write(page2) //nolint:errcheck // test helper
-		})
-		srv := httptest.NewServer(s)
-		defer srv.Close()
-		srvURL = srv.URL
-
-		cfg := validConfig(testProject)
-		cfg["endpoint"] = srv.URL
-		a, err := NewGitLabAdapter(cfg)
-		if err != nil {
-			t.Fatalf("NewGitLabAdapter: %v", err)
-		}
-		ga := a.(*GitLabAdapter)
-
-		notes, err := ga.paginateNotes(context.Background(), "/projects/"+testEscapedProject+"/issues/42/notes", url.Values{"per_page": {"100"}})
-		if err != nil {
-			t.Fatalf("paginateNotes: %v", err)
-		}
-		if len(notes) != 4 {
-			t.Fatalf("len = %d, want 4 raw notes across 2 pages (before system-note filtering)", len(notes))
-		}
-		if got := calls.Load(); got != 2 {
-			t.Errorf("call count = %d, want 2 (one per page)", got)
-		}
-	})
-}
-
 func TestFetchCandidateIssues(t *testing.T) {
 	t.Parallel()
 
@@ -1409,58 +1416,37 @@ func TestFetchIssueComments(t *testing.T) {
 		t.Parallel()
 
 		s := newPreflightServer(t)
-		var srvURL string
-		var calls atomic.Int32
-		basePath := "/api/v4/projects/" + testEscapedProject + "/issues/55/notes"
-		s.handle(basePath, func(w http.ResponseWriter, r *http.Request) {
-			n := calls.Add(1)
-			if n == 1 {
-				// Only the first request carries the base params; the
-				// paginator follows subsequent pages via the absolute
-				// Link-header URL, which does not repeat them.
-				assertQueryParams(t, "notes", r.URL.Query(), map[string]string{
-					"activity_filter": "only_comments", "sort": "asc", "per_page": "100",
-				})
-			}
-			first := fmt.Sprintf(`<%s%s?page=1>; rel="first"`, srvURL, basePath)
-			last := fmt.Sprintf(`<%s%s?page=2>; rel="last"`, srvURL, basePath)
-			if n == 1 {
-				next := fmt.Sprintf(`<%s%s?page=2>; rel="next"`, srvURL, basePath)
-				w.Header().Set("Link", strings.Join([]string{next, first, last}, ", "))
-				w.WriteHeader(http.StatusOK)
-				w.Write(loadFixture(t, "notes_page1.json")) //nolint:errcheck // test helper
-				return
-			}
-			w.Header().Set("Link", strings.Join([]string{first, last}, ", "))
-			w.WriteHeader(http.StatusOK)
-			w.Write(loadFixture(t, "notes_page2.json")) //nolint:errcheck // test helper
-		})
-		srv := httptest.NewServer(s)
-		defer srv.Close()
-		srvURL = srv.URL
+		var log requestLog
+		serveNotePages(t, s, "55", &log, "notes_page1.json", "notes_page2.json")
+		a := mustAdapter(t, s)
 
-		cfg := validConfig(testProject)
-		cfg["endpoint"] = srv.URL
-		a, err := NewGitLabAdapter(cfg)
-		if err != nil {
-			t.Fatalf("NewGitLabAdapter: %v", err)
-		}
-
-		comments, err := a.(*GitLabAdapter).FetchIssueComments(context.Background(), "55")
+		comments, err := a.FetchIssueComments(context.Background(), "55")
 		if err != nil {
 			t.Fatalf("FetchIssueComments: %v", err)
 		}
-		if len(comments) != 3 {
-			t.Fatalf("len = %d, want 3 (4 raw notes minus the one system note)", len(comments))
+
+		wantRequests := []string{
+			"GET " + notesURI("55") + "?activity_filter=only_comments&per_page=100&sort=asc",
+			"GET " + notesURI("55") + "?page=2",
+		}
+		if got := log.list(); !slices.Equal(got, wantRequests) {
+			t.Errorf("FetchIssueComments(%q) requests = %q, want %q", "55", got, wantRequests)
 		}
 		wantIDs := []string{"501", "503", "504"}
-		for i, want := range wantIDs {
-			if comments[i].ID != want {
-				t.Errorf("comments[%d].ID = %q, want %q", i, comments[i].ID, want)
-			}
+		gotIDs := make([]string, len(comments))
+		for i, c := range comments {
+			gotIDs[i] = c.ID
 		}
-		if got := calls.Load(); got != 2 {
-			t.Errorf("call count = %d, want 2 (one per page)", got)
+		if !slices.Equal(gotIDs, wantIDs) {
+			t.Fatalf("FetchIssueComments(%q) IDs = %q, want %q", "55", gotIDs, wantIDs)
+		}
+		wantFirst := domain.Comment{
+			ID: "501", Author: "alice", AuthorID: "alice", AuthorKind: domain.CommentAuthorUnknown,
+			Body:      "Started investigating the failure.",
+			CreatedAt: "2026-01-10T09:00:00.000Z", UpdatedAt: "2026-01-10T09:00:00.000Z",
+		}
+		if comments[0] != wantFirst {
+			t.Errorf("FetchIssueComments(%q)[0] = %+v, want %+v", "55", comments[0], wantFirst)
 		}
 	})
 
@@ -1509,6 +1495,155 @@ func TestFetchIssueComments(t *testing.T) {
 				_, err := a.FetchIssueComments(context.Background(), raw)
 				assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 			})
+		}
+	})
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	const (
+		point       = "2026-01-10T12:00:00Z"
+		newest      = "2026-01-10T12:40:00.123Z"
+		changeQuery = "?activity_filter=only_comments&order_by=updated_at&per_page=100&sort=desc"
+	)
+	allPages := []string{"comment_changes_page1.json", "comment_changes_page2.json"}
+	edited := domain.Comment{
+		ID: "603", Author: "alice", AuthorID: "alice", AuthorKind: domain.CommentAuthorPerson,
+		Body:      "Edited: rollback verified on staging.",
+		CreatedAt: "2026-01-10T10:00:00.000Z", UpdatedAt: "2026-01-10T12:20:00.000Z",
+	}
+	added := domain.Comment{
+		ID: "605", Author: "renovate-bot", AuthorID: "renovate-bot", AuthorKind: domain.CommentAuthorBot,
+		Body:      "Bumped the base image to 1.24.3.",
+		CreatedAt: "2026-01-10T12:40:00.123Z", UpdatedAt: "2026-01-10T12:40:00.123Z",
+	}
+
+	tests := []struct {
+		name        string
+		since       domain.CommentReadPoint
+		pages       []string
+		usersStatus int
+		wantPages   int
+		wantLookups int
+		wantIDs     []string
+		wantNext    domain.CommentReadPoint
+		wantSpot    []domain.Comment
+		wantKind    domain.TrackerErrorKind
+	}{
+		{
+			name:  "empty point reads every page, each note once, oldest created first",
+			pages: allPages, wantPages: 2, wantLookups: 2,
+			wantIDs: []string{"601", "602", "603", "605"}, wantNext: newest,
+		},
+		{
+			name:  "undecodable point reads every page without stopping",
+			since: "x", pages: allPages, wantPages: 2, wantLookups: 2,
+			wantIDs: []string{"601", "602", "603", "605"}, wantNext: newest,
+		},
+		{
+			name:  "new and edited notes carry author, kind, update time and new body",
+			since: point, pages: allPages, wantPages: 2, wantLookups: 2,
+			wantIDs: []string{"602", "603", "605"}, wantNext: newest,
+			wantSpot: []domain.Comment{edited, added},
+		},
+		{
+			name:  "nothing new returns only notes updated at the point and the same point",
+			since: newest, pages: allPages, wantPages: 1, wantLookups: 1,
+			wantIDs: []string{"605"}, wantNext: newest,
+		},
+		{
+			name:  "walk stops after the page reaching an older note and drops a newer system note",
+			since: "2026-01-10T12:15:00Z", pages: allPages, wantPages: 1, wantLookups: 2,
+			wantIDs: []string{"603", "605"}, wantNext: newest,
+		},
+		{
+			name:  "unparseable update time with a point is a payload error",
+			since: point, pages: []string{"comment_changes_bad_updated_at.json"}, wantPages: 1,
+			wantKind: domain.ErrTrackerPayload,
+		},
+		{
+			name:  "unparseable update time without a point is a payload error",
+			pages: []string{"comment_changes_bad_updated_at.json"}, wantPages: 1,
+			wantKind: domain.ErrTrackerPayload,
+		},
+		{
+			name:  "failed author lookup fails the read",
+			pages: allPages, usersStatus: http.StatusInternalServerError, wantPages: 2, wantLookups: 1,
+			wantKind: domain.ErrTrackerTransport,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newPreflightServer(t)
+			var log requestLog
+			serveNotePages(t, s, "55", &log, tt.pages...)
+			serveUsers(s, &log, cmp.Or(tt.usersStatus, http.StatusOK))
+			a := mustAdapter(t, s)
+
+			changes, err := a.FetchIssueCommentChanges(context.Background(), "55", tt.since)
+
+			notes := log.withPrefix("GET " + notesURI("55"))
+			if len(notes) != tt.wantPages {
+				t.Errorf("FetchIssueCommentChanges(%q) sent %d note requests %q, want %d", tt.since, len(notes), notes, tt.wantPages)
+			}
+			if len(notes) > 0 && notes[0] != "GET "+notesURI("55")+changeQuery {
+				t.Errorf("FetchIssueCommentChanges(%q) first request = %q, want query %q", tt.since, notes[0], changeQuery)
+			}
+			if got := len(log.withPrefix("GET /api/v4/users/")); got != tt.wantLookups {
+				t.Errorf("FetchIssueCommentChanges(%q) sent %d user lookups, want %d", tt.since, got, tt.wantLookups)
+			}
+			if tt.wantKind != "" {
+				assertTrackerErrorKind(t, err, tt.wantKind)
+				if len(changes.Comments) != 0 || changes.Next != "" {
+					t.Errorf("FetchIssueCommentChanges(%q) = %+v on error, want zero value", tt.since, changes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FetchIssueCommentChanges(%q): %v", tt.since, err)
+			}
+
+			adaptertest.AssertCommentsAscending(t, changes.Comments)
+			gotIDs := make([]string, len(changes.Comments))
+			for i, c := range changes.Comments {
+				gotIDs[i] = c.ID
+			}
+			if !slices.Equal(gotIDs, tt.wantIDs) {
+				t.Errorf("FetchIssueCommentChanges(%q) IDs = %q, want %q", tt.since, gotIDs, tt.wantIDs)
+			}
+			if changes.Next != tt.wantNext {
+				t.Errorf("FetchIssueCommentChanges(%q).Next = %q, want %q", tt.since, changes.Next, tt.wantNext)
+			}
+			for _, want := range tt.wantSpot {
+				i := slices.Index(gotIDs, want.ID)
+				if i < 0 || changes.Comments[i] != want {
+					t.Errorf("FetchIssueCommentChanges(%q) comment %q = %+v, want %+v", tt.since, want.ID, changes.Comments, want)
+				}
+			}
+		})
+	}
+
+	t.Run("two reads of one adapter look up each author once", func(t *testing.T) {
+		t.Parallel()
+
+		s := newPreflightServer(t)
+		var log requestLog
+		serveNotePages(t, s, "55", &log, allPages...)
+		serveUsers(s, &log, http.StatusOK)
+		a := mustAdapter(t, s)
+
+		for range 2 {
+			if _, err := a.FetchIssueCommentChanges(context.Background(), "55", ""); err != nil {
+				t.Fatalf("FetchIssueCommentChanges: %v", err)
+			}
+		}
+
+		if got := len(log.withPrefix("GET /api/v4/users/")); got != 2 {
+			t.Errorf("two FetchIssueCommentChanges reads sent %d user lookups, want 2 (alice and renovate-bot once each)", got)
 		}
 	})
 }
@@ -1998,32 +2133,46 @@ func TestTransitionIssue(t *testing.T) {
 func TestCommentIssue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("posts the note verbatim including newlines", func(t *testing.T) {
+	t.Run("posts the note verbatim including newlines and returns the created note's identity", func(t *testing.T) {
 		t.Parallel()
 
 		const text = "Automated check failed.\nSee the CI log for detail."
 
+		created := loadFixture(t, "note_created.json")
+		listed := append(append([]byte("["), created...), ']')
+		notesPath := "/api/v4/projects/" + testEscapedProject + "/issues/1/notes"
 		s := newPreflightServer(t)
 		var postBody []byte
-		var postCalls atomic.Int32
-		s.handleMethod(http.MethodPost, "/api/v4/projects/"+testEscapedProject+"/issues/1/notes", func(w http.ResponseWriter, r *http.Request) {
-			postCalls.Add(1)
+		var requests atomic.Int32
+		s.handleMethod(http.MethodPost, notesPath, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
 			postBody = readRequestBody(t, r)
 			w.WriteHeader(http.StatusCreated)
-			w.Write(loadFixture(t, "note_created.json")) //nolint:errcheck // test helper
+			w.Write(created) //nolint:errcheck // test helper
+		})
+		s.handle(notesPath, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			w.Write(listed) //nolint:errcheck // test helper
 		})
 		a := mustAdapter(t, s)
 
-		if err := a.CommentIssue(context.Background(), "1", text); err != nil {
+		id, err := a.CommentIssue(context.Background(), "1", text)
+		if err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
-		if got := postCalls.Load(); got != 1 {
-			t.Errorf("POST call count = %d, want 1", got)
+		if got := requests.Load(); got != 1 {
+			t.Errorf("request count during CommentIssue = %d, want 1", got)
 		}
 		want := `{"body":` + strconv.Quote(text) + `}`
 		if string(postBody) != want {
 			t.Errorf("POST body = %s, want %s (text must pass through byte-identical, including newlines)", postBody, want)
 		}
+
+		comments, err := a.FetchIssueComments(context.Background(), "1")
+		if err != nil {
+			t.Fatalf("FetchIssueComments: %v", err)
+		}
+		adaptertest.AssertPostedCommentListed(t, id, comments)
 	})
 
 	t.Run("a 2xx that created no note reports ErrTrackerPayload", func(t *testing.T) {
@@ -2036,7 +2185,7 @@ func TestCommentIssue(t *testing.T) {
 		})
 		a := mustAdapter(t, s)
 
-		err := a.CommentIssue(context.Background(), "2", "/close")
+		_, err := a.CommentIssue(context.Background(), "2", "/close")
 		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
 	})
 
@@ -2053,7 +2202,7 @@ func TestCommentIssue(t *testing.T) {
 		var buf bytes.Buffer
 		a.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-		if err := a.CommentIssue(context.Background(), "3", "/close\nSome text"); err != nil {
+		if _, err := a.CommentIssue(context.Background(), "3", "/close\nSome text"); err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 		output := buf.String()
@@ -2064,55 +2213,6 @@ func TestCommentIssue(t *testing.T) {
 			t.Errorf("log output missing the executed command key add_label_ids\noutput: %s", output)
 		}
 	})
-}
-
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			bodies := make(chan []byte, 1)
-			s := newPreflightServer(t)
-			s.handleMethod(http.MethodPost, "/api/v4/projects/"+testEscapedProject+"/issues/1/notes", func(w http.ResponseWriter, r *http.Request) {
-				raw, _ := io.ReadAll(r.Body)
-				bodies <- raw
-				w.WriteHeader(http.StatusCreated)
-				w.Write([]byte(`{"id":900}`)) //nolint:errcheck // test helper
-			})
-			a := mustAdapter(t, s)
-
-			if err := a.CommentIssueWithLiteral(context.Background(), "1", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			want := `{"body":` + strconv.Quote(tt.want) + `}`
-			if got := string(<-bodies); got != want {
-				t.Errorf("POST body = %s, want %s", got, want)
-			}
-		})
-	}
 }
 
 func TestAddLabel(t *testing.T) {
@@ -2657,11 +2757,30 @@ func TestWriteIdentifierGuard(t *testing.T) {
 			err := a.TransitionIssue(context.Background(), raw, "done")
 			assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 
-			err = a.CommentIssue(context.Background(), raw, "text")
+			_, err = a.CommentIssue(context.Background(), raw, "text")
 			assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 
 			err = a.AddLabel(context.Background(), raw, "needs-human")
 			assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
+		})
+	}
+}
+
+func TestProjectWebURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, endpoint, project, want string }{
+		{"subgroup path", "https://gitlab.com", "acme/team/widgets", "https://gitlab.com/acme/team/widgets"},
+		{"api suffix is dropped", "https://example.com/gitlab/api/v4", "acme/widgets", "https://example.com/gitlab/acme/widgets"},
+		{"numeric id uses the projects route", "https://gitlab.com/api/v4", "4242", "https://gitlab.com/projects/4242"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := projectWebURL(tt.endpoint, tt.project); got != tt.want {
+				t.Errorf("projectWebURL(%q, %q) = %q, want %q", tt.endpoint, tt.project, got, tt.want)
+			}
 		})
 	}
 }

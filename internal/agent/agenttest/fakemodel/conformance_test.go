@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/launchtest"
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -43,6 +49,7 @@ const (
 	conformanceContinuedAt = iota + 1
 	conformanceControlAt
 	conformanceResumedAt
+	conformanceUnheldAt
 )
 
 const (
@@ -58,6 +65,7 @@ var (
 
 	conformanceKindsOnce     sync.Once
 	errConformanceFactory    = errors.New("conformance factory refused")
+	errConformanceCleanup    = errors.New("conformance cleanup refused")
 	conformanceUnservedKinds = []ExchangeKind{ExchangeExhausted, ExchangeUnmatched, ExchangeUnrouted, ExchangeUnsupported, ExchangeInvalid}
 )
 
@@ -69,8 +77,10 @@ type conformanceCase[S any] struct {
 }
 
 type conformanceUsageState struct {
-	run     Run
-	arrival registry.UsageArrival
+	run      Run
+	arrival  registry.UsageArrival
+	spend    *SpendSources
+	settling usageSettling
 }
 
 type conformanceContainmentState struct {
@@ -83,6 +93,8 @@ type conformanceExhaustionState struct {
 	timedOut bool
 	failures []string
 	nonce    string
+	folded   bool
+	settling usageSettling
 }
 
 type conformanceSpyTB struct {
@@ -231,14 +243,61 @@ func conformanceRunCases[S any](t *testing.T, property string, cases []conforman
 	}
 }
 
+func conformanceTokens(input, output, cacheRead, cacheWrite int64) domain.TokenUsage {
+	return domain.TokenUsage{InputTokens: input, OutputTokens: output, TotalTokens: input + output, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite}
+}
+
+func conformancePerModel(s *conformanceUsageState) {
+	s.run.Exchanges[conformanceAuxiliaryAt].Model = "model-a"
+	s.run.Exchanges[conformanceFirstTurnAt].Model = "model-a"
+	s.run.Exchanges[conformanceSecondTurnAt].Model = "model-b"
+	s.run.Events[conformanceEventUsageAt].UsageByModel = map[string]domain.TokenUsage{
+		"model-a": conformanceTokens(218, 23, 53, 19),
+		"model-b": conformanceTokens(307, 24, 61, 23),
+	}
+}
+
+func conformanceLiveOnlyInterrupted(s *conformanceUsageState) {
+	live := domain.UsageProvenance{Source: "protocol", Strategy: 1}
+	s.spend = &SpendSources{Live: live, Records: domain.UsageProvenance{Source: "journal", Strategy: 2}}
+	s.settling.recordsUnread = true
+	s.run.Result.ExitReason = domain.EventTurnCancelled
+	s.run.Result.SpendUnaccounted = true
+	s.run.Result.UsageProvenance = []domain.UsageProvenance{live}
+}
+
+func conformanceLiveLowerBound(s *conformanceUsageState) {
+	s.settling.liveLowerBound = true
+}
+
 func conformanceRegisterKinds() {
 	conformanceKindsOnce.Do(func() {
 		refuse := func() (domain.AgentAdapter, error) { return nil, errConformanceFactory }
 		registry.Agents.RegisterWithMeta(conformanceCommandKind, refuse, registry.AgentMeta{
+			UsageSources: usage.Sources{Live: usage.Source{
+				Category: usage.SourceOutput,
+				Strategy: usage.StrategyLive,
+				Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, LowerBound: true},
+			}},
 			RequiresCommand: true,
 			CredentialEnv:   registry.DeclareCredentialEnv(conformanceDeclaredToken),
+
+			VerificationContext: registry.DeclareVerificationContext(),
 		})
-		registry.Agents.RegisterWithMeta(conformancePlainKind, refuse, registry.AgentMeta{})
+		registry.Agents.RegisterWithMeta(conformancePlainKind, refuse, registry.AgentMeta{
+			UsageSources: usage.Sources{
+				Live: usage.Source{
+					Category: usage.SourceOutput,
+					Strategy: usage.StrategyLive,
+					Spend:    usage.SpendDeclaration{Amounts: []usage.AmountDeclaration{{Unit: "credits", Shape: usage.AmountPerTurn}}},
+				},
+				Records: usage.Source{
+					Category: usage.SourceJournal,
+					Strategy: usage.StrategyRecords,
+					Spend:    usage.SpendDeclaration{Shape: usage.SpendPerRequest},
+				},
+			},
+		})
 	})
 }
 
@@ -283,7 +342,10 @@ func conformanceGoneRun() conformanceGoneState {
 			Environment: Environment{Scenario: ScenarioStop},
 			Session:     domain.Session{AgentPID: strconv.Itoa(conformanceRuntimePID)},
 		},
-		td:        teardown{snapshot: []int{conformanceRuntimePID, conformanceRuntimePID + 1}},
+		td: teardown{
+			aliveWhileHeld: []int{conformanceRuntimePID, conformanceRuntimePID + 1},
+			heldLaunches:   []func() (bool, error){func() (bool, error) { return true, nil }},
+		},
 		remaining: map[int]string{},
 	}
 }
@@ -294,10 +356,11 @@ type conformanceContinuationState struct {
 	turns     []continuedTurn
 	resumed   domain.Session
 	exchanges []Exchange
+	settling  usageSettling
 }
 
 func conformanceContinuationRun() conformanceContinuationState {
-	const originID, controlID = "session-origin", "session-control"
+	const originID, controlID, unheldRequested, unheldID = "session-origin", "session-control", "session-unheld-requested", "session-unheld"
 	started := func(id string) []domain.AgentEvent {
 		return []domain.AgentEvent{{Type: domain.EventSessionStarted, SessionID: id}}
 	}
@@ -309,19 +372,22 @@ func conformanceContinuationRun() conformanceContinuationState {
 		"nonce-p1 nonce-a1 nonce-p2",
 		"nonce-p3",
 		"nonce-p1 nonce-a1 nonce-p2 nonce-a2 nonce-p4",
+		"nonce-p5",
 	}
 	var exchanges []Exchange
 	for step, body := range requests {
 		exchanges = append(exchanges, Exchange{Seq: step + 1, Kind: ExchangeTurn, Method: "POST", Path: "/v1/messages", Step: step, Body: []byte(body)})
 	}
+	origin, control, resumed, unheld := domain.Session{ID: originID}, domain.Session{ID: controlID}, domain.Session{ID: originID, CarriedHistory: true}, domain.Session{ID: unheldID}
 	return conformanceContinuationState{
 		turns: []continuedTurn{
-			{role: roleOrigin, prompt: "nonce-p1", answer: "nonce-a1", result: result(originID), events: started(originID)},
-			{role: roleOrigin, prompt: "nonce-p2", answer: "nonce-a2", result: result(originID)},
-			{role: roleControl, prompt: "nonce-p3", answer: "nonce-a3", result: result(controlID), events: started(controlID)},
-			{role: roleResumed, prompt: "nonce-p4", answer: "nonce-a4", result: result(originID), events: started(originID)},
+			{role: roleOrigin, session: origin, promptMarker: "nonce-p1", answerMarker: "nonce-a1", result: result(originID), events: started(originID)},
+			{role: roleOrigin, session: origin, promptMarker: "nonce-p2", answerMarker: "nonce-a2", result: result(originID)},
+			{role: roleControl, session: control, promptMarker: "nonce-p3", answerMarker: "nonce-a3", result: result(controlID), events: started(controlID)},
+			{role: roleResumed, session: resumed, resumeID: originID, promptMarker: "nonce-p4", answerMarker: "nonce-a4", result: result(originID), events: started(originID)},
+			{role: roleUnheld, session: unheld, resumeID: unheldRequested, promptMarker: "nonce-p5", answerMarker: "nonce-a5", result: result(unheldID), events: started(unheldID)},
 		},
-		resumed:   domain.Session{ID: originID},
+		resumed:   resumed,
 		exchanges: exchanges,
 	}
 }
@@ -417,7 +483,7 @@ func TestConformanceClosingResponse(t *testing.T) {
 	}
 }
 
-func TestConformanceExpectedUsage(t *testing.T) {
+func TestConformanceServed(t *testing.T) {
 	t.Parallel()
 
 	turnOne := domain.TokenUsage{InputTokens: 211, OutputTokens: 18, TotalTokens: 229, CacheReadTokens: 53, CacheWriteTokens: 19}
@@ -427,10 +493,17 @@ func TestConformanceExpectedUsage(t *testing.T) {
 	}
 	tests := []struct {
 		name      string
+		binding   Binding
 		exchanges []Exchange
 		want      domain.TokenUsage
 	}{
 		{name: "no exchanges", want: domain.TokenUsage{}},
+		{
+			name:      "a runtime reporting no cache write keeps those tokens in input and carries zero writes",
+			binding:   Binding{CacheWriteUnreported: true},
+			exchanges: []Exchange{conformanceExchange(ExchangeTurn, conformanceFirstUsage)},
+			want:      domain.TokenUsage{InputTokens: 211, OutputTokens: 18, TotalTokens: 229, CacheReadTokens: 53},
+		},
 		{
 			name:      "one turn sums thoughts into output and keeps cache counts out of input",
 			exchanges: []Exchange{conformanceExchange(ExchangeTurn, conformanceFirstUsage)},
@@ -461,10 +534,47 @@ func TestConformanceExpectedUsage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := expectedUsage(tt.exchanges)
+			got := served(tt.exchanges, turnAndAuxiliary, tt.binding)
 
 			if got != tt.want {
-				t.Errorf("expectedUsage(%d exchanges) = %+v, want %+v", len(tt.exchanges), got, tt.want)
+				t.Errorf("served(%d exchanges) = %+v, want %+v", len(tt.exchanges), got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConformanceEffectiveSplit(t *testing.T) {
+	t.Parallel()
+
+	total := conformanceTokens(100, 10, 20, 5)
+	stated := conformanceTokens(60, 6, 12, 3)
+	rest := conformanceTokens(40, 4, 8, 2)
+	over := conformanceTokens(100, 10, 20, 6)
+	named := func(model string, usage domain.TokenUsage) map[string]domain.TokenUsage {
+		return map[string]domain.TokenUsage{model: usage}
+	}
+
+	tests := []struct {
+		name       string
+		event      domain.AgentEvent
+		runModel   string
+		want       map[string]domain.TokenUsage
+		wantExceed bool
+	}{
+		{"no split credits the total to the event's model", domain.AgentEvent{Usage: total, Model: "model-a"}, "", named("model-a", total), false},
+		{"rest goes to the event's model", domain.AgentEvent{Usage: total, Model: "model-b", UsageByModel: named("model-a", stated)}, "", map[string]domain.TokenUsage{"model-a": stated, "model-b": rest}, false},
+		{"rest goes to the run's reported model when the event names none", domain.AgentEvent{Usage: total, UsageByModel: named("model-a", stated)}, "model-r", map[string]domain.TokenUsage{"model-a": stated, "model-r": rest}, false},
+		{"a split above the total in one class", domain.AgentEvent{Usage: total, Model: "model-b", UsageByModel: named("model-a", over)}, "", named("model-a", over), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, exceeds := effectiveSplit(tt.event, tt.runModel)
+
+			if !maps.Equal(got, tt.want) || exceeds != tt.wantExceed {
+				t.Errorf("effectiveSplit(%+v, %q) = (%+v, %t), want (%+v, %t)", tt.event, tt.runModel, got, exceeds, tt.want, tt.wantExceed)
 			}
 		})
 	}
@@ -480,16 +590,16 @@ func TestConformancePropertyCleanRuns(t *testing.T) {
 	cancelled, stopped, gone := conformanceCancelledRun(), conformanceStoppedRun(), conformanceGoneRun()
 	continuation := conformanceContinuationRun()
 	got := map[string][]string{
-		"continuation":                   continuationViolations(continuation.turns, continuation.resumed, continuation.exchanges),
+		"continuation":                   continuationViolations(continuation.turns, continuation.resumed, continuation.exchanges, nil, usageSettling{}),
 		"interrupted turn, cancellation": interruptedTurnViolations(cancelled.run, cancelled.in),
 		"interrupted turn, stop":         interruptedTurnViolations(stopped.run, stopped.in),
 		"runtime gone":                   runtimeGoneViolations(gone.run, gone.probe, gone.td),
 		"turn outcome":                   turnOutcomeViolations(run, 2),
 		"deterministic tool path":        toolPathViolations(run, conformanceNonce),
 		"tool server":                    toolServerViolations(toolServer, conformanceServerTurn),
-		"exact usage":                    usageViolations(run, registry.UsageArrivalTurnEnd),
+		"exact usage":                    exactUsage(run, registry.UsageArrivalTurnEnd, served(run.Exchanges, turnAndAuxiliary, Binding{}), nil, nil, usageSettling{}),
 		"credential containment":         containmentViolations(run, streams),
-		"script exhaustion":              exhaustionViolations(exhaustion.run, conformanceNonce, false, exhaustion.failures),
+		"script exhaustion":              exhaustionViolations(exhaustion.run, Binding{}, usageSettling{}, conformanceNonce, false, exhaustion.failures),
 		"refused call":                   refusedCallViolations(conformanceRefusedRun(), conformanceNonce, conformanceNotice),
 	}
 
@@ -563,9 +673,16 @@ func TestConformancePropertyContinuation(t *testing.T) {
 			want: []string{"control turn"},
 		},
 		{
-			name:   "no turn exchange for the resumed entry",
-			mutate: func(s *conformanceContinuationState) { s.exchanges = s.exchanges[:conformanceResumedAt] },
-			want:   []string{"resumed script entry 3: no turn exchange"},
+			name:   "unheld session reporting carried history",
+			mutate: func(s *conformanceContinuationState) { s.turns[conformanceUnheldAt].session.CarriedHistory = true },
+			want:   []string{"unheld session: Session.CarriedHistory = true, want false"},
+		},
+		{
+			name: "no turn exchange for the resumed entry",
+			mutate: func(s *conformanceContinuationState) {
+				s.exchanges = slices.Delete(s.exchanges, conformanceResumedAt, conformanceUnheldAt)
+			},
+			want: []string{"resumed script entry 3: no turn exchange"},
 		},
 		{
 			name:   "measured first turn carrying the flag",
@@ -580,12 +697,28 @@ func TestConformancePropertyContinuation(t *testing.T) {
 			},
 			want: []string{"resumed turn: Result.UsageMeasured is false"},
 		},
+		{
+			name: "lower-bound resumed result unmeasured with spend unaccounted",
+			mutate: func(s *conformanceContinuationState) {
+				s.settling = usageSettling{liveLowerBound: true}
+				s.turns[conformanceResumedAt].result.UsageMeasured = false
+				s.turns[conformanceResumedAt].result.SpendUnaccounted = true
+			},
+		},
+		{
+			name: "lower-bound resumed result unmeasured without spend unaccounted",
+			mutate: func(s *conformanceContinuationState) {
+				s.settling = usageSettling{liveLowerBound: true}
+				s.turns[conformanceResumedAt].result.UsageMeasured = false
+			},
+			want: []string{"resumed turn: Result.SpendUnaccounted is false, want true for a turn with no figure"},
+		},
 	}
 
 	conformanceRunCases(t, "continuation", cases,
 		conformanceContinuationRun,
 		func(s conformanceContinuationState) []string {
-			return continuationViolations(s.turns, s.resumed, s.exchanges)
+			return continuationViolations(s.turns, s.resumed, s.exchanges, nil, s.settling)
 		},
 	)
 }
@@ -666,6 +799,25 @@ func TestConformancePropertyTurnOutcome(t *testing.T) {
 	)
 }
 
+func TestConformanceRefusalOutcome(t *testing.T) {
+	t.Parallel()
+
+	cases := []conformanceCase[Run]{
+		{name: "turn ended on the refusal"},
+		{name: "returned an error", mutate: func(run *Run) { run.Err = errors.New("boom") }, want: []string{""}},
+		{name: "reported failed", mutate: func(run *Run) { run.Result.ExitReason = domain.EventTurnFailed }, want: []string{""}},
+	}
+
+	conformanceRunCases(t, "turn outcome", cases,
+		func() Run {
+			run := conformanceTurnRun()
+			run.Exchanges = slices.Delete(run.Exchanges, conformanceSecondTurnAt, conformanceSecondTurnAt+1)
+			return run
+		},
+		func(run Run) []string { return refusalOutcomeViolations(run, 2) },
+	)
+}
+
 func TestConformancePropertyToolPath(t *testing.T) {
 	t.Parallel()
 
@@ -729,11 +881,6 @@ func TestConformancePropertyToolPath(t *testing.T) {
 			name:   "tool event reports an error",
 			mutate: func(run *Run) { run.Events[conformanceEventToolAt].ToolError = true },
 			want:   []string{"reports a tool error"},
-		},
-		{
-			name:   "tool event has no tool name",
-			mutate: func(run *Run) { run.Events[conformanceEventToolAt].ToolName = "" },
-			want:   []string{"tool name"},
 		},
 		{
 			name:   "tool event has the unknown tool name",
@@ -814,6 +961,63 @@ func TestConformancePropertyToolServer(t *testing.T) {
 	)
 }
 
+func TestConformancePropertySSHDelivery(t *testing.T) {
+	t.Parallel()
+
+	notice := domain.AgentEvent{Type: domain.EventNotification, Message: toolrelay.GapNotice}
+	otherNotification := domain.AgentEvent{Type: domain.EventNotification, Message: "tool call refused by the session policy"}
+
+	t.Run("delivered", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []conformanceCase[Run]{
+			{name: "no notice and a tool channel", mutate: func(run *Run) { run.Events = append(run.Events, otherNotification) }},
+			{
+				name:   "opening notice",
+				mutate: func(run *Run) { run.Events = append(run.Events, notice) },
+				want:   []string{"opening notice"},
+			},
+			{
+				name:   "no tool channel",
+				mutate: func(run *Run) { run.Session.NoToolChannel = true },
+				want:   []string{"NoToolChannel = true"},
+			},
+		}
+
+		conformanceRunCases(t, "ssh tool delivery", cases, conformanceToolServerRun,
+			func(run Run) []string { return sshDeliveryViolations(run, false) })
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+
+		refusedRun := func() Run {
+			run := conformanceToolServerRun()
+			run.Events = append(run.Events, notice)
+			run.Session.NoToolChannel = true
+			return run
+		}
+		cases := []conformanceCase[Run]{
+			{name: "notice and no tool channel"},
+			{
+				name: "no notice",
+				mutate: func(run *Run) {
+					run.Events = slices.DeleteFunc(run.Events, func(e domain.AgentEvent) bool { return e.Type == domain.EventNotification })
+				},
+				want: []string{"0 opening notices"},
+			},
+			{
+				name:   "tool channel kept",
+				mutate: func(run *Run) { run.Session.NoToolChannel = false },
+				want:   []string{"NoToolChannel = false"},
+			},
+		}
+
+		conformanceRunCases(t, "ssh tool delivery", cases, refusedRun,
+			func(run Run) []string { return sshDeliveryViolations(run, true) })
+	})
+}
+
 func TestConformancePropertyInterruptedTurn(t *testing.T) {
 	t.Parallel()
 
@@ -849,6 +1053,14 @@ func TestConformancePropertyInterruptedTurn(t *testing.T) {
 			mutate: func(s *conformanceInterruptedState) { s.run.Environment.Scenario = ScenarioCancellationAfterOutput },
 			want:   []string{"SpendUnaccounted = false"},
 			also:   []string{"after"},
+		},
+		{
+			name: "kill ending the turn as cancelled",
+			mutate: func(s *conformanceInterruptedState) {
+				s.run.Environment.Scenario = ScenarioKill
+				s.run.Result.SpendUnaccounted = true
+			},
+			want: []string{"ExitReason"},
 		},
 		{
 			name:   "I-1: the endpoint never held the request",
@@ -922,17 +1134,17 @@ func TestConformancePropertyRuntimeGone(t *testing.T) {
 			},
 		},
 		{
-			name:   "R-1: no process id reported",
+			name:   "no process id reported",
 			mutate: func(s *conformanceGoneState) { s.run.Session.AgentPID = "" },
 			want:   []string{"AgentPID"},
 		},
 		{
-			name:   "R-3: reported process still answers, and so does its snapshot entry",
+			name:   "reported process still answers, and so does its snapshot entry",
 			mutate: func(s *conformanceGoneState) { s.remaining[pid] = "process 4242" },
 			want:   []string{"reported process 4242", "4242"},
 		},
 		{
-			name: "R-4: a request is still held",
+			name: "a request is still held",
 			mutate: func(s *conformanceGoneState) {
 				s.td.stillHeld = []Exchange{{Seq: 1, Method: "POST", Path: "/v1/messages", Kind: ExchangeHeld}}
 			},
@@ -940,14 +1152,26 @@ func TestConformancePropertyRuntimeGone(t *testing.T) {
 			also: []string{holdEndBound.String()},
 		},
 		{
-			name:   "R-5: reported process missing from the snapshot",
-			mutate: func(s *conformanceGoneState) { s.td.snapshot = []int{pid + 1} },
+			name:   "reported process missing from the snapshot",
+			mutate: func(s *conformanceGoneState) { s.td.aliveWhileHeld = []int{pid + 1} },
 			want:   []string{strconv.Itoa(pid)},
 		},
 		{
-			name:   "R-5: a snapshot process outside the reported ones still answers",
+			name:   "a snapshot process outside the reported ones still answers",
 			mutate: func(s *conformanceGoneState) { s.remaining[pid+1] = "process 4243" },
 			want:   []string{strconv.Itoa(pid + 1)},
+		},
+		{
+			name:   "a launch record is not released",
+			mutate: func(s *conformanceGoneState) { s.td.heldLaunches[0] = func() (bool, error) { return false, nil } },
+			want:   []string{launchtest.ErrNotReleased.Error()},
+		},
+		{
+			name: "a launch record is released with a cleanup error",
+			mutate: func(s *conformanceGoneState) {
+				s.td.heldLaunches[0] = func() (bool, error) { return true, errConformanceCleanup }
+			},
+			want: []string{errConformanceCleanup.Error()},
 		},
 	}
 
@@ -1039,6 +1263,129 @@ func TestConformancePropertyExactUsage(t *testing.T) {
 	}
 	cases := []conformanceCase[conformanceUsageState]{
 		{name: "clean turn_end run"},
+		{name: "clean per-model split", mutate: conformancePerModel},
+		{
+			name: "split attributes a model's usage to another model",
+			mutate: func(s *conformanceUsageState) {
+				conformancePerModel(s)
+				split := s.run.Events[conformanceEventUsageAt].UsageByModel
+				split["model-a"], split["model-b"] = split["model-b"], split["model-a"]
+			},
+			want: []string{"per model, want"},
+		},
+		{
+			name: "lower bound expected of a completed turn reported complete",
+			mutate: func(s *conformanceUsageState) {
+				live := domain.UsageProvenance{Source: "protocol", Strategy: 1}
+				s.spend = &SpendSources{Live: live, Records: domain.UsageProvenance{Source: "journal", Strategy: 2}, LowerBound: true}
+				s.run.Result.UsageProvenance = []domain.UsageProvenance{live}
+			},
+			want: []string{"SpendUnaccounted"},
+		},
+		{
+			name: "event names a model the endpoint never served, whatever the attribution",
+			mutate: func(s *conformanceUsageState) {
+				s.run.Events[conformanceEventUsageAt].Model = "model-z"
+			},
+			want: []string{"per model, want"},
+		},
+		{name: "interrupted turn no records settle keeps its live figure", mutate: conformanceLiveOnlyInterrupted},
+		{
+			name: "interrupted turn no records settle with no figure and no provenance",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveOnlyInterrupted(s)
+				s.run.Result.UsageMeasured = false
+				s.run.Result.UsageProvenance = nil
+			},
+		},
+		{
+			name: "interrupted turn no records settle is not flagged unaccounted",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveOnlyInterrupted(s)
+				s.run.Result.SpendUnaccounted = false
+			},
+			want: []string{"SpendUnaccounted is false"},
+		},
+		{
+			name: "interrupted turn no records settle reports above the served usage",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveOnlyInterrupted(s)
+				s.run.Result.Usage.InputTokens++
+			},
+			want: []string{"exceeds"},
+		},
+		{
+			name: "interrupted turn no records settle carries the records provenance",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveOnlyInterrupted(s)
+				s.run.Result.UsageProvenance = []domain.UsageProvenance{s.spend.Records}
+			},
+			want: []string{"the live source"},
+		},
+		{
+			name: "interrupted turn no records settle carries provenance with no figure",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveOnlyInterrupted(s)
+				s.run.Result.UsageMeasured = false
+			},
+			want: []string{"want none"},
+		},
+		{
+			name: "lower-bound live source, no figure, flagged unaccounted",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveLowerBound(s)
+				s.run.Result.UsageMeasured = false
+				s.run.Result.SpendUnaccounted = true
+			},
+		},
+		{
+			name: "lower-bound live source, no figure, not flagged",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveLowerBound(s)
+				s.run.Result.UsageMeasured = false
+			},
+			want: []string{"SpendUnaccounted is false"},
+		},
+		{
+			name: "figure marked a lower bound within the served usage",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveLowerBound(s)
+				s.run.Result.SpendUnaccounted = true
+				s.run.Result.Usage.InputTokens--
+			},
+		},
+		{
+			name: "figure marked a lower bound above the served usage",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveLowerBound(s)
+				s.run.Result.SpendUnaccounted = true
+				s.run.Result.Usage.InputTokens++
+			},
+			want: []string{"a lower bound, exceeds"},
+		},
+		{
+			name: "figure marked complete is held to the exact usage",
+			mutate: func(s *conformanceUsageState) {
+				conformanceLiveLowerBound(s)
+				conformanceReport(&s.run, func(u *domain.TokenUsage) { u.InputTokens-- })
+			},
+			want: []string{"Result.Usage ="},
+		},
+		{
+			name: "arrival none checks no figure",
+			mutate: func(s *conformanceUsageState) {
+				s.arrival = registry.UsageArrivalNone
+				conformanceReport(&s.run, func(u *domain.TokenUsage) { u.InputTokens++ })
+			},
+		},
+		{
+			name: "per-model kind's last usage event names no model",
+			mutate: func(s *conformanceUsageState) {
+				s.settling.splitExpected = true
+				s.run.Exchanges[conformanceSecondTurnAt].Model = "model-b"
+			},
+			want: []string{"per model, want"},
+		},
 		{
 			name: "measured usage is not reported",
 			mutate: func(s *conformanceUsageState) {
@@ -1116,7 +1463,109 @@ func TestConformancePropertyExactUsage(t *testing.T) {
 		func() conformanceUsageState {
 			return conformanceUsageState{run: conformanceTurnRun(), arrival: registry.UsageArrivalTurnEnd}
 		},
-		func(s conformanceUsageState) []string { return usageViolations(s.run, s.arrival) },
+		func(s conformanceUsageState) []string {
+			return exactUsage(s.run, s.arrival,
+				served(s.run.Exchanges, turnAndAuxiliary, Binding{}), servedByModel(s.run.Exchanges, turnAndAuxiliary, Binding{}), s.spend, s.settling)
+		},
+	)
+}
+
+func TestAssertExactUsageReadsTheKindsSources(t *testing.T) {
+	t.Parallel()
+
+	conformanceRegisterKinds()
+	live := domain.UsageProvenance{Source: "protocol", Strategy: 1}
+	records := domain.UsageProvenance{Source: "journal", Strategy: 2}
+	unmeasured := func(exit domain.AgentEventType) func(run *Run) {
+		return func(run *Run) {
+			run.Events = nil
+			run.Result = domain.TurnResult{ExitReason: exit, SpendUnaccounted: true}
+		}
+	}
+	remote := func(run *Run) { run.Environment.Remote = true }
+	chain := func(mutations ...func(run *Run)) func(run *Run) {
+		return func(run *Run) {
+			for _, mutate := range mutations {
+				mutate(run)
+			}
+		}
+	}
+	tests := []struct {
+		name          string
+		binding       Binding
+		mutate        func(run *Run)
+		wantFailed    bool
+		wantReporting bool
+	}{
+		{
+			name:          "local launch of a kind with a records source carries a figure",
+			binding:       Binding{Kind: conformancePlainKind},
+			wantReporting: true,
+		},
+		{
+			name:          "remote launch of a kind with a records source carries a figure",
+			binding:       Binding{Kind: conformancePlainKind},
+			mutate:        remote,
+			wantReporting: true,
+		},
+		{
+			name:    "lower-bound live source without Spend accepts a turn with no figure",
+			binding: Binding{Kind: conformanceCommandKind},
+			mutate:  unmeasured(domain.EventTurnCompleted),
+		},
+		{
+			name:       "lower-bound live source without Spend rejects an unflagged turn with no figure",
+			binding:    Binding{Kind: conformanceCommandKind},
+			mutate:     chain(unmeasured(domain.EventTurnCompleted), func(run *Run) { run.Result.SpendUnaccounted = false }),
+			wantFailed: true,
+		},
+		{
+			name:          "remote binding reading records rejects an interrupted turn with no figure",
+			binding:       Binding{Kind: conformanceCommandKind, Spend: &SpendSources{Live: live, Records: records}, SSH: &SSHVariant{}},
+			mutate:        chain(remote, unmeasured(domain.EventTurnCancelled)),
+			wantFailed:    true,
+			wantReporting: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			run := conformanceTurnRun()
+			if tt.mutate != nil {
+				tt.mutate(&run)
+			}
+			var reported bool
+			stand := new(testing.T)
+
+			assertExactUsage(stand, tt.binding, run, tt.name, func(*testing.T, string, agenttest.UsageReportingCase) { reported = true })
+
+			if stand.Failed() != tt.wantFailed {
+				t.Errorf("assertExactUsage(%s) failed = %v, want %v", tt.name, stand.Failed(), tt.wantFailed)
+			}
+			if reported != tt.wantReporting {
+				t.Errorf("assertExactUsage(%s) ran the per-case reporting check = %v, want %v", tt.name, reported, tt.wantReporting)
+			}
+		})
+	}
+}
+
+func TestConformancePropertyKilledBeforeRecords(t *testing.T) {
+	t.Parallel()
+
+	cases := []conformanceCase[domain.TurnResult]{
+		{name: "unmeasured and flagged"},
+		{
+			name:   "measured zero",
+			mutate: func(r *domain.TurnResult) { r.UsageMeasured = true },
+			want:   []string{"UsageMeasured is true"},
+		},
+	}
+
+	conformanceRunCases(t, "exact usage", cases,
+		func() domain.TurnResult { return domain.TurnResult{SpendUnaccounted: true} },
+		killedBeforeRecordsViolations,
 	)
 }
 
@@ -1173,7 +1622,8 @@ func TestConformancePropertyContainment(t *testing.T) {
 		{
 			name: "event that cannot be encoded",
 			mutate: func(s *conformanceContainmentState) {
-				s.run.Events[conformanceEventToolAt].RateLimits = map[string]any{"unencodable": make(chan int)}
+				nan := math.NaN()
+				s.run.Events[conformanceEventToolAt].UsageWindows = []domain.UsageWindow{{Key: "five_hour", UsedPercent: &nan}}
 			},
 			want: []string{"cannot be encoded"},
 		},
@@ -1233,6 +1683,11 @@ func TestConformancePropertyExhaustion(t *testing.T) {
 
 	cases := []conformanceCase[conformanceExhaustionState]{
 		{name: "clean run"},
+		{
+			name:   "folded failure reported as failed",
+			mutate: func(s *conformanceExhaustionState) { s.folded = true },
+			want:   []string{""},
+		},
 		{
 			name:   "RunTurn did not return inside the bound",
 			mutate: func(s *conformanceExhaustionState) { s.timedOut = true },
@@ -1304,6 +1759,41 @@ func TestConformancePropertyExhaustion(t *testing.T) {
 			want:   []string{"UsageMeasured is false"},
 		},
 		{
+			name: "unmeasured with spend unaccounted outside a lower-bound settling",
+			mutate: func(s *conformanceExhaustionState) {
+				s.run.Result.UsageMeasured = false
+				s.run.Result.SpendUnaccounted = true
+			},
+			want: []string{"UsageMeasured is false"},
+		},
+		{
+			name: "lower-bound unmeasured with spend unaccounted",
+			mutate: func(s *conformanceExhaustionState) {
+				s.settling = usageSettling{liveLowerBound: true}
+				s.run.Result.Usage = domain.TokenUsage{}
+				s.run.Result.UsageMeasured = false
+				s.run.Result.SpendUnaccounted = true
+			},
+		},
+		{
+			name: "lower-bound unmeasured without spend unaccounted",
+			mutate: func(s *conformanceExhaustionState) {
+				s.settling = usageSettling{liveLowerBound: true}
+				s.run.Result.Usage = domain.TokenUsage{}
+				s.run.Result.UsageMeasured = false
+			},
+			want: []string{"Result.SpendUnaccounted is false, want true for a turn with no figure"},
+		},
+		{
+			name: "lower-bound figure above what the endpoint served",
+			mutate: func(s *conformanceExhaustionState) {
+				s.settling = usageSettling{liveLowerBound: true}
+				s.run.Result.SpendUnaccounted = true
+				s.run.Result.Usage.InputTokens++
+			},
+			want: []string{"a lower bound, exceeds"},
+		},
+		{
 			name:   "usage differs from what the endpoint served",
 			mutate: func(s *conformanceExhaustionState) { s.run.Result.Usage.InputTokens++ },
 			want:   []string{"Result.Usage ="},
@@ -1360,7 +1850,7 @@ func TestConformancePropertyExhaustion(t *testing.T) {
 	conformanceRunCases(t, "script exhaustion", cases,
 		conformanceNewExhaustion,
 		func(s conformanceExhaustionState) []string {
-			return exhaustionViolations(s.run, s.nonce, s.timedOut, s.failures)
+			return exhaustionViolations(s.run, Binding{RuntimeFailureFolded: s.folded}, s.settling, s.nonce, s.timedOut, s.failures)
 		},
 	)
 }
@@ -1558,9 +2048,10 @@ func TestConformanceFatalArmChild(t *testing.T) {
 
 	conformanceRegisterKinds()
 	binding := Binding{
-		Kind:   conformanceCommandKind,
-		Read:   ReadFile,
-		Launch: func(*testing.T, Environment) Launch { return Launch{} },
+		Kind:             conformanceCommandKind,
+		Read:             ReadFile,
+		UserInstructions: "instructions.md",
+		Launch:           func(*testing.T, Environment) Launch { return Launch{} },
 	}
 	switch arm {
 	case "unregistered":
@@ -1642,7 +2133,7 @@ func TestConformanceFatalArms(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestConformanceFatalArmChild$", "-test.v") //nolint:gosec // re-executes this test binary
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestConformanceFatalArmChild$", "-test.v") //nolint:gosec // os.Args[0] is this test binary, not external input
 			cmd.Env = append(os.Environ(), conformanceArmEnv+"="+tt.arm)
 
 			out, err := cmd.CombinedOutput()

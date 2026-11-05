@@ -14,7 +14,8 @@ These pages are for working on Sortie itself. To install, configure, and run Sor
     - [Claude Code](claude-code-adapter-notes.md) - model mismatches and known traps
     - [Codex](codex-adapter-notes.md) - process model and trust and approval collisions
     - [Copilot CLI](copilot-adapter-notes.md) - session and cost model and hard-to-diagnose failures
-    - [OpenCode](opencode-adapter-notes.md) - why it skips the shared subprocess skeleton
+    - [OpenCode](opencode-adapter-notes.md) - launch contract, usage export, and session identity
+    - [Pi](pi-adapter-notes.md) - the JSON event stream, exit codes, and session resume
     - [Agent Client Protocol](agent-client-protocol-adapter-notes.md) - the generic ACP adapter: pinned schema artifact and runtime selection
     - [Kiro CLI](kiro-adapter-notes.md) - Kiro through the generic ACP adapter
     - [Gemini CLI](gemini-adapter-notes.md) - Gemini through the generic ACP adapter and its token accounting
@@ -90,3 +91,16 @@ These pages are for working on Sortie itself. To install, configure, and run Sor
     - [Keep both kinds registered and retire a hand-written one only at parity](decisions/0030-keep-both-kinds-registered-and-retire-only-at-parity.md)
     - [Let a dispatch rule carry the settings of the agent kind it selects](decisions/0031-let-a-dispatch-rule-carry-its-agent-kinds-settings.md)
     - [Route Outbound Messages Through Per-Destination Event Subscriptions](decisions/0032-route-outbound-messages-through-per-destination-event-subscriptions.md)
+    - [Advance an issue to the next stage by swapping a stage label](decisions/0033-advance-an-issue-to-the-next-stage-by-swapping-a-stage-label.md)
+    - [Build the dashboard as a React application committed and embedded in the binary](decisions/0034-build-the-dashboard-as-an-embedded-react-application.md)
+    - [Retain agent events per run and stream them on the change stream](decisions/0035-retain-agent-events-per-run-and-stream-them-on-the-change-stream.md)
+    - [Label usage, runtime and exit counters by model](decisions/0036-label-usage-runtime-and-exit-counters-by-model.md)
+    - [Supply a built-in prompt for every reaction run](decisions/0037-supply-a-built-in-prompt-for-every-reaction-run.md)
+    - [Price runs from a layered rate table and record the price when the run is written](decisions/0038-price-runs-from-a-layered-rate-table-and-record-the-price-at-write.md)
+    - [Account for agent spend in one usage component fed by each runtime's own reports](decisions/0039-account-for-agent-spend-in-one-usage-component.md)
+    - [Keep the Codex and Claude Code kinds as the routes to their CLIs](decisions/0040-keep-the-codex-and-claude-code-kinds-as-the-routes-to-their-clis.md)
+    - [Reset a usage-limit refusal at the latest reset of its gating windows](decisions/0041-reset-a-usage-limit-refusal-at-the-latest-reset-of-its-gating-windows.md)
+    - [Hand the agent every unseen issue comment through one shared feed](decisions/0042-hand-the-agent-every-unseen-issue-comment-through-one-shared-feed.md)
+- **Process**
+  - [Contributing](../CONTRIBUTING.md) - setup, making a change, code and testing conventions, commits and PRs
+  - [Releasing](../RELEASING.md) - the ordered checklist for cutting a release

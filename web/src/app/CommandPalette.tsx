@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { useLocation, useNavigate } from "react-router";
+import { useLocation } from "react-router";
 
 import { useIssueLookupQuery, useStateQuery } from "@/api/queries";
 import { Kbd } from "@/app/Kbd";
 import { useLive } from "@/app/live";
+import { Parts } from "@/components/Parts";
+import { useNavigate } from "@/components/carried-links";
 import {
   Autocomplete,
   AutocompleteCollection,
@@ -15,13 +17,14 @@ import {
   AutocompleteList,
   useAutocompleteFilter,
 } from "@/components/ui/autocomplete";
+import { MONO } from "@/components/ui/mono";
 import { Dialog, DialogPopup } from "@/components/ui/dialog";
-import { routeText } from "@/lib/active-rows";
+import { issueAwaitsApproval, routeText } from "@/lib/active-rows";
 import { fmtStamp, parseInstant } from "@/lib/format";
 import { issueLinkOf, sessionLinkOf } from "@/lib/issue-link";
 import { issueStanding, runRouteText } from "@/lib/lane";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 import { setTheme } from "@/lib/theme";
 
 import type { ScreenEntry } from "@/app/Rail";
@@ -80,6 +83,7 @@ function isSessionEntry(item: PaletteItem): item is SessionEntry {
 function issueEntryOf(
   issue: ActiveIssueResponse | IssueGroupResponse,
   attention: readonly AttentionItemResponse[],
+  awaitingApproval: boolean,
 ): IssueEntry {
   const key = issue.display_identifier || issue.issue_identifier;
   const outcome = "issue_outcome" in issue ? issue.issue_outcome : null;
@@ -87,7 +91,7 @@ function issueEntryOf(
     value: `issue:${issue.issue_id}`,
     label: issue.issue_title ? `${key} ${issue.issue_title}` : key,
     identifier: issue.issue_identifier,
-    word: issueStanding(issue.issue_id, issue.status, outcome, attention).word,
+    word: issueStanding(issue.issue_id, issue.status, outcome, attention, awaitingApproval).word,
   };
 }
 
@@ -135,7 +139,7 @@ function finishedSessionEntriesOf(
       identifier: group.issue_identifier,
       dispatchId,
       route: runRouteText(run, config),
-      status: runStatus(run.status).word,
+      status: runOutcome(run).word,
       startedAt: run.started_at,
     }));
 }
@@ -155,7 +159,6 @@ const THEME_COMMANDS: { choice: ThemeChoice; label: string }[] = [
   { choice: "dark", label: "Theme: Dark" },
 ];
 
-/** Props of {@link CommandPalette}. */
 export interface CommandPaletteProps {
   screens: ScreenEntry[];
   open: boolean;
@@ -166,7 +169,6 @@ export interface CommandPaletteProps {
   onOpenShortcuts: () => void;
 }
 
-/** Renders the command palette: a dialog with a search field over "Go to" entries for the registered screens and the global commands. */
 export function CommandPalette({
   screens,
   open,
@@ -223,7 +225,7 @@ export function CommandPalette({
           .filter((group) => !activeIds.has(group.issue_id))
           .slice(0, FINISHED_ENTRY_CAP);
   const issueEntries = [...activeIssues, ...finishedIssues].map((issue) =>
-    issueEntryOf(issue, state?.attention ?? []),
+    issueEntryOf(issue, state?.attention ?? [], issueAwaitsApproval(state, issue.issue_id)),
   );
   const sessionEntries =
     issueQuery === ""
@@ -273,9 +275,7 @@ export function CommandPalette({
           <AutocompleteList>
             {(group: AutocompleteGroupData<PaletteItem>) => (
               <AutocompleteGroup key={group.value} items={group.items}>
-                {group.value === ISSUES_GROUP || group.value === SESSIONS_GROUP ? (
-                  <AutocompleteGroupLabel>{group.value}</AutocompleteGroupLabel>
-                ) : undefined}
+                <AutocompleteGroupLabel>{group.value}</AutocompleteGroupLabel>
                 <AutocompleteCollection>
                   {(item: PaletteItem) =>
                     isSessionEntry(item) ? (
@@ -287,11 +287,22 @@ export function CommandPalette({
                       >
                         <span className="flex min-w-0 flex-col">
                           <span className="wrap-anywhere">{item.label}</span>
-                          <span className="flex flex-wrap gap-x-sm text-body-sm text-ink-muted wrap-anywhere">
-                            {item.route === null ? undefined : <span>{item.route}</span>}
-                            <span>{item.status}</span>
-                            <span className="tabular-nums">{fmtStamp(item.startedAt)}</span>
-                          </span>
+                          <Parts
+                            className="text-body-sm text-ink-muted wrap-anywhere"
+                            parts={[
+                              ...(item.route === null
+                                ? []
+                                : [
+                                    <span key="route" className={MONO}>
+                                      {item.route}
+                                    </span>,
+                                  ]),
+                              <span key="status">{item.status}</span>,
+                              <span key="at" className="tabular-nums">
+                                {fmtStamp(item.startedAt)}
+                              </span>,
+                            ]}
+                          />
                         </span>
                       </AutocompleteItem>
                     ) : isIssueEntry(item) ? (
@@ -330,7 +341,7 @@ export function CommandPalette({
           {issueQuery !== "" && lookup.isError ? (
             <p className="px-md py-xs text-body-sm text-ink-muted">{LOOKUP_FAILED}</p>
           ) : undefined}
-          <AutocompleteEmpty>{`Nothing matches "${query}".`}</AutocompleteEmpty>
+          <AutocompleteEmpty title="Not found">{`Nothing matches "${query}".`}</AutocompleteEmpty>
         </Autocomplete>
       </DialogPopup>
     </Dialog>

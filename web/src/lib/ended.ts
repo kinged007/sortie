@@ -1,4 +1,4 @@
-import { fmtClock, parseInstant, upperFirst } from "@/lib/format";
+import { fmtClock, parseInstant } from "@/lib/format";
 
 import type {
   IssueDetailResponse,
@@ -9,25 +9,19 @@ import type {
   StateResponse,
 } from "@/api/types.gen";
 
-/**
- * Gives the one word a status column shows for an ending: the tracker state the
- * issue reached, as the operator configured it with a capital first letter, or Merged.
- */
+/** The tracker state the issue reached, exactly as the operator configured it, or Merged. */
 export function endingWord(outcome: IssueOutcomeResponse): string {
   switch (outcome.kind) {
     case "merged":
       return "Merged";
     case "handed_off":
     case "terminal":
-      return outcome.state === undefined || outcome.state === ""
-        ? "Ended"
-        : upperFirst(outcome.state);
+      return outcome.state === undefined || outcome.state === "" ? "Ended" : outcome.state;
     default:
       return "Ended";
   }
 }
 
-/** Reports whether the workflow lists two or more terminal states. */
 export function hasSeveralTerminalStates(
   terminalStates: readonly string[] | null | undefined,
 ): boolean {
@@ -64,15 +58,12 @@ function activeIssueIds(state: StateResponse): Set<string> {
     state.parked,
     state.pending_reactions,
     state.between_stages,
+    state.held,
   ];
   return new Set(lists.flatMap((list) => (list ?? []).map((entry) => entry.issue_id)));
 }
 
-/**
- * Builds today's ended set from the run pages, which serve runs newest first:
- * the newest run of each issue that has an outcome and is in no row list of
- * the state, newest ending first.
- */
+/** Runs are served newest first; the newest run of each issue that has an outcome and is in no row list of the state, newest ending first. */
 export function buildEnded(pages: RunsResponse[], state: StateResponse): EndedIssue[] {
   const active = activeIssueIds(state);
   const newest = new Map<string, RunResponse>();

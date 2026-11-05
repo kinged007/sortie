@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,32 +54,6 @@ func loadFixture(t *testing.T, name string) []byte {
 		t.Fatalf("reading fixture %s: %v", name, err)
 	}
 	return data
-}
-
-const adversarialStatement = "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-	"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]"
-
-func postedCommentBody(t *testing.T, config func(endpoint string) map[string]any, post func(*JiraAdapter) error) []byte {
-	t.Helper()
-
-	bodies := make(chan []byte, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		bodies <- body
-		w.WriteHeader(http.StatusCreated)
-	}))
-	t.Cleanup(srv.Close)
-
-	if err := post(mustAdapter(t, config(srv.URL))); err != nil {
-		t.Fatalf("post comment: %v", err)
-	}
-	select {
-	case body := <-bodies:
-		return body
-	default:
-		t.Fatal("server received no comment request")
-		return nil
-	}
 }
 
 func TestNewJiraAdapter(t *testing.T) {
@@ -1081,23 +1056,53 @@ func TestFetchIssueStatesByIdentifiers_NoQueryFilter(t *testing.T) {
 	}
 }
 
+func serveCommentPages(t *testing.T, pages map[string][]byte) (*JiraAdapter, func() []string) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		mu.Unlock()
+
+		page, ok := pages[r.URL.Query().Get("startAt")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write(page) //nolint:errcheck // test helper
+	}))
+	t.Cleanup(srv.Close)
+
+	return mustAdapter(t, validConfig(srv.URL)), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(requests)
+	}
+}
+
+func commentsRequest(orderBy string, startAt int) string {
+	return fmt.Sprintf("GET /rest/api/3/issue/PROJ-1/comment?maxResults=50&orderBy=%s&startAt=%d", orderBy, startAt)
+}
+
+func idPoint(from, to int) domain.CommentReadPoint {
+	ids := make([]string, 0, to-from+1)
+	for id := from; id <= to; id++ {
+		ids = append(ids, strconv.Itoa(id))
+	}
+	encoded, _ := json.Marshal(ids)
+	return domain.CommentReadPoint(encoded)
+}
+
 func TestFetchIssueComments_MultiPage(t *testing.T) {
 	t.Parallel()
 
-	page1 := loadFixture(t, "comments_multi_page_1.json")
-	page2 := loadFixture(t, "comments_multi_page_2.json")
+	a, requests := serveCommentPages(t, map[string][]byte{
+		"0": loadFixture(t, "comments_multi_page_1.json"),
+		"2": loadFixture(t, "comments_multi_page_2.json"),
+	})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		startAt := r.URL.Query().Get("startAt")
-		if startAt == "0" || startAt == "" {
-			w.Write(page1) //nolint:errcheck // test helper
-		} else {
-			w.Write(page2) //nolint:errcheck // test helper
-		}
-	}))
-	defer srv.Close()
-
-	a := mustAdapter(t, validConfig(srv.URL))
 	comments, err := a.FetchIssueComments(context.Background(), "PROJ-1")
 	if err != nil {
 		t.Fatalf("FetchIssueComments: %v", err)
@@ -1112,6 +1117,123 @@ func TestFetchIssueComments_MultiPage(t *testing.T) {
 		t.Errorf("comments[2].Body = %q", comments[2].Body)
 	}
 	adaptertest.AssertCommentsAscending(t, comments)
+
+	want := []string{commentsRequest("created", 0), commentsRequest("created", 2)}
+	if got := requests(); !slices.Equal(got, want) {
+		t.Errorf("FetchIssueComments requests = %q, want %q", got, want)
+	}
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	const (
+		page1 = "comment_changes_page_1.json"
+		page2 = "comment_changes_page_2.json"
+	)
+	tests := []struct {
+		name         string
+		since        domain.CommentReadPoint
+		pages        map[string]string
+		wantRequests []string
+		wantCount    int
+		wantNewest   domain.Comment
+		wantBodies   map[string]string
+		wantNextSame bool
+		wantKind     domain.TrackerErrorKind
+	}{
+		{
+			name:         "new comment above the known page costs one request",
+			since:        idPoint(20070, 20119),
+			pages:        map[string]string{"0": page1},
+			wantRequests: []string{commentsRequest("-created", 0)},
+			wantCount:    50,
+			wantNewest:   domain.Comment{ID: "20120", AuthorID: "5b10ac8d82e05b22cc7d4ef5", AuthorKind: domain.CommentAuthorPerson, UpdatedAt: "2025-03-03T11:30:00.000+0000"},
+		},
+		{
+			name:         "unchanged issue with an edit below an unchanged comment",
+			since:        idPoint(20071, 20120),
+			pages:        map[string]string{"0": page1},
+			wantRequests: []string{commentsRequest("-created", 0)},
+			wantCount:    50,
+			wantBodies:   map[string]string{"20090": "Deployment verified on staging (edited)."},
+			wantNextSame: true,
+		},
+		{
+			name:         "deleted oldest known comment still stops on page one",
+			since:        `["20001","20100"]`,
+			pages:        map[string]string{"0": page1},
+			wantRequests: []string{commentsRequest("-created", 0)},
+			wantCount:    50,
+		},
+		{
+			name:         "no known comment on page one walks to page two and stops",
+			since:        idPoint(20022, 20069),
+			pages:        map[string]string{"0": page1, "50": page2},
+			wantRequests: []string{commentsRequest("-created", 0), commentsRequest("-created", 50)},
+			wantCount:    99,
+		},
+		{
+			name:         "undecodable point reads the full list ascending",
+			since:        "x",
+			pages:        map[string]string{"0": "comments.json"},
+			wantRequests: []string{commentsRequest("created", 0)},
+			wantCount:    2,
+		},
+		{
+			name:     "unparseable created time is a payload error",
+			since:    `["1"]`,
+			pages:    map[string]string{"0": "comment_changes_bad_created.json"},
+			wantKind: domain.ErrTrackerPayload,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixtures := make(map[string][]byte, len(tt.pages))
+			for startAt, name := range tt.pages {
+				fixtures[startAt] = loadFixture(t, name)
+			}
+			a, requests := serveCommentPages(t, fixtures)
+
+			got, err := a.FetchIssueCommentChanges(context.Background(), "PROJ-1", tt.since)
+
+			if tt.wantKind != "" {
+				assertTrackerErrorKind(t, err, tt.wantKind)
+				return
+			}
+			if err != nil {
+				t.Fatalf("FetchIssueCommentChanges(%q): %v", tt.since, err)
+			}
+			if gotRequests := requests(); !slices.Equal(gotRequests, tt.wantRequests) {
+				t.Errorf("FetchIssueCommentChanges(%q) requests = %q, want %q", tt.since, gotRequests, tt.wantRequests)
+			}
+			if len(got.Comments) != tt.wantCount {
+				t.Fatalf("FetchIssueCommentChanges(%q) returned %d comments, want %d", tt.since, len(got.Comments), tt.wantCount)
+			}
+			adaptertest.AssertCommentsAscending(t, got.Comments)
+
+			seen := make(map[string]bool, len(got.Comments))
+			for _, c := range got.Comments {
+				if seen[c.ID] {
+					t.Errorf("FetchIssueCommentChanges(%q) returned comment %q twice", tt.since, c.ID)
+				}
+				seen[c.ID] = true
+				if want, ok := tt.wantBodies[c.ID]; ok && c.Body != want {
+					t.Errorf("comment %q Body = %q, want %q", c.ID, c.Body, want)
+				}
+			}
+			if newest := got.Comments[len(got.Comments)-1]; tt.wantNewest.ID != "" &&
+				(newest.ID != tt.wantNewest.ID || newest.AuthorID != tt.wantNewest.AuthorID || newest.AuthorKind != tt.wantNewest.AuthorKind || newest.UpdatedAt != tt.wantNewest.UpdatedAt) {
+				t.Errorf("newest comment = %+v, want ID, AuthorID, AuthorKind, UpdatedAt of %+v", newest, tt.wantNewest)
+			}
+			if tt.wantNextSame && got.Next != tt.since {
+				t.Errorf("FetchIssueCommentChanges(%q) Next = %q, want the given point", tt.since, got.Next)
+			}
+		})
+	}
 }
 
 func TestFetchIssueComments_Empty(t *testing.T) {
@@ -1806,12 +1928,12 @@ func TestJiraAdapterMetrics(t *testing.T) {
 	t.Run("CommentIssue/success", func(t *testing.T) {
 		t.Parallel()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusCreated)
+			writeCommentCreated(w, "20001")
 		}))
 		defer srv.Close()
 
 		a, spy := mustAdapterWithMetrics(t, validConfig(srv.URL))
-		if err := a.CommentIssue(ctx, "PROJ-5", "test"); err != nil {
+		if _, err := a.CommentIssue(ctx, "PROJ-5", "test"); err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 		requireSingleCall(t, spy, "comment", "success")
@@ -1825,25 +1947,11 @@ func TestJiraAdapterMetrics(t *testing.T) {
 		defer srv.Close()
 
 		a, spy := mustAdapterWithMetrics(t, validConfig(srv.URL))
-		err := a.CommentIssue(ctx, "PROJ-5", "test")
+		_, err := a.CommentIssue(ctx, "PROJ-5", "test")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
 		requireSingleCall(t, spy, "comment", "error")
-	})
-
-	t.Run("CommentIssueWithLiteral/success", func(t *testing.T) {
-		t.Parallel()
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusCreated)
-		}))
-		defer srv.Close()
-
-		a, spy := mustAdapterWithMetrics(t, validConfig(srv.URL))
-		if err := a.CommentIssueWithLiteral(ctx, "PROJ-5", "test", "reason"); err != nil {
-			t.Fatalf("CommentIssueWithLiteral: %v", err)
-		}
-		requireSingleCall(t, spy, "comment", "success")
 	})
 
 	t.Run("AddLabel/success", func(t *testing.T) {
@@ -1914,19 +2022,35 @@ func TestCommentIssue_Success(t *testing.T) {
 		receivedMethod string
 		receivedPath   string
 		receivedBody   []byte
+		requests       atomic.Int32
 	)
+	list := loadFixture(t, "comments.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodGet {
+			w.Write(list) //nolint:errcheck // test helper
+			return
+		}
 		receivedMethod = r.Method
 		receivedPath = r.URL.Path
 		receivedBody, _ = io.ReadAll(r.Body)
-		w.WriteHeader(http.StatusCreated)
+		writeCommentCreated(w, "20002")
 	}))
 	defer srv.Close()
 
 	a := mustAdapter(t, validConfig(srv.URL))
-	if err := a.CommentIssue(context.Background(), "PROJ-123", "Hello\nWorld"); err != nil {
+	id, err := a.CommentIssue(context.Background(), "PROJ-123", "Hello\nWorld")
+	if err != nil {
 		t.Fatalf("CommentIssue() unexpected error: %v", err)
 	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests during CommentIssue() = %d, want 1", n)
+	}
+	comments, err := a.FetchIssueComments(context.Background(), "PROJ-123")
+	if err != nil {
+		t.Fatalf("FetchIssueComments: %v", err)
+	}
+	adaptertest.AssertPostedCommentListed(t, id, comments)
 
 	wantPath := "/rest/api/3/issue/PROJ-123/comment"
 	if receivedMethod != "POST" {
@@ -1958,50 +2082,9 @@ func TestCommentIssue_Success(t *testing.T) {
 	}
 }
 
-func TestCommentIssueWithLiteral_V3SendsOneCodeBlockHoldingTheStatement(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	raw := postedCommentBody(t, validConfig, func(a *JiraAdapter) error {
-		return a.CommentIssueWithLiteral(context.Background(), "PROJ-9", text, adversarialStatement)
-	})
-
-	var body struct {
-		Body struct {
-			Version int    `json:"version"`
-			Type    string `json:"type"`
-			Content []struct {
-				Type    string `json:"type"`
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"content"`
-		} `json:"body"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		t.Fatalf("unmarshal request body %s: %v", raw, err)
-	}
-
-	nodes := body.Body.Content
-	if len(nodes) != 3 {
-		t.Fatalf("body.content has %d nodes, want 2 paragraphs and 1 codeBlock", len(nodes))
-	}
-	for i, node := range nodes[:2] {
-		if node.Type != "paragraph" {
-			t.Errorf("body.content[%d].type = %q, want paragraph", i, node.Type)
-		}
-	}
-	block := nodes[2]
-	if block.Type != "codeBlock" {
-		t.Fatalf("body.content[2].type = %q, want codeBlock", block.Type)
-	}
-	if len(block.Content) != 1 || block.Content[0].Type != "text" || block.Content[0].Text != adversarialStatement {
-		t.Errorf("codeBlock content = %+v, want one text node holding the statement verbatim", block.Content)
-	}
-	if strings.Count(string(raw), "@octocat") != 1 {
-		t.Errorf("request body %s holds the statement more than once, want it only inside the codeBlock", raw)
-	}
+func writeCommentCreated(w http.ResponseWriter, id string) {
+	w.WriteHeader(http.StatusCreated)
+	fmt.Fprintf(w, `{"id":%q}`, id) //nolint:errcheck // test helper
 }
 
 func TestCommentIssue_IDURLEscaped(t *testing.T) {
@@ -2010,12 +2093,12 @@ func TestCommentIssue_IDURLEscaped(t *testing.T) {
 	var receivedPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.EscapedPath()
-		w.WriteHeader(http.StatusCreated)
+		writeCommentCreated(w, "20001")
 	}))
 	defer srv.Close()
 
 	a := mustAdapter(t, validConfig(srv.URL))
-	if err := a.CommentIssue(context.Background(), "PROJ 123", "text"); err != nil {
+	if _, err := a.CommentIssue(context.Background(), "PROJ 123", "text"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := "/rest/api/3/issue/PROJ%20123/comment"
@@ -2030,11 +2113,14 @@ func TestCommentIssue_ErrorCases(t *testing.T) {
 	tests := []struct {
 		name     string
 		status   int
+		body     string
 		wantKind domain.TrackerErrorKind
 	}{
-		{"not_found", http.StatusNotFound, domain.ErrTrackerNotFound},
-		{"unauthorized", http.StatusUnauthorized, domain.ErrTrackerAuth},
-		{"server_error", http.StatusInternalServerError, domain.ErrTrackerTransport},
+		{"not_found", http.StatusNotFound, "", domain.ErrTrackerNotFound},
+		{"unauthorized", http.StatusUnauthorized, "", domain.ErrTrackerAuth},
+		{"server_error", http.StatusInternalServerError, "", domain.ErrTrackerTransport},
+		{"created_with_empty_id", http.StatusCreated, `{"id":""}`, domain.ErrTrackerPayload},
+		{"created_with_empty_body", http.StatusCreated, "", domain.ErrTrackerPayload},
 	}
 
 	for _, tt := range tests {
@@ -2043,12 +2129,17 @@ func TestCommentIssue_ErrorCases(t *testing.T) {
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tt.status)
+				w.Write([]byte(tt.body)) //nolint:errcheck // test helper
 			}))
 			defer srv.Close()
 
 			a := mustAdapter(t, validConfig(srv.URL))
-			err := a.CommentIssue(context.Background(), "PROJ-123", "text")
+			id, err := a.CommentIssue(context.Background(), "PROJ-123", "text")
+
 			assertTrackerErrorKind(t, err, tt.wantKind)
+			if id != "" {
+				t.Errorf("CommentIssue() id = %q on error, want empty", id)
+			}
 		})
 	}
 }
@@ -2274,4 +2365,32 @@ func TestFetchCandidateIssueByIDEquivalence(t *testing.T) {
 	// Negative: a 404 response from the server returns ErrTrackerNotFound.
 	_, err = a.FetchIssueByID(ctx, "99999")
 	assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
+}
+
+func TestJiraAdapter_ProjectURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "plain endpoint", endpoint: "https://test.atlassian.net/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			adapter, err := NewJiraAdapter(validConfig(tt.endpoint))
+			if err != nil {
+				t.Fatalf("NewJiraAdapter() error = %v", err)
+			}
+			linker, ok := adapter.(domain.ProjectLinker)
+			if !ok {
+				t.Fatal("JiraAdapter does not implement domain.ProjectLinker")
+			}
+			if got, want := linker.ProjectURL(), "https://test.atlassian.net/browse/PROJ"; got != want {
+				t.Errorf("ProjectURL() = %q, want %q", got, want)
+			}
+		})
+	}
 }

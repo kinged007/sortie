@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -14,12 +15,14 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/redact"
 )
 
-// Compile-time operator-facing messages. None interpolates a request body, a
-// response body, a raw line, a schema field name, or a code identifier.
+// Operator-facing messages; none interpolates a body, a raw line, or a code
+// identifier.
 const (
 	streamEndedMessage               = "the agent's connection ended before a response arrived"
 	lineTooLongMessage               = "a line from the agent exceeded the connection's line bound"
@@ -55,37 +58,137 @@ type activeTurn struct {
 
 	awaitedID jsonrpc.ID
 
-	// capsSnapshot is the capability record as it stood when this turn began, so
-	// a lowering observed while the turn is in flight takes effect from the next
-	// turn onward.
-	capsSnapshot capabilityRecord
-
 	pendingEnd    turnEndKind
 	pendingDetail string
 	cancelSent    bool
 	deadlineC     <-chan time.Time
 
-	// spend is this turn's evidence for the shared spend rule. A turn that
-	// reached the model and produced no figure is spend that occurred and was
-	// not measured.
+	// spend lets a turn that reached the model with no figure count as spend
+	// that occurred unmeasured.
 	spend agentcore.TurnSpend
 
-	// drainEvidence is the disposition this turn is finalized on once its drain
-	// reports, held while the drain runs. draining distinguishes a turn waiting
-	// on a drain from one whose bounded wait belongs to an end attempt.
+	// draining separates a turn waiting on its records read from one whose
+	// bounded wait belongs to an end attempt; drainEvidence is the disposition
+	// held meanwhile.
 	drainEvidence agentcore.TurnEvidence
 	draining      bool
 
 	// endSettled marks a turn the transport has already seen end, kept in flight
 	// only long enough to collect its figure.
 	endSettled bool
+
+	// pullPending marks a usage pull still running; a turn that would end
+	// meanwhile waits in held for the pull's result.
+	pullPending bool
+	held        *heldEnd
+
+	// pullArmed marks a pull owed while the turn's records read is in flight.
+	pullArmed bool
+
+	// spendEnd and spendLive are what the ledger settles the turn on while its
+	// records read is in flight, so a turn that ends meanwhile settles on them.
+	// spendSettled latches once the ledger has settled the turn, which keeps a
+	// held turn from being settled a second time.
+	spendEnd       usage.TurnEnd
+	spendLive      *usage.SpendReading
+	recordsPending bool
+	spendSettled   bool
+
+	// children is what the turn's updates showed of child sessions.
+	children childSessions
+
+	usageUpdateSeen bool
+
+	// refusal is the usage-limit refusal the turn's notifications or prompt
+	// error showed, a copy the turn owns. retrying latches once the runtime
+	// announced a retry of a refused request, after which a notified refusal is
+	// no longer the turn's.
+	refusal  *usagesource.Refusal
+	retrying bool
+
+	// pulledWindows are the windows of the turn-end pull, nil when none ran or
+	// it failed.
+	pulledWindows []domain.UsageWindow
 }
 
-// disposition returns the evidence turn is finalized on. A turn winding down
-// toward a forced outcome reports that outcome, unless the transport has already
-// seen how the turn ended: an end attempt arriving while such a turn waits for
-// its figure stops nothing still running, and taking its outcome would report
-// the failure as something else.
+// childSessions is the child-session state of one running turn, kept in
+// first-seen order and read and written only by the pump goroutine.
+type childSessions struct {
+	started        []string // calls that started a child session
+	startedUnnamed bool     // a start named no call, so no completion can match it
+	completedCalls []string // started calls that completed and named their session
+	sessions       []string // child sessions the turn named
+	settled        []string // sessions a completed call named
+}
+
+// note folds one session update's child signal into the state.
+func (c *childSessions) note(signal usagesource.ChildSignal) {
+	if signal.Started {
+		if signal.Call == "" {
+			c.startedUnnamed = true
+		} else {
+			c.started = appendNew(c.started, signal.Call)
+		}
+	}
+	if signal.Session == "" {
+		return
+	}
+	c.sessions = appendNew(c.sessions, signal.Session)
+	if signal.Completed && signal.Call != "" {
+		c.completedCalls = appendNew(c.completedCalls, signal.Call)
+		c.settled = appendNew(c.settled, signal.Session)
+	}
+}
+
+// end reports whether the turn showed a child session and whether every one it
+// showed completed and named its identifier.
+func (c *childSessions) end() (children, settled bool) {
+	children = c.startedUnnamed || len(c.started) > 0 || len(c.sessions) > 0
+	if !children {
+		return false, false
+	}
+	settled = !c.startedUnnamed &&
+		isSubset(c.started, c.completedCalls) &&
+		isSubset(c.sessions, c.settled)
+	return children, settled
+}
+
+func appendNew(list []string, value string) []string {
+	if slices.Contains(list, value) {
+		return list
+	}
+	return append(list, value)
+}
+
+func isSubset(members, of []string) bool {
+	return !slices.ContainsFunc(members, func(member string) bool {
+		return !slices.Contains(of, member)
+	})
+}
+
+// spendTurnEnd builds the ledger's view of how the turn ended.
+func (t *activeTurn) spendTurnEnd(replied, cancelled bool) usage.TurnEnd {
+	children, settled := t.children.end()
+	return usage.TurnEnd{
+		Replied:         replied,
+		Cancelled:       cancelled,
+		ModelReached:    t.spend.ModelReached(),
+		Children:        children,
+		ChildrenSettled: settled,
+	}
+}
+
+// heldEnd is the disposition and settled figure a turn ends on once its pull
+// has returned.
+type heldEnd struct {
+	evidence agentcore.TurnEvidence
+	observed *usageObserved
+}
+
+// disposition returns the evidence the turn is finalized on. A forced outcome
+// wins unless the transport already saw how the turn ended: an end attempt
+// arriving while such a turn waits for its figure stops nothing still running,
+// and taking its outcome would misreport the failure.
 func (t *activeTurn) disposition(ev agentcore.TurnEvidence) agentcore.TurnEvidence {
 	if t.endSettled {
 		return ev
@@ -99,22 +202,26 @@ func (t *activeTurn) disposition(ev agentcore.TurnEvidence) agentcore.TurnEviden
 	return ev
 }
 
-// pumpState is the pump's mutable state. It exists only inside runPump's
-// goroutine, which is what makes the pump the session's sole mutator of
-// protocol state by construction rather than by convention.
+// pumpState is the pump's mutable state. It lives only inside runPump's
+// goroutine, which makes the pump the sole mutator of protocol state.
 type pumpState struct {
 	state *sessionState
 
 	tracker *agentcore.ToolTracker
 
-	// reader is the session's measurement source while it still applies. It is
-	// cleared, and the token-counts entry lowered, the moment the source proves
-	// inapplicable.
-	reader usageReader
+	declaration usagesource.Declaration
 
-	// drainProven latches once a drain has produced a record. Until it does, a
-	// drain that produces nothing drops the source for the rest of the session.
-	drainProven bool
+	loopDone <-chan struct{}
+
+	// ledger is the session's spend accounting, set at the handshake and never
+	// dropped. figureSeen latches once a turn produced a figure.
+	ledger     *usage.Ledger
+	figureSeen bool
+
+	// pullInFlight keeps a second pull from starting while an earlier one holds
+	// the puller, which is not safe for concurrent use.
+	puller       *usage.Puller
+	pullInFlight bool
 
 	sessionID      string
 	sessionIDKnown bool
@@ -142,40 +249,23 @@ type pumpState struct {
 	malformedVariantLogged bool
 	streamEnded            bool
 
-	// capabilityNoticeSent reports whether the once-per-session gap notice has
-	// been emitted. A lowering observed after that point is logged at warn level
-	// instead of producing a second notice.
+	// capabilityNoticeSent latches once the gap notice is out; later lowerings
+	// log at warn instead of producing a second notice.
 	capabilityNoticeSent bool
 
-	// toolServersDelivered mirrors the handshake fact: whether the
-	// session-creation request carried at least one tool server.
 	toolServersDelivered bool
-
-	// toolDeliveryReported latches the once-per-session uncallable-tool report
-	// so a later permission request does not repeat it.
 	toolDeliveryReported bool
 
-	// openRequests records the request the pump is answering while it is
-	// answering it. The pump answers each request inside the call that receives
-	// it, so teardown's answerOpen step observes an empty map in the ordinary
-	// case; the map exists so that step walks a defined set rather than assuming
-	// one.
+	// openRequests holds the request being answered while it is answered, so
+	// teardown's answerOpen step walks a defined set rather than assuming one.
 	openRequests map[jsonrpc.ID]string
 
-	// loadExpected reports whether an expectLoad control message has been
-	// processed. It gates observeReplay so a chunk observed before the
-	// session/load call itself cannot confirm a load that replayed nothing.
-	loadExpected bool
-
-	// replayObserved reports whether the pump has seen a chunk replayed for the
-	// identifier a session/load control message named. Set at most once per
-	// session and never cleared.
+	// loadExpected gates observeReplay so a chunk seen before the session/load
+	// call cannot confirm a load that replayed nothing.
+	loadExpected   bool
 	replayObserved bool
 
-	// pendingReplayQuery and replayDeadlineC track a replayQuery still awaiting
-	// an answer: set together when the query arrives with no replay observed
-	// yet, and cleared together once a replayed chunk or the deadline resolves
-	// it.
+	// pendingReplayQuery and replayDeadlineC are set and cleared together.
 	pendingReplayQuery *replayQuery
 	replayDeadlineC    <-chan time.Time
 }
@@ -191,20 +281,31 @@ func runPump(state *sessionState) {
 		tracker:      agentcore.NewToolTracker(),
 		openRequests: make(map[jsonrpc.ID]string),
 	}
+	defer p.finalizeDecidedTurn()
 
 	doneCh := state.conn.Done()
 	doneFired := false
 	writeFailedCh := state.conn.WriteFailed()
 	var writeFailDeadlineC <-chan time.Time
 
-	// abandonedCh closes once the release gives up on the reader parked on a dead
-	// runtime's standard output. It is nil for a session built without a release.
+	// abandonedCh is nil for a session built without a release.
 	abandonedCh := state.release.Abandoned()
-	// stopArm stays nil until abandonment, so only a session whose reader was
-	// given up on returns on the stop signal without waiting for that reader.
+	// stopArm stays nil until abandonment: only then may the pump return on stop
+	// without waiting for the reader.
 	var stopArm <-chan struct{}
+	stopCh := state.stopCh
+	stopRequested := false
+
+	loopDone := make(chan struct{})
+	defer close(loopDone)
+	p.loopDone = loopDone
 
 	for {
+		if stopRequested && p.settleForStop() {
+			p.logDroppedQueue()
+			return
+		}
+
 		var cancelSig <-chan struct{}
 		var deadlineC <-chan time.Time
 		if p.activeTurn != nil {
@@ -241,15 +342,14 @@ func runPump(state *sessionState) {
 			case <-p.replayDeadlineC:
 				p.finalizeReplayQueryOnDeadline()
 			case <-stopArm:
-				p.logDroppedQueue()
-				return
+				stopRequested = true
+				stopArm = nil
 			}
 			continue
 		}
 
-		// The connection's reader has exited. The pump keeps draining any further
-		// control message until teardown closes the stop channel, the second
-		// condition its exit requires.
+		// The reader has exited; control messages keep draining until teardown
+		// closes the stop channel, the second condition for exit.
 		select {
 		case <-state.inbox.Ready():
 			if item, ok := state.inbox.Take(); ok {
@@ -261,11 +361,29 @@ func runPump(state *sessionState) {
 			p.finalizeActiveTurnOnDeadline()
 		case <-p.replayDeadlineC:
 			p.finalizeReplayQueryOnDeadline()
-		case <-state.stopCh:
-			p.logDroppedQueue()
-			return
+		case <-stopCh:
+			stopRequested = true
+			stopCh = nil
 		}
 	}
+}
+
+// settleForStop reports whether the pump may return. A turn awaiting a records
+// read or pull is left to that result or its deadline: a stop never cuts a
+// measurement short.
+func (p *pumpState) settleForStop() bool {
+	turn := p.activeTurn
+	if turn == nil {
+		return true
+	}
+	if !turn.awaitsBackgroundResult() {
+		p.recoverThenFinalize(streamEndedEvidence(p.state, p.state.release.TurnEndMessage(streamEndedMessage), nil))
+	}
+	return p.activeTurn == nil
+}
+
+func (t *activeTurn) awaitsBackgroundResult() bool {
+	return t.recordsPending || t.draining || t.pullPending
 }
 
 func (p *pumpState) handleItem(item pumpItem) {
@@ -284,31 +402,29 @@ func (p *pumpState) handleControl(ctrl pumpControl) {
 		p.agentInfoPresent = ctrl.handshake.agentInfoPresent
 		p.caps = ctrl.handshake.caps
 		p.toolServersDelivered = ctrl.handshake.toolServersDelivered
-		p.reader = ctrl.handshake.reader
+		p.declaration = ctrl.handshake.declaration
+		p.puller = ctrl.handshake.puller
+		p.ledger = ctrl.handshake.ledger
 		p.applyHandshakeCapabilityLowering(ctrl.handshake)
+		if p.ledger != nil && p.declaration.Live.Spend.Shape != usage.SpendUndeclared {
+			p.state.caps.tokenCounts = capabilityOurs
+		}
 
 	case ctrl.sessionID != "":
 		p.sessionID = ctrl.sessionID
 		p.sessionIDKnown = true
-		if p.reader != nil {
-			p.reader.Open(p.sessionID)
-		}
-		// Logged once per session here, not on the handshake control message: the
-		// handshake is always published first, so both the implementation record
-		// and the session identifier are known only by this point.
+		// Logged here rather than on the handshake message: the handshake is
+		// published first, so only now are both the implementation record and the
+		// session identifier known.
 		p.state.logger.Info("agent implementation",
 			slog.String("session_id", p.sessionID),
 			slog.String("name", p.agentInfo.Name),
 			slog.String("version", p.agentInfo.Version))
 
 	case ctrl.expectLoad != "":
-		// Adopted silently, ahead of the definitive sessionID control message
-		// that always follows: the identifier is already known here, so this
-		// closes the race a session/new launch leaves open. If the load is not
-		// confirmed, handleReplayQuery and finalizeReplayQueryOnDeadline clear
-		// both fields back to their deferred-filter state; otherwise the
-		// following sessionID message overwrites this value with the one already
-		// in place.
+		// Adopted ahead of the sessionID message that always follows, so replayed
+		// updates are not filtered as foreign. An unconfirmed load reverts it in
+		// handleReplayQuery and finalizeReplayQueryOnDeadline.
 		p.sessionID = ctrl.expectLoad
 		p.sessionIDKnown = true
 		p.loadExpected = true
@@ -319,8 +435,11 @@ func (p *pumpState) handleControl(ctrl pumpControl) {
 	case ctrl.startTurn != nil:
 		p.handleStartTurn(ctrl.startTurn)
 
-	case ctrl.usage != nil:
-		p.handleUsageObserved(ctrl.usage)
+	case ctrl.pulled != nil:
+		p.handlePullResult(ctrl.pulled)
+
+	case ctrl.records != nil:
+		p.handleRecordsRead(ctrl.records)
 
 	case ctrl.answerOpen != nil:
 		p.handleAnswerOpen()
@@ -329,10 +448,9 @@ func (p *pumpState) handleControl(ctrl pumpControl) {
 }
 
 // handleReplayQuery applies q. A nil reply means the call already failed: the
-// provisional identifier is cleared and the entry lowered at once, with nothing
-// sent back. Otherwise a session/load answered success: this answers true when
-// replay has already been observed, or defers until a replayed chunk or this
-// query's bounded wait resolves it.
+// provisional identifier is cleared and the entry lowered, nothing sent back.
+// Otherwise it answers true if replay was already observed, or defers until a
+// replayed chunk or the bounded wait resolves it.
 func (p *pumpState) handleReplayQuery(q *replayQuery) {
 	if q.reply == nil {
 		p.cancelPendingReplayQuery()
@@ -348,10 +466,8 @@ func (p *pumpState) handleReplayQuery(q *replayQuery) {
 	p.replayDeadlineC = time.After(agentcore.ReadTimeout(p.state.agentConfig))
 }
 
-// finalizeReplayQueryOnDeadline ends a pending replay query once its bounded
-// wait elapsed with no replay: the session/load succeeded but replayed nothing,
-// so this answers false, clears the provisional identifier, and lowers
-// sessionContinuation.
+// finalizeReplayQueryOnDeadline answers a pending replay query false once its
+// bounded wait elapsed: the session/load succeeded but replayed nothing.
 func (p *pumpState) finalizeReplayQueryOnDeadline() {
 	if p.pendingReplayQuery == nil {
 		return
@@ -363,28 +479,25 @@ func (p *pumpState) finalizeReplayQueryOnDeadline() {
 	q.reply <- false
 }
 
-// cancelPendingReplayQuery drops a replay query still waiting and disarms its
-// deadline, so a wait already answered or abandoned cannot fire later and act on
-// a session that has since been replaced.
+// cancelPendingReplayQuery disarms the deadline so an answered or abandoned
+// wait cannot fire later against a replaced session.
 func (p *pumpState) cancelPendingReplayQuery() {
 	p.pendingReplayQuery = nil
 	p.replayDeadlineC = nil
 }
 
-// clearProvisionalSessionID reverts the identifier expectLoad adopted back to
-// unknown. Without this, an update for the session session/new actually created
-// would be compared against the loaded session's stale identifier and dropped
-// as foreign.
+// clearProvisionalSessionID reverts the identifier expectLoad adopted. Left in
+// place, it would make updates for the session session/new created drop as
+// foreign.
 func (p *pumpState) clearProvisionalSessionID() {
 	p.sessionID = ""
 	p.sessionIDKnown = false
 	p.loadExpected = false
 }
 
-// observeReplay records that the pump has seen a chunk replayed for the session
-// a session/load control message named, and resolves a pending replay query. A
-// chunk observed before that control message arrives is not counted: it cannot
-// confirm a load not yet attempted.
+// observeReplay records a chunk replayed for the session a session/load control
+// message named and resolves a pending replay query. A chunk seen before that
+// message cannot confirm a load not yet attempted.
 func (p *pumpState) observeReplay() {
 	if !p.loadExpected || p.replayObserved {
 		return
@@ -398,9 +511,10 @@ func (p *pumpState) observeReplay() {
 	q.reply <- true
 }
 
-// applyHandshakeCapabilityLowering lowers the capability record's stage-two
-// entries from what the initialize response advertised. It never raises an
-// entry, and always precedes the once-per-session notice.
+// applyHandshakeCapabilityLowering lowers capability entries from what the
+// initialize response advertised. It never raises one, and precedes the
+// once-per-session notice. The raise of the token-counts entry for a session
+// with a ledger follows it in handleControl.
 func (p *pumpState) applyHandshakeCapabilityLowering(facts *handshakeFacts) {
 	if !facts.agentInfoPresent {
 		p.lowerCapability(&p.state.caps.agentVersion, capabilityLabelAgentVersion)
@@ -408,21 +522,10 @@ func (p *pumpState) applyHandshakeCapabilityLowering(facts *handshakeFacts) {
 	if !advertisesSessionContinuation(facts.caps) {
 		p.lowerCapability(&p.state.caps.sessionContinuation, capabilityLabelSessionContinuation)
 	}
-	if facts.toolServersWithheld {
-		p.lowerCapability(&p.state.caps.toolServers, capabilityLabelToolServers)
-	}
 }
 
-// dropReader gives up on the measurement source and lowers the token-counts
-// entry to the gap it would have held with no source.
-func (p *pumpState) dropReader() {
-	p.reader = nil
-	p.lowerCapability(&p.state.caps.tokenCounts, capabilityLabelTokenCounts)
-}
-
-// lowerCapability lowers entry to gap. A lowering after the once-per-session
-// notice has been sent is logged at warn level rather than folded into a second
-// notice.
+// lowerCapability lowers entry, logging at warn when the once-per-session
+// notice has already gone out.
 func (p *pumpState) lowerCapability(entry *capabilityState, label string) {
 	if !lower(entry) {
 		return
@@ -442,11 +545,10 @@ func (p *pumpState) drainReadyItems() {
 	}
 }
 
-// handleStreamEnd runs when jsonrpc.Conn.Done() closes. It first drains every
-// queued item, because the reader completes its delivery into the inbox before
-// it closes Done(), so a KindStreamEnd message it produced is already there.
-// Only when the drain leaves a turn still in flight does this finalize it on the
-// process-exit row.
+// handleStreamEnd runs when jsonrpc.Conn.Done() closes. It drains queued items
+// first, because the reader delivers into the inbox before closing Done(), so a
+// KindStreamEnd message is already there. Only a turn still in flight afterward
+// is finalized as a process exit.
 func (p *pumpState) handleStreamEnd() {
 	p.drainReadyItems()
 	p.streamEnded = true
@@ -476,11 +578,10 @@ func streamEndedEvidence(state *sessionState, message string, cause error) agent
 }
 
 // handleAbandonment runs once the release gives up on the connection's reader.
-// Unlike handleStreamEnd it does not wait for state.conn.Done(): that reader is
-// exactly what the release gave up on, and waiting for it would make this bound
-// unbounded on a platform where closing the read end does not unpark a parked
-// read. It first handles every queued item, so a response the reader delivered
-// before it was given up on still decides the turn.
+// Unlike handleStreamEnd it does not wait for state.conn.Done(): where closing
+// the read end does not unpark a parked read, that wait would never end. Queued
+// items are handled first, so a response delivered before the reader was given
+// up on still decides the turn.
 func (p *pumpState) handleAbandonment() {
 	p.drainReadyItems()
 	p.streamEnded = true
@@ -488,11 +589,16 @@ func (p *pumpState) handleAbandonment() {
 	if p.activeTurn == nil {
 		return
 	}
-	p.finalizeTurn(streamEndedEvidence(p.state, p.state.release.TurnEndMessage(streamEndedMessage), nil))
+	ev := streamEndedEvidence(p.state, p.state.release.TurnEndMessage(streamEndedMessage), nil)
+	if p.ledger != nil {
+		p.endUnreplied(ev)
+		return
+	}
+	p.finalizeTurn(ev)
 }
 
-// releaseAbandoned reports whether the release has given up on the connection's
-// reader, even before runPump has handled that.
+// releaseAbandoned reports whether the release gave up on the reader, even
+// before runPump has handled that.
 func (p *pumpState) releaseAbandoned() bool {
 	select {
 	case <-p.state.release.Abandoned():
@@ -502,10 +608,9 @@ func (p *pumpState) releaseAbandoned() bool {
 	}
 }
 
-// armWriteFailedDeadline arms the bounded wait a write failure starts for the
-// active turn, or returns nil when no turn is active. The reader stays free to
-// end the turn through the stream-end path meanwhile; only a turn still active
-// once this deadline elapses falls to handleWriteFailed.
+// armWriteFailedDeadline arms the bounded wait a write failure starts, or
+// returns nil when no turn is active. The reader stays free to end the turn
+// through the stream-end path meanwhile.
 func (p *pumpState) armWriteFailedDeadline() <-chan time.Time {
 	if p.activeTurn == nil {
 		return nil
@@ -513,10 +618,9 @@ func (p *pumpState) armWriteFailedDeadline() <-chan time.Time {
 	return time.After(agentcore.ReadTimeout(p.state.agentConfig))
 }
 
-// handleWriteFailed ends the active turn with the send-failure outcome. It runs
-// only once a write failure's bounded wait has elapsed with the turn still
-// active: a reader that ends inside that wait reports the turn through the
-// stream-end path first, making this a no-op.
+// handleWriteFailed ends the active turn with the send-failure outcome once the
+// bounded wait elapsed; a reader that ended inside it already reported the turn,
+// making this a no-op.
 func (p *pumpState) handleWriteFailed() {
 	if p.activeTurn == nil {
 		return
@@ -528,8 +632,6 @@ func (p *pumpState) handleWriteFailed() {
 	})
 }
 
-// logDroppedQueue logs, at warn level, any event this adapter would have
-// delivered into a turn that never started before the session ended.
 func (p *pumpState) logDroppedQueue() {
 	if len(p.queued) == 0 {
 		return
@@ -538,10 +640,8 @@ func (p *pumpState) logDroppedQueue() {
 	p.queued = nil
 }
 
-// handleMessage dispatches one routed message. Dispatch is on method before
-// kind: session/update is normalized and never answered, and
-// session/request_permission is always answered, before either falls through to
-// the generic kind-based handling.
+// handleMessage dispatches one routed message, on method before kind:
+// session/update is never answered and session/request_permission always is.
 func (p *pumpState) handleMessage(msg *jsonrpc.Message) {
 	switch msg.Method {
 	case methodSessionUpdate:
@@ -558,7 +658,7 @@ func (p *pumpState) handleMessage(msg *jsonrpc.Message) {
 	case jsonrpc.KindRequest:
 		p.answerMethodNotFound(msg)
 	case jsonrpc.KindNotification:
-		p.state.logger.Debug("unhandled notification", slog.String("method", msg.Method))
+		p.handleTurnNotification(msg)
 	case jsonrpc.KindMalformed:
 		p.emitOrQueue(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: time.Now().UTC(), Message: malformedLineMessage})
 	case jsonrpc.KindStreamEnd:
@@ -566,11 +666,44 @@ func (p *pumpState) handleMessage(msg *jsonrpc.Message) {
 	}
 }
 
-// handleStreamEndMessage runs when a KindStreamEnd message reaches the pump
-// through the ordinary message arm (the common case: the shared package
-// delivers this message before it closes Done(), and the two select arms are
-// chosen at random). A line above the connection's bound is a different
-// condition from the loss of the subprocess and is not retried.
+// handleTurnNotification lets the declaration read a notification, in a turn or
+// outside one, hands on the amounts it reports, and records what it shows of a
+// retry or refusal in the active turn. A notification that shows none of these
+// is only logged.
+func (p *pumpState) handleTurnNotification(msg *jsonrpc.Message) {
+	if !p.sessionIDKnown || p.declaration.TurnNotification == nil {
+		p.state.logger.Debug("unhandled notification", slog.String("method", msg.Method))
+		return
+	}
+	signal := p.declaration.TurnNotification(p.sessionID, msg.Method, msg.Params)
+	applied := p.applyTurnSignal(signal)
+	p.observeAmounts(signal.Amounts)
+	if !applied && len(signal.Amounts) == 0 {
+		p.state.logger.Debug("unhandled notification", slog.String("method", msg.Method))
+	}
+}
+
+// applyTurnSignal records a retry or refusal in the active turn and reports
+// whether the turn took one; outside a turn it takes none.
+func (p *pumpState) applyTurnSignal(signal usagesource.TurnSignal) bool {
+	turn := p.activeTurn
+	if turn == nil || (!signal.Retrying && signal.Refusal == nil) {
+		return false
+	}
+	if signal.Retrying {
+		turn.retrying = true
+	}
+	if signal.Refusal != nil && turn.refusal == nil && !turn.retrying {
+		refusal := *signal.Refusal
+		turn.refusal = &refusal
+	}
+	return true
+}
+
+// handleStreamEndMessage handles a KindStreamEnd message that reached the pump
+// through the message arm; the shared package delivers it before closing Done()
+// and the select arms are chosen at random. A line above the connection's bound
+// is not the loss of the subprocess and is not retried.
 func (p *pumpState) handleStreamEndMessage(msg *jsonrpc.Message) {
 	p.streamEnded = true
 	p.flushAgentMessage()
@@ -597,12 +730,11 @@ func (p *pumpState) handleResponse(msg *jsonrpc.Message) {
 		return
 	}
 
+	p.armPull(turn)
+	defer p.launchPull(turn)
+
 	if msg.Error != nil {
-		p.recoverThenFinalize(agentcore.TurnEvidence{
-			Terminal:          agentcore.TerminalFailure,
-			TerminalErrorKind: domain.ErrResponseError,
-			TerminalMessage:   fmt.Sprintf("session/prompt error %d: %s", msg.Error.Code, quoteJSONRPCError(msg.Error)),
-		})
+		p.recoverThenFinalize(p.promptErrorEvidence(turn, msg.Error))
 		return
 	}
 
@@ -617,75 +749,316 @@ func (p *pumpState) handleResponse(msg *jsonrpc.Message) {
 	}
 
 	evidence := stopReasonEvidence(resp.StopReason)
+	if turn.refusal != nil && resp.StopReason != stopReasonCancelled {
+		evidence = refusalEvidence(*turn.refusal, refusalMessage(*turn.refusal))
+	}
 	bound, _ := spendLowerBound(resp.Meta)
 	if bound > 0 {
 		turn.spend.MarkModelReached()
 	}
 
-	// A turn winding down toward a forced outcome already has a disposition
-	// and, on the cancelled path, no figure to wait for.
-	if p.reader == nil || bound <= 0 || turn.pendingEnd != turnEndNone {
-		p.finalizeTurn(evidence)
+	if p.ledger != nil {
+		var live *usage.SpendReading
+		if p.declaration.PromptSpend != nil {
+			live = p.declaration.PromptSpend(msg.Result)
+		}
+		p.settleReply(turn, evidence, resp.StopReason == stopReasonCancelled, live)
 		return
 	}
-	p.armDrain(turn, evidence, bound)
+
+	p.settleTurn(evidence, nil)
 }
 
-// armDrain hands one turn's measurement wait to its own goroutine and leaves the
-// pump loop running: the source is batched behind a tick this transport cannot
-// shorten, and a blocked pump would stop answering the runtime for that tick.
-// The drain publishes its result back through the inbox, so the usage
-// accumulator is touched only by the pump goroutine.
-func (p *pumpState) armDrain(turn *activeTurn, evidence agentcore.TurnEvidence, bound int64) {
+// promptErrorEvidence maps a session/prompt error. The declaration's verdict
+// outranks the authentication-required code, which a runtime also uses for its
+// usage limits; a refusal a notification showed earlier does not.
+func (p *pumpState) promptErrorEvidence(turn *activeTurn, e *jsonrpc.Error) agentcore.TurnEvidence {
+	message := fmt.Sprintf("session/prompt error %d: %s", e.Code, quoteJSONRPCError(e))
+
+	var verdict usagesource.PromptVerdict
+	if p.declaration.PromptError != nil {
+		verdict = p.declaration.PromptError(*e)
+	}
+	switch {
+	case verdict.Refusal != nil:
+		refusal := *verdict.Refusal
+		turn.refusal = &refusal
+		return refusalEvidence(refusal, message)
+	case verdict.Transient:
+		return responseErrorEvidence(message)
+	case e.Code == errorCodeAuthRequired:
+		return agentcore.TurnEvidence{
+			Terminal:          agentcore.TerminalFailure,
+			TerminalErrorKind: domain.ErrCredentialUnverified,
+			TerminalMessage:   agentcore.CredentialRefusedMessage(quoteJSONRPCError(e)),
+		}
+	case turn.refusal != nil:
+		return refusalEvidence(*turn.refusal, message)
+	}
+	return responseErrorEvidence(message)
+}
+
+func responseErrorEvidence(message string) agentcore.TurnEvidence {
+	return agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrResponseError,
+		TerminalMessage:   message,
+	}
+}
+
+// refusalEvidence carries a copy of the refusal's limit, so a reset filled in
+// later never reaches the refusal the turn keeps.
+func refusalEvidence(r usagesource.Refusal, message string) agentcore.TurnEvidence {
+	limit := r.Limit
+	return agentcore.TurnEvidence{
+		Terminal:          agentcore.TerminalFailure,
+		TerminalErrorKind: domain.ErrUsageLimit,
+		UsageLimit:        &limit,
+		TerminalMessage:   message,
+	}
+}
+
+func refusalMessage(r usagesource.Refusal) string {
+	if r.Message == "" {
+		return "usage-limit refusal"
+	}
+	return fmt.Sprintf("usage-limit refusal: %q", redact.Truncate(r.Message, messageTruncateLimit))
+}
+
+// contextUntilStop returns a context that ends when stop closes or cancel is
+// called, so a background wait never outlives the session.
+func contextUntilStop(stop <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+// settleReply settles a turn whose prompt result arrived through the ledger. The
+// live reading comes from the raw result because the generated response type
+// carries no usage member, and the ledger alone decides whether the records are
+// needed.
+func (p *pumpState) settleReply(turn *activeTurn, evidence agentcore.TurnEvidence, cancelled bool, live *usage.SpendReading) {
+	end := turn.spendTurnEnd(true, cancelled)
+	if p.ledger.NeedsRecords(end, live) {
+		p.startRecordsRead(turn, evidence, end, live)
+		return
+	}
+	p.settleTurn(evidence, p.settleSpend(turn, end, live, usage.RecordsRead{}))
+}
+
+// startRecordsRead reads the runtime's records for turn on its own goroutine: the
+// read touches the host's disk, and a blocked pump would stop answering the
+// runtime meanwhile. The result returns through the inbox, so the ledger stays
+// on the pump goroutine. The read ends with the main loop, not a stop, so a
+// stopped turn settles on the same reading as one that was not.
+func (p *pumpState) startRecordsRead(turn *activeTurn, evidence agentcore.TurnEvidence, end usage.TurnEnd, live *usage.SpendReading) {
 	turn.drainEvidence = evidence
 	turn.draining = true
+	turn.recordsPending = true
+	turn.spendEnd = end
+	turn.spendLive = live
 	if turn.deadlineC == nil {
 		turn.deadlineC = time.After(agentcore.ReadTimeout(p.state.agentConfig))
 	}
 
-	reader := p.reader
+	state := p.state
+	declaration := p.declaration
+	children := slices.Clone(turn.children.sessions)
+	inbox := state.inbox
+	loopDone := p.loopDone
+
+	go func() {
+		ctx, cancel := contextUntilStop(loopDone)
+		defer cancel()
+
+		read, refusal := readTurnRecords(ctx, state, declaration, children)
+		inbox.Put(pumpItem{control: &pumpControl{records: &recordsResult{turn: turn, read: read, refusal: refusal}}})
+	}()
+}
+
+// handleRecordsRead settles the turn a records read was started for, discarding
+// the result of a turn that already ended or was settled without it.
+func (p *pumpState) handleRecordsRead(result *recordsResult) {
+	turn := p.activeTurn
+	if turn == nil || turn != result.turn || !turn.recordsPending {
+		return
+	}
+	applyRecordedReset(turn, result.refusal)
+	p.settleTurn(turn.drainEvidence, p.settleSpend(turn, turn.spendEnd, turn.spendLive, result.read))
+}
+
+// applyRecordedReset gives the held refusal the reset the runtime's records
+// hold for it. A record naming another refusal, or carrying no reset, leaves
+// the evidence as it stood.
+func applyRecordedReset(turn *activeTurn, recorded usagesource.RecordedRefusal) {
+	limit := turn.drainEvidence.UsageLimit
+	if turn.refusal == nil || turn.refusal.Name == "" || recorded.Name != turn.refusal.Name ||
+		recorded.ResetsAt.IsZero() || limit == nil || turn.drainEvidence.TerminalErrorKind != domain.ErrUsageLimit {
+		return
+	}
+	limit.ResetsAt = recorded.ResetsAt
+}
+
+// settleSpend runs the ledger over turn and applies the settlement to the turn's
+// spend evidence.
+func (p *pumpState) settleSpend(turn *activeTurn, end usage.TurnEnd, live *usage.SpendReading, read usage.RecordsRead) *usageObserved {
+	settlement := p.ledger.Settle(end, live, read)
+	turn.recordsPending = false
+	turn.spendSettled = true
+	p.launchPull(turn)
+	p.noteSpendFigure(end, settlement)
+	return &usageObserved{turn: turn, recovered: turn.spend.ApplySettlement(settlement)}
+}
+
+// noteSpendFigure lowers the token-counts entry when the first turn that reached
+// the model ends with no figure and no earlier turn had one.
+func (p *pumpState) noteSpendFigure(end usage.TurnEnd, settlement usage.Settlement) {
+	if settlement.Figure {
+		p.figureSeen = true
+		return
+	}
+	if end.ModelReached && !p.figureSeen {
+		p.lowerCapability(&p.state.caps.tokenCounts, capabilityLabelTokenCounts)
+	}
+}
+
+// endUnreplied settles a turn that ends without a prompt result. A turn whose
+// records read is in flight settles at once on the end and reading it stored,
+// without waiting for the read.
+func (p *pumpState) endUnreplied(ev agentcore.TurnEvidence) {
+	turn := p.activeTurn
+	switch {
+	case turn == nil:
+		return
+	case turn.spendSettled:
+		p.settleTurn(ev, nil)
+	case turn.recordsPending:
+		p.settleTurn(ev, p.settleSpend(turn, turn.spendEnd, turn.spendLive, usage.RecordsRead{}))
+	default:
+		end := turn.spendTurnEnd(false, false)
+		if p.ledger.NeedsRecords(end, nil) {
+			turn.endSettled = true
+			p.startRecordsRead(turn, ev, end, nil)
+			return
+		}
+		p.settleTurn(ev, p.settleSpend(turn, end, nil, usage.RecordsRead{}))
+	}
+}
+
+// pullEnding names a turn's pending end in the terms the usage component's
+// pull policy reads.
+func pullEnding(end turnEndKind) usage.TurnEnding {
+	switch end {
+	case turnEndCancelled:
+		return usage.EndingCancelled
+	case turnEndHumanInput:
+		return usage.EndingHumanInput
+	default:
+		return usage.EndingAnswered
+	}
+}
+
+// armPull marks a turn whose ending the usage component pulls after as owing a
+// pull, and holds its wait open for the puller's bound, which the shorter
+// records-read wait would cut. launchPull starts the pull.
+func (p *pumpState) armPull(turn *activeTurn) {
+	ending := pullEnding(turn.pendingEnd)
+	if !p.puller.PullsAfter(ending) || p.pullInFlight {
+		return
+	}
+	select {
+	case <-p.state.stopCh:
+		return
+	default:
+	}
+
+	turn.pullPending = true
+	turn.pullArmed = true
+	p.pullInFlight = true
+	if turn.deadlineC == nil {
+		cfg := p.state.agentConfig
+		turn.deadlineC = time.After(max(agentcore.ReadTimeout(cfg), agentcore.AuxiliaryTimeout(cfg)))
+	}
+}
+
+// launchPull runs the armed pull on its own goroutine once no records read of
+// the turn is in flight; the result returns through the inbox.
+//
+// The pull and the read each start the runtime on the session's host, and two
+// runs in one workspace can contend for its state, failing the read and costing
+// the figure its served model. settleSpend launches the pull when the read ends.
+func (p *pumpState) launchPull(turn *activeTurn) {
+	if !turn.pullArmed || turn.recordsPending {
+		return
+	}
+	turn.pullArmed = false
+
+	ending := pullEnding(turn.pendingEnd)
+	puller := p.puller
 	inbox := p.state.inbox
 	stop := p.state.stopCh
 
 	go func() {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := contextUntilStop(stop)
 		defer cancel()
-		go func() {
-			select {
-			case <-stop:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
 
-		recovered, source, found := reader.Drain(ctx, bound)
-		observed := &usageObserved{turn: turn, source: source, completeness: reader.Completeness()}
-		if found {
-			observed.recovered = &recovered
-		}
-		inbox.Put(pumpItem{control: &pumpControl{usage: observed}})
+		windows, err := puller.Pull(ctx, ending)
+		inbox.Put(pumpItem{control: &pumpControl{pulled: &pullResult{turn: turn, windows: windows, err: err}}})
 	}()
 }
 
-// handleUsageObserved applies one turn's drain result. A result for a turn that
-// already ended some other way is discarded.
-func (p *pumpState) handleUsageObserved(observed *usageObserved) {
+// handlePullResult publishes the pulled windows ahead of the turn's terminal
+// event and ends the turn if it was waiting on the pull. A result for a turn
+// that already ended is dropped.
+func (p *pumpState) handlePullResult(result *pullResult) {
+	p.pullInFlight = false
 	turn := p.activeTurn
-	if turn == nil || turn != observed.turn {
+	if turn == nil || turn != result.turn {
 		return
 	}
+	turn.pullPending = false
 
-	if observed.recovered == nil {
-		if !p.drainProven {
-			p.dropReader()
-		}
-		p.finalizeTurnWithUsage(turn.drainEvidence, observed)
+	if result.err != nil {
+		p.state.logger.Debug("usage pull failed", slog.Any("error", result.err))
+	} else {
+		turn.pulledWindows = result.windows
+	}
+	if len(result.windows) > 0 {
+		agentcore.EmitUsageWindows(p.publishOrQueue, time.Now().UTC(), result.windows)
+	}
+	if held := turn.held; held != nil {
+		p.finalizeTurnWithUsage(held.evidence, held.observed)
+	}
+}
+
+// settleTurn ends the active turn on ev, or holds that end until the turn's
+// pull has returned so its windows precede the terminal event.
+func (p *pumpState) settleTurn(ev agentcore.TurnEvidence, observed *usageObserved) {
+	turn := p.activeTurn
+	if turn == nil {
 		return
 	}
+	if !turn.pullPending {
+		p.finalizeTurnWithUsage(ev, observed)
+		return
+	}
+	if observed == nil && turn.held != nil {
+		observed = turn.held.observed
+	}
+	turn.held = &heldEnd{evidence: ev, observed: observed}
+}
 
-	p.drainProven = true
-	p.state.logger.Debug("usage recovered for a turn", slog.String("source", observed.source))
-	p.finalizeTurnWithUsage(turn.drainEvidence, observed)
+// isForeignSession reports whether id names a conversation this adapter did not
+// create. Before the session identifier is known, every update counts as the
+// session's own.
+func (p *pumpState) isForeignSession(id sessionId) bool {
+	return p.sessionIDKnown && string(id) != p.sessionID
 }
 
 func (p *pumpState) handleSessionUpdateMessage(msg *jsonrpc.Message) {
@@ -695,13 +1068,12 @@ func (p *pumpState) handleSessionUpdateMessage(msg *jsonrpc.Message) {
 		return
 	}
 
-	// Once the session identifier is known, an update naming a different session
-	// describes a conversation this adapter did not create and is dropped.
-	// Before that, every update is treated as the session's own.
-	if p.sessionIDKnown && string(notif.SessionID) != p.sessionID {
+	if p.isForeignSession(notif.SessionID) {
 		p.state.logger.Debug("dropping session/update for a foreign session")
 		return
 	}
+
+	p.observeSessionUpdateAmounts(notif.Update.Remainder)
 
 	sue, recognized := parseSessionUpdate(notif.Update.Remainder)
 	if !recognized {
@@ -715,7 +1087,11 @@ func (p *pumpState) handleSessionUpdateMessage(msg *jsonrpc.Message) {
 	if sue.kind == updateUserMessageChunk || sue.kind == updateAgentMessageChunk {
 		p.observeReplay()
 	}
+	p.observeChildSession(notif.Update.Remainder)
 	p.observeModelReached(sue.kind)
+	if sue.kind == updateUsage {
+		p.observeUsageUpdate()
+	}
 
 	result := applySessionUpdate(p.tracker, sue)
 	switch {
@@ -727,11 +1103,45 @@ func (p *pumpState) handleSessionUpdateMessage(msg *jsonrpc.Message) {
 		}
 		return
 	case sue.kind == updateUserMessageChunk:
-		// Ends the agent message before it without publishing an event.
 		p.flushAgentMessage()
 	}
 	if result.hasEvent {
 		p.emitOrQueue(result.event)
+	}
+}
+
+// observeChildSession folds what the declared runtime shows of a child session
+// in update into the running turn. Updates outside a turn show nothing the
+// ledger counts.
+func (p *pumpState) observeChildSession(update json.RawMessage) {
+	turn := p.activeTurn
+	if turn == nil || !p.sessionIDKnown || p.declaration.ChildSession == nil {
+		return
+	}
+	turn.children.note(p.declaration.ChildSession(p.sessionID, update))
+}
+
+// observeSessionUpdateAmounts hands the amounts the declaration reads off a
+// session update to the ledger, whatever the update's variant.
+func (p *pumpState) observeSessionUpdateAmounts(update json.RawMessage) {
+	if p.declaration.SessionUpdateAmounts == nil {
+		return
+	}
+	p.observeAmounts(p.declaration.SessionUpdateAmounts(update))
+}
+
+// observeAmounts hands readings to the ledger, which counts those read in a
+// turn at the session's next settlement and none read outside one.
+func (p *pumpState) observeAmounts(readings []usage.AmountReading) {
+	if p.ledger == nil || len(readings) == 0 {
+		return
+	}
+	p.ledger.ObserveAmounts(readings, p.activeTurn != nil)
+}
+
+func (p *pumpState) observeUsageUpdate() {
+	if p.activeTurn != nil {
+		p.activeTurn.usageUpdateSeen = true
 	}
 }
 
@@ -787,29 +1197,35 @@ func (p *pumpState) flushAgentMessage() {
 	p.agentMessageTruncated = false
 }
 
-// observeModelReached records that the active turn reached the model, for the
-// kinds only a served model produces. A thought chunk counts, since reasoning
-// tokens are billed; a replayed user chunk does not, being this session's own
-// prompt echoed back.
+// observeModelReached records that the active turn reached the model. A thought
+// chunk counts, since reasoning tokens are billed; a replayed user chunk does
+// not, being this session's own prompt echoed back. Under a declaration that
+// sends a usage_update before each model request, an agent message chunk ahead
+// of the turn's first one is the runtime's own text and does not count.
 func (p *pumpState) observeModelReached(kind sessionUpdateKind) {
 	if p.activeTurn == nil {
 		return
 	}
 	switch kind {
-	case updateAgentMessageChunk, updateAgentThoughtChunk, updateToolCall:
+	case updateAgentMessageChunk:
+		if p.declaration.UsageUpdateBeforeRequest && !p.activeTurn.usageUpdateSeen {
+			return
+		}
+		p.activeTurn.spend.MarkModelReached()
+	case updateAgentThoughtChunk, updateToolCall:
 		p.activeTurn.spend.MarkModelReached()
 	}
 }
 
-// emitOrQueue completes any agent message still being accumulated, then
-// publishes or queues ev, so events keep the order the agent produced them in.
+// emitOrQueue completes any agent message still being accumulated before
+// publishing ev, so events keep the order the agent produced them in.
 func (p *pumpState) emitOrQueue(ev domain.AgentEvent) {
 	p.flushAgentMessage()
 	p.publishOrQueue(ev)
 }
 
-// publishOrQueue publishes ev into the active turn's sink, or queues it when no
-// turn is in flight, to be flushed after the next turn's session_started event.
+// publishOrQueue publishes ev into the active turn's sink, or queues it for
+// flushing after the next turn's session_started event.
 func (p *pumpState) publishOrQueue(ev domain.AgentEvent) {
 	if p.activeTurn != nil {
 		p.publish(p.activeTurn)(ev)
@@ -818,9 +1234,13 @@ func (p *pumpState) publishOrQueue(ev domain.AgentEvent) {
 	p.queued = append(p.queued, ev)
 }
 
-// publish returns an emit function that delivers into turn's sink, guarded by
-// turn's done channel so a publish can never block once the turn has ended.
 func (p *pumpState) publish(turn *activeTurn) func(domain.AgentEvent) {
+	return p.state.tools.Emit(deliverToTurn(turn), p.openingNotice)
+}
+
+// deliverToTurn is guarded by turn's done channel so a delivery never blocks
+// once the turn has ended.
+func deliverToTurn(turn *activeTurn) func(domain.AgentEvent) {
 	return func(ev domain.AgentEvent) {
 		select {
 		case turn.sink <- ev:
@@ -845,9 +1265,9 @@ func (p *pumpState) flushQueued(turn *activeTurn) {
 func (p *pumpState) handleStartTurn(ts *turnStart) {
 	select {
 	case <-ts.done:
-		// The caller stopped waiting for this verdict. Accepting it would prompt
-		// the agent for work no one collects and leave the session holding a turn
-		// that can never end, rejecting every later turn as already in flight.
+		// Accepting a verdict nobody waits for would prompt the agent for work no
+		// one collects and leave a turn that can never end, rejecting every later
+		// turn as already in flight.
 		return
 	default:
 	}
@@ -868,12 +1288,11 @@ func (p *pumpState) handleStartTurn(ts *turnStart) {
 	}
 
 	p.flushAgentMessage()
-	turn := &activeTurn{sink: ts.sink, resultCh: ts.resultCh, done: ts.done, cancelCh: ts.cancelCh, capsSnapshot: *p.state.caps}
+	turn := &activeTurn{sink: ts.sink, resultCh: ts.resultCh, done: ts.done, cancelCh: ts.cancelCh}
 	p.activeTurn = turn
 	ts.reply <- turnVerdict{accepted: true}
 
 	agentcore.EmitSessionStarted(p.publish(turn), strconv.Itoa(p.state.pid), p.sessionID)
-	p.emitCapabilityGapNoticeOnce(turn)
 	p.flushQueued(turn)
 
 	if p.latchedHumanInput {
@@ -900,20 +1319,17 @@ func (p *pumpState) handleStartTurn(ts *turnStart) {
 	turn.awaitedID = id
 }
 
-// emitCapabilityGapNoticeOnce emits the once-per-session notice listing turn's
-// gap entries, the first time any turn starts. It reads turn's snapshot rather
-// than the pump's live record, so the notice reports what the first turn saw.
-func (p *pumpState) emitCapabilityGapNoticeOnce(turn *activeTurn) {
-	if p.capabilityNoticeSent {
-		return
+// openingNotice lowers the tool-server gap first so the notice lists it beside
+// every other gap.
+func (p *pumpState) openingNotice(emit func(domain.AgentEvent), toolServersGap bool) {
+	if toolServersGap {
+		p.lowerCapability(&p.state.caps.toolServers, toolrelay.ToolServersLabel)
 	}
 	p.capabilityNoticeSent = true
 
-	message, hasGap := turn.capsSnapshot.gapNotice()
-	if !hasGap {
-		return
+	if message, hasGap := p.state.caps.gapNotice(); hasGap {
+		agentcore.EmitNotification(emit, message)
 	}
-	agentcore.EmitNotification(p.publish(turn), message)
 }
 
 // finalizeTurn ends the active turn on the disposition [activeTurn.disposition]
@@ -922,9 +1338,9 @@ func (p *pumpState) finalizeTurn(ev agentcore.TurnEvidence) {
 	p.finalizeTurnWithUsage(ev, nil)
 }
 
-// finalizeTurnWithUsage ends the active turn, settling the drained figure into
-// the session's run-cumulative snapshot. A nil observed, or one whose source
-// held no record, leaves the snapshot and the measurement verdict as they stood.
+// finalizeTurnWithUsage ends the active turn, settling the recovered figure into
+// the run-cumulative snapshot. A nil observed, or one with no record, leaves the
+// snapshot as it stood.
 func (p *pumpState) finalizeTurnWithUsage(ev agentcore.TurnEvidence, observed *usageObserved) {
 	turn := p.activeTurn
 	if turn == nil {
@@ -933,6 +1349,7 @@ func (p *pumpState) finalizeTurnWithUsage(ev agentcore.TurnEvidence, observed *u
 	p.flushAgentMessage()
 	p.activeTurn = nil
 	ev = turn.disposition(ev)
+	p.resetFromPulledWindows(turn, ev)
 
 	var recovered *agentcore.RecoveredUsage
 	if observed != nil {
@@ -940,15 +1357,7 @@ func (p *pumpState) finalizeTurnWithUsage(ev agentcore.TurnEvidence, observed *u
 	}
 
 	emit := p.publish(turn)
-	// Unmeasured spend and a figure short of its turn are not folded into the
-	// measurement verdict, which asserts a measurement exists, not that the
-	// accounting is complete.
-	spend := turn.spend
-	if accountsForWholeTurn(observed) {
-		spend.MarkSettled()
-		spend.MarkSessionTotal()
-	}
-	result, agentErr := p.state.usage.Finalize(emit, p.state.logger, ev, p.sessionID, 0, recovered, spend)
+	result, agentErr := p.state.usage.Finalize(emit, p.state.logger, ev, p.sessionID, 0, recovered, turn.spend)
 
 	select {
 	case turn.resultCh <- turnEnd{result: result, err: agentErr}:
@@ -956,32 +1365,34 @@ func (p *pumpState) finalizeTurnWithUsage(ev agentcore.TurnEvidence, observed *u
 	}
 }
 
-func accountsForWholeTurn(observed *usageObserved) bool {
-	return observed != nil && observed.recovered != nil &&
-		observed.completeness == usagesource.CompletenessAccounted
+// resetFromPulledWindows fills a zero reset of the turn's refusal with the one
+// the usage component chooses among the windows of the turn-end pull, under the
+// configured model. A reset the records already set is never replaced.
+func (p *pumpState) resetFromPulledWindows(turn *activeTurn, ev agentcore.TurnEvidence) {
+	if turn.refusal == nil || !turn.refusal.WindowReset || ev.TerminalErrorKind != domain.ErrUsageLimit ||
+		ev.UsageLimit == nil || !ev.UsageLimit.ResetsAt.IsZero() {
+		return
+	}
+	ev.UsageLimit.ResetsAt = usage.RefusalReset(turn.pulledWindows, p.state.configuredModel, time.Now().UTC())
 }
 
-// recoverThenFinalize ends the active turn on ev, first giving the measurement
-// source the one bounded chance it would otherwise never get: a turn that ends
-// without a wire result still spent what its completed requests cost. ev is the
-// disposition either way, no wire result is waited for, and a turn already
-// draining keeps that drain.
+// recoverThenFinalize ends the active turn on ev: a turn that ends without a
+// wire result still spent what its completed requests cost, which the ledger
+// settles. ev is the disposition either way.
 func (p *pumpState) recoverThenFinalize(ev agentcore.TurnEvidence) {
 	turn := p.activeTurn
 	if turn == nil {
 		return
 	}
-	if p.reader == nil || !turn.spend.ModelReached() || turn.draining {
-		p.finalizeTurn(ev)
+	if p.ledger != nil {
+		p.endUnreplied(ev)
 		return
 	}
-	turn.endSettled = true
-	p.armDrain(turn, ev, 0)
+	p.settleTurn(ev, nil)
 }
 
 // beginEndAttempt marks the active turn as winding down toward kind, sends
-// session/cancel exactly once, and arms the bounded wait for the prompt
-// response.
+// session/cancel once, and arms the bounded wait for the prompt response.
 func (p *pumpState) beginEndAttempt(kind turnEndKind, detail string) {
 	turn := p.activeTurn
 	if turn == nil {
@@ -1000,25 +1411,54 @@ func (p *pumpState) beginEndAttempt(kind turnEndKind, detail string) {
 	}
 }
 
-// finalizeActiveTurnOnDeadline ends the active turn once its bounded wait for
-// the prompt response has elapsed. The evidence passed here is overridden by
-// finalizeTurn's own pendingEnd handling.
-func (p *pumpState) finalizeActiveTurnOnDeadline() {
+// finalizeDecidedTurn ends the active turn on the disposition it already has,
+// when it has one, and reports whether it did. The wait elapsing, or the pump
+// exiting, costs a held turn its windows and a draining turn its figure, never
+// its outcome; the pull or read behind either delivers into an inbox no one
+// reads once the pump is gone, and RunTurn would wait on the turn for good.
+func (p *pumpState) finalizeDecidedTurn() bool {
 	turn := p.activeTurn
-	if turn == nil {
-		return
-	}
-	// A turn whose bounded wait belongs to a drain already has its disposition;
-	// the wait elapsing costs it its figure, not its outcome.
-	if turn.draining {
+	switch {
+	case turn == nil:
+		return false
+	case turn.held != nil:
+		p.finalizeTurnWithUsage(turn.held.evidence, turn.held.observed)
+	case turn.recordsPending:
+		p.finalizeTurnWithUsage(turn.drainEvidence, p.settleSpend(turn, turn.spendEnd, turn.spendLive, usage.RecordsRead{}))
+	case turn.draining:
 		p.finalizeTurn(turn.drainEvidence)
-		return
+	default:
+		return false
 	}
-	p.finalizeTurn(agentcore.TurnEvidence{Terminal: agentcore.TerminalFailure, TerminalErrorKind: domain.ErrTurnFailed})
+	return true
 }
 
-// handlePermissionRequest answers a session/request_permission request and, when
-// the shared posture ends the attempt, latches or begins that end.
+// finalizeActiveTurnOnDeadline ends the active turn once its bounded wait for
+// the prompt response has elapsed; pendingEnd overrides the evidence given here.
+func (p *pumpState) finalizeActiveTurnOnDeadline() {
+	turn := p.activeTurn
+	if turn == nil || p.finalizeDecidedTurn() {
+		return
+	}
+	ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalFailure, TerminalErrorKind: domain.ErrTurnFailed}
+	if p.ledger == nil || turn.spendSettled {
+		p.finalizeTurn(ev)
+		return
+	}
+	end := turn.spendTurnEnd(false, false)
+	if p.ledger.NeedsRecords(end, nil) {
+		// The elapsed wait is spent; the read gets a wait of its own.
+		turn.deadlineC = nil
+		p.startRecordsRead(turn, ev, end, nil)
+		return
+	}
+	p.finalizeTurnWithUsage(ev, p.settleSpend(turn, end, nil, usage.RecordsRead{}))
+}
+
+// handlePermissionRequest answers a session/request_permission request with the
+// once-only allowing option when the operator declared approval and the offer
+// holds exactly one, and otherwise by the shared refusal posture, which may end
+// the attempt by latching or beginning that end.
 func (p *pumpState) handlePermissionRequest(msg *jsonrpc.Message) {
 	if !msg.ID.Present() {
 		return
@@ -1036,8 +1476,14 @@ func (p *pumpState) handlePermissionRequest(msg *jsonrpc.Message) {
 		params = requestPermissionRequest{}
 	}
 
+	approveID, approvable := selectApprovingOption(params.Options)
 	optionID, found := selectRefusingOption(params.Options)
-	posture := agentcore.DecideHumanRequest(agentcore.ClassPermission, found, agentcore.AnswerPending)
+	posture := agentcore.DecidePermissionRequest(p.state.permissions, approvable, found)
+
+	if posture.Approve {
+		p.respondSelected(msg.ID, approveID)
+		return
+	}
 
 	if posture.Notice != "" {
 		agentcore.EmitNotification(p.emitOrQueue, posture.NoticeWithDetail(""))
@@ -1075,9 +1521,9 @@ func dropMalformedToolCallNameFromParams(raw json.RawMessage) json.RawMessage {
 	return adapted
 }
 
-// reportUncallableToolDelivery reports, once per session, that a session which
-// delivered tool servers met a permission request the refusal posture answered,
-// so any delivered tool the runtime gates the same way cannot be called.
+// reportUncallableToolDelivery reports once per session that a permission
+// request met the refusal posture after tool servers were delivered, so any tool
+// the runtime gates the same way cannot be called.
 func (p *pumpState) reportUncallableToolDelivery() {
 	if !p.toolServersDelivered {
 		return
@@ -1091,10 +1537,9 @@ func (p *pumpState) reportUncallableToolDelivery() {
 	p.state.logger.Warn(toolDeliveryUncallableLog, slog.String("reason", "permission_refused"))
 }
 
-// answerMethodNotFound answers any request naming a method this client does not
-// implement. elicitation/create additionally ends the attempt, per the posture
-// for a request only a person could answer; every other unimplemented method
-// emits one malformed event and does not end the attempt.
+// answerMethodNotFound answers a request naming a method this client does not
+// implement. elicitation/create also ends the attempt, being a request only a
+// person could answer; every other method emits one malformed event.
 func (p *pumpState) answerMethodNotFound(msg *jsonrpc.Message) {
 	if !msg.ID.Present() {
 		return
@@ -1118,9 +1563,8 @@ func (p *pumpState) answerMethodNotFound(msg *jsonrpc.Message) {
 	p.emitOrQueue(domain.AgentEvent{Type: domain.EventMalformed, Timestamp: time.Now().UTC(), Message: unimplementedMethodMessage})
 }
 
-// latchOrBeginEndAttempt ends the active turn's attempt, or, when no turn is in
-// flight, latches the human-input-required outcome so the next turn ends with it
-// immediately.
+// latchOrBeginEndAttempt ends the active turn's attempt, or with no turn in
+// flight latches the human-input outcome for the next turn.
 func (p *pumpState) latchOrBeginEndAttempt(detail string) {
 	if p.activeTurn != nil {
 		p.beginEndAttempt(turnEndHumanInput, detail)
@@ -1156,9 +1600,8 @@ func (p *pumpState) respondCancelled(id jsonrpc.ID) {
 	}
 }
 
-// handleAnswerOpen answers every request the pump received but has not yet
-// answered, best-effort, so teardown's first step has a receiver even when a
-// reply from before teardown began is still outstanding.
+// handleAnswerOpen answers every request received but not yet answered,
+// best-effort, so teardown's first step has a receiver.
 func (p *pumpState) handleAnswerOpen() {
 	for id, method := range p.openRequests {
 		if method == methodSessionRequestPermission {

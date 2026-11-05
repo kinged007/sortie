@@ -122,11 +122,13 @@ State filtering stays client-side. The server-side label filter is AND across na
 
 **The notes route mixes system notes in with human comments.** Passing a "marked as related to" system note to an agent as human feedback would pollute every continuation prompt. There is a server-side filter parameter for this, and it fails loudly on a bad value, so it cannot be silently dropped by a version that lacks it. The adapter still keeps a client-side guard on the per-note system flag, because the field is authoritative and the check is free.
 
-Two more properties of that route: it defaults to **newest-first**, so ascending order is requested explicitly, and it **paginates**, unlike Gitea's equivalent.
+Further properties of that route: it defaults to **newest-first**, so the full reads request ascending order explicitly, and it **paginates**, unlike Gitea's equivalent.
+
+**The change read orders by update time, newest first, and stops early.** It requests comment notes ordered by `updated_at` descending, and reads pages down to the first page that ends in a note updated before the point it was given, so an idle issue costs one page while fewer than 100 notes were updated at or after the point. The point is the newest `updated_at` seen so far. Notes updated exactly at the point are read again, so notes that share that time are all read; identity and body, not the read boundary, decide what is new. A note whose `updated_at` moved without an edit, as GitLab moves it when a note is resolved, is read again as well.
+
+**The issue's `updated_at` is no probe.** GitLab skips that bump for a note made within a minute of another update, so a new comment can leave it unchanged. A `304` is charged against the rate limit here, so the change read sends no conditional request.
 
 Internal notes are passed through. They are genuine human comments, and an operator who does not want them in prompts controls that by not writing them.
-
-**A note that carries agent text must not expose it to slash commands.** A recognized slash command at the start of a line in a note body runs as a quick action, so a literal `/close` in agent text would close the issue. A comment that carries agent text is therefore the text, a blank line, a Markdown fence, the literal, and the same fence, with the fence one backtick longer than the longest backtick run in the literal and at least three. GitLab extracts quick actions from rendered Markdown paragraphs only, so no line inside the fence runs, whatever it starts with. The guard for Sortie's own text is unchanged: a body consumed entirely as quick actions creates no note and is reported as a payload error.
 
 **There is a true batch state lookup**, which neither sibling adapter has: one request resolves many issues by their internal ids. Reconciliation for N running issues costs one request instead of N. Two caveats: the batch must request all states so a just-closed issue is still reported, and it must be **chunked**, because the request is a query string and a long enough one meets a URI-length limit imposed by the front-end web server rather than by GitLab.
 
@@ -189,6 +191,8 @@ The unstable mergeability state is never emitted, by design rather than omission
 Two of the four fields it does return are **computed for the calling token**, not for the merge request: the same merge request reports one thing to the approver and the opposite to a different token in the same second. Ignore them. Only the identity-independent approval flag and the approver list are usable.
 
 So the decision is folded from the approvals payload plus the per-reviewer review states, in the same spirit as the Gitea fold. Changes-requested is tested first, so a later approval by a second reviewer cannot silently clear an outstanding block.
+
+Enterprise adds `approvals_left` to the same payload, the number of approvals the merge gate still needs. The fold reads it: a value above zero is review-required whether or not a reviewer is assigned. Community omits the field, which decodes as zero, so the fold never reports review-required there, and an assigned reviewer folds to review-requested, which auto-merge still defers on. A negative value is not unmet, and a value that is not an integer fails the read. Enterprise reports the approved flag as true when no rule applies, so approved does not prove a person approved.
 
 The load-bearing arm is the last one: with no reviewer assigned, the decision is **not-required**, which lets auto-merge proceed. That is a deliberate widening of the merge gate, and it is forced: the floor has no approval rules, so it can never *require* an approval, and a merge request with no reviewer is genuinely unreviewed rather than pending. An operator who wants review enforced on the floor must assign a reviewer, because the platform offers no server-side alternative.
 
@@ -262,7 +266,17 @@ The marker is available on the per-user route, and a non-administrator token can
 
 An adapter run with an empty allowlist may skip the lookup, but then bot selection returns nothing, so the allowlist stops being optional. That degradation belongs in the operator-facing documentation.
 
+**The change read resolves each note author's kind through the same cached lookup.** A note carries no author kind, so `fetch_issue_comment_changes` looks up each distinct author once for the adapter's lifetime and reads the marker from the per-user route. A `404` for the user reads as a person and is cached too, and any other failure fails the read and caches nothing. The full comment reads send no per-user request, so the kind they report is empty. GitLab.com caps the per-user route at 300 requests per 10 minutes per user, and a lookup the cap rejects fails the read.
+
 **The generated-bot username pattern is a hint, not a contract.** GitLab names its own managed token identities predictably, so a prefix match would classify them for free. It would not classify a third-party review bot driven by a personal access token, which is the common case for the review-comments reaction. Never use the pattern as the only platform signal.
+
+## Comment author write access needs a user search first
+
+**The membership route takes a numeric id, and comments carry the username.** A username in place of the id answers `400`. So a lookup searches users by `username`, which matches exactly and ignores letter case, picks the element whose username equals the login ignoring case, and reads that user's membership by its id. A search that returns no such element answers false with no membership request, and no other element is ever used for the membership read. The username is resolved on every lookup and never cached, so the membership read concerns the account that holds the username at that moment.
+
+**Read `members/all`, not `members`.** The `all` route includes memberships inherited from ancestor groups and invited through groups, and reports the highest level among a person's memberships. The direct route answers `404` for a group owner who is not a direct member. The adapter grants at `access_level` 30 (Developer) or above.
+
+**A non-member is `404`.** An existing account that is not a member and an unknown id both answer `404`, and the adapter answers false for both. Any other failure is returned as it arrived. The token needs member read on the project, which project membership gives, so the documented `api` scope is enough. The lookup records one tracker operation for its two requests.
 
 ## Configuration and construction
 

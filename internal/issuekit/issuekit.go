@@ -10,11 +10,16 @@ import (
 )
 
 // SourceComment is the adapter-local staging shape for comment normalization.
+// Its fields carry the meaning of the [domain.Comment] fields of the same
+// name.
 type SourceComment struct {
-	ID        string
-	Author    string
-	Body      string
-	CreatedAt string
+	ID         string
+	Author     string
+	AuthorID   string
+	AuthorKind domain.CommentAuthorKind
+	Body       string
+	CreatedAt  string
+	UpdatedAt  string
 }
 
 // NormalizeLabels lowercases labels in input order and always returns a non-nil slice.
@@ -59,6 +64,11 @@ func ParsePriorityIntFromString(s string) *int {
 }
 
 // NormalizeComments maps adapter-local comment values to [domain.Comment] values.
+//
+// Every field is copied. CreatedAt and UpdatedAt pass through unchanged, so
+// every source comment must carry a form the [domain.Comment] CreatedAt
+// documentation lists (UpdatedAt may also be empty); callers parse them
+// with [domain.Comment.CreatedTime] and [domain.Comment.UpdatedTime].
 func NormalizeComments(in []SourceComment) []domain.Comment {
 	if in == nil {
 		return []domain.Comment{}
@@ -67,34 +77,16 @@ func NormalizeComments(in []SourceComment) []domain.Comment {
 	out := make([]domain.Comment, len(in))
 	for i, comment := range in {
 		out[i] = domain.Comment{
-			ID:        comment.ID,
-			Author:    comment.Author,
-			Body:      comment.Body,
-			CreatedAt: comment.CreatedAt,
+			ID:         comment.ID,
+			Author:     comment.Author,
+			AuthorID:   comment.AuthorID,
+			AuthorKind: comment.AuthorKind,
+			Body:       comment.Body,
+			CreatedAt:  comment.CreatedAt,
+			UpdatedAt:  comment.UpdatedAt,
 		}
 	}
 	return out
-}
-
-// MarkdownLiteralComment returns text followed by literal in a fenced code
-// block. The fence is one backtick longer than the longest backtick run in
-// literal, and at least three, so nothing inside literal can close it.
-func MarkdownLiteralComment(text, literal string) string {
-	fence := strings.Repeat("`", max(3, 1+longestBacktickRun(literal)))
-	return text + "\n\n" + fence + "\n" + literal + "\n" + fence
-}
-
-func longestBacktickRun(s string) int {
-	longest, run := 0, 0
-	for i := 0; i < len(s); i++ {
-		if s[i] != '`' {
-			run = 0
-			continue
-		}
-		run++
-		longest = max(longest, run)
-	}
-	return longest
 }
 
 func isJSONIntLiteral(s string) bool {
