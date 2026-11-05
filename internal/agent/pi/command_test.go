@@ -2,7 +2,7 @@ package pi
 
 import (
 	"context"
-	"io"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -409,32 +409,6 @@ func TestBuildRunArgs(t *testing.T) {
 	}
 }
 
-// TestBuildTurnStdin asserts the prompt reaches pi byte for byte on
-// standard input, behind the SSH preamble when there is one. A prompt
-// beginning with "@" would be read as a file to include if it were an
-// argument.
-func TestBuildTurnStdin(t *testing.T) {
-	t.Parallel()
-
-	const prompt = "@/etc/passwd\n--help\n" + "'quoted' $(not run)"
-
-	got, err := io.ReadAll(buildTurnStdin(prompt, nil))
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
-	}
-	if string(got) != prompt {
-		t.Errorf("stdin without a preamble = %q, want %q", got, prompt)
-	}
-
-	got, err = io.ReadAll(buildTurnStdin(prompt, strings.NewReader("PREAMBLE")))
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
-	}
-	if string(got) != "PREAMBLE"+prompt {
-		t.Errorf("stdin with a preamble = %q, want %q", got, "PREAMBLE"+prompt)
-	}
-}
-
 // TestBuildRunArgs_NoOpencodeFlagsRemains asserts that no environment
 // key from a different CLI is still being delivered: pi takes every
 // restriction it honors as a flag, so an OPENCODE_* variable would be
@@ -458,51 +432,21 @@ func TestBuildRunArgs_NoOpencodeFlagsRemains(t *testing.T) {
 
 // TestMCPInjectionConformance drives a real turn for a session that
 // carries the worker-generated MCP config path, captures the argv and
-// environment the pi process actually received, and asserts the
-// translated servers reach it locally but not over SSH. Capturing the
-// launch rather than composing one is what makes both assertions able
-// to fail.
+// environment the pi process actually received, and asserts the rendered
+// servers reach it locally but not over SSH. Capturing the launch rather
+// than composing one is what makes both assertions able to fail.
 func TestMCPInjectionConformance(t *testing.T) {
-	t.Parallel()
-
 	declared, ok := registry.Agents.Meta("pi")
 	if !ok {
 		t.Fatal(`registry.Agents.Meta("pi") reported not registered`)
 	}
-	if declared.MCPInjection != registry.MCPInjectionTranslated {
-		t.Fatalf("registered MCPInjection = %q, want %q", declared.MCPInjection, registry.MCPInjectionTranslated)
-	}
-	if !declared.MCPInjection.DeliversTools(false) {
-		t.Error("MCPInjection.DeliversTools(remote=false) = false, want true: a local pi session must reach Sortie tools")
-	}
-	if declared.MCPInjection.DeliversTools(true) {
-		t.Error("MCPInjection.DeliversTools(remote=true) = true, want false: a remote pi launch cannot deliver Sortie tools")
+	if declared.MCPDialect != registry.MCPDialectMCPServersJSON {
+		t.Fatalf("registered MCPDialect = %q, want %q", declared.MCPDialect, registry.MCPDialectMCPServersJSON)
 	}
 
-	dir := t.TempDir()
-	mcpConfigPath := filepath.Join(dir, ".sortie", "mcp.json")
-	if err := os.MkdirAll(filepath.Dir(mcpConfigPath), 0o750); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	const generatedConfig = `{"mcpServers":{"sortie-tools":{"type":"stdio","command":"/usr/local/bin/sortie","args":["mcp-server","--workflow","/repo/WORKFLOW.md"],"env":{"SORTIE_ISSUE_ID":"abc-123"}}}}`
-	if err := os.WriteFile(mcpConfigPath, []byte(generatedConfig), 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	// Local launch: the bridge extension and the env JSON both carry the
-	// server detail, which the Translated assertion looks for as
-	// substrings on the launch surface.
-	t.Run("local launch delivers the translated servers", func(t *testing.T) {
-		t.Parallel()
-
-		localDir := filepath.Join(dir, "local")
-		if err := os.MkdirAll(filepath.Join(localDir, ".sortie"), 0o750); err != nil {
-			t.Fatalf("MkdirAll() error = %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(localDir, ".sortie", "mcp.json"), []byte(generatedConfig), 0o600); err != nil {
-			t.Fatalf("WriteFile() error = %v", err)
-		}
-		localMCP := filepath.Join(localDir, ".sortie", "mcp.json")
+	t.Run("local launch delivers the rendered servers", func(t *testing.T) {
+		localDir := t.TempDir()
+		localMCP := agenttest.WriteSeededMCPConfig(t, localDir)
 		argvFile := filepath.Join(localDir, "argv.txt")
 		envFile := filepath.Join(localDir, "env.txt")
 		script := writePiScript(t, localDir, `printf '%s\n' "$*" > `+argvFile+`
@@ -514,14 +458,14 @@ exit 0`)
 			t.Fatalf("NewPiAdapter() error = %v", err)
 		}
 		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-			WorkspacePath:   localDir,
-			AgentConfig:     domain.AgentConfig{Command: script},
-			MCPConfigPath:   localMCP,
-			ResumeSessionID: "",
+			WorkspacePath: localDir,
+			AgentConfig:   domain.AgentConfig{Command: script},
+			MCPConfigPath: localMCP,
 		})
 		if err != nil {
 			t.Fatalf("StartSession() error = %v", err)
 		}
+		state := session.Internal.(*sessionState)
 		_, _, _ = collectEvents(t, a, session, "work")
 
 		argv, err := os.ReadFile(argvFile)
@@ -533,50 +477,48 @@ exit 0`)
 			t.Fatalf("ReadFile(env) error = %v", err)
 		}
 
-		surface := agenttest.MCPLaunchSurface{
+		agenttest.AssertMCPInjection(t, declared.MCPDialect, localMCP, agenttest.MCPLaunchSurface{
 			Args: strings.Split(strings.TrimRight(string(argv), "\n"), "\n"),
-			Env:  strings.Split(strings.TrimRight(string(env), "\n"), "\n"),
-		}
-		agenttest.AssertMCPInjection(t, declared.MCPInjection, localMCP, surface)
+			Env:  append(strings.Split(strings.TrimRight(string(env), "\n"), "\n"), state.tools.LocalEnv()...),
+			File: state.mcpConfigPath,
+		})
 	})
 
-	// Remote launch: no Sortie server detail must reach the launch.
 	t.Run("remote launch delivers no tool servers", func(t *testing.T) {
-		t.Parallel()
+		remoteDir := t.TempDir()
+		remoteMCP := agenttest.WriteSeededMCPConfig(t, remoteDir)
+		fakeBin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(fakeBin, "ssh"), []byte("#!/bin/sh\necho 0.99.2\n"), 0o700); err != nil { //nolint:gosec // test stub must be executable
+			t.Fatalf("WriteFile(ssh) error = %v", err)
+		}
+		t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-		remoteDir := filepath.Join(dir, "remote")
-		if err := os.MkdirAll(filepath.Join(remoteDir, ".sortie"), 0o750); err != nil {
-			t.Fatalf("MkdirAll() error = %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(remoteDir, ".sortie", "mcp.json"), []byte(generatedConfig), 0o600); err != nil {
-			t.Fatalf("WriteFile() error = %v", err)
-		}
-		// The remote's server-side launch is not observable from this
-		// process, but the translation itself must already be nil so no
-		// bridge file or env value is built for it. Rendering the arg
-		// slice from the translated result is enough to drive the
-		// Unsupported assertion against its launch surface.
-		servers, err := translateMCPServers(mcpConfigPath, true)
+		a, err := NewPiAdapter()
 		if err != nil {
-			t.Fatalf("translateMCPServers() error = %v", err)
+			t.Fatalf("NewPiAdapter() error = %v", err)
 		}
-		if servers != nil {
-			t.Fatalf("translateMCPServers(remote=true) = %v, want nil", servers)
-		}
-		doc, err := buildMCPEnvValue(servers)
+		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+			WorkspacePath: remoteDir,
+			AgentConfig:   domain.AgentConfig{Command: "pi"},
+			SSHHost:       "example.test",
+			MCPConfigPath: remoteMCP,
+		})
 		if err != nil {
-			t.Fatalf("buildMCPEnvValue() error = %v", err)
+			t.Fatalf("StartSession() error = %v", err)
 		}
-		if doc != "" {
-			t.Fatalf("buildMCPEnvValue(remote) = %q, want %q", doc, "")
+		t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
+
+		state := session.Internal.(*sessionState)
+		if !session.NoToolChannel {
+			t.Error("Session.NoToolChannel = false, want true: a remote pi launch cannot deliver Sortie tools")
 		}
-		state := newTestSessionState(remoteDir, "")
+		if state.mcpConfigPath != "" || state.mcpBridgePath != "" {
+			t.Errorf("remote session carries config %q and bridge %q, want neither", state.mcpConfigPath, state.mcpBridgePath)
+		}
 		args := buildRunArgs(state, passthroughConfig{ProjectTrust: trustApprove})
-		env := []string{"PATH=/usr/bin"}
-		if doc != "" {
-			env = append(env, "SORTIE_PI_MCP_SERVERS="+doc)
+		if slices.ContainsFunc(args, func(arg string) bool { return strings.Contains(arg, ".sortie") }) {
+			t.Errorf("remote args = %v, want no .sortie path", args)
 		}
-		agenttest.AssertMCPInjection(t, registry.MCPInjectionUnsupported, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: env})
 	})
 }
 
@@ -598,5 +540,77 @@ func TestValidateConfig_NoFaultsForSupportedConfiguration(t *testing.T) {
 	})
 	if len(diags) != 0 {
 		t.Errorf("validateConfig() = %+v, want no diagnostics", diags)
+	}
+}
+
+func TestStartSession_LocalLaunchWritesTheBridgeFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mcpPath := agenttest.WriteSeededMCPConfig(t, dir)
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: dir,
+		AgentConfig:   domain.AgentConfig{Command: writePiScript(t, dir, "exit 0")},
+		MCPConfigPath: mcpPath,
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
+
+	bridge, err := os.ReadFile(filepath.Join(dir, ".sortie", bridgeFileName))
+	if err != nil {
+		t.Fatalf("ReadFile(bridge) error = %v", err)
+	}
+	if string(bridge) != bridgeFileContent {
+		t.Errorf("bridge file = %q, want bridgeFileContent", bridge)
+	}
+	derived, err := os.ReadFile(filepath.Join(dir, ".sortie", derivedConfigName))
+	if err != nil {
+		t.Fatalf("ReadFile(derived config) error = %v", err)
+	}
+	var doc struct {
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(derived, &doc); err != nil {
+		t.Fatalf("derived config is not JSON: %v", err)
+	}
+	if _, ok := doc.MCPServers["sortie-tools"]; !ok {
+		t.Errorf("derived config servers = %v, want sortie-tools", doc.MCPServers)
+	}
+}
+
+func TestStartSession_RemoteLaunchWritesNoBridgeFiles(t *testing.T) {
+	dir := t.TempDir()
+	mcpPath := agenttest.WriteSeededMCPConfig(t, dir)
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "ssh"), []byte("#!/bin/sh\necho 0.99.2\n"), 0o700); err != nil { //nolint:gosec // test stub must be executable
+		t.Fatalf("WriteFile(ssh) error = %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a, err := NewPiAdapter()
+	if err != nil {
+		t.Fatalf("NewPiAdapter() error = %v", err)
+	}
+	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+		WorkspacePath: dir,
+		AgentConfig:   domain.AgentConfig{Command: "pi"},
+		SSHHost:       "example.test",
+		MCPConfigPath: mcpPath,
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
+
+	for _, name := range []string{bridgeFileName, derivedConfigName} {
+		if _, err := os.Stat(filepath.Join(dir, ".sortie", name)); err == nil {
+			t.Errorf("%s exists, want none written for a remote launch", name)
+		}
 	}
 }

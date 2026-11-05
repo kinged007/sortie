@@ -396,21 +396,6 @@ func TestTokenUsage(t *testing.T) {
 	}
 }
 
-func TestAddUsage(t *testing.T) {
-	t.Parallel()
-
-	first := domain.TokenUsage{InputTokens: 90, OutputTokens: 18, CacheReadTokens: 5, TotalTokens: 108}
-	second := domain.TokenUsage{InputTokens: 40, OutputTokens: 9, CacheReadTokens: 2, TotalTokens: 49}
-
-	want := domain.TokenUsage{InputTokens: 130, OutputTokens: 27, CacheReadTokens: 7, TotalTokens: 157}
-	if got := addUsage(first, second); got != want {
-		t.Errorf("addUsage() = %+v, want %+v: the total is recomputed from the components", got, want)
-	}
-	if got := addUsage(domain.TokenUsage{}, domain.TokenUsage{}); got != (domain.TokenUsage{}) {
-		t.Errorf("addUsage(zero, zero) = %+v, want the zero figure", got)
-	}
-}
-
 func TestKnownEventTypes(t *testing.T) {
 	t.Parallel()
 

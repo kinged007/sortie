@@ -3,6 +3,7 @@ package pi_test
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,15 +191,21 @@ func TestIntegration_TurnCancellation(t *testing.T) {
 	defer cancel()
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	resultCh := make(chan domain.TurnResult, 1)
+	firstEvent := make(chan struct{})
+	var once sync.Once
 	go func() {
 		result, _ := adapter.RunTurn(turnCtx, session, domain.RunTurnParams{
 			Prompt:  "Count slowly from 1 to 1000, putting each number on its own line",
-			OnEvent: func(domain.AgentEvent) {},
+			OnEvent: func(domain.AgentEvent) { once.Do(func() { close(firstEvent) }) },
 		})
 		resultCh <- result
 	}()
 
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-firstEvent:
+	case <-ctx.Done():
+		t.Fatal("RunTurn emitted no event before the timeout")
+	}
 	turnCancel()
 
 	select {

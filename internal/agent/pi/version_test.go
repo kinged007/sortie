@@ -13,65 +13,6 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-func TestParseRuntimeVersion(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		out       string
-		truncated bool
-		want      piVersion
-		wantOK    bool
-	}{
-		{name: "bare version", out: "1.3.0\n", want: piVersion{1, 3, 0}, wantOK: true},
-		{name: "v-prefixed", out: "v0.99.2\n", want: piVersion{0, 99, 2}, wantOK: true},
-		{name: "named binary", out: "pi 0.99.0\n", want: piVersion{0, 99, 0}, wantOK: true},
-		{name: "prerelease suffix", out: "1.4.0-beta.1\n", want: piVersion{1, 4, 0}, wantOK: true},
-		{name: "leading blank lines are skipped", out: "\n\n1.3.0\n", want: piVersion{1, 3, 0}, wantOK: true},
-		{name: "empty output is not ok", out: "", wantOK: false},
-		{name: "usage text carries no version", out: "Usage: pi [options]\n", wantOK: false},
-		{name: "two components are not a version", out: "1.3\n", wantOK: false},
-		{name: "truncated output is never ok", out: "1.3.0\n", truncated: true, wantOK: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got, ok := parseRuntimeVersion([]byte(tt.out), tt.truncated)
-			if ok != tt.wantOK {
-				t.Fatalf("parseRuntimeVersion(%q, truncated=%v) ok = %v, want %v", tt.out, tt.truncated, ok, tt.wantOK)
-			}
-			if ok && got != tt.want {
-				t.Errorf("parseRuntimeVersion(%q) = %+v, want %+v", tt.out, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPiVersionBefore(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		version piVersion
-		want    bool
-	}{
-		{piVersion{0, 85, 1}, true},
-		{piVersion{0, 98, 9}, true},
-		{piVersion{0, 99, 0}, false},
-		{piVersion{0, 99, 2}, false},
-		{piVersion{0, 100, 0}, false},
-		{piVersion{1, 0, 0}, false},
-		{piVersion{2, 0, 18}, false},
-	}
-
-	for _, tt := range tests {
-		if got := tt.version.before(minimumVersion); got != tt.want {
-			t.Errorf("%v.before(%v) = %v, want %v", tt.version, minimumVersion, got, tt.want)
-		}
-	}
-}
-
 func TestStartSession_VersionGate(t *testing.T) {
 	t.Parallel()
 
@@ -179,11 +120,11 @@ func TestStartSession_RefusedVersionWritesNoBridge(t *testing.T) {
 	}
 }
 
-func TestVersionQueryEnv_DropsTheServerList(t *testing.T) {
+func TestWithoutServerList(t *testing.T) {
 	t.Parallel()
 
-	got := versionQueryEnv([]string{"PATH=/usr/bin", mcpServersEnv + "=stale", "HOME=/h"})
+	got := withoutServerList([]string{"PATH=/usr/bin", mcpServersEnv + "=stale", "HOME=/h"})
 	if strings.Join(got, "|") != "PATH=/usr/bin|HOME=/h" {
-		t.Errorf("versionQueryEnv() = %v, want the inherited server list dropped", got)
+		t.Errorf("withoutServerList() = %v, want the inherited server list dropped", got)
 	}
 }

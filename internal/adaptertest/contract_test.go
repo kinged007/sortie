@@ -1872,7 +1872,7 @@ func contractIdentityWordsFromIdent(name string) []string {
 		// An uppercase run ending in a lowercase rune starts a new word at
 		// that run's last uppercase rune, so useCLAUDEFlag yields "use",
 		// "claude" and "flag" rather than gluing the token to "flag".
-				// A short initialism followed by a plural s stays one word: PIDs
+		// A short initialism followed by a plural s stays one word: PIDs
 		// is not the identity token pi followed by ds.
 		if i > 0 && unicode.IsUpper(runes[i-1]) && unicode.IsLower(r) && len(current) > 1 &&
 			(len(current) > 3 || r != 's') {
@@ -2972,7 +2972,7 @@ var contractAnchorSortieDirSites = []contractSiteEntry{
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/copilot", name: "writeDerivedConfig", reason: "returned path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "WriteSeededMCPConfig", reason: "returned path"},
 	{importPath: "github.com/sortie-ai/sortie/internal/agent/agenttest", name: "assertMalformedMCPConfigRejected", reason: "fixture path"},
-	{importPath: "github.com/sortie-ai/sortie/internal/agent/pi", name: "ensureBridgeFile", reason: "bridge extension path"},
+	{importPath: "github.com/sortie-ai/sortie/internal/agent/pi", name: "writeDerivedConfig", reason: "returned path"},
 }
 
 // contractWorkdirSites pairs each exec.Cmd.Dir assignment rule WORKDIR

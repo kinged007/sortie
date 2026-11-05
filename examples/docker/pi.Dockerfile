@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget && \
     rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1 && \
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0 && \
     npm cache clean --force
 
 # Create a non-root user. Remove the base image's node user so the sortie

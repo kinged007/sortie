@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -28,6 +29,12 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 		Kind:        "pi",
 		Passthrough: map[string]any{"model": "anthropic/claude-3-5-sonnet"},
 		Read:        fakemodel.ReadFile,
+		Spend: &fakemodel.SpendSources{
+			Live: domain.UsageProvenance{Source: usage.SourceOutput, Strategy: usage.StrategyLive},
+		},
+		SSH: &fakemodel.SSHVariant{
+			Skip: "pi delivers no tool servers over SSH and has no scripted-model endpoint to drive",
+		},
 		Launch: func(_ *testing.T, env fakemodel.Environment) fakemodel.Launch {
 			return fakemodel.Launch{
 				Config: domain.AgentConfig{

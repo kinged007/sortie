@@ -530,7 +530,7 @@ func TestRunTurn_UsageAccumulatesAcrossTurns(t *testing.T) {
 // TestRunTurn_ResumeSession resumes into a session whose header names
 // the id Sortie already held, and reports session_started once.
 func TestRunTurn_ResumeSession(t *testing.T) {
-	t.Parallel()
+	stageSession(t, "7a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d")
 	dir := t.TempDir()
 	a, err := NewPiAdapter()
 	if err != nil {
@@ -869,4 +869,44 @@ func TestRunTurn_RealStreams(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stageSession stores a session file for id under a fresh
+// PI_CODING_AGENT_DIR, so the resume probe finds it. The caller cannot run
+// in parallel.
+func stageSession(t *testing.T, id string) {
+	t.Helper()
+
+	agentDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+	projectDir := filepath.Join(agentDir, "sessions", "--ws--")
+	if err := os.MkdirAll(projectDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "2026-01-01T00-00-00-000Z_"+id+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+// TestSessionContinuity stages the held session as a session file under
+// PI_CODING_AGENT_DIR, so it is not parallel.
+func TestSessionContinuity(t *testing.T) {
+	a, _ := NewPiAdapter()
+
+	agenttest.AssertSessionContinuity(t, func(t *testing.T, held, resumeID string) (domain.Session, error) {
+		t.Helper()
+
+		stageSession(t, held)
+
+		workspace := t.TempDir()
+		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+			WorkspacePath:   workspace,
+			AgentConfig:     domain.AgentConfig{Command: writePiScript(t, t.TempDir(), "exit 0")},
+			ResumeSessionID: resumeID,
+		})
+		if err == nil {
+			t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
+		}
+		return session, err
+	})
 }

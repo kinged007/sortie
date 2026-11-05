@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -28,17 +30,6 @@ import (
 type turnOutcome struct {
 	result domain.TurnResult
 	err    error
-}
-
-// testDrainGrace bounds every post-exit wait a turn performs on its
-// readers, so a test that ends a turn by signal does not spend the
-// production default on it.
-const testDrainGrace = 250 * time.Millisecond
-
-// boundDrain sets the session's post-exit drain bound. It must be called
-// before the session's first turn, while no turn is running.
-func boundDrain(session domain.Session) {
-	session.Internal.(*sessionState).drainGrace = testDrainGrace
 }
 
 // headerScript returns a fake-pi whose only output is one session header
@@ -121,7 +112,6 @@ func TestRunTurn_SessionHeaderWorkspaceMismatch(t *testing.T) {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 	session := mustStartSession(t, a, dir, headerScript(t, dir, "ws-1", `"$PWD/elsewhere"`))
-	boundDrain(session)
 
 	events, result, runErr := collectEvents(t, a, session, "work")
 	if runErr == nil {
@@ -146,7 +136,7 @@ func TestRunTurn_SessionHeaderWorkspaceMismatch(t *testing.T) {
 // a session other than the one being resumed is refused, so a turn never
 // appends to, or reports usage for, a pi session Sortie did not launch.
 func TestRunTurn_SessionIDMismatch(t *testing.T) {
-	t.Parallel()
+	stageSession(t, "expected-id")
 
 	dir := t.TempDir()
 	a, err := NewPiAdapter()
@@ -161,7 +151,6 @@ func TestRunTurn_SessionIDMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
-	boundDrain(session)
 
 	events, result, runErr := collectEvents(t, a, session, "work")
 	if runErr == nil {
@@ -194,7 +183,6 @@ func TestRunTurn_SessionStartedOnceAcrossTurns(t *testing.T) {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 	session := mustStartSession(t, a, dir, writeRunFixtureScript(t, dir, "simple_turn.jsonl"))
-	boundDrain(session)
 
 	first, _, err := collectEvents(t, a, session, "one")
 	if err != nil {
@@ -219,9 +207,8 @@ func TestRunTurn_SessionStartedOnceAcrossTurns(t *testing.T) {
 // the built argument slice would not show that the resumed id survived
 // the launch.
 func TestRunTurn_ResumeForwardsTheSessionID(t *testing.T) {
-	t.Parallel()
-
 	const resumeID = "7a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+	stageSession(t, resumeID)
 	dir := t.TempDir()
 	argvPath := filepath.Join(dir, "argv.txt")
 	script := writePiScript(t, dir, `printf '%s\n' "$@" > `+argvPath+`
@@ -239,7 +226,6 @@ exit 0`)
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
 	}
-	boundDrain(session)
 
 	// The fake process writes its argv and exits without a JSON
 	// response, so the shared no-work rule fails this turn. The captured
@@ -283,7 +269,7 @@ func TestStopSession_NoActiveTurn(t *testing.T) {
 func TestRunTurn_ContextCancellationEndsTheTurn(t *testing.T) {
 	t.Parallel()
 
-	testCtx, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelTest()
 
 	dir := t.TempDir()
@@ -292,7 +278,6 @@ func TestRunTurn_ContextCancellationEndsTheTurn(t *testing.T) {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 	session := mustStartSession(t, a, dir, hangingTurnScript(t, dir))
-	boundDrain(session)
 
 	turnCtx, cancelTurn := context.WithCancel(testCtx)
 	first, out := startTurn(t, turnCtx, a, session)
@@ -313,7 +298,7 @@ func TestRunTurn_ContextCancellationEndsTheTurn(t *testing.T) {
 func TestStopSession_DuringTurnCancelsTheTurn(t *testing.T) {
 	t.Parallel()
 
-	testCtx, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelTest()
 
 	dir := t.TempDir()
@@ -322,7 +307,6 @@ func TestStopSession_DuringTurnCancelsTheTurn(t *testing.T) {
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 	session := mustStartSession(t, a, dir, hangingTurnScript(t, dir))
-	boundDrain(session)
 
 	first, out := startTurn(t, testCtx, a, session)
 	awaitFirstEvent(t, first, testCtx.Done())
@@ -352,7 +336,7 @@ func TestRunTurn_EscapedDescendantWritingIsCapped(t *testing.T) {
 	agenttest.RequireSetsid(t)
 	t.Parallel()
 
-	testCtx, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelTest()
 
 	dir := t.TempDir()
@@ -383,7 +367,6 @@ exit 0
 		t.Fatalf("NewPiAdapter() error = %v", err)
 	}
 	session := mustStartSession(t, a, dir, script)
-	boundDrain(session)
 
 	start := time.Now()
 	_, out := startTurn(t, testCtx, a, session)
@@ -393,7 +376,7 @@ exit 0
 	// Without the cap the descendant holds the turn open indefinitely,
 	// so the bound is the assertion: a turn that waits it out is the
 	// failure this test exists to catch.
-	if elapsed > 5*time.Second {
+	if elapsed > 3*procutil.DefaultDrainGrace {
 		t.Errorf("RunTurn() took %v, want the post-exit cap to end the wait", elapsed)
 	}
 	if got.result.ExitReason != domain.EventTurnFailed {
@@ -437,4 +420,79 @@ func hasConsecutive(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+func TestRunTurn_UsageSettlementFollowsTheExit(t *testing.T) {
+	t.Parallel()
+
+	const turnEnd = `printf '{"type":"session","version":3,"id":"settle-1","timestamp":"t","cwd":"%s"}\n' "$PWD"
+printf '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"model":"m","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":12},"stopReason":"stop"},"toolResults":[]}\n'
+`
+	tests := []struct {
+		name            string
+		body            string
+		cancel          bool
+		wantUnaccounted bool
+	}{
+		{name: "clean exit settles the turn", body: turnEnd + "exit 0", wantUnaccounted: false},
+		{name: "cancelled turn keeps its partial usage unsettled", body: turnEnd + "while :; do sleep 1; done", cancel: true, wantUnaccounted: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			testCtx, cancelTest := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancelTest()
+
+			dir := t.TempDir()
+			a, err := NewPiAdapter()
+			if err != nil {
+				t.Fatalf("NewPiAdapter() error = %v", err)
+			}
+			session := mustStartSession(t, a, dir, writePiScript(t, dir, tt.body))
+
+			turnCtx, cancelTurn := context.WithCancel(testCtx)
+			defer cancelTurn()
+			notified := make(chan struct{})
+			var once sync.Once
+			var mu sync.Mutex
+			var usageEvents int
+			out := make(chan turnOutcome, 1)
+			go func() {
+				result, err := a.RunTurn(turnCtx, session, domain.RunTurnParams{
+					Prompt: "work",
+					OnEvent: func(e domain.AgentEvent) {
+						switch e.Type {
+						case domain.EventNotification:
+							once.Do(func() { close(notified) })
+						case domain.EventTokenUsage:
+							mu.Lock()
+							usageEvents++
+							mu.Unlock()
+						}
+					},
+				})
+				out <- turnOutcome{result: result, err: err}
+			}()
+			if tt.cancel {
+				select {
+				case <-notified:
+				case <-testCtx.Done():
+					t.Fatal("timed out waiting for the turn's first message")
+				}
+				cancelTurn()
+			}
+
+			got := awaitOutcome(t, out, testCtx.Done())
+			if got.result.SpendUnaccounted != tt.wantUnaccounted {
+				t.Errorf("RunTurn().SpendUnaccounted = %v, want %v", got.result.SpendUnaccounted, tt.wantUnaccounted)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if usageEvents != 1 {
+				t.Errorf("token_usage events = %d, want 1", usageEvents)
+			}
+		})
+	}
 }

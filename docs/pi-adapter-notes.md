@@ -4,7 +4,7 @@ Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: wh
 
 ## Where to get the volatile facts
 
-Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 0.85.1 schema, so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
+Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 1.3.0 schema, so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
 
 ## Version check and launch contract
 
@@ -16,7 +16,7 @@ The launch contract:
 
 - The prompt is written to standard input, not passed on the command line. pi treats a message argument beginning with `@` as a file to include, and Linux limits a single argument string to 128 KiB. Over SSH the prompt follows the environment preamble on standard input.
 - A credential-verification run adds `--no-session`, so it leaves no session file in the runtime's session store.
-- The version query's environment never carries `SORTIE_PI_MCP_SERVERS`, and neither does a turn's: an inherited value is removed before the adapter adds its own.
+- The version query's environment never carries `SORTIE_PI_MCP_SERVERS`, and a turn's carries it only for a session with tool servers: an inherited value is removed before the adapter adds its own.
 
 ## The surface Sortie drives
 
@@ -45,7 +45,7 @@ stdout carries one JSON object per line, framed by a session header before anyth
 {"type":"agent_end","messages":[...],"willRetry":false}
 ```
 
-Those are the families the adapter reads. The full 0.85.1 set also contains `agent_settled`, `bash_execution_update`, `queue_update`, `entry_appended`, `session_info_changed`, `thinking_level_changed`, `compaction_start`, `compaction_end`, `auto_retry_start`, `auto_retry_end`, `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and `summarization_retry_finished`. Most of them are framing with nothing for the orchestrator to record, and several only appear in an interactive session. Two are not: `tool_execution_end` and `compaction_end`, both covered below.
+Those are the families the adapter reads. The full 1.3.0 set also contains `agent_settled`, `bash_execution_update`, `queue_update`, `entry_appended`, `session_info_changed`, `thinking_level_changed`, `compaction_start`, `compaction_end`, `auto_retry_start`, `auto_retry_end`, `summarization_retry_scheduled`, `summarization_retry_attempt_start`, and `summarization_retry_finished`. Most of them are framing with nothing for the orchestrator to record, and several only appear in an interactive session. Two are not: `tool_execution_end` and `compaction_end`, both covered below.
 
 A line that is not a JSON object carrying a `type`, and a `type` outside that set, are both reported as a malformed line rather than skipped. That is deliberate. A future event the adapter silently dropped could carry the only text, the only usage, or the only failure the turn produced, and a stream that has moved past what this adapter understands is worth an operator's attention rather than a quiet empty turn. The same holds for the `message_update` delta types (`text_start`, `text_delta`, `text_end`, `thinking_start`, `thinking_delta`, `thinking_end`, `toolcall_start`, `toolcall_delta`, `toolcall_end`, `start`, `done`, `error`): a variant outside the set is a fault.
 
@@ -61,9 +61,9 @@ A line that is not a JSON object carrying a `type`, and a `type` outside that se
 
 The last response decides because pi retries a response that stopped with `error` inside the same process (`agent_end` with `willRetry` true, `auto_retry_start`, a new `agent_start`): a retry that succeeds makes the turn succeed, and a turn whose retries all fail reports the last error. Usage of every response, including each retry, is summed. A turn that produced no assistant output at all takes the shared zero-work row and is reported as a failure rather than a silent success, which is also where a stream that never produced a JSON event and exited 0 lands.
 
-The first-JSON deadline defaults to thirty seconds and takes the workflow's read timeout when one is configured. It is armed only until the first JSON event arrives, so it guards a subprocess that never starts talking; a mid-turn stall is the orchestrator's `stall_timeout_ms`. Once the subprocess has been reaped, the remaining stdout is drained for a bounded grace so a descendant holding the output handle cannot withhold the turn's result.
+The turn runs on the shared fork-per-turn skeleton, which owns the process start, the reap, the stop sequence, and the bounded drains of standard output and standard error. The first-event deadline is the larger of the workflow's read timeout and 60 seconds. It is armed only until the first line that parses as a pi event arrives, and a line that does not parse restarts it, so it guards a subprocess that never starts talking; a mid-turn stall is the orchestrator's `stall_timeout_ms`. Once the subprocess has been reaped, the remaining stdout is drained for a bounded grace so a descendant holding the output handle cannot withhold the turn's result. A stdout line longer than the scanner limit fails the turn with `port_exit`.
 
-The session header is checked, not merely recorded. Its `cwd` must be the turn's own workspace, and on a resumed session its id must be the id Sortie already holds. Either mismatch kills the process and fails the turn with `response_error` naming both values, because a stream that reports a different workspace or a different session is not the session this turn was supposed to continue.
+The session header is checked, not merely recorded. Its `cwd` must be the turn's own workspace, and on a resumed session its id must be the id Sortie already holds. Either mismatch ends the turn, which stops the process, and fails it with `response_error` naming both values, because a stream that reports a different workspace or a different session is not the session this turn was supposed to continue.
 
 A turn whose process exits on its own as the context is cancelled is reported by its real outcome, a success or a failure, rather than as cancelled.
 
@@ -106,21 +106,21 @@ Compaction is an extra model call, so it is an extra charge. A `compaction_end` 
 
 ## SSH
 
-The adapter builds the same ssh argument vector the other fork-per-turn kinds use, from the shared helper, with the same per-turn arguments: a remote session runs the same `pi -p --mode json ...` command on the remote host, in the remote workspace, with the same session flag. `AgentPID` is left unset for a remote turn, since the pid belongs to the ssh process rather than to pi.
+The adapter builds the same ssh argument vector the other fork-per-turn kinds use, from the shared helper, with the same per-turn arguments: a remote session runs the same `pi -p --mode json ...` command on the remote host, in the remote workspace, with the same session flag. `AgentPID` is the pid of the ssh client for a remote turn, since the process Sortie started is the ssh client rather than pi.
 
 A remote launch takes its ssh options from the shared launch target, the same path `opencode` uses. It carries the names listed under `worker.ssh_pass_env` that are set and non-empty in Sortie's environment, minus those under `worker.ssh_disallow_pass_env`, applies the target's host-key checking setting, and unsets a withheld variable for the remote command. The kind declares no credential variables of its own, so nothing is carried that the operator did not list. Carried values and the prompt travel on the ssh connection's standard input, the values first, which is why the remote host needs `dd` once a variable is carried; see the SSH section of the workflow reference.
 
-The MCP delivery is not carried over SSH. The bridge extension is a file in the local workspace and the server document is an environment variable of the local subprocess, so a remote turn carries neither `--extension` nor `SORTIE_PI_MCP_SERVERS`.
+The MCP delivery is not carried over SSH. The bridge extension is a file in the local workspace and the derived server file is a path in the local workspace named by an environment variable of the local subprocess, so a remote turn carries neither `--extension` nor `SORTIE_PI_MCP_SERVERS`. The session reports `NoToolChannel`, so the first prompt does not advertise Sortie's tools.
 
 ## Sortie's own tools
 
-The kind registers `MCPInjectionTranslated`. pi loads MCP servers from its own `mcp.json` and from extensions, and the adapter does not use the generated `.sortie/mcp.json` as is. For a local launch whose session carries Sortie MCP servers:
+The kind declares the `mcp_servers_json` dialect. The shared tool-server delivery renders the session's servers in that dialect. pi loads MCP servers from its own `mcp.json` and from extensions, so the adapter does not hand the rendered document to pi as a configuration file. For a local launch whose session carries Sortie MCP servers:
 
-- `ensureBridgeFile` writes a fixed extension, `.sortie/pi-mcp-bridge.js`, in the workspace and reuses an existing file whose content already matches. The file's text never varies between sessions; it holds no server data.
+- `writeDerivedConfig` writes both files on every session start through `WriteSortieFile`, replacing any existing copy. The fixed extension, `.sortie/pi-mcp-bridge.js`, is the same text in every session and holds no server data.
 - Each turn's command line adds `--extension <path>`.
-- The servers travel as one JSON document in `SORTIE_PI_MCP_SERVERS` in the turn's environment, in the shape `{"mcpServers": {"<name>": {"command"|"url", ...}}}`. The extension parses it and calls `pi.registerMcpServer` once per entry with `exposure: "direct"`, so each server's tools are listed to the model directly.
+- The adapter writes the rendered document to `.sortie/pi-mcp.json`, in the shape `{"mcpServers": {"<name>": {"command"|"url", ...}}}`, and the turn's environment names that file in `SORTIE_PI_MCP_SERVERS`. The extension reads it, replaces each `${VAR}` reference in a header value with the variable's value from the turn's environment, and calls `pi.registerMcpServer` once per entry with `exposure: "direct"`, so each server's tools are listed to the model directly.
 
-The extension writes a parse failure or a failed registration to stderr with the prefix `sortie-pi-mcp-bridge:` and carries on without that server. A fault in building the document or writing the file fails the session start instead.
+The extension writes a parse failure or a failed registration to stderr with the prefix `sortie-pi-mcp-bridge:` and carries on without that server. A fault in writing the derived file or the extension fails the session start instead.
 
 The servers delivered are Sortie's own plus those the file named by `mcp_config` declares, merged by the orchestrator into the generated configuration.
 
@@ -130,7 +130,7 @@ A remote (SSH) launch carries no servers, as described under SSH.
 
 - **Exit 0 with a failed turn.** A provider failure, such as a rejected model name or an authentication error, can end an assistant response with stop reason `error` while the process exits 0. The turn still fails, as `response_error`, from that stop reason. A report of a failed turn with exit status 0 is this, not an adapter fault.
 - **Early exit.** A process that exits before it wrote any readable line is reported as an early exit carrying its exit status and the end of its stderr, so a wrong `agent.command`, a missing binary, or an option pi rejects shows up with pi's own usage text rather than as an empty turn. It is not reported when the turn was cancelled or the session was stopped.
-- **No first event.** A subprocess that stays alive without printing a JSON event is killed when the first-JSON deadline passes, and the turn fails with `response_timeout` and the message `timed out waiting for first pi json event`. A credential or provider prompt that waits on a terminal is the usual cause.
+- **No first event.** A subprocess that stays alive without printing a JSON event is killed when the first-JSON deadline passes, and the turn fails with `response_timeout` and the message `timed out waiting for first event`. A credential or provider prompt that waits on a terminal is the usual cause.
 - **Empty turn.** An exit-0 turn with no assistant text, reasoning, or tool call takes the shared zero-work row and fails, so it is retried instead of counting as work done.
 - **SSH connection failure.** On a remote launch, exit status 255 with no assistant failure on the stream is reported as a failed SSH connection, not as a pi failure. The same status with an assistant failure on the stream is reported as that failure.
 - **MCP servers not loaded.** When a turn's stderr carries a line starting with `sortie-pi-mcp-bridge:`, the adapter logs a warning, "pi could not load Sortie's MCP servers", with the line as its detail, even if the turn succeeded. The session ran without the tools of the server that failed.

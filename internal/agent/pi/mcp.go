@@ -1,17 +1,16 @@
 package pi
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
-// mcpServersEnv is the variable the bridge extension reads its servers from.
+// mcpServersEnv names the variable that holds the path of the derived MCP
+// configuration file the bridge extension reads its servers from.
 const mcpServersEnv = "SORTIE_PI_MCP_SERVERS"
 
 // bridgeFailurePrefix starts every line the bridge extension writes to
@@ -20,138 +19,58 @@ const bridgeFailurePrefix = "sortie-pi-mcp-bridge:"
 
 // buildTurnEnv returns the environment every turn's subprocess inherits,
 // minus an inherited mcpServersEnv, plus mcpServersEnv when the session
-// carries Sortie MCP servers locally. The orchestrator passes
-// MCPConfigPath only for a local launch carrying servers, so a remote
-// session carries neither the bridge path nor this variable.
+// carries tool servers on a local launch. The skeleton adds the header
+// values their references name. A remote session carries neither.
 func buildTurnEnv(state *sessionState) []string {
-	base := os.Environ()
-	env := make([]string, 0, len(base)+1)
-	for _, entry := range base {
-		if shouldDropManagedEnv(entry) {
-			continue
-		}
-		env = append(env, entry)
-	}
-	if state.mcpEnvValue != "" {
-		env = append(env, mcpServersEnv+"="+state.mcpEnvValue)
+	env := withoutServerList(os.Environ())
+	if state.mcpConfigPath != "" {
+		env = append(env, mcpServersEnv+"="+state.mcpConfigPath)
 	}
 	return env
 }
 
-func shouldDropManagedEnv(entry string) bool {
-	key, _, found := strings.Cut(entry, "=")
-	return found && key == mcpServersEnv
+func withoutServerList(base []string) []string {
+	env := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if key, _, found := strings.Cut(entry, "="); found && key == mcpServersEnv {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
 }
 
 const bridgeFileName = "pi-mcp-bridge.js"
 
-const bridgeFileContent = `export default function(pi){
+const derivedConfigName = "pi-mcp.json"
+
+const bridgeFileContent = `import { readFileSync } from "node:fs";
+
+export default function(pi){
   const fail = (what, e) => console.error("sortie-pi-mcp-bridge: " + what + ": " + (e && e.message ? e.message : e));
-  const raw = process.env.SORTIE_PI_MCP_SERVERS;
-  if(!raw) return;
+  const path = process.env.SORTIE_PI_MCP_SERVERS;
+  if(!path) return;
   let doc;
-  try{ doc = JSON.parse(raw); } catch(e){ fail("cannot parse SORTIE_PI_MCP_SERVERS", e); return; }
+  try{ doc = JSON.parse(readFileSync(path, "utf8")); } catch(e){ fail("cannot read " + path, e); return; }
   const servers = doc.mcpServers || {};
+  const expand = (v) => typeof v === "string" ? v.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, n) => process.env[n] || "") : v;
   for(const [name, cfg] of Object.entries(servers)){
-    try{ pi.registerMcpServer(name, {...cfg, exposure: "direct"}); } catch(e){ fail("cannot register server " + name, e); }
+    const headers = cfg.headers ? Object.fromEntries(Object.entries(cfg.headers).map(([k, v]) => [k, expand(v)])) : undefined;
+    try{ pi.registerMcpServer(name, {...cfg, ...(headers ? {headers} : {}), exposure: "direct"}); } catch(e){ fail("cannot register server " + name, e); }
   }
 }
 `
 
-// translateMCPServers parses mcpConfigPath into its servers, or returns
-// nil for a remote launch, an empty path, or a configuration declaring no
-// server. Remote launches carry no Sortie MCP servers: the bridge
-// extension file and the environment variable that points pi at it exist
-// only on the local host.
-func translateMCPServers(mcpConfigPath string, remote bool) ([]mcpconfig.Server, error) {
-	if mcpConfigPath == "" || remote {
-		return nil, nil
+// writeDerivedConfig writes the rendered tool-server document to
+// <workspacePath>/.sortie/pi-mcp.json and the static bridge extension to
+// <workspacePath>/.sortie/pi-mcp-bridge.js, and returns their paths.
+func writeDerivedConfig(workspacePath string, document []byte) (configPath, bridgePath string, err error) {
+	if err := workspacekit.WriteSortieFile(workspacePath, derivedConfigName, document); err != nil {
+		return "", "", err
 	}
-	servers, err := mcpconfig.Parse(mcpConfigPath)
-	if err != nil {
-		return nil, err
+	if err := workspacekit.WriteSortieFile(workspacePath, bridgeFileName, []byte(bridgeFileContent)); err != nil {
+		return "", "", fmt.Errorf("write pi mcp bridge: %w", err)
 	}
-	if len(servers) == 0 {
-		return nil, nil
-	}
-	return servers, nil
-}
-
-// buildMCPEnvValue returns the JSON the bridge extension reads from
-// SORTIE_PI_MCP_SERVERS. It mirrors the worker-generated mcp.json shape
-// so its string still carries every server name, command, url and env
-// name the Translated assertion looks for.
-func buildMCPEnvValue(servers []mcpconfig.Server) (string, error) {
-	if len(servers) == 0 {
-		return "", nil
-	}
-	mcpServers := make(map[string]any, len(servers))
-	for _, s := range servers {
-		switch s.Transport {
-		case mcpconfig.TransportStdio:
-			entry := map[string]any{
-				"command": s.Command,
-			}
-			if len(s.Args) > 0 {
-				entry["args"] = s.Args
-			}
-			if len(s.Env) > 0 {
-				entry["env"] = s.Env
-			}
-			if s.Enabled != nil {
-				entry["enabled"] = *s.Enabled
-			}
-			mcpServers[s.Name] = entry
-		case mcpconfig.TransportHTTP:
-			entry := map[string]any{
-				"url": s.URL,
-			}
-			if len(s.Headers) > 0 {
-				entry["headers"] = s.Headers
-			}
-			if s.Enabled != nil {
-				entry["enabled"] = *s.Enabled
-			}
-			mcpServers[s.Name] = entry
-		default:
-			return "", fmt.Errorf("mcp server %q: entry carries neither command nor url", s.Name)
-		}
-	}
-	doc := map[string]any{"mcpServers": mcpServers}
-	data, err := json.Marshal(doc)
-	if err != nil {
-		return "", fmt.Errorf("marshal pi mcp env value: %w", err)
-	}
-	return string(data), nil
-}
-
-// ensureBridgeFile writes the static bridge extension to
-// <workspacePath>/.sortie/pi-mcp-bridge.js when servers is non-empty,
-// and returns its absolute path. It reuses an existing file whose
-// content already matches, so a resumed session does not churn the
-// workspace.
-func ensureBridgeFile(workspacePath string, servers []mcpconfig.Server) (string, error) {
-	if len(servers) == 0 {
-		return "", nil
-	}
-	if workspacePath == "" {
-		return "", fmt.Errorf("workspace path is empty")
-	}
-	dir, err := workspacekit.OpenSortieDir(workspacePath, true)
-	if err != nil {
-		return "", fmt.Errorf("open .sortie directory: %w", err)
-	}
-	defer dir.Close() //nolint:errcheck
-
-	// Reuse if already correct, to avoid rewriting on every retry.
-	if existing, err := os.ReadFile(filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName)); err == nil { //nolint:gosec // path is the workspace plus constant names
-		if string(existing) == bridgeFileContent {
-			return filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName), nil
-		}
-	}
-
-	if err := workspacekit.ReplaceFile(dir, bridgeFileName, []byte(bridgeFileContent)); err != nil {
-		return "", fmt.Errorf("write pi mcp bridge: %w", err)
-	}
-	return filepath.Join(workspacePath, workspacekit.SortieDir, bridgeFileName), nil
+	dir := filepath.Join(workspacePath, workspacekit.SortieDir)
+	return filepath.Join(dir, derivedConfigName), filepath.Join(dir, bridgeFileName), nil
 }

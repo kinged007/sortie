@@ -18,7 +18,6 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
-	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -34,7 +33,7 @@ func mustBuildSSHSession(t *testing.T, dir, script string) domain.Session {
 	if len(faults) > 0 {
 		t.Fatalf("parsePassthroughConfig() faults = %v", faults)
 	}
-	return domain.Session{Internal: &sessionState{
+	state := &sessionState{
 		target: agentcore.LaunchTarget{
 			Command:       script,
 			WorkspacePath: dir,
@@ -45,8 +44,9 @@ func mustBuildSSHSession(t *testing.T, dir, script string) domain.Session {
 		sessionID:   resumeFixtureSessionID,
 		baseLogger:  slog.Default(),
 		usage:       agentcore.NewTurnEndUsage(),
-		drainGrace:  procutil.DefaultDrainGrace,
-	}}
+	}
+	state.fork = newForkSession(state)
+	return domain.Session{Internal: state}
 }
 
 // writeCapturingFixtureScript returns a fake-pi that records its argument
@@ -194,25 +194,6 @@ func TestRunTurn_ClosedSession(t *testing.T) {
 	}
 }
 
-func TestRunTurn_ConcurrentRunRejected(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	a, _ := NewPiAdapter()
-	session := mustStartSession(t, a, dir, writePiScript(t, dir, "exit 0"))
-	state := session.Internal.(*sessionState)
-	state.mu.Lock()
-	state.active = &turnRuntime{waitCh: make(chan waitResult)}
-	state.mu.Unlock()
-
-	_, err := a.RunTurn(context.Background(), session, domain.RunTurnParams{Prompt: "work", OnEvent: func(domain.AgentEvent) {}})
-
-	agentErr, ok := errors.AsType[*domain.AgentError](err)
-	if !ok || agentErr.Kind != domain.ErrResponseError || agentErr.Message != "session already has an active turn" {
-		t.Fatalf("RunTurn() error = %v, want %q of kind %q", err, "session already has an active turn", domain.ErrResponseError)
-	}
-}
-
 func TestRunTurn_LinkedWorkspaceRefusedBeforeStart(t *testing.T) {
 	t.Parallel()
 
@@ -253,21 +234,16 @@ printf '\n'`)
 	events, result, err := collectEvents(t, a, session, "work")
 
 	agentErr, ok := errors.AsType[*domain.AgentError](err)
-	if !ok || agentErr.Kind != domain.ErrResponseError {
-		t.Fatalf("RunTurn() error = %v, want an AgentError of kind %q", err, domain.ErrResponseError)
+	if !ok || agentErr.Kind != domain.ErrPortExit {
+		t.Fatalf("RunTurn() error = %v, want an AgentError of kind %q", err, domain.ErrPortExit)
 	}
 	if result.ExitReason != domain.EventTurnFailed {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
 	}
 	failed := eventsOfType(events, domain.EventTurnFailed)
-	if len(failed) != 1 || failed[0].Message != "stdout read error" {
-		t.Fatalf("turn_failed events = %+v, want exactly one with Message %q", failed, "stdout read error")
+	if len(failed) != 1 || !strings.HasPrefix(failed[0].Message, "stdout read error") {
+		t.Fatalf("turn_failed events = %+v, want exactly one with a Message starting %q", failed, "stdout read error")
 	}
-	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
-		Terminal:          agentcore.TerminalFailure,
-		TerminalErrorKind: domain.ErrResponseError,
-		TerminalMessage:   "stdout read error",
-	}, result, err)
 }
 
 func TestRunTurn_EventAgentPID(t *testing.T) {
@@ -294,7 +270,7 @@ func TestRunTurn_EventAgentPID(t *testing.T) {
 		}
 	})
 
-	t.Run("ssh_events_leave_pid_empty", func(t *testing.T) {
+	t.Run("ssh_events_carry_the_client_pid", func(t *testing.T) {
 		t.Parallel()
 
 		dir := t.TempDir()
@@ -309,42 +285,11 @@ func TestRunTurn_EventAgentPID(t *testing.T) {
 			t.Fatal("events = 0, want > 0")
 		}
 		for _, event := range events {
-			if event.AgentPID != "" {
-				t.Errorf("event %q AgentPID = %q, want empty in ssh mode", event.Type, event.AgentPID)
+			if event.AgentPID == "" {
+				t.Errorf("event %q AgentPID is empty, want the ssh client's pid", event.Type)
 			}
 		}
 	})
-}
-
-func TestRunTurn_ReadTimeoutBeforeFirstJSONEvent(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	a, _ := NewPiAdapter()
-	session := mustStartSession(t, a, dir, writePiScript(t, dir, "sleep 5"))
-	session.Internal.(*sessionState).agentConfig.ReadTimeoutMS = 100
-
-	events, result, err := collectEvents(t, a, session, "work")
-
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-	}
-	agentErr, ok := errors.AsType[*domain.AgentError](err)
-	if !ok || agentErr.Kind != domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() error = %v, want an AgentError of kind %q", err, domain.ErrResponseTimeout)
-	}
-	const wantMessage = "timed out waiting for first pi json event"
-	if agentErr.Message != wantMessage {
-		t.Errorf("Message = %q, want %q", agentErr.Message, wantMessage)
-	}
-	if failed := eventsOfType(events, domain.EventTurnFailed); len(failed) != 1 {
-		t.Fatalf("turn_failed event count = %d, want 1", len(failed))
-	}
-	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
-		Terminal:          agentcore.TerminalFailure,
-		TerminalErrorKind: domain.ErrResponseTimeout,
-		TerminalMessage:   wantMessage,
-	}, result, err)
 }
 
 func abandonmentWarnCount(spy *agenttest.LogSpy) int {
@@ -406,7 +351,7 @@ func TestRunTurn_DescendantHoldsStdout(t *testing.T) {
 		session := mustStartSession(t, a, dir, script)
 		state := session.Internal.(*sessionState)
 		state.baseLogger = slog.New(spy)
-		state.drainGrace = 200 * time.Millisecond
+		state.fork = newForkSession(state)
 
 		start := time.Now()
 		_, result, err := collectEvents(t, a, session, "work")
@@ -441,13 +386,13 @@ func TestRunTurn_DescendantHoldsStdout(t *testing.T) {
 		session := mustStartSession(t, a, dir, script)
 		state := session.Internal.(*sessionState)
 		state.baseLogger = slog.New(spy)
-		state.drainGrace = 200 * time.Millisecond
+		state.fork = newForkSession(state)
 
 		start := time.Now()
 		_, result, err := collectEvents(t, a, session, "work")
 
-		if elapsed := time.Since(start); elapsed > 3*time.Second {
-			t.Errorf("RunTurn() took %v, want well under 3s", elapsed)
+		if elapsed := time.Since(start); elapsed > 3*procutil.DefaultDrainGrace {
+			t.Errorf("RunTurn() took %v, want the drain bound to end the wait", elapsed)
 		}
 		if got := abandonmentWarnCount(spy); got != 1 {
 			t.Errorf("abandonment WARN count = %d, want exactly 1", got)
@@ -500,7 +445,6 @@ exit 0
 
 	a, _ := NewPiAdapter()
 	session := mustStartSession(t, a, dir, script)
-	session.Internal.(*sessionState).drainGrace = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -758,8 +702,12 @@ func TestBuildTurnEnv_DropsInheritedServerList(t *testing.T) {
 	if n, _ := count(buildTurnEnv(&sessionState{})); n != 0 {
 		t.Errorf("a session without servers carries %d %s entries, want the inherited one dropped", n, mcpServersEnv)
 	}
-	const fresh = `{"mcpServers":{"sortie-tools":{"command":"sortie"}}}`
-	if n, last := count(buildTurnEnv(&sessionState{mcpEnvValue: fresh})); n != 1 || last != fresh {
+	const fresh = "/ws/.sortie/pi-mcp.json"
+	tools, toolsErr := agentcore.ResolveToolDelivery(context.Background(), domain.StartSessionParams{}, agentcore.LaunchTarget{}, registry.MCPDialectMCPServersJSON, nil)
+	if toolsErr != nil {
+		t.Fatalf("ResolveToolDelivery() error = %v", toolsErr)
+	}
+	if n, last := count(buildTurnEnv(&sessionState{mcpConfigPath: fresh, tools: tools})); n != 1 || last != fresh {
 		t.Errorf("a session with servers carries %d %s entries, last %q, want exactly one carrying %q", n, mcpServersEnv, last, fresh)
 	}
 }

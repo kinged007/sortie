@@ -82,14 +82,6 @@ var knownDeltaTypes = map[string]struct{}{
 	"error":          {},
 }
 
-// parsedLine is one stdout line's outcome: exactly one of the two fields
-// is set. PlainText carries a line that is not a JSON event object, so
-// the caller can report it verbatim.
-type parsedLine struct {
-	Event     *rawRunEvent
-	PlainText string
-}
-
 type rawRunEvent struct {
 	Type string `json:"type"`
 
@@ -209,18 +201,18 @@ func (e *rawRunEvent) completedMessage() (rawMessage, error) {
 	if e.Type != "message_end" && e.Type != "turn_end" {
 		return rawMessage{}, fmt.Errorf("event %q carries no completed message", e.Type)
 	}
-	var msg rawMessage
-	if err := decodeStrict(e.Message, &struct {
-		Role *string `json:"role"`
-	}{&msg.Role}); err != nil {
+	var head struct {
+		Role string `json:"role"`
+	}
+	if err := decodeStrict(e.Message, &head); err != nil {
 		return rawMessage{}, fmt.Errorf("event %q message: %w", e.Type, err)
 	}
-	if msg.Role == "" {
+	if head.Role == "" {
 		return rawMessage{}, fmt.Errorf("event %q message carries no role", e.Type)
 	}
+	msg := rawMessage{Role: head.Role}
+	// A system message's content is a string, which the full decode rejects.
 	if msg.Role == "system" {
-		// The system message's content is a string and carries nothing
-		// the adapter reads.
 		return msg, nil
 	}
 	if err := json.Unmarshal(e.Message, &msg); err != nil {
@@ -306,18 +298,6 @@ func (u rawUsage) tokenUsage() domain.TokenUsage {
 	}
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return usage
-}
-
-// addUsage returns the componentwise sum of two usage figures, with
-// TotalTokens recomputed.
-func addUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	sum := domain.TokenUsage{
-		InputTokens:     a.InputTokens + b.InputTokens,
-		OutputTokens:    a.OutputTokens + b.OutputTokens,
-		CacheReadTokens: a.CacheReadTokens + b.CacheReadTokens,
-	}
-	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
-	return sum
 }
 
 // decodeStrict decodes raw into target, rejecting a payload the event's

@@ -44,3 +44,9 @@ __pycache__
 /web/node_modules/
 !/internal/server/ui/dist/
 !/internal/server/ui/dist/**
+# sortie-loop local state (added by sortie-loop setup)
+.sortie/
+sortie-loop
+# Jigz local state (added by jig setup)
+.jigz/
+/jig

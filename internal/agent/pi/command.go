@@ -2,7 +2,6 @@ package pi
 
 import (
 	"fmt"
-	"io"
 	"slices"
 	"strings"
 
@@ -76,12 +75,10 @@ type configFault struct {
 	Err     error
 }
 
-// fault builds one configFault under the adapter's diagnostic namespace.
 func fault(check, format string, args ...any) *configFault {
 	return &configFault{Check: "pi." + check, Message: fmt.Sprintf(format, args...)}
 }
 
-// typeFault builds the configFault for a key holding the wrong YAML type.
 func typeFault(f *typeutil.TypeFault) *configFault {
 	return &configFault{Check: "pi." + f.Key + ".wrong_type", Message: f.Error(), Err: f}
 }
@@ -251,15 +248,10 @@ func sortedConfigKeys() []string {
 	return keys
 }
 
-// pi runs non-interactive with -p --mode json and reads the prompt from
-// standard input, so neither a prompt beginning with "@" (which pi treats
-// as a file to include) nor a prompt longer than the kernel's argument
-// limit reaches the command line. cmd.Dir is already the workspace, so
-// no --dir. A credential-verification session is ephemeral: --no-session
-// leaves no session file behind. When the session carries Sortie MCP
-// servers locally the static bridge extension is loaded through
-// --extension and the JSON document is delivered through
-// SORTIE_PI_MCP_SERVERS in the turn's environment.
+// buildRunArgs puts the prompt on stdin, not the command line: pi treats a
+// prompt starting with "@" as a file to include, and a long prompt can
+// exceed the kernel's argument limit. The MCP bridge extension is loaded
+// with --extension.
 func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	args := []string{"-p", "--mode", "json"}
 
@@ -290,15 +282,4 @@ func buildRunArgs(state *sessionState, pt passthroughConfig) []string {
 	}
 
 	return args
-}
-
-// buildTurnStdin returns the reader a turn's subprocess reads from:
-// prompt, preceded by preamble (nil on a local launch, the SSH preamble
-// otherwise).
-func buildTurnStdin(prompt string, preamble io.Reader) io.Reader {
-	promptReader := strings.NewReader(prompt)
-	if preamble == nil {
-		return promptReader
-	}
-	return io.MultiReader(preamble, promptReader)
 }

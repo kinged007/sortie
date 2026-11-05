@@ -260,7 +260,7 @@ func TestAdapterMeta_RealRegistrations(t *testing.T) {
 				wantUsageAttribution:   registry.UsageAttributionPerModel,
 				wantCredentialEnvNames: nil,
 				wantEffortForwarding:   registry.EffortForwarded,
-				wantUsageLimit:         registry.UsageLimitRecognized,
+				wantUsageLimit:         registry.UsageLimitNotRecognized,
 			},
 			{
 				name:                   "opencode requires command, declares MCP dialect mcp_member_json, derives turn_end/per_model usage, declares no resume blocker, and declares no credential names",
