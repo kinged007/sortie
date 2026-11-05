@@ -60,15 +60,16 @@ const maxPages = 200
 // REST API. Safe for concurrent use.
 type GitHubAdapter struct {
 	*issuekit.StateSource
-	client      *httpkit.Client
-	owner       string
-	repo        string
-	queryFilter string
-	projectURL  string
-	metrics     domain.Metrics
-	etagCache   *etagCache
-	model       *issuekit.LabelStateModel
-	access      *scmcore.WriteAccessCache
+	client       *httpkit.Client
+	owner        string
+	repo         string
+	queryFilter  string
+	pullRequests bool
+	projectURL   string
+	metrics      domain.Metrics
+	etagCache    *etagCache
+	model        *issuekit.LabelStateModel
+	access       *scmcore.WriteAccessCache
 }
 
 // NewGitHubAdapter creates a [GitHubAdapter] from adapter configuration.
@@ -160,14 +161,15 @@ func NewGitHubAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 	}
 
 	adapter := &GitHubAdapter{
-		StateSource: source,
-		client:      newGitHubClient(endpoint, apiKey, userAgent),
-		owner:       owner,
-		repo:        repo,
-		queryFilter: queryFilter,
-		projectURL:  webBase(endpoint) + "/" + owner + "/" + repo,
-		etagCache:   newETagCache(etagCacheSize),
-		model:       issuekit.NewLabelStateModel(source, slog.Default()),
+		StateSource:  source,
+		client:       newGitHubClient(endpoint, apiKey, userAgent),
+		owner:        owner,
+		repo:         repo,
+		queryFilter:  queryFilter,
+		pullRequests: targetsPullRequests(queryFilter),
+		projectURL:   webBase(endpoint) + "/" + owner + "/" + repo,
+		etagCache:    newETagCache(etagCacheSize),
+		model:        issuekit.NewLabelStateModel(source, slog.Default()),
 	}
 	adapter.access = scmcore.NewWriteAccessCache(adapter.lookupWriteAccess)
 	return adapter, nil
@@ -207,6 +209,26 @@ func (a *GitHubAdapter) FetchCandidateIssues(ctx context.Context) ([]domain.Issu
 	return issues, err
 }
 
+// skips reports whether gi is outside the kind of item the adapter tracks:
+// pull requests when query_filter carries is:pr or type:pr, issues otherwise.
+func (a *GitHubAdapter) skips(gi githubIssue) bool {
+	return isPullRequest(gi) != a.pullRequests
+}
+
+func (a *GitHubAdapter) searchType() string {
+	if a.pullRequests {
+		return "pr"
+	}
+	return "issue"
+}
+
+func (a *GitHubAdapter) itemNoun() string {
+	if a.pullRequests {
+		return "pull request"
+	}
+	return "issue"
+}
+
 func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
 	path := "/repos/" + a.owner + "/" + a.repo + "/issues"
 	params := url.Values{
@@ -228,7 +250,7 @@ func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context, states iss
 
 		issues := make([]domain.Issue, 0, len(raw))
 		for _, gi := range raw {
-			if isPullRequest(gi) {
+			if a.skips(gi) {
 				continue
 			}
 			issue := normalizeIssue(gi, a.model, states)
@@ -254,7 +276,7 @@ func (a *GitHubAdapter) fetchCandidatesViaIssues(ctx context.Context, states iss
 }
 
 func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context, states issuekit.LabelStates) ([]domain.Issue, error) {
-	q := fmt.Sprintf("repo:%s/%s type:issue state:open %s", a.owner, a.repo, a.queryFilter)
+	q := fmt.Sprintf("repo:%s/%s type:%s state:open %s", a.owner, a.repo, a.searchType(), a.queryFilter)
 	params := url.Values{
 		"q":        {q},
 		"sort":     {"created"},
@@ -278,7 +300,7 @@ func (a *GitHubAdapter) fetchCandidatesViaSearch(ctx context.Context, states iss
 
 		issues := make([]domain.Issue, 0, len(page.Items))
 		for _, gi := range page.Items {
-			if isPullRequest(gi) {
+			if a.skips(gi) {
 				continue
 			}
 			issue := normalizeIssue(gi, a.model, states)
@@ -331,10 +353,10 @@ func (a *GitHubAdapter) FetchIssueByID(ctx context.Context, issueID string) (dom
 			}
 		}
 
-		if isPullRequest(gi) {
+		if a.skips(gi) {
 			return &domain.TrackerError{
 				Kind:    domain.ErrTrackerNotFound,
-				Message: fmt.Sprintf("resource is a pull request, not an issue: %s", issueID),
+				Message: fmt.Sprintf("resource is not a %s: %s", a.itemNoun(), issueID),
 			}
 		}
 
@@ -517,7 +539,7 @@ func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet ma
 
 		issues := make([]domain.Issue, 0, len(raw))
 		for _, gi := range raw {
-			if isPullRequest(gi) {
+			if a.skips(gi) {
 				continue
 			}
 			issue := normalizeIssue(gi, a.model, states)
@@ -547,7 +569,7 @@ func (a *GitHubAdapter) fetchOpenIssuesByStates(ctx context.Context, stateSet ma
 }
 
 func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label string, seen map[string]struct{}, states issuekit.LabelStates) ([]domain.Issue, error) {
-	q := fmt.Sprintf(`repo:%s/%s type:issue state:closed label:"%s"`, a.owner, a.repo, label)
+	q := fmt.Sprintf(`repo:%s/%s type:%s state:closed label:"%s"`, a.owner, a.repo, a.searchType(), label)
 	params := url.Values{
 		"q":        {q},
 		"sort":     {"created"},
@@ -571,7 +593,7 @@ func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label stri
 
 		issues := make([]domain.Issue, 0, len(page.Items))
 		for _, gi := range page.Items {
-			if isPullRequest(gi) {
+			if a.skips(gi) {
 				continue
 			}
 			issue := normalizeIssue(gi, a.model, states)
@@ -686,7 +708,7 @@ func (a *GitHubAdapter) readState(ctx context.Context, snapshot issuekit.LabelSt
 			Err:     err,
 		}
 	}
-	if isPullRequest(gi) {
+	if a.skips(gi) {
 		return domain.IssueStateAndLabels{}, false, nil
 	}
 	labels := githubLabelNames(gi.Labels)

@@ -311,6 +311,19 @@ Gitea has no transition workflow, so the adapter derives an issue's state from i
 
 `handoff_state` and `in_progress_state` also name repository labels. At transition time the adapter adds the target label first, then removes the labels of the other configured states, so the issue never reads as being in no state between the two writes. A move to a terminal label then closes the issue, and a move to an active label reopens a closed one. A move to the handoff state is refused for a closed issue. The issue carries the labels of exactly one configured state afterward, and labels outside the configured states are never touched. Gitea imposes no transition graph, so any open issue can move to any configured state. The dispatch-time `in_progress_state` transition runs through this same label swap, so its generic validation rules (must appear in `active_states`, must not collide with `terminal_states` or `handoff_state`) apply unchanged.
 
+**GitHub `query_filter`:** For `kind: github`, `query_filter` is a raw GitHub search-qualifier fragment appended to the adapter's own `repo:`, `type:issue`, and `state:open` qualifiers, so any search qualifier works (for example `assignee:@me label:agent-ready`). Including the token `is:pr` or `type:pr` switches the adapter to pull requests: Sortie then tracks open pull requests that match the filter instead of issues, and skips issues. The workflow's states, labels, comments, and transitions apply to the pull request number as they do to an issue number.
+
+```yaml
+tracker:
+  kind: github
+  project: acme/widgets
+  api_key: $GITHUB_TOKEN
+  query_filter: "is:pr assignee:@me label:agent-review"
+  active_states: [agent-review]
+  handoff_state: reviewed
+  terminal_states: [done]
+```
+
 **Gitea `query_filter`:** For `kind: gitea`, `query_filter` is a URL query fragment for Gitea's repository issue-list route, not a string predicate or a JSON object. The adapter parses it with `url.ParseQuery` and merges the parameters into candidate polling, so an operator can scope which open issues the agent picks up (for example, to issues assigned to or mentioning the automation identity). Parameters combine with `&`. Rules:
 
 - The adapter rejects only the four keys it owns: `state`, `type`, `page`, and `limit`. Naming any of them fails construction with a configuration error.

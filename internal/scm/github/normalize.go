@@ -225,3 +225,14 @@ func isClosed(gi githubIssue) bool {
 func isPullRequest(gi githubIssue) bool {
 	return gi.PullRequest != nil
 }
+
+// targetsPullRequests reports whether a query filter selects pull requests
+// with an is:pr or type:pr qualifier.
+func targetsPullRequests(filter string) bool {
+	for _, tok := range strings.Fields(strings.ToLower(filter)) {
+		if tok == "is:pr" || tok == "type:pr" {
+			return true
+		}
+	}
+	return false
+}

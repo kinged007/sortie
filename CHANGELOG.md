@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `sortie validate` now checks the `comment_feed` setting and flags a misspelled field of the `comment_feed` template variable. ([#1585](https://github.com/sortie-ai/sortie/issues/1585), [#1586](https://github.com/sortie-ai/sortie/issues/1586))
 - `agent-client-protocol` workflows can pass environment variables to the agent with `agent-client-protocol.env`, locally and on SSH workers. ([#1595](https://github.com/sortie-ai/sortie/issues/1595))
 - `agent-client-protocol.permissions: approve-all` now approves a request to allow a single tool call; every other permission request is still refused. ([#1595](https://github.com/sortie-ai/sortie/issues/1595))
+- A GitHub workflow can track pull requests instead of issues: put `is:pr` or `type:pr` in `tracker.query_filter`, for example `is:pr assignee:@me label:agent-review`.
 - The state API reports the web address of the tracked project as `config.tracker.project_url` for GitHub, GitLab, Gitea, Linear, and Jira. ([#1630](https://github.com/sortie-ai/sortie/pull/1630))
 - Dashboard: long code blocks and JSON in messages fold to one line and expand on a click. ([#1630](https://github.com/sortie-ai/sortie/pull/1630))
 - Dashboard: issue titles in Overview, Pipeline, and History are links, so an issue page opens in a new tab or from the keyboard. ([#1630](https://github.com/sortie-ai/sortie/pull/1630))

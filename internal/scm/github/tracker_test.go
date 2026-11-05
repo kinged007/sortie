@@ -2772,3 +2772,49 @@ func TestFetchCandidateIssueByIDEquivalence(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchCandidateIssues_PullRequestQuery(t *testing.T) {
+	t.Parallel()
+
+	body := `{"total_count":2,"incomplete_results":false,"items":[
+{"number":7,"title":"pr","state":"open","labels":[{"name":"review"}],"pull_request":{}},
+{"number":8,"title":"issue","state":"open","labels":[{"name":"review"}]}]}`
+	var gotQ string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQ = r.URL.Query().Get("q")
+		w.Write([]byte(body)) //nolint:errcheck // test helper
+	}))
+	defer srv.Close()
+
+	cfg := validConfig(srv.URL)
+	cfg["query_filter"] = "is:pr assignee:@me label:agent-review"
+	a := mustAdapter(t, cfg)
+	issues, err := a.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues: %v", err)
+	}
+	if !strings.Contains(gotQ, "type:pr") || strings.Contains(gotQ, "type:issue") {
+		t.Errorf("q = %q, want type:pr and no type:issue", gotQ)
+	}
+	if len(issues) != 1 || issues[0].ID != "7" {
+		t.Errorf("issues = %+v, want only pull request 7", issues)
+	}
+}
+
+func TestTargetsPullRequests(t *testing.T) {
+	t.Parallel()
+
+	for filter, want := range map[string]bool{
+		"":                      false,
+		"label:bug":             false,
+		"label:is:pr-ish":       false,
+		"is:pr label:x":         true,
+		"assignee:@me IS:PR":    true,
+		"label:x type:pr":       true,
+		`label:"is:pr" is:open`: false,
+	} {
+		if got := targetsPullRequests(filter); got != want {
+			t.Errorf("targetsPullRequests(%q) = %v, want %v", filter, got, want)
+		}
+	}
+}
