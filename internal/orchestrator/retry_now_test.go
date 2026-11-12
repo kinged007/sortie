@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -11,27 +12,13 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
-func eventually(t *testing.T, what string, cond func() bool) {
+func snapshotRetryRow(t *testing.T, snapshot func() RuntimeSnapshotResult, issueID string) SnapshotRetryEntry {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen within 5s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func snapshotRetryRow(t *testing.T, snapshot func() (RuntimeSnapshotResult, error), issueID string) SnapshotRetryEntry {
-	t.Helper()
-
-	snap, err := snapshot()
-	if err != nil {
-		t.Fatalf("snapshot(): %v", err)
-	}
+	snap := snapshot()
 	i := slices.IndexFunc(snap.Retrying, func(r SnapshotRetryEntry) bool { return r.IssueID == issueID })
 	if i < 0 {
 		return SnapshotRetryEntry{}
@@ -150,14 +137,32 @@ func TestRetryNow(t *testing.T) {
 			})
 
 			snapshot := o.SnapshotFunc()
+			sessionStarted := func(identifier string) func() error {
+				return func() error {
+					if _, ok := started.Load(identifier); !ok {
+						return fmt.Errorf("no session started for %q", identifier)
+					}
+					return nil
+				}
+			}
 			if tt.otherRunning {
-				eventually(t, "the other issue's session", func() bool { _, ok := started.Load("OTHER-1"); return ok })
-				eventually(t, "the other issue running", func() bool {
-					snap, _ := snapshot()
-					return len(snap.Running) == 1
+				waittest.Until(t, sessionStarted("OTHER-1"))
+				waittest.Until(t, func() error {
+					snap := snapshot()
+					if len(snap.Running) != 1 {
+						return fmt.Errorf("running = %d, want 1", len(snap.Running))
+					}
+					return nil
 				})
 			}
-			before := snapshotRetryRow(t, snapshot, retryID)
+			var before SnapshotRetryEntry
+			waittest.Until(t, func() error {
+				before = snapshotRetryRow(t, snapshot, retryID)
+				if before.IssueID == "" {
+					return fmt.Errorf("no retry row for %q published yet", retryID)
+				}
+				return nil
+			})
 
 			result := o.RetryNowFunc()(ctx, tt.identifier)
 
@@ -165,13 +170,16 @@ func TestRetryNow(t *testing.T) {
 				t.Fatalf("RetryNowFunc()(%q).Status = %d, want %d", tt.identifier, result.Status, tt.wantStatus)
 			}
 			if tt.wantStarted {
-				eventually(t, "the retry's session start", func() bool { _, ok := started.Load(retryIdentifier); return ok })
+				waittest.Until(t, sessionStarted(retryIdentifier))
 				return
 			}
 
-			eventually(t, "the retry put back", func() bool {
+			waittest.Until(t, func() error {
 				row := snapshotRetryRow(t, snapshot, retryID)
-				return row.Paused == tt.wantPaused && (tt.wantError == "" || row.Error == tt.wantError)
+				if row.Paused != tt.wantPaused || (tt.wantError != "" && row.Error != tt.wantError) {
+					return fmt.Errorf("retry row Paused = %t, Error = %q, want Paused = %t, Error = %q", row.Paused, row.Error, tt.wantPaused, tt.wantError)
+				}
+				return nil
 			})
 			after := snapshotRetryRow(t, snapshot, retryID)
 			if _, ok := started.Load(retryIdentifier); ok {

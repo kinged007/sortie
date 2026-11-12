@@ -1,22 +1,36 @@
 // Package mcpconfig parses the worker-generated MCP configuration file
-// into a runtime-neutral shape an agent adapter can render into its
-// own runtime's configuration form. It lives under internal/agent/
-// rather than internal/domain/ because parsing this file is a concern
-// shared by adapter packages, not part of the orchestrator's domain
-// model, and both translating adapters use it rather than duplicating
-// the logic per adapter.
+// into a runtime-neutral server model and renders it into the syntax each
+// agent runtime parses. [Load] reads the file into a [Config];
+// [Config.Render] formats it through the dialect a kind declares in its
+// registry metadata and returns the [Delivery] the kind places.
 package mcpconfig
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
 	"path/filepath"
 	"slices"
+	"strconv"
 
 	"github.com/sortie-ai/sortie/internal/workspacekit"
+)
+
+const (
+	// ToolServerName is the generated entry that declares Sortie's own tool
+	// server.
+	ToolServerName = "sortie-tools"
+
+	// HeaderEnvPrefix prefixes the variables that carry operator HTTP header
+	// values by reference.
+	HeaderEnvPrefix = "SORTIE_MCP_HEADER_"
+
+	// BearerEnv is the variable that carries the bearer of Sortie's HTTP tool
+	// server by reference.
+	BearerEnv = "SORTIE_TOOL_SERVER_BEARER" //nolint:gosec // G101: an environment variable name, not a credential
 )
 
 // Transport identifies how a server communicates with the agent
@@ -67,6 +81,128 @@ type Server struct {
 	// Enabled is the operator's enable flag. Nil when the entry omits
 	// it.
 	Enabled *bool
+
+	// Raw is the entry's JSON object as declared.
+	Raw json.RawMessage
+
+	// Unmodeled lists, sorted, the entry's keys outside the modeled members.
+	// Only the mcp_servers_json dialects can carry them to a runtime.
+	Unmodeled []string
+}
+
+// HeaderRef carries one HTTP header value by reference, so a rendered
+// declaration names Env instead of holding Value.
+type HeaderRef struct {
+	Server string
+	Header string
+
+	// Env is the variable that carries Value.
+	Env   string
+	Value string
+}
+
+// Declarable returns servers without the disabled ones, keeping order.
+func Declarable(servers []Server) []Server {
+	return slices.DeleteFunc(slices.Clone(servers), func(s Server) bool {
+		return s.Enabled != nil && !*s.Enabled
+	})
+}
+
+// HeaderRefs returns one reference per HTTP header, numbered in (server,
+// header) byte order whatever the order of servers.
+func HeaderRefs(servers []Server) []HeaderRef {
+	var refs []HeaderRef
+	for _, server := range servers {
+		if server.Transport != TransportHTTP {
+			continue
+		}
+		for header, value := range server.Headers {
+			refs = append(refs, HeaderRef{Server: server.Name, Header: header, Value: value})
+		}
+	}
+	slices.SortFunc(refs, func(a, b HeaderRef) int {
+		return cmp.Or(cmp.Compare(a.Server, b.Server), cmp.Compare(a.Header, b.Header))
+	})
+	for i := range refs {
+		refs[i].Env = HeaderEnvPrefix + strconv.Itoa(i+1)
+	}
+	return refs
+}
+
+type StdioLaunch struct {
+	Command string
+	Args    []string
+	Env     map[string]string
+}
+
+// Endpoint is Sortie's HTTP tool server as a runtime reaches it.
+type Endpoint struct {
+	URL    string
+	Bearer string
+}
+
+// Config is one session's declarable servers with their header references. It
+// is immutable; derivation methods return new values.
+type Config struct {
+	servers []Server
+	refs    []HeaderRef
+}
+
+// Load reads the generated configuration at path, dropping disabled servers.
+func Load(path string) (Config, error) {
+	servers, err := Parse(path)
+	if err != nil {
+		return Config{}, err
+	}
+	return newConfig(Declarable(servers)), nil
+}
+
+func newConfig(servers []Server) Config {
+	return Config{servers: servers, refs: HeaderRefs(servers)}
+}
+
+// ToolServer returns the stdio [ToolServerName] entry, or false when absent.
+func (c Config) ToolServer() (StdioLaunch, bool) {
+	for _, server := range c.servers {
+		if isToolServer(server) {
+			return StdioLaunch{Command: server.Command, Args: server.Args, Env: server.Env}, true
+		}
+	}
+	return StdioLaunch{}, false
+}
+
+// WithoutToolServer returns c without its stdio [ToolServerName] entry.
+func (c Config) WithoutToolServer() Config {
+	return newConfig(slices.DeleteFunc(slices.Clone(c.servers), isToolServer))
+}
+
+// WithoutTransport returns c without every server of transport t and the
+// names of the removed servers other than [ToolServerName].
+func (c Config) WithoutTransport(t Transport) (Config, []string) {
+	var removed []string
+	kept := slices.DeleteFunc(slices.Clone(c.servers), func(s Server) bool {
+		if s.Transport != t {
+			return false
+		}
+		if s.Name != ToolServerName {
+			removed = append(removed, s.Name)
+		}
+		return true
+	})
+	return newConfig(kept), removed
+}
+
+// HeaderEnv returns one "<Env>=<Value>" entry per header reference.
+func (c Config) HeaderEnv() []string {
+	env := make([]string, 0, len(c.refs))
+	for _, ref := range c.refs {
+		env = append(env, ref.Env+"="+ref.Value)
+	}
+	return env
+}
+
+func isToolServer(s Server) bool {
+	return s.Name == ToolServerName && s.Transport == TransportStdio
 }
 
 // ErrorKind classifies why [Parse] failed.
@@ -87,20 +223,19 @@ const (
 	// inferred.
 	ErrorEntryNotExpressible ErrorKind = "entry_not_expressible"
 
-	// ErrorUnmodeledKey reports that an entry carries a key outside
-	// the set this package models.
+	// ErrorUnmodeledKey reports a dialect that cannot carry a key this
+	// package does not model.
 	ErrorUnmodeledKey ErrorKind = "unmodeled_key"
 )
 
-// modeledKeys is the complete set of keys an entry may carry. Derived
-// from the shape the worker's generator writes and the entry forms
-// each translating runtime accepts; growing it requires measuring the
-// candidate key against both runtimes first.
+// modeledKeys are the keys [Parse] reads into [Server] fields; other keys
+// stay in [Server.Raw] so runtimes that read the JSON themselves still see
+// them. Measure a candidate key against every translating runtime before
+// adding it.
 var modeledKeys = []string{"type", "command", "args", "env", "url", "headers", "enabled"}
 
-// Error reports why [Parse] failed, naming the file and, when the
-// fault is scoped to one entry, the server and, for an unmodeled key,
-// the offending key.
+// Error reports why [Parse] or [Config.Render] failed; Path is empty for a
+// render failure.
 type Error struct {
 	Kind   ErrorKind
 	Path   string
@@ -111,13 +246,17 @@ type Error struct {
 
 // Error implements the error interface.
 func (e *Error) Error() string {
+	prefix := "mcpconfig"
+	if e.Path != "" {
+		prefix += " " + e.Path
+	}
 	switch {
 	case e.Server != "" && e.Key != "":
-		return fmt.Sprintf("mcpconfig %s: server %q: key %q: %s", e.Path, e.Server, e.Key, e.detail())
+		return fmt.Sprintf("%s: server %q: key %q: %s", prefix, e.Server, e.Key, e.detail())
 	case e.Server != "":
-		return fmt.Sprintf("mcpconfig %s: server %q: %s", e.Path, e.Server, e.detail())
+		return fmt.Sprintf("%s: server %q: %s", prefix, e.Server, e.detail())
 	default:
-		return fmt.Sprintf("mcpconfig %s: %s", e.Path, e.detail())
+		return fmt.Sprintf("%s: %s", prefix, e.detail())
 	}
 }
 
@@ -129,7 +268,7 @@ func (e *Error) detail() string {
 	case ErrorEntryNotExpressible:
 		return "entry carries neither command nor url, or carries both"
 	case ErrorUnmodeledKey:
-		return "entry carries a key this parser does not model"
+		return "the runtime's MCP configuration syntax cannot carry a key this entry declares"
 	default:
 		return string(e.Kind)
 	}
@@ -143,8 +282,9 @@ func (e *Error) Unwrap() error { return e.Err }
 //
 // path must be non-empty and readable. The document must be a JSON
 // object; mcpServers must be absent or an object; each entry must be
-// an object. Parse performs one file read and no writes, network
-// calls, or environment reads.
+// an object. An unmodeled entry key is kept in [Server.Raw] rather than
+// rejected. Parse performs one file read and no writes, network calls, or
+// environment reads.
 func Parse(path string) ([]Server, error) {
 	if path == "" {
 		return nil, &Error{Kind: ErrorUnreadable, Path: path, Err: fmt.Errorf("path is empty")}
@@ -239,9 +379,11 @@ func parseEntry(path, name string, raw json.RawMessage) (Server, error) {
 		return Server{}, &Error{Kind: ErrorNotJSON, Path: path, Server: name, Err: err}
 	}
 
+	var unmodeled []string
 	for key, raw := range fields {
 		if !slices.Contains(modeledKeys, key) {
-			return Server{}, &Error{Kind: ErrorUnmodeledKey, Path: path, Server: name, Key: key}
+			unmodeled = append(unmodeled, key)
+			continue
 		}
 		// A null decodes into the zero value of every modeled field's
 		// type without an error, so a null command would survive its
@@ -263,7 +405,8 @@ func parseEntry(path, name string, raw json.RawMessage) (Server, error) {
 		return Server{}, err
 	}
 
-	server := Server{Name: name}
+	slices.Sort(unmodeled)
+	server := Server{Name: name, Raw: slices.Clone(raw), Unmodeled: unmodeled}
 
 	if enabledRaw, ok := fields["enabled"]; ok {
 		var enabled bool

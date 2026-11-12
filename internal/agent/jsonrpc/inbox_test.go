@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // TestInbox_PutNeverWaitsAndOrderHolds asserts that a large volume of
@@ -21,7 +23,7 @@ import (
 func TestInbox_PutNeverWaitsAndOrderHolds(t *testing.T) {
 	t.Parallel()
 
-	t.Run("100000 puts with no taker return within 5s", func(t *testing.T) {
+	t.Run("100000 puts with no taker return", func(t *testing.T) {
 		t.Parallel()
 
 		inbox := NewInbox[int]()
@@ -32,11 +34,7 @@ func TestInbox_PutNeverWaitsAndOrderHolds(t *testing.T) {
 			}
 			close(done)
 		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("100000 Put calls with no taker did not return within 5s")
-		}
+		waittest.Receive(t, done, "100000 Put calls with no taker")
 	})
 
 	t.Run("four producers put interleaved sequences and one consumer preserves each producer's order", func(t *testing.T) {
@@ -77,11 +75,7 @@ func TestInbox_PutNeverWaitsAndOrderHolds(t *testing.T) {
 		}()
 
 		wg.Wait()
-		select {
-		case <-drainDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("consumer did not take every produced item within 5s")
-		}
+		waittest.Receive(t, drainDone, "the consumer to take every produced item")
 
 		lastSeq := make([]int, producers)
 		for i := range lastSeq {
@@ -264,17 +258,12 @@ func TestDeliver_PanicsOnNilInboxOrWrap(t *testing.T) {
 	})
 }
 
-// takeWithin waits up to timeout for inbox to hold an item or be
-// closed, then takes one. It fails t when nothing arrives in time, so
-// a delivery that never happens fails the test instead of blocking it
+// takeNext waits for inbox to hold an item or be closed, then takes one,
+// so a delivery that never happens fails the test instead of blocking it
 // until the package timeout.
-func takeWithin[T any](t *testing.T, inbox *Inbox[T], timeout time.Duration) (T, bool) {
+func takeNext[T any](t *testing.T, inbox *Inbox[T]) (T, bool) {
 	t.Helper()
-	select {
-	case <-inbox.Ready():
-	case <-time.After(timeout):
-		t.Fatalf("inbox held nothing to take within %v", timeout)
-	}
+	waittest.Receive(t, inbox.Ready(), "the inbox to hold an item")
 	return inbox.Take()
 }
 
@@ -339,13 +328,8 @@ func TestInbox_ReaderNeverWaits(t *testing.T) {
 			fmt.Fprintf(peerW, "{\"id\":%d,\"result\":{}}\n", id) //nolint:errcheck,gosec // best-effort fixture write; a failed write surfaces through the assertion that reads its effect
 		}()
 
-		select {
-		case got := <-callDone:
-			if got.err != nil {
-				t.Fatalf("Call() error = %v, want nil", got.err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("Call() did not return within 2s despite the reader never waiting on the inbox")
+		if got := waittest.Receive(t, callDone, "Call() return despite the reader never waiting on the inbox"); got.err != nil {
+			t.Fatalf("Call() error = %v, want nil", got.err)
 		}
 
 		for i := range burst {
@@ -374,6 +358,7 @@ func TestInbox_ReaderNeverWaits(t *testing.T) {
 
 		var calls atomic.Int64
 		release := make(chan struct{})
+		releaseWrap := sync.OnceFunc(func() { close(release) })
 		wrap := func(m Message) Message {
 			if calls.Add(1) >= 17 {
 				<-release
@@ -383,6 +368,7 @@ func TestInbox_ReaderNeverWaits(t *testing.T) {
 		inbox := NewInbox[Message]()
 		conn := NewConn(reqW, peerR, Deliver(inbox, wrap))
 		t.Cleanup(conn.Close)
+		t.Cleanup(releaseWrap)
 
 		callDone := make(chan struct{}, 1)
 		go func() {
@@ -403,19 +389,10 @@ func TestInbox_ReaderNeverWaits(t *testing.T) {
 			fmt.Fprintf(peerW, "{\"id\":%d,\"result\":{}}\n", id) //nolint:errcheck,gosec // best-effort fixture write; a failed write surfaces through the assertion that reads its effect
 		}()
 
-		select {
-		case <-callDone:
-			close(release)
-			t.Fatal("Call() returned within 300ms despite a wrap blocked on its 17th call, want it still unreturned")
-		case <-time.After(300 * time.Millisecond):
-		}
-		close(release)
+		waittest.Never(t, callDone, 300*time.Millisecond, "Call() return despite a wrap blocked on its 17th call")
+		releaseWrap()
 
-		select {
-		case <-callDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Call() did not return after releasing the blocked wrap")
-		}
+		waittest.Receive(t, callDone, "Call() return after releasing the blocked wrap")
 	})
 }
 
@@ -442,22 +419,18 @@ func TestInbox_StreamEndDeliveredLast(t *testing.T) {
 		_ = peerW.CloseWithError(errors.New("boom"))
 	}()
 
-	msg1, ok := takeWithin(t, inbox, 2*time.Second)
+	msg1, ok := takeNext(t, inbox)
 	if !ok || msg1.Method != "one" {
 		t.Fatalf("first message = %+v, ok=%v, want method %q", msg1, ok, "one")
 	}
-	msg2, ok := takeWithin(t, inbox, 2*time.Second)
+	msg2, ok := takeNext(t, inbox)
 	if !ok || msg2.Method != "two" {
 		t.Fatalf("second message = %+v, ok=%v, want method %q", msg2, ok, "two")
 	}
-	msg3, ok := takeWithin(t, inbox, 2*time.Second)
+	msg3, ok := takeNext(t, inbox)
 	if !ok || msg3.Kind != KindStreamEnd {
 		t.Fatalf("third message = %+v, ok=%v, want Kind %v", msg3, ok, KindStreamEnd)
 	}
 
-	select {
-	case <-conn.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() did not close after KindStreamEnd was put")
-	}
+	waittest.Receive(t, conn.Done(), "Done() close after KindStreamEnd was put")
 }

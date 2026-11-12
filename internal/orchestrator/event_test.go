@@ -430,44 +430,59 @@ func TestHandleAgentEvent_TwoSessions_AgentTotals(t *testing.T) {
 	}
 }
 
-// TestHandleAgentEvent_RateLimits verifies that a non-nil RateLimits payload
-// is stored as a shallow copy in state.AgentRateLimits so that mutating the
-// original map after delivery does not corrupt the stored snapshot. Also
-// verifies that a nil RateLimits event does not clear an existing snapshot.
-func TestHandleAgentEvent_RateLimits(t *testing.T) {
+func usageWindowAt(key string, used float64, reportedAt time.Time) domain.UsageWindow {
+	return domain.UsageWindow{Key: key, Label: key, UsedPercent: &used, ReportedAt: reportedAt}
+}
+
+func windowUsed(t *testing.T, windows []domain.UsageWindow, key string) float64 {
+	t.Helper()
+	for _, w := range windows {
+		if w.Key == key {
+			if w.UsedPercent == nil {
+				t.Fatalf("window %q UsedPercent = nil, want a value", key)
+			}
+			return *w.UsedPercent
+		}
+	}
+	t.Fatalf("window %q not held in %+v", key, windows)
+	return 0
+}
+
+func TestHandleAgentEvent_UsageWindows(t *testing.T) {
 	t.Parallel()
 
-	state, _ := newStateWithEntry("MT-9")
-	ts := time.Now().UTC()
+	state := NewState(5000, 4, 0, nil, AgentTotals{})
+	state.Running["MT-claude"] = &RunningEntry{AgentKind: "claude-code"}
+	state.Running["MT-codex"] = &RunningEntry{AgentKind: "codex"}
+	base := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 
-	originalMap := map[string]any{"limit": 100}
-	HandleAgentEvent(state, "MT-9", domain.AgentEvent{
-		Type:       domain.EventNotification,
-		Timestamp:  ts,
-		RateLimits: originalMap,
-	}, slog.Default(), nil)
-
-	if state.AgentRateLimits == nil {
-		t.Fatal("AgentRateLimits = nil, want non-nil after delivery")
-	}
-	if got := state.AgentRateLimits.Data["limit"]; got != 100 {
-		t.Errorf("AgentRateLimits.Data[\"limit\"] = %v, want 100", got)
+	deliver := func(issueID string, at time.Time, windows ...domain.UsageWindow) {
+		HandleAgentEvent(state, issueID, domain.AgentEvent{
+			Type:         domain.EventNotification,
+			Timestamp:    at,
+			UsageWindows: windows,
+		}, slog.Default(), nil)
 	}
 
-	// Mutate the original map; the stored copy must be unaffected.
-	originalMap["limit"] = 999
-	if got := state.AgentRateLimits.Data["limit"]; got != 100 {
-		t.Errorf("after mutation: AgentRateLimits.Data[\"limit\"] = %v, want 100 (shallow copy isolation breach)", got)
+	deliver("MT-claude", base, usageWindowAt("five_hour", 10, base), usageWindowAt("seven_day", 20, base))
+	deliver("MT-codex", base, usageWindowAt("codex/primary", 30, base))
+	later := base.Add(time.Minute)
+	deliver("MT-claude", later, usageWindowAt("five_hour", 90, later))
+
+	claude := state.UsageWindows["claude-code"]
+	if got := windowUsed(t, claude, "five_hour"); got != 90 {
+		t.Errorf("claude-code five_hour used = %v, want 90 after the later report", got)
+	}
+	if got := windowUsed(t, claude, "seven_day"); got != 20 {
+		t.Errorf("claude-code seven_day used = %v, want 20 (a report that omits a window keeps it)", got)
+	}
+	if got := len(state.UsageWindows["codex"]); got != 1 {
+		t.Errorf("len(UsageWindows[codex]) = %d, want 1 (claude-code reports stay under their own kind)", got)
 	}
 
-	// A second event with nil RateLimits must NOT clear the existing snapshot.
-	HandleAgentEvent(state, "MT-9", domain.AgentEvent{
-		Type:       domain.EventNotification,
-		Timestamp:  ts,
-		RateLimits: nil,
-	}, slog.Default(), nil)
-	if state.AgentRateLimits == nil {
-		t.Error("AgentRateLimits = nil after nil-RateLimits event, want previous snapshot preserved")
+	deliver("MT-claude", later.Add(time.Second))
+	if got := len(state.UsageWindows["claude-code"]); got != 2 {
+		t.Errorf("len(UsageWindows[claude-code]) = %d after an event without windows, want 2", got)
 	}
 }
 
@@ -588,50 +603,6 @@ func TestHandleAgentEvent_TokenUsage_CounterRegression(t *testing.T) {
 	}
 	if entry.LastReportedInputTokens != 250 {
 		t.Errorf("after recovery: LastReportedInputTokens = %d, want 250", entry.LastReportedInputTokens)
-	}
-}
-
-// TestHandleAgentEvent_RateLimits_OutOfOrder verifies that an out-of-order
-// event with a non-nil RateLimits payload does NOT overwrite a newer
-// snapshot. The monotonic timestamp guard on rate-limit storage ensures the
-// most recent payload survives reordering.
-func TestHandleAgentEvent_RateLimits_OutOfOrder(t *testing.T) {
-	t.Parallel()
-
-	state, _ := newStateWithEntry("MT-12")
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	tPlus2 := base.Add(2 * time.Second)
-	tPlus1 := base.Add(1 * time.Second)
-
-	// Newer event arrives first at T+2s.
-	HandleAgentEvent(state, "MT-12", domain.AgentEvent{
-		Type:       domain.EventNotification,
-		Timestamp:  tPlus2,
-		RateLimits: map[string]any{"a": 1},
-	}, slog.Default(), nil)
-
-	if state.AgentRateLimits == nil {
-		t.Fatal("AgentRateLimits = nil after first delivery")
-	}
-	if got := state.AgentRateLimits.Data["a"]; got != 1 {
-		t.Errorf("after newer event: Data[\"a\"] = %v, want 1", got)
-	}
-
-	// Older event arrives second at T+1s, must NOT overwrite.
-	HandleAgentEvent(state, "MT-12", domain.AgentEvent{
-		Type:       domain.EventNotification,
-		Timestamp:  tPlus1,
-		RateLimits: map[string]any{"b": 2},
-	}, slog.Default(), nil)
-
-	if got := state.AgentRateLimits.Data["a"]; got != 1 {
-		t.Errorf("after out-of-order event: Data[\"a\"] = %v, want 1 (must not be overwritten)", got)
-	}
-	if _, exists := state.AgentRateLimits.Data["b"]; exists {
-		t.Error("after out-of-order event: Data[\"b\"] exists, want absent (older event must not replace newer snapshot)")
-	}
-	if !state.AgentRateLimits.ReceivedAt.Equal(tPlus2) {
-		t.Errorf("after out-of-order event: ReceivedAt = %v, want %v", state.AgentRateLimits.ReceivedAt, tPlus2)
 	}
 }
 
@@ -1725,9 +1696,6 @@ func TestHandleAgentEvent_CombinedTimingAccumulation(t *testing.T) {
 	}
 }
 
-// TestHandleAgentEvent_ToolCallMetric verifies that HandleAgentEvent
-// increments the IncToolCalls metric for EventToolResult events with
-// non-empty ToolName, using the correct result label based on ToolError.
 func TestHandleAgentEvent_ToolCallMetric(t *testing.T) {
 	t.Parallel()
 
@@ -1756,10 +1724,11 @@ func TestHandleAgentEvent_ToolCallMetric(t *testing.T) {
 			wantResult: "error",
 		},
 		{
-			name:      "empty ToolName skips metric",
-			toolName:  "",
-			toolError: false,
-			wantCalls: 0,
+			name:       "empty ToolName counts under other",
+			toolName:   "",
+			wantCalls:  1,
+			wantTool:   "other",
+			wantResult: "success",
 		},
 	}
 
@@ -1903,7 +1872,7 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 		}
 	})
 
-	t.Run("empty ToolName emits no log", func(t *testing.T) {
+	t.Run("empty ToolName logs the other label", func(t *testing.T) {
 		t.Parallel()
 
 		var buf bytes.Buffer
@@ -1922,8 +1891,8 @@ func TestHandleAgentEvent_ToolCallLogging(t *testing.T) {
 		}, logger, spy)
 
 		out := buf.String()
-		if strings.Contains(out, "tool call completed") {
-			t.Errorf("log output contains 'tool call completed' for empty ToolName\ngot: %s", out)
+		if !strings.Contains(out, "tool=other") {
+			t.Errorf("log output missing %q for empty ToolName\ngot: %s", "tool=other", out)
 		}
 	})
 }
@@ -2130,5 +2099,125 @@ func TestHandleAgentEvent_NoneArrivalDiscardsFigures(t *testing.T) {
 	}
 	if !noneEntry.LastAgentTimestamp.Equal(incEntry.LastAgentTimestamp) {
 		t.Errorf("none-arrival LastAgentTimestamp = %v, want %v", noneEntry.LastAgentTimestamp, incEntry.LastAgentTimestamp)
+	}
+}
+
+func TestToolText(t *testing.T) {
+	t.Parallel()
+
+	secret := eventTestSecret(t)
+	redact.Add("test.event tool text", secret)
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"skill name", "ce-plan", "ce-plan"},
+		{"qualified name", "plugin:name", "plugin:name"},
+		{"C0, DEL, and C1 runes become spaces", "a\x01b\x7fc\u0085d", "a b c d"},
+		{"bidi override and zero-width runes are removed", "x\u202ey\u200bz", "xyz"},
+		{"white space only", " \t\n\x01 ", ""},
+		{"1,200 runes are cut to 999 and an ellipsis", strings.Repeat("é", 1200), strings.Repeat("é", 999) + "…"},
+		{"registered secret is masked", "token " + secret, "token [redacted]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := toolText(tt.input); got != tt.want {
+				t.Errorf("toolText(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnwrapShell(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"single quotes", "bash -lc 'git status'", "git status"},
+		{"path and double quotes", `/bin/zsh -lc "make test"`, "make test"},
+		{"unquoted script", "sh -c ls", "ls"},
+		{"plain command", "git status", "git status"},
+		{"script file", "bash build.sh", "bash build.sh"},
+		{"flag without script", "bash -lc", "bash -lc"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := unwrapShell(tt.input); got != tt.want {
+				t.Errorf("unwrapShell(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkspaceRelative(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		workspace string
+		want      string
+	}{
+		{"path in workspace", "/ws/a/internal/foo.go", "/ws/a", "internal/foo.go"},
+		{"workspace with trailing separator", "/ws/a/internal/foo.go", "/ws/a/", "internal/foo.go"},
+		{"backslash separators", `\ws\a\internal\foo.go`, `\ws\a`, `internal\foo.go`},
+		{"joined paths", "/ws/a/x.go, /ws/a/y.go", "/ws/a", "x.go, y.go"},
+		{"sibling directory with the same prefix", "/ws/ab/x.go", "/ws/a", "/ws/ab/x.go"},
+		{"path outside workspace", "/etc/hosts", "/ws/a", "/etc/hosts"},
+		{"workspace inside a longer path", "/home/u/ws/a/x.go", "/ws/a", "/home/u/ws/a/x.go"},
+		{"already relative", "internal/foo.go", "/ws/a", "internal/foo.go"},
+		{"empty workspace", "/ws/a/x.go", "", "/ws/a/x.go"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := workspaceRelative(tt.input, tt.workspace); got != tt.want {
+				t.Errorf("workspaceRelative(%q, %q) = %q, want %q", tt.input, tt.workspace, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToolLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		toolName string
+		kind     domain.ToolKind
+		want     string
+	}{
+		{"plain name", "Bash", "", "Bash"},
+		{"qualified MCP name", "github.get_issue", "", "github.get_issue"},
+		{"plugin name", "plugin:name", "", "plugin:name"},
+		{"no name uses the kind", "", domain.ToolKindEdit, "edit"},
+		{"no name and no kind", "", "", "other"},
+		{"name with a space", "ls -la", "", "other"},
+		{"name with a slash", "./build.sh", "", "other"},
+		{"masked name", "tool [redacted]", "", "other"},
+		{"cut name", "tool…", "", "other"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := toolLabel(tt.toolName, tt.kind); got != tt.want {
+				t.Errorf("toolLabel(%q, %q) = %q, want %q", tt.toolName, tt.kind, got, tt.want)
+			}
+		})
 	}
 }

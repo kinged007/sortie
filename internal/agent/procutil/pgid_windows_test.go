@@ -4,6 +4,7 @@ package procutil
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestSetProcessGroup_CreationFlags(t *testing.T) {
@@ -52,14 +55,16 @@ func TestSetProcessGroup_CreationFlags(t *testing.T) {
 func awaitJobMembers(t *testing.T, g *Group, want int) {
 	t.Helper()
 	job := jobHandleOf(g)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if pids, err := jobMemberPIDs(job); err == nil && len(pids) >= want {
-			return
+	waittest.Until(t, func() error {
+		pids, err := jobMemberPIDs(job)
+		if err != nil {
+			return err
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("job object held fewer than %d members within 5s", want)
+		if len(pids) < want {
+			return fmt.Errorf("job object holds %d members, want at least %d", len(pids), want)
+		}
+		return nil
+	})
 }
 
 func TestGroupKill_KillsChildAndGrandchild(t *testing.T) {
@@ -74,7 +79,7 @@ func TestGroupKill_KillsChildAndGrandchild(t *testing.T) {
 		t.Fatalf("Kill() = %v, want nil", err)
 	}
 
-	awaitDone(t, r, 3*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 	if err := r.CleanupErr(); err != nil {
 		t.Errorf("CleanupErr() = %v, want nil (Kill drained the job)", err)
 	}
@@ -174,7 +179,7 @@ func TestKill_JobTerminationRecordsStopWithControlCExit(t *testing.T) {
 		t.Fatalf("Kill() = %v", err)
 	}
 
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 	exitErr, ok := errors.AsType[*exec.ExitError](r.Err())
 	if !ok {
 		t.Fatalf("Err() = %v (%T), want *exec.ExitError after Job Object termination", r.Err(), r.Err())
@@ -414,7 +419,7 @@ func TestArmGroupEscalation_ReleasesDuplicateOnEveryExitPath(t *testing.T) {
 		canary := newCaptureTestHeldMember(t, job)
 		_ = windows.CloseHandle(job)
 
-		assertCaptureWinProcessGone(t, canary.Process.Pid, 2*time.Second)
+		waittest.ProcessGone(t, canary.Process.Pid)
 	})
 
 	t.Run("terminate exit", func(t *testing.T) {
@@ -432,7 +437,7 @@ func TestArmGroupEscalation_ReleasesDuplicateOnEveryExitPath(t *testing.T) {
 		canary := newCaptureTestHeldMember(t, job)
 		_ = windows.CloseHandle(job)
 
-		assertCaptureWinProcessGone(t, canary.Process.Pid, 2*time.Second)
+		waittest.ProcessGone(t, canary.Process.Pid)
 	})
 }
 

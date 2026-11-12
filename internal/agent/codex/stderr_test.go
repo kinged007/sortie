@@ -4,6 +4,7 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,12 +13,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // handshakeReplies is the app-server side of the three handshake calls
@@ -167,11 +170,7 @@ func TestRunTurn_TurnStartOnDeadRuntimeReportsStderr(t *testing.T) {
 	if _, writeErr := fmt.Fprintln(state.stdin, "die"); writeErr != nil {
 		t.Fatalf("writing the sentinel: %v", writeErr)
 	}
-	select {
-	case <-state.readerDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the connection's reader did not end after the runtime exited")
-	}
+	waittest.Receive(t, state.readerDone, "connection reader end after the runtime exited")
 
 	if _, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
 		Prompt:  "work",
@@ -255,23 +254,6 @@ func writeFakeAppServerScriptStderrLiveRuntime(t *testing.T, line, readyFile, ex
 	return agenttest.WriteScript(t, t.TempDir(), "fake-codex-app-server-stderr-live", content)
 }
 
-// awaitReady blocks until the fake runtime has written its ready marker,
-// so a test acts on a runtime that has reached a known point rather than
-// on a sleep.
-func awaitReady(t *testing.T, readyFile string) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if data, err := os.ReadFile(readyFile); err == nil && len(data) > 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the fake runtime never reached its ready marker")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // TestStopSession_DoesNotReportStderrOfATurnItInterrupts covers the
 // contract StopSession states: the stop closes the connection, which
 // closes the inbox and sends the turn still running down the same path
@@ -305,16 +287,12 @@ func TestStopSession_DoesNotReportStderrOfATurnItInterrupts(t *testing.T) {
 			OnEvent: func(domain.AgentEvent) {},
 		})
 	}()
-	awaitReady(t, readyFile)
+	waittest.File(t, readyFile)
 
 	if stopErr := adapter.StopSession(context.Background(), session); stopErr != nil {
 		t.Errorf("StopSession() error = %v, want nil", stopErr)
 	}
-	select {
-	case <-turnDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the turn did not end after the stop")
-	}
+	waittest.Receive(t, turnDone, "turn end after the stop")
 
 	for _, line := range spy.WarnLines() {
 		if strings.Contains(line, diagnostic) {
@@ -339,11 +317,10 @@ func TestRunTurn_MalformedLineDoesNotReportStderrOfALiveRuntime(t *testing.T) {
 
 	readyFile := filepath.Join(t.TempDir(), "ready")
 	const diagnostic = "codex: a warning from a runtime that is still running"
-	const grace = 3 * time.Second
 	script := writeFakeAppServerScriptStderrLiveRuntime(t, diagnostic, readyFile,
 		"printf 'this is not json\\n'\n")
 
-	adapter := &CodexAdapter{drainGrace: grace}
+	adapter := &CodexAdapter{drainGrace: time.Hour}
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: script},
@@ -353,18 +330,17 @@ func TestRunTurn_MalformedLineDoesNotReportStderrOfALiveRuntime(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
-	start := time.Now()
-	_, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "work",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	elapsed := time.Since(start)
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, runErr := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
+			Prompt:  "work",
+			OnEvent: func(domain.AgentEvent) {},
+		})
+		runErrCh <- runErr
+	}()
 
-	if runErr == nil {
+	if runErr := waittest.Receive(t, runErrCh, "RunTurn return: a live runtime's output is still coming, so the turn must not wait for it"); runErr == nil {
 		t.Fatal("RunTurn() error = nil, want the malformed line to end the turn")
-	}
-	if elapsed >= grace {
-		t.Errorf("RunTurn() took %v, want well under the %v drain bound: a live runtime's output is still coming, so the turn must not wait for it", elapsed, grace)
 	}
 	for _, line := range spy.WarnLines() {
 		if strings.Contains(line, diagnostic) {
@@ -416,13 +392,12 @@ func TestRelease_EndsAStderrDrainNothingElseCanEnd(t *testing.T) {
 		Logger:     slog.Default(),
 	})
 
-	deadline := time.Now().Add(5 * time.Second)
-	for !collector.WaitDone(0) {
-		if time.Now().After(deadline) {
-			t.Fatal("the standard-error drain is still blocked in its read, want release to have closed the read end once its bound resolved")
+	waittest.Until(t, func() error {
+		if !collector.WaitDone(0) {
+			return errors.New("the standard-error drain is still blocked in its read, want release to have closed the read end once its bound resolved")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return nil
+	})
 }
 
 // TestReportStderr_AbandonsADrainThatCannotFinish pins the bound the
@@ -437,36 +412,32 @@ func TestRelease_EndsAStderrDrainNothingElseCanEnd(t *testing.T) {
 func TestReportStderr_AbandonsADrainThatCannotFinish(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = writer.Close()
-		_ = reader.Close()
-	})
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 100 * time.Millisecond
+		reader, writer := io.Pipe()
+		t.Cleanup(func() {
+			_ = writer.Close()
+			_ = reader.Close()
+		})
 
-	state := &sessionState{drainGrace: 100 * time.Millisecond}
-	state.stderrCollector = procutil.NewStderrCollector(reader, slog.Default())
-	if _, err := io.WriteString(writer, "codex: still writing\n"); err != nil {
-		t.Fatalf("writing to the stderr pipe: %v", err)
-	}
-
-	done := make(chan struct{})
-	start := time.Now()
-	go func() {
-		state.reportStderr(slog.Default())
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		if elapsed := time.Since(start); elapsed > 5*time.Second {
-			t.Errorf("reportStderr took %v on a 100ms bound, want it to give up inside the bound", elapsed)
+		state := &sessionState{drainGrace: bound}
+		state.stderrCollector = procutil.NewStderrCollector(reader, slog.Default())
+		if _, err := io.WriteString(writer, "codex: still writing\n"); err != nil {
+			t.Fatalf("writing to the stderr pipe: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("reportStderr never returned while the stderr write end was held: the wait is unbounded")
-	}
+
+		done := make(chan struct{})
+		start := time.Now()
+		go func() {
+			state.reportStderr(slog.Default())
+			close(done)
+		}()
+
+		waittest.Receive(t, done, "reportStderr return while the stderr write end is held")
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Errorf("reportStderr took %v on a %v bound, want it to give up inside the bound", elapsed, bound)
+		}
+	})
 
 	lines := agenttest.RequireWarnLines(t, spy, "abandoned drain")
 	if !slices.Contains(lines, "codex: still writing") {
@@ -485,50 +456,46 @@ func TestReportStderr_AbandonsADrainThatCannotFinish(t *testing.T) {
 // write end here is what the escaped descendant does in production.
 func TestStopSession_JoinsADrainThatCannotFinishOnItsOwn(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
+	const diagnostic = "codex: written before the stop"
 
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = writer.Close()
-		_ = reader.Close()
+	synctest.Test(t, func(t *testing.T) {
+		reader, writer := io.Pipe()
+		t.Cleanup(func() {
+			_ = writer.Close()
+			_ = reader.Close()
+		})
+
+		state := &sessionState{drainGrace: 100 * time.Millisecond}
+		state.stderrCollector = procutil.NewStderrCollector(reader, slog.Default())
+		if _, err := io.WriteString(writer, diagnostic+"\n"); err != nil {
+			t.Fatalf("writing to the stderr pipe: %v", err)
+		}
+		if state.stderrCollector.WaitDone(0) {
+			t.Fatal("the drain ended before the stop, so this test would pass without the stop ending it")
+		}
+
+		adapter := &CodexAdapter{}
+		start := time.Now()
+		if stopErr := adapter.StopSession(context.Background(), domain.Session{Internal: state}); stopErr != nil {
+			t.Errorf("StopSession() error = %v, want nil", stopErr)
+		}
+		elapsed := time.Since(start)
+
+		// A drain blocked in a read cannot be joined, only released by the
+		// bound, so the guarantee is that the stop does not return while the
+		// drain is still unresolved. Paying the bound is what proves it
+		// waited; a stop that skipped the wait returns at once.
+		if elapsed < state.drainGrace {
+			t.Errorf("StopSession() returned after %v, want it to have waited out the %v bound the unfinished drain needs", elapsed, state.drainGrace)
+		}
+		resolved := make(chan struct{})
+		go func() {
+			_ = state.stderrCollector.Lines()
+			close(resolved)
+		}()
+		waittest.Receive(t, resolved, "standard-error drain resolution after StopSession returned")
 	})
 
-	const diagnostic = "codex: written before the stop"
-	state := &sessionState{drainGrace: 100 * time.Millisecond}
-	state.stderrCollector = procutil.NewStderrCollector(reader, slog.Default())
-	if _, err := io.WriteString(writer, diagnostic+"\n"); err != nil {
-		t.Fatalf("writing to the stderr pipe: %v", err)
-	}
-	if state.stderrCollector.WaitDone(0) {
-		t.Fatal("the drain ended before the stop, so this test would pass without the stop ending it")
-	}
-
-	adapter := &CodexAdapter{}
-	start := time.Now()
-	if stopErr := adapter.StopSession(context.Background(), domain.Session{Internal: state}); stopErr != nil {
-		t.Errorf("StopSession() error = %v, want nil", stopErr)
-	}
-	elapsed := time.Since(start)
-
-	// A drain blocked in a read cannot be joined, only released by the
-	// bound, so the guarantee is that the stop does not return while the
-	// drain is still unresolved. Paying the bound is what proves it
-	// waited; a stop that skipped the wait returns at once.
-	if elapsed < state.drainGrace {
-		t.Errorf("StopSession() returned after %v, want it to have waited out the %v bound the unfinished drain needs", elapsed, state.drainGrace)
-	}
-	resolved := make(chan struct{})
-	go func() {
-		_ = state.stderrCollector.Lines()
-		close(resolved)
-	}()
-	select {
-	case <-resolved:
-	case <-time.After(2 * time.Second):
-		t.Error("the standard-error drain was still unresolved after StopSession returned, want the stop to have finished or abandoned it")
-	}
 	for _, line := range spy.WarnLines() {
 		if strings.Contains(line, diagnostic) {
 			t.Errorf("the stop emitted the runtime's standard error %q, want it joined without reporting", line)
@@ -576,11 +543,7 @@ func TestReportStderr_StopInsideTheWaitSuppressesTheWarning(t *testing.T) {
 		t.Errorf("StopSession() error = %v, want nil", stopErr)
 	}
 
-	select {
-	case <-reported:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reportStderr never returned")
-	}
+	waittest.Receive(t, reported, "reportStderr return")
 
 	for _, line := range spy.WarnLines() {
 		if strings.Contains(line, diagnostic) {
@@ -641,11 +604,7 @@ func TestReaderEnded_SeesTheConnectionBeforeTheWatcher(t *testing.T) {
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("closing the write end: %v", closeErr)
 	}
-	select {
-	case <-state.conn.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the connection's reader did not exit after the stream ended")
-	}
+	waittest.Receive(t, state.conn.Done(), "connection reader exit after the stream ended")
 
 	select {
 	case <-state.readerDone:

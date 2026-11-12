@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // The marker exists because a fixed sleep cannot prove the trap is installed:
@@ -43,7 +45,7 @@ func TestForkPerTurnSession_GracefulSignal(t *testing.T) {
 			sess.RunTurn(context.Background(), "p", emit) //nolint:errcheck // testing Stop's timing, not RunTurn's outcome
 		}()
 
-		waitForTrap(t, ready)
+		waittest.File(t, ready)
 
 		start := time.Now()
 		if err := sess.Stop(context.Background()); err != nil {
@@ -51,15 +53,11 @@ func TestForkPerTurnSession_GracefulSignal(t *testing.T) {
 		}
 		elapsed := time.Since(start)
 
-		if elapsed > 2*time.Second {
-			t.Errorf("Stop() force-terminated after %v, want well under the built-in 5s default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed)
+		if elapsed > procutil.DefaultStopGrace {
+			t.Errorf("Stop() force-terminated after %v, want under the built-in %v default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed, procutil.DefaultStopGrace)
 		}
 
-		select {
-		case <-done:
-		case <-time.After(6 * time.Second):
-			t.Fatal("RunTurn did not return within 6s after Stop")
-		}
+		waittest.Receive(t, done, "RunTurn return after Stop")
 	})
 
 	t.Run("RunTurn_CancelledTurnEscalatesOnConfiguredGrace", func(t *testing.T) {
@@ -81,136 +79,98 @@ func TestForkPerTurnSession_GracefulSignal(t *testing.T) {
 			done <- err
 		}()
 
-		waitForTrap(t, ready)
+		waittest.File(t, ready)
 		start := time.Now()
 		cancel()
 
-		var err error
-		select {
-		case err = <-done:
-		case <-time.After(6 * time.Second):
-			t.Fatal("RunTurn did not return within 6s of cancellation")
-		}
+		err := waittest.Receive(t, done, "RunTurn return after cancellation")
 		elapsed := time.Since(start)
 
 		requireAgentError(t, err, domain.ErrTurnCancelled)
-		if elapsed > 2*time.Second {
-			t.Errorf("RunTurn's cancelled-turn escalation took %v, want well under the built-in 5s default (proves the configured 200ms grace bounded cmd.WaitDelay, not DefaultStopGrace)", elapsed)
+		if elapsed > procutil.DefaultStopGrace {
+			t.Errorf("RunTurn's cancelled-turn escalation took %v, want under the built-in %v default (proves the configured 200ms grace bounded cmd.WaitDelay, not DefaultStopGrace)", elapsed, procutil.DefaultStopGrace)
 		}
 	})
 
 	t.Run("Stop_EscalationLogging", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("exit_inside_grace_emits_debug_and_no_warn", func(t *testing.T) {
-			t.Parallel()
-			tmpDir := t.TempDir()
-			script, ready := buildTrapAgent(t, tmpDir, true)
-			target := newTestTarget(tmpDir, script)
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			// The grace is far longer than this exit needs. The subtest proves
-			// which record the clean-exit path emits, not that the grace bounds
-			// anything, and a tight bound races the runner's scheduler instead
-			// of testing the code.
-			sess := NewForkPerTurnSession(target, noopHooks(), logger, 30000)
+		for _, tc := range []struct {
+			name         string
+			exitOnSignal bool
+			graceMS      int
+			stopTimeout  time.Duration
+			wantStopErr  error
+			wantLogged   []string
+			wantNoWarn   bool
+		}{
+			{
+				name:         "exit_inside_grace_emits_debug_and_no_warn",
+				exitOnSignal: true,
+				// The grace is far longer than this exit needs. The case proves
+				// which record the clean-exit path emits, not that the grace
+				// bounds anything, and a tight bound races the runner's
+				// scheduler instead of testing the code.
+				graceMS:    30000,
+				wantLogged: []string{"agent exited during the graceful phase", "outcome=exited"},
+				wantNoWarn: true,
+			},
+			{
+				name:    "grace_elapsed_emits_warn_with_outcome_and_grace",
+				graceMS: 150,
+				wantLogged: []string{
+					"agent did not exit inside the graceful period and was force-terminated",
+					`outcome="grace elapsed"`,
+					"grace=",
+					"elapsed=",
+				},
+			},
+			{
+				name:        "caller_deadline_emits_warn_with_that_outcome",
+				graceMS:     5000,
+				stopTimeout: 150 * time.Millisecond,
+				wantStopErr: context.DeadlineExceeded,
+				wantLogged:  []string{`outcome="caller deadline"`},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				tmpDir := t.TempDir()
+				script, ready := buildTrapAgent(t, tmpDir, tc.exitOnSignal)
+				target := newTestTarget(tmpDir, script)
+				var buf bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+				sess := NewForkPerTurnSession(target, noopHooks(), logger, tc.graceMS)
 
-			emit, _ := sinkEvents()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				sess.RunTurn(context.Background(), "p", emit) //nolint:errcheck // testing log output, not the outcome
-			}()
-			waitForTrap(t, ready)
+				emit, _ := sinkEvents()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					sess.RunTurn(context.Background(), "p", emit) //nolint:errcheck // testing log output, not the outcome
+				}()
+				waittest.File(t, ready)
 
-			if err := sess.Stop(context.Background()); err != nil {
-				t.Errorf("Stop() = %v, want nil", err)
-			}
-			<-done
+				stopCtx := context.Background()
+				if tc.stopTimeout > 0 {
+					var cancel context.CancelFunc
+					stopCtx, cancel = context.WithTimeout(stopCtx, tc.stopTimeout)
+					defer cancel()
+				}
+				if err := sess.Stop(stopCtx); !errors.Is(err, tc.wantStopErr) {
+					t.Errorf("Stop() error = %v, want %v", err, tc.wantStopErr)
+				}
+				waittest.Receive(t, done, "RunTurn return after Stop")
 
-			output := buf.String()
-			if !strings.Contains(output, "agent exited during the graceful phase") {
-				t.Errorf("Stop() did not log the exited-inside-grace Debug record: %s", output)
-			}
-			if !strings.Contains(output, `outcome=exited`) {
-				t.Errorf("Stop()'s Debug record missing outcome=exited: %s", output)
-			}
-			if strings.Contains(output, "level=WARN") {
-				t.Errorf("Stop() logged a Warn record for a clean exit, want none: %s", output)
-			}
-		})
-
-		t.Run("grace_elapsed_emits_warn_with_outcome_and_grace", func(t *testing.T) {
-			t.Parallel()
-			tmpDir := t.TempDir()
-			script, ready := buildTrapAgent(t, tmpDir, false)
-			target := newTestTarget(tmpDir, script)
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			sess := NewForkPerTurnSession(target, noopHooks(), logger, 150)
-
-			emit, _ := sinkEvents()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				sess.RunTurn(context.Background(), "p", emit) //nolint:errcheck // testing log output, not the outcome
-			}()
-			waitForTrap(t, ready)
-
-			if err := sess.Stop(context.Background()); err != nil {
-				t.Errorf("Stop() = %v, want nil", err)
-			}
-			<-done
-
-			output := buf.String()
-			if !strings.Contains(output, "agent did not exit inside the graceful period and was force-terminated") {
-				t.Errorf("Stop() did not log the grace-elapsed Warn record: %s", output)
-			}
-			if !strings.Contains(output, `outcome="grace elapsed"`) {
-				t.Errorf(`Stop()'s Warn record missing outcome="grace elapsed": %s`, output)
-			}
-			if !strings.Contains(output, "grace=") {
-				t.Errorf("Stop()'s Warn record missing the configured grace ceiling: %s", output)
-			}
-			if !strings.Contains(output, "elapsed=") {
-				t.Errorf("Stop()'s Warn record missing the elapsed wait: %s", output)
-			}
-		})
-
-		t.Run("caller_deadline_emits_warn_with_that_outcome", func(t *testing.T) {
-			t.Parallel()
-			tmpDir := t.TempDir()
-			script, ready := buildTrapAgent(t, tmpDir, false)
-			target := newTestTarget(tmpDir, script)
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			sess := NewForkPerTurnSession(target, noopHooks(), logger, 5000)
-
-			emit, _ := sinkEvents()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				sess.RunTurn(context.Background(), "p", emit) //nolint:errcheck // testing log output, not the outcome
-			}()
-			waitForTrap(t, ready)
-
-			stopCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-			defer cancel()
-			err := sess.Stop(stopCtx)
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Errorf("Stop() error = %v, want %v", err, context.DeadlineExceeded)
-			}
-
-			select {
-			case <-done:
-			case <-time.After(6 * time.Second):
-				t.Fatal("RunTurn did not return within 6s")
-			}
-
-			output := buf.String()
-			if !strings.Contains(output, `outcome="caller deadline"`) {
-				t.Errorf(`Stop()'s Warn record missing outcome="caller deadline": %s`, output)
-			}
-		})
+				output := buf.String()
+				for _, want := range tc.wantLogged {
+					if !strings.Contains(output, want) {
+						t.Errorf("Stop() log missing %s: %s", want, output)
+					}
+				}
+				if tc.wantNoWarn && strings.Contains(output, "level=WARN") {
+					t.Errorf("Stop() logged a Warn record for a clean exit, want none: %s", output)
+				}
+			})
+		}
 	})
 }

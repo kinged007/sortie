@@ -9,75 +9,96 @@
 package copilot
 
 import (
-	"bytes"
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"log/slog"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
-	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
-// sessionIDPattern matches the safe path-segment character set a
-// copilot session id must satisfy before it is joined into a
-// session-state path.
-var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+const derivedConfigName = "copilot-mcp.json"
+
+// writeDerivedConfig returns the path a local launch hands to
+// --additional-mcp-config.
+func writeDerivedConfig(workspacePath string, tools *agentcore.ToolSession) (string, error) {
+	doc := tools.Delivery(sshutil.ForwardOutcome{}).Document
+	if err := workspacekit.WriteSortieFile(workspacePath, derivedConfigName, doc); err != nil {
+		return "", err
+	}
+	return filepath.Join(workspacePath, workspacekit.SortieDir, derivedConfigName), nil
+}
+
+// placeMCPConfig passes the delivery inline: a host path names nothing on the
+// remote host.
+func placeMCPConfig(d mcpconfig.Delivery) sshutil.LatePreamble {
+	if len(d.Document) == 0 {
+		return sshutil.LatePreamble{}
+	}
+	return sshutil.LatePreamble{Args: []string{"--additional-mcp-config", string(d.Document)}}
+}
 
 // copilotToolDeniedCode is the tool.execution_complete error code the CLI
 // reports when its own non-interactive permission policy refuses a tool
 // call and the session continues.
 const copilotToolDeniedCode = "denied"
 
-// defaultCommand is what a session launches when it is given no command.
 const defaultCommand = "copilot"
+
+// usageSources: the usage checkpoint on the event stream is the running total
+// per served model, the journal's per-request lines settle a turn the
+// checkpoints left unsettled. Premium requests and AI credits ride on both,
+// each in its own unit and never converted.
+var usageSources = usage.Sources{
+	Live: usage.Source{
+		Category: usage.SourceOutput,
+		Strategy: usage.StrategyLive,
+		Spend: usage.SpendDeclaration{
+			Shape:             usage.SpendSessionCumulative,
+			CacheInInput:      true,
+			ReasoningInOutput: true,
+			ServedModel:       true,
+			Amounts: []usage.AmountDeclaration{
+				{Unit: usagesource.CopilotUnitPremiumRequests, Shape: usage.AmountSessionCumulative},
+				{Unit: usagesource.CopilotUnitAICredits, Shape: usage.AmountSessionCumulative},
+			},
+		},
+	},
+	Records: usagesource.CopilotRecords,
+}
 
 func init() {
 	registry.Agents.RegisterWithMeta("copilot-cli", NewCopilotAdapter, registry.AgentMeta{
-		RequiresCommand:     true,
-		DefaultCommand:      defaultCommand,
-		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionSupported,
-		UsageArrival:        registry.UsageArrivalTurnEnd,
-		UsageAttribution:    registry.UsageAttributionPerModel,
-		CredentialEnv:       registry.DeclareCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
-		EffortForwarding:    registry.EffortForwarded,
-		UsageSessionRules: []registry.UsageSessionRule{
-			{
-				// Mirrors sessionState.recoverUsage's own remote
-				// condition: over SSH, the post-exit journal read is
-				// skipped entirely, so nothing ever arrives.
-				When:        func(passthrough map[string]any, remote bool) bool { return remote },
-				Arrival:     registry.UsageArrivalNone,
-				Attribution: registry.UsageAttributionNone,
-			},
-		},
+		RequiresCommand:       true,
+		DefaultCommand:        defaultCommand,
+		ValidateAgentConfig:   validateConfig,
+		MCPDialect:            registry.MCPDialectMCPServersJSON,
+		UsageSources:          usageSources,
+		CredentialEnv:         registry.DeclareCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+		Deprecation:           &registry.AgentDeprecation{Replacement: "agent-client-protocol"},
+		VerificationContext:   registry.DeclareVerificationContext(registry.VerificationKeepsSomeTools, registry.VerificationKeepsSystemPrompt),
+		EffortForwarding:      registry.EffortForwarded,
+		UsageLimitRecognition: registry.UsageLimitRecognized,
 	})
 }
 
-// Compile-time interface satisfaction check.
 var _ domain.AgentAdapter = (*CopilotAdapter)(nil)
 
-// CopilotAdapter satisfies [domain.AgentAdapter] by managing Copilot
-// CLI subprocesses. One adapter instance serves all concurrent
-// sessions; per-session state is held in [sessionState] via the
-// [domain.Session] Internal field.
+// CopilotAdapter satisfies [domain.AgentAdapter] for the Copilot CLI. One
+// instance serves all concurrent sessions.
 type CopilotAdapter struct{}
 
-// sessionState is adapter-internal state stored in [domain.Session]
-// Internal. It tracks the Copilot CLI session ID and per-turn scan
-// state across turns.
 type sessionState struct {
 	target           agentcore.LaunchTarget
 	copilotSessionID string
@@ -85,58 +106,59 @@ type sessionState struct {
 	agentConfig      domain.AgentConfig
 	baseLogger       *slog.Logger
 
-	// mcpConfigPath is the worker-generated MCP config file path.
+	// mcpConfigPath is empty on a remote launch, where the declaration travels
+	// inline.
 	mcpConfigPath string
 
 	isContinuation bool
 
 	credentialVerification bool
 
-	// forkSession owns the subprocess lifecycle for this session.
+	reducedVerificationContext bool
+
 	forkSession *agentcore.ForkPerTurnSession
 
-	// usage holds the session's usage report. Constructed once in
-	// StartSession and never reset between turns.
+	// usage is built once in StartSession and never reset between turns.
 	usage *agentcore.TurnEndUsage
 
-	// resume separates this run's spend from the usage the session held
-	// when the run started. Never reset between turns.
-	resume agentcore.ResumeBaseline
+	// ledger converts the checkpoints' session totals into the run's spend and
+	// decides when it is complete. Never reset between turns.
+	ledger *usage.Ledger
 
-	// sessionIDRejectionLogged suppresses repeating the invalid-session-id
-	// Warn on every turn of a run whose session id never becomes valid.
-	sessionIDRejectionLogged bool
-
-	// Per-turn scan state owned by the ParseLine and OnFinalize hook
-	// closures. Reset at the top of each RunTurn call before delegating
-	// to forkSession.
+	// Per-turn scan state, owned by the ParseLine and OnFinalize hooks and
+	// cleared by resetTurn.
 	inFlight *agentcore.ToolTracker
 	work     *agentcore.WorkObserver
 
-	// turnCompletionSeen is true once a session.task_complete event has
-	// arrived this turn.
 	turnCompletionSeen bool
 
-	// turnCompletionSuccess is false only when a session.task_complete
-	// payload parsed this turn and its success field was explicitly
-	// false.
+	// turnCompletionSuccess is false only when a session.task_complete payload
+	// carried an explicit false success field.
 	turnCompletionSuccess bool
 
-	// turnCompletionSummary is the session.task_complete report's
-	// summary, empty when the report never arrived or its payload was
-	// unreadable.
 	turnCompletionSummary string
 
-	// turnErrorMessage is the trimmed message of the turn's last
-	// session.error event, empty when none arrived or its payload was
-	// unreadable. It is the failure reason when the result event reports a
-	// failed exit.
 	turnErrorMessage string
 
-	// turnContinuations counts the user.message events this turn whose
-	// payload marked them as autopilot continuations. Diagnostic only;
-	// never consulted by the turn disposition.
+	// turnRefusal is the first session error of the turn that is a usage-limit
+	// refusal; nil when the turn saw none.
+	turnRefusal *usagesource.CopilotRefusal
+
+	// turnContinuations is diagnostic only; the turn disposition never reads
+	// it.
 	turnContinuations int
+
+	turnResultSeen bool
+
+	// turnReading is the turn's last usage checkpoint; nil when it saw none.
+	turnReading *usage.SpendReading
+
+	turnReplied bool
+
+	// turnAborted is true when the runtime reported the turn aborted. The
+	// final checkpoint and result that follow an abort omit the request in
+	// flight, so they never settle the turn complete.
+	turnAborted bool
 }
 
 func (s *sessionState) logger() *slog.Logger {
@@ -144,113 +166,6 @@ func (s *sessionState) logger() *slog.Logger {
 		return s.baseLogger
 	}
 	return logging.WithSession(s.baseLogger, s.copilotSessionID)
-}
-
-func (s *sessionState) refreshForkLogger() {
-	if s.forkSession != nil {
-		s.forkSession.SetLogger(s.logger())
-	}
-}
-
-// recoverUsage reads the runtime's session-state journal after the
-// subprocess has exited and returns this run's usage with the model the
-// journal's newest record names, whether that figure is an estimate, and the
-// session's own usage for hand-over to a later run.
-//
-// A skipped or failed read returns no figure, false, and no hand-over
-// figure. A journal without a record, or one whose newest record equals the
-// last reading, means the turn wrote none: no figure, and the session's
-// usage is unchanged. A reading the baseline cannot place exactly returns no
-// figure and true.
-func (s *sessionState) recoverUsage(logger *slog.Logger) (recovered *agentcore.RecoveredUsage, estimated bool, resume *domain.TokenUsage, resumeByModel map[string]domain.TokenUsage) {
-	remote := s.target.RemoteCommand != ""
-	sessionID := s.copilotSessionID
-	validID := sessionID != "" && sessionIDPattern.MatchString(sessionID)
-
-	if remote || !validID {
-		if sessionID != "" && !validID && !s.sessionIDRejectionLogged {
-			logger.Warn("copilot session id rejected for session-state read",
-				slog.String("reason", "invalid_session_id"))
-			s.sessionIDRejectionLogged = true
-		}
-		return nil, false, nil, nil
-	}
-
-	root, err := sessionStateRoot(os.Getenv, os.UserHomeDir)
-	if err != nil {
-		logger.Debug("copilot session-state root resolution failed",
-			slog.String("session_id", sessionID), slog.String("reason", "root_unresolved"))
-		return nil, false, nil, nil
-	}
-	eventsPath := filepath.Join(root, sessionID, "events.jsonl")
-
-	current, currentByModel, model, found, err := readSessionUsage(eventsPath)
-	if err != nil {
-		if errors.Is(err, errSessionStateCapExceeded) {
-			logger.Warn("copilot session-state read abandoned",
-				slog.String("session_id", sessionID), slog.String("reason", "cap_exceeded"))
-		} else {
-			logger.Debug("copilot session-state read failed",
-				slog.String("session_id", sessionID), slog.String("reason", "unreadable"))
-		}
-		return nil, false, nil, nil
-	}
-
-	if !found {
-		logger.Debug("copilot session-state has no session.shutdown record yet",
-			slog.String("session_id", sessionID), slog.String("reason", "no_record"))
-		last, lastByModel := s.resume.Resume()
-		return nil, false, last, lastByModel
-	}
-
-	if last, lastByModel := s.resume.Resume(); last != nil && *last == current {
-		return nil, false, last, lastByModel
-	}
-
-	run, runByModel, estimated := s.resume.Observe(current, currentByModel, nil)
-	latest, latestByModel := s.resume.Resume()
-	if estimated {
-		return nil, true, latest, latestByModel
-	}
-	return &agentcore.RecoveredUsage{Run: run, Model: model, ByModel: runByModel}, false, latest, latestByModel
-}
-
-// seedResumeBaseline returns the baseline a session starts from: zero for a
-// session the run creates, the figure handed over for a resumed one, and
-// otherwise the newest record of the resumed session's local journal. A
-// remote launch, an invalid session id, or an unreadable journal leaves the
-// baseline unknown; none fails the session start.
-func seedResumeBaseline(params domain.StartSessionParams, target agentcore.LaunchTarget, sessionID string, logger *slog.Logger) agentcore.ResumeBaseline {
-	switch {
-	case params.ResumeSessionID == "":
-		return *agentcore.NewResumeBaseline(&domain.TokenUsage{}, nil)
-	case params.ResumeUsage != nil:
-		return *agentcore.NewResumeBaseline(params.ResumeUsage, params.ResumeUsageByModel)
-	case target.RemoteCommand != "" || !sessionIDPattern.MatchString(sessionID):
-		return agentcore.ResumeBaseline{}
-	}
-	return *agentcore.NewResumeBaseline(journalResumeUsage(sessionID, logger))
-}
-
-// journalResumeUsage returns the totals of the newest session.shutdown record
-// in the session's journal with its per-model split, zero and nil when the
-// journal is missing or holds no record, and nil and nil when unreadable.
-func journalResumeUsage(sessionID string, logger *slog.Logger) (*domain.TokenUsage, map[string]domain.TokenUsage) {
-	root, err := sessionStateRoot(os.Getenv, os.UserHomeDir)
-	if err != nil {
-		logger.Debug("copilot session-state root resolution failed", slog.String("reason", "root_unresolved"))
-		return nil, nil
-	}
-
-	current, currentByModel, _, found, err := readSessionUsage(filepath.Join(root, sessionID, "events.jsonl"))
-	if errors.Is(err, fs.ErrNotExist) || (err == nil && !found) {
-		return &domain.TokenUsage{}, nil
-	}
-	if err != nil {
-		logger.Debug("copilot session-state baseline read failed", slog.String("reason", "unreadable"))
-		return nil, nil
-	}
-	return &current, currentByModel
 }
 
 // NewCopilotAdapter creates a [CopilotAdapter]. Settings and command
@@ -273,46 +188,53 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 		return domain.Session{}, agentErr
 	}
 
-	// The canary check is local-mode only.
 	if target.RemoteCommand == "" {
-		stopGrace := procutil.StopGrace(params.AgentConfig.StopGraceMS)
-
-		canaryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(canaryCtx, target.Command, "--version") //nolint:gosec // target.Command from LookPath
-		var combined bytes.Buffer
-		result, startErr := procutil.RunCapture(canaryCtx, cmd, stopGrace, procutil.CaptureParams{Stdout: &combined, Stderr: &combined})
-		if startErr != nil || result.WaitErr != nil {
-			if cancelled := agentcore.SessionStartCancelledError(ctx, startErr); cancelled != nil {
-				return domain.Session{}, cancelled
+		if _, canaryErr := agentcore.QueryRuntimeVersion(ctx, target, params.AgentConfig, nil, nil); canaryErr != nil {
+			if canaryErr.Kind == domain.ErrPortExit {
+				canaryErr.Message = "copilot binary found but not functional; ensure Node.js 22+ is available: " + canaryErr.Message
 			}
-			canaryErr := startErr
-			if canaryErr == nil {
-				canaryErr = result.WaitErr
-			}
-			return domain.Session{}, &domain.AgentError{
-				Kind:    domain.ErrAgentNotFound,
-				Message: "copilot binary found but not functional; ensure Node.js 22+ is available",
-				Err:     canaryErr,
-			}
+			return domain.Session{}, canaryErr
 		}
-		slog.Debug("copilot version check passed", slog.String("version", strings.TrimSpace(combined.String())))
-	}
-
-	copilotSessionID := params.ResumeSessionID
-	if copilotSessionID == "" {
-		uuid, uuidErr := agentcore.NewUUIDv4()
-		if uuidErr != nil {
-			return domain.Session{}, &domain.AgentError{
-				Kind:    domain.ErrAgentNotFound,
-				Message: "could not generate a session id",
-				Err:     uuidErr,
-			}
-		}
-		copilotSessionID = uuid
 	}
 
 	baseLogger := slog.Default().With(slog.String("component", "copilot-adapter"))
+
+	probe := agentcore.RuntimeFileProbe(target, agentcore.ReadTimeout(params.AgentConfig), usagesource.CopilotJournalPath)
+	start, startErr := agentcore.ResolveSessionStart(ctx, params.ResumeSessionID, probe, baseLogger)
+	if startErr != nil {
+		return domain.Session{}, startErr
+	}
+	copilotSessionID, idErr := start.AssignedID()
+	if idErr != nil {
+		return domain.Session{}, idErr
+	}
+
+	ledger, err := usage.NewLedger(usageSources.Live, usageSources.Records)
+	if err != nil {
+		return domain.Session{}, &domain.AgentError{
+			Kind:    domain.ErrResponseError,
+			Message: "usage ledger refused the kind's sources",
+			Err:     err,
+		}
+	}
+
+	tools, toolsErr := agentcore.ResolveToolDelivery(ctx, params, target, registry.MCPDialectMCPServersJSON, baseLogger)
+	if toolsErr != nil {
+		return domain.Session{}, toolsErr
+	}
+
+	mcpConfigPath := ""
+	if target.RemoteCommand == "" && tools.Configured() && !params.CredentialVerification {
+		mcpConfigPath, err = writeDerivedConfig(target.WorkspacePath, tools)
+		if err != nil {
+			_ = tools.Close()
+			return domain.Session{}, &domain.AgentError{
+				Kind:    domain.ErrResponseError,
+				Message: fmt.Sprintf("prepare MCP config: %v", err),
+				Err:     err,
+			}
+		}
+	}
 
 	state := &sessionState{
 		target:                 target,
@@ -320,14 +242,24 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 		passthrough:            pt,
 		agentConfig:            params.AgentConfig,
 		baseLogger:             baseLogger,
-		mcpConfigPath:          params.MCPConfigPath,
-		isContinuation:         params.ResumeSessionID != "",
+		mcpConfigPath:          mcpConfigPath,
+		isContinuation:         start.CarriedHistory(),
 		credentialVerification: params.CredentialVerification,
 		usage:                  agentcore.NewTurnEndUsage(),
-		resume:                 seedResumeBaseline(params, target, copilotSessionID, logging.WithSession(baseLogger, copilotSessionID)),
+		ledger:                 ledger,
+
+		reducedVerificationContext: params.ReducedVerificationContext(),
 	}
 
+	ledger.BeginSession(start.CarriedHistory(), func() usage.RecordsRead {
+		readCtx, cancel := context.WithTimeout(ctx, agentcore.ReadTimeout(params.AgentConfig))
+		defer cancel()
+		return state.readJournal(readCtx)
+	})
+
 	hooks := agentcore.ForkPerTurnHooks{
+		Tools:         tools,
+		ToolPlacement: placeMCPConfig,
 		BuildArgs: func(turn int, prompt string) []string {
 			return buildArgs(state, turn, prompt, state.passthrough)
 		},
@@ -345,7 +277,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				// The event type itself names an assistant message, so it
 				// is a work signal even though its payload is unparsed.
 				state.work.ObserveAssistantOutput()
-				// Stall timer reset; ephemeral streaming content.
+				// Empty notification: resets the stall timer only.
 				agentcore.EmitNotification(emit, "")
 
 			case "assistant.message":
@@ -378,7 +310,7 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 					toolData, dataErr := parseToolExecutionData(event.Data)
 					if dataErr == nil {
 						state.work.ObserveToolActivity()
-						state.inFlight.Begin(toolData.ToolCallID, toolData.ToolName)
+						state.inFlight.Begin(toolData.ToolCallID, toolData.toolCall())
 						agentcore.EmitNotification(emit, "")
 					}
 				}
@@ -388,23 +320,20 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 					toolData, dataErr := parseToolExecutionData(event.Data)
 					if dataErr == nil {
 						state.work.ObserveToolActivity()
-						toolName, durationMS, ok := state.inFlight.End(toolData.ToolCallID)
-						if !ok {
-							toolName = toolData.ToolName
-						}
+						call, durationMS, _ := state.inFlight.End(toolData.ToolCallID)
 						emit(domain.AgentEvent{
 							Type:           domain.EventToolResult,
 							Timestamp:      now,
-							ToolName:       toolName,
+							ToolName:       call.Name,
+							ToolKind:       call.Kind,
+							ToolArgument:   call.Argument,
 							ToolDurationMS: durationMS,
 							ToolError:      !toolData.Success,
 						})
 
-						// The CLI's own non-interactive permission policy
-						// denied this tool call and the session continues;
-						// --no-ask-user closes the human-question path, so
-						// every recognized request here is a permission
-						// request with no reply channel.
+						// --no-ask-user closes the human-question path, so a
+						// denied call here is always a permission request
+						// with no reply channel.
 						if !toolData.Success && toolData.Error != nil && toolData.Error.Code == copilotToolDeniedCode {
 							posture := agentcore.DecideHumanRequest(agentcore.ClassPermission, false, agentcore.AnswerRuntimeRefused)
 							agentcore.EmitNotification(emit, posture.Notice)
@@ -453,11 +382,14 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				"session.tools_updated":
 				state.logger().Debug("copilot event logged only", slog.String("event_type", event.Type))
 
-			case "session.error":
+			case usagesource.CopilotSessionErrorEvent:
 				if len(event.Data) > 0 {
-					errData, dataErr := parseSessionErrorData(event.Data)
+					sessionErr, dataErr := usagesource.CopilotParseSessionError(event.Data)
 					if dataErr == nil {
-						state.turnErrorMessage = strings.TrimSpace(errData.Message)
+						state.turnErrorMessage = sessionErr.Message
+						if refusal, ok := usagesource.CopilotRefusalOf(sessionErr); ok && state.turnRefusal == nil {
+							state.turnRefusal = &refusal
+						}
 					}
 				}
 				agentcore.EmitNotification(emit, "")
@@ -471,7 +403,20 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 				}
 				state.logger().Debug("copilot event logged only", slog.String("event_type", event.Type))
 
+			case "session.usage_checkpoint":
+				if reading, ok := usagesource.CopilotUsageCheckpoint(line); ok {
+					state.turnReading = &reading
+				}
+
+			case "abort":
+				state.turnAborted = true
+
 			case "result":
+				if event.SessionID != "" {
+					state.copilotSessionID = event.SessionID
+				}
+				state.turnResultSeen = true
+				state.turnReplied = event.ExitCode != nil && *event.ExitCode == 0
 				return new(event), nil
 
 			default:
@@ -485,23 +430,14 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 			return state.usage.Snapshot(), state.usage.ByModel(), state.usage.Measured()
 		},
 		GetSessionID: func() string { return state.copilotSessionID },
+		SettleUsage: func(ctx context.Context, emit func(domain.AgentEvent), spend *agentcore.TurnSpend, _ bool) {
+			end := usage.TurnEnd{Replied: state.turnReplied, Cancelled: state.turnAborted, ModelReached: spend.ModelReached()}
+			recovered := agentcore.SettleSpend(ctx, state.ledger, end, state.turnReading,
+				state.readJournal, agentcore.ReadTimeout(state.agentConfig), spend)
+			state.usage.Settle(emit, recovered)
+		},
 		OnFinalize: func(emit func(domain.AgentEvent), lastParsed any, exitCode int, waitErr error, stderrLines []string, earlyExit *domain.AgentError, spend *agentcore.TurnSpend) (domain.TurnResult, *domain.AgentError) {
 			lastResult, _ := lastParsed.(*rawEvent)
-
-			// Capture session ID from result event for subsequent turns.
-			if lastResult != nil && lastResult.SessionID != "" {
-				state.copilotSessionID = lastResult.SessionID
-				state.refreshForkLogger()
-			}
-
-			recovered, estimated, resume, resumeByModel := state.recoverUsage(state.logger())
-			if lastResult != nil && recovered != nil {
-				spend.MarkSettled()
-				spend.MarkSessionTotal()
-			}
-			if estimated {
-				spend.MarkEstimated()
-			}
 
 			ev := agentcore.TurnEvidence{
 				ExitObserved: true,
@@ -512,56 +448,58 @@ func (a *CopilotAdapter) StartSession(ctx context.Context, params domain.StartSe
 			ev.Work, ev.WorkDetail = state.work.Report()
 
 			var apiDurationMS int64
-			if lastResult != nil {
-				if lastResult.Usage != nil {
-					apiDurationMS = lastResult.Usage.TotalAPIDurMS
-					state.logger().Info("copilot turn completed",
-						slog.Int64("premium_requests", lastResult.Usage.PremiumRequests))
-				}
-
-				switch {
-				case lastResult.ExitCode == nil || *lastResult.ExitCode != 0:
-					ev.Terminal = agentcore.TerminalFailure
-					ev.TerminalMessage = "non-zero exit in result event"
-					if state.turnErrorMessage != "" {
-						ev.TerminalMessage = state.turnErrorMessage
-					}
-				case !state.turnCompletionSeen:
-					ev.Terminal = agentcore.TerminalIncomplete
-					ev.TerminalMessage = "raise copilot-cli.max_autopilot_continues if the turn needs more steps"
-					state.logger().Warn("copilot turn ended without a task-completion report",
-						slog.Int("autopilot_continuations_observed", state.turnContinuations),
-						slog.Int("max_autopilot_continues", effectiveMaxAutopilotContinues(state.passthrough)))
-				case !state.turnCompletionSuccess:
-					ev.Terminal = agentcore.TerminalFailure
-					ev.TerminalErrorKind = domain.ErrTurnFailed
-					ev.TerminalMessage = completionFailureMessage(state.turnCompletionSummary)
-				default:
-					ev.Terminal = agentcore.TerminalSuccess
-				}
+			if lastResult != nil && lastResult.Usage != nil {
+				apiDurationMS = lastResult.Usage.TotalAPIDurMS
 			}
 
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.copilotSessionID, apiDurationMS, recovered, *spend)
-			result.ResumeUsage = resume
-			result.ResumeUsageByModel = resumeByModel
-			return result, agentErr
+			switch {
+			case state.turnRefusal != nil:
+				limit := state.turnRefusal.Limit
+				ev.Terminal = agentcore.TerminalFailure
+				ev.TerminalErrorKind = domain.ErrUsageLimit
+				ev.UsageLimit = &limit
+				ev.TerminalMessage = state.turnErrorMessage
+			case lastResult == nil:
+			case lastResult.ExitCode == nil || *lastResult.ExitCode != 0:
+				ev.Terminal = agentcore.TerminalFailure
+				ev.TerminalMessage = "non-zero exit in result event"
+				if state.turnErrorMessage != "" {
+					ev.TerminalMessage = state.turnErrorMessage
+				}
+			case !state.turnCompletionSeen:
+				ev.Terminal = agentcore.TerminalIncomplete
+				ev.TerminalMessage = "raise copilot-cli.max_autopilot_continues if the turn needs more steps"
+				state.logger().Warn("copilot turn ended without a task-completion report",
+					slog.Int("autopilot_continuations_observed", state.turnContinuations),
+					slog.Int("max_autopilot_continues", effectiveMaxAutopilotContinues(state.passthrough)))
+			case !state.turnCompletionSuccess:
+				ev.Terminal = agentcore.TerminalFailure
+				ev.TerminalErrorKind = domain.ErrTurnFailed
+				ev.TerminalMessage = completionFailureMessage(state.turnCompletionSummary)
+			default:
+				ev.Terminal = agentcore.TerminalSuccess
+			}
+
+			return state.usage.Finalize(emit, state.logger(), ev, state.copilotSessionID, apiDurationMS, nil, *spend)
 		},
-		// Copilot emits EventSessionStarted before the scan loop using the
-		// session's own ID, assigned in StartSession.
 		EmitSessionStartID: func() string { return state.copilotSessionID },
 	}
 
-	state.forkSession = agentcore.NewForkPerTurnSession(&state.target, hooks, state.logger(), state.agentConfig.StopGraceMS)
+	hooks.PullWindows = usage.NewPuller(usagesource.CopilotSource, agentcore.AuxiliaryTimeout(params.AgentConfig), params.CredentialVerification, copilotPull(target)).Pull
+	hooks.RefusalWindowReset = func() bool { return state.turnRefusal != nil && state.turnRefusal.QuotaWindow }
+
+	state.forkSession = agentcore.NewForkPerTurnSession(&state.target, hooks, state.baseLogger, state.agentConfig.StopGraceMS)
 
 	return domain.Session{
-		ID:       copilotSessionID,
-		Internal: state,
+		ID:             copilotSessionID,
+		Internal:       state,
+		NoToolChannel:  tools.NoToolChannel(),
+		CarriedHistory: start.CarriedHistory(),
 	}, nil
 }
 
-// RunTurn executes one agent turn by delegating to the session's
-// [agentcore.ForkPerTurnSession]. Per-turn scan state is reset before
-// delegation so each turn starts with a fresh accumulator and clean state.
+// RunTurn executes one agent turn on the session's
+// [agentcore.ForkPerTurnSession], with per-turn scan state reset first.
 func (a *CopilotAdapter) RunTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 	if params.OnEvent == nil {
 		panic("copilot: OnEvent must be non-nil")
@@ -572,24 +510,28 @@ func (a *CopilotAdapter) RunTurn(ctx context.Context, session domain.Session, pa
 		return domain.TurnResult{}, fmt.Errorf("unexpected session internal type %T", session.Internal)
 	}
 
-	state.refreshForkLogger()
-
-	// Reset per-turn scan state before delegation. state.usage is
-	// constructed once in StartSession and carries the run-cumulative
-	// snapshot across turns, so it is not reset here.
-	state.inFlight = agentcore.NewToolTracker()
-	state.work = agentcore.NewWorkObserver(agentcore.WorkSignals{AssistantOutput: true, ToolActivity: true})
-	state.turnCompletionSeen = false
-	state.turnCompletionSuccess = false
-	state.turnCompletionSummary = ""
-	state.turnErrorMessage = ""
-	state.turnContinuations = 0
-
+	state.resetTurn()
 	return state.forkSession.RunTurn(ctx, params.Prompt, params.OnEvent)
 }
 
-// StopSession terminates a running Copilot CLI subprocess gracefully by
-// delegating to the session's [agentcore.ForkPerTurnSession].
+func (s *sessionState) resetTurn() {
+	s.inFlight = agentcore.NewToolTracker()
+	s.work = agentcore.NewWorkObserver(agentcore.WorkSignals{AssistantOutput: true, ToolActivity: true})
+	s.turnCompletionSeen = false
+	s.turnCompletionSuccess = false
+	s.turnCompletionSummary = ""
+	s.turnErrorMessage = ""
+	s.turnRefusal = nil
+	s.turnContinuations = 0
+	s.turnResultSeen = false
+	s.turnReading = nil
+	s.turnReplied = false
+	s.turnAborted = false
+}
+
+// StopSession terminates the session's running Copilot CLI subprocess and,
+// for a credential verification session, deletes the session the run
+// created.
 func (a *CopilotAdapter) StopSession(ctx context.Context, session domain.Session) error {
 	state, ok := session.Internal.(*sessionState)
 	if !ok {
@@ -603,4 +545,32 @@ func (a *CopilotAdapter) StopSession(ctx context.Context, session domain.Session
 		deleteVerificationSession(ctx, state.target, state.copilotSessionID, agentcore.AuxiliaryTimeout(state.agentConfig), state.agentConfig.StopGraceMS, state.logger())
 	}
 	return stopErr
+}
+
+// hostQuotaRuntime reaches the Copilot runtime through the session's launch
+// target.
+type hostQuotaRuntime struct {
+	target agentcore.LaunchTarget
+}
+
+func (r hostQuotaRuntime) Env(name string) (string, bool) {
+	return r.target.RuntimeEnv(nil, name)
+}
+
+func (r hostQuotaRuntime) Exchange(ctx context.Context, args []string, limit int64, exchange func(stdin io.Writer, stdout io.Reader) error) error {
+	return r.target.RunHostExchange(ctx, nil, agentcore.HostCommand{
+		LaunchWords: len(r.target.CommandWords()),
+		Args:        args,
+		InSession:   true,
+		Limit:       limit,
+	}, exchange)
+}
+
+// copilotPull returns the quota pull for one session. A turn runs with the
+// host environment and the adapter sets no TurnEnv hook, so a nil env reads
+// exactly that.
+func copilotPull(target agentcore.LaunchTarget) func(context.Context) ([]usage.WindowReading, error) {
+	return func(ctx context.Context) ([]usage.WindowReading, error) {
+		return usagesource.CopilotPull(ctx, hostQuotaRuntime{target: target})
+	}
 }

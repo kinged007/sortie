@@ -22,8 +22,9 @@ const CredentialExchangeBound = 60 * time.Second
 // CredentialVerification carries the inputs of [VerifyCredential].
 type CredentialVerification struct {
 	// Session is the working session's parameters; VerifyCredential
-	// overrides CredentialVerification, ResumeSessionID, ResumeUsage,
-	// ResumeUsageByModel and MCPConfigPath.
+	// overrides CredentialVerification, ResumeSessionID and MCPConfigPath.
+	// Its VerificationFullContext is set only by the retry inside
+	// VerifyCredential.
 	Session domain.StartSessionParams
 
 	Issue domain.Issue
@@ -34,7 +35,7 @@ type CredentialVerification struct {
 	// StopBound bounds StopSession, which outlives ctx's cancellation.
 	StopBound time.Duration
 
-	// OnRequest runs once before RunTurn, never after a failed StartSession.
+	// OnRequest runs before each RunTurn, never after a failed StartSession.
 	OnRequest func()
 
 	OnEvent func(domain.AgentEvent)
@@ -42,16 +43,55 @@ type CredentialVerification struct {
 	Logger *slog.Logger
 }
 
+// VerificationSystemPrompt replaces a runtime's built-in system prompt
+// in a verification session. It is the text the measured Claude Code
+// and Codex runs used.
+const VerificationSystemPrompt = "You are a helpful assistant."
+
 // VerifyCredential sends [CredentialVerificationPrompt] through a fresh
 // session on adapter and returns the turn's result with a nil error
 // when the runtime answered. A started session is always stopped, even
 // when RunTurn panics; a stop failure is only logged.
+//
+// A session that never reached the model, because the runtime rejected
+// a switch that drops agent context, is repeated once with the full
+// context under a fresh TurnBound; that session's outcome is returned.
+//
+// A turn the provider refused for a usage limit returns its
+// [domain.ErrUsageLimit] error unchanged, so the caller's reset wait applies.
 func VerifyCredential(ctx context.Context, adapter domain.AgentAdapter, v CredentialVerification) (domain.TurnResult, error) {
 	logger := v.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	result, startFailed, err := verifyOnce(ctx, adapter, v, logger)
+	if !retriesWithFullContext(ctx, v.Session, startFailed, err) {
+		return result, err
+	}
+
+	logger.Warn("credential verification did not reach the model, retrying with the full agent context", slog.Any("error", err))
+	v.Session.VerificationFullContext = true
+	result, _, err = verifyOnce(ctx, adapter, v, logger)
+	return result, err
+}
+
+func retriesWithFullContext(ctx context.Context, session domain.StartSessionParams, startFailed bool, err error) bool {
+	if err == nil || session.VerificationFullContext || ctx.Err() != nil || errors.Is(err, sshutil.ErrConnectionFailed) {
+		return false
+	}
+	if _, isEarlyExit := errors.AsType[*EarlyExitError](err); isEarlyExit {
+		return true
+	}
+	if !startFailed {
+		return false
+	}
+	agentErr, isAgentErr := errors.AsType[*domain.AgentError](err)
+	return isAgentErr && (agentErr.Kind == domain.ErrPortExit || agentErr.Kind == domain.ErrResponseError)
+}
+
+// verifyOnce reports startFailed when StartSession itself returned the error.
+func verifyOnce(ctx context.Context, adapter domain.AgentAdapter, v CredentialVerification, logger *slog.Logger) (result domain.TurnResult, startFailed bool, err error) {
 	turnCtx := ctx
 	if v.TurnBound > 0 {
 		var cancel context.CancelFunc
@@ -62,13 +102,11 @@ func VerifyCredential(ctx context.Context, adapter domain.AgentAdapter, v Creden
 	sessionParams := v.Session
 	sessionParams.CredentialVerification = true
 	sessionParams.ResumeSessionID = ""
-	sessionParams.ResumeUsage = nil
-	sessionParams.ResumeUsageByModel = nil
 	sessionParams.MCPConfigPath = ""
 
 	session, startErr := adapter.StartSession(turnCtx, sessionParams)
 	if startErr != nil {
-		return domain.TurnResult{}, classifyVerificationStartError(ctx, turnCtx, v.TurnBound, startErr)
+		return domain.TurnResult{}, true, classifyVerificationStartError(ctx, turnCtx, v.TurnBound, startErr)
 	}
 
 	defer func() {
@@ -95,12 +133,12 @@ func VerifyCredential(ctx context.Context, adapter domain.AgentAdapter, v Creden
 		onEvent = v.OnEvent
 	}
 
-	result, runErr := adapter.RunTurn(turnCtx, session, domain.RunTurnParams{
+	turnResult, runErr := adapter.RunTurn(turnCtx, session, domain.RunTurnParams{
 		Prompt:  CredentialVerificationPrompt,
 		Issue:   v.Issue,
 		OnEvent: onEvent,
 	})
-	return result, classifyVerificationRunTurnOutcome(ctx, turnCtx, v.TurnBound, result, runErr)
+	return turnResult, false, classifyVerificationRunTurnOutcome(ctx, turnCtx, v.TurnBound, turnResult, runErr)
 }
 
 func verificationTurnBoundElapsed(ctx, turnCtx context.Context) bool {
@@ -119,7 +157,7 @@ func isTerminalVerificationError(err error) bool {
 	if !errors.As(err, &agentErr) {
 		return false
 	}
-	if agentErr.Kind == domain.ErrCredentialUnverified {
+	if agentErr.Kind == domain.ErrCredentialUnverified || agentErr.Kind == domain.ErrUsageLimit {
 		return true
 	}
 	return !agentErr.Kind.RetryClassification().Retryable
@@ -193,7 +231,14 @@ func CredentialUnverifiedError(reason string, cause error) *domain.AgentError {
 func CredentialRefusedError(runtimeText string, cause error) *domain.AgentError {
 	return &domain.AgentError{
 		Kind:    domain.ErrCredentialUnverified,
-		Message: fmt.Sprintf("the agent runtime refused its credential: %s", runtimeText),
+		Message: CredentialRefusedMessage(runtimeText),
 		Err:     cause,
 	}
+}
+
+// CredentialRefusedMessage builds the message of a credential refusal
+// from the runtime's own text, for a turn that reports through
+// [TurnEvidence].
+func CredentialRefusedMessage(runtimeText string) string {
+	return fmt.Sprintf("the agent runtime refused its credential: %s", runtimeText)
 }

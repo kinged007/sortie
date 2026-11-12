@@ -1,3 +1,4 @@
+import { MONO } from "@/components/ui/mono";
 import {
   Table,
   TableBody,
@@ -7,20 +8,18 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { fmtCount, fmtDuration } from "@/lib/format";
+import { Panel } from "@/components/Panel";
 
-import { COLUMN_WIDTH, CountBar } from "./GroupTable";
+import { COLUMN_WIDTH } from "./GroupTable";
 
 import type { ConfigResponse, Funnel, FunnelStage } from "@/api/types.gen";
 import type { ReactNode } from "react";
-
-const MONO = "font-mono text-body-sm";
-const ENTRY_TAG =
-  "inline-block border border-line-medium rounded px-xxs text-label-caps font-medium uppercase text-ink-muted";
 
 const REASON_WORDS: Record<string, string> = {
   run_failed: "failed run",
   needs_person: "needs a person",
   budget_held: "budget held",
+  usage_limited: "usage limit",
   operator_stopped: "stopped by an operator",
   verdict_withheld: "verdict withheld",
 };
@@ -49,11 +48,10 @@ function CountCell({ value }: CountCellProps) {
 interface StageRowProps {
   stage: FunnelStage;
   index: number;
-  widest: number;
   targets: string | undefined;
 }
 
-function StageRow({ stage, index, widest, targets }: StageRowProps) {
+function StageRow({ stage, index, targets }: StageRowProps) {
   const { arrivals, outcomes } = stage;
   const reasons = stage.no_hop_reasons ?? [];
   const reasonsTitle =
@@ -65,23 +63,14 @@ function StageRow({ stage, index, widest, targets }: StageRowProps) {
     <TableRow>
       <TableCell look="number-muted">{index + 1}</TableCell>
       <TableCell>
-        <span
-          title={stage.rule}
-          className={`inline-block truncate align-bottom ${MONO} ${stage.entry ? COLUMN_WIDTH.entryStageText : COLUMN_WIDTH.stageText}`}
-        >
+        <span title={stage.rule} className={`block truncate ${MONO} ${COLUMN_WIDTH.stageText}`}>
           {stage.rule}
         </span>
-        {stage.entry ? (
-          <>
-            {" "}
-            <span className={ENTRY_TAG}>entry</span>
-          </>
-        ) : undefined}
       </TableCell>
-      <TableCell look={stage.runs === 0 ? "muted" : "text"}>{fmtCount(stage.runs)}</TableCell>
-      <TableCell>
-        <CountBar value={stage.entered} max={widest} />
+      <TableCell look={stage.runs === 0 ? "number-muted" : "number"}>
+        {fmtCount(stage.runs)}
       </TableCell>
+      <TableCell look="number">{fmtCount(stage.entered)}</TableCell>
       <TableCell look="number">
         {arrivals.label === 0 ? undefined : fmtCount(arrivals.label)}
       </TableCell>
@@ -120,70 +109,66 @@ function headingOf(stages: readonly FunnelStage[]): ReactNode {
   );
 }
 
-/** Props of {@link ChainFunnel}. */
 export interface ChainFunnelProps {
   funnel: Funnel;
   config: ConfigResponse | undefined;
 }
 
-/** Renders one chain definition of the report: a row per stage with the passes that reached it and how each one left it. */
 export function ChainFunnel({ funnel, config }: ChainFunnelProps) {
   const stages = funnel.stages ?? [];
-  const widest = Math.max(1, ...stages.map((stage) => stage.entered));
   const targets = handoffTargets(config);
 
   return (
-    <Table title={headingOf(stages)} className="table-fixed min-w-287">
-      <TableHeader>
-        <TableHead align="right" className={COLUMN_WIDTH.stageNumber}>
-          #
-        </TableHead>
-        <TableHead className={COLUMN_WIDTH.stage}>Stage</TableHead>
-        <TableHead
-          className={COLUMN_WIDTH.runs}
-          title="Finished runs of the rule, retries and pull request fixes included"
-        >
-          Runs
-        </TableHead>
-        <TableHead title="Passes through the stage, each counted once">Entered</TableHead>
-        <TableHead
-          align="right"
-          title="Passes that arrived by a stage label a person put on the issue"
-        >
-          By label
-        </TableHead>
-        <TableHead
-          align="right"
-          title={`Passes that hopped to the next stage; on the last stage, ${targets === undefined ? "handed off" : `moved to ${targets}`}`}
-        >
-          Advanced
-        </TableHead>
-        <TableHead align="right" title="Hops refused by dispatch.max_consecutive_hops">
-          Ceiling
-        </TableHead>
-        <TableHead align="right">Hop failed</TableHead>
-        <TableHead
-          align="right"
-          title="The run failed, stopped for a person or at a budget, was stopped by an operator, or had its handoff withheld, so no hop was due"
-        >
-          No hop
-        </TableHead>
-        <TableHead align="right" title="Passes whose run is going or retrying now">
-          In stage
-        </TableHead>
-        <TableHead align="right">Median</TableHead>
-      </TableHeader>
-      <TableBody>
-        {stages.map((stage, index) => (
-          <StageRow
-            key={stage.rule}
-            stage={stage}
-            index={index}
-            widest={widest}
-            targets={targets}
-          />
-        ))}
-      </TableBody>
-    </Table>
+    <Panel title={headingOf(stages)}>
+      <Table className="table-fixed min-w-287" frozenColumns={2}>
+        <TableHeader>
+          <TableHead align="right" className={COLUMN_WIDTH.stageNumber}>
+            #
+          </TableHead>
+          <TableHead className={COLUMN_WIDTH.stage}>Stage</TableHead>
+          <TableHead
+            align="right"
+            className={COLUMN_WIDTH.runs}
+            title="Finished runs of the rule, retries and pull request fixes included"
+          >
+            Runs
+          </TableHead>
+          <TableHead align="right" title="Passes through the stage, each counted once">
+            Entered
+          </TableHead>
+          <TableHead
+            align="right"
+            title="Passes that arrived by a stage label a person put on the issue"
+          >
+            By label
+          </TableHead>
+          <TableHead
+            align="right"
+            title={`Passes that hopped to the next stage; on the last stage, ${targets === undefined ? "handed off" : `moved to ${targets}`}`}
+          >
+            Advanced
+          </TableHead>
+          <TableHead align="right" title="Hops refused by dispatch.max_consecutive_hops">
+            Ceiling
+          </TableHead>
+          <TableHead align="right">Hop failed</TableHead>
+          <TableHead
+            align="right"
+            title="The run failed, needed a person, stopped at a budget or at a usage limit, was stopped by an operator, or had its handoff withheld, so no hop was due"
+          >
+            No hop
+          </TableHead>
+          <TableHead align="right" title="Passes whose run is going or retrying now">
+            In stage
+          </TableHead>
+          <TableHead align="right">Median</TableHead>
+        </TableHeader>
+        <TableBody>
+          {stages.map((stage, index) => (
+            <StageRow key={stage.rule} stage={stage} index={index} targets={targets} />
+          ))}
+        </TableBody>
+      </Table>
+    </Panel>
   );
 }

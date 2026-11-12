@@ -7,11 +7,11 @@
 // Optional environment variables:
 //
 //	SORTIE_COPILOT_COMMAND         override the default "copilot" binary
-//	SORTIE_COPILOT_MODEL           override the default "gpt-5-mini" model
+//	SORTIE_COPILOT_MODEL           override the default "claude-haiku-4.5" model
 //
-// Authentication: the live cases need at least one of COPILOT_GITHUB_TOKEN,
-// GH_TOKEN, or GITHUB_TOKEN, or an authenticated gh CLI. The scripted-model
-// case reads no credential and needs only SORTIE_COPILOT_TEST=1.
+// Authentication: the live cases need one of COPILOT_GITHUB_TOKEN, GH_TOKEN or
+// GITHUB_TOKEN, or an authenticated gh CLI; the scripted-model case needs only
+// the gate.
 //
 // Run:
 //
@@ -22,12 +22,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
+	"github.com/sortie-ai/sortie/internal/agent/clientprotocol/usagesource"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -41,7 +46,7 @@ func skipUnlessCopilotIntegration(t *testing.T) {
 func integrationConfig() map[string]any {
 	model := os.Getenv("SORTIE_COPILOT_MODEL")
 	if model == "" {
-		model = "gpt-5-mini"
+		model = "claude-haiku-4.5"
 	}
 	return map[string]any{
 		"max_autopilot_continues": float64(5),
@@ -134,11 +139,26 @@ func TestIntegration_StartSession_InvalidCommand(t *testing.T) {
 func TestIntegration_ScriptedModel(t *testing.T) {
 	skipUnlessCopilotIntegration(t)
 
-	fakemodel.AssertConformance(t, fakemodel.Binding{
-		Kind:          "copilot-cli",
-		Passthrough:   map[string]any{"model": "scripted-model", "max_autopilot_continues": float64(5)},
-		CredentialEnv: []string{"COPILOT_PROVIDER_API_KEY"},
-		Read:          fakemodel.ReadFile,
+	t.Setenv("COPILOT_GITHUB_TOKEN", "unused-token-for-quota-endpoint")
+
+	binding := fakemodel.Binding{
+		Kind:             "copilot-cli",
+		Passthrough:      map[string]any{"model": "scripted-model", "max_autopilot_continues": float64(5)},
+		CredentialEnv:    []string{"COPILOT_PROVIDER_API_KEY"},
+		UserInstructions: filepath.Join(".copilot", "copilot-instructions.md"),
+		Read:             fakemodel.ReadFile,
+		Spend: &fakemodel.SpendSources{
+			// A custom provider gets no usage checkpoint, so the journal settles each turn.
+			Live:              domain.UsageProvenance{Source: usage.SourceJournal, Strategy: usage.StrategyRecords},
+			Records:           domain.UsageProvenance{Source: usage.SourceJournal, Strategy: usage.StrategyRecords},
+			RecordsAtTurnEnd:  usagesource.CopilotRecords.WrittenAtTurnEnd,
+			CancelEndsProcess: true,
+		},
+		SSH: &fakemodel.SSHVariant{
+			Package:       "@github/copilot",
+			HostCommand:   integrationCommand(),
+			RemoteCommand: func(fakemodel.Environment) string { return "copilot" },
+		},
 		Finish: func(text string) fakemodel.ToolChoice {
 			summary, _ := json.Marshal(map[string]string{"summary": text})
 			return fakemodel.Named("task_complete", summary)
@@ -159,6 +179,11 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 			}
 		},
 		Inspect: func(t *testing.T, run fakemodel.Run) {
+			for _, ev := range run.Events {
+				if len(ev.UsageWindows) != 0 {
+					t.Errorf("event %q reports %d usage windows on a custom provider, want none", ev.Type, len(ev.UsageWindows))
+				}
+			}
 			if run.Environment.Scenario != fakemodel.ScenarioTurn {
 				return
 			}
@@ -166,14 +191,28 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 			if !ok {
 				t.Fatalf("session.Internal type = %T, want *sessionState", run.Session.Internal)
 			}
-			// A normal turn decides at the terminal-success row and never
-			// consults Work, so the disposition alone does not show the
-			// observer fired against the installed runtime.
+			// The disposition never consults Work on a normal turn, so only
+			// the observer shows it fired.
 			if !state.work.Observed() {
 				t.Error("state.work.Observed() = false after a scripted turn, want true")
 			}
 		},
-	})
+	}
+	fakemodel.AssertConformance(t, binding)
+
+	// The runtime retries a 429 that names no Retry-After six times before it
+	// refuses.
+	refusal := slices.Repeat([]fakemodel.Response{{Status: http.StatusTooManyRequests, Text: "Rate limit exceeded."}}, 6)
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("usage limit refusal remote=%v", remote), func(t *testing.T) {
+			run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{Script: refusal, Prompt: "Reply with the word ok.", Remote: remote})
+
+			var agentErr *domain.AgentError
+			if !errors.As(run.Err, &agentErr) || agentErr.Kind != domain.ErrUsageLimit || agentErr.UsageLimit == nil || !agentErr.UsageLimit.ModelOnly {
+				t.Fatalf("RunTurn error = %v, want a model-only usage_limit error", run.Err)
+			}
+		})
+	}
 }
 
 func TestIntegration_CredentialVerification(t *testing.T) {
@@ -193,17 +232,14 @@ func TestIntegration_CredentialVerification(t *testing.T) {
 	}
 
 	t.Run("working credential verifies and leaves no session state", func(t *testing.T) {
-		t.Setenv("COPILOT_HOME", t.TempDir())
+		home := t.TempDir()
+		t.Setenv("COPILOT_HOME", home)
 
 		result := credentialtest.VerifyLiveUsage(t, "copilot-cli", adapter, params(t), passthrough)
 		if result.SessionID == "" {
 			t.Fatal("VerifyCredential() TurnResult.SessionID is empty, want the minted verification session id")
 		}
-		root, rootErr := sessionStateRoot(os.Getenv, os.UserHomeDir)
-		if rootErr != nil {
-			t.Fatalf("sessionStateRoot: %v", rootErr)
-		}
-		if _, statErr := os.Stat(filepath.Join(root, result.SessionID)); !os.IsNotExist(statErr) {
+		if _, statErr := os.Stat(filepath.Join(home, "session-state", result.SessionID)); !os.IsNotExist(statErr) {
 			t.Errorf("session-state directory for verification session %q still present after the step, want deleted (stat error = %v)", result.SessionID, statErr)
 		}
 	})

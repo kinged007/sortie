@@ -3,16 +3,19 @@ package clientprotocol
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 type teardownOrderRecorder struct {
@@ -65,83 +68,81 @@ func (o *orderedStdinWriter) Close() error {
 func TestTeardown_AnswerOpenWrittenBeforeCloseSessionAndStdinClose(t *testing.T) {
 	t.Parallel()
 
-	outPr, outPw := io.Pipe()
-	inPr, inPw := io.Pipe()
-	go func() { _, _ = io.Copy(io.Discard, outPr) }()
+	synctest.Test(t, func(t *testing.T) {
+		outPr, outPw := io.Pipe()
+		inPr, inPw := io.Pipe()
+		go func() { _, _ = io.Copy(io.Discard, outPr) }()
 
-	rec := &teardownOrderRecorder{}
-	writer := &orderedStdinWriter{w: outPw, rec: rec, replyWriteStarted: make(chan struct{})}
+		rec := &teardownOrderRecorder{}
+		writer := &orderedStdinWriter{w: outPw, rec: rec, replyWriteStarted: make(chan struct{})}
 
-	state := &sessionState{
-		caps:           newCapabilityRecord(false, false),
-		usage:          agentcore.NewTurnEndUsage(),
-		stopCh:         make(chan struct{}),
-		pumpDone:       make(chan struct{}),
-		logger:         discardLogger(),
-		origins:        &sessionOrigins{},
-		stdinCloser:    writer,
-		closeSessionID: "sess-order",
-		agentConfig:    domain.AgentConfig{ReadTimeoutMS: 60000},
-	}
-	state.inbox = jsonrpc.NewInbox[pumpItem]()
-	state.conn = jsonrpc.NewConn(writer, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
-		jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
-
-	go runPump(state)
-	markSessionKnown(state)
-	// Closing inPw first ends the connection's reader (conn.Done()), which is
-	// the only thing that lets runPump's select start observing state.stopCh;
-	// stopping the pump before that would deadlock waiting on pumpDone.
-	t.Cleanup(func() {
-		_ = inPw.Close()
-		state.stopOnce.Do(func() { close(state.stopCh) })
-		<-state.pumpDone
-		_ = outPr.Close()
-		_ = outPw.Close()
-		_ = inPr.Close()
-	})
-
-	sendLine(t, inPw, `{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"sess-test","options":[{"kind":"reject_once","name":"reject","optionId":"reject-id"}],"toolCall":{"toolCallId":"tc-1","title":"do a thing"}}}`)
-
-	select {
-	case <-writer.replyWriteStarted:
-	case <-time.After(awaitTimeout):
-		t.Fatal("timed out waiting for the pump to begin writing the permission reply")
-	}
-
-	const grace = 1 * time.Second
-	graceCtx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
-
-	awaitAnswerOpen(graceCtx, grace)(state)
-
-	if got := rec.snapshot(); len(got) != 1 || got[0] != "permission_reply" {
-		t.Fatalf("recorded events right after answer_open returned = %v, want exactly [permission_reply] (answer_open must wait for the in-flight write, not just enqueue the request to answer it)", got)
-	}
-
-	runTeardown(state, []teardownStep{
-		{name: "close_session", run: closeSession(context.Background(), graceCtx, grace)},
-		{name: "close_stdin", run: closeStdin},
-	})
-
-	deadline := time.Now().Add(awaitTimeout)
-	for len(rec.snapshot()) < 3 {
-		if time.Now().After(deadline) {
-			break
+		state := &sessionState{
+			caps:           newCapabilityRecord(),
+			usage:          agentcore.NewTurnEndUsage(),
+			stopCh:         make(chan struct{}),
+			pumpDone:       make(chan struct{}),
+			logger:         discardLogger(),
+			origins:        &sessionOrigins{},
+			stdinCloser:    writer,
+			closeSessionID: "sess-order",
+			agentConfig:    domain.AgentConfig{ReadTimeoutMS: 60000},
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		state.inbox = jsonrpc.NewInbox[pumpItem]()
+		state.conn = jsonrpc.NewConn(writer, inPr, jsonrpc.Deliver(state.inbox, wrapPumpMessage),
+			jsonrpc.WithVersionMember(), jsonrpc.WithMaxLineBytes(8<<20))
 
-	got := rec.snapshot()
-	want := []string{"permission_reply", "session_close_request", "stdin_closed"}
-	if len(got) != len(want) {
-		t.Fatalf("recorded events = %v, want %v", got, want)
-	}
-	for i, ev := range want {
-		if got[i] != ev {
-			t.Errorf("event %d = %q, want %q (full order: %v)", i, got[i], ev, got)
+		go runPump(state)
+		markSessionKnown(state)
+		// Closing inPw first ends the connection's reader (conn.Done()), which is
+		// the only thing that lets runPump's select start observing state.stopCh;
+		// stopping the pump before that would deadlock waiting on pumpDone.
+		t.Cleanup(func() {
+			_ = inPw.Close()
+			state.stopOnce.Do(func() { close(state.stopCh) })
+			<-state.pumpDone
+			state.conn.Close()
+			_ = outPr.Close()
+			_ = outPw.Close()
+			_ = inPr.Close()
+		})
+
+		sendLine(t, inPw, `{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"sess-test","options":[{"kind":"reject_once","name":"reject","optionId":"reject-id"}],"toolCall":{"toolCallId":"tc-1","title":"do a thing"}}}`)
+
+		waittest.Receive(t, writer.replyWriteStarted, "the pump to begin writing the permission reply")
+
+		const grace = 1 * time.Second
+		graceCtx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+
+		awaitAnswerOpen(graceCtx, grace)(state)
+
+		if got := rec.snapshot(); len(got) != 1 || got[0] != "permission_reply" {
+			t.Fatalf("recorded events right after answer_open returned = %v, want exactly [permission_reply] (answer_open must wait for the in-flight write, not just enqueue the request to answer it)", got)
 		}
-	}
+
+		runTeardown(state, []teardownStep{
+			{name: "close_session", run: closeSession(context.Background(), graceCtx, grace)},
+			{name: "close_stdin", run: closeStdin},
+		})
+
+		waittest.Until(t, func() error {
+			if got := rec.snapshot(); len(got) < 3 {
+				return fmt.Errorf("recorded events = %v, want 3", got)
+			}
+			return nil
+		})
+
+		got := rec.snapshot()
+		want := []string{"permission_reply", "session_close_request", "stdin_closed"}
+		if len(got) != len(want) {
+			t.Fatalf("recorded events = %v, want %v", got, want)
+		}
+		for i, ev := range want {
+			if got[i] != ev {
+				t.Errorf("event %d = %q, want %q (full order: %v)", i, got[i], ev, got)
+			}
+		}
+	})
 }
 
 func TestLogCloseSessionOutcome(t *testing.T) {
@@ -211,35 +212,33 @@ func TestLogCloseSessionOutcome(t *testing.T) {
 func TestAwaitAnswerOpen_PumpNeverAnswersReturnsWithinBound(t *testing.T) {
 	t.Parallel()
 
-	state := &sessionState{inbox: jsonrpc.NewInbox[pumpItem]()}
+	synctest.Test(t, func(t *testing.T) {
+		state := &sessionState{inbox: jsonrpc.NewInbox[pumpItem]()}
 
-	const grace = 400 * time.Millisecond
-	graceCtx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
+		const grace = 400 * time.Millisecond
+		graceCtx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
 
-	start := time.Now()
-	done := make(chan struct{})
-	go func() {
-		awaitAnswerOpen(graceCtx, grace)(state)
-		close(done)
-	}()
+		start := time.Now()
+		done := make(chan struct{})
+		go func() {
+			awaitAnswerOpen(graceCtx, grace)(state)
+			close(done)
+		}()
 
-	select {
-	case <-done:
-	case <-time.After(awaitTimeout):
-		t.Fatal("awaitAnswerOpen() did not return within the bound against a pump that never answers")
-	}
-	if elapsed := time.Since(start); elapsed >= closeCallBound(grace)+1*time.Second {
-		t.Errorf("awaitAnswerOpen() took %v, want close to its own %v bound", elapsed, closeCallBound(grace))
-	}
+		waittest.Receive(t, done, "awaitAnswerOpen() to return against a pump that never answers")
+		if elapsed := time.Since(start); elapsed > closeCallBound(grace) {
+			t.Errorf("awaitAnswerOpen() took %v, want at most its own %v bound", elapsed, closeCallBound(grace))
+		}
 
-	var ranNextStep bool
-	runTeardown(state, []teardownStep{
-		{name: "next", run: func(*sessionState) { ranNextStep = true }},
+		var ranNextStep bool
+		runTeardown(state, []teardownStep{
+			{name: "next", run: func(*sessionState) { ranNextStep = true }},
+		})
+		if !ranNextStep {
+			t.Error("a later teardown step did not run after awaitAnswerOpen returned, want teardown to continue")
+		}
 	})
-	if !ranNextStep {
-		t.Error("a later teardown step did not run after awaitAnswerOpen returned, want teardown to continue")
-	}
 }
 
 // The pipes StartOutputRelease closes on give-up are never wired to this
@@ -254,11 +253,7 @@ func TestStopSessionReturnsBoundedWithReaderGenuinelyParked(t *testing.T) {
 	state, _, _ := newTestSessionWithRelease(t, grace, reaped)
 
 	close(reaped)
-	select {
-	case <-state.release.Abandoned():
-	case <-time.After(awaitTimeout):
-		t.Fatal("the release never abandoned within the test's wait bound")
-	}
+	waittest.Receive(t, state.release.Abandoned(), "the release to abandon")
 
 	select {
 	case <-state.conn.Done():
@@ -271,12 +266,8 @@ func TestStopSessionReturnsBoundedWithReaderGenuinelyParked(t *testing.T) {
 		done <- stopSession(context.Background(), fakeSession(state))
 	}()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("stopSession() error = %v, want nil", err)
-		}
-	case <-time.After(awaitTimeout):
-		t.Fatal("stopSession() did not return within the bound though the release had already abandoned, want the abandonment-armed stop arm to end the pump")
+	err := waittest.Receive(t, done, "stopSession() to return after the release had abandoned, through the abandonment-armed stop arm")
+	if err != nil {
+		t.Errorf("stopSession() error = %v, want nil", err)
 	}
 }

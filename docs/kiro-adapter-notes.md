@@ -16,11 +16,11 @@ Read the flags off `kiro-cli chat --help` and `kiro-cli acp --help`. Read the ac
 
 This CLI is a distribution of Amazon Q Developer CLI, so `aws/amazon-q-developer-cli` is the source of record for CLI behavior. The public Kiro tracker is for product feature requests. Search upstream for a CLI bug, not the IDE tracker.
 
-The runtime keeps its own log at `kiro-log/kiro-chat.log` under its runtime directory. Some failures below are explained only there.
+The runtime keeps its own log at `kiro-log/kiro-chat.log` under its runtime directory. Some failures below are explained only there. At its debug log level the runtime writes the `Authorization` value of an HTTP tool server to that log, which is the per-session bearer of Sortie's tool server; the bearer is useless once its session ends.
 
 ## Entry points
 
-The generic `agent-client-protocol` kind drives `kiro-cli acp`. It delivers session continuation and, on a local launch and subject to the credential constraint below, Sortie's own tool servers.
+The generic `agent-client-protocol` kind drives `kiro-cli acp`. It delivers session continuation and, on every launch over HTTP and subject to the credential constraint below, Sortie's own tool servers.
 
 The `acp` subcommand is missing from `kiro-cli --help` and listed only under `--help-all`.
 
@@ -44,7 +44,9 @@ No flag turns the profile check off. Whether it fails for every API key or only 
 
 Every grade on this page was measured under a stored device login, the credential the measurement assumes. Nothing was measured under an API key.
 
-Token accounting has no source on either surface. The runtime reports spend as an abstract credits figure and context use as a percentage, never as tokens. So token-based budgets are inert, and only the turn timeout and cancellation bound a turn. The protocol route reports credits per turn in a vendor extension; the native stream has no token field either. Parity holds on this row because the shortfall is shared; conformance fails because the capability works on neither route. A live run with a one-token `agent.max_tokens` ceiling spent tokens, recorded unaccounted spend, and finished without stopping.
+Token accounting has no source on either surface. The runtime reports spend as an abstract credits figure and context use as a percentage, never as tokens. So token-based budgets are inert, and only the turn timeout and cancellation bound a turn. The protocol route reports credits per turn in a vendor extension; the native stream has no token field either. Parity holds on this row because the shortfall is shared; conformance fails because the capability works on neither route. A live run with a one-token `agent.max_tokens` ceiling spent tokens and finished without stopping.
+
+Sortie records the credits each turn reports, per run and in credits, never converted. A Kiro CLI run carries no token or money figure and counts among the unmeasured runs, so `agent.max_tokens` and the cost limits count nothing for it, and the session, turn, time, and absence limits bound it. The prompt result carries no `usage` member, and no source reads the zero token counts of the default engine's session file.
 
 Two cases are declared, not measured, on both surfaces: a turn ending in `runtime_refusal` and a retry classified as `non_retryable_refusal`. This runtime never produces either. A request built to trigger one completes normally, so the case is recorded as `outcome_never_produced`.
 
@@ -69,13 +71,62 @@ Permission handling was measured with the `-a` switch removed. The runtime raise
 
 ## Protocol-specific observations
 
-The handshake advertises `loadSession` true, `mcpCapabilities.http` true with `sse` false, and an empty `sessionCapabilities` object, so Sortie never closes a session here through the protocol. `authMethods` is empty, which proves nothing either way. `agentInfo` carries a name and a version, which the gated suite's identity rule reads.
+The handshake advertises `loadSession` true, `mcpCapabilities.http` true with `sse` false, and an empty `sessionCapabilities` object, so Sortie never closes a session here through the protocol. `authMethods` is empty, which proves nothing either way. On the default engine `agentInfo` carries a name and a version, which the gated suite's identity rule reads; the `--agent-engine v3` engine sends no `agentInfo` at all.
 
 Session continuation restores the session and its memory: the recall turn runs under the seed's own session identifier and returns what the seed asked it to remember. A successful load alone does not prove that; only the recall answer does.
 
-The runtime sends many notifications under its own vendor method prefix. Sortie records them as unrecognized and moves on. Do not add handlers for them to quiet a log; the standard surface already carries everything the adapter reads.
+The runtime sends many notifications under its own vendor method prefix. Sortie reads the credit frame (see "Credits") and the refusal notifications "Usage limits" names, and records the rest as unrecognized. Do not add handlers for the rest to quiet a log.
 
 `limit_reached` was not induced here: the prompt channel cannot carry a request big enough to reach the runtime's limit.
+
+## Credits
+
+The runtime reports each turn's spend in credits and carries no token figure. Sortie records those credits on the run, in credits and never converted. Each engine reports a turn's credits in one frame type:
+
+| Engine | Frame | Entries | Entry read when | Amount member |
+| --- | --- | --- | --- | --- |
+| Default | Notification `_kiro.dev/metadata` | `params.meteringUsage[]` | `unit` is `credit` | `value` |
+| `--agent-engine v3` | `session/update` whose update has `sessionUpdate` `session_info_update` and `_meta.kiro.kind` `turn_completion` | `update._meta.kiro.promptTurnSummaries[]` | `unit` is `credit` | `usage` |
+
+Each entry is one turn's own amount, and the entries of one turn add. An entry of another unit is not read. An amount member that is absent, null, not a JSON number, or negative reads as unknown, never zero, and the credits then count as a lower bound. The other `_kiro.dev/metadata` frames, which carry context use, hold no `meteringUsage` and carry no amount.
+
+In every completed turn captured, on either engine, the credit frame precedes the `session/prompt` result, so the credits settle with their own turn. A cancelled or failed turn reports none: the v3 engine sends an empty `promptTurnSummaries`, and the default engine sends a frame without `meteringUsage`. Such a turn that reached the model marks the credits counted so far as a lower bound.
+
+A session load on the v3 engine replays every earlier `turn_completion`, each marked `_meta.kiro.replay` true, before it answers the load. Sortie reads no frame before that answer, so none of them counts. A credit frame that arrives after the load result and outside a turn counts nothing. The default engine's replay is unobserved: whether it repeats `_kiro.dev/metadata` frames on a load is unknown, and a load adds no credits as long as those frames precede the first prompt.
+
+Credits that Kiro reports outside a prompt turn, such as for a context compaction between turns, count nothing. Whether the runtime reports any is unobserved.
+
+## Usage limits
+
+The runtime answers a credit-usage question on the session's own connection, so Sortie asks it when a turn ends and no credential leaves the runtime. The engines name the method differently, and Sortie tries them in order:
+
+1. `_kiro.dev/commands/execute` with `{"sessionId": "<id>", "command": {"command": "usage", "args": {}}}`. This is the default engine's method, the one the runtime's own terminal client calls for its usage panel.
+2. `_kiro/account/getUsage` with `{}`, when the first answers method not found. The `--agent-engine v3` engine serves this one, and the vendor documents that it drops the first. The v3 engine does not list it under `agentCapabilities._meta.kiro.extensionMethods` although the vendor says it does, so the handshake cannot be used to choose.
+
+Neither request makes the runtime emit agent text. The notifications seen around it are command lists, metadata, and context use, so nothing joins the turn's last agent message. The request costs no credits and, on the session's own connection, no extra session files; a separate probe process leaves a session pair in the runtime's store.
+
+The result is the usage object under `data`, or the result itself when `data` is absent. `success` false is an error. Trimmed:
+
+```json
+{"success": true, "message": "...", "data": {"planName": "<plan>", "billingCycleReset": "<YYYY-MM-DD>", "usageBreakdowns": [{"resourceType": "CREDIT", "displayName": "Credits", "used": 7.05, "limit": 1000.0, "percentage": 0.7, "hasLimit": true}], "bonusCredits": [], "addOnCredits": []}}
+```
+
+Each `usageBreakdowns` entry with `hasLimit` true becomes one window: `resourceType` names it, `displayName` is its scope, and `used` and `limit` are the amount in credits. Sortie computes the share from those two numbers. `percentage` is left unread because it is an integer on some engines and builds and a float on others, and it rounds to 0 below one percent.
+
+`billingCycleReset` is a calendar date with no time or zone. Sortie reads it as 00:00 UTC, so the shown reset can differ from the real instant by hours. The plan name, add-on credits, bonus credits, and overage fields are not read.
+
+The figure trails the spend. A 0.035-credit turn did not move `used` at once or a minute later, and it moved some minutes after. A window pulled when a turn ends therefore shows the usage before that turn and the turns just before it.
+
+The usage declaration is registered once, under `Kiro CLI Agent`, the default engine's `agentInfo.name`. The v3 engine sends no name, so on it the declaration is selected by the launch command naming `kiro-cli`.
+
+The two engines report a refusal differently, and the same declaration reads both. Neither is held on a model, because Kiro's credits and request counts belong to the account.
+
+- The `--agent-engine v3` engine classifies the provider's error into `data.errorType` and its retry class into `data.retryErrorType`, and sends every classified error as `-32000`. An `errorType` of `UsageLimitReachedError` or `OverageLimitReachedError` ends the turn `usage_limit`, whatever the code. A `retryErrorType` of `THROTTLING` (a client, service, or model throttle) ends `response_error`. The declaration's verdict outranks the `-32000` rule, so neither reads as a rejected credential.
+- The default engine sends a `_kiro.dev/error/rate_limit` notification for a usage limit, and also for throttles and capacity shortages, then a `-32603` prompt error whose `data` is a string. It retries a throttled or capacity-short request first and announces each retry with a `retry_warning` update. A notification with no `retry_warning` earlier in the turn is the usage-limit shape, and the turn ends `usage_limit` when the prompt error that follows is not `-32000`. A notification after a `retry_warning` ends `response_error`. Recognition rests on the absence of the retry announcement because no structured member separates the cases.
+
+Some refusals stay `response_error`. A default-engine overage limit arrives as a bare `-32603` with nothing structured. A default-engine monthly limit the service answers at HTTP 429 is retried like a throttle and so reads as one, and sources disagree on which status the service uses. A usage limit that follows a retried throttle in the same turn reads as a throttle too, because the retry announcement holds for the rest of the turn.
+
+The reset comes from the latest reset among the exhausted credit windows of the pull, which reset on the billing-cycle date at 00:00 UTC. A daily or hourly limit on an account with overage enabled is the unobserved case: if the pull reports credits above the limit for such an account, the window reads exhausted and the refusal waits for the billing-cycle reset, which the orchestrator caps. When the pull fails or no window is exhausted, the refusal carries no reset and retries on the exponential backoff.
 
 ## Native headless observations
 
@@ -111,4 +162,8 @@ Windows live qualification is unobserved.
 
 ## Verifying a change
 
-The generic adapter's gated suite covers this route when its command coordinate points at `kiro-cli acp`. The live qualification profile is gated separately and spends real credits.
+The generic adapter's gated suite covers this route when its command coordinate points at `kiro-cli acp`. Its scripted contract (`TestIntegration_ScriptedModel`) runs with the settings of the nightly "Kiro CLI - ACP (scripted)" row: the command, the credential variable, the model document path, and the model document, including the spend declaration `Kiro CLI Agent`. Every scenario expects no token figure and asserts no credits, because the scripted model endpoint emits no metering and the vendor's service computes credits.
+
+The contract's SSH variants add `SORTIE_CLIENTPROTOCOL_SSH_COMMAND`, `SORTIE_CLIENTPROTOCOL_HTTP_TOOLS=1`, and an `SORTIE_CLIENTPROTOCOL_SSH_INSTALL` that puts `kiro-cli` on the lab user's PATH. The nightly row installs the latest stable release (`https://prod.download.cli.kiro.dev/stable/latest/kirocli-x86_64-linux.tar.gz`). A local lab keeps the release it first fetched until its image is removed (`make ssh-lab-clean`).
+
+The live qualification profile is gated separately and spends real credits.

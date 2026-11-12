@@ -5,12 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
 
-// assertHasArgPair fails if flag and value do not appear as consecutive
-// elements in args.
 func assertHasArgPair(t *testing.T, args []string, flag, value string) {
 	t.Helper()
 	for i := 0; i < len(args)-1; i++ {
@@ -21,7 +21,15 @@ func assertHasArgPair(t *testing.T, args []string, flag, value string) {
 	t.Errorf("buildArgs() missing %q %q in [%s]", flag, value, strings.Join(args, " "))
 }
 
-// assertHasFlag fails if flag does not appear anywhere in args.
+func countArg(args []string, arg string) (n int) {
+	for _, a := range args {
+		if a == arg {
+			n++
+		}
+	}
+	return n
+}
+
 func assertHasFlag(t *testing.T, args []string, flag string) {
 	t.Helper()
 	if slices.Contains(args, flag) {
@@ -30,7 +38,6 @@ func assertHasFlag(t *testing.T, args []string, flag string) {
 	t.Errorf("buildArgs() missing flag %q in [%s]", flag, strings.Join(args, " "))
 }
 
-// assertNoFlag fails if flag appears anywhere in args.
 func assertNoFlag(t *testing.T, args []string, flag string) {
 	t.Helper()
 	if slices.Contains(args, flag) {
@@ -156,10 +163,6 @@ func TestParsePassthroughConfig(t *testing.T) {
 	}
 }
 
-// TestMCPInjectionConformance proves copilot-cli's real buildArgs
-// output carries the generated MCP config path, matching its declared
-// disposition. The path is checked by substring containment because
-// buildArgs composes it as "@<path>".
 func TestMCPInjectionConformance(t *testing.T) {
 	t.Parallel()
 
@@ -167,12 +170,43 @@ func TestMCPInjectionConformance(t *testing.T) {
 	if !ok {
 		t.Fatal(`registry.Agents.Meta("copilot-cli") reported not registered`)
 	}
+	workspace := t.TempDir()
+	params := domain.StartSessionParams{
+		WorkspacePath: workspace,
+		AgentConfig:   domain.AgentConfig{Command: fakeCopilotBinary(t)},
+		MCPConfigPath: agenttest.WriteSeededMCPConfig(t, workspace),
+	}
+	adapter, _ := NewCopilotAdapter()
+	session, err := adapter.StartSession(t.Context(), params)
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	t.Cleanup(func() { _ = adapter.StopSession(t.Context(), session) })
+	state := session.Internal.(*sessionState)
+	tools, agentErr := agentcore.ResolveToolDelivery(t.Context(), params, agentcore.LaunchTarget{}, declared.MCPDialect, nil)
+	if agentErr != nil {
+		t.Fatalf("ResolveToolDelivery() error = %v", agentErr)
+	}
 
-	const mcpConfigPath = "/ws/.sortie/mcp.json"
-	state := &sessionState{mcpConfigPath: mcpConfigPath}
-	args := buildArgs(state, 1, "do work", passthroughConfig{})
+	args := buildArgs(state, 1, "do work", state.passthrough)
 
-	agenttest.AssertMCPInjection(t, declared.MCPInjection, mcpConfigPath, agenttest.MCPLaunchSurface{Args: args})
+	agenttest.AssertMCPInjection(t, declared.MCPDialect, params.MCPConfigPath, agenttest.MCPLaunchSurface{Args: args, Env: tools.LocalEnv(), File: state.mcpConfigPath})
+}
+
+func TestStartSession_MalformedMCPConfigRejected(t *testing.T) {
+	t.Parallel()
+
+	command := fakeCopilotBinary(t)
+	adapter, _ := NewCopilotAdapter()
+
+	agenttest.AssertMalformedMCPConfigRejected(t, func(mcpConfigPath string) error {
+		_, err := adapter.StartSession(t.Context(), domain.StartSessionParams{
+			WorkspacePath: t.TempDir(),
+			AgentConfig:   domain.AgentConfig{Command: command},
+			MCPConfigPath: mcpConfigPath,
+		})
+		return err
+	})
 }
 
 func TestBuildArgs(t *testing.T) {
@@ -304,7 +338,6 @@ func TestBuildArgs(t *testing.T) {
 			},
 		},
 		{
-			// Worker-generated path takes priority over operator-configured path.
 			name:   "worker mcp config takes priority over operator",
 			state:  &sessionState{mcpConfigPath: "/ws/.sortie/mcp.json"},
 			prompt: "p",
@@ -404,7 +437,6 @@ func TestFormatMCPConfigValue(t *testing.T) {
 func TestBuildArgs_AlwaysPresent(t *testing.T) {
 	t.Parallel()
 
-	// Required flags must appear in every invocation regardless of configuration.
 	required := []string{"-p", "--output-format", "-s", "--allow-all", "--autopilot", "--no-ask-user", "--max-autopilot-continues"}
 	got := buildArgs(&sessionState{}, 1, "test prompt", passthroughConfig{})
 
@@ -412,17 +444,62 @@ func TestBuildArgs_AlwaysPresent(t *testing.T) {
 		assertHasFlag(t, got, flag)
 	}
 
-	// The prompt value must follow -p.
 	assertHasArgPair(t, got, "-p", "test prompt")
 	assertHasArgPair(t, got, "--output-format", "json")
 }
 
-// TestBuildArgs_LaunchPosture asserts the launch posture the refusal path
-// assumes: --no-ask-user closes the human-question path on every
-// invocation, and --allow-all is present unless allowed_tools holds a
-// non-whitespace value, in which case that allow-list replaces it. The
-// other three tool-scoping keys compose with the grant instead of
-// displacing it.
+func TestBuildArgs_VerificationLaunch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                  string
+		verification, full    bool
+		noCustom, wantReduced bool
+		wantNoCustom          int
+	}{
+		{name: "working launch"},
+		{name: "verification launch", verification: true, wantReduced: true, wantNoCustom: 1},
+		{name: "verification launch with no_custom_instructions set", verification: true, noCustom: true, wantReduced: true, wantNoCustom: 1},
+		{name: "verification launch with full context", verification: true, full: true, noCustom: true, wantNoCustom: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			adapter, _ := NewCopilotAdapter()
+			session, err := adapter.StartSession(t.Context(), domain.StartSessionParams{
+				WorkspacePath:           t.TempDir(),
+				AgentConfig:             domain.AgentConfig{Command: fakeCopilotBinary(t)},
+				CredentialVerification:  tt.verification,
+				VerificationFullContext: tt.full,
+				Settings: map[string]any{
+					"agent": "reviewer", "available_tools": "sentinel-available",
+					"excluded_tools": "sentinel-excluded", "no_custom_instructions": tt.noCustom,
+				},
+			})
+			if err != nil {
+				t.Fatalf("StartSession() error = %v", err)
+			}
+			state := session.Internal.(*sessionState)
+
+			args := buildArgs(state, 1, "p", state.passthrough)
+
+			assertHasArgPair(t, args, "--agent", "reviewer")
+			if tt.wantReduced {
+				assertHasArgPair(t, args, "--available-tools", "view")
+				assertNoFlag(t, args, "--excluded-tools")
+			} else {
+				assertHasArgPair(t, args, "--available-tools", "sentinel-available")
+				assertHasArgPair(t, args, "--excluded-tools", "sentinel-excluded")
+			}
+			if n, m := countArg(args, "--available-tools"), countArg(args, "--no-custom-instructions"); n != 1 || m != tt.wantNoCustom {
+				t.Errorf("buildArgs() carries --available-tools %d and --no-custom-instructions %d times, want 1 and %d in [%s]", n, m, tt.wantNoCustom, strings.Join(args, " "))
+			}
+		})
+	}
+}
+
 func TestBuildArgs_LaunchPosture(t *testing.T) {
 	t.Parallel()
 

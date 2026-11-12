@@ -8,10 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // TestInitializeHandshake_BoundedByReadTimeout drives initializeHandshake
@@ -22,27 +24,26 @@ import (
 func TestInitializeHandshake_BoundedByReadTimeout(t *testing.T) {
 	t.Parallel()
 
-	state := openEndedHandshakeState(t, map[int64]string{})
-	state.agentConfig.ReadTimeoutMS = 200
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 200 * time.Millisecond
+		state := openEndedHandshakeState(t, map[int64]string{})
+		state.agentConfig.ReadTimeoutMS = int(bound.Milliseconds())
 
-	start := time.Now()
-	done := make(chan error, 1)
-	go func() { done <- initializeHandshake(context.Background(), state) }()
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- initializeHandshake(context.Background(), state) }()
 
-	select {
-	case err := <-done:
+		err := waittest.Receive(t, done, "initializeHandshake return")
 		if err == nil {
 			t.Fatal("initializeHandshake() error = nil, want a timeout error")
 		}
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("initializeHandshake() error = %v, want error wrapping context.DeadlineExceeded", err)
 		}
-		if elapsed := time.Since(start); elapsed > 5*time.Second {
-			t.Errorf("initializeHandshake() took %v, want close to the 200ms agent.read_timeout_ms bound", elapsed)
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Errorf("initializeHandshake() took %v, want within the %v agent.read_timeout_ms bound", elapsed, bound)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("initializeHandshake() did not return within 5s against a runtime that never answers initialize (want it bounded by agent.read_timeout_ms)")
-	}
+	})
 }
 
 // mcpStartupFailedLine is a real mcpServer/startupStatus/updated
@@ -84,7 +85,7 @@ func TestMCPStartupFailure_LoggedDuringThreadStartedWait(t *testing.T) {
 		`{"method":"thread/started","params":{"threadId":"thread-abc"}}`,
 	)
 
-	threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, logger)
+	threadID, _, _, err := startThread(context.Background(), state, passthroughConfig{}, logger)
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}

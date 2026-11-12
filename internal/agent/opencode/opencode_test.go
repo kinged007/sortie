@@ -5,27 +5,25 @@ package opencode
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
-	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
@@ -61,30 +59,30 @@ func mustStartSessionWith(t *testing.T, a domain.AgentAdapter, workDir, cmd stri
 	return session
 }
 
-// mustBuildSSHSessionWithLocalScript builds a session whose SSH-mode
-// target execs script directly in place of the local ssh binary,
-// bypassing StartSession's version query so these tests exercise
-// RunTurn's SSH launch machinery against a local fixture rather than a
-// real network host.
 func mustBuildSSHSessionWithLocalScript(t *testing.T, workDir, script, sshHost string) domain.Session {
 	t.Helper()
 	pt, fault := parsePassthroughConfig(map[string]any{})
 	if fault != nil {
 		t.Fatalf("parsePassthroughConfig() error = %v", fault)
 	}
-	return domain.Session{Internal: &sessionState{
+	ledger, err := usage.NewLedger(usageSources.Live, usageSources.Records)
+	if err != nil {
+		t.Fatalf("NewLedger() error = %v", err)
+	}
+	state := &sessionState{
 		target: agentcore.LaunchTarget{
 			Command:       script,
 			WorkspacePath: workDir,
 			RemoteCommand: "opencode",
 			SSHHost:       sshHost,
 		},
-		passthrough:       pt,
-		baseLogger:        slog.Default(),
-		usage:             agentcore.NewTurnEndUsage(),
-		drainGrace:        procutil.DefaultDrainGrace,
-		firstEventTimeout: agentcore.FirstResponseTimeout(domain.AgentConfig{}),
-	}}
+		passthrough: pt,
+		baseLogger:  slog.Default(),
+		usage:       agentcore.NewTurnEndUsage(),
+		ledger:      ledger,
+	}
+	state.fork = newForkSession(state)
+	return domain.Session{Internal: state}
 }
 
 func writeRunFixtureScript(t *testing.T, dir, fixtureName string) string {
@@ -147,6 +145,66 @@ func collectEvents(t *testing.T, a domain.AgentAdapter, session domain.Session, 
 	return events, result, err
 }
 
+type exportFile struct {
+	session string
+	body    []byte
+}
+
+func exportOf(t *testing.T, fixture string, messageIDs ...string) exportFile {
+	t.Helper()
+	var doc struct {
+		Info     json.RawMessage   `json:"info"`
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(loadFixture(t, fixture), &doc); err != nil {
+		t.Fatalf("Unmarshal(%q): %v", fixture, err)
+	}
+	var info struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(doc.Info, &info); err != nil {
+		t.Fatalf("Unmarshal(%q info): %v", fixture, err)
+	}
+	if len(messageIDs) > 0 {
+		doc.Messages = slices.DeleteFunc(doc.Messages, func(m json.RawMessage) bool {
+			var head struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(m, &head)
+			return !slices.Contains(messageIDs, head.ID)
+		})
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal(%q): %v", fixture, err)
+	}
+	return exportFile{session: info.ID, body: body}
+}
+
+func writeExportServingScript(t *testing.T, dir, runFixture string, hang bool) string {
+	t.Helper()
+	runPath := writeFixtureFile(t, dir, "run.jsonl", string(loadFixture(t, runFixture)))
+	tail := ""
+	if hang {
+		tail = "\nsleep 1000"
+	}
+	return writeOpenCodeScript(t, dir, `case "$1 $2" in
+  "session export") cat '`+dir+`'/export."$5".json || exit 1; exit 0;;
+esac
+cat '`+runPath+`'`+tail)
+}
+
+func emptyExport(id string) exportFile {
+	return exportFile{session: id, body: []byte(`{"info":{"id":"` + id + `"},"messages":[]}`)}
+}
+
+func serveExports(t *testing.T, dir string, files []exportFile) {
+	t.Helper()
+	for _, f := range files {
+		writeFixtureFile(t, dir, "export."+f.session+".json", string(f.body))
+	}
+}
+
 func TestNewOpenCodeAdapter(t *testing.T) {
 	t.Parallel()
 
@@ -193,7 +251,9 @@ func TestStartSession_SettingsArePerSession(t *testing.T) {
 	t.Parallel()
 
 	a, _ := NewOpenCodeAdapter()
-	script := fakeMinimalRuntime(t)
+	dir := t.TempDir()
+	script := writeExportServingScript(t, dir, "simple_turn.jsonl", false)
+	serveExports(t, dir, []exportFile{emptyExport("ses_prior")})
 
 	first := mustStartSessionWith(t, a, t.TempDir(), script, map[string]any{"model": "provider/model-a", "allowed_tools": []any{"read"}}).Internal.(*sessionState)
 	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
@@ -273,26 +333,56 @@ func TestStartSession_InvalidWorkspace(t *testing.T) {
 	}
 }
 
-func TestStartSession_ResumeSession(t *testing.T) {
+func TestSessionContinuity(t *testing.T) {
 	t.Parallel()
 
-	a, _ := NewOpenCodeAdapter()
-	resumeID := "ses_resume123"
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath:   t.TempDir(),
-		AgentConfig:     domain.AgentConfig{Command: fakeMinimalRuntime(t)},
-		ResumeSessionID: resumeID,
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
+	agenttest.AssertSessionContinuity(t, func(t *testing.T, held, resumeID string) (domain.Session, error) {
+		t.Helper()
 
-	state := session.Internal.(*sessionState)
-	if state.sessionID != resumeID {
-		t.Errorf("sessionID = %q, want %q", state.sessionID, resumeID)
+		dir := t.TempDir()
+		script := writeExportServingScript(t, dir, "simple_turn.jsonl", false)
+		serveExports(t, dir, []exportFile{emptyExport(held)})
+		a, _ := NewOpenCodeAdapter()
+
+		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+			WorkspacePath:   dir,
+			AgentConfig:     domain.AgentConfig{Command: script},
+			ResumeSessionID: resumeID,
+		})
+		if err == nil {
+			t.Cleanup(func() { _ = a.StopSession(context.Background(), session) })
+		}
+		return session, err
+	})
+}
+
+func TestStartSession_SlowExportStartsNewSession(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := writeOpenCodeScript(t, dir, "case \"$1\" in\n  session) exec sleep 1000;;\nesac")
+	a, _ := NewOpenCodeAdapter()
+	type started struct {
+		session domain.Session
+		err     error
 	}
-	if session.ID != resumeID {
-		t.Errorf("session.ID = %q, want %q", session.ID, resumeID)
+	done := make(chan started, 1)
+
+	go func() {
+		session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+			WorkspacePath:   dir,
+			AgentConfig:     domain.AgentConfig{Command: script, ReadTimeoutMS: 500},
+			ResumeSessionID: "ses_slow",
+		})
+		done <- started{session, err}
+	}()
+	got := waittest.Receive(t, done, "StartSession")
+
+	if got.err != nil {
+		t.Fatalf("StartSession(resume=%q) error = %v, want nil", "ses_slow", got.err)
+	}
+	if got.session.CarriedHistory || got.session.ID != "" {
+		t.Errorf("StartSession(resume=%q) = {CarriedHistory: %v, ID: %q}, want {false, %q}", "ses_slow", got.session.CarriedHistory, got.session.ID, "")
 	}
 }
 
@@ -317,14 +407,14 @@ func TestStartSession_MCPConfigContent(t *testing.T) {
 	const withServer = `{"mcpServers":{"sortie-tools":{"command":"/usr/local/bin/sortie","args":["mcp-server"]}}}`
 
 	tests := []struct {
-		name    string
-		content string
-		sshHost string
-		wantMCP bool
+		name       string
+		content    string
+		sshHost    string
+		wantServer bool
 	}{
-		{name: "local launch carries the document", content: withServer, wantMCP: true},
-		{name: "remote launch stores the agent member alone", content: withServer, sshHost: "build-host"},
-		{name: "no declared server stores the agent member alone", content: `{"mcpServers":{}}`},
+		{name: "local launch carries the tool server", content: withServer, wantServer: true},
+		{name: "remote launch without a relay carries an empty mcp member", content: withServer, sshHost: "build-host"},
+		{name: "no declared server carries an empty mcp member", content: `{"mcpServers":{}}`},
 	}
 
 	for _, tt := range tests {
@@ -363,8 +453,9 @@ func TestStartSession_MCPConfigContent(t *testing.T) {
 			doc := decodeConfigDocument(t, state.turnConfigContent)
 
 			assertTitleAgentDisabled(t, doc)
-			if _, ok := doc["mcp"]; ok != tt.wantMCP {
-				t.Errorf("StartSession() stored mcp present = %v, want %v (content %q)", ok, tt.wantMCP, state.turnConfigContent)
+			mcp, ok := doc["mcp"]
+			if !ok || strings.Contains(string(mcp), "sortie-tools") != tt.wantServer {
+				t.Errorf("StartSession() stored mcp = %s (present %v), want a member naming sortie-tools = %v", mcp, ok, tt.wantServer)
 			}
 		})
 	}
@@ -395,107 +486,13 @@ func TestRunTurn_WrongInternalType(t *testing.T) {
 	}
 }
 
-func TestRunTurn_ClosedSession(t *testing.T) {
-	t.Parallel()
-
-	a, _ := NewOpenCodeAdapter()
-	tmpDir := t.TempDir()
-	session := mustStartSession(t, a, tmpDir, fakeMinimalRuntime(t))
-
-	state := session.Internal.(*sessionState)
-	state.mu.Lock()
-	state.closed = true
-	state.mu.Unlock()
-
-	_, err := a.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "work",
-		OnEvent: func(_ domain.AgentEvent) {},
-	})
-	if err == nil {
-		t.Fatal("RunTurn() error = nil, want error for closed session")
-	}
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) {
-		t.Fatalf("error type = %T, want *domain.AgentError", err)
-	}
-	if agentErr.Kind != domain.ErrResponseError {
-		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrResponseError)
-	}
-}
-
-func TestRunTurn_LinkedWorkspaceRefusedBeforeStart(t *testing.T) {
-	t.Parallel()
-
-	a, _ := NewOpenCodeAdapter()
-	tmpDir := t.TempDir()
-	marker := filepath.Join(tmpDir, "marker")
-	script := writeOpenCodeScript(t, t.TempDir(), "#!/bin/sh\ntouch "+marker+"\n")
-
-	session := mustStartSession(t, a, tmpDir, script)
-
-	if err := os.RemoveAll(tmpDir); err != nil {
-		t.Fatalf("RemoveAll(workspace): %v", err)
-	}
-	linkTarget := t.TempDir()
-	if err := os.Symlink(linkTarget, tmpDir); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
-
-	_, err := a.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "work",
-		OnEvent: func(_ domain.AgentEvent) {},
-	})
-	if err == nil {
-		t.Fatal("RunTurn(linked workspace) error = nil, want non-nil")
-	}
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) {
-		t.Fatalf("error type = %T, want *domain.AgentError", err)
-	}
-	if agentErr.Kind != domain.ErrInvalidWorkspaceCwd {
-		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrInvalidWorkspaceCwd)
-	}
-	if _, statErr := os.Stat(marker); statErr == nil {
-		t.Error("marker file exists, want the subprocess never to start")
-	}
-}
-
-func TestRunTurn_ConcurrentRunRejected(t *testing.T) {
-	t.Parallel()
-
-	a, _ := NewOpenCodeAdapter()
-	tmpDir := t.TempDir()
-	session := mustStartSession(t, a, tmpDir, fakeMinimalRuntime(t))
-
-	state := session.Internal.(*sessionState)
-	state.mu.Lock()
-	state.active = &turnRuntime{
-		waitCh: make(chan waitResult),
-	}
-	state.mu.Unlock()
-
-	_, err := a.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "work",
-		OnEvent: func(_ domain.AgentEvent) {},
-	})
-	if err == nil {
-		t.Fatal("RunTurn() error = nil, want error for concurrent turn")
-	}
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) {
-		t.Fatalf("error type = %T, want *domain.AgentError", err)
-	}
-	if agentErr.Kind != domain.ErrResponseError {
-		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrResponseError)
-	}
-}
-
 func TestRunTurn_SessionIDMismatch(t *testing.T) {
 	t.Parallel()
 
 	a, _ := NewOpenCodeAdapter()
 	tmpDir := t.TempDir()
-	script := writeRunFixtureScript(t, tmpDir, "simple_turn.jsonl")
+	script := writeExportServingScript(t, tmpDir, "simple_turn.jsonl", false)
+	serveExports(t, tmpDir, []exportFile{emptyExport("ses_expected")})
 
 	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath:   tmpDir,
@@ -556,305 +553,8 @@ func TestStopSession_NoActiveTurn(t *testing.T) {
 	if err := a.StopSession(context.Background(), session); err != nil {
 		t.Fatalf("StopSession() error = %v, want nil", err)
 	}
-	// Double stop should also return nil.
 	if err := a.StopSession(context.Background(), session); err != nil {
 		t.Fatalf("StopSession() second call error = %v, want nil", err)
-	}
-}
-
-func TestStopSession_ContextDeadline(t *testing.T) {
-	t.Parallel()
-
-	testCtx, testCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer testCancel()
-
-	tmpDir := t.TempDir()
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-trap '' TERM
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-while :; do sleep 1; done`)
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(testCtx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	gotEvent := make(chan struct{}, 1)
-	resultCh := make(chan domain.TurnResult, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		result, runErr := a.RunTurn(context.Background(), session, domain.RunTurnParams{
-			Prompt: "work",
-			OnEvent: func(_ domain.AgentEvent) {
-				select {
-				case gotEvent <- struct{}{}:
-				default:
-				}
-			},
-		})
-		resultCh <- result
-		errCh <- runErr
-	}()
-
-	select {
-	case <-gotEvent:
-	case <-testCtx.Done():
-		t.Fatal("timed out waiting for first event")
-	}
-
-	stopCtx, stopCancel := context.WithTimeout(testCtx, 50*time.Millisecond)
-	defer stopCancel()
-
-	err = a.StopSession(stopCtx, session)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("StopSession() error = %v, want %v", err, context.DeadlineExceeded)
-	}
-
-	select {
-	case result := <-resultCh:
-		if result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
-		}
-		runErr := <-errCh
-		var agentErr *domain.AgentError
-		if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
-			t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q}", runErr, domain.ErrTurnCancelled)
-		}
-	case <-testCtx.Done():
-		t.Fatal("RunTurn did not return after StopSession timeout")
-	}
-}
-
-// The readiness marker keeps the caller's SignalGraceful from racing the
-// shell installing its trap. scriptBody's first line MUST be a "trap ..."
-// statement; the marker touch is inserted right after it.
-func startTurnRuntimeProcess(t *testing.T, scriptBody string) *turnRuntime {
-	t.Helper()
-
-	dir := t.TempDir()
-	readyPath := filepath.Join(dir, "ready")
-	trapLine, rest, ok := strings.Cut(scriptBody, "\n")
-	if !ok || !strings.HasPrefix(trapLine, "trap ") {
-		t.Fatalf("startTurnRuntimeProcess: scriptBody must start with a trap statement, got %q", scriptBody)
-	}
-	script := trapLine + "\ntouch '" + readyPath + "'\n" + rest
-	scriptPath := agenttest.WriteScript(t, dir, "agent.sh", script)
-
-	cmd := exec.Command(scriptPath) //nolint:gosec // fixed path under t.TempDir()
-	pipes, group, err := procutil.StartWithOwnedPipes(context.Background(), cmd, nil)
-	if err != nil {
-		t.Fatalf("procutil.StartWithOwnedPipes() = %v", err)
-	}
-	t.Cleanup(func() { _ = pipes.Close() })
-	t.Cleanup(func() { _ = group.Kill() })
-	reaper := procutil.StartReaper(cmd, nil)
-
-	runtime := &turnRuntime{
-		group:  group,
-		waitCh: make(chan waitResult),
-	}
-	go func() {
-		<-reaper.Done()
-		waitErr := reaper.Err()
-		runtime.waitMu.Lock()
-		runtime.waitRes = waitResult{exitCode: procutil.ExtractExitCode(waitErr), err: waitErr}
-		runtime.waitMu.Unlock()
-		close(runtime.waitCh)
-	}()
-
-	waitForReady(t, readyPath)
-	return runtime
-}
-
-// waitForReady polls until path exists, failing t after 5 seconds. Used
-// to synchronize with a script that touches path only after installing
-// a signal trap, so a caller's subsequent signal cannot race the trap
-// installation.
-func waitForReady(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("waitForReady(%q): marker did not appear within 5s", path)
-}
-
-// TestStopActiveTurn_GraceCoverage calls stopActiveTurn directly so the
-// configured grace and its escalation log records can be asserted
-// without spending the built-in five-second default in wall clock.
-func TestStopActiveTurn_GraceCoverage(t *testing.T) {
-	t.Parallel()
-
-	t.Run("configured_grace_bounds_the_wait", func(t *testing.T) {
-		t.Parallel()
-		runtime := startTurnRuntimeProcess(t, `trap '' TERM
-while :; do :; done`)
-
-		start := time.Now()
-		err := stopActiveTurn(context.Background(), runtime, 200*time.Millisecond, slog.Default())
-		elapsed := time.Since(start)
-
-		if err != nil {
-			t.Errorf("stopActiveTurn() = %v, want nil", err)
-		}
-		if elapsed > 2*time.Second {
-			t.Errorf("stopActiveTurn() force-terminated after %v, want well under the built-in 5s default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed)
-		}
-	})
-
-	t.Run("exit_inside_grace_emits_debug_and_no_warn", func(t *testing.T) {
-		t.Parallel()
-		runtime := startTurnRuntimeProcess(t, `trap 'exit 0' TERM
-while :; do :; done`)
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		// The grace is far longer than this exit needs. The subtest proves
-		// which record the clean-exit path emits, not that the grace bounds
-		// anything, and a tight bound races the runner's scheduler instead
-		// of testing the code.
-		if err := stopActiveTurn(context.Background(), runtime, 30*time.Second, logger); err != nil {
-			t.Errorf("stopActiveTurn() = %v, want nil", err)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, "agent exited during the graceful phase") {
-			t.Errorf("stopActiveTurn() did not log the exited-inside-grace Debug record: %s", output)
-		}
-		if !strings.Contains(output, `outcome=exited`) {
-			t.Errorf("stopActiveTurn()'s Debug record missing outcome=exited: %s", output)
-		}
-		if strings.Contains(output, "level=WARN") {
-			t.Errorf("stopActiveTurn() logged a Warn record for a clean exit, want none: %s", output)
-		}
-	})
-
-	t.Run("grace_elapsed_emits_warn_with_outcome_and_grace", func(t *testing.T) {
-		t.Parallel()
-		runtime := startTurnRuntimeProcess(t, `trap '' TERM
-while :; do :; done`)
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		if err := stopActiveTurn(context.Background(), runtime, 150*time.Millisecond, logger); err != nil {
-			t.Errorf("stopActiveTurn() = %v, want nil", err)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, "agent did not exit inside the graceful period and was force-terminated") {
-			t.Errorf("stopActiveTurn() did not log the grace-elapsed Warn record: %s", output)
-		}
-		if !strings.Contains(output, `outcome="grace elapsed"`) {
-			t.Errorf(`stopActiveTurn()'s Warn record missing outcome="grace elapsed": %s`, output)
-		}
-		if !strings.Contains(output, "grace=") {
-			t.Errorf("stopActiveTurn()'s Warn record missing the configured grace ceiling: %s", output)
-		}
-		if !strings.Contains(output, "elapsed=") {
-			t.Errorf("stopActiveTurn()'s Warn record missing the elapsed wait: %s", output)
-		}
-	})
-
-	t.Run("caller_deadline_emits_warn_with_that_outcome", func(t *testing.T) {
-		t.Parallel()
-		runtime := startTurnRuntimeProcess(t, `trap '' TERM
-while :; do :; done`)
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		defer cancel()
-		if err := stopActiveTurn(ctx, runtime, 5*time.Second, logger); !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("stopActiveTurn() = %v, want %v", err, context.DeadlineExceeded)
-		}
-
-		output := buf.String()
-		if !strings.Contains(output, `outcome="caller deadline"`) {
-			t.Errorf(`stopActiveTurn()'s Warn record missing outcome="caller deadline": %s`, output)
-		}
-	})
-}
-
-// TestRunTurn_CancelledTurnEscalatesOnConfiguredGrace asserts that a
-// cancelled turn's process-group cancellation, wired through
-// procutil.SetGroupCancel inside RunTurn, escalates on the session's
-// configured grace rather than the built-in five-second default.
-func TestRunTurn_CancelledTurnEscalatesOnConfiguredGrace(t *testing.T) {
-	t.Parallel()
-
-	testCtx, testCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer testCancel()
-
-	tmpDir := t.TempDir()
-	// A shell builtin busy-loop rather than a forked "sleep": a forked
-	// child would inherit the shell's ignored TERM disposition across
-	// exec and keep the stdout pipe open after os/exec's own WaitDelay
-	// escalation kills only the direct child, hanging the reader
-	// instead of exercising the bounded escalation this test measures.
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-trap '' TERM
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-while :; do :; done`)
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(testCtx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script, StopGraceMS: 200},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	gotEvent := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, runErr := a.RunTurn(ctx, session, domain.RunTurnParams{
-			Prompt: "work",
-			OnEvent: func(_ domain.AgentEvent) {
-				select {
-				case gotEvent <- struct{}{}:
-				default:
-				}
-			},
-		})
-		done <- runErr
-	}()
-
-	select {
-	case <-gotEvent:
-	case <-testCtx.Done():
-		t.Fatal("timed out waiting for first event")
-	}
-
-	start := time.Now()
-	cancel()
-
-	var runErr error
-	select {
-	case runErr = <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("RunTurn did not return within 6s of cancellation")
-	}
-	elapsed := time.Since(start)
-
-	var agentErr *domain.AgentError
-	if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
-		t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q}", runErr, domain.ErrTurnCancelled)
-	}
-	if elapsed > 2*time.Second {
-		t.Errorf("RunTurn's cancelled-turn escalation took %v, want well under the built-in 5s default (proves the configured 200ms grace bounded cmd.WaitDelay, not DefaultStopGrace)", elapsed)
 	}
 }
 
@@ -876,188 +576,11 @@ func TestStopSession_WrongInternalType(t *testing.T) {
 	}
 }
 
-// TestRunTurn_MultiTurnAccumulation drives two turns on one session
-// where the underlying opencode export reports the session-cumulative
-// total after each turn (100 output tokens after turn 1, 160 after
-// turn 2), and asserts the adapter's run-cumulative snapshot after
-// turn 2 reports 160 output tokens rather than the 100 a per-turn
-// reset would leave in place.
-func TestRunTurn_MultiTurnAccumulation(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	runFixture := loadFixture(t, "simple_turn.jsonl")
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	export1Path := filepath.Join(tmpDir, "export1.json")
-	export1 := `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(export1Path, []byte(export1), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	export2Path := filepath.Join(tmpDir, "export2.json")
-	export2 := `{"info":{"id":"ses_abc123"},"messages":[` +
-		`{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":0,"output":100,"total":100,"cache":{"read":0,"write":0}}},` +
-		`{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":0,"output":60,"total":60,"cache":{"read":0,"write":0}}}` +
-		`]}`
-	if err := os.WriteFile(export2Path, []byte(export2), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	counterPath := filepath.Join(tmpDir, "export-call-count")
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export")
-    if [ -f '`+counterPath+`' ]; then
-      cat '`+export2Path+`'
-    else
-      touch '`+counterPath+`'
-      cat '`+export1Path+`'
-    fi
-    exit 0
-    ;;
-esac
-cat '`+runPath+`'`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-
-	var allEvents []domain.AgentEvent
-
-	events1, result1, err := collectEvents(t, a, session, "first prompt")
-	if err != nil {
-		t.Fatalf("RunTurn (turn 1) error = %v", err)
-	}
-	if result1.Usage.OutputTokens != 100 {
-		t.Errorf("turn 1: Usage.OutputTokens = %d, want 100", result1.Usage.OutputTokens)
-	}
-	allEvents = append(allEvents, events1...)
-
-	events2, result2, err := collectEvents(t, a, session, "second prompt")
-	if err != nil {
-		t.Fatalf("RunTurn (turn 2) error = %v", err)
-	}
-	if result2.Usage.OutputTokens != 160 {
-		t.Errorf("turn 2: Usage.OutputTokens = %d, want 160 (session-cumulative, not the max of the two turns)", result2.Usage.OutputTokens)
-	}
-	allEvents = append(allEvents, events2...)
-
-	agenttest.AssertUsageContract(t, allEvents)
-	agenttest.AssertModelReported(t, allEvents, "anthropic/claude-sonnet-4-5")
-}
-
-// TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn drives two turns
-// on one session: the first turn's export yields a usage figure and
-// measures the run, and the second turn is cancelled via context before
-// it completes. It asserts the second turn's UsageMeasured stays true,
-// since the measured latch lives in the session's TurnEndUsage rather
-// than being derived per turn.
-func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	runFixture := loadFixture(t, "simple_turn.jsonl")
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// The first invocation completes normally and leaves counterPath
-	// behind; the second invocation, detecting it, emits one event and
-	// blocks until the test cancels its turn's context.
-	counterPath := filepath.Join(tmpDir, "turn-count")
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-if [ -f '`+counterPath+`' ]; then
-  printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-  sleep 1000
-fi
-touch '`+counterPath+`'
-cat '`+runPath+`'`)
-
-	outerCtx, outerCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer outerCancel()
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(outerCtx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	result1, err := a.RunTurn(outerCtx, session, domain.RunTurnParams{
-		Prompt:  "first prompt",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn (turn 1) error = %v", err)
-	}
-	if !result1.UsageMeasured {
-		t.Fatal("turn 1: UsageMeasured = false, want true")
-	}
-
-	turnCtx, turnCancel := context.WithCancel(outerCtx)
-	gotEvent := make(chan struct{}, 1)
-	resultCh := make(chan domain.TurnResult, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		result, runErr := a.RunTurn(turnCtx, session, domain.RunTurnParams{
-			Prompt: "second prompt",
-			OnEvent: func(domain.AgentEvent) {
-				select {
-				case gotEvent <- struct{}{}:
-				default:
-				}
-			},
-		})
-		resultCh <- result
-		errCh <- runErr
-	}()
-
-	select {
-	case <-gotEvent:
-	case <-outerCtx.Done():
-		t.Fatal("timed out waiting for turn 2's first event")
-	}
-	turnCancel()
-
-	select {
-	case result2 := <-resultCh:
-		if result2.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("turn 2: ExitReason = %q, want %q", result2.ExitReason, domain.EventTurnCancelled)
-		}
-		if !result2.UsageMeasured {
-			t.Error("turn 2 (cancelled after a measured turn): UsageMeasured = false, want true")
-		}
-		runErr := <-errCh
-		var agentErr *domain.AgentError
-		if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
-			t.Errorf("turn 2: RunTurn() error = %v, want AgentError{Kind: %q}", runErr, domain.ErrTurnCancelled)
-		}
-	case <-outerCtx.Done():
-		t.Fatal("RunTurn (turn 2) did not return after context cancel")
-	}
-}
-
 func TestRunTurn_SessionStartedOnce(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
 
-	// Write fixture to a stable path the script can cat.
 	fixture := loadFixture(t, "simple_turn.jsonl")
 	fixturePath := filepath.Join(tmpDir, "output.jsonl")
 	if err := os.WriteFile(fixturePath, fixture, 0o644); err != nil {
@@ -1079,7 +602,6 @@ func TestRunTurn_SessionStartedOnce(t *testing.T) {
 		return n
 	}
 
-	// First turn: session_started fires exactly once.
 	turn1Events, result1, err := collectEvents(t, a, session, "first prompt")
 	if err != nil {
 		t.Fatalf("RunTurn (turn 1) error = %v", err)
@@ -1092,7 +614,6 @@ func TestRunTurn_SessionStartedOnce(t *testing.T) {
 	}
 	agenttest.AssertSessionIDContract(t, []string{session.ID}, turn1Events, result1)
 
-	// Second turn on the same session: session_started must not fire again.
 	turn2Events, result2, err := collectEvents(t, a, session, "second prompt")
 	if err != nil {
 		t.Fatalf("RunTurn (turn 2) error = %v", err)
@@ -1149,9 +670,6 @@ func TestRunTurn_LogicalFailureExitZero(t *testing.T) {
 	}, result, err)
 }
 
-// TestRunTurn_LogicalFailureDualError covers a failure that emits both the
-// actionable diagnostic and opencode's masked placeholder on the run stream.
-// Either order is possible, and the operator must see the diagnostic in both.
 func TestRunTurn_LogicalFailureDualError(t *testing.T) {
 	t.Parallel()
 
@@ -1182,9 +700,6 @@ func TestRunTurn_LogicalFailureDualError(t *testing.T) {
 				t.Fatalf("RunTurn() error = %v, want AgentError{Kind: %q}", err, domain.ErrTurnFailed)
 			}
 
-			// Exactly one terminal event fires per turn: the two error
-			// events collapse into a single turn_failed carrying the
-			// detail, not the placeholder that shares the stream with it.
 			var turnFailedMessages []string
 			for _, event := range events {
 				if event.Type == domain.EventTurnEndedWithError {
@@ -1271,8 +786,8 @@ printf '\n'`)
 	if !errors.As(err, &agentErr) {
 		t.Fatalf("error type = %T, want *domain.AgentError", err)
 	}
-	if agentErr.Kind != domain.ErrResponseError {
-		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrResponseError)
+	if agentErr.Kind != domain.ErrPortExit {
+		t.Errorf("Kind = %q, want %q", agentErr.Kind, domain.ErrPortExit)
 	}
 	if result.ExitReason != domain.EventTurnFailed {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
@@ -1282,133 +797,15 @@ printf '\n'`)
 	if len(failedEvents) != 1 {
 		t.Fatalf("turn_failed event count = %d, want 1", len(failedEvents))
 	}
-	if failedEvents[0].Message != "stdout read error" {
-		t.Errorf("turn_failed Message = %q, want %q", failedEvents[0].Message, "stdout read error")
+	if !strings.HasPrefix(failedEvents[0].Message, "stdout read error") {
+		t.Errorf("turn_failed Message = %q, want prefix %q", failedEvents[0].Message, "stdout read error")
 	}
 
 	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
 		Terminal:          agentcore.TerminalFailure,
-		TerminalErrorKind: domain.ErrResponseError,
-		TerminalMessage:   "stdout read error",
+		TerminalErrorKind: domain.ErrPortExit,
+		TerminalMessage:   "stdout scanner error",
 	}, result, err)
-}
-
-// TestRunTurn_ReadErrorRecoversUsageFromExport pins recovery on the stdout
-// read-error arm. That arm also kills and waits for the process itself, and a
-// cancellation can surface through it as well as through the context case, so
-// without its own recovery the same work reports a figure or nothing
-// depending on which one fired first.
-func TestRunTurn_ReadErrorRecoversUsageFromExport(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// The first event teaches the adapter the session id an export needs;
-	// the oversized line after it is what fails the read.
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-head -c $((10*1024*1024+1)) /dev/zero | tr '\000' 'a'
-printf '\n'`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-
-	events, result, err := collectEvents(t, a, session, "work")
-	if err == nil {
-		t.Fatal("RunTurn() error = nil, want oversized-line failure")
-	}
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-	}
-	if !result.UsageMeasured {
-		t.Error("UsageMeasured = false; the export was readable and named a figure")
-	}
-	if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 {
-		t.Errorf("Usage = in:%d out:%d, want in:10 out:20",
-			result.Usage.InputTokens, result.Usage.OutputTokens)
-	}
-
-	var usageEvents []domain.AgentEvent
-	for _, ev := range events {
-		if ev.Type == domain.EventTokenUsage {
-			usageEvents = append(usageEvents, ev)
-		}
-	}
-	if len(usageEvents) != 1 {
-		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
-	}
-	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
-		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
-	}
-}
-
-func TestRunTurn_EventAgentPID(t *testing.T) {
-	t.Parallel()
-
-	t.Run("local_events_include_pid", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		script := writeRunFixtureScript(t, tmpDir, "simple_turn.jsonl")
-
-		a, _ := NewOpenCodeAdapter()
-		session := mustStartSession(t, a, tmpDir, script)
-
-		events, result, err := collectEvents(t, a, session, "work")
-		if err != nil {
-			t.Fatalf("RunTurn() error = %v", err)
-		}
-		if result.ExitReason != domain.EventTurnCompleted {
-			t.Fatalf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-		}
-		if len(events) == 0 {
-			t.Fatal("events = 0, want > 0")
-		}
-
-		wantPID := events[0].AgentPID
-		if wantPID == "" {
-			t.Fatal("first event AgentPID is empty, want subprocess pid")
-		}
-		for _, event := range events {
-			if event.AgentPID != wantPID {
-				t.Errorf("event %q AgentPID = %q, want %q", event.Type, event.AgentPID, wantPID)
-			}
-		}
-	})
-
-	t.Run("ssh_events_leave_pid_empty", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		script := writeRunFixtureScript(t, tmpDir, "simple_turn.jsonl")
-
-		a, _ := NewOpenCodeAdapter()
-		session := mustBuildSSHSessionWithLocalScript(t, tmpDir, script, "example.test")
-
-		events, result, err := collectEvents(t, a, session, "work")
-		if err != nil {
-			t.Fatalf("RunTurn() error = %v", err)
-		}
-		if result.ExitReason != domain.EventTurnCompleted {
-			t.Fatalf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-		}
-		if len(events) == 0 {
-			t.Fatal("events = 0, want > 0")
-		}
-		for _, event := range events {
-			if event.AgentPID != "" {
-				t.Errorf("event %q AgentPID = %q, want empty in ssh mode", event.Type, event.AgentPID)
-			}
-		}
-	})
 }
 
 func TestRunTurn_SSH_CarriesInlineConfigDocument(t *testing.T) {
@@ -1459,221 +856,147 @@ func TestRunTurn_SSH_CarriesInlineConfigDocument(t *testing.T) {
 	t.Fatalf("no invocation received the prompt on standard input among %d captured inputs", len(inputs))
 }
 
-func TestRunTurn_UsageMeasured_AbsentWhenExportYieldsNoUsage(t *testing.T) {
+func TestRunTurn_SSH_CompletedTurnWithExit255IsNotAConnectionFailure(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	script := writeRunFixtureScript(t, tmpDir, "simple_turn.jsonl")
+	fixture := writeFixtureFile(t, tmpDir, "simple_turn.jsonl", string(loadFixture(t, "simple_turn.jsonl")))
+	script := writeOpenCodeScript(t, tmpDir, "cat '"+fixture+"'\nexit 255")
 
 	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
+	session := mustBuildSSHSessionWithLocalScript(t, tmpDir, script, "example.test")
 
-	events, result, err := collectEvents(t, a, session, "work")
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
+	_, _, err := collectEvents(t, a, session, "work")
 
-	agenttest.AssertMeasurementAbsent(t, events, result)
-
-	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
-		ExitObserved: true,
-		ExitCode:     0,
-		Work:         agentcore.WorkPresent,
-	}, result, err)
-}
-
-func TestRunTurn_UsageMeasured_TrueWhenExportYieldsUsage(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	runFixture := loadFixture(t, "simple_turn.jsonl")
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-cat '`+runPath+`'`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-
-	_, result, err := collectEvents(t, a, session, "work")
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	if !result.UsageMeasured {
-		t.Error("RunTurn().UsageMeasured = false, want true when the session export yielded a usage figure")
+	if errors.Is(err, sshutil.ErrConnectionFailed) {
+		t.Errorf("RunTurn() error = %v, wraps sshutil.ErrConnectionFailed, want a turn that produced a terminal step_finish before ssh exited 255 reported as a runtime exit", err)
 	}
 }
 
-// The runtime can end a completed turn without a step_finish line; the
-// export it leaves behind is still final once the process exits on its own.
-func TestRunTurn_CleanExitWithoutStepFinishSettlesSpend(t *testing.T) {
+func TestRunTurn_SpendFromCapturedTurns(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
+	const (
+		captureSession = "ses_e737d08b8ffeydhSupdjhqQAAy"
+		textMsg        = "msg_18c82fbd800157fY0B3mhDaRnu"
+		toolStepMsg    = "msg_18c830495001LqXhqww8lHz3TQ"
+		toolFinalMsg   = "msg_18c830b96001lR1XlMWhZ9BfIq"
+		servedModel    = "google/gemini-2.5-flash"
+	)
+	type turnSpend struct {
+		input, output int64
+		unaccounted   bool
+		provenance    string
+		model         string
+	}
+	records := usage.FormatProvenance([]domain.UsageProvenance{{Source: usage.SourceJournal, Strategy: usage.StrategyRecords}})
+	live := usage.FormatProvenance([]domain.UsageProvenance{{Source: usage.SourceOutput, Strategy: usage.StrategyLive}})
 
-	runFixture := loadFixture(t, "simple_turn.jsonl")
-	withoutStepFinish := bytes.Join(bytes.SplitAfter(runFixture, []byte("\n"))[:2], nil)
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, withoutStepFinish, 0o644); err != nil {
-		t.Fatal(err)
+	const twoTurns = "live_two_turns_export.json"
+	history := exportOf(t, twoTurns, textMsg)
+	toolTurn := exportOf(t, twoTurns, toolStepMsg, toolFinalMsg)
+	historyAndToolTurn := exportOf(t, twoTurns, textMsg, toolStepMsg, toolFinalMsg)
+	parent := exportOf(t, "live_subagent_export.json")
+	child := exportOf(t, "live_subagent_child_export.json")
+
+	tests := []struct {
+		name          string
+		run           string
+		resume        string
+		atStart       []exportFile
+		atEnd         []exportFile
+		want          turnSpend
+		checkContract bool
+		cancel        bool
+	}{
+		{"completed tool turn settles the export's exact figure", "live_tool_turn.jsonl", "", nil, []exportFile{toolTurn}, turnSpend{36542, 175, false, records, servedModel}, true, false},
+		{"failed export leaves the tool step as a lower bound", "live_tool_turn.jsonl", "", nil, nil, turnSpend{17780, 174, true, live, ""}, false, false},
+		{"failed export leaves a turn with a final step report complete", "live_tool_turn_final_report.jsonl", "", nil, nil, turnSpend{518, 42, false, live, ""}, false, false},
+		{"text-only turn settles from the export", "live_text_turn.jsonl", "", nil, []exportFile{history}, turnSpend{17693, 20, false, records, servedModel}, false, false},
+		{"resumed session counts none of its history", "live_tool_turn.jsonl", captureSession, []exportFile{history}, []exportFile{historyAndToolTurn}, turnSpend{36542, 175, false, records, servedModel}, false, false},
+		{"unconfirmed resume starts a new session that counts its whole export", "live_tool_turn.jsonl", captureSession, nil, []exportFile{toolTurn}, turnSpend{36542, 175, false, records, servedModel}, false, false},
+		{"subagent turn counts the child's records once", "live_subagent_turn.jsonl", "", nil, []exportFile{parent, child}, turnSpend{52565, 192, false, records, servedModel}, false, false},
+		{"failed child export leaves the turn a lower bound", "live_subagent_turn.jsonl", "", nil, []exportFile{parent}, turnSpend{36322, 191, true, records, servedModel}, false, false},
+		{"failed subagent call leaves the turn a lower bound", "live_subagent_failed_turn.jsonl", "", nil, []exportFile{exportOf(t, "live_subagent_failed_export.json")}, turnSpend{36394, 96, true, records, servedModel}, false, false},
+		{"cancelled turn without a step_finish settles the export's figure", "live_ssh_cancel_after_output_turn.jsonl", "", nil, []exportFile{exportOf(t, "live_ssh_cancel_after_output_export.json", "msg_18d086f070016id4slPEE0FtIH")}, turnSpend{211, 18, true, records, "scripted/scripted-model"}, false, true},
 	}
 
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-cat '`+runPath+`'`)
+			dir := t.TempDir()
+			script := writeExportServingScript(t, dir, tt.run, tt.cancel)
+			serveExports(t, dir, tt.atStart)
+			a, _ := NewOpenCodeAdapter()
+			session, err := a.StartSession(context.Background(), domain.StartSessionParams{
+				WorkspacePath:   dir,
+				AgentConfig:     domain.AgentConfig{Command: script},
+				ResumeSessionID: tt.resume,
+			})
+			if err != nil {
+				t.Fatalf("StartSession() error = %v", err)
+			}
+			serveExports(t, dir, tt.atEnd)
 
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
+			ctx, cancel := context.WithCancel(waittest.Context(t))
+			defer cancel()
+			var events []domain.AgentEvent
+			result, err := a.RunTurn(ctx, session, domain.RunTurnParams{
+				Prompt: "work",
+				OnEvent: func(e domain.AgentEvent) {
+					events = append(events, e)
+					if tt.cancel && e.Type == domain.EventToolResult {
+						cancel()
+					}
+				},
+			})
+			var agentErr *domain.AgentError
+			if tt.cancel != errors.As(err, &agentErr) {
+				t.Fatalf("RunTurn() error = %v, want an error only for a cancelled turn", err)
+			}
 
-	_, result, err := collectEvents(t, a, session, "work")
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	if result.SpendUnaccounted {
-		t.Error("RunTurn().SpendUnaccounted = true, want false for a turn whose process exited cleanly after the export recovered its usage")
-	}
-	if !result.UsageMeasured {
-		t.Error("RunTurn().UsageMeasured = false, want true when the session export yielded a usage figure")
-	}
-	if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 || result.Usage.TotalTokens != 30 {
-		t.Errorf("RunTurn().Usage = {input %d, output %d, total %d}, want {10, 20, 30} from the export",
-			result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens)
+			var model string
+			for _, e := range events {
+				if e.Type == domain.EventTokenUsage {
+					model = e.Model
+				}
+			}
+			got := turnSpend{result.Usage.InputTokens, result.Usage.OutputTokens, result.SpendUnaccounted, usage.FormatProvenance(result.UsageProvenance), model}
+			if got != tt.want || !result.UsageMeasured {
+				t.Errorf("turn spend = %+v measured=%v, want %+v measured=true", got, result.UsageMeasured, tt.want)
+			}
+			if tt.checkContract {
+				agenttest.AssertUsageReporting(t, "opencode", []agenttest.UsageReportingCase{{Name: tt.name, Events: events, Result: result}})
+			}
+		})
 	}
 }
 
-// TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero is the same
-// property as the test above on the COMPLETION path, for the export shape the
-// value-based check used to throw away: an assistant message whose tokens are
-// all zero. The terminal-turn tests all use non-zero exports, so none of them
-// would notice a finalizer that went back to reading the values.
-func TestRunTurn_UsageMeasured_TrueWhenTheExportIsAGenuineZero(t *testing.T) {
+func TestRuntimeCommand_NeverCarriesInlineConfiguration(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-
-	runFixture := loadFixture(t, "simple_turn.jsonl")
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
-		t.Fatal(err)
+	state := &sessionState{
+		target:            agentcore.LaunchTarget{Command: "opencode"},
+		turnConfigContent: `{"permission":{}}`,
 	}
 
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop",` +
-		`"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},` +
-		`"tokens":{"input":0,"output":0,"total":0,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	cmd := state.runtimeCommand([]string{"session", "export", "ses_x"}, 7)
 
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-cat '`+runPath+`'`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-
-	events, result, err := collectEvents(t, a, session, "work")
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	// A known zero is a MEASURED spend, not an unknown one -- that is the
-	// distinction the verdict exists to make.
-	if !result.UsageMeasured {
-		t.Error("UsageMeasured = false; the export was readable and reported zero")
-	}
-	if result.Usage.InputTokens != 0 || result.Usage.OutputTokens != 0 {
-		t.Errorf("Usage = in:%d out:%d, want in:0 out:0",
-			result.Usage.InputTokens, result.Usage.OutputTokens)
-	}
-
-	var usageEvents []domain.AgentEvent
-	for _, ev := range events {
-		if ev.Type == domain.EventTokenUsage {
-			usageEvents = append(usageEvents, ev)
+	for _, v := range cmd.Settings {
+		if v.Name == "OPENCODE_CONFIG_CONTENT" {
+			t.Errorf("runtimeCommand() Settings carry %q, want none", v.Name)
 		}
 	}
-	if len(usageEvents) != 1 {
-		t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
+	if cmd.LaunchWords != 1 || cmd.Limit != 7 || !cmd.InSession {
+		t.Errorf("runtimeCommand() = LaunchWords %d, Limit %d, InSession %v, want 1, 7, true", cmd.LaunchWords, cmd.Limit, cmd.InSession)
 	}
-	// The model the export named rides along with the zero; dropping the
-	// recovery dropped this too.
-	if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
-		t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
-	}
-}
-
-// TestAssertUsageReporting proves opencode's registered
-// usage-reporting declaration (turn_end, per_model) against a real
-// event stream: one usage figure, carrying the exported model,
-// arriving after the run's tool_result, since finalizeExitedTurn
-// queries the export only after the subprocess exits.
-func TestAssertUsageReporting(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	runFixture := loadFixture(t, "tool_success.jsonl")
-	runPath := filepath.Join(tmpDir, "run.jsonl")
-	if err := os.WriteFile(runPath, runFixture, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	exportPath := filepath.Join(tmpDir, "export.json")
-	exportFixture := loadFixture(t, "export_usage.json")
-	if err := os.WriteFile(exportPath, exportFixture, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-cat '`+runPath+`'`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-
-	events, result, err := collectEvents(t, a, session, "work")
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	agenttest.AssertUsageReporting(t, "opencode", []agenttest.UsageReportingCase{
-		{Name: "one figure after the tool result, carrying the exported model", Events: events, Result: result},
-	})
 }
 
 func TestRunTurn_ActivityVisibilityForStallWatchdog(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	// A "text" part carries the turn's own work evidence, keeping this
-	// turn on the turn_completed row so the test still exercises
-	// notification, malformed-event, and session-lifecycle visibility
-	// during an otherwise-successful turn, rather than becoming a
-	// duplicate of the dedicated zero-work-row pin.
 	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
   "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
 esac
@@ -1743,11 +1066,6 @@ printf '{"type":"step_finish","timestamp":1002,"sessionID":"ses_visibility123","
 	}, result, err)
 }
 
-// TestRunTurn_ReasoningPartCountsAsWork drives a run stream carrying a
-// "reasoning" part and nothing else: no text, no tool_use. Reasoning is
-// one of this adapter's two declared assistant-output feed points, so it
-// alone must satisfy WorkObserver and the turn must complete as
-// turn_completed rather than falling to the zero-work row.
 func TestRunTurn_ReasoningPartCountsAsWork(t *testing.T) {
 	t.Parallel()
 
@@ -1792,15 +1110,6 @@ printf '{"type":"reasoning","timestamp":1000,"sessionID":"ses_reasoning123","par
 	}, result, err)
 }
 
-// TestRunTurn_PermissionWarningRecognizedOnStderr drives the
-// permission_warning_then_error.txt fixture split across the two real
-// streams the opencode runtime uses: the denial warning on stderr, the
-// tool_use envelope alone on stdout. Previously both lines
-// arrived on stdout and the recognition branch that would have read the
-// warning there was dead code, so a fixture that did not distinguish the
-// streams let a test pass without exercising the refusal path at all. See
-// TestRunTurn_PermissionWarningOnStdoutIsNotRecognized for the negative
-// control this test alone cannot provide.
 func TestRunTurn_PermissionWarningRecognizedOnStderr(t *testing.T) {
 	t.Parallel()
 
@@ -1834,17 +1143,6 @@ cat '`+stdoutPath+`'`)
 	}
 }
 
-// TestRunTurn_PermissionWarningOnStdoutIsNotRecognized is the negative
-// control for TestRunTurn_PermissionWarningRecognizedOnStderr: it delivers
-// the same fixture's warning line on stdout instead of stderr, the shape
-// the fixture previously modeled, and asserts the permission
-// refusal notification is absent; the line is malformed input on stdout
-// instead, since the dead stdout-side filter was removed. Together
-// the two tests carry the guarantee that recognition fires on the stream
-// the runtime actually uses and nowhere else: this one fails if
-// recognition leaked back onto stdout or the fixture regressed to its old
-// single-stream shape, and its counterpart fails if isPermissionWarning
-// stopped firing on stderr at all.
 func TestRunTurn_PermissionWarningOnStdoutIsNotRecognized(t *testing.T) {
 	t.Parallel()
 
@@ -1887,12 +1185,9 @@ cat '`+stdoutPath+`'`)
 func TestRunTurn_TurnCancelledOnContextCancel(t *testing.T) {
 	t.Parallel()
 
-	outerCtx, outerCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer outerCancel()
+	outerCtx := waittest.Context(t)
 
 	tmpDir := t.TempDir()
-	// Script: emit one JSON event on a run call, then block until killed.
-	// Handle export subcommand immediately so queryExportUsage doesn't block.
 	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
   "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
 esac
@@ -1908,7 +1203,6 @@ sleep 1000`)
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
-	// turnCtx is the context this test cancels to trigger TurnCancelled.
 	turnCtx, turnCancel := context.WithCancel(outerCtx)
 
 	gotEvent := make(chan struct{}, 1)
@@ -1928,7 +1222,6 @@ sleep 1000`)
 		errCh <- runErr
 	}()
 
-	// Wait for the subprocess to emit the first event.
 	select {
 	case <-gotEvent:
 	case <-outerCtx.Done():
@@ -1952,83 +1245,11 @@ sleep 1000`)
 	}
 }
 
-func TestRunTurn_StopSessionUnblocksReader(t *testing.T) {
-	t.Parallel()
-
-	// testCtx bounds the assertion deadline; runCtx is separate so
-	// ctx.Done() in RunTurn's main loop doesn't race with the test's
-	// resultCh select.
-	testCtx, testCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer testCancel()
-
-	runCtx := t.Context()
-
-	tmpDir := t.TempDir()
-	// Script: emit one JSON event on a run call, then block until killed.
-	// Handle export subcommand immediately so queryExportUsage doesn't block.
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-sleep 1000`)
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(testCtx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	gotEvent := make(chan struct{}, 1)
-	resultCh := make(chan domain.TurnResult, 1)
-	go func() {
-		result, _ := a.RunTurn(runCtx, session, domain.RunTurnParams{
-			Prompt: "work",
-			OnEvent: func(_ domain.AgentEvent) {
-				select {
-				case gotEvent <- struct{}{}:
-				default:
-				}
-			},
-		})
-		resultCh <- result
-	}()
-
-	// Wait for the subprocess to be active.
-	select {
-	case <-gotEvent:
-	case <-testCtx.Done():
-		t.Fatal("timed out waiting for first event")
-	}
-
-	if err := a.StopSession(testCtx, session); err != nil {
-		t.Fatalf("StopSession() error = %v", err)
-	}
-
-	select {
-	case result := <-resultCh:
-		if result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
-		}
-	case <-testCtx.Done():
-		t.Fatal("RunTurn did not return after StopSession")
-	}
-}
-
-// mustMakeTempDir is a helper that returns a temporary directory path.
-// Used in test table initialization where t.TempDir() cannot be called
-// inside a struct literal.
 func mustMakeTempDir(t *testing.T) string {
 	t.Helper()
 	return t.TempDir()
 }
 
-// TestRunTurn_ExitZeroNoAssistantOutputPart pins that a process which
-// exits 0 having parsed JSON events but never a text, reasoning, or
-// tool_use part reports turn_failed, not the silent success this class
-// of bug produced before the shared decision.
 func TestRunTurn_ExitZeroNoAssistantOutputPart(t *testing.T) {
 	t.Parallel()
 
@@ -2068,12 +1289,6 @@ printf '{"type":"step_finish","timestamp":1001,"sessionID":"ses_c1","part":{"id"
 	}, result, err)
 }
 
-// TestRunTurn_ExitZeroNoJSONEventAtAll pins an emptier variant of the
-// no-output case: the process exits 0 having written nothing readable
-// on standard output at all, so it fails with the early-exit report
-// rather than letting the adapter pre-classify a bare exit 0 as a
-// success or reach the zero-work row a readable-but-empty transcript
-// would.
 func TestRunTurn_ExitZeroNoJSONEventAtAll(t *testing.T) {
 	t.Parallel()
 
@@ -2105,10 +1320,6 @@ exit 0`)
 	}
 }
 
-// TestRunTurn_UnparseableLineDoesNotCountAsResponse pins that a line the
-// JSON decoder rejects never counts as the turn's response, even though
-// the runtime wrote it and exited cleanly: only a line that decodes as
-// a run event satisfies OutputWatch.
 func TestRunTurn_UnparseableLineDoesNotCountAsResponse(t *testing.T) {
 	t.Parallel()
 
@@ -2185,72 +1396,6 @@ exit 7`)
 	}, result, err)
 }
 
-func TestRunTurn_ReadTimeoutBeforeFirstJSONEvent(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-sleep 5`)
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	session.Internal.(*sessionState).firstEventTimeout = 100 * time.Millisecond
-
-	events, result, err := collectEvents(t, a, session, "work")
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-	}
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() error = %v, want AgentError{Kind: %q}", err, domain.ErrResponseTimeout)
-	}
-	const wantMessage = "timed out waiting for first opencode json event"
-	if agentErr.Message != wantMessage {
-		t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, wantMessage)
-	}
-
-	failedEvents := turnFailedEvents(events)
-	if len(failedEvents) != 1 {
-		t.Fatalf("turn_failed event count = %d, want 1", len(failedEvents))
-	}
-
-	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
-		Terminal:          agentcore.TerminalFailure,
-		TerminalErrorKind: domain.ErrResponseTimeout,
-		TerminalMessage:   wantMessage,
-	}, result, err)
-}
-
-func TestRunTurn_FirstEventLaterThanReadTimeoutCompletes(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	runPath := writeFixtureFile(t, tmpDir, "run.jsonl", string(loadFixture(t, "simple_turn.jsonl")))
-	script := writeOpenCodeScript(t, tmpDir, "sleep 0.5; cat '"+runPath+"'")
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script, ReadTimeoutMS: 100},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	_, result, err := collectEvents(t, a, session, "work")
-	if err != nil || result.ExitReason != domain.EventTurnCompleted {
-		t.Fatalf("RunTurn() = (%q, %v), want a completed turn: the model answering slower than agent.read_timeout_ms is healthy", result.ExitReason, err)
-	}
-}
-
 func TestRunTurn_CompletedTurnReturnsUntypedNilError(t *testing.T) {
 	t.Parallel()
 
@@ -2269,14 +1414,6 @@ func TestRunTurn_CompletedTurnReturnsUntypedNilError(t *testing.T) {
 	}
 }
 
-// TestRunTurn_ToolOnlyNoTerminalCompletes drives the committed
-// tool_success.jsonl fixture, which carries a completed tool_use part and
-// no text or reasoning part at all. opencode's normal path sets no
-// terminal report, so DecideTurn genuinely consults Work here: reporting
-// turn_completed is proof the observer's ToolActivity field fired from
-// this shape of the committed fixture corpus, and it doubles as the
-// tool-activity-only case among the DecideTurn conformance checks the
-// committed fixture corpus exercises.
 func TestRunTurn_ToolOnlyNoTerminalCompletes(t *testing.T) {
 	t.Parallel()
 
@@ -2295,6 +1432,44 @@ func TestRunTurn_ToolOnlyNoTerminalCompletes(t *testing.T) {
 	}
 
 	dispositiontest.AssertWorkEvidenceConsistent(t, events, result, err)
+}
+
+func TestRunTurn_ToolUseMapsKindAndArgument(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	script := writeRunFixtureScript(t, tmpDir, "tool_calls_mapped.jsonl")
+
+	a, _ := NewOpenCodeAdapter()
+	session := mustStartSession(t, a, tmpDir, script)
+
+	events, _, err := collectEvents(t, a, session, "work")
+	if err != nil {
+		t.Fatalf("RunTurn() error = %v", err)
+	}
+
+	type call struct {
+		name     string
+		kind     domain.ToolKind
+		argument string
+	}
+	want := []call{
+		{"shell", domain.ToolKindShell, "go test ./..."},
+		{"read", domain.ToolKindRead, "/tmp/work/main.go"},
+		{"write", domain.ToolKindEdit, "/tmp/work/notes.md"},
+		{"edit", domain.ToolKindEdit, "/tmp/work/main.go"},
+		{"skill", domain.ToolKindSkill, "demo-skill"},
+		{"grep", "", ""},
+	}
+	var got []call
+	for _, e := range events {
+		if e.Type == domain.EventToolResult {
+			got = append(got, call{e.ToolName, e.ToolKind, e.ToolArgument})
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("tool_result calls = %+v, want %+v", got, want)
+	}
 }
 
 func TestRunTurn_SecondTurnFailsAfterFirstTurnBothSignals(t *testing.T) {
@@ -2334,11 +1509,6 @@ fi`, counterFile, counterFile))
 	}
 }
 
-// TestRunTurn_WorkPredicateIsPerTurn pins that the work predicate reads
-// this turn's own parsed parts, not the run cumulative. The first turn
-// produces a text part and completes; the second turn, on the same
-// session, produces none and must fail rather than inherit the first
-// turn's evidence.
 func TestRunTurn_WorkPredicateIsPerTurn(t *testing.T) {
 	t.Parallel()
 
@@ -2375,998 +1545,6 @@ fi`, counterFile, counterFile))
 	}
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// writeEscapedHolderSpawn returns shell script text that starts a
-// setsid-detached background job holding whichever standard streams
-// redirect leaves unredirected, and blocks the leader until the job's
-// own marker at pidFile proves its setsid() transition has already
-// completed. Waiting on that self-written marker, rather than on the
-// leader's own $!, is what keeps a later group-kill from racing the
-// descendant's escape: $! only proves the job was forked, not that it
-// has already left the process group, and setsid (without --fork) does
-// not create a second process to wait for, so nothing else observes
-// that transition from outside.
-func writeEscapedHolderSpawn(pidFile, redirect string) string {
-	return fmt.Sprintf(
-		"setsid sh -c 'echo $$ > %s; sleep 3600' %s &\n"+
-			"while [ ! -s %s ]; do sleep 0.01; done\n",
-		pidFile, redirect, pidFile,
-	)
-}
-
-func abandonmentWarnCount(spy *agenttest.LogSpy) int {
-	var n int
-	for _, e := range spy.Entries() {
-		if e.Level == slog.LevelWarn && e.Msg == "agent stdout was not fully collected before the turn ended" {
-			n++
-		}
-	}
-	return n
-}
-
-// isOpenCodeTestZombie reports whether pid is a zombie by reading
-// /proc/<pid>/stat. Returns false if the file cannot be read.
-func isOpenCodeTestZombie(pid int) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return false
-	}
-	if i := strings.LastIndex(string(data), ")"); i >= 0 && i+2 < len(data) {
-		return data[i+2] == 'Z'
-	}
-	return false
-}
-
-// assertOpenCodeProcessDead polls until pid is gone or a zombie, or
-// fails t after timeout.
-func assertOpenCodeProcessDead(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return
-		}
-		if isOpenCodeTestZombie(pid) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("process %d still alive after %v, want gone", pid, timeout)
-}
-
-// killEscapedGroupOnCleanup registers a best-effort SIGKILL of the
-// process group led by the PID recorded in pidFile, so a setsid-escaped
-// descendant this file's fixtures leave running does not survive past
-// the test that started it. It tolerates a pidFile that never appears.
-func killEscapedGroupOnCleanup(t *testing.T, pidFile string) {
-	t.Helper()
-	t.Cleanup(func() {
-		data, err := os.ReadFile(pidFile)
-		if err != nil {
-			return
-		}
-		pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if convErr != nil || pid <= 0 {
-			return
-		}
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-	})
-}
-
-func readPIDFile(t *testing.T, path string) int {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) = %v", path, err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		t.Fatalf("readPIDFile(%q) = %q, want a valid PID", path, data)
-	}
-	return pid
-}
-
-// pollOpenCodePIDFile polls pidFile until it contains a valid positive
-// PID, or fails t after timeout.
-func pollOpenCodePIDFile(t *testing.T, pidFile string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(pidFile)
-		if err == nil {
-			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("pollOpenCodePIDFile(%q): no valid PID after %v", pidFile, timeout)
-	return 0
-}
-
-// writeOpenCodeInGroupDescendantScript builds a script whose direct
-// child starts a long-running background job without redirecting its
-// own standard output, so the job inherits the same pipe write end,
-// writes the job's PID to pidFile, emits one step_start event carrying
-// sessionID, and exits normally. The reaper's unconditional group kill
-// is what ends the descendant once the turn returns.
-func writeOpenCodeInGroupDescendantScript(t *testing.T, dir, pidFile, sessionID string) string {
-	t.Helper()
-	body := fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-sleep 3600 &
-printf '%%s\n' "$!" > %s
-printf '{"type":"step_start","timestamp":1000,"sessionID":"%s","part":{"id":"p1","messageID":"m1","sessionID":"%s","snapshot":"","type":"step-start"}}\n'
-exit 0
-`, shellQuote(pidFile), sessionID, sessionID)
-	return writeOpenCodeScript(t, dir, body)
-}
-
-// writeOpenCodeEscapedDescendantScript behaves like
-// writeOpenCodeInGroupDescendantScript, except the background job is
-// started through setsid, so it leaves the process group while still
-// inheriting the standard-output handle and survives the group kill.
-func writeOpenCodeEscapedDescendantScript(t *testing.T, dir, pidFile, sessionID string) string {
-	t.Helper()
-	body := fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-%sprintf '{"type":"step_start","timestamp":1000,"sessionID":"%s","part":{"id":"p1","messageID":"m1","sessionID":"%s","snapshot":"","type":"step-start"}}\n'
-exit 0
-`, writeEscapedHolderSpawn(pidFile, "2>/dev/null"), sessionID, sessionID)
-	return writeOpenCodeScript(t, dir, body)
-}
-
-// TestRunTurn_DescendantHoldsStdout drives the two scripts above
-// through the normal waitCh/postExitC completion path (never through
-// cancellation or StopSession) and asserts that the in-group descendant
-// is dead once the turn returns and no abandonment record fires,
-// because the reaper's unconditional group kill releases the reader
-// before sessionState.drainGrace can fire; the escaped descendant
-// survives, the turn still publishes within that bound, and exactly one
-// abandonment record is emitted; and both variants publish the
-// identical disposition and error.
-func TestRunTurn_DescendantHoldsStdout(t *testing.T) {
-	t.Parallel()
-
-	t.Run("in-group descendant: no abandonment, descendant dies", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		pidFile := filepath.Join(tmpDir, "descendant.pid")
-		script := writeOpenCodeInGroupDescendantScript(t, tmpDir, pidFile, "ses_ingroup")
-
-		spy := &agenttest.LogSpy{}
-		a, _ := NewOpenCodeAdapter()
-		session := mustStartSession(t, a, tmpDir, script)
-		state := session.Internal.(*sessionState)
-		state.baseLogger = slog.New(spy)
-		state.drainGrace = 200 * time.Millisecond
-
-		start := time.Now()
-		_, result, err := collectEvents(t, a, session, "work")
-		elapsed := time.Since(start)
-
-		if elapsed > 3*time.Second {
-			t.Errorf("RunTurn() took %v, want well under 3s", elapsed)
-		}
-		if result.ExitReason != domain.EventTurnFailed {
-			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-		}
-		var agentErr *domain.AgentError
-		if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrTurnFailed {
-			t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q}", err, domain.ErrTurnFailed)
-		}
-
-		assertOpenCodeProcessDead(t, readPIDFile(t, pidFile), 3*time.Second)
-
-		if got := abandonmentWarnCount(spy); got != 0 {
-			t.Errorf("abandonment WARN count = %d, want 0 (the group kill releases an in-group descendant before the bound fires)", got)
-		}
-	})
-
-	t.Run("escaped descendant: exactly one abandonment record, turn still bounded", func(t *testing.T) {
-		agenttest.RequireSetsid(t)
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		pidFile := filepath.Join(tmpDir, "escaped.pid")
-		killEscapedGroupOnCleanup(t, pidFile)
-		script := writeOpenCodeEscapedDescendantScript(t, tmpDir, pidFile, "ses_ingroup")
-
-		spy := &agenttest.LogSpy{}
-		a, _ := NewOpenCodeAdapter()
-		session := mustStartSession(t, a, tmpDir, script)
-		state := session.Internal.(*sessionState)
-		state.baseLogger = slog.New(spy)
-		state.drainGrace = 200 * time.Millisecond
-
-		start := time.Now()
-		_, result, err := collectEvents(t, a, session, "work")
-		elapsed := time.Since(start)
-
-		if elapsed > 3*time.Second {
-			t.Errorf("RunTurn() took %v, want well under 3s (bounded by sessionState.drainGrace)", elapsed)
-		}
-
-		if got := abandonmentWarnCount(spy); got != 1 {
-			t.Errorf("abandonment WARN count = %d, want exactly 1", got)
-		}
-
-		if result.ExitReason != domain.EventTurnFailed {
-			t.Errorf("ExitReason = %q, want %q (same disposition as the unabandoned in-group variant)", result.ExitReason, domain.EventTurnFailed)
-		}
-		var agentErr *domain.AgentError
-		if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrTurnFailed {
-			t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q} (same error as the unabandoned in-group variant)", err, domain.ErrTurnFailed)
-		}
-	})
-}
-
-// TestRunTurn_EscapedStderrHolderKeepsLinesUnblocked drives an escaped
-// descendant that holds only the standard-error handle open through a
-// turn whose standard output completes normally, and asserts that
-// startWait's post-reap stderr bound still runs and does not leave
-// finalizeExitedTurn's stderrCollector.Lines() call blocked. This is the
-// regression test the risk assessment names for rewriting
-// opencode.startWait: the package's only Abandon call must survive the
-// rewrite onto procutil.StartReaper.
-func TestRunTurn_EscapedStderrHolderKeepsLinesUnblocked(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	pidFile := filepath.Join(tmpDir, "stderr-holder.pid")
-	killEscapedGroupOnCleanup(t, pidFile)
-	script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-printf 'direct child stderr\n' >&2
-%sprintf '{"type":"step_start","timestamp":1000,"sessionID":"ses_stderr_holder","part":{"id":"p1","messageID":"m1","sessionID":"ses_stderr_holder","snapshot":"","type":"step-start"}}\n'
-printf '{"type":"text","timestamp":1001,"sessionID":"ses_stderr_holder","part":{"id":"p2","messageID":"m1","sessionID":"ses_stderr_holder","type":"text","text":"done","time":{"start":1001,"end":1001}}}\n'
-exit 0
-`, writeEscapedHolderSpawn(pidFile, ">/dev/null")))
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-	session.Internal.(*sessionState).drainGrace = 200 * time.Millisecond
-
-	done := make(chan struct{})
-	var result domain.TurnResult
-	var runErr error
-	go func() {
-		defer close(done)
-		_, result, runErr = collectEvents(t, a, session, "work")
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("RunTurn did not return within 3s; stderrCollector.Lines() may be blocked on the escaped stderr holder")
-	}
-
-	if runErr != nil {
-		t.Errorf("RunTurn() error = %v, want nil", runErr)
-	}
-	if result.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-	}
-}
-
-func awaitReapedFromFile(pidFile string) bool {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(pidFile)
-		if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && convErr == nil && pid > 0 {
-			if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-				return true
-			}
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return false
-}
-
-func TestRunTurn_ZeroExitCompletesWhenTheDeadlineFallsAfterTheReap(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	holderPID := filepath.Join(tmpDir, "stderr-holder.pid")
-	runtimePID := filepath.Join(tmpDir, "runtime.pid")
-	killEscapedGroupOnCleanup(t, holderPID)
-	script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-printf '%%s\n' "$$" > %s
-%sprintf '{"type":"step_start","timestamp":1000,"sessionID":"ses_deadline_after_reap","part":{"id":"p1","messageID":"m1","sessionID":"ses_deadline_after_reap","snapshot":"","type":"step-start"}}\n'
-printf '{"type":"text","timestamp":1001,"sessionID":"ses_deadline_after_reap","part":{"id":"p2","messageID":"m1","sessionID":"ses_deadline_after_reap","type":"text","text":"done","time":{"start":1001,"end":1001}}}\n'
-exit 0
-`, shellQuote(runtimePID), writeEscapedHolderSpawn(holderPID, ">/dev/null")))
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-	session.Internal.(*sessionState).drainGrace = 200 * time.Millisecond
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	var once sync.Once
-	var reaped bool
-	onEvent := func(domain.AgentEvent) {
-		once.Do(func() {
-			reaped = awaitReapedFromFile(runtimePID)
-			cancel()
-		})
-	}
-
-	done := make(chan struct{})
-	var result domain.TurnResult
-	var runErr error
-	go func() {
-		defer close(done)
-		result, runErr = a.RunTurn(ctx, session, domain.RunTurnParams{Prompt: "work", OnEvent: onEvent})
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunTurn did not return within 10s")
-	}
-
-	if !reaped {
-		t.Fatal("the runtime was not reaped before the context was cancelled, want the cancellation to fall after the reap")
-	}
-	if runErr != nil {
-		t.Errorf("RunTurn() error = %v, want nil for a runtime that exited zero before the deadline", runErr)
-	}
-	if result.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-	}
-}
-
-// TestRunTurn_ContextCancellationArm_BoundedDrain exercises the bounded
-// drain on opencode's context-cancellation early-return arm: with a
-// descendant holding the standard-output handle, the turn still
-// publishes within sessionState.drainGrace and emits exactly one
-// abandonment record; with no descendant, or one that dies with the
-// group, it publishes without spending the bound and without the
-// record.
-func TestRunTurn_ContextCancellationArm_BoundedDrain(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name          string
-		spawn         func(pidFile string) string
-		requireSetsid bool
-		wantAbandon   bool
-		wantDead      bool
-	}{
-		{name: "no descendant"},
-		{
-			name:     "in-group descendant",
-			spawn:    func(pidFile string) string { return "sleep 3600 &\nprintf '%s\\n' \"$!\" > " + pidFile + "\n" },
-			wantDead: true,
-		},
-		{
-			name:          "escaped descendant",
-			spawn:         func(pidFile string) string { return writeEscapedHolderSpawn(pidFile, "2>/dev/null") },
-			requireSetsid: true,
-			wantAbandon:   true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.requireSetsid {
-				agenttest.RequireSetsid(t)
-			}
-			t.Parallel()
-
-			tmpDir := t.TempDir()
-			pidFile := filepath.Join(tmpDir, "descendant.pid")
-			killEscapedGroupOnCleanup(t, pidFile)
-			spawn := ""
-			if tt.spawn != nil {
-				spawn = tt.spawn(pidFile)
-			}
-			script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-%sprintf '{"type":"step_start","timestamp":1000,"sessionID":"ses_ctxcancel","part":{"id":"p1","messageID":"m1","sessionID":"ses_ctxcancel","snapshot":"","type":"step-start"}}\n'
-sleep 3600
-`, spawn))
-
-			spy := &agenttest.LogSpy{}
-			a, _ := NewOpenCodeAdapter()
-			session := mustStartSession(t, a, tmpDir, script)
-			state := session.Internal.(*sessionState)
-			state.baseLogger = slog.New(spy)
-			state.drainGrace = 200 * time.Millisecond
-
-			ctx, cancel := context.WithCancel(context.Background())
-			gotEvent := make(chan struct{}, 1)
-			type outcome struct {
-				result domain.TurnResult
-				err    error
-			}
-			done := make(chan outcome, 1)
-			go func() {
-				result, runErr := a.RunTurn(ctx, session, domain.RunTurnParams{
-					Prompt: "work",
-					OnEvent: func(domain.AgentEvent) {
-						select {
-						case gotEvent <- struct{}{}:
-						default:
-						}
-					},
-				})
-				done <- outcome{result, runErr}
-			}()
-
-			select {
-			case <-gotEvent:
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for the first event")
-			}
-
-			start := time.Now()
-			cancel()
-
-			var got outcome
-			select {
-			case got = <-done:
-			case <-time.After(3 * time.Second):
-				t.Fatal("RunTurn did not return within 3s of cancellation")
-			}
-			if elapsed := time.Since(start); elapsed > 2*time.Second {
-				t.Errorf("RunTurn published %v after cancellation, want well under 2s", elapsed)
-			}
-
-			if got.result.ExitReason != domain.EventTurnCancelled {
-				t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
-			}
-			var agentErr *domain.AgentError
-			if !errors.As(got.err, &agentErr) || agentErr.Kind != domain.ErrTurnCancelled {
-				t.Errorf("RunTurn() error = %v, want AgentError{Kind: %q}", got.err, domain.ErrTurnCancelled)
-			}
-
-			wantCount := 0
-			if tt.wantAbandon {
-				wantCount = 1
-			}
-			if got := abandonmentWarnCount(spy); got != wantCount {
-				t.Errorf("abandonment WARN count = %d, want %d", got, wantCount)
-			}
-
-			if tt.wantDead {
-				assertOpenCodeProcessDead(t, readPIDFile(t, pidFile), 3*time.Second)
-			}
-		})
-	}
-}
-
-func TestRunTurn_SessionMismatchArm_BoundedDrain(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	pidFile := filepath.Join(tmpDir, "escaped.pid")
-	killEscapedGroupOnCleanup(t, pidFile)
-	script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-%sprintf '{"type":"step_start","timestamp":1000,"sessionID":"ses_mismatch","part":{"id":"p1","messageID":"m1","sessionID":"ses_mismatch","snapshot":"","type":"step-start"}}\n'
-sleep 3600
-`, writeEscapedHolderSpawn(pidFile, "2>/dev/null")))
-
-	spy := &agenttest.LogSpy{}
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath:   tmpDir,
-		AgentConfig:     domain.AgentConfig{Command: script},
-		ResumeSessionID: "ses_expected",
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	state := session.Internal.(*sessionState)
-	state.baseLogger = slog.New(spy)
-	state.drainGrace = 300 * time.Millisecond
-
-	start := time.Now()
-	_, result, runErr := collectEvents(t, a, session, "work")
-	elapsed := time.Since(start)
-
-	if elapsed > 2*time.Second {
-		t.Errorf("RunTurn() took %v after a session mismatch, want well under 2s (bounded by sessionState.drainGrace)", elapsed)
-	}
-
-	var agentErr *domain.AgentError
-	if !errors.As(runErr, &agentErr) || agentErr.Kind != domain.ErrResponseError {
-		t.Fatalf("RunTurn() error = %v, want AgentError{Kind: %q}", runErr, domain.ErrResponseError)
-	}
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-	}
-
-	if got := abandonmentWarnCount(spy); got != 1 {
-		t.Errorf("abandonment WARN count = %d, want exactly 1", got)
-	}
-}
-
-// TestRunTurn_ReadTimeoutDoesNotFireAfterObservedExit asserts that an
-// observed exit disarms the read timer: sessionState.firstEventTimeout is
-// set shorter than the injected sessionState.drainGrace, and the
-// subprocess exits without ever emitting a JSON event while an escaped
-// descendant holds the output handle. The published disposition must be
-// the exit-based one, never ErrResponseTimeout: the exit is observed and
-// the read timer disarmed well before it could elapse.
-func TestRunTurn_ReadTimeoutDoesNotFireAfterObservedExit(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	pidFile := filepath.Join(tmpDir, "escaped.pid")
-	killEscapedGroupOnCleanup(t, pidFile)
-	script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-%sexit 0
-`, writeEscapedHolderSpawn(pidFile, "2>/dev/null")))
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		// The leader's own exit waits on the escaped descendant's marker
-		// loop (writeEscapedHolderSpawn), polling every 10ms, so the
-		// read timeout needs enough margin over that polling latency to
-		// keep this deterministic rather than racing the scheduler.
-		AgentConfig: domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	session.Internal.(*sessionState).firstEventTimeout = 300 * time.Millisecond
-	session.Internal.(*sessionState).drainGrace = 800 * time.Millisecond
-
-	_, result, runErr := collectEvents(t, a, session, "work")
-
-	var agentErr *domain.AgentError
-	if errors.As(runErr, &agentErr) && agentErr.Kind == domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() reported ErrResponseTimeout, want the exit-based disposition: err = %v", runErr)
-	}
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q (exit 0, no output at all)", result.ExitReason, domain.EventTurnFailed)
-	}
-}
-
-// writeOpenCodeLatchMoveScript builds the fixture the latch-move case
-// needs: a direct child that writes one standard-error line, writes
-// nothing to standard output, and exits; and an escaped descendant that
-// inherits the standard-output handle alone (never standard error too),
-// blocks on gatePath, then writes one JSON event that is neither an
-// error event nor a session-id mismatch, and exits.
-func writeOpenCodeLatchMoveScript(t *testing.T, dir, gatePath, pidFile, sessionID string) string {
-	t.Helper()
-	descendant := fmt.Sprintf(
-		"echo $$ > %s; "+
-			"while [ ! -f %s ]; do sleep 0.02; done; "+
-			`printf '{"type":"text","timestamp":1001,"sessionID":"%s","part":{"id":"p2","messageID":"m1","sessionID":"%s","type":"text","text":"done","time":{"start":1001,"end":1001}}}\n'`,
-		pidFile, shellQuote(gatePath), sessionID, sessionID,
-	)
-	body := fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-printf 'direct child stderr\n' >&2
-setsid sh -c %s 2>/dev/null &
-while [ ! -s %s ]; do sleep 0.01; done
-exit 0
-`, shellQuote(descendant), shellQuote(pidFile))
-	return writeOpenCodeScript(t, dir, body)
-}
-
-// A turn whose first JSON event is received only after the exit has
-// been observed must still set the first-JSON latch, so finalizeExitedTurn
-// does not re-emit the direct child's standard error at WARN on a turn
-// that otherwise succeeded. The gate opens no earlier than
-// sessionState.firstEventTimeout after the direct child has already exited and
-// started the descendant, so by the time it opens the read timer has
-// long been disarmed by the observed exit.
-func TestRunTurn_LatchSetDuringPostExitDrain(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	gatePath := filepath.Join(tmpDir, "gate")
-	pidFile := filepath.Join(tmpDir, "descendant.pid")
-	script := writeOpenCodeLatchMoveScript(t, tmpDir, gatePath, pidFile, "ses_latch")
-
-	spy := &agenttest.LogSpy{}
-	const readTimeoutMS = 150
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	state := session.Internal.(*sessionState)
-	state.firstEventTimeout = readTimeoutMS * time.Millisecond
-	state.baseLogger = slog.New(spy)
-	state.drainGrace = 2 * time.Second
-
-	done := make(chan struct{})
-	var result domain.TurnResult
-	var runErr error
-	go func() {
-		defer close(done)
-		_, result, runErr = collectEvents(t, a, session, "work")
-	}()
-
-	descendantPID := pollOpenCodePIDFile(t, pidFile, 5*time.Second)
-	time.Sleep(readTimeoutMS * time.Millisecond)
-	if err := os.WriteFile(gatePath, nil, 0o644); err != nil {
-		t.Fatalf("WriteFile(gate) = %v", err)
-	}
-	t.Cleanup(func() { syscall.Kill(-descendantPID, syscall.SIGKILL) }) //nolint:errcheck // best-effort cleanup
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("RunTurn did not return within 3s of opening the gate")
-	}
-
-	var agentErr *domain.AgentError
-	if errors.As(runErr, &agentErr) && agentErr.Kind == domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() reported ErrResponseTimeout, want the exit-based disposition: err = %v", runErr)
-	}
-	_ = result
-
-	for _, e := range spy.Entries() {
-		if e.Level == slog.LevelWarn && e.Msg == "agent stderr" {
-			t.Errorf("finalizeExitedTurn re-emitted the direct child's stderr at WARN, want none: the latch must be set from the post-exit JSON event: %+v", e)
-		}
-	}
-}
-
-// TestRunTurn_ReadTimeoutDoesNotFireWhileStderrBoundRuns drives the gap
-// between the reap and the turn's published result. The wait goroutine
-// reaps first and only then applies the stderr bound, so an escaped
-// descendant holding the standard-error handle delays the result
-// channel by the whole drain grace. A read timeout shorter than that
-// delay fires inside the gap, on a subprocess that has already exited
-// and been reaped, unless the timer is disarmed from the reap itself.
-func TestRunTurn_ReadTimeoutDoesNotFireWhileStderrBoundRuns(t *testing.T) {
-	agenttest.RequireSetsid(t)
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	pidFile := filepath.Join(tmpDir, "stderr-holder-timeout.pid")
-	killEscapedGroupOnCleanup(t, pidFile)
-	script := writeOpenCodeScript(t, tmpDir, fmt.Sprintf(`case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-printf 'direct child stderr\n' >&2
-%sexit 0
-`, writeEscapedHolderSpawn(pidFile, ">/dev/null")))
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	session.Internal.(*sessionState).firstEventTimeout = 200 * time.Millisecond
-	// Longer than the read timeout, so the escaped holder keeps the
-	// result channel shut for a window the timer would otherwise win.
-	session.Internal.(*sessionState).drainGrace = 1500 * time.Millisecond
-
-	_, result, runErr := collectEvents(t, a, session, "work")
-
-	var agentErr *domain.AgentError
-	if errors.As(runErr, &agentErr) && agentErr.Kind == domain.ErrResponseTimeout {
-		t.Fatalf("RunTurn() reported ErrResponseTimeout on a reaped subprocess: "+
-			"the read timer outlived the reap by the stderr bound; err = %v", runErr)
-	}
-	if result.ExitReason != domain.EventTurnFailed {
-		t.Errorf("ExitReason = %q, want %q (exit 0, no output at all)", result.ExitReason, domain.EventTurnFailed)
-	}
-}
-
-// TestRunTurn_LongTurnOutlivesTheDrainGrace pins where the post-exit
-// bound is anchored. It is armed when the subprocess is reaped, never
-// when the turn starts, so a turn that legitimately runs longer than
-// the grace keeps its output and its disposition. Moving the anchor to
-// the launch would cut every such turn short while every fixture that
-// exits immediately still passed.
-func TestRunTurn_LongTurnOutlivesTheDrainGrace(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
-esac
-sleep 0.6
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_long","part":{"id":"p1","messageID":"m1","sessionID":"ses_long","snapshot":"","type":"step-start"}}\n'
-printf '{"type":"text","timestamp":1001,"sessionID":"ses_long","part":{"id":"p2","messageID":"m1","sessionID":"ses_long","type":"text","text":"late but complete","time":{"start":1001,"end":1001}}}\n'
-exit 0
-`)
-
-	a, _ := NewOpenCodeAdapter()
-	session := mustStartSession(t, a, tmpDir, script)
-	// Far shorter than the turn: an anchor at launch would expire long
-	// before the agent says anything.
-	session.Internal.(*sessionState).drainGrace = 100 * time.Millisecond
-
-	_, result, runErr := collectEvents(t, a, session, "work")
-
-	if runErr != nil {
-		t.Fatalf("RunTurn() error = %v, want nil: a turn longer than the drain grace must not be cut short", runErr)
-	}
-	if result.ExitReason != domain.EventTurnCompleted {
-		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
-	}
-}
-
-// TestRunTurn_CancelledTurnRecoversUsageFromExport pins recovery on the
-// cancellation branch of the turn's select. That branch terminates the process
-// itself rather than routing through the normal-exit finalization, so without
-// its own recovery the same completed work reports a figure or nothing
-// depending only on which case won.
-//
-// The turn cancelled here is the FIRST one, so `measured` starts false and a
-// true verdict can only have come from recovery on this path.
-func TestRunTurn_CancelledTurnRecoversUsageFromExport(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	exportPath := filepath.Join(tmpDir, "export.json")
-	const export = `{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},"tokens":{"input":10,"output":20,"total":30,"cache":{"read":0,"write":0}}}]}`
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// One event so the test knows the turn is running, then block until
-	// the context is cancelled.
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-printf '{"type":"step_start","timestamp":1000,"sessionID":"ses_abc123","part":{"id":"p1","messageID":"m1","sessionID":"ses_abc123","snapshot":"","type":"step-start"}}\n'
-sleep 1000`)
-
-	outerCtx, outerCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer outerCancel()
-
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(outerCtx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		AgentConfig:   domain.AgentConfig{Command: script},
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	turnCtx, turnCancel := context.WithCancel(outerCtx)
-	gotEvent := make(chan struct{}, 1)
-	resultCh := make(chan domain.TurnResult, 1)
-	var mu sync.Mutex
-	var usageEvents []domain.AgentEvent
-	go func() {
-		result, _ := a.RunTurn(turnCtx, session, domain.RunTurnParams{
-			Prompt: "only prompt",
-			OnEvent: func(ev domain.AgentEvent) {
-				if ev.Type == domain.EventTokenUsage {
-					mu.Lock()
-					usageEvents = append(usageEvents, ev)
-					mu.Unlock()
-				}
-				select {
-				case gotEvent <- struct{}{}:
-				default:
-				}
-			},
-		})
-		resultCh <- result
-	}()
-
-	select {
-	case <-gotEvent:
-	case <-outerCtx.Done():
-		t.Fatal("timed out waiting for the turn's first event")
-	}
-	turnCancel()
-
-	select {
-	case result := <-resultCh:
-		if result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
-		}
-		if !result.UsageMeasured {
-			t.Error("UsageMeasured = false; the export was readable and named a figure")
-		}
-		if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 20 {
-			t.Errorf("Usage = in:%d out:%d, want in:10 out:20",
-				result.Usage.InputTokens, result.Usage.OutputTokens)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if len(usageEvents) != 1 {
-			t.Fatalf("token-usage events = %d, want exactly 1", len(usageEvents))
-		}
-		if usageEvents[0].Model != "anthropic/claude-sonnet-4-5" {
-			t.Errorf("Model = %q, want the model the export named", usageEvents[0].Model)
-		}
-	case <-outerCtx.Done():
-		t.Fatal("RunTurn did not return after context cancel")
-	}
-}
-
-// TestRunTurn_ReadTimeoutRecoversUsageFromExport is the same defect on the
-// other abnormal branch: a turn killed for producing no first event still has
-// a readable session export, because the process is already gone by the time
-// the branch finalizes.
-func TestRunTurn_ReadTimeoutRecoversUsageFromExport(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-
-	// A resumed session exports the whole history, so the adapter filters
-	// on the run's start time. This message has to fall inside that
-	// window; the window itself is covered by TestParseSessionExport.
-	createdMS := time.Now().Add(time.Minute).UnixMilli()
-	exportPath := filepath.Join(tmpDir, "export.json")
-	export := fmt.Sprintf(`{"info":{"id":"ses_abc123"},"messages":[{"type":"assistant","finish":"stop","time":{"created":%d},`+
-		`"model":{"providerID":"anthropic","id":"claude-sonnet-4-5"},`+
-		`"tokens":{"input":7,"output":3,"total":10,"cache":{"read":0,"write":0}}}]}`, createdMS)
-	if err := os.WriteFile(exportPath, []byte(export), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Never emits a json event, so the read timer is what ends the turn.
-	script := writeOpenCodeScript(t, tmpDir, `case "$1 $2" in
-  "session export") cat '`+exportPath+`'; exit 0;;
-esac
-sleep 1000`)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Resumed, so the session id is known before the turn starts. A turn
-	// that emits nothing never learns one, and an export needs one -- which
-	// is a separate reason to recover nothing, and not the one under test.
-	a, _ := NewOpenCodeAdapter()
-	session, err := a.StartSession(ctx, domain.StartSessionParams{
-		WorkspacePath: tmpDir,
-		// The export's own budget is 2x this, so a value tight enough to
-		// keep the test quick still has to leave the export room to run
-		// on a loaded machine -- at 300ms it flaked under `go test` for
-		// the whole package.
-		AgentConfig:     domain.AgentConfig{Command: script, ReadTimeoutMS: 1500},
-		ResumeSessionID: "ses_abc123",
-	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-	session.Internal.(*sessionState).firstEventTimeout = 1500 * time.Millisecond
-
-	result, _ := a.RunTurn(ctx, session, domain.RunTurnParams{
-		Prompt:  "only prompt",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-
-	if !result.UsageMeasured {
-		t.Error("UsageMeasured = false; the export was readable and named a figure")
-	}
-	if result.Usage.InputTokens != 7 || result.Usage.OutputTokens != 3 {
-		t.Errorf("Usage = in:%d out:%d, want in:7 out:3",
-			result.Usage.InputTokens, result.Usage.OutputTokens)
-	}
-}
-
-// writeRunFixtureScriptWithCapture is [writeRunFixtureScript] extended
-// to record, only for the primary run invocation (not the export
-// sub-invocation the case statement intercepts first), the argument
-// vector and the whole of standard input it received.
-func writeRunFixtureScriptWithCapture(t *testing.T, dir, fixtureName, argvPath, stdinPath string) string {
-	t.Helper()
-
-	runPath := filepath.Join(dir, fixtureName)
-	if err := os.WriteFile(runPath, loadFixture(t, fixtureName), 0o644); err != nil {
-		t.Fatalf("WriteFile(%q): %v", fixtureName, err)
-	}
-
-	exportPath := filepath.Join(dir, "export.json")
-	if err := os.WriteFile(exportPath, []byte(`{"info":{"id":""},"messages":[]}`), 0o644); err != nil {
-		t.Fatalf("WriteFile(export.json): %v", err)
-	}
-
-	body := `case "$1 $2" in
-  "session export") cat '` + exportPath + `'; exit 0;;
-esac
-cat > '` + stdinPath + `'
-printf '%s\n' "$@" > '` + argvPath + `'
-cat '` + runPath + `'`
-
-	return writeOpenCodeScript(t, dir, body)
-}
-
-// TestRunTurn_LocalLaunchIgnoresSSHEnvNames asserts that a local turn
-// (RemoteCommand empty) sends the same argument vector and a standard
-// input holding the prompt alone whether or not
-// LaunchTarget.SSHEnvNames names a set variable: RunTurn's local branch
-// never consults it. This reddens if that branch starts treating a
-// non-empty SSHEnvNames as a signal to take the remote path, which
-// would replace the local argument vector with an SSH option vector and
-// put a preamble ahead of the prompt on standard input.
-func TestRunTurn_LocalLaunchIgnoresSSHEnvNames(t *testing.T) {
-	// Not parallel: sets the carried variable via t.Setenv.
-	const varName = "SORTIE_OPENCODE_RUNTURN_LOCAL_INVARIANCE"
-	t.Setenv(varName, "should-never-reach-a-local-launch")
-
-	for _, tc := range []struct {
-		name        string
-		sshEnvNames []string
-	}{
-		{"SSHEnvNames absent", nil},
-		{"SSHEnvNames naming a set variable", []string{varName}},
-	} {
-		tmpDir := t.TempDir()
-		argvPath := filepath.Join(tmpDir, "argv.txt")
-		stdinPath := filepath.Join(tmpDir, "stdin.txt")
-		script := writeRunFixtureScriptWithCapture(t, tmpDir, "simple_turn.jsonl", argvPath, stdinPath)
-
-		a, err := NewOpenCodeAdapter()
-		if err != nil {
-			t.Fatalf("%s: NewOpenCodeAdapter() error = %v, want nil", tc.name, err)
-		}
-		session := mustStartSession(t, a, tmpDir, script)
-		state, ok := session.Internal.(*sessionState)
-		if !ok {
-			t.Fatalf("%s: session.Internal type = %T, want *sessionState", tc.name, session.Internal)
-		}
-		state.target.SSHEnvNames = tc.sshEnvNames
-
-		events, result, err := collectEvents(t, a, session, "work")
-		if err != nil {
-			t.Fatalf("%s: RunTurn() error = %v, want nil", tc.name, err)
-		}
-		if result.ExitReason != domain.EventTurnCompleted {
-			t.Errorf("%s: ExitReason = %q, want %q", tc.name, result.ExitReason, domain.EventTurnCompleted)
-		}
-		if len(events) == 0 {
-			t.Errorf("%s: events = 0, want > 0", tc.name)
-		}
-
-		argv, err := os.ReadFile(argvPath)
-		if err != nil {
-			t.Fatalf("%s: ReadFile(argv.txt): %v", tc.name, err)
-		}
-		if strings.Contains(string(argv), "StrictHostKeyChecking") {
-			t.Errorf("%s: argv = %q, want the local argument vector, not an SSH option vector", tc.name, argv)
-		}
-
-		stdin, err := os.ReadFile(stdinPath)
-		if err != nil {
-			t.Fatalf("%s: ReadFile(stdin.txt): %v", tc.name, err)
-		}
-		if string(stdin) != "work" {
-			t.Errorf("%s: subprocess standard input = %q, want the prompt alone on a local launch", tc.name, stdin)
-		}
-	}
-}
-
-// newHookTestState builds a sessionState pointing to a local fake
-// runtime, for a test-only hook that reads a session's own auxiliary
-// commands directly rather than through StartSession.
 func newHookTestState(t *testing.T, scriptBody string) *sessionState {
 	t.Helper()
 

@@ -10,13 +10,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
@@ -31,8 +34,11 @@ func init() {
 	registry.Agents.RegisterWithMeta(fixtureBudgetAgentKind, func() (domain.AgentAdapter, error) {
 		return nil, fmt.Errorf("%s is resolved through AgentAdapterByKind, never constructed from the registry", fixtureBudgetAgentKind)
 	}, registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalIncremental,
-		UsageAttribution: registry.UsageAttributionSessionTotal,
+		UsageSources: usage.Sources{Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, DuringTurn: true},
+		}},
 	})
 
 	registry.Trackers.RegisterWithMeta(fixtureBudgetTrackerKind, func(map[string]any) (domain.TrackerAdapter, error) {
@@ -89,9 +95,8 @@ func (tr *budgetE2ETracker) FetchIssueComments(_ context.Context, _ string) ([]d
 }
 
 func (tr *budgetE2ETracker) TransitionIssue(_ context.Context, _ string, _ string) error { return nil }
-func (tr *budgetE2ETracker) CommentIssue(_ context.Context, _ string, _ string) error    { return nil }
-func (tr *budgetE2ETracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
-	return nil
+func (tr *budgetE2ETracker) CommentIssue(_ context.Context, _ string, _ string) (string, error) {
+	return "comment-1", nil
 }
 func (tr *budgetE2ETracker) AddLabel(_ context.Context, _ string, _ string) error { return nil }
 
@@ -177,28 +182,22 @@ func (m *budgetE2EWorkflowManager) WorkflowAbsPath() string { return m.absPath }
 
 func (m *budgetE2EWorkflowManager) LoadStatus() workflow.LoadStatus { return workflow.LoadStatus{} }
 
-func waitForSessionMetadataTotal(t *testing.T, store *persistence.Store, issueID string, want int64, deadline time.Duration) persistence.SessionMetadata {
+func waitForSessionMetadataTotal(t *testing.T, store storage.SessionMetadataStore, issueID string, want int64) storage.SessionMetadata {
 	t.Helper()
-	ctx := context.Background()
-	timeout := time.After(deadline)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		meta, found, err := store.LoadSessionMetadata(ctx, issueID)
+	var meta storage.SessionMetadata
+	waittest.Until(t, func() error {
+		var found bool
+		var err error
+		meta, found, err = store.LoadSessionMetadata(t.Context(), issueID)
 		if err != nil {
 			t.Fatalf("LoadSessionMetadata: %v", err)
 		}
-		if found && meta.TotalTokens == want {
-			return meta
+		if !found || meta.TotalTokens != want {
+			return fmt.Errorf("session_metadata.total_tokens: found=%v, total=%d, want %d", found, meta.TotalTokens, want)
 		}
-		select {
-		case <-ticker.C:
-		case <-timeout:
-			t.Fatalf("session_metadata.total_tokens did not reach %d within %s (last observed: found=%v, total=%d)",
-				want, deadline, found, meta.TotalTokens)
-		}
-	}
+		return nil
+	})
+	return meta
 }
 
 type costBudgetResult struct {
@@ -235,7 +234,7 @@ func TestMCPServerBudget(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "budget-e2e.db")
 
-	rw, err := persistence.Open(ctx, dbPath)
+	rw, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
 	}
@@ -252,7 +251,7 @@ func TestMCPServerBudget(t *testing.T) {
 	const identifier = "BUDGET-E2E-1"
 	const budgetTokens = 1000
 
-	if _, err := rw.AppendRunHistory(ctx, persistence.RunHistory{
+	if _, err := rw.AppendRunHistory(ctx, storage.RunHistory{
 		IssueID:         issueID,
 		Identifier:      identifier,
 		Attempt:         1,
@@ -337,12 +336,7 @@ func TestMCPServerBudget(t *testing.T) {
 		<-runDone
 	})
 
-	var startParams domain.StartSessionParams
-	select {
-	case startParams = <-agent.started:
-	case <-time.After(15 * time.Second):
-		t.Fatal("StartSession was not called within 15 seconds")
-	}
+	startParams := waittest.Receive(t, agent.started, "StartSession call")
 	if startParams.MCPConfigPath == "" {
 		t.Fatal("StartSessionParams.MCPConfigPath is empty, want non-empty")
 	}
@@ -395,6 +389,11 @@ func TestMCPServerBudget(t *testing.T) {
 		t.Fatal("SessionToolRegistry.Store is nil, want a read-only store backing cost_budget")
 	}
 
+	sessions, ok := reg.Store.(storage.SessionMetadataStore)
+	if !ok {
+		t.Fatalf("SessionToolRegistry.Store = %T, want a storage.SessionMetadataStore", reg.Store)
+	}
+
 	costBudget, ok := reg.Registry.Get("cost_budget")
 	if !ok {
 		t.Fatal("cost_budget tool not registered")
@@ -412,7 +411,7 @@ func TestMCPServerBudget(t *testing.T) {
 	agent.cacheReadTokens = 600
 	agent.emitUsage <- eventTotal
 
-	meta := waitForSessionMetadataTotal(t, reg.Store, issueID, eventTotal, 15*time.Second)
+	meta := waitForSessionMetadataTotal(t, sessions, issueID, eventTotal)
 	if meta.DispatchID != params.DispatchID {
 		t.Fatalf("session_metadata.dispatch_id = %q, want %q (the dispatch id recorded in mcp.json)", meta.DispatchID, params.DispatchID)
 	}
@@ -438,7 +437,7 @@ func TestMCPServerBudget_WarningThreshold(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "budget-warning-e2e.db")
 
-	rw, err := persistence.Open(ctx, dbPath)
+	rw, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", dbPath, err)
 	}
@@ -528,12 +527,7 @@ func TestMCPServerBudget_WarningThreshold(t *testing.T) {
 		<-runDone
 	})
 
-	var startParams domain.StartSessionParams
-	select {
-	case startParams = <-agent.started:
-	case <-time.After(15 * time.Second):
-		t.Fatal("StartSession was not called within 15 seconds")
-	}
+	startParams := waittest.Receive(t, agent.started, "StartSession call")
 
 	rawMCP, err := os.ReadFile(startParams.MCPConfigPath)
 	if err != nil {
@@ -570,13 +564,18 @@ func TestMCPServerBudget_WarningThreshold(t *testing.T) {
 		}
 	})
 
+	sessions, ok := reg.Store.(storage.SessionMetadataStore)
+	if !ok {
+		t.Fatalf("SessionToolRegistry.Store = %T, want a storage.SessionMetadataStore", reg.Store)
+	}
+
 	costBudget, ok := reg.Registry.Get("cost_budget")
 	if !ok {
 		t.Fatal("cost_budget tool not registered")
 	}
 
 	agent.emitUsage <- 600
-	meta1 := waitForSessionMetadataTotal(t, reg.Store, issueID, 600, 15*time.Second)
+	meta1 := waitForSessionMetadataTotal(t, sessions, issueID, 600)
 	if meta1.DispatchID != params.DispatchID {
 		t.Fatalf("session_metadata.dispatch_id = %q, want %q", meta1.DispatchID, params.DispatchID)
 	}
@@ -596,7 +595,7 @@ func TestMCPServerBudget_WarningThreshold(t *testing.T) {
 	// sessionMetadataWriteInterval of the write above: only the pending
 	// write bypassing the throttle lets it reach session_metadata at all.
 	agent.emitUsage <- 1100
-	waitForSessionMetadataTotal(t, reg.Store, issueID, 1100, 15*time.Second)
+	waitForSessionMetadataTotal(t, sessions, issueID, 1100)
 
 	above := executeBudgetTool(t, costBudget)
 	if above.UsedTokens != 1100 {

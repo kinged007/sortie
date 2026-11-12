@@ -13,7 +13,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // mgcTransitionCall records one TransitionIssue invocation.
@@ -32,7 +33,6 @@ type mgcLabelCall struct {
 type mgcCommentCall struct {
 	issueID string
 	text    string
-	literal string
 }
 
 // mgcTrackerFake is a fully controllable domain.TrackerAdapter for
@@ -83,8 +83,9 @@ func (f *mgcTrackerFake) FetchIssueComments(context.Context, string) ([]domain.C
 	return nil, nil
 }
 
-func (f *mgcTrackerFake) FetchIssueStatesAndLabelsByIDs(context.Context, []string) (map[string]domain.IssueStateAndLabels, error) {
-	return nil, nil
+func (f *mgcTrackerFake) FetchIssueStatesAndLabelsByIDs(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+	states, err := f.FetchIssueStatesByIDs(ctx, ids)
+	return statesWithLabels(states, nil), err
 }
 
 func (f *mgcTrackerFake) FetchIssueStatesByIDs(_ context.Context, _ []string) (map[string]string, error) {
@@ -103,16 +104,10 @@ func (f *mgcTrackerFake) TransitionIssue(_ context.Context, issueID, target stri
 	return f.transitionErr
 }
 
-func (f *mgcTrackerFake) CommentIssue(ctx context.Context, issueID, text string) error {
+func (f *mgcTrackerFake) CommentIssue(ctx context.Context, issueID, text string) (string, error) {
 	f.commentCalls = append(f.commentCalls, mgcCommentCall{issueID: issueID, text: text})
 	f.commentCtx = ctx
-	return f.commentErr
-}
-
-func (f *mgcTrackerFake) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	f.commentCalls = append(f.commentCalls, mgcCommentCall{issueID: issueID, text: text, literal: literal})
-	f.commentCtx = ctx
-	return f.commentErr
+	return commentResult(f.commentErr)
 }
 
 func (f *mgcTrackerFake) AddLabel(ctx context.Context, issueID, label string) error {
@@ -174,6 +169,10 @@ type mgcFingerprintRecord struct {
 // cross-kind-clear interaction are exercised against real stored
 // state rather than canned values.
 type mgcStoreFake struct {
+	storage.RunHistoryStore
+	storage.RetryEntryStore
+	storage.ReactionFingerprintStore
+	storage.StageHopStore
 	reactionActivityLog
 	noopOutcomeRecorder
 	noEscalationRecords
@@ -207,12 +206,12 @@ func newMGCStore() *mgcStoreFake {
 	return &mgcStoreFake{fingerprints: make(map[string]mgcFingerprintRecord)}
 }
 
-func (s *mgcStoreFake) SaveRetryEntry(context.Context, persistence.RetryEntry) error { return nil }
+func (s *mgcStoreFake) SaveRetryEntry(context.Context, storage.RetryEntry) error { return nil }
 func (s *mgcStoreFake) DeleteRetryEntry(context.Context, string) error {
 	s.deleteRetryCalls++
 	return nil
 }
-func (s *mgcStoreFake) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (s *mgcStoreFake) AppendRunHistory(_ context.Context, run storage.RunHistory) (storage.RunHistory, error) {
 	return run, nil
 }
 
@@ -265,10 +264,10 @@ func (s *mgcStoreFake) UpsertReactionObservation(
 	_ context.Context,
 	issueID, kind, fingerprint string,
 	observedAt time.Time,
-) (persistence.ReactionObservation, error) {
+) (storage.ReactionObservation, error) {
 	s.observeCalls++
 	if s.observeErr != nil {
-		return persistence.ReactionObservation{}, s.observeErr
+		return storage.ReactionObservation{}, s.observeErr
 	}
 	key := issueID + ":" + kind
 	rec, exists := s.fingerprints[key]
@@ -279,7 +278,7 @@ func (s *mgcStoreFake) UpsertReactionObservation(
 		}
 		s.fingerprints[key] = rec
 	}
-	return persistence.ReactionObservation{
+	return storage.ReactionObservation{
 		FirstObservedAt: rec.updatedAt,
 		Dispatched:      rec.dispatched,
 	}, nil
@@ -553,7 +552,7 @@ func TestReconcileMergeCompletion_RecoveryOverDispatchedFingerprintNoTransition(
 		NowFunc:                           func() time.Time { return recoveryNow },
 		Logger:                            discardLogger(),
 	}
-	result, err := RecoverPendingReactions(context.Background(), state, []persistence.RunHistory{run}, recoverParams)
+	result, err := RecoverPendingReactions(context.Background(), state, []storage.RunHistory{run}, recoverParams)
 	if err != nil {
 		t.Fatalf("RecoverPendingReactions: %v", err)
 	}
@@ -1964,11 +1963,7 @@ func TestReconcileMergeCompletion_MissingSHAMarkerDoesNotWaitForOtherDestination
 	now = now.Add(31 * time.Minute)
 	reconcileMergeCompletion(state, params, discardLogger(), context.Background(), &domain.NoopMetrics{})
 
-	select {
-	case <-store.marked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("observation marker not written while the Slack send is in flight, want it decided by the tracker comment alone")
-	}
+	waittest.Receive(t, store.marked, "observation marker written while the Slack send is in flight")
 	release()
 	state.TrackerOpsWg.Wait()
 

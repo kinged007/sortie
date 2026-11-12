@@ -1,0 +1,176 @@
+//go:build unix
+
+package opencode
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
+)
+
+func limitsRuntime(t *testing.T, limitsAnswer, runFixture string) (dir, script, callLog string) {
+	t.Helper()
+	dir = t.TempDir()
+	callLog = filepath.Join(dir, "limits-calls")
+	runPath, _ := filepath.Abs(filepath.Join("testdata", runFixture))
+	answer := "exit 1"
+	if limitsAnswer != "" {
+		answer = "echo '" + limitsAnswer + "'"
+	}
+	script = writeOpenCodeScript(t, dir, `case "$1 $2" in
+  "api --standalone") echo called >> '`+callLog+`'; `+answer+`;;
+  "session export") echo '{"info":{"id":""},"messages":[]}'; exit 0;;
+esac
+cat '`+runPath+`'`)
+	return dir, script, callLog
+}
+
+func startLimitsSession(t *testing.T, limitsAnswer, runFixture string) (domain.AgentAdapter, domain.Session, string) {
+	t.Helper()
+	dir, script, callLog := limitsRuntime(t, limitsAnswer, runFixture)
+	a, _ := NewOpenCodeAdapter()
+	return a, mustStartSession(t, a, dir, script), callLog
+}
+
+func pulledWindows(events []domain.AgentEvent) []domain.UsageWindow {
+	var windows []domain.UsageWindow
+	for _, e := range events {
+		windows = append(windows, e.UsageWindows...)
+	}
+	return windows
+}
+
+func TestRunTurn_PulledLimitWindows(t *testing.T) {
+	t.Parallel()
+
+	pct := func(v float64) *float64 { return &v }
+	signedIn := []domain.UsageWindow{
+		{Key: "rolling", Label: "Rolling limit", UsedPercent: pct(37.5), ResetsAt: time.UnixMilli(1793199600000).UTC()},
+		{Key: "weekly", Label: "Weekly limit", Minutes: 10080, UsedPercent: pct(12), ResetsAt: time.UnixMilli(1793577600000).UTC()},
+		{Key: "monthly", Label: "Monthly limit", UsedPercent: pct(100), Status: domain.UsageWindowExhausted, ResetsAt: time.UnixMilli(1794700800000).UTC()},
+	}
+	tests := []struct {
+		name   string
+		answer string
+		turns  int
+		want   []domain.UsageWindow
+	}{
+		{"signed in", string(loadFixture(t, "../../clientprotocol/usagesource/testdata/api-limits-signed.json")), 1, signedIn},
+		{"command fails", "", 2, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, session, callLog := startLimitsSession(t, tt.answer, "simple_turn.jsonl")
+
+			var got []domain.UsageWindow
+			for range tt.turns {
+				events, _, _ := collectEvents(t, a, session, "work")
+				got = append(got, pulledWindows(events)...)
+			}
+
+			for i := range got {
+				got[i].ReportedAt = time.Time{}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("pulled usage windows = %+v, want %+v", got, tt.want)
+			}
+			calls, _ := os.ReadFile(callLog)
+			if n := strings.Count(string(calls), "called"); n != 1 {
+				t.Errorf("usage limits invocations over %d turns = %d, want 1", tt.turns, n)
+			}
+		})
+	}
+}
+
+func TestRunTurn_FreeUsageLimitWindow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		fixture string
+		want    int
+	}{
+		{"free usage limit", "run2-free.jsonl", 1},
+		{"other provider refusal", "free_tier_refusal.jsonl", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, session, _ := startLimitsSession(t, "", tt.fixture)
+
+			events, result, _ := collectEvents(t, a, session, "work")
+
+			if result.ExitReason != domain.EventTurnFailed {
+				t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
+			}
+			windows := pulledWindows(events)
+			if len(windows) != tt.want {
+				t.Fatalf("usage windows = %+v, want %d", windows, tt.want)
+			}
+			for _, w := range windows {
+				if w.Label != "Free usage limit" || w.Status != domain.UsageWindowExhausted {
+					t.Errorf("window = {Label %q, Status %q}, want {%q, %q}", w.Label, w.Status, "Free usage limit", domain.UsageWindowExhausted)
+				}
+				if want := time.Unix(1793151700, 0); !w.ResetsAt.Equal(want) {
+					t.Errorf("window ResetsAt = %v, want %v", w.ResetsAt, want)
+				}
+			}
+		})
+	}
+}
+
+func TestUsageLimitRefusal(t *testing.T) {
+	t.Parallel()
+
+	refusal := func(t *testing.T, name, fixture string, wantResetsAt time.Time) agenttest.UsageLimitRefusalCase {
+		t.Helper()
+		dir, script, _ := limitsRuntime(t, "", fixture)
+		a, _ := NewOpenCodeAdapter()
+		return agenttest.UsageLimitRefusalCase{
+			Name:          name,
+			Adapter:       a,
+			Start:         domain.StartSessionParams{WorkspacePath: dir, AgentConfig: domain.AgentConfig{Command: script}},
+			Turn:          domain.RunTurnParams{Prompt: "work"},
+			WantResetsAt:  wantResetsAt,
+			WantModelOnly: true,
+		}
+	}
+
+	agenttest.AssertUsageLimitRefusal(t, "opencode", []agenttest.UsageLimitRefusalCase{
+		refusal(t, "free limit resets at the event timestamp plus the delay", "run2-free.jsonl", time.UnixMilli(1793151700867).UTC()),
+		refusal(t, "quota without a delay", "usage_limit_quota.jsonl", time.Time{}),
+	})
+}
+
+func TestOpencodePull_ConnectionFailureClass(t *testing.T) {
+	t.Parallel()
+
+	for _, exitCode := range []int{255, 1} {
+		t.Run("exit "+strconv.Itoa(exitCode), func(t *testing.T) {
+			t.Parallel()
+
+			command := agenttest.FakeRuntime(t, t.TempDir(), "ssh", agenttest.OutputScenario, agenttest.Output{ExitCode: exitCode})
+			state := &sessionState{target: agentcore.LaunchTarget{Command: command, WorkspacePath: t.TempDir(), SSHHost: "user@stand-in-host", RemoteCommand: "opencode"}}
+
+			_, err := opencodePull(state)(waittest.Context(t))
+
+			if got, want := errors.Is(err, sshutil.ErrConnectionFailed), exitCode == 255; got != want {
+				t.Errorf("errors.Is(opencodePull() error, ErrConnectionFailed) = %v, want %v for ssh exit %d (error: %v)", got, want, exitCode, err)
+			}
+		})
+	}
+}

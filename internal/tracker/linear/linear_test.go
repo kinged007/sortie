@@ -676,6 +676,7 @@ func TestFetchIssueByID(t *testing.T) {
 		if continuation[0].variables["after"] != "comment-0002" {
 			t.Errorf("continuation after = %v, want %q (inline endCursor, not page 1)", continuation[0].variables["after"], "comment-0002")
 		}
+		assertBaseCommentVariables(t, continuation, "SOR-5")
 	})
 
 	t.Run("inline page hasNextPage without end cursor is missing cursor", func(t *testing.T) {
@@ -782,6 +783,32 @@ func TestFetchIssueComments(t *testing.T) {
 		}
 	})
 
+	t.Run("two pages send the base variables and no filter", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFakeClient()
+		seedPreflight(f, t)
+		f.queueBody("query IssueComments", loadFixture(t, "comment_changes_page1.json"))
+		f.queueBody("query IssueComments", loadFixture(t, "comment_changes_page2.json"))
+
+		adapter := newTestAdapter(t, f)
+
+		comments, err := adapter.FetchIssueComments(context.Background(), "SOR-5")
+		if err != nil {
+			t.Fatalf("FetchIssueComments: %v", err)
+		}
+
+		wantIDs := []string{"comment-lookback", "comment-edited", "comment-new"}
+		if got := commentIDs(comments); !reflect.DeepEqual(got, wantIDs) {
+			t.Errorf("comment order = %v, want %v", got, wantIDs)
+		}
+		calls := f.callsFor("query IssueComments")
+		if len(calls) != 2 {
+			t.Fatalf("FetchIssueComments sent %d requests, want 2", len(calls))
+		}
+		assertBaseCommentVariables(t, calls, "SOR-5")
+	})
+
 	t.Run("empty connection returns non-nil empty slice", func(t *testing.T) {
 		t.Parallel()
 
@@ -811,6 +838,77 @@ func TestFetchIssueComments(t *testing.T) {
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 	})
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	commentNew := domain.Comment{ID: "comment-new", Author: "Zendesk", AuthorID: "ext-7", AuthorKind: domain.CommentAuthorExternal, Body: "Customer replied through Zendesk: the export still fails.", CreatedAt: "2026-11-02T12:00:10.000Z", UpdatedAt: "2026-11-02T12:00:10.000Z"}
+	commentEdited := domain.Comment{ID: "comment-edited", Author: "Grace Hopper", AuthorID: "user-grace", AuthorKind: domain.CommentAuthorPerson, Body: "Edited: the retry limit is 3, not 5.", CreatedAt: "2026-11-02T10:00:00.000Z", UpdatedAt: "2026-11-02T12:00:30.000Z"}
+	commentLookback := domain.Comment{ID: "comment-lookback", Author: "Release Bot", AuthorID: "user-release-bot", AuthorKind: domain.CommentAuthorBot, Body: "Release notes drafted.", CreatedAt: "2026-11-02T09:00:00.000Z", UpdatedAt: "2026-11-02T11:59:45.000Z"}
+	commentAtPoint := domain.Comment{ID: "comment-at-point", Author: "Ada Lovelace", AuthorID: "user-ada", AuthorKind: domain.CommentAuthorPerson, Body: "Reproduced on staging.", CreatedAt: "2026-11-02T09:30:00.000Z", UpdatedAt: "2026-11-02T12:00:00.500Z"}
+
+	const point domain.CommentReadPoint = "2026-11-02T12:00:00.5Z"
+
+	tests := []struct {
+		name       string
+		since      domain.CommentReadPoint
+		key        string
+		fixtures   []string
+		want       []domain.Comment
+		wantNext   domain.CommentReadPoint
+		wantFilter string
+		wantErr    domain.TrackerErrorKind
+	}{
+		{"new and edited comments are read from the lookback start", point, "query IssueCommentChanges", []string{"comment_changes_page1.json", "comment_changes_page2.json"}, []domain.Comment{commentLookback, commentEdited, commentNew}, "2026-11-02T12:00:30Z", "2026-11-02T11:59:30.5Z", ""},
+		{"only the comment updated at the point leaves the point unchanged", point, "query IssueCommentChanges", []string{"comment_changes_unchanged.json"}, []domain.Comment{commentAtPoint}, point, "2026-11-02T11:59:30.5Z", ""},
+		{"undecodable point reads every comment without a filter", "x", "query IssueComments", []string{"comment_changes_page1.json", "comment_changes_page2.json"}, []domain.Comment{commentLookback, commentEdited, commentNew}, "2026-11-02T12:00:30Z", "", ""},
+		{"unparseable updatedAt is a payload error", point, "query IssueCommentChanges", []string{"comment_changes_bad_updated_at.json"}, nil, "", "2026-11-02T11:59:30.5Z", domain.ErrTrackerPayload},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeClient()
+			seedPreflight(f, t)
+			for _, fixture := range tt.fixtures {
+				f.queueBody(tt.key, loadFixture(t, fixture))
+			}
+			adapter := newTestAdapter(t, f)
+
+			got, err := adapter.FetchIssueCommentChanges(context.Background(), "SOR-5", tt.since)
+
+			calls := f.callsFor(tt.key)
+			if len(calls) != len(tt.fixtures) {
+				t.Fatalf("FetchIssueCommentChanges(%q) sent %d requests, want %d", tt.since, len(calls), len(tt.fixtures))
+			}
+			for _, call := range calls {
+				filter, hasFilter := call.variables["filter"]
+				wantFilter := map[string]any{"updatedAt": map[string]any{"gte": tt.wantFilter}}
+				if tt.wantFilter == "" && hasFilter {
+					t.Errorf("FetchIssueCommentChanges(%q) sent filter %v, want none", tt.since, filter)
+				}
+				if tt.wantFilter != "" && !reflect.DeepEqual(filter, wantFilter) {
+					t.Errorf("FetchIssueCommentChanges(%q) filter = %v, want %v", tt.since, filter, wantFilter)
+				}
+			}
+			if tt.wantErr != "" {
+				assertTrackerErrorKind(t, err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				t.Fatalf("FetchIssueCommentChanges(%q): %v", tt.since, err)
+			}
+			if !reflect.DeepEqual(got.Comments, tt.want) {
+				t.Errorf("FetchIssueCommentChanges(%q).Comments = %+v, want %+v", tt.since, got.Comments, tt.want)
+			}
+			if got.Next != tt.wantNext {
+				t.Errorf("FetchIssueCommentChanges(%q).Next = %q, want %q", tt.since, got.Next, tt.wantNext)
+			}
+			adaptertest.AssertCommentsAscending(t, got.Comments)
+		})
+	}
 }
 
 func TestFetchIssueStatesByIDs(t *testing.T) {
@@ -1308,19 +1406,30 @@ func TestTransitionIssue(t *testing.T) {
 func TestCommentIssue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("sends the markdown body verbatim and returns nil", func(t *testing.T) {
+	t.Run("sends the markdown body verbatim and returns the listed identity", func(t *testing.T) {
 		t.Parallel()
 
 		f := newFakeClient()
 		seedPreflight(f, t)
 		f.queueBody("CommentCreate", loadFixture(t, "comment_create_success.json"))
+		f.queueBody("query IssueComments", loadFixture(t, "comments_single_page.json"))
 
 		adapter := newTestAdapter(t, f)
 
 		body := "CI failed on `make test`.\n\n- step: build\n- see **logs** for details"
-		if err := adapter.CommentIssue(context.Background(), "SOR-5", body); err != nil {
+		before := len(f.calls)
+		id, err := adapter.CommentIssue(context.Background(), "SOR-5", body)
+		if err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
+		if n := len(f.calls) - before; n != 1 {
+			t.Errorf("requests during CommentIssue = %d, want 1", n)
+		}
+		comments, err := adapter.FetchIssueComments(context.Background(), "SOR-5")
+		if err != nil {
+			t.Fatalf("FetchIssueComments: %v", err)
+		}
+		adaptertest.AssertPostedCommentListed(t, id, comments)
 
 		calls := f.callsFor("CommentCreate")
 		if len(calls) != 1 {
@@ -1343,57 +1452,10 @@ func TestCommentIssue(t *testing.T) {
 
 		adapter := newTestAdapter(t, f)
 
-		err := adapter.CommentIssue(context.Background(), "SOR-5", "body")
+		_, err := adapter.CommentIssue(context.Background(), "SOR-5", "body")
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerAuth)
 	})
-}
-
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			f := newFakeClient()
-			seedPreflight(f, t)
-			f.queueBody("CommentCreate", loadFixture(t, "comment_create_success.json"))
-			adapter := newTestAdapter(t, f)
-
-			if err := adapter.CommentIssueWithLiteral(context.Background(), "SOR-5", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			calls := f.callsFor("CommentCreate")
-			if len(calls) != 1 {
-				t.Fatalf("CommentCreate call count = %d, want 1", len(calls))
-			}
-			if got := calls[0].variables["body"]; got != tt.want {
-				t.Errorf("CommentCreate body = %q, want %q", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestAddLabel(t *testing.T) {
@@ -1986,29 +2048,32 @@ func TestCreateLabel(t *testing.T) {
 	})
 }
 
-func TestDecodeCommentCreateSuccess(t *testing.T) {
+func TestDecodeCommentCreate(t *testing.T) {
 	t.Parallel()
 
 	t.Run("malformed body is a payload error", func(t *testing.T) {
 		t.Parallel()
 
-		_, _, err := decodeCommentCreateSuccess([]byte("{not json"))
+		_, _, _, err := decodeCommentCreate([]byte("{not json"))
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerPayload)
 	})
 
-	t.Run("well-formed success body reports success with no error", func(t *testing.T) {
+	t.Run("well-formed success body reports success and the comment id", func(t *testing.T) {
 		t.Parallel()
 
-		errs, success, err := decodeCommentCreateSuccess(loadFixture(t, "comment_create_success.json"))
+		errs, success, id, err := decodeCommentCreate(loadFixture(t, "comment_create_success.json"))
 		if err != nil {
-			t.Fatalf("decodeCommentCreateSuccess: %v", err)
+			t.Fatalf("decodeCommentCreate: %v", err)
 		}
 		if !success {
-			t.Errorf("decodeCommentCreateSuccess success = %v, want true", success)
+			t.Errorf("decodeCommentCreate success = %v, want true", success)
 		}
 		if len(errs) != 0 {
-			t.Errorf("decodeCommentCreateSuccess errs = %v, want empty", errs)
+			t.Errorf("decodeCommentCreate errs = %v, want empty", errs)
+		}
+		if id != "comment-b" {
+			t.Errorf("decodeCommentCreate id = %q, want %q", id, "comment-b")
 		}
 	})
 }
@@ -2051,6 +2116,7 @@ func TestWriteErrorMapping(t *testing.T) {
 		{"invalid input maps to payload", "mutation_invalid_input.json", domain.ErrTrackerPayload},
 		{"ratelimited maps to API", "mutation_ratelimited.json", domain.ErrTrackerAPI},
 		{"success false with no errors maps to API", "mutation_success_false.json", domain.ErrTrackerAPI},
+		{"success true without a comment maps to payload", "comment_create_no_comment.json", domain.ErrTrackerPayload},
 	}
 
 	for _, tt := range tests {
@@ -2058,13 +2124,16 @@ func TestWriteErrorMapping(t *testing.T) {
 			t.Parallel()
 
 			f := newFakeClient()
+			seedPreflight(f, t)
 			f.queueBody("CommentCreate", loadFixture(t, tt.fixture))
+			adapter := newTestAdapter(t, f)
 
-			err := runMutation(context.Background(), f, newTextLogger(&bytes.Buffer{}),
-				queryCommentCreate, map[string]any{"issueId": "SOR-5", "body": "x"},
-				decodeCommentCreateSuccess)
+			id, err := adapter.CommentIssue(context.Background(), "SOR-5", "x")
 
 			assertTrackerErrorKind(t, err, tt.wantKind)
+			if id != "" {
+				t.Errorf("CommentIssue id = %q on error, want empty", id)
+			}
 		})
 	}
 }
@@ -2160,6 +2229,18 @@ func identifiers(issues []domain.Issue) []string {
 		out[i] = iss.Identifier
 	}
 	return out
+}
+
+func assertBaseCommentVariables(t *testing.T, calls []recordedCall, issueID string) {
+	t.Helper()
+	for i, call := range calls {
+		if got, want := slices.Sorted(maps.Keys(call.variables)), []string{"after", "first", "id"}; !slices.Equal(got, want) {
+			t.Errorf("call[%d] variables = %v, want keys %v (no filter)", i, got, want)
+		}
+		if call.variables["id"] != issueID || call.variables["first"] != topLevelPageSize {
+			t.Errorf("call[%d] id, first = %v, %v, want %q, %d", i, call.variables["id"], call.variables["first"], issueID, topLevelPageSize)
+		}
+	}
 }
 
 func commentIDs(comments []domain.Comment) []string {

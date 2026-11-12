@@ -2,6 +2,7 @@ package sentence
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,12 +359,12 @@ func TestAttentionTexts(t *testing.T) {
 		}},
 		{"bot review budget escalation", escalatedInput("bot-review", budget, nil), shape, texts{
 			"Bot review escalated on #931",
-			"Sortie used 2 of 2 bot review fix runs on PR #931, and the pull request still holds review bot comments on its code that no Sortie run was given.",
-			"Clears when no review bot comment on the code of PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.bot_review.max_continuation_turns` above 2, or when the issue reaches a terminal tracker state or leaves In Review.",
+			"Sortie used 2 of 2 bot review fix runs on PR #931, and the pull request still holds bot review comments on its code that no Sortie run was given.",
+			"Clears when no bot review comment on the code of PR #931 is left that no Sortie run was given, when the pull request merges or closes, when Sortie restarts with `reactions.bot_review.max_continuation_turns` above 2, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"bot review triage escalation", escalatedInput("bot-review", triage, nil), shape, texts{
-			why:    "Sortie escalated review bot comments on PR #931 because the triage command asked for a person.",
-			clears: "Clears when the review bot comments on PR #931 change, when the pull request merges or closes, or when the issue reaches a terminal tracker state or leaves In Review.",
+			why:    "Sortie escalated bot review comments on PR #931 because the triage command asked for a person.",
+			clears: "Clears when the bot review comments on PR #931 change, when the pull request merges or closes, or when the issue reaches a terminal tracker state or leaves In Review.",
 		}},
 		{"merge conflict budget escalation", escalatedInput("merge-conflict", budget, nil), shape, texts{
 			"Merge conflict escalated on #931",
@@ -414,6 +415,38 @@ func TestAttentionTexts(t *testing.T) {
 				if part.want != "" && part.got != part.want {
 					t.Errorf("Attention(%s) %s = %q, want %q", tt.name, part.name, part.got, part.want)
 				}
+			}
+		})
+	}
+}
+
+func TestAttentionSpendWordingPerWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, window := range orchestrator.SpendWindows() {
+		t.Run(string(window), func(t *testing.T) {
+			t.Parallel()
+
+			snap := orchestrator.RuntimeSnapshotResult{SpendCeilings: []orchestrator.SpendCeilingStatus{
+				{Window: window, BudgetUSD: 7, UsedUSD: 7, Holding: true, ResetsAt: attentionAt},
+			}}
+
+			got := Attention(snap, nil, Context{})
+
+			if len(got) != 1 {
+				t.Fatalf("Attention(%s hold) = %d items, want 1", window, len(got))
+			}
+			wantPrefix := strings.ToUpper(string(window)[:1]) + string(window)[1:] + " "
+			if !strings.HasPrefix(got[0].ReasonText, wantPrefix) {
+				t.Errorf("Attention(%s hold) ReasonText = %q, want prefix %q", window, got[0].ReasonText, wantPrefix)
+			}
+			for _, text := range []string{got[0].WhyText, got[0].ClearsText} {
+				if text == fallbackText {
+					t.Errorf("Attention(%s hold) text = %q, want the window's wording", window, text)
+				}
+			}
+			if !strings.Contains(got[0].ClearsText, window.Setting()) {
+				t.Errorf("Attention(%s hold) ClearsText = %q, want it to name %q", window, got[0].ClearsText, window.Setting())
 			}
 		})
 	}

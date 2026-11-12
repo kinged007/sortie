@@ -6,15 +6,24 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
+	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/runstats"
 )
 
@@ -52,10 +61,106 @@ type jsonField struct {
 	depth    int
 }
 
+var contractEnums = map[reflect.Type]map[string][]string{
+	reflect.TypeFor[holdResponse]():        {"reason": holdReasonValues()},
+	reflect.TypeFor[usageWindowResponse](): {"status": usageWindowStatusValues()},
+	reflect.TypeFor[runstats.Spend]():      {"period": spendPeriodValues()},
+	reflect.TypeFor[runstats.SpanReport](): {"period": spendPeriodValues()},
+}
+
+var contractNeverNull = map[reflect.Type][]string{
+	reflect.TypeFor[stateResponse](): {"rate_limits"},
+}
+
 var dateTime = contractNode{"string", map[string]any{"type": "string", "format": "date-time"}}
 
 func primitive(ts, jsonType string) contractNode {
 	return contractNode{ts, map[string]any{"type": jsonType}}
+}
+
+func enumNode(values []string) contractNode {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = strconv.Quote(v)
+	}
+	return contractNode{strings.Join(quoted, " | "), map[string]any{"type": "string", "enum": values}}
+}
+
+func holdReasonValues() []string {
+	reasons := orchestrator.HoldReasons()
+	values := make([]string, len(reasons))
+	for i, r := range reasons {
+		values[i] = string(r)
+	}
+	return values
+}
+
+func spendPeriodValues() []string {
+	return []string{
+		string(runstats.PeriodFiveMinutes),
+		string(runstats.PeriodQuarterHour),
+		string(runstats.PeriodHour),
+		string(runstats.PeriodDay),
+		string(runstats.PeriodMonth),
+	}
+}
+
+func usageWindowStatusValues() []string {
+	return []string{
+		string(domain.UsageWindowAllowed),
+		string(domain.UsageWindowWarning),
+		string(domain.UsageWindowExhausted),
+	}
+}
+
+func declaredHoldReasons(t *testing.T) []string {
+	t.Helper()
+
+	const dir = "../orchestrator"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dir, err)
+	}
+	var values []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("ParseFile(%q): %v", e.Name(), err)
+		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || len(vs.Names) != len(vs.Values) {
+					continue
+				}
+				if typ, ok := vs.Type.(*ast.Ident); !ok || typ.Name != "SkipReason" {
+					continue
+				}
+				for i, name := range vs.Names {
+					if name.Name == "SkipNone" || name.Name == "SkipIneligible" {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						t.Fatalf("%s is not a string literal", name.Name)
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("Unquote(%s): %v", lit.Value, err)
+					}
+					values = append(values, value)
+				}
+			}
+		}
+	}
+	return values
 }
 
 func nullable(n contractNode) contractNode {
@@ -108,7 +213,7 @@ func (c *contract) convert(t reflect.Type) (contractNode, error) {
 			return contractNode{}, fmt.Errorf("%v is an unnamed struct type", t)
 		}
 		name, err := c.addStruct(t)
-		return contractNode{name, map[string]any{"$ref": "#/$defs/" + name}}, err
+		return contractNode{name, map[string]any{"$ref": "#/components/schemas/" + name}}, err
 	}
 	return contractNode{}, fmt.Errorf("%v has unsupported kind %v", t, t.Kind())
 }
@@ -146,7 +251,10 @@ func (c *contract) addStruct(t reflect.Type) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if k := f.typ.Kind(); !f.optional && (k == reflect.Pointer || k == reflect.Slice || k == reflect.Map || k == reflect.Interface) {
+		if values, ok := contractEnums[t][f.name]; ok {
+			n = enumNode(values)
+		}
+		if k := f.typ.Kind(); !f.optional && !slices.Contains(contractNeverNull[t], f.name) && (k == reflect.Pointer || k == reflect.Slice || k == reflect.Map || k == reflect.Interface) {
 			n = nullable(n)
 		}
 		members = append(members, contractMember{f.name, n, f.optional})
@@ -168,6 +276,7 @@ func reactionCheckMembers() []contractMember {
 		{"actionable_comments", num, true},
 		{"new_comments", num, true},
 		{"handled", primitive("boolean", "boolean"), true},
+		{"awaiting_approval", primitive("boolean", "boolean"), true},
 		{"mergeable", nullable(primitive("boolean", "boolean")), true},
 	}
 }
@@ -180,8 +289,11 @@ func runEventMembers(usage contractNode) []contractMember {
 		{"event", str, false},
 		{"message", str, false},
 		{"text", str, false},
+		{"tool_line", str, true},
 		{"session_id", str, true},
 		{"tool_name", str, true},
+		{"tool_kind", str, true},
+		{"tool_argument", str, true},
 		{"duration_ms", num, true},
 		{"tool_error", primitive("boolean", "boolean"), true},
 		{"usage", nullable(usage), true},
@@ -258,8 +370,76 @@ func (c *contract) typescript() []byte {
 	return []byte(b.String())
 }
 
-func (c *contract) jsonSchema() ([]byte, error) {
-	defs := map[string]any{}
+func contractRoots(routes []apiRoute) []reflect.Type {
+	var roots []reflect.Type
+	for _, route := range routes {
+		for _, response := range route.responses {
+			if response.body != nil {
+				roots = append(roots, response.body)
+			}
+			for _, event := range response.events {
+				if event.data != nil {
+					roots = append(roots, event.data)
+				}
+			}
+		}
+	}
+	return roots
+}
+
+func registeredRoutes(path string) ([]string, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	var patterns []string
+	var failure error
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || failure != nil {
+			return failure == nil
+		}
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || (fn.Sel.Name != "Handle" && fn.Sel.Name != "HandleFunc") || len(call.Args) == 0 {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			failure = fmt.Errorf("%s: %s pattern is not a string literal", fset.Position(call.Args[0].Pos()), fn.Sel.Name)
+			return false
+		}
+		pattern, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			failure = fmt.Errorf("%s: unquote %s: %w", fset.Position(lit.Pos()), lit.Value, err)
+			return false
+		}
+		_, route, found := strings.Cut(pattern, " ")
+		if !found {
+			route = pattern
+		}
+		if strings.HasPrefix(route, "/api/v1/") || route == "/livez" || route == "/readyz" {
+			patterns = append(patterns, pattern)
+		}
+		return true
+	})
+	return patterns, failure
+}
+
+func absentFrom(names, others []string) []string {
+	var absent []string
+	for _, name := range names {
+		if !slices.Contains(others, name) {
+			absent = append(absent, name)
+		}
+	}
+	return absent
+}
+
+var pathParamPattern = regexp.MustCompile(`\{([^}]+)\}`)
+
+func (c *contract) schemas() map[string]any {
+	schemas := map[string]any{}
 	for name, members := range c.members {
 		properties, required := map[string]any{}, []string{}
 		for _, m := range members {
@@ -268,34 +448,135 @@ func (c *contract) jsonSchema() ([]byte, error) {
 				required = append(required, m.name)
 			}
 		}
-		defs[name] = map[string]any{"type": "object", "properties": properties, "required": required}
+		schemas[name] = map[string]any{"type": "object", "properties": properties, "required": required}
+	}
+	return schemas
+}
+
+func operationParameters(route apiRoute, path string) ([]any, error) {
+	var parameters []any
+	for _, match := range pathParamPattern.FindAllStringSubmatch(path, -1) {
+		parameters = append(parameters, map[string]any{
+			"name": match[1], "in": "path", "required": true, "schema": map[string]any{"type": "string"},
+		})
+	}
+	for _, location := range []struct {
+		in    string
+		names []string
+	}{{"query", route.query}, {"header", route.headers}} {
+		for _, name := range location.names {
+			param, ok := route.params[name]
+			if !ok {
+				return nil, fmt.Errorf("%s has %s parameter %q without a params entry", route.pattern, location.in, name)
+			}
+			parameter := map[string]any{"name": name, "in": location.in, "schema": param.schema}
+			if param.required {
+				parameter["required"] = true
+			}
+			if param.description != "" {
+				parameter["description"] = param.description
+			}
+			parameters = append(parameters, parameter)
+		}
+	}
+	return parameters, nil
+}
+
+func (c *contract) content(response apiResponse) (map[string]any, error) {
+	if response.events == nil {
+		node, err := c.convert(response.body)
+		return map[string]any{"application/json": map[string]any{"schema": node.schema}}, err
+	}
+	alternatives := make([]any, len(response.events))
+	for i, event := range response.events {
+		data := map[string]any{"type": "object"}
+		if event.data != nil {
+			node, err := c.convert(event.data)
+			if err != nil {
+				return nil, err
+			}
+			data = node.schema
+		}
+		alternatives[i] = map[string]any{"properties": map[string]any{
+			"event": map[string]any{"const": event.name},
+			"data":  map[string]any{"contentMediaType": "application/json", "contentSchema": data},
+		}}
+	}
+	text := map[string]any{"type": "string"}
+	return map[string]any{"text/event-stream": map[string]any{"itemSchema": map[string]any{
+		"type":       "object",
+		"required":   []string{"id", "event", "data"},
+		"properties": map[string]any{"id": text, "event": text, "data": text},
+		"oneOf":      alternatives,
+	}}}, nil
+}
+
+func (c *contract) openAPI(routes []apiRoute) ([]byte, error) {
+	paths := map[string]any{}
+	for _, route := range routes {
+		path := strings.TrimPrefix(route.pattern, route.method+" ")
+		operation := map[string]any{}
+		parameters, err := operationParameters(route, path)
+		if err != nil {
+			return nil, err
+		}
+		if len(parameters) > 0 {
+			operation["parameters"] = parameters
+		}
+		responses := map[string]any{}
+		for _, response := range route.responses {
+			content, err := c.content(response)
+			if err != nil {
+				return nil, fmt.Errorf("%s response %d: %w", route.pattern, response.status, err)
+			}
+			responses[strconv.Itoa(response.status)] = map[string]any{"description": http.StatusText(response.status), "content": content}
+		}
+		operation["responses"] = responses
+		item, ok := paths[path].(map[string]any)
+		if !ok {
+			item = map[string]any{}
+			paths[path] = item
+		}
+		item[strings.ToLower(route.method)] = operation
 	}
 	out, err := json.MarshalIndent(map[string]any{
-		"$schema": "https://json-schema.org/draft/2020-12/schema",
-		"title":   "Sortie JSON API responses",
-		"$defs":   defs,
+		"openapi":    "3.2.1",
+		"info":       map[string]any{"title": "Sortie JSON API", "version": "v1"},
+		"paths":      paths,
+		"components": map[string]any{"schemas": c.schemas()},
 	}, "", "  ")
 	return append(out, '\n'), err
 }
 
 func TestAPIContract(t *testing.T) {
-	c, err := newContract(
-		reflect.TypeFor[stateResponse](), reflect.TypeFor[issueDetailResponse](), reflect.TypeFor[runsResponse](), reflect.TypeFor[issueGroupsResponse](),
-		reflect.TypeFor[runstats.Report](), reflect.TypeFor[refreshResponse](), reflect.TypeFor[retryNowResponse](), reflect.TypeFor[checkNowResponse](),
-		reflect.TypeFor[acknowledgeResponse](), reflect.TypeFor[errorResponse](),
-		reflect.TypeFor[healthResponse](), reflect.TypeFor[readyResponse](), reflect.TypeFor[runEventsResponse](),
-		agentEventType, reflect.TypeFor[runEndedFrame](), reflect.TypeFor[runResetFrame](),
-		reflect.TypeFor[pricesResponse](),
-	)
+	declared := slices.Sorted(slices.Values(declaredHoldReasons(t)))
+	if served := slices.Sorted(slices.Values(holdReasonValues())); !slices.Equal(served, declared) {
+		t.Fatalf("sorted HoldReasons() = %v, want the SkipReason constants less SkipNone and SkipIneligible, each once: %v", served, declared)
+	}
+
+	registered, err := registeredRoutes("server.go")
+	if err != nil {
+		t.Fatalf("registeredRoutes: %v", err)
+	}
+	described := make([]string, len(apiRoutes))
+	for i, route := range apiRoutes {
+		described[i] = route.pattern
+	}
+	missing, extra := absentFrom(registered, described), absentFrom(described, registered)
+	if len(missing) > 0 || len(extra) > 0 {
+		t.Fatalf("server.go and apiRoutes disagree: registered without an apiRoutes entry: %q; apiRoutes entries without a registration: %q", missing, extra)
+	}
+
+	c, err := newContract(contractRoots(apiRoutes)...)
 	if err != nil {
 		t.Fatalf("newContract: %v", err)
 	}
-	schema, err := c.jsonSchema()
+	document, err := c.openAPI(apiRoutes)
 	if err != nil {
-		t.Fatalf("jsonSchema: %v", err)
+		t.Fatalf("openAPI: %v", err)
 	}
 
-	files := map[string][]byte{"../../web/src/api/types.gen.ts": c.typescript(), "../../docs/api.schema.json": schema}
+	files := map[string][]byte{"../../web/src/api/types.gen.ts": c.typescript(), "../../docs/openapi.json": document}
 	for path, want := range files {
 		if *updateContract {
 			if err := os.WriteFile(path, want, 0o644); err != nil {

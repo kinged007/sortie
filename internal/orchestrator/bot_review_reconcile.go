@@ -359,11 +359,14 @@ func applyBotReviewEscalation(
 		)
 	}
 
-	commentText := buildBotReviewEscalationComment(botReviewData, turnCount)
-	if trigger == EscalationTriggerTriage {
-		commentText = buildTriageEscalationComment("bot-review", fmt.Sprintf("PR #%d", botReviewData.PRNumber))
+	var facts domain.MessageFacts = domain.BotReviewEscalationFacts{
+		PRNumber: botReviewData.PRNumber,
+		Turns:    turnCount,
 	}
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationBotReview, pending, commentText))
+	if trigger == EscalationTriggerTriage {
+		facts = domain.TriageEscalationFacts{PRNumber: botReviewData.PRNumber}
+	}
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationBotReview, pending, facts))
 
 	if params.BotReviewConfig.Escalation == "label" {
 		label := params.BotReviewConfig.EscalationLabel
@@ -401,14 +404,4 @@ func applyBotReviewEscalation(
 	publishEscalation(ctx, &state.TrackerOpsWg, delivery, log, record, func(err error) {
 		log.Warn("bot review escalation comment failed", slog.Any("error", err))
 	})
-}
-
-// buildBotReviewEscalationComment returns the escalation comment used when
-// the bot review continuation turn budget is exhausted.
-func buildBotReviewEscalationComment(botReviewData *BotReviewReactionData, turnCount int) string {
-	return fmt.Sprintf(
-		"Sortie attempted %d bot-review continuation turn(s) and could not resolve the automated review comments for PR #%d. Remaining bot review comments require human attention.",
-		turnCount,
-		botReviewData.PRNumber,
-	)
 }

@@ -1,12 +1,15 @@
 package orchestrator
 
 import (
+	"cmp"
 	"log/slog"
 	"maps"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/redact"
@@ -58,6 +61,21 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		return
 	}
 
+	if event.Type == domain.EventToolResult {
+		switch event.ToolKind {
+		case domain.ToolKindShell:
+			event.ToolArgument = unwrapShell(event.ToolArgument)
+		case domain.ToolKindRead, domain.ToolKindEdit:
+			event.ToolArgument = workspaceRelative(event.ToolArgument, entry.WorkspacePath)
+		case domain.ToolKindSkill:
+		default:
+			event.ToolKind = ""
+			event.ToolArgument = ""
+		}
+		event.ToolName = toolText(event.ToolName)
+		event.ToolArgument = toolText(event.ToolArgument)
+	}
+
 	log := logging.WithIssue(logger, issueID, entry.Identifier)
 	if entry.SessionID != "" {
 		log = logging.WithSession(log, entry.SessionID)
@@ -104,15 +122,23 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		entry.ToolTimeMs += event.ToolDurationMS
 	}
 
-	// Increment the tool call completion counter for tool_result events
-	// with a known tool name. Empty ToolName is a defensive guard;
-	// well-behaved adapters always populate it.
-	if event.Type == domain.EventToolResult && event.ToolName != "" {
+	// Skill calls are kept from every event on arrival because the retained
+	// buffer evicts early events of a long run.
+	if event.Type == domain.EventToolResult && event.ToolKind == domain.ToolKindSkill && event.ToolArgument != "" {
+		entry.Skills = append(entry.Skills, domain.SkillCall{Skill: event.ToolArgument, ToolError: event.ToolError})
+	}
+
+	if event.Type == domain.EventToolResult {
+		entry.turnToolCalls++
+		if event.ToolError {
+			entry.turnErrors++
+		}
+		tool := toolLabel(event.ToolName, event.ToolKind)
 		outcome := outcomeSuccess
 		if event.ToolError {
 			outcome = outcomeError
 		}
-		metrics.IncToolCalls(event.ToolName, outcome)
+		metrics.IncToolCalls(tool, outcome)
 
 		// Agents call tools constantly and a failed call is routine, so these
 		// records stay at Debug; the error keeps only its first line because
@@ -123,18 +149,24 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 				errMsg = "tool returned error"
 			}
 			log.Debug("tool call completed",
-				slog.String("tool", event.ToolName),
+				slog.String("tool", tool),
 				slog.Int64("duration_ms", event.ToolDurationMS),
 				slog.String("outcome", outcome),
 				slog.String("tool_error", redact.Truncate(errMsg, 200)),
 			)
 		} else {
 			log.Debug("tool call completed",
-				slog.String("tool", event.ToolName),
+				slog.String("tool", tool),
 				slog.Int64("duration_ms", event.ToolDurationMS),
 				slog.String("outcome", outcome),
 			)
 		}
+	}
+
+	// Amounts are not token figures, so the usage arrival does not gate
+	// them. The in-flight ceilings read the entry after this call returns.
+	if event.ReportedAmounts != nil {
+		entry.ReportedAmounts = usage.MergeAmounts(entry.ReportedAmounts, event.ReportedAmounts)
 	}
 
 	// Apply the token delta algorithm for any event that reports usage,
@@ -198,22 +230,11 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 		}
 	}
 
-	// Snapshot the rate-limit payload when present. The worker's
-	// OnEvent relay already defensive-copies the map before it crosses
-	// the goroutine boundary. The second maps.Clone here is
-	// defense-in-depth: it isolates the stored snapshot from any
-	// top-level mutation of event.RateLimits within this function or
-	// future callers.
-	if event.RateLimits != nil {
-		// Only replace the snapshot when this event is at least as recent
-		// as the stored one, preserving monotonicity under out-of-order
-		// delivery.
-		if state.AgentRateLimits == nil || !event.Timestamp.Before(state.AgentRateLimits.ReceivedAt) {
-			state.AgentRateLimits = &RateLimitSnapshot{
-				Data:       maps.Clone(event.RateLimits),
-				ReceivedAt: event.Timestamp,
-			}
+	if len(event.UsageWindows) > 0 {
+		if state.UsageWindows == nil {
+			state.UsageWindows = make(map[string][]domain.UsageWindow)
 		}
+		state.UsageWindows[entry.AgentKind] = usage.MergeWindows(state.UsageWindows[entry.AgentKind], event.UsageWindows)
 	}
 
 	// Emit a Debug-level summary for observability. Handlers skip
@@ -251,9 +272,99 @@ func HandleAgentEvent(state *State, issueID string, event domain.AgentEvent, log
 	// current turn only, never against a session-wide total.
 	if isTurnTerminalEvent(event.Type) {
 		entry.APIRequestCountAtLastTurnEnd = entry.APIRequestCount
+		endTurn(state, issueID, entry, event)
 	}
 
 	retainEvent(entry, event)
+}
+
+// toolText returns s as text safe to store and show: control characters
+// become spaces, format characters (bidirectional overrides, zero-width
+// marks) are dropped, and the result is masked and bounded as a message is.
+func toolText(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.Is(unicode.Cc, r):
+			return ' '
+		case unicode.Is(unicode.Cf, r):
+			return -1
+		}
+		return r
+	}, s)
+	return redact.Truncate(strings.TrimSpace(cleaned), retainedMessageRunes)
+}
+
+// unwrapShell returns the script of a "bash -lc", "sh -c", or "zsh -c"
+// invocation without its wrapper and outer quotes, and cmd unchanged for any
+// other command line.
+func unwrapShell(cmd string) string {
+	shell, rest := cutWord(cmd)
+	switch shell[strings.LastIndexByte(shell, '/')+1:] {
+	case "bash", "sh", "zsh":
+	default:
+		return cmd
+	}
+	flag, script := cutWord(rest)
+	script = strings.TrimSpace(script)
+	if (flag != "-c" && flag != "-lc") || script == "" {
+		return cmd
+	}
+	if len(script) >= 2 && (script[0] == '\'' || script[0] == '"') && script[len(script)-1] == script[0] {
+		return script[1 : len(script)-1]
+	}
+	return script
+}
+
+// cutWord splits s at its first white-space-separated word.
+func cutWord(s string) (word, rest string) {
+	s = strings.TrimLeftFunc(s, unicode.IsSpace)
+	i := strings.IndexFunc(s, unicode.IsSpace)
+	if i < 0 {
+		return s, ""
+	}
+	return s[:i], s[i:]
+}
+
+// workspaceRelative removes the workspace root, with the separator that
+// follows it, from the start of each ", "-joined path in s, so a path inside
+// the run's workspace reads relative to it and names no directory of the host.
+func workspaceRelative(s, workspace string) string {
+	root := strings.TrimRight(workspace, `/\`)
+	if root == "" {
+		return s
+	}
+	paths := strings.Split(s, ", ")
+	for i, p := range paths {
+		if rest, ok := strings.CutPrefix(p, root+"/"); ok {
+			paths[i] = rest
+		} else if rest, ok := strings.CutPrefix(p, root+`\`); ok {
+			paths[i] = rest
+		}
+	}
+	return strings.Join(paths, ", ")
+}
+
+// toolLabel returns the metric and log label of a tool call: the tool's name
+// when it is plain enough to keep the label set bounded, else its kind, else
+// "other".
+func toolLabel(name string, kind domain.ToolKind) string {
+	if name == "" {
+		return cmp.Or(string(kind), "other")
+	}
+	for _, r := range name {
+		if !isLabelRune(r) {
+			return "other"
+		}
+	}
+	return name
+}
+
+func isLabelRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return r == '_' || r == '-' || r == '.' || r == ':'
 }
 
 // hasUsage reports whether usage carries a non-zero component. Every

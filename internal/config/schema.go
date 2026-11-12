@@ -100,6 +100,7 @@ var knownFieldsRegistry = map[string]SectionSchema{
 			{Name: "max_tokens", Type: FieldInt},
 			{Name: "max_cost_usd", Type: FieldNumber},
 			{Name: "max_daily_cost_usd", Type: FieldNumber},
+			{Name: "max_weekly_cost_usd", Type: FieldNumber},
 			{Name: "max_monthly_cost_usd", Type: FieldNumber},
 			{Name: "token_warning_percent", Type: FieldInt},
 			{Name: "max_consecutive_absences", Type: FieldInt},
@@ -115,6 +116,14 @@ var knownFieldsRegistry = map[string]SectionSchema{
 			{Name: "verification_timeout_ms", Type: FieldInt},
 			{Name: "max_diff_bytes", Type: FieldInt},
 			{Name: "reviewer", Type: FieldString},
+		},
+	},
+	"comment_feed": {
+		Fields: []FieldDef{
+			{Name: "enabled", Type: FieldBool},
+			{Name: "authors", Type: FieldString},
+			{Name: "include_authors", Type: FieldStringList},
+			{Name: "exclude_authors", Type: FieldStringList},
 		},
 	},
 	"reactions": {

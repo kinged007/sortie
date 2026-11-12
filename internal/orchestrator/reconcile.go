@@ -10,42 +10,23 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
 // ReconcileStore is the persistence interface required by
-// [ReconcileRunningIssues]. Satisfied by [persistence.Store] in production
-// and by test doubles in unit tests.
+// [ReconcileRunningIssues].
 type ReconcileStore interface {
-	SaveRetryEntry(ctx context.Context, entry persistence.RetryEntry) error
-	DeleteRetryEntry(ctx context.Context, issueID string) error
-	AppendRunHistory(ctx context.Context, run persistence.RunHistory) (persistence.RunHistory, error)
-	UpsertReactionFingerprint(ctx context.Context, issueID, kind, fingerprint string) error
-	GetReactionFingerprint(ctx context.Context, issueID, kind string) (fingerprint string, dispatched bool, err error)
-	MarkReactionDispatched(ctx context.Context, issueID, kind string) error
-	DeleteReactionFingerprint(ctx context.Context, issueID, kind string) error
-	AddReactionHandedOffComments(ctx context.Context, issueID, kind string, commentIDs []string) error
-	ListReactionHandedOffComments(ctx context.Context, issueID, kind string) ([]string, error)
-	UpsertReactionObservation(
-		ctx context.Context,
-		issueID, kind, fingerprint string,
-		observedAt time.Time,
-	) (persistence.ReactionObservation, error)
-	MarkReactionObservationDispatched(ctx context.Context, issueID, kind, fingerprint string) error
-	CountWorkerRunsCompletedSince(ctx context.Context, issueID string, since time.Time) (int, error)
-	DeleteStageHop(ctx context.Context, issueID string) error
-	RecordIssueOutcome(ctx context.Context, outcome persistence.IssueOutcome) error
-	GetReactionEscalation(ctx context.Context, issueID, kind string) (persistence.ReactionEscalation, bool, error)
-	SaveReactionEscalation(ctx context.Context, rec persistence.ReactionEscalation) error
-	EndReactionEscalation(ctx context.Context, issueID, kind string) error
-	DeleteReactionEscalations(ctx context.Context, issueID string) error
-	RecordReactionActivity(ctx context.Context, records []persistence.ReactionActivity) error
-	RecordReactionTriageOutcome(ctx context.Context, outcome persistence.ReactionTriageOutcome) error
-	LatestReactionTriageDisposition(ctx context.Context, issueID, kind, fingerprint string) (disposition string, found bool, err error)
+	storage.RetryEntryStore
+	storage.RunHistoryStore
+	storage.ReactionFingerprintStore
+	storage.ReactionHandoffStore
+	storage.StageHopStore
+	storage.IssueOutcomeStore
+	storage.ReactionEscalationStore
+	storage.ReactionActivityStore
+	storage.ReactionTriageOutcomeStore
 }
-
-var _ ReconcileStore = (*persistence.Store)(nil)
 
 // ReconcileParams holds the dependencies for [ReconcileRunningIssues] that
 // are not part of the core [State]. This separates pure state mutation from
@@ -122,8 +103,9 @@ type ReconcileParams struct {
 	ReviewConfig ReviewReactionConfig
 
 	// ReviewPendingTTL bounds the age of a review PendingReaction entry,
-	// measured from the entry's creation. Zero or negative disables the
-	// bound. Supplied from reactions.review_comments.watch_window_ms.
+	// measured from the entry's creation, except while its latest check
+	// awaits approval. Zero or negative disables the bound. Supplied from
+	// reactions.review_comments.watch_window_ms.
 	ReviewPendingTTL time.Duration
 
 	// AutoMergeConfig holds auto-merge reaction configuration. Only
@@ -218,6 +200,10 @@ type ReconcileParams struct {
 	// reads this field and never CIFeedback.Triage, which the poll
 	// tick refreshes from the reloaded configuration.
 	CITriage config.ReactionTriageConfig
+
+	// SkipReactions stops reconciliation after the stall, overdue-retry,
+	// and tracker-state passes, so no reaction or label-command pass runs.
+	SkipReactions bool
 }
 
 // ReconcileRunningIssues detects stalled workers and refreshes tracker
@@ -264,6 +250,10 @@ func ReconcileRunningIssues(state *State, params ReconcileParams) {
 	// Refresh issue states from the tracker and stop workers for
 	// terminal or non-active issues.
 	reconcileTrackerState(state, params, log, ctx, now, metrics)
+
+	if params.SkipReactions {
+		return
+	}
 
 	// Poll CI status for issues with pending CI checks.
 	reconcileCIStatus(state, params, log, ctx, metrics)
@@ -360,6 +350,7 @@ func reconcileOverdueRetries(state *State, params ReconcileParams, log *slog.Log
 			Logger:              entryLog,
 			Trigger:             entry.Trigger,
 			OriginTrigger:       entry.OriginTrigger,
+			UsageLimitNotified:  entry.UsageLimitNotified,
 		}, params.OnRetryFire)
 
 		if rearmed, ok := state.RetryAttempts[issueID]; ok {
@@ -392,9 +383,7 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 			continue
 		}
 
-		if entry.CancelFunc != nil {
-			entry.CancelFunc()
-		}
+		entry.cancelRun(errCancelStall)
 
 		entryLog.Warn("stall detected, cancelling worker",
 			slog.Int64("elapsed_ms", elapsedMS),
@@ -416,7 +405,7 @@ func reconcileStalled(state *State, params ReconcileParams, log *slog.Logger, ct
 			IssueIdentity:       issueIdentityOf(entry.Issue),
 			Attempt:             nextAttempt,
 			DelayMS:             delayMS,
-			Error:               "stall timeout exceeded",
+			Error:               StallCancelError,
 			LastSSHHost:         entry.SSHHost,
 			SessionID:           entry.SessionID,
 			ContinuationContext: entry.ContinuationContext,
@@ -503,11 +492,11 @@ type issueReleaseCounts struct {
 	RetryCancelled   bool
 }
 
-// retryEntryDeleter is the pair of store methods [releaseIssueRuntimeState]
-// needs: the issue's persisted retry and its escalation records.
+// retryEntryDeleter is what [releaseIssueRuntimeState] clears: the issue's
+// persisted retry and its escalation records.
 type retryEntryDeleter interface {
-	DeleteRetryEntry(ctx context.Context, issueID string) error
-	DeleteReactionEscalations(ctx context.Context, issueID string) error
+	storage.RetryEntryStore
+	storage.ReactionEscalationStore
 }
 
 // releaseIssueRuntimeState drops one issue's runtime reaction bookkeeping
@@ -605,7 +594,8 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 		return
 	}
 
-	refreshed, err := params.TrackerAdapter.FetchIssueStatesByIDs(ctx, ids)
+	readStartedAt := time.Now()
+	refreshed, err := params.TrackerAdapter.FetchIssueStatesAndLabelsByIDs(ctx, ids)
 	if err != nil {
 		log.Warn("tracker state refresh failed, keeping workers running",
 			slog.Any("error", err),
@@ -616,7 +606,8 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 	activeSet := stateSet(params.ActiveStates)
 	terminalSet := stateSet(params.TerminalStates)
 
-	for issueID, stateName := range refreshed {
+	for issueID, read := range refreshed {
+		stateName := read.State
 		entry := state.Running[issueID]
 		hop := state.StageHops[issueID]
 
@@ -659,9 +650,7 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 
 			var counts issueReleaseCounts
 			if entry != nil {
-				if entry.CancelFunc != nil {
-					entry.CancelFunc()
-				}
+				entry.cancelRun(terminalCancelCause(stateName))
 				counts = releaseIssueRuntimeState(ctx, state, params.Store, issueID, entryLog)
 				entry.PendingCleanup = true
 				entry.ObservedTerminalState = stateName
@@ -699,8 +688,9 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 			continue
 		}
 
-		if isActive {
-			entry.Issue.State = stateName
+		keepsRun := readKeepsRun(entry, stateName, params.ActiveStates, params.HandoffState)
+		if keepsRun && isActive {
+			recordIssueRead(entry, read, readStartedAt)
 			metrics.IncReconciliationActions(actionKeep)
 			entryLog.Debug("refreshed issue state",
 				slog.String("state", stateName),
@@ -708,9 +698,8 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 			continue
 		}
 
-		isHandoff := params.HandoffState != "" && strings.EqualFold(stateName, params.HandoffState)
-		if isHandoff && isKnownReactionKind(entry.ReactionKind) {
-			entry.Issue.State = stateName
+		if keepsRun {
+			recordIssueRead(entry, read, readStartedAt)
 			metrics.IncReconciliationActions(actionKeep)
 			entryLog.Debug("keeping reaction worker running in handoff state",
 				slog.String("state", stateName),
@@ -720,9 +709,7 @@ func reconcileTrackerState(state *State, params ReconcileParams, log *slog.Logge
 		}
 
 		// Non-active, non-terminal: cancel without workspace cleanup.
-		if entry.CancelFunc != nil {
-			entry.CancelFunc()
-		}
+		entry.cancelRun(inactiveCancelCause(stateName))
 		if incumbent := retrySlotIncumbent(state, issueID); incumbent != nil {
 			// Skipping only one of CancelRetry or DeleteRetryEntry would
 			// leave the in-memory entry and the persisted row disagreeing,
@@ -770,11 +757,6 @@ func clearNoStateObserved(entry *RunningEntry, hop *StageHopEntry) {
 // consistency while avoiding unbounded tracker API load from orphaned
 // non-terminal workspaces.
 const sweepEveryNTicks = 60
-
-// SweepStore is the persistence interface required by [SweepWorkspaces].
-type SweepStore interface {
-	LatestRunCompletionByIdentifier(ctx context.Context, identifiers []string) (map[string]string, error)
-}
 
 // sweepSummary accumulates the per-pass outcome counts reported by
 // [emitSweepSummary]. The nine counters after candidates partition the
@@ -994,7 +976,7 @@ type SweepWorkspacesParams struct {
 	// Store resolves each age candidate's latest recorded activity. A
 	// nil Store disables the age pass, reported as agePass
 	// "unavailable".
-	Store SweepStore
+	Store storage.RunHistoryStore
 
 	// NowFunc returns the current time. If nil, time.Now is used.
 	NowFunc func() time.Time

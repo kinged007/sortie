@@ -1,6 +1,12 @@
 package agentcore
 
-import "github.com/sortie-ai/sortie/internal/domain"
+import (
+	"context"
+	"time"
+
+	"github.com/sortie-ai/sortie/internal/agent/usage"
+	"github.com/sortie-ai/sortie/internal/domain"
+)
 
 // TurnSpend is one turn's evidence for the shared spend rule. The zero
 // value is a turn that has observed nothing. Whoever starts a turn owns
@@ -11,6 +17,8 @@ type TurnSpend struct {
 	settled      bool
 	sessionTotal bool
 	estimated    bool
+	provenance   []domain.UsageProvenance
+	amounts      []domain.ReportedAmount
 }
 
 // MarkModelReached records that the runtime served this turn output: a
@@ -40,6 +48,46 @@ func (s *TurnSpend) MarkEstimated() {
 	s.estimated = true
 }
 
+// ApplySettlement marks the turn's evidence from a ledger settlement and
+// returns the figure it produced, or nil when the settlement has none. It keeps
+// the settlement's amounts whether or not a figure came with them.
+func (s *TurnSpend) ApplySettlement(settlement usage.Settlement) *RecoveredUsage {
+	if settlement.Spent {
+		s.MarkModelReached()
+	}
+	if settlement.Complete {
+		s.MarkSettled()
+	}
+	if settlement.CoversSession {
+		s.MarkSessionTotal()
+	}
+	if settlement.Estimated {
+		s.MarkEstimated()
+	}
+	s.amounts = settlement.Amounts
+	if !settlement.Figure {
+		return nil
+	}
+	s.provenance = settlement.Provenance
+	return &RecoveredUsage{Run: settlement.Run, ByModel: settlement.ByModel, Model: settlement.Model}
+}
+
+// SettleSpend settles one turn through the ledger and returns the figure it
+// produced, or nil when it has none. It calls read, bounded by timeout, only
+// when the ledger needs the records. ledger must be non-nil, read reports
+// every failure as OK false, and the call is not safe for concurrent use with
+// other calls on the same ledger.
+func SettleSpend(ctx context.Context, ledger *usage.Ledger, end usage.TurnEnd, live *usage.SpendReading,
+	read func(context.Context) usage.RecordsRead, timeout time.Duration, spend *TurnSpend) *RecoveredUsage {
+	records := usage.RecordsRead{}
+	if ledger.NeedsRecords(end, live) {
+		readCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		records = read(readCtx)
+	}
+	return spend.ApplySettlement(ledger.Settle(end, live, records))
+}
+
 // ModelReached reports whether the runtime served this turn output.
 func (s TurnSpend) ModelReached() bool {
 	return s.modelReached
@@ -53,4 +101,6 @@ func (s TurnSpend) applyTo(result *domain.TurnResult, completed bool) {
 	result.SpendUnaccounted = s.estimated || unsettled
 	result.SpendCoverable = completed && unsettled && !s.estimated
 	result.CoversSession = s.settled && s.sessionTotal && !s.estimated
+	result.UsageProvenance = s.provenance
+	result.ReportedAmounts = s.amounts
 }

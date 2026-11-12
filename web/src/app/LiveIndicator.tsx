@@ -71,14 +71,12 @@ function indicatorFor(input: IndicatorInput): Indicator {
   return { word: "Live", tip: `Live${poll}. Press P to pause.`, tone: "live" };
 }
 
-/** Props of {@link LiveIndicator}. */
 export interface LiveIndicatorProps {
   /** True while the peek holds Overview still. */
   isHolding: boolean;
   onTogglePause: () => void;
 }
 
-/** Renders the button that shows in one word how fresh the screen is, with the detail in its tooltip, and pauses or resumes live updates. */
 export function LiveIndicator({ isHolding, onTogglePause }: LiveIndicatorProps) {
   const { paused, streamStatus } = useLive();
   const { data, isError, dataUpdatedAt } = useStateQuery();
@@ -104,7 +102,7 @@ export function LiveIndicator({ isHolding, onTogglePause }: LiveIndicatorProps) 
               type="button"
               onClick={onTogglePause}
               aria-describedby={tipId}
-              className="inline-flex h-(--size-control) cursor-pointer items-center gap-xs rounded-lg px-sm text-body-sm whitespace-nowrap transition-colors duration-(--duration-feedback) hover:bg-state-hover focus-visible:-outline-offset-1 focus-visible:outline-2 focus-visible:outline-focus-ring active:bg-state-pressed"
+              className="inline-flex h-(--size-control) cursor-pointer items-center gap-xs rounded-lg px-sm text-body-md whitespace-nowrap transition-colors duration-(--duration-feedback) hover:bg-state-hover focus-visible:-outline-offset-1 focus-visible:outline-2 focus-visible:outline-focus-ring active:bg-state-pressed"
             />
           }
         >

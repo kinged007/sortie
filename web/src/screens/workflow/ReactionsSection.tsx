@@ -1,3 +1,4 @@
+import { MONO } from "@/components/ui/mono";
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
 import {
@@ -89,20 +90,18 @@ function reactionRows(reactions: ShapeReactions): Row[] {
     );
     rows.push({
       kind: "label_commands",
-      limit: labels.length === 0 ? "—" : joinLabels(labels, " "),
-      escalation: "—",
+      limit: labels.length === 0 ? "–" : joinLabels(labels, " "),
+      escalation: "–",
     });
   }
   return rows;
 }
 
-/** Props of {@link ReactionsSection}. */
 export interface ReactionsSectionProps {
   reactions: ShapeReactions;
   handoffState: string | undefined;
 }
 
-/** Renders Reactions: one table row per configured pull request reaction, in a fixed order, above the restart note. */
 export function ReactionsSection({ reactions, handoffState }: ReactionsSectionProps) {
   const rows = reactionRows(reactions);
   const handoff =
@@ -123,7 +122,7 @@ export function ReactionsSection({ reactions, handoffState }: ReactionsSectionPr
             {rows.map((row) => (
               <TableRow key={row.kind}>
                 <TableCell>
-                  <span className="font-mono">{row.kind}</span>
+                  <span className={MONO}>{row.kind}</span>
                 </TableCell>
                 <TableCell>{row.limit}</TableCell>
                 <TableCell>{row.escalation}</TableCell>

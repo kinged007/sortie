@@ -20,14 +20,19 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/notify/route"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workflow"
+
+	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 )
 
 type stubWorkflowManager struct {
@@ -101,18 +106,37 @@ type observerFunc func()
 
 func (f observerFunc) OnStateChange() { f() }
 
+// stateChangeSignal returns an observer and the channel it signals. The send
+// never blocks because OnStateChange runs on the event loop.
+func stateChangeSignal() (Observer, <-chan struct{}) {
+	signal := make(chan struct{}, 1)
+	return observerFunc(func() {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}), signal
+}
+
 type stubStore struct {
+	storage.RunHistoryStore
+	storage.RunEventStore
+	storage.SessionMetadataStore
+	storage.AggregateMetricsStore
+	storage.RetryEntryStore
 	reactionActivityLog
 	livePassLog
 	noopOutcomeRecorder
 	noEscalationRecords
+	noUsageLimitHolds
 	unsupportedReactionObservationStore
 
 	mu              sync.Mutex
-	runHistories    []persistence.RunHistory
-	aggregates      []persistence.AggregateMetrics
-	sessions        []persistence.SessionMetadata
-	savedRetries    []persistence.RetryEntry
+	runHistories    []storage.RunHistory
+	aggregates      []storage.AggregateMetrics
+	sessions        []storage.SessionMetadata
+	savedRetries    []storage.RetryEntry
+	givenRows       map[string][]storage.GivenComment
 	deletedRetryIDs []string
 	// budgetExhaustedIDs maps an issue to its run-history session count.
 	budgetExhaustedIDs map[string]int
@@ -139,58 +163,89 @@ type stubStore struct {
 	// is zero.
 	tokenUnaccountedIDs []string
 
-	tokenExhaustedUsage map[string]persistence.IssueTokenUsage
+	tokenExhaustedUsage map[string]storage.IssueTokenUsage
 
 	upsertSessionMetadataErr error
 
-	windowUsage persistence.IssueTokenUsage
+	windowUsage storage.IssueTokenUsage
 
-	parkedIssues       []persistence.ParkedIssue
+	parkedIssues       []storage.ParkedIssue
 	deletedParkedIDs   []string
 	labelAppliedIDs    []string
-	listParkedIssues   []persistence.ParkedIssue
+	listParkedIssues   []storage.ParkedIssue
 	listParkedIssueErr error
 
-	latestRuns      map[string]persistence.RunHistory
+	latestRuns      map[string]storage.RunHistory
 	latestRunsErr   error
 	latestRunsCalls [][]string
-
-	resumeUsage    *persistence.ResumeUsage
-	resumeUsageErr error
 
 	dispatchMarked    []string
 	clearedOutcomeIDs []string
 	markDispatchedErr error
 
-	budgetHoldNotices         []persistence.BudgetHoldNotice
+	budgetHoldNotices         []storage.BudgetHoldNotice
 	upsertBudgetHoldNoticeErr error
 	deletedBudgetHoldIDs      []string
 	deleteBudgetHoldNoticeErr error
 	deleteAllBudgetHoldCalls  int
 	deleteAllBudgetHoldErr    error
-	listBudgetHoldNotices     []persistence.BudgetHoldNotice
+	listBudgetHoldNotices     []storage.BudgetHoldNotice
 	listBudgetHoldNoticesErr  error
 
-	storedAcknowledgements    map[string]persistence.AttentionAcknowledgement
-	savedAcknowledgements     []persistence.AttentionAcknowledgement
+	storedAcknowledgements    map[string]storage.AttentionAcknowledgement
+	savedAcknowledgements     []storage.AttentionAcknowledgement
 	deletedAcknowledgementIDs []string
 	saveAcknowledgementErr    error
 	deleteAcknowledgementsErr error
 
 	// scopeBudgetToCandidates makes QueryBudgetExhaustedIssues answer only
-	// for the candidate IDs it receives, as persistence.Store does.
+	// for the candidate IDs it receives, as the SQLite store does.
 	scopeBudgetToCandidates bool
 
 	// onAppendRunHistory and onUpsertSessionMetadata, when set, run
 	// synchronously after the write so a test can capture single-writer
 	// state at the moment a record is persisted rather than by polling.
-	onAppendRunHistory      func(persistence.RunHistory)
-	onUpsertSessionMetadata func(persistence.SessionMetadata)
+	onAppendRunHistory      func(storage.RunHistory)
+	onUpsertSessionMetadata func(storage.SessionMetadata)
 }
 
 var _ OrchestratorStore = (*stubStore)(nil)
 
-func (s *stubStore) AppendRunHistory(_ context.Context, run persistence.RunHistory) (persistence.RunHistory, error) {
+func (s *stubStore) RecordGivenComments(_ context.Context, issueID string, rows []storage.GivenComment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.givenRows == nil {
+		s.givenRows = make(map[string][]storage.GivenComment)
+	}
+	s.givenRows[issueID] = append(s.givenRows[issueID], rows...)
+	return nil
+}
+
+func (s *stubStore) ListGivenComments(_ context.Context, issueID, conversationID string) ([]storage.GivenComment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []storage.GivenComment
+	for _, row := range s.givenRows[issueID] {
+		if row.ConversationID == conversationID {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) ListEarlierGivenComments(_ context.Context, issueID, conversationID string) ([]storage.GivenComment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []storage.GivenComment
+	for _, row := range s.givenRows[issueID] {
+		if row.ConversationID != conversationID {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) AppendRunHistory(_ context.Context, run storage.RunHistory) (storage.RunHistory, error) {
 	s.mu.Lock()
 	run.ID = int64(len(s.runHistories) + 1)
 	s.runHistories = append(s.runHistories, run)
@@ -202,22 +257,22 @@ func (s *stubStore) AppendRunHistory(_ context.Context, run persistence.RunHisto
 	return run, nil
 }
 
-func (s *stubStore) AppendRunHistoryWithEvents(ctx context.Context, run persistence.RunHistory, _ []persistence.RunEvent, _ persistence.RunEventLimits) (persistence.RunHistory, error) {
+func (s *stubStore) AppendRunHistoryWithEvents(ctx context.Context, run storage.RunHistory, _ []storage.RunEvent, _ storage.RunEventLimits) (storage.RunHistory, error) {
 	return s.AppendRunHistory(ctx, run)
 }
 
-func (s *stubStore) AppendRunEvents(context.Context, string, string, []persistence.RunEvent, persistence.RunEventLimits) error {
+func (s *stubStore) AppendRunEvents(context.Context, string, string, []storage.RunEvent, storage.RunEventLimits) error {
 	return nil
 }
 
-func (s *stubStore) UpsertAggregateMetrics(_ context.Context, m persistence.AggregateMetrics) error {
+func (s *stubStore) UpsertAggregateMetrics(_ context.Context, m storage.AggregateMetrics) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.aggregates = append(s.aggregates, m)
 	return nil
 }
 
-func (s *stubStore) UpsertSessionMetadata(_ context.Context, m persistence.SessionMetadata) error {
+func (s *stubStore) UpsertSessionMetadata(_ context.Context, m storage.SessionMetadata) error {
 	s.mu.Lock()
 	s.sessions = append(s.sessions, m)
 	hook := s.onUpsertSessionMetadata
@@ -229,15 +284,15 @@ func (s *stubStore) UpsertSessionMetadata(_ context.Context, m persistence.Sessi
 	return err
 }
 
-func (s *stubStore) sessionWrites() []persistence.SessionMetadata {
+func (s *stubStore) sessionWrites() []storage.SessionMetadata {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]persistence.SessionMetadata, len(s.sessions))
+	out := make([]storage.SessionMetadata, len(s.sessions))
 	copy(out, s.sessions)
 	return out
 }
 
-func (s *stubStore) SaveRetryEntry(_ context.Context, entry persistence.RetryEntry) error {
+func (s *stubStore) SaveRetryEntry(_ context.Context, entry storage.RetryEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.savedRetries = append(s.savedRetries, entry)
@@ -260,16 +315,26 @@ func (s *stubStore) DeleteRetryEntry(_ context.Context, issueID string) error {
 
 func (s *stubStore) Ping(_ context.Context) error { return nil }
 
+func (s *stubStore) AddPostedComment(context.Context, string, string) error { return nil }
+
+func (s *stubStore) ListPostedComments(context.Context, string) ([]string, error) {
+	return []string{}, nil
+}
+
+func (s *stubStore) CountWorkerRunsCompletedSince(ctx context.Context, issueID string, since time.Time) (int, error) {
+	return s.unsupportedReactionObservationStore.CountWorkerRunsCompletedSince(ctx, issueID, since)
+}
+
 func (s *stubStore) ListReportedModels(context.Context) ([]string, error) { return nil, nil }
 
 func (s *stubStore) CountRunHistoryByIssue(_ context.Context, _ string) (int, error) {
 	return 0, nil
 }
 
-func (s *stubStore) TokenUsageByIssue(_ context.Context, _ string) (persistence.IssueTokenUsage, error) {
+func (s *stubStore) TokenUsageByIssue(_ context.Context, _ string) (storage.IssueTokenUsage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return persistence.IssueTokenUsage{
+	return storage.IssueTokenUsage{
 		TotalTokens:        s.tokenSum,
 		UncachedTokens:     s.tokenSum,
 		Sessions:           s.tokenSessionCount,
@@ -278,7 +343,7 @@ func (s *stubStore) TokenUsageByIssue(_ context.Context, _ string) (persistence.
 	}, nil
 }
 
-func (s *stubStore) UsageCompletedBetween(context.Context, time.Time, time.Time) (persistence.IssueTokenUsage, error) {
+func (s *stubStore) UsageCompletedBetween(context.Context, time.Time, time.Time) (storage.IssueTokenUsage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.windowUsage, nil
@@ -320,13 +385,13 @@ func (s *stubStore) ResetHandoffAbsenceSequence(_ context.Context, issueID strin
 	return nil
 }
 
-func (s *stubStore) QueryTokenBudgetUsage(_ context.Context, candidateIDs []string) (map[string]persistence.IssueTokenUsage, error) {
+func (s *stubStore) QueryTokenBudgetUsage(_ context.Context, candidateIDs []string) (map[string]storage.IssueTokenUsage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tokenExhaustedErr != nil {
 		return nil, s.tokenExhaustedErr
 	}
-	usage := make(map[string]persistence.IssueTokenUsage, len(candidateIDs))
+	usage := make(map[string]storage.IssueTokenUsage, len(candidateIDs))
 	for _, id := range candidateIDs {
 		if custom, ok := s.tokenExhaustedUsage[id]; ok {
 			usage[id] = custom
@@ -334,11 +399,11 @@ func (s *stubStore) QueryTokenBudgetUsage(_ context.Context, candidateIDs []stri
 		}
 		switch {
 		case slices.Contains(s.tokenExhaustedIDs, id):
-			usage[id] = persistence.IssueTokenUsage{TotalTokens: 1000, UncachedTokens: 1000}
+			usage[id] = storage.IssueTokenUsage{TotalTokens: 1000, UncachedTokens: 1000}
 		case slices.Contains(s.tokenIncompleteIDs, id):
-			usage[id] = persistence.IssueTokenUsage{TotalTokens: 0, UnmeasuredSessions: 1}
+			usage[id] = storage.IssueTokenUsage{TotalTokens: 0, UnmeasuredSessions: 1}
 		case slices.Contains(s.tokenUnaccountedIDs, id):
-			usage[id] = persistence.IssueTokenUsage{TotalTokens: 500, UncachedTokens: 500, Sessions: 1, UnaccountedTurns: 1}
+			usage[id] = storage.IssueTokenUsage{TotalTokens: 500, UncachedTokens: 500, Sessions: 1, UnaccountedTurns: 1}
 		}
 	}
 	return usage, nil
@@ -364,7 +429,7 @@ func (s *stubStore) LatestRunCompletionByIdentifier(_ context.Context, _ []strin
 	return map[string]string{}, nil
 }
 
-func (s *stubStore) UpsertParkedIssue(_ context.Context, entry persistence.ParkedIssue) error {
+func (s *stubStore) UpsertParkedIssue(_ context.Context, entry storage.ParkedIssue) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.parkedIssues = append(s.parkedIssues, entry)
@@ -385,18 +450,18 @@ func (s *stubStore) MarkParkedIssueLabelApplied(_ context.Context, issueID strin
 	return nil
 }
 
-func (s *stubStore) ListParkedIssues(_ context.Context) ([]persistence.ParkedIssue, error) {
+func (s *stubStore) ListParkedIssues(_ context.Context) ([]storage.ParkedIssue, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.listParkedIssueErr != nil {
 		return nil, s.listParkedIssueErr
 	}
-	out := make([]persistence.ParkedIssue, len(s.listParkedIssues))
+	out := make([]storage.ParkedIssue, len(s.listParkedIssues))
 	copy(out, s.listParkedIssues)
 	return out, nil
 }
 
-func (s *stubStore) UpsertBudgetHoldNotice(_ context.Context, notice persistence.BudgetHoldNotice) error {
+func (s *stubStore) UpsertBudgetHoldNotice(_ context.Context, notice storage.BudgetHoldNotice) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.upsertBudgetHoldNoticeErr != nil {
@@ -420,25 +485,25 @@ func (s *stubStore) DeleteAllBudgetHoldNotices(_ context.Context) error {
 	return s.deleteAllBudgetHoldErr
 }
 
-func (s *stubStore) ListBudgetHoldNotices(_ context.Context) ([]persistence.BudgetHoldNotice, error) {
+func (s *stubStore) ListBudgetHoldNotices(_ context.Context) ([]storage.BudgetHoldNotice, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.listBudgetHoldNoticesErr != nil {
 		return nil, s.listBudgetHoldNoticesErr
 	}
-	out := make([]persistence.BudgetHoldNotice, len(s.listBudgetHoldNotices))
+	out := make([]storage.BudgetHoldNotice, len(s.listBudgetHoldNotices))
 	copy(out, s.listBudgetHoldNotices)
 	return out, nil
 }
 
-func (s *stubStore) SaveAttentionAcknowledgement(_ context.Context, ack persistence.AttentionAcknowledgement) error {
+func (s *stubStore) SaveAttentionAcknowledgement(_ context.Context, ack storage.AttentionAcknowledgement) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.saveAcknowledgementErr != nil {
 		return s.saveAcknowledgementErr
 	}
 	if s.storedAcknowledgements == nil {
-		s.storedAcknowledgements = make(map[string]persistence.AttentionAcknowledgement)
+		s.storedAcknowledgements = make(map[string]storage.AttentionAcknowledgement)
 	}
 	s.storedAcknowledgements[ack.ItemID] = ack
 	s.savedAcknowledgements = append(s.savedAcknowledgements, ack)
@@ -458,7 +523,7 @@ func (s *stubStore) DeleteAttentionAcknowledgements(_ context.Context, itemIDs [
 	return nil
 }
 
-func (s *stubStore) ListAttentionAcknowledgements(_ context.Context) ([]persistence.AttentionAcknowledgement, error) {
+func (s *stubStore) ListAttentionAcknowledgements(_ context.Context) ([]storage.AttentionAcknowledgement, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Collect(maps.Values(s.storedAcknowledgements)), nil
@@ -993,11 +1058,7 @@ func TestMakeWorkerFn_SSHEnvNamesJoinsRegistryAndOperatorLists(t *testing.T) {
 		close(exitDone)
 	}()
 
-	select {
-	case <-exitDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("worker did not exit within 10 seconds")
-	}
+	waittest.Receive(t, exitDone, "worker exit")
 
 	if !slices.Equal(capturedSSHEnvNames, []string{"K1", "L"}) {
 		t.Errorf("StartSessionParams.SSHEnvNames = %v, want [K1 L]", capturedSSHEnvNames)
@@ -1106,11 +1167,7 @@ func TestOrchestratorShutdown(t *testing.T) {
 
 	cancel()
 
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Run did not return within 3 seconds of context cancellation")
-	}
+	waittest.Receive(t, done, "Run return")
 }
 
 // TestApplyQueued pins applyQueued's bound: it drains in receive order,
@@ -1242,11 +1299,11 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			// an empty DispatchID is HandleWorkerExit's own, distinguishable
 			// from the queued write regardless of call order.
 			type observedRow struct {
-				meta               persistence.SessionMetadata
+				meta               storage.SessionMetadata
 				selfReviewQueueLen int
 			}
 			captured := make(chan observedRow, 1)
-			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
+			store.onUpsertSessionMetadata = func(meta storage.SessionMetadata) {
 				if meta.DispatchID != "" {
 					return
 				}
@@ -1264,14 +1321,11 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 				close(done)
 			}()
 
-			var row observedRow
-			select {
-			case row = <-captured:
-			case <-time.After(10 * time.Second):
+			t.Cleanup(func() {
 				cancel()
 				<-done
-				t.Fatalf("trial %d: timed out waiting for HandleWorkerExit's session_metadata row", trial)
-			}
+			})
+			row := waittest.Receive(t, captured, fmt.Sprintf("trial %d: HandleWorkerExit's session_metadata row", trial))
 
 			cancel()
 			<-done
@@ -1307,7 +1361,7 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 			// distinguishes it from the queued event's earlier throttled
 			// incremental write, carrying the entry's non-empty DispatchID.
 			selfReviewQueueLen := -1
-			store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) {
+			store.onUpsertSessionMetadata = func(meta storage.SessionMetadata) {
 				if meta.DispatchID != "" {
 					return
 				}
@@ -1324,11 +1378,7 @@ func TestOrchestrator_QueuedMessagesApplyAheadOfExit(t *testing.T) {
 				close(done)
 			}()
 
-			select {
-			case <-done:
-			case <-time.After(10 * time.Second):
-				t.Fatalf("trial %d: drainRunningWorkers did not return within 10 seconds", trial)
-			}
+			waittest.Receive(t, done, fmt.Sprintf("trial %d: drainRunningWorkers return", trial))
 
 			// The queued agent event's own throttled incremental write may
 			// land before HandleWorkerExit's unconditional exit-time write,
@@ -1633,7 +1683,7 @@ func TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues(t *testing.T) {
 				stoppedByBudget int
 			}
 			captured := make(chan observedRow, 1)
-			store.onAppendRunHistory = func(persistence.RunHistory) {
+			store.onAppendRunHistory = func(storage.RunHistory) {
 				select {
 				case captured <- observedRow{
 					yCancels:        yCancels.Load(),
@@ -1653,14 +1703,11 @@ func TestApplyQueuedAheadOfExit_EnforcesCeilingForOtherIssues(t *testing.T) {
 				close(done)
 			}()
 
-			var row observedRow
-			select {
-			case row = <-captured:
-			case <-time.After(10 * time.Second):
+			t.Cleanup(func() {
 				cancel()
 				<-done
-				t.Fatalf("trial %d: timed out waiting for X's run_history row", trial)
-			}
+			})
+			row := waittest.Receive(t, captured, fmt.Sprintf("trial %d: X's run_history row", trial))
 
 			// Y exits too, so the shutdown drain finds no running entry to
 			// wait for.
@@ -1708,6 +1755,50 @@ func TestApplyTurnStarted(t *testing.T) {
 			t.Errorf("state.Running = %v, want empty", state.Running)
 		}
 	})
+}
+
+func TestApplyIssueRead(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, issueID, dispatchID, state, reactionKind string
+		pendingCleanup, recorded                       bool
+	}{
+		{name: "active state", issueID: "A", dispatchID: "d1", state: "ai:in-progress", recorded: true},
+		{name: "absent entry", issueID: "missing", dispatchID: "d1", state: "ai:in-progress"},
+		{name: "mismatched dispatch", issueID: "A", dispatchID: "d0", state: "ai:in-progress"},
+		{name: "pending cleanup", issueID: "A", dispatchID: "d1", state: "ai:in-progress", pendingCleanup: true},
+		{name: "empty state", issueID: "A", dispatchID: "d1"},
+		{name: "terminal state", issueID: "A", dispatchID: "d1", state: "Done"},
+		{name: "non-active state", issueID: "A", dispatchID: "d1", state: "Backlog"},
+		{name: "handoff without reaction kind", issueID: "A", dispatchID: "d1", state: "Handoff"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			wm := &stubWorkflowManager{}
+			wm.config.Tracker.ActiveStates = []string{"ai:in-progress"}
+			wm.config.Tracker.HandoffState = "Handoff"
+			entry := &RunningEntry{DispatchID: "d1", PendingCleanup: tt.pendingCleanup, Issue: domain.Issue{State: "ai:ready", Labels: []string{"ai:ready"}}}
+			state := NewState(1000, 4, 0, nil, AgentTotals{})
+			state.Running["A"] = entry
+			o := &Orchestrator{state: state, workflowManager: wm}
+			startedAt := time.Now()
+
+			o.applyIssueRead(issueReadMsg{IssueID: tt.issueID, DispatchID: tt.dispatchID, Read: domain.IssueStateAndLabels{State: tt.state, Labels: []string{"ai:in-progress"}}, StartedAt: startedAt})
+
+			got := fmt.Sprintf("%s %v %t", entry.Issue.State, entry.Issue.Labels, entry.IssueReadAt.Equal(startedAt))
+			want := "ai:ready [ai:ready] false"
+			if tt.recorded {
+				want = tt.state + " [ai:in-progress] true"
+			}
+			if got != want {
+				t.Errorf("applyIssueRead(%q, %q) entry = %q, want %q", tt.dispatchID, tt.state, got, want)
+			}
+		})
+	}
 }
 
 func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
@@ -1787,11 +1878,7 @@ func TestOrchestrator_TurnStartedAppliesAheadOfExit(t *testing.T) {
 				close(done)
 			}()
 
-			select {
-			case <-done:
-			case <-time.After(10 * time.Second):
-				t.Fatalf("trial %d: drainRunningWorkers did not return within 10 seconds", trial)
-			}
+			waittest.Receive(t, done, fmt.Sprintf("trial %d: drainRunningWorkers return", trial))
 
 			if entry.TurnCount != 9 {
 				t.Fatalf("trial %d: entry.TurnCount = %d, want 9 (applied before the drain's HandleWorkerExit removed the entry)", trial, entry.TurnCount)
@@ -1817,8 +1904,8 @@ func TestOrchestrator_UnaccountedTurnsRelayWritesWithoutWorkerExit(t *testing.T)
 		store := &stubStore{}
 		o := budgetOrchestrator(state, budgetTickConfig(0), store, &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}})
 		o.drainTimeout = 100 * time.Millisecond
-		written := make(chan persistence.SessionMetadata, 8)
-		store.onUpsertSessionMetadata = func(meta persistence.SessionMetadata) { written <- meta }
+		written := make(chan storage.SessionMetadata, 8)
+		store.onUpsertSessionMetadata = func(meta storage.SessionMetadata) { written <- meta }
 		o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: issueID, UnaccountedTurns: 3}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1828,12 +1915,11 @@ func TestOrchestrator_UnaccountedTurnsRelayWritesWithoutWorkerExit(t *testing.T)
 			close(done)
 		}()
 
-		var got persistence.SessionMetadata
-		select {
-		case got = <-written:
-		case <-time.After(5 * time.Second):
-			t.Error("UpsertSessionMetadata not called within 5 seconds of the relay, want one")
-		}
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		got := waittest.Receive(t, written, "UpsertSessionMetadata call after the relay")
 		cancel()
 		<-done
 
@@ -1851,7 +1937,9 @@ func TestOrchestrator_RunNotifiesObserversAfterAgentLaneMessage(t *testing.T) {
 		name string
 		send func(o *Orchestrator)
 	}{
-		{"token usage event", func(o *Orchestrator) { o.agentEventCh <- agentEventMsg{id, tokenUsageEvent(1, 1, 2, 0)} }},
+		{"token usage event", func(o *Orchestrator) {
+			o.agentEventCh <- agentEventMsg{IssueID: id, Event: tokenUsageEvent(1, 1, 2, 0)}
+		}},
 		{"turn start", func(o *Orchestrator) { o.turnStartedCh <- turnStartedMsg{IssueID: id, TurnsStarted: 2} }},
 		{"self-review progress", func(o *Orchestrator) { o.selfReviewCh <- selfReviewProgressMsg{IssueID: id, Iteration: 1} }},
 		{"unaccounted turns", func(o *Orchestrator) { o.unaccountedTurnsCh <- unaccountedTurnsMsg{IssueID: id, UnaccountedTurns: 3} }},
@@ -1872,48 +1960,68 @@ func TestOrchestrator_RunNotifiesObserversAfterAgentLaneMessage(t *testing.T) {
 			t.Cleanup(running.Wait)
 
 			<-notified
-			_, _ = o.SnapshotFunc()()
+			o.runOnLoop(t.Context(), func(context.Context) {})
 			for len(notified) > 0 {
 				<-notified
 			}
 			tt.send(o)
 
-			select {
-			case <-notified:
-			case <-time.After(5 * time.Second):
-				t.Errorf("observer not called within 5 seconds of the %s, want a call with no tick in between", tt.name)
-			}
+			waittest.Receive(t, notified, "observer call after the "+tt.name+", with no tick in between")
 		})
 	}
 }
 
+func TestOrchestrator_ObserverReadSeesTheAgentLaneChange(t *testing.T) {
+	t.Parallel()
+
+	const id = "ISSUE-LANE-READ"
+	state := NewState(60000, 4, 0, nil, AgentTotals{})
+	state.Running[id] = queuedOrderingIssueEntry(id)
+	o := budgetOrchestrator(state, budgetTickConfig(0), &stubStore{}, &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}})
+	o.drainTimeout = 100 * time.Millisecond
+	seen := make(chan int, 16)
+	o.AddObserver(observerFunc(func() {
+		if running := o.SnapshotFunc()().Running; len(running) == 1 {
+			seen <- running[0].TurnCount
+		}
+	}))
+	var running sync.WaitGroup
+	running.Go(func() { o.Run(t.Context()) })
+	t.Cleanup(running.Wait)
+
+	waittest.Receive(t, seen, "first observer call")
+	o.runOnLoop(t.Context(), func(context.Context) {})
+	for len(seen) > 0 {
+		<-seen
+	}
+	o.turnStartedCh <- turnStartedMsg{IssueID: id, TurnsStarted: 2}
+
+	if got := waittest.Receive(t, seen, "observer call after the turn start"); got != 2 {
+		t.Errorf("TurnCount read inside OnStateChange = %d, want 2", got)
+	}
+}
+
 // waitForTurnCount polls snapshots until issueID reports want, failing on
-// a larger value or at the deadline. Run applies turn-started messages
-// asynchronously to snapshot requests, so a single read can race ahead.
-func waitForTurnCount(t *testing.T, snapshot func() (RuntimeSnapshotResult, error), issueID string, want int) {
+// a larger value. Run applies turn-started messages asynchronously to
+// snapshot requests, so a single read can race ahead.
+func waitForTurnCount(t *testing.T, snapshot func() RuntimeSnapshotResult, issueID string, want int) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		snap, err := snapshot()
-		if err != nil {
-			t.Fatalf("snapshot(): %v", err)
-		}
+	waittest.Until(t, func() error {
+		snap := snapshot()
 		idx := slices.IndexFunc(snap.Running, func(e SnapshotRunningEntry) bool { return e.IssueID == issueID })
 		if idx < 0 {
 			t.Fatalf("snapshot has no running entry for %q", issueID)
 		}
 		got := snap.Running[idx].TurnCount
-		if got == want {
-			return
-		}
 		if got > want {
 			t.Fatalf("TurnCount = %d, want %d (observed ahead of releasing this turn)", got, want)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("TurnCount did not reach %d within the deadline, last observed %d", want, got)
+		if got < want {
+			return fmt.Errorf("TurnCount = %d, want %d", got, want)
 		}
-	}
+		return nil
+	})
 }
 
 // TestOrchestrator_TurnCountTracksWorkerTally pins that a live snapshot
@@ -2005,11 +2113,7 @@ func TestOrchestrator_TurnCountTracksWorkerTally(t *testing.T) {
 				adapter.release <- struct{}{}
 			}
 
-			select {
-			case <-workerDone:
-			case <-time.After(10 * time.Second):
-				t.Fatal("worker did not exit within 10 seconds")
-			}
+			waittest.Receive(t, workerDone, "worker exit")
 		})
 	}
 }
@@ -2066,12 +2170,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		var exitResult WorkerResult
-		select {
-		case exitResult = <-o.workerExitCh:
-		case <-time.After(10 * time.Second):
-			t.Fatal("worker did not exit within 10 seconds")
-		}
+		exitResult := waittest.Receive(t, o.workerExitCh, "worker exit")
 
 		<-exitDone
 
@@ -2126,13 +2225,9 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		select {
-		case result := <-o.workerExitCh:
-			if result.IssueID != issue.ID {
-				t.Errorf("WorkerResult.IssueID = %q, want %q", result.IssueID, issue.ID)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("timed out waiting for workerExitCh")
+		result := waittest.Receive(t, o.workerExitCh, "worker exit result")
+		if result.IssueID != issue.ID {
+			t.Errorf("WorkerResult.IssueID = %q, want %q", result.IssueID, issue.ID)
 		}
 
 		<-exitDone
@@ -2147,11 +2242,9 @@ func TestMakeWorkerFn(t *testing.T) {
 		tmpl := mustParseTemplate(t, "do {{ .issue.identifier }}")
 
 		var capturedResumeID string
-		var capturedResumeUsage *domain.TokenUsage
 		agent := &mockAgentAdapter{
 			startSessionFn: func(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
 				capturedResumeID = params.ResumeSessionID
-				capturedResumeUsage = params.ResumeUsage
 				return domain.Session{ID: "new-sess"}, nil
 			},
 		}
@@ -2164,7 +2257,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			TrackerAdapter:  &mockTrackerAdapter{},
 			AgentAdapter:    agent,
 			WorkflowManager: wm,
-			Store:           &stubStore{resumeUsage: &persistence.ResumeUsage{InputTokens: 900, OutputTokens: 100, CacheReadTokens: 40, CacheWriteTokens: 5}},
+			Store:           &stubStore{},
 		})
 
 		issue := workerTestIssue()
@@ -2182,18 +2275,10 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		select {
-		case <-exitDone:
-		case <-time.After(10 * time.Second):
-			t.Fatal("worker did not exit within 10 seconds")
-		}
+		waittest.Receive(t, exitDone, "worker exit")
 
 		if capturedResumeID != "resume-sess-42" {
 			t.Errorf("ResumeSessionID = %q, want %q", capturedResumeID, "resume-sess-42")
-		}
-		wantUsage := domain.TokenUsage{InputTokens: 900, OutputTokens: 100, TotalTokens: 1000, CacheReadTokens: 40, CacheWriteTokens: 5}
-		if capturedResumeUsage == nil || *capturedResumeUsage != wantUsage {
-			t.Errorf("StartSessionParams.ResumeUsage = %+v, want %+v", capturedResumeUsage, wantUsage)
 		}
 	})
 
@@ -2240,11 +2325,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		select {
-		case <-exitDone:
-		case <-time.After(10 * time.Second):
-			t.Fatal("worker did not exit within 10 seconds")
-		}
+		waittest.Receive(t, exitDone, "worker exit")
 
 		if capturedStrictHostKeyChecking != "yes" {
 			t.Errorf("StartSessionParams.SSHStrictHostKeyChecking = %q, want %q", capturedStrictHostKeyChecking, "yes")
@@ -2292,11 +2373,7 @@ func TestMakeWorkerFn(t *testing.T) {
 			close(exitDone)
 		}()
 
-		select {
-		case <-exitDone:
-		case <-time.After(10 * time.Second):
-			t.Fatal("worker did not exit within 10 seconds")
-		}
+		waittest.Receive(t, exitDone, "worker exit")
 
 		mcpConfigPath, _ := capturedMCPConfigPath.Load().(string)
 		if mcpConfigPath == "" {
@@ -2363,11 +2440,7 @@ func TestMakeWorkerFn_DerivesPostureFromReactionKind(t *testing.T) {
 				close(exitDone)
 			}()
 
-			select {
-			case <-o.workerExitCh:
-			case <-time.After(10 * time.Second):
-				t.Fatal("worker did not exit within 10 seconds")
-			}
+			waittest.Receive(t, o.workerExitCh, "worker exit")
 			<-exitDone
 
 			gotTransitioned := len(tracker.transitionCalls) > 0
@@ -3017,26 +3090,19 @@ func TestOrchestratorLifecycle(t *testing.T) {
 
 	// state belongs to the event loop, so progress is read from the
 	// mutex-protected store rather than from state directly.
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			store.mu.Lock()
-			n := len(store.runHistories)
-			store.mu.Unlock()
-			t.Fatalf("timed out: run histories = %d, want 3", n)
-		default:
-		}
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
 		store.mu.Lock()
 		n := len(store.runHistories)
 		store.mu.Unlock()
-		if n >= 3 {
-			break
+		if n < 3 {
+			return fmt.Errorf("run histories = %d, want 3", n)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return nil
+	})
 
 	cancel()
 	<-done
@@ -3113,7 +3179,7 @@ func TestOrchestratorLifecycle_TokenCeilingStopsRunMidTurn(t *testing.T) {
 	agentRegistry := &stubAgentRegistry{
 		getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 		metaFunc: func(string) (registry.AgentMeta, bool) {
-			return registry.AgentMeta{UsageArrival: registry.UsageArrivalIncremental, UsageAttribution: registry.UsageAttributionPerModel}, true
+			return registry.AgentMeta{UsageSources: usage.Sources{Live: tokenLive}}, true
 		},
 	}
 
@@ -3146,23 +3212,19 @@ func TestOrchestratorLifecycle_TokenCeilingStopsRunMidTurn(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			t.Fatal("timed out waiting for a run_history record")
-		default:
-		}
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
 		store.mu.Lock()
 		n := len(store.runHistories)
 		store.mu.Unlock()
-		if n >= 1 {
-			break
+		if n < 1 {
+			return errors.New("no run_history record yet")
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return nil
+	})
 
 	// The run already exited through the normal event-loop path above;
 	// nothing is left in state.Running for a later shutdown-time
@@ -3176,7 +3238,7 @@ func TestOrchestratorLifecycle_TokenCeilingStopsRunMidTurn(t *testing.T) {
 	<-done
 
 	store.mu.Lock()
-	runs := append([]persistence.RunHistory(nil), store.runHistories...)
+	runs := append([]storage.RunHistory(nil), store.runHistories...)
 	store.mu.Unlock()
 	if len(runs) != 1 {
 		t.Fatalf("run history count = %d, want 1", len(runs))
@@ -3269,20 +3331,13 @@ func TestOrchestratorLifecycleRetry(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			store.mu.Lock()
-			h, r := len(store.runHistories), len(store.savedRetries)
-			store.mu.Unlock()
-			t.Fatalf("timed out: run histories = %d, saved retries = %d", h, r)
-		default:
-		}
-
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		hasOKHistory := false
 		for _, rh := range store.runHistories {
 			if rh.IssueID == "id-ok" {
@@ -3297,13 +3352,11 @@ func TestOrchestratorLifecycleRetry(t *testing.T) {
 				break
 			}
 		}
-		store.mu.Unlock()
-
-		if hasOKHistory && hasFailRetry {
-			break
+		if !hasOKHistory || !hasFailRetry {
+			return fmt.Errorf("run histories = %d, saved retries = %d, want id-ok history and id-fail retry", len(store.runHistories), len(store.savedRetries))
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return nil
+	})
 
 	cancel()
 	<-done
@@ -3400,20 +3453,13 @@ func TestDispatchLoopPerStateExhaustion(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			store.mu.Lock()
-			n := len(store.runHistories)
-			store.mu.Unlock()
-			t.Fatalf("timed out: run histories = %d, want >= 3", n)
-		default:
-		}
-
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		hasIP1, hasIP2, hasTD1 := false, false, false
 		for _, rh := range store.runHistories {
 			switch rh.IssueID {
@@ -3425,13 +3471,11 @@ func TestDispatchLoopPerStateExhaustion(t *testing.T) {
 				hasTD1 = true
 			}
 		}
-		store.mu.Unlock()
-
-		if hasIP1 && hasIP2 && hasTD1 {
-			break
+		if !hasIP1 || !hasIP2 || !hasTD1 {
+			return fmt.Errorf("run histories = %d, want ip-1, ip-2 and td-1", len(store.runHistories))
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return nil
+	})
 
 	cancel()
 	<-done
@@ -3449,6 +3493,192 @@ func TestDispatchLoopPerStateExhaustion(t *testing.T) {
 
 	if firstThreeIDs["ip-3"] && !firstThreeIDs["td-1"] {
 		t.Error("ip-3 was dispatched before td-1, per-state limit was not enforced")
+	}
+}
+
+func newHeldHarness(t *testing.T, tune func(*config.ServiceConfig), candidates ...domain.Issue) *runHarness {
+	t.Helper()
+	cfg := runConfig(t, map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}})
+	if tune != nil {
+		tune(&cfg)
+	}
+	h := newRunHarness(t, cfg, "kind-a")
+	h.state.MaxConcurrentAgents = cfg.Agent.MaxConcurrentAgents
+	h.state.MaxConcurrentByState = cfg.Agent.MaxConcurrentByState
+	h.tracker.candidates = candidates
+	h.build()
+	return h
+}
+
+func requireHeld(t *testing.T, h *runHarness, id string, reason SkipReason) *HeldEntry {
+	t.Helper()
+	got := h.state.Held[id]
+	if got == nil || got.Reason != reason {
+		t.Fatalf("State.Held[%q] = %+v, want a hold for %q", id, got, reason)
+	}
+	return got
+}
+
+func blockedCandidate(state string) domain.Issue {
+	issue := candidate("id-1", "A-1")
+	issue.BlockedBy = []domain.BlockerRef{{ID: "b-1", Identifier: "B-1", State: state}}
+	return issue
+}
+
+func TestHandleTick_Held(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	oneSlot := func(cfg *config.ServiceConfig) { cfg.Agent.MaxConcurrentAgents = 1 }
+	spendHeld := func(h *runHarness) {
+		h.store.windowUsage = storage.IssueTokenUsage{RecordedCostUSD: 5, PricedSessions: 1, Sessions: 1}
+	}
+	dailyCeiling := func(cfg *config.ServiceConfig) { cfg.Agent.MaxDailyCostUSD = 5 }
+	dailyResetsAt := func(h *runHarness) time.Time {
+		for _, status := range h.state.SpendCeilings {
+			if status.Window == SpendWindowDaily {
+				return status.ResetsAt
+			}
+		}
+		return time.Time{}
+	}
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"an open blocker holds the issue until it turns terminal", func(t *testing.T) {
+			h := newHeldHarness(t, nil, blockedCandidate("In Progress"))
+
+			h.o.handleTick(ctx)
+
+			got := requireHeld(t, h, "id-1", SkipBlockedBy)
+			if len(got.Blockers) != 1 || got.Blockers[0].Identifier != "B-1" || got.Blockers[0].State != "In Progress" {
+				t.Errorf("State.Held[id-1].Blockers = %+v, want B-1 in In Progress", got.Blockers)
+			}
+
+			h.tracker.candidates = []domain.Issue{blockedCandidate("Done")}
+			h.o.handleTick(ctx)
+
+			h.waitForSessions(1)
+			if len(h.state.Held) != 0 {
+				t.Errorf("State.Held after the blocker turned terminal = %+v, want none", h.state.Held)
+			}
+		}},
+		{"a full global slot limit holds the issue without reading its blockers", func(t *testing.T) {
+			h := newHeldHarness(t, oneSlot, blockedCandidate("In Progress"))
+			h.state.Running["r"] = &RunningEntry{Issue: candidate("r", "R-1")}
+			resolver := &fakeBlockerResolver{needsReadFn: func(domain.Issue) bool { return true }}
+			h.o.blockerResolver = resolver
+
+			h.o.handleTick(ctx)
+
+			got := requireHeld(t, h, "id-1", SkipAgentSlotsFull)
+			if want := (SlotHold{Scope: SlotScopeGlobal, Used: 1, Limit: 1}); got.Slot == nil || *got.Slot != want {
+				t.Errorf("State.Held[id-1].Slot = %+v, want %+v", got.Slot, want)
+			}
+			if len(resolver.callOrder) != 0 {
+				t.Errorf("blocker reads under a full slot limit = %v, want none", resolver.callOrder)
+			}
+
+			delete(h.state.Running, "r")
+			h.tracker.candidates = []domain.Issue{candidate("id-1", "A-1")}
+			h.o.handleTick(ctx)
+
+			h.waitForSessions(1)
+			if len(h.state.Held) != 0 {
+				t.Errorf("State.Held after a slot freed = %+v, want none", h.state.Held)
+			}
+		}},
+		{"a full per-state slot limit holds the issue", func(t *testing.T) {
+			h := newHeldHarness(t, func(cfg *config.ServiceConfig) {
+				cfg.Agent.MaxConcurrentByState = map[string]int{"to do": 1}
+			}, candidate("id-1", "A-1"))
+			h.state.Running["r"] = &RunningEntry{Issue: candidate("r", "R-1")}
+
+			h.o.handleTick(ctx)
+
+			got := requireHeld(t, h, "id-1", SkipAgentSlotsFull)
+			if want := (SlotHold{Scope: SlotScopeState, State: "To Do", Used: 1, Limit: 1}); got.Slot == nil || *got.Slot != want {
+				t.Errorf("State.Held[id-1].Slot = %+v, want %+v", got.Slot, want)
+			}
+		}},
+		{"a full SSH host pool holds the issue", func(t *testing.T) {
+			raw := map[string]any{"agent": map[string]any{"kind": "kind-a", "command": "a-cmd"}}
+			raw["worker"] = map[string]any{"ssh_hosts": []any{"host-1"}, "max_concurrent_agents_per_host": 1}
+			h := newRunHarness(t, runConfig(t, raw), "kind-a")
+			h.tracker.candidates = []domain.Issue{candidate("id-1", "A-1")}
+			h.build()
+			h.o.applyWorkerConfig(h.wm.Config())
+			if _, ok := h.o.hostPool.AcquireHost("r", ""); !ok {
+				t.Fatal("AcquireHost() = false on an empty pool, want true")
+			}
+
+			h.o.handleTick(ctx)
+
+			requireHeld(t, h, "id-1", SkipSSHHostsFull)
+		}},
+		{"a failed candidate fetch keeps the hold and its first-held time", func(t *testing.T) {
+			h := newHeldHarness(t, nil, blockedCandidate("In Progress"))
+			h.o.handleTick(ctx)
+			since := requireHeld(t, h, "id-1", SkipBlockedBy).Since
+
+			h.tracker.fetchErr = errors.New("tracker unreachable")
+			h.o.handleTick(ctx)
+			requireHeld(t, h, "id-1", SkipBlockedBy)
+
+			h.tracker.fetchErr = nil
+			h.o.handleTick(ctx)
+
+			if got := requireHeld(t, h, "id-1", SkipBlockedBy).Since; !got.Equal(since) {
+				t.Errorf("State.Held[id-1].Since after a failed fetch = %v, want %v", got, since)
+			}
+		}},
+		{"an unconfirmed stage move holds the issue on its between-stages row", func(t *testing.T) {
+			h := newHeldHarness(t, nil, candidate("id-1", "A-1"))
+			h.state.StageHops["id-1"] = &StageHopEntry{Identifier: "A-1", TargetRule: "review", TargetLabel: "stage:review"}
+
+			h.o.handleTick(ctx)
+
+			requireHeld(t, h, "id-1", SkipStageHopUnconfirmed)
+			snap := RuntimeSnapshot(h.state, time.Now())
+			if len(snap.Held) != 0 || len(snap.BetweenStages) != 1 || snap.BetweenStages[0].Hold == nil || snap.BetweenStages[0].Hold.Reason != SkipStageHopUnconfirmed {
+				t.Errorf("RuntimeSnapshot() Held, BetweenStages = %+v, %+v, want no held row and a between-stages row holding %q",
+					snap.Held, snap.BetweenStages, SkipStageHopUnconfirmed)
+			}
+		}},
+		{"a spend ceiling holds every candidate with its reset while a slot is free", func(t *testing.T) {
+			h := newHeldHarness(t, dailyCeiling, candidate("id-1", "A-1"), candidate("id-2", "A-2"))
+			spendHeld(h)
+
+			h.o.handleTick(ctx)
+
+			resetsAt := dailyResetsAt(h)
+			for _, id := range []string{"id-1", "id-2"} {
+				if got := requireHeld(t, h, id, SkipDailySpendCeiling); resetsAt.IsZero() || !got.ResetsAt.Equal(resetsAt) {
+					t.Errorf("State.Held[%s].ResetsAt = %v, want the window's reset %v", id, got.ResetsAt, resetsAt)
+				}
+			}
+		}},
+		{"a spend ceiling outranks a full slot limit and an open blocker", func(t *testing.T) {
+			h := newHeldHarness(t, func(cfg *config.ServiceConfig) { oneSlot(cfg); dailyCeiling(cfg) }, blockedCandidate("In Progress"), candidate("id-2", "A-2"))
+			spendHeld(h)
+			h.state.Running["r"] = &RunningEntry{Issue: candidate("r", "R-1")}
+
+			h.o.handleTick(ctx)
+
+			for _, id := range []string{"id-1", "id-2"} {
+				requireHeld(t, h, id, SkipDailySpendCeiling)
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tt.run(t)
+		})
 	}
 }
 
@@ -3579,11 +3809,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 				entry.CancelFunc()
 			}
 		}
-		select {
-		case <-o.workerExitCh:
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for first worker exit")
-		}
+		waittest.Receive(t, o.workerExitCh, "first worker exit")
 		for id := range state.Running {
 			delete(state.Running, id)
 			delete(state.Claimed, id)
@@ -3603,11 +3829,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 
 		cancel()
 		for i := 0; i < len(state.Running); i++ {
-			select {
-			case <-o.workerExitCh:
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for worker exit")
-			}
+			waittest.Receive(t, o.workerExitCh, "worker exit")
 		}
 	})
 
@@ -3688,11 +3910,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 
 		cancel()
 		for range state.Running {
-			select {
-			case <-o.workerExitCh:
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for worker exit")
-			}
+			waittest.Receive(t, o.workerExitCh, "worker exit")
 		}
 	})
 
@@ -3861,39 +4079,25 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 			close(done)
 		}()
 
-		deadline := time.After(10 * time.Second)
-		for {
-			if _, ok := capturedPrompts.Load("P-1"); ok {
-				break
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		promptCaptured := func(identifier string) func() error {
+			return func() error {
+				if _, ok := capturedPrompts.Load(identifier); !ok {
+					return fmt.Errorf("no prompt captured for %s yet", identifier)
+				}
+				return nil
 			}
-			select {
-			case <-deadline:
-				cancel()
-				<-done
-				t.Fatal("timed out waiting for the prompt for P-1")
-			default:
-			}
-			time.Sleep(20 * time.Millisecond)
 		}
+		waittest.Until(t, promptCaptured("P-1"))
 
 		tmpl2 := mustParseTemplate(t, "review {{ .issue.identifier }}")
 		wm.setTemplate(tmpl2)
 		issueSet.Store(1)
 
-		deadline = time.After(10 * time.Second)
-		for {
-			if _, ok := capturedPrompts.Load("P-2"); ok {
-				break
-			}
-			select {
-			case <-deadline:
-				cancel()
-				<-done
-				t.Fatal("timed out waiting for the prompt for P-2")
-			default:
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
+		waittest.Until(t, promptCaptured("P-2"))
 
 		cancel()
 		<-done
@@ -4003,11 +4207,7 @@ func TestOrchestratorDynamicConfigReload(t *testing.T) {
 
 		originalCancel()
 
-		select {
-		case <-o.workerExitCh:
-		case <-time.After(5 * time.Second):
-			t.Fatal("worker did not exit after cancel")
-		}
+		waittest.Receive(t, o.workerExitCh, "worker exit")
 	})
 
 	t.Run("state_updates_on_preflight_failure", func(t *testing.T) {
@@ -4452,8 +4652,6 @@ do {{ .issue.identifier }}
 		t.Fatalf("Start watcher: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	tracker := &candidateTrackerAdapter{
 		mockTrackerAdapter: &mockTrackerAdapter{},
 		fetchCandidatesFn: func(_ context.Context) ([]domain.Issue, error) {
@@ -4532,24 +4730,16 @@ do {{ .issue.identifier }}
 	// Poll the atomic snapshot written by the observer. The observer
 	// runs on the event loop goroutine after state mutation, so this
 	// is free of data races.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			t.Fatalf("timed out: MaxConcurrentAgents = %d, want 7",
-				observedMax.Load())
-		default:
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
+		if got := observedMax.Load(); got != 7 {
+			return fmt.Errorf("MaxConcurrentAgents = %d, want 7", got)
 		}
-		if observedMax.Load() == 7 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	cancel()
-	<-done
+		return nil
+	})
 }
 
 func TestReconciliationGuardOnInvalidReload(t *testing.T) {
@@ -4937,11 +5127,7 @@ func TestGracefulShutdown(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			t.Fatal("Run did not return within 1 second with pre-cancelled context and empty state")
-		}
+		waittest.Receive(t, done, "Run return with a pre-cancelled context and empty state")
 
 		if len(state.Running) != 0 {
 			t.Errorf("Running = %d, want 0", len(state.Running))
@@ -5021,21 +5207,14 @@ func TestGracefulShutdown(t *testing.T) {
 			workersStarted.Wait()
 			close(waitCh)
 		}()
-		select {
-		case <-waitCh:
-		case <-time.After(10 * time.Second):
+		t.Cleanup(func() {
 			cancel()
 			<-done
-			t.Fatal("timed out waiting for workers to start")
-		}
+		})
+		waittest.Receive(t, waitCh, "workers to start")
 
 		cancel()
-
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("Run did not return within 10 seconds of cancellation")
-		}
+		waittest.Receive(t, done, "Run return after cancellation")
 
 		if len(state.Running) != 0 {
 			t.Errorf("Running = %d after drain, want 0", len(state.Running))
@@ -5109,11 +5288,7 @@ func TestGracefulShutdown(t *testing.T) {
 
 		cancel()
 
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("Run did not return within 3 seconds (expected ~200ms drain timeout)")
-		}
+		waittest.Receive(t, done, "Run return after the drain timeout")
 
 		logOutput := buf.String()
 		if !strings.Contains(logOutput, "drain timeout exceeded") {
@@ -5164,26 +5339,15 @@ func TestGracefulShutdown(t *testing.T) {
 
 		cancel()
 
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("Run did not return within 3 seconds")
-		}
-
-		time.Sleep(200 * time.Millisecond)
-
-		select {
-		case id := <-o.retryTimerCh:
-			t.Errorf("retryTimerCh received %q after shutdown, want no late fires", id)
-		default:
-			// No message, timer was stopped correctly.
-		}
+		waittest.Receive(t, done, "Run return")
+		waittest.Never(t, o.retryTimerCh, 200*time.Millisecond, "a retry timer fire after shutdown")
 	})
 
 	t.Run("drains_in_flight_triage_run", func(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(60000, 1, 0, nil, AgentTotals{})
+		obs, started := stateChangeSignal()
 		o := NewOrchestrator(OrchestratorParams{
 			State:           state,
 			Logger:          discardLogger(),
@@ -5191,6 +5355,7 @@ func TestGracefulShutdown(t *testing.T) {
 			AgentAdapter:    &mockAgentAdapter{},
 			WorkflowManager: &stubWorkflowManager{},
 			Store:           &stubStore{},
+			Observers:       []Observer{obs},
 			PreflightParams: PreflightParams{
 				ReloadWorkflow: func() error { return errPreflightFailed },
 				ConfigFunc:     func() config.ServiceConfig { return config.ServiceConfig{} },
@@ -5214,14 +5379,10 @@ func TestGracefulShutdown(t *testing.T) {
 			close(runReturned)
 		}()
 
-		time.Sleep(10 * time.Millisecond)
+		waittest.Receive(t, started, "first state change")
 		cancel()
 
-		select {
-		case <-runReturned:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Run did not return after context cancellation")
-		}
+		waittest.Receive(t, runReturned, "Run return after context cancellation")
 		elapsed := time.Since(start)
 
 		select {
@@ -5235,25 +5396,57 @@ func TestGracefulShutdown(t *testing.T) {
 	})
 }
 
-func TestSnapshotFunc(t *testing.T) {
+func TestSnapshotFunc_AnswersWhileLoopBlocked(t *testing.T) {
 	t.Parallel()
 
-	t.Run("round-trip through event loop", func(t *testing.T) {
-		t.Parallel()
-
-		state := NewState(60000, 1, 0, nil, AgentTotals{InputTokens: 42})
-
-		o := NewOrchestrator(OrchestratorParams{
-			State:           state,
+	newOrchestrator := func(reload func() error) *Orchestrator {
+		return NewOrchestrator(OrchestratorParams{
+			State:           NewState(60000, 1, 0, nil, AgentTotals{InputTokens: 42}),
 			Logger:          discardLogger(),
 			TrackerAdapter:  &mockTrackerAdapter{},
 			AgentAdapter:    &mockAgentAdapter{},
 			WorkflowManager: &stubWorkflowManager{},
 			Store:           &stubStore{},
 			PreflightParams: PreflightParams{
-				ReloadWorkflow: func() error { return errPreflightFailed },
+				ReloadWorkflow: reload,
 				ConfigFunc:     func() config.ServiceConfig { return config.ServiceConfig{} },
 			},
+		})
+	}
+
+	readAsync := func(o *Orchestrator) <-chan RuntimeSnapshotResult {
+		ch := make(chan RuntimeSnapshotResult, 1)
+		go func() { ch <- o.SnapshotFunc()() }()
+		return ch
+	}
+
+	assertTotals := func(t *testing.T, got RuntimeSnapshotResult) {
+		t.Helper()
+		if got.AgentTotals.InputTokens != 42 {
+			t.Errorf("SnapshotFunc()().AgentTotals.InputTokens = %d, want 42", got.AgentTotals.InputTokens)
+		}
+	}
+
+	t.Run("before Run", func(t *testing.T) {
+		t.Parallel()
+
+		o := newOrchestrator(func() error { return errPreflightFailed })
+
+		assertTotals(t, waittest.Receive(t, readAsync(o), "snapshot read before Run"))
+	})
+
+	t.Run("while the tick is blocked", func(t *testing.T) {
+		t.Parallel()
+
+		entered := make(chan struct{}, 1)
+		release := make(chan struct{})
+		o := newOrchestrator(func() error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return errPreflightFailed
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -5262,28 +5455,15 @@ func TestSnapshotFunc(t *testing.T) {
 			o.Run(ctx)
 			close(done)
 		}()
+		t.Cleanup(func() {
+			close(release)
+			cancel()
+			waittest.Receive(t, done, "Run return")
+		})
 
-		time.Sleep(100 * time.Millisecond)
+		waittest.Receive(t, entered, "tick entering the workflow reload")
 
-		snapFn := o.SnapshotFunc()
-		snap, err := snapFn()
-		if err != nil {
-			t.Fatalf("SnapshotFunc() error = %v", err)
-		}
-
-		if snap.GeneratedAt.IsZero() {
-			t.Error("GeneratedAt is zero")
-		}
-		if snap.AgentTotals.InputTokens != 42 {
-			t.Errorf("AgentTotals.InputTokens = %d, want 42", snap.AgentTotals.InputTokens)
-		}
-
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Run did not return within 5 seconds")
-		}
+		assertTotals(t, waittest.Receive(t, readAsync(o), "snapshot read during the blocked tick"))
 	})
 }
 
@@ -5339,6 +5519,7 @@ func TestRefreshFunc(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(60000, 1, 0, nil, AgentTotals{})
+		obs, started := stateChangeSignal()
 		o := NewOrchestrator(OrchestratorParams{
 			State:           state,
 			Logger:          discardLogger(),
@@ -5346,6 +5527,7 @@ func TestRefreshFunc(t *testing.T) {
 			AgentAdapter:    &mockAgentAdapter{},
 			WorkflowManager: &stubWorkflowManager{},
 			Store:           &stubStore{},
+			Observers:       []Observer{obs},
 			PreflightParams: PreflightParams{
 				ReloadWorkflow: func() error { return errPreflightFailed },
 				ConfigFunc:     func() config.ServiceConfig { return config.ServiceConfig{} },
@@ -5359,15 +5541,10 @@ func TestRefreshFunc(t *testing.T) {
 			close(done)
 		}()
 
-		time.Sleep(100 * time.Millisecond)
+		waittest.Receive(t, started, "first state change")
 
 		cancel()
-
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Run did not return within 5 seconds")
-		}
+		waittest.Receive(t, done, "Run return")
 
 		refreshFn := o.RefreshFunc()
 		if refreshFn() {
@@ -5410,6 +5587,7 @@ func TestSnapshotDuringDrain(t *testing.T) {
 		CancelFunc: func() {},
 	}
 
+	obs, stateChanged := stateChangeSignal()
 	o := NewOrchestrator(OrchestratorParams{
 		State:           state,
 		Logger:          discardLogger(),
@@ -5417,6 +5595,7 @@ func TestSnapshotDuringDrain(t *testing.T) {
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: &stubWorkflowManager{},
 		Store:           &stubStore{},
+		Observers:       []Observer{obs},
 		PreflightParams: PreflightParams{
 			ReloadWorkflow: func() error { return errPreflightFailed },
 			ConfigFunc:     func() config.ServiceConfig { return config.ServiceConfig{} },
@@ -5430,33 +5609,22 @@ func TestSnapshotDuringDrain(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
+	waittest.Receive(t, stateChanged, "first state change")
 	cancel()
-
-	time.Sleep(50 * time.Millisecond)
-
-	snapFn := o.SnapshotFunc()
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		o.workerExitCh <- WorkerResult{IssueID: "id-1"}
-	}()
-
-	snap, err := snapFn()
-	if err != nil {
-		t.Fatalf("SnapshotFunc() during drain: %v", err)
+	waittest.Receive(t, stateChanged, "state change as shutdown starts")
+	if got := len(o.SnapshotFunc()().Running); got != 1 {
+		t.Fatalf("SnapshotFunc()().Running has %d entries before the worker exit, want 1", got)
 	}
 
-	if snap.GeneratedAt.IsZero() {
-		t.Error("GeneratedAt is zero")
-	}
+	waittest.Send(t, o.workerExitCh, WorkerResult{IssueID: "id-1"}, "worker exit")
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return within 5 seconds")
-	}
+	waittest.Until(t, func() error {
+		if got := len(o.SnapshotFunc()().Running); got != 0 {
+			return fmt.Errorf("SnapshotFunc()().Running has %d entries after the worker exit, want 0", got)
+		}
+		return nil
+	})
+	waittest.Receive(t, done, "Run return")
 }
 
 func TestRefreshDrainedDuringShutdown(t *testing.T) {
@@ -5470,6 +5638,7 @@ func TestRefreshDrainedDuringShutdown(t *testing.T) {
 		CancelFunc: func() {},
 	}
 
+	obs, started := stateChangeSignal()
 	o := NewOrchestrator(OrchestratorParams{
 		State:           state,
 		Logger:          discardLogger(),
@@ -5477,6 +5646,7 @@ func TestRefreshDrainedDuringShutdown(t *testing.T) {
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: &stubWorkflowManager{},
 		Store:           &stubStore{},
+		Observers:       []Observer{obs},
 		PreflightParams: PreflightParams{
 			ReloadWorkflow: func() error { return errPreflightFailed },
 			ConfigFunc:     func() config.ServiceConfig { return config.ServiceConfig{} },
@@ -5501,17 +5671,13 @@ func TestRefreshDrainedDuringShutdown(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waittest.Receive(t, started, "first state change")
 
 	cancel()
 
 	o.workerExitCh <- WorkerResult{IssueID: "id-1"}
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return within 5 seconds")
-	}
+	waittest.Receive(t, done, "Run return")
 
 	if refreshFn() {
 		t.Error("RefreshFunc() = true after drain, want false")
@@ -5544,7 +5710,7 @@ func budgetOrchestrator(state *State, wm *stubWorkflowManager, store *stubStore,
 		State:           state,
 		Logger:          discardLogger(),
 		TrackerAdapter:  tracker,
-		Router:          route.NewRouter(tracker, nil),
+		Router:          route.NewRouter(tracker, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5560,7 +5726,7 @@ func budgetOrchestratorWithLogger(state *State, wm *stubWorkflowManager, store *
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
-		Router:          route.NewRouter(tracker, nil),
+		Router:          route.NewRouter(tracker, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5576,7 +5742,7 @@ func budgetOrchestratorWithMetrics(state *State, wm *stubWorkflowManager, store 
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
-		Router:          route.NewRouter(tracker, nil),
+		Router:          route.NewRouter(tracker, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -5690,7 +5856,7 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		if _, ok := state.BudgetExhausted[issue.ID]; ok {
 			t.Errorf("BudgetExhausted[%s] remains with MaxSessions=0, want cleared", issue.ID)
 		}
-		requireLivePasses(t, "DeleteLivePass", store.deleted, []persistence.LivePass{{IssueID: issue.ID, Kind: persistence.LivePassBudget}})
+		requireLivePasses(t, "DeleteLivePass", store.deleted, []storage.LivePass{{IssueID: issue.ID, Kind: storage.LivePassBudget}})
 	})
 
 	t.Run("empty candidate list with budget enabled clears stale set", func(t *testing.T) {
@@ -5715,7 +5881,7 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		if _, ok := state.BudgetExhausted[issue.ID]; ok {
 			t.Errorf("BudgetExhausted[%s] retained on empty candidate list, want cleared", issue.ID)
 		}
-		requireLivePasses(t, "DeleteLivePass", store.deleted, []persistence.LivePass{{IssueID: issue.ID, Kind: persistence.LivePassBudget}})
+		requireLivePasses(t, "DeleteLivePass", store.deleted, []storage.LivePass{{IssueID: issue.ID, Kind: storage.LivePassBudget}})
 	})
 
 	t.Run("dispatch context of a hold", func(t *testing.T) {
@@ -5729,11 +5895,11 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		fromRun := holdContext{"plan", "kind-b", "model-run", StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-run", DispatchedAt: passAt}}
 		fromHop := holdContext{"plan", "kind-b", "model-plan", StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-hop", DispatchedAt: passAt}}
 		held := holdContext{"implement", "kind-c", "model-held", StageLineage{ChainID: "chain-held", DispatchedAt: passAt.Add(-time.Hour)}}
-		latest := map[string]persistence.RunHistory{issue.ID: {
+		latest := map[string]storage.RunHistory{issue.ID: {
 			RuleName: "plan", AgentAdapter: "kind-b", ConfiguredModel: "model-run", StagePrevious: "specify", StagePreviousOutcome: "succeeded",
 			ChainID: "chain-run", DispatchedAt: "2026-03-19T09:00:00Z",
 		}}
-		waiting := persistence.StageHop{
+		waiting := storage.StageHop{
 			IssueID: issue.ID, Identifier: issue.Identifier, HopCount: 1, SourceRule: "specify", TargetRule: "plan", TargetLabel: "Stage-Plan",
 			PreviousOutcome: "succeeded", ChainID: "chain-hop", HoppedAt: "2026-03-19T10:00:00Z", DispatchedAt: "2026-03-19T09:00:00Z",
 		}
@@ -5755,7 +5921,7 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 		tests := []struct {
 			name      string
 			prior     *BudgetExhaustedEntry
-			hop       *persistence.StageHop
+			hop       *storage.StageHop
 			runsErr   error
 			ticks     int
 			want      holdContext
@@ -5783,7 +5949,7 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 					state.BudgetExhausted[issue.ID] = tt.prior
 				}
 				if tt.hop != nil {
-					PopulateStageHops(state, []persistence.StageHop{*tt.hop}, nil)
+					PopulateStageHops(state, []storage.StageHop{*tt.hop}, nil)
 				}
 				tracker := &candidateTrackerAdapter{
 					mockTrackerAdapter: &mockTrackerAdapter{},
@@ -5806,7 +5972,7 @@ func TestHandleTick_BudgetExhaustionRebuildsState(t *testing.T) {
 				if reads := len(store.latestRunsCalls); reads != tt.wantReads {
 					t.Errorf("LatestAgentRuns calls = %d over %d ticks, want %d", reads, tt.ticks, tt.wantReads)
 				}
-				wantPasses := []persistence.LivePass{{IssueID: issue.ID, Kind: persistence.LivePassBudget, ChainID: tt.want.lineage.ChainID, RuleName: tt.want.rule, StagePrevious: tt.want.lineage.PreviousRule}}
+				wantPasses := []storage.LivePass{{IssueID: issue.ID, Kind: storage.LivePassBudget, ChainID: tt.want.lineage.ChainID, RuleName: tt.want.rule, StagePrevious: tt.want.lineage.PreviousRule}}
 				if !tt.wantRow {
 					wantPasses = nil
 				}
@@ -5861,7 +6027,7 @@ func TestHandleTick_TokenBudgetRebuild(t *testing.T) {
 
 		store := &stubStore{
 			tokenExhaustedIDs: []string{issueA.ID, issueB.ID},
-			tokenExhaustedUsage: map[string]persistence.IssueTokenUsage{
+			tokenExhaustedUsage: map[string]storage.IssueTokenUsage{
 				issueA.ID: {TotalTokens: 1600, UncachedTokens: 600},
 				issueB.ID: {TotalTokens: 2500, UncachedTokens: 1100},
 			},
@@ -6222,13 +6388,13 @@ func TestHandleTick_MoneyBudgetRebuild(t *testing.T) {
 
 	issue := domain.Issue{ID: "iss-usd", Identifier: "TEST-USD", Title: "title", State: "To Do"}
 	first, second := 0.7, 0.1
-	atCeiling := persistence.IssueTokenUsage{RecordedCostUSD: first + second, PricedSessions: 2, Sessions: 2}
+	atCeiling := storage.IssueTokenUsage{RecordedCostUSD: first + second, PricedSessions: 2, Sessions: 2}
 
 	tests := []struct {
 		name            string
 		maxTokens       int
 		maxCostUSD      float64
-		usage           persistence.IssueTokenUsage
+		usage           storage.IssueTokenUsage
 		queryErr        error
 		priorHold       *BudgetExhaustedEntry
 		priorIncomplete bool
@@ -6244,19 +6410,19 @@ func TestHandleTick_MoneyBudgetRebuild(t *testing.T) {
 		{
 			name:       "recorded costs one cent below the ceiling hold nothing",
 			maxCostUSD: 0.8,
-			usage:      persistence.IssueTokenUsage{RecordedCostUSD: 0.79, PricedSessions: 2, Sessions: 2},
+			usage:      storage.IssueTokenUsage{RecordedCostUSD: 0.79, PricedSessions: 2, Sessions: 2},
 		},
 		{
 			name:       "past the money and token ceilings the reason is money",
 			maxTokens:  1000,
 			maxCostUSD: 0.8,
-			usage:      persistence.IssueTokenUsage{TotalTokens: 1500, UncachedTokens: 1500, RecordedCostUSD: first + second, PricedSessions: 2, Sessions: 2},
+			usage:      storage.IssueTokenUsage{TotalTokens: 1500, UncachedTokens: 1500, RecordedCostUSD: first + second, PricedSessions: 2, Sessions: 2},
 			wantReason: budgetReasonMoney,
 		},
 		{
 			name:           "an unpriced run beside a priced run below the ceiling holds nothing and is flagged incomplete",
 			maxCostUSD:     0.8,
-			usage:          persistence.IssueTokenUsage{RecordedCostUSD: 0.5, PricedSessions: 1, UnpricedSessions: 1, Sessions: 2},
+			usage:          storage.IssueTokenUsage{RecordedCostUSD: 0.5, PricedSessions: 1, UnpricedSessions: 1, Sessions: 2},
 			wantIncomplete: true,
 		},
 		{
@@ -6286,7 +6452,7 @@ func TestHandleTick_MoneyBudgetRebuild(t *testing.T) {
 			wm := budgetTickConfigTokens(0, tt.maxTokens)
 			wm.config.Agent.MaxCostUSD = tt.maxCostUSD
 			store := &stubStore{
-				tokenExhaustedUsage: map[string]persistence.IssueTokenUsage{issue.ID: tt.usage},
+				tokenExhaustedUsage: map[string]storage.IssueTokenUsage{issue.ID: tt.usage},
 				tokenExhaustedErr:   tt.queryErr,
 			}
 			state := NewState(60000, 10, 0, nil, AgentTotals{})
@@ -7268,9 +7434,7 @@ func TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry(t *testing.T)
 	store := &stubStore{}
 	tracker := &candidateTrackerAdapter{mockTrackerAdapter: &mockTrackerAdapter{}}
 	o := budgetOrchestrator(state, budgetTickConfig(0), store, tracker)
-	// The drain must still serve snapshot requests when the poll below
-	// gives up, so its own deadline sits well beyond the poll's.
-	o.drainTimeout = time.Minute
+	o.drainTimeout = time.Hour
 
 	done := make(chan struct{})
 	go func() {
@@ -7280,27 +7444,16 @@ func TestDrainRunningWorkers_SelfReviewProgressUpdatesRunningEntry(t *testing.T)
 
 	o.selfReviewCh <- selfReviewProgressMsg{IssueID: "id-1", Message: "self_review_iteration", Iteration: 2, MaxIterations: 3}
 
-	deadline := time.After(10 * time.Second)
-	for {
-		reply := make(chan RuntimeSnapshotResult, 1)
-		o.snapshotCh <- snapshotRequest{ReplyCh: reply}
-		snap := <-reply
-		if len(snap.Running) == 1 && snap.Running[0].SelfReviewActive && snap.Running[0].SelfReviewIteration == 2 {
-			break
+	waittest.Until(t, func() error {
+		snap := o.SnapshotFunc()()
+		if len(snap.Running) != 1 || !snap.Running[0].SelfReviewActive || snap.Running[0].SelfReviewIteration != 2 {
+			return fmt.Errorf("RuntimeSnapshot().Running = %+v, want one entry with SelfReviewActive true and SelfReviewIteration 2", snap.Running)
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("RuntimeSnapshot().Running = %+v after 10s of drain, want one entry with SelfReviewActive true and SelfReviewIteration 2", snap.Running)
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
+		return nil
+	})
 
 	o.workerExitCh <- WorkerResult{IssueID: "id-1", Identifier: "id-1-ident"}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("drainRunningWorkers did not return within 10 seconds")
-	}
+	waittest.Receive(t, done, "drainRunningWorkers return")
 }
 
 func TestDrainRunningWorkers_TokenUsageEventTriggersIncrementalWrite(t *testing.T) {
@@ -7330,14 +7483,12 @@ func TestDrainRunningWorkers_TokenUsageEventTriggersIncrementalWrite(t *testing.
 
 	// The incremental write must land before the worker exit is delivered;
 	// the exit-path metadata write cannot have happened yet.
-	deadline := time.After(10 * time.Second)
-	for len(store.sessionWrites()) == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for incremental session_metadata write during drain")
-		case <-time.After(10 * time.Millisecond):
+	waittest.Until(t, func() error {
+		if len(store.sessionWrites()) == 0 {
+			return errors.New("no incremental session_metadata write during drain yet")
 		}
-	}
+		return nil
+	})
 
 	meta := store.sessionWrites()[0]
 	if meta.IssueID != "id-1" {
@@ -7351,11 +7502,7 @@ func TestDrainRunningWorkers_TokenUsageEventTriggersIncrementalWrite(t *testing.
 	}
 
 	o.workerExitCh <- WorkerResult{IssueID: "id-1", Identifier: "MT-1"}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("drainRunningWorkers did not return within 10 seconds")
-	}
+	waittest.Receive(t, done, "drainRunningWorkers return")
 }
 
 func TestDrainRunningWorkers_AbsenceCeiling(t *testing.T) {
@@ -7399,11 +7546,7 @@ func TestDrainRunningWorkers_AbsenceCeiling(t *testing.T) {
 			AgentAdapter:            "mock",
 		}
 
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("drainRunningWorkers did not return within 10 seconds")
-		}
+		waittest.Receive(t, done, "drainRunningWorkers return")
 		state.TrackerOpsWg.Wait()
 
 		if _, ok := state.Parked[issueID]; !ok {
@@ -7451,11 +7594,7 @@ func TestDrainRunningWorkers_AbsenceCeiling(t *testing.T) {
 			AgentAdapter:            "mock",
 		}
 
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("drainRunningWorkers did not return within 10 seconds")
-		}
+		waittest.Receive(t, done, "drainRunningWorkers return")
 		state.TrackerOpsWg.Wait()
 
 		if _, ok := state.Parked[issueID]; !ok {
@@ -7526,11 +7665,7 @@ func TestDrainRunningWorkers_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("drainRunningWorkers did not return promptly with a closed AbandonCh")
-		}
+		waittest.Receive(t, done, "drainRunningWorkers return with a closed AbandonCh")
 
 		output := buf.String()
 		if !strings.Contains(output, "worker drain abandoned at the operator's request") {
@@ -7563,11 +7698,7 @@ func TestDrainRunningWorkers_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("drainRunningWorkers did not return within 5s")
-		}
+		waittest.Receive(t, done, "drainRunningWorkers return")
 		elapsed := time.Since(start)
 
 		if elapsed < 300*time.Millisecond {
@@ -7602,11 +7733,7 @@ func TestDrainTrackerOps_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("drainTrackerOps did not return promptly with a closed AbandonCh")
-		}
+		waittest.Receive(t, done, "drainTrackerOps return with a closed AbandonCh")
 
 		output := buf.String()
 		if !strings.Contains(output, "tracker ops drain abandoned at the operator's request") {
@@ -7633,14 +7760,9 @@ func TestDrainTrackerOps_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-			t.Fatal("drainTrackerOps returned with a nil AbandonCh and in-flight work still pending, want it to keep waiting")
-		case <-time.After(300 * time.Millisecond):
-			// Still waiting after 300ms, well short of the 35s
-			// trackerOpsDrainTimeout: this is the entered-the-wait
-			// evidence the nil arm must not have short-circuited past.
-		}
+		// The window sits well short of trackerOpsDrainTimeout, so a drain that
+		// is still waiting has entered the wait the nil arm must not skip.
+		waittest.Never(t, done, 300*time.Millisecond, "drainTrackerOps return with a nil AbandonCh and in-flight work pending")
 	})
 }
 
@@ -7666,11 +7788,7 @@ func TestDrainTriageRuns_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("drainTriageRuns did not return promptly with a closed AbandonCh")
-		}
+		waittest.Receive(t, done, "drainTriageRuns return with a closed AbandonCh")
 
 		output := buf.String()
 		if !strings.Contains(output, "reaction triage drain abandoned at the operator's request") {
@@ -7697,14 +7815,9 @@ func TestDrainTriageRuns_AbandonChannel(t *testing.T) {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-			t.Fatal("drainTriageRuns returned with a nil AbandonCh and in-flight work still pending, want it to keep waiting")
-		case <-time.After(300 * time.Millisecond):
-			// Still waiting after 300ms, well short of the 35s
-			// trackerOpsDrainTimeout: this is the entered-the-wait
-			// evidence the nil arm must not have short-circuited past.
-		}
+		// The window sits well short of trackerOpsDrainTimeout, so a drain that
+		// is still waiting has entered the wait the nil arm must not skip.
+		waittest.Never(t, done, 300*time.Millisecond, "drainTriageRuns return with a nil AbandonCh and in-flight work pending")
 	})
 }
 
@@ -7716,7 +7829,7 @@ func drainTestOrchestrator(state *State, wm *stubWorkflowManager, store *stubSto
 		State:           state,
 		Logger:          logger,
 		TrackerAdapter:  tracker,
-		Router:          route.NewRouter(tracker, nil),
+		Router:          route.NewRouter(tracker, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store,
@@ -7782,24 +7895,16 @@ func TestOrchestratorScenarios(t *testing.T) {
 		return domain.Issue{ID: id, Identifier: identifier, Title: "Scenario Issue", State: "To Do"}
 	}
 
-	// pollStore polls the store until cond returns true or the deadline fires.
 	pollStore := func(t *testing.T, store *stubStore, cond func(*stubStore) bool) {
 		t.Helper()
-		deadline := time.After(15 * time.Second)
-		for {
-			select {
-			case <-deadline:
-				t.Fatal("timed out polling store for expected condition")
-			default:
-			}
+		waittest.Until(t, func() error {
 			store.mu.Lock()
-			ok := cond(store)
-			store.mu.Unlock()
-			if ok {
-				return
+			defer store.mu.Unlock()
+			if !cond(store) {
+				return errors.New("store does not hold the expected rows yet")
 			}
-			time.Sleep(50 * time.Millisecond)
-		}
+			return nil
+		})
 	}
 
 	// writeStatusFile creates .sortie/status in the given workspace directory.
@@ -8299,6 +8404,7 @@ func TestOrchestratorScenarios(t *testing.T) {
 		// from the event loop or from worker-driven state refreshes. Atomic access
 		// also keeps the value visible to the test-goroutine poll below.
 		var handoffDone atomic.Bool
+		var candidateFetches atomic.Int64
 
 		mockTracker := &mockTrackerAdapter{
 			transitionIssueFn: func(_ context.Context, _, _ string) error {
@@ -8327,6 +8433,7 @@ func TestOrchestratorScenarios(t *testing.T) {
 		tracker := &candidateTrackerAdapter{
 			mockTrackerAdapter: mockTracker,
 			fetchCandidatesFn: func(_ context.Context) ([]domain.Issue, error) {
+				candidateFetches.Add(1)
 				issueState := "To Do"
 				if handoffDone.Load() {
 					issueState = "In Review"
@@ -8366,19 +8473,37 @@ func TestOrchestratorScenarios(t *testing.T) {
 			close(done)
 		}()
 
-		deadline := time.After(15 * time.Second)
-		for !handoffDone.Load() {
-			select {
-			case <-deadline:
-				cancel()
-				<-done
-				t.Fatal("timed out waiting for handoff transition")
-			default:
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		waittest.Until(t, func() error {
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			if !handoffDone.Load() || len(store.runHistories) < 1 {
+				return fmt.Errorf("handoff done = %t, run histories = %d, want a handoff and one history", handoffDone.Load(), len(store.runHistories))
 			}
-			time.Sleep(50 * time.Millisecond)
-		}
+			return nil
+		})
 
-		time.Sleep(500 * time.Millisecond)
+		waittest.Until(t, func() error {
+			snap := o.SnapshotFunc()()
+			if len(snap.Running) != 0 || len(snap.Retrying) != 0 {
+				return fmt.Errorf("snapshot running = %d, retrying = %d, want the orchestrator to hold the issue nowhere", len(snap.Running), len(snap.Retrying))
+			}
+			return nil
+		})
+
+		// The fetch after the next one starts only once the tick that began
+		// with the next one has finished dispatching, so the orchestrator has
+		// had a full tick in which to re-dispatch the handed-off issue.
+		wantFetches := candidateFetches.Load() + 2
+		waittest.Until(t, func() error {
+			if got := candidateFetches.Load(); got < wantFetches {
+				return fmt.Errorf("candidate fetches = %d, want at least %d", got, wantFetches)
+			}
+			return nil
+		})
 
 		cancel()
 		<-done
@@ -8452,11 +8577,9 @@ func (s *sweepThrottleTracker) FetchIssueComments(_ context.Context, _ string) (
 
 func (s *sweepThrottleTracker) TransitionIssue(_ context.Context, _, _ string) error { return nil }
 
-func (s *sweepThrottleTracker) CommentIssue(_ context.Context, _, _ string) error { return nil }
-func (s *sweepThrottleTracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
-	return nil
+func (s *sweepThrottleTracker) CommentIssue(_ context.Context, _, _ string) (string, error) {
+	return testCommentID, nil
 }
-
 func (s *sweepThrottleTracker) AddLabel(_ context.Context, _, _ string) error { return nil }
 
 func (s *sweepThrottleTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
@@ -8815,32 +8938,25 @@ func TestDispatch_RuleResolvedKindPersistsToRunHistory(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			store.mu.Lock()
-			n := len(store.runHistories)
-			store.mu.Unlock()
-			t.Fatalf("timed out: run histories = %d, want 2", n)
-		default:
-		}
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waittest.Until(t, func() error {
 		store.mu.Lock()
 		n := len(store.runHistories)
 		store.mu.Unlock()
-		if n >= 2 {
-			break
+		if n < 2 {
+			return fmt.Errorf("run histories = %d, want 2", n)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return nil
+	})
 
 	cancel()
 	<-done
 
 	store.mu.Lock()
-	rows := make(map[string]persistence.RunHistory, len(store.runHistories))
+	rows := make(map[string]storage.RunHistory, len(store.runHistories))
 	for _, rh := range store.runHistories {
 		rows[rh.IssueID] = rh
 	}
@@ -8950,22 +9066,9 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 		metaFunc: func(kind string) (registry.AgentMeta, bool) {
 			switch kind {
 			case "mock":
-				return registry.AgentMeta{
-					UsageArrival:     registry.UsageArrivalIncremental,
-					UsageAttribution: registry.UsageAttributionPerModel,
-				}, true
+				return registry.AgentMeta{UsageSources: usage.Sources{Live: tokenLive}}, true
 			case "narrowed-kind":
-				return registry.AgentMeta{
-					UsageArrival:     registry.UsageArrivalTurnEnd,
-					UsageAttribution: registry.UsageAttributionSessionTotal,
-					UsageSessionRules: []registry.UsageSessionRule{
-						{
-							When:        func(map[string]any, bool) bool { return true },
-							Arrival:     registry.UsageArrivalNone,
-							Attribution: registry.UsageAttributionNone,
-						},
-					},
-				}, true
+				return registry.AgentMeta{UsageSources: usage.Sources{Live: vendorOnlyLive}}, true
 			default:
 				return registry.AgentMeta{}, false
 			}
@@ -8998,28 +9101,24 @@ func TestHandleTick_DispatchFreezesUsageDisposition(t *testing.T) {
 	if defaultEntry == nil {
 		t.Fatal("no RunningEntry for the default-kind issue")
 	}
-	if defaultEntry.UsageArrival != registry.UsageArrivalIncremental || defaultEntry.UsageAttribution != registry.UsageAttributionPerModel {
-		t.Errorf("default-kind entry (UsageArrival, UsageAttribution) = (%q, %q), want (%q, %q)",
-			defaultEntry.UsageArrival, defaultEntry.UsageAttribution, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel)
+	if defaultEntry.UsageArrival != registry.UsageArrivalIncremental || defaultEntry.UsageAttribution != registry.UsageAttributionPerModel || !defaultEntry.CarriesTokenFigure {
+		t.Errorf("default-kind entry (UsageArrival, UsageAttribution, CarriesTokenFigure) = (%q, %q, %t), want (%q, %q, true)",
+			defaultEntry.UsageArrival, defaultEntry.UsageAttribution, defaultEntry.CarriesTokenFigure, registry.UsageArrivalIncremental, registry.UsageAttributionPerModel)
 	}
 
 	narrowedEntry := state.Running[narrowedIssue.ID]
 	if narrowedEntry == nil {
 		t.Fatal("no RunningEntry for the rule-routed issue")
 	}
-	if narrowedEntry.UsageArrival != registry.UsageArrivalNone || narrowedEntry.UsageAttribution != registry.UsageAttributionNone {
-		t.Errorf("rule-routed entry (UsageArrival, UsageAttribution) = (%q, %q), want (%q, %q)",
-			narrowedEntry.UsageArrival, narrowedEntry.UsageAttribution, registry.UsageArrivalNone, registry.UsageAttributionNone)
+	if narrowedEntry.UsageArrival != registry.UsageArrivalNone || narrowedEntry.UsageAttribution != registry.UsageAttributionNone || narrowedEntry.CarriesTokenFigure {
+		t.Errorf("vendor-only entry (UsageArrival, UsageAttribution, CarriesTokenFigure) = (%q, %q, %t), want (%q, %q, false)",
+			narrowedEntry.UsageArrival, narrowedEntry.UsageAttribution, narrowedEntry.CarriesTokenFigure, registry.UsageArrivalNone, registry.UsageAttributionNone)
 	}
 
 	exitResults := make(map[string]WorkerResult, 2)
 	for i := range 2 {
-		select {
-		case r := <-o.workerExitCh:
-			exitResults[r.IssueID] = r
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for worker exit %d/2", i+1)
-		}
+		r := waittest.Receive(t, o.workerExitCh, fmt.Sprintf("worker exit %d/2", i+1))
+		exitResults[r.IssueID] = r
 	}
 
 	if got := exitResults[defaultIssue.ID].Usage; got != reportedUsage {
@@ -9206,7 +9305,7 @@ func TestHandleTick_StageLineageChain(t *testing.T) {
 
 	const fresh = "<fresh>"
 	passAt := time.Date(2026, 3, 19, 9, 0, 0, 500_000_000, time.UTC)
-	hopReachedPlan := persistence.StageHop{
+	hopReachedPlan := storage.StageHop{
 		IssueID: "id-1", Identifier: "S-1", HopCount: 1, SourceRule: "specify", TargetRule: "plan", TargetLabel: "Stage-Plan",
 		PreviousOutcome: "succeeded", SourceDispatchID: "d0", HoppedAt: "2026-03-19T10:00:00Z", ChainID: "chain-hop",
 		DispatchedAt: "2026-03-19T09:00:00.5Z",
@@ -9216,7 +9315,7 @@ func TestHandleTick_StageLineageChain(t *testing.T) {
 	reachedPlan := StageLineage{PreviousRule: "specify", PreviousOutcome: "succeeded", ChainID: "chain-hop", DispatchedAt: passAt}
 	tests := []struct {
 		name       string
-		hops       []persistence.StageHop
+		hops       []storage.StageHop
 		want       map[string]StageLineage
 		wantBefore int
 		wantMarked []string
@@ -9225,12 +9324,12 @@ func TestHandleTick_StageLineageChain(t *testing.T) {
 		{name: "dispatches no hop reached each start a chain", want: map[string]StageLineage{"id-1": {ChainID: fresh}, "id-2": {ChainID: fresh}}},
 		{
 			name: "a restored hop record hands its chain and pass time to the dispatch it reached and to no other",
-			hops: []persistence.StageHop{hopReachedPlan}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
+			hops: []storage.StageHop{hopReachedPlan}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
 			wantBefore: 1, wantMarked: []string{"id-1"}, wantFirst: "id-1",
 		},
 		{
 			name: "a restored hop record already followed by a run is neither listed nor marked again",
-			hops: []persistence.StageHop{followedByRun}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
+			hops: []storage.StageHop{followedByRun}, want: map[string]StageLineage{"id-1": reachedPlan, "id-2": {ChainID: fresh}},
 		},
 	}
 
@@ -9277,7 +9376,7 @@ func TestHandleTick_StageLineageChain(t *testing.T) {
 				if wantFirst := id == tt.wantFirst; entry.FirstAfterHop != wantFirst {
 					t.Errorf("Running[%q].FirstAfterHop = %t, want %t", id, entry.FirstAfterHop, wantFirst)
 				}
-				wantPass := persistence.LivePass{IssueID: id, Kind: persistence.LivePassRunning, ChainID: entry.StageLineage.ChainID, RuleName: "plan", StagePrevious: want.PreviousRule}
+				wantPass := storage.LivePass{IssueID: id, Kind: storage.LivePassRunning, ChainID: entry.StageLineage.ChainID, RuleName: "plan", StagePrevious: want.PreviousRule}
 				if !slices.Contains(h.store.upserted, wantPass) {
 					t.Errorf("UpsertLivePass calls = %+v, want one for %+v", h.store.upserted, wantPass)
 				}
@@ -9638,7 +9737,12 @@ func TestHandleTick_BudgetHoldNoticeOnce(t *testing.T) {
 	if !ok {
 		t.Fatal("BudgetExhausted missing after the ticks, want present")
 	}
-	if want := buildBudgetHoldComment(entry); calls[0].Text != want {
+	want := "Sortie stopped dispatching this issue.\n" +
+		"Recorded: " + entry.ExhaustedAt.Format(time.RFC3339) + "\n" +
+		"Ceiling: session budget (agent.max_sessions)\n" +
+		"Sessions: 5 of 3\n" +
+		"Raising agent.max_sessions raises this ceiling."
+	if calls[0].Text != want {
 		t.Errorf("commentCalls[0].Text =\n%q\nwant\n%q", calls[0].Text, want)
 	}
 
@@ -9658,16 +9762,16 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir() + "/test.db"
 
-	store1, err := persistence.Open(ctx, dbPath)
+	store1, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
-		t.Fatalf("persistence.Open: %v", err)
+		t.Fatalf("sqlite.Open: %v", err)
 	}
 	if err := store1.Migrate(ctx); err != nil {
 		t.Fatalf("store1.Migrate: %v", err)
 	}
 
 	for range 3 {
-		if _, err := store1.AppendRunHistory(ctx, persistence.RunHistory{
+		if _, err := store1.AppendRunHistory(ctx, storage.RunHistory{
 			IssueID:      issueID,
 			Identifier:   "PROJ-RESTART",
 			Attempt:      1,
@@ -9696,7 +9800,7 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 		State:           state1,
 		Logger:          discardLogger(),
 		TrackerAdapter:  tracker1,
-		Router:          route.NewRouter(tracker1, nil),
+		Router:          route.NewRouter(tracker1, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store1,
@@ -9721,9 +9825,9 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 		t.Fatalf("store1.Close: %v", err)
 	}
 
-	store2, err := persistence.Open(ctx, dbPath)
+	store2, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
-		t.Fatalf("persistence.Open (reopen): %v", err)
+		t.Fatalf("sqlite.Open (reopen): %v", err)
 	}
 	t.Cleanup(func() {
 		if err := store2.Close(); err != nil {
@@ -9749,7 +9853,7 @@ func TestBudgetHoldNoticeSurvivesRestart(t *testing.T) {
 		State:           state2,
 		Logger:          logger,
 		TrackerAdapter:  tracker2,
-		Router:          route.NewRouter(tracker2, nil),
+		Router:          route.NewRouter(tracker2, nil, nil, nil),
 		AgentAdapter:    &mockAgentAdapter{},
 		WorkflowManager: wm,
 		Store:           store2,
@@ -10200,7 +10304,7 @@ func TestHandleTick_BudgetHoldNoticeQueryErrorWithholdsRelease(t *testing.T) {
 	state := NewState(60000, 10, 0, nil, AgentTotals{})
 	// The state a restart leaves behind: the notice memory is reloaded
 	// from the durable rows, while the exhausted set starts empty.
-	PopulateBudgetHoldNotices(state, []persistence.BudgetHoldNotice{
+	PopulateBudgetHoldNotices(state, []storage.BudgetHoldNotice{
 		{IssueID: issue.ID, Reason: budgetReasonSession, NoticedAt: "2026-08-25T09:14:03Z"},
 	}, discardLogger())
 	tracker := &candidateTrackerAdapter{
@@ -10236,104 +10340,67 @@ func TestHandleTick_BudgetHoldNoticeQueryErrorWithholdsRelease(t *testing.T) {
 func TestReconcilePasses_DoNotBlockOnInFlightTriage(t *testing.T) {
 	t.Parallel()
 
-	const nonBlockingBound = 200 * time.Millisecond
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (pass func(), providerCalls func() int)
+	}{
+		{"ci", func(t *testing.T) (func(), func() int) {
+			state := stateWithPendingReaction(t, "ISS-NB-CI", "feature/nb", 1)
+			state.PendingReactions[ReactionKey("ISS-NB-CI", ReactionKindCI)].Triage = inFlightTriageRun("fp-nb", func() {})
+			scm := defaultCISCM()
+			ci := &mockCIProvider{}
+			params := ciParams(t, &ciReconcileStore{}, ci, nil, scm)
+			return func() { reconcileCIStatus(state, params, discardLogger(), context.Background(), newCIMetricsSpy()) },
+				func() int { return scm.calls + ci.calls }
+		}},
+		{"review", func(t *testing.T) (func(), func() int) {
+			state := stateWithReviewReaction(t, "ISS-NB-REVIEW", 10)
+			state.PendingReactions[ReactionKey("ISS-NB-REVIEW", ReactionKindReview)].Triage = inFlightTriageRun("fp-nb", func() {})
+			scm := &mockSCMAdapter{comments: oldEnoughReviewComments()}
+			params := reviewParams(&reviewReconcileStore{}, scm, nil)
+			return func() {
+					reconcileReviewComments(state, params, discardLogger(), context.Background(), newReviewMetricsSpy())
+				},
+				func() int { return scm.calls }
+		}},
+		{"bot-review", func(t *testing.T) (func(), func() int) {
+			state := stateWithBotReviewReaction(t, "ISS-NB-BOT", 10)
+			state.PendingReactions[ReactionKey("ISS-NB-BOT", ReactionKindBotReview)].Triage = inFlightTriageRun("fp-nb", func() {})
+			scm := &mockSCMAdapter{botComments: actionableBotReviewComments()}
+			params := botReviewParams(&reviewReconcileStore{}, scm, nil)
+			return func() {
+					reconcileBotReviewComments(state, params, discardLogger(), context.Background(), newBotReviewMetricsSpy())
+				},
+				func() int { return scm.botCalls }
+		}},
+		{"merge-conflict", func(t *testing.T) (func(), func() int) {
+			state := stateWithMergeConflict(t, "ISS-NB-MC", 10)
+			state.PendingReactions[ReactionKey("ISS-NB-MC", ReactionKindMergeConflict)].Triage = inFlightTriageRun("fp-nb", func() {})
+			scm := &mergeabilitySCM{}
+			params := mergeConflictParams(newStatefulFingerprintStore(), scm, nil)
+			return func() {
+					reconcileMergeConflicts(state, params, discardLogger(), context.Background(), newMergeConflictMetricsSpy())
+				},
+				func() int { return scm.calls }
+		}},
+	}
 
-	t.Run("ci", func(t *testing.T) {
-		t.Parallel()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		state := stateWithPendingReaction(t, "ISS-NB-CI", "feature/nb", 1)
-		rkey := ReactionKey("ISS-NB-CI", ReactionKindCI)
-		state.PendingReactions[rkey].Triage = inFlightTriageRun("fp-nb", func() {})
-		scm := defaultCISCM()
-		ci := &mockCIProvider{}
-		params := ciParams(t, &ciReconcileStore{}, ci, nil, scm)
-
-		done := make(chan struct{})
-		go func() {
-			reconcileCIStatus(state, params, discardLogger(), context.Background(), newCIMetricsSpy())
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(nonBlockingBound):
-			t.Fatal("reconcileCIStatus blocked on an in-flight triage run")
-		}
-		if scm.calls != 0 || ci.calls != 0 {
-			t.Errorf("provider calls (scm=%d, ci=%d), want 0 while a triage run is in flight", scm.calls, ci.calls)
-		}
-	})
-
-	t.Run("review", func(t *testing.T) {
-		t.Parallel()
-
-		state := stateWithReviewReaction(t, "ISS-NB-REVIEW", 10)
-		rkey := ReactionKey("ISS-NB-REVIEW", ReactionKindReview)
-		state.PendingReactions[rkey].Triage = inFlightTriageRun("fp-nb", func() {})
-		scm := &mockSCMAdapter{comments: oldEnoughReviewComments()}
-		params := reviewParams(&reviewReconcileStore{}, scm, nil)
-
-		done := make(chan struct{})
-		go func() {
-			reconcileReviewComments(state, params, discardLogger(), context.Background(), newReviewMetricsSpy())
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(nonBlockingBound):
-			t.Fatal("reconcileReviewComments blocked on an in-flight triage run")
-		}
-		if scm.calls != 0 {
-			t.Errorf("FetchPendingReviews calls = %d, want 0 while a triage run is in flight", scm.calls)
-		}
-	})
-
-	t.Run("bot-review", func(t *testing.T) {
-		t.Parallel()
-
-		state := stateWithBotReviewReaction(t, "ISS-NB-BOT", 10)
-		rkey := ReactionKey("ISS-NB-BOT", ReactionKindBotReview)
-		state.PendingReactions[rkey].Triage = inFlightTriageRun("fp-nb", func() {})
-		scm := &mockSCMAdapter{botComments: actionableBotReviewComments()}
-		params := botReviewParams(&reviewReconcileStore{}, scm, nil)
-
-		done := make(chan struct{})
-		go func() {
-			reconcileBotReviewComments(state, params, discardLogger(), context.Background(), newBotReviewMetricsSpy())
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(nonBlockingBound):
-			t.Fatal("reconcileBotReviewComments blocked on an in-flight triage run")
-		}
-		if scm.botCalls != 0 {
-			t.Errorf("FetchBotReviewComments calls = %d, want 0 while a triage run is in flight", scm.botCalls)
-		}
-	})
-
-	t.Run("merge-conflict", func(t *testing.T) {
-		t.Parallel()
-
-		state := stateWithMergeConflict(t, "ISS-NB-MC", 10)
-		rkey := ReactionKey("ISS-NB-MC", ReactionKindMergeConflict)
-		state.PendingReactions[rkey].Triage = inFlightTriageRun("fp-nb", func() {})
-		scm := &mergeabilitySCM{}
-		params := mergeConflictParams(newStatefulFingerprintStore(), scm, nil)
-
-		done := make(chan struct{})
-		go func() {
-			reconcileMergeConflicts(state, params, discardLogger(), context.Background(), newMergeConflictMetricsSpy())
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(nonBlockingBound):
-			t.Fatal("reconcileMergeConflicts blocked on an in-flight triage run")
-		}
-		if scm.calls != 0 {
-			t.Errorf("GetMergeability calls = %d, want 0 while a triage run is in flight", scm.calls)
-		}
-	})
+			pass, providerCalls := tt.setup(t)
+			done := make(chan struct{})
+			go func() {
+				pass()
+				close(done)
+			}()
+			waittest.Receive(t, done, "reconcile pass return while a triage run is in flight")
+			if got := providerCalls(); got != 0 {
+				t.Errorf("provider calls = %d, want 0 while a triage run is in flight", got)
+			}
+		})
+	}
 }
 
 type sessionRecorder struct {
@@ -10362,13 +10429,14 @@ type runTracker struct {
 	candidates       []domain.Issue
 	issues           map[string]domain.Issue
 	candidateFetches atomic.Int64
+	fetchErr         error
 }
 
 func (r *runTracker) FetchCandidateIssues(context.Context) ([]domain.Issue, error) {
 	r.candidateFetches.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return slices.Clone(r.candidates), nil
+	return slices.Clone(r.candidates), r.fetchErr
 }
 
 func (r *runTracker) SetTrackerStates(func() domain.TrackerStates) {}
@@ -10393,6 +10461,8 @@ type runHarness struct {
 	store     *stubStore
 	metrics   domain.Metrics
 	meta      map[string]registry.AgentMeta
+
+	orchestratorStore OrchestratorStore
 
 	mu          sync.Mutex
 	unavailable map[string]bool
@@ -10457,6 +10527,10 @@ func (h *runHarness) build() {
 		},
 	}
 	cfg := h.wm.Config()
+	store := OrchestratorStore(h.store)
+	if h.orchestratorStore != nil {
+		store = h.orchestratorStore
+	}
 	h.o = NewOrchestrator(OrchestratorParams{
 		State:          h.state,
 		Logger:         slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
@@ -10472,7 +10546,7 @@ func (h *runHarness) build() {
 			return recorder.adapter, nil
 		},
 		WorkflowManager: h.wm,
-		Store:           h.store,
+		Store:           store,
 		Metrics:         h.metrics,
 		PreflightParams: PreflightParams{
 			ReloadWorkflow:  func() error { return nil },
@@ -10516,32 +10590,29 @@ func (h *runHarness) started() map[string][]domain.StartSessionParams {
 
 func (h *runHarness) waitForSessions(n int) map[string][]domain.StartSessionParams {
 	h.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got := h.started()
+	var got map[string][]domain.StartSessionParams
+	waittest.Until(h.t, func() error {
+		got = h.started()
 		total := 0
 		for _, sessions := range got {
 			total += len(sessions)
 		}
-		if total >= n {
-			return got
+		if total < n {
+			return fmt.Errorf("sessions started = %v, want at least %d; log: %s", got, n, h.logs.String())
 		}
-		if time.Now().After(deadline) {
-			h.t.Fatalf("sessions started = %v after 5s, want at least %d; log: %s", got, n, h.logs.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return nil
+	})
+	return got
 }
 
 func (h *runHarness) waitForLog(message string) {
 	h.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for len(logRecords(h.t, h.logs, message)) == 0 {
-		if time.Now().After(deadline) {
-			h.t.Fatalf("log holds no %q record after 5s; log: %s", message, h.logs.String())
+	waittest.Until(h.t, func() error {
+		if len(logRecords(h.t, h.logs, message)) == 0 {
+			return fmt.Errorf("log holds no %q record; log: %s", message, h.logs.String())
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return nil
+	})
 }
 
 func rawWithBackendRule(agent map[string]any, ruleAgent string) map[string]any {
@@ -10796,13 +10867,12 @@ func TestRun_ConversionAdvisoryIsLoggedOnceAcrossTicks(t *testing.T) {
 	h := newRunHarness(t, cfg, "plain", "modern")
 
 	h.run()
-	deadline := time.Now().Add(5 * time.Second)
-	for h.tracker.candidateFetches.Load() < 4 {
-		if time.Now().After(deadline) {
-			t.Fatalf("candidate fetches = %d after 5s, want at least 4 ticks", h.tracker.candidateFetches.Load())
+	waittest.Until(t, func() error {
+		if fetches := h.tracker.candidateFetches.Load(); fetches < 4 {
+			return fmt.Errorf("candidate fetches = %d, want at least 4 ticks", fetches)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return nil
+	})
 	h.stop()
 
 	records := logRecords(t, h.logs, "agent kind was removed and its configuration was converted to the replacement kind; the conversion will be removed in a later release")
@@ -10849,7 +10919,7 @@ func seedRetry(h *runHarness, mode string, entry RetryEntry) {
 	h.state.Claimed[entry.IssueID] = struct{}{}
 	if mode == "recovered" {
 		session := entry.SessionID
-		PopulateRetries(h.state, []persistence.PendingRetry{{Entry: persistence.RetryEntry{
+		PopulateRetries(h.state, []storage.PendingRetry{{Entry: storage.RetryEntry{
 			IssueID: entry.IssueID, Identifier: entry.Identifier, Attempt: entry.Attempt, SessionID: &session,
 			RuleName: entry.RuleName, TemplateID: entry.TemplateID, AgentKind: entry.AgentKind,
 		}}}, nil)
@@ -11075,21 +11145,19 @@ func TestRun_RetriesDispatchOnTheSelectionTheConfigurationInForceGives(t *testin
 	}
 }
 
-func (h *runHarness) waitForRunHistories(n int) []persistence.RunHistory {
+func (h *runHarness) waitForRunHistories(n int) []storage.RunHistory {
 	h.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	var rows []storage.RunHistory
+	waittest.Until(h.t, func() error {
 		h.store.mu.Lock()
-		rows := slices.Clone(h.store.runHistories)
+		rows = slices.Clone(h.store.runHistories)
 		h.store.mu.Unlock()
-		if len(rows) >= n {
-			return rows
+		if len(rows) < n {
+			return fmt.Errorf("run_history rows = %d, want at least %d; log: %s", len(rows), n, h.logs.String())
 		}
-		if time.Now().After(deadline) {
-			h.t.Fatalf("run_history rows = %d after 5s, want at least %d; log: %s", len(rows), n, h.logs.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return nil
+	})
+	return rows
 }
 
 func ruleBlock(name, label, agent string, block map[string]any) map[string]any {
@@ -11159,7 +11227,7 @@ func TestRun_TwoRulesOnOneKindDispatchWithTheirOwnSettings(t *testing.T) {
 	}
 }
 
-func rowOfIdentifier(t *testing.T, rows []persistence.RunHistory, identifier string) persistence.RunHistory {
+func rowOfIdentifier(t *testing.T, rows []storage.RunHistory, identifier string) storage.RunHistory {
 	t.Helper()
 	for _, row := range rows {
 		if row.Identifier == identifier {
@@ -11167,7 +11235,7 @@ func rowOfIdentifier(t *testing.T, rows []persistence.RunHistory, identifier str
 		}
 	}
 	t.Fatalf("no run_history row for %s; rows: %+v", identifier, rows)
-	return persistence.RunHistory{}
+	return storage.RunHistory{}
 }
 
 func interactiveModeRaw(withBadBlock bool) map[string]any {
@@ -11336,7 +11404,7 @@ func TestHandleTick_FreshDispatchIsGivenPullRequestComments(t *testing.T) {
 				State:            state,
 				Logger:           discardLogger(),
 				TrackerAdapter:   tracker,
-				Router:           route.NewRouter(tracker, nil),
+				Router:           route.NewRouter(tracker, nil, nil, nil),
 				AgentAdapter:     &mockAgentAdapter{},
 				WorkflowManager:  wm,
 				Store:            &stubStore{},
@@ -11370,7 +11438,7 @@ func TestHandleTick_FreshDispatchIsGivenPullRequestComments(t *testing.T) {
 
 func (s *stubStore) DeleteStageHop(context.Context, string) error { return nil }
 
-func (s *stubStore) RecordStageHop(context.Context, persistence.StageHop) error { return nil }
+func (s *stubStore) RecordStageHop(context.Context, storage.StageHop) error { return nil }
 
 func (s *stubStore) RecordRunStageResult(context.Context, int64, string, string) error { return nil }
 
@@ -11383,14 +11451,14 @@ func (s *stubStore) MarkStageHopDispatched(_ context.Context, issueID string) er
 	return s.markDispatchedErr
 }
 
-func (s *stubStore) LatestAgentRuns(_ context.Context, issueIDs []string) (map[string]persistence.RunHistory, error) {
+func (s *stubStore) LatestAgentRuns(_ context.Context, issueIDs []string) (map[string]storage.RunHistory, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.latestRunsCalls = append(s.latestRunsCalls, slices.Clone(issueIDs))
 	if s.latestRunsErr != nil {
 		return nil, s.latestRunsErr
 	}
-	runs := make(map[string]persistence.RunHistory)
+	runs := make(map[string]storage.RunHistory)
 	for _, id := range issueIDs {
 		if run, ok := s.latestRuns[id]; ok {
 			runs[id] = run
@@ -11399,11 +11467,7 @@ func (s *stubStore) LatestAgentRuns(_ context.Context, issueIDs []string) (map[s
 	return runs, nil
 }
 
-func (s *stubStore) LatestResumeUsage(context.Context, string, string) (*persistence.ResumeUsage, error) {
-	return s.resumeUsage, s.resumeUsageErr
-}
-
-func (s *stubStore) ListStageHops(context.Context) ([]persistence.StageHop, error) {
+func (s *stubStore) ListStageHops(context.Context) ([]storage.StageHop, error) {
 	return nil, nil
 }
 
@@ -11450,5 +11514,108 @@ func TestWriteIncrementalMetadata_LiveEstimate(t *testing.T) {
 					tt.kind, meta.EstimatedCostUSD, meta.CostStatus, tt.wantCost, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestApplyAgentEvent_WorkspaceReadyShortensLaterPaths covers a live run:
+// the workspace message arrives before the agent's first tool call, so a read
+// of a file inside the workspace is retained relative to it, not as a path
+// of the host.
+func TestApplyAgentEvent_WorkspaceReadyShortensLaterPaths(t *testing.T) {
+	t.Parallel()
+
+	o, entry := tokenWarningApplyEventOrchestrator(t, 0, 0)
+	entry.events = o.state.RetainedEvents.register("d-ws")
+
+	o.applyAgentEvent(context.Background(), agentEventMsg{IssueID: "id-apply", Workspace: "/ws/ISS-1"}, true)
+	o.applyAgentEvent(context.Background(), agentEventMsg{IssueID: "id-apply", Event: domain.AgentEvent{
+		Type: domain.EventToolResult, ToolName: "Read", ToolKind: domain.ToolKindRead, ToolArgument: "/ws/ISS-1/internal/foo.go",
+	}}, true)
+
+	events := entry.events.snapshot()
+	if len(events) != 1 || events[0].ToolArgument != "internal/foo.go" {
+		t.Fatalf("retained events = %+v, want one tool_result with ToolArgument %q", events, "internal/foo.go")
+	}
+}
+
+func backWithMockAdapter(t *testing.T, recorder *sessionRecorder) {
+	t.Helper()
+	construct, err := registry.Agents.Get("mock")
+	if err != nil {
+		t.Fatalf("registry.Agents.Get(mock) error = %v", err)
+	}
+	adapter, err := construct()
+	if err != nil {
+		t.Fatalf("mock constructor error = %v", err)
+	}
+	recorder.adapter.startSessionFn = adapter.StartSession
+	recorder.adapter.runTurnFn = adapter.RunTurn
+	recorder.adapter.stopSessionFn = adapter.StopSession
+}
+
+func TestRun_UsageLimitRefusalHoldsItsKindOnly(t *testing.T) {
+	t.Parallel()
+
+	resetsAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	raw := rawWithBackendRule(map[string]any{
+		"kind":                  "mock",
+		"command":               "mock-cmd",
+		"max_concurrent_agents": 1,
+		"max_sessions":          1,
+	}, "mock-b")
+	raw["mock"] = map[string]any{
+		"turn_outcomes":         []any{"usage_limit"},
+		"usage_limit_resets_at": resetsAt.Format(time.RFC3339),
+		"report_token_usage":    true,
+	}
+	cfg := runConfig(t, raw)
+	h := newRunHarness(t, cfg, "mock", "mock-b")
+	backWithMockAdapter(t, h.recorders["mock"])
+	backWithMockAdapter(t, h.recorders["mock-b"])
+	h.orchestratorStore = openParkStore(t)
+	h.state.MaxConcurrentAgents = cfg.Agent.MaxConcurrentAgents
+	h.tracker.candidates = []domain.Issue{
+		candidate("id-1", "A-1"),
+		candidate("id-2", "A-2"),
+		candidate("id-3", "B-1", "backend"),
+	}
+
+	h.run()
+	snapshot := h.o.SnapshotFunc()
+	var refused SnapshotRetryEntry
+	waittest.Until(t, func() error {
+		snap := snapshot()
+		for _, retry := range snap.Retrying {
+			if retry.Identifier == "A-1" {
+				refused = retry
+				return nil
+			}
+		}
+		return fmt.Errorf("no retry for A-1 yet; log: %s", h.logs.String())
+	})
+
+	if refused.DueAtMS != resetsAt.UnixMilli() || refused.Trigger != triggerUsageLimit {
+		t.Errorf("A-1 retry = {DueAtMS: %d, Trigger: %q}, want {%d, %q}", refused.DueAtMS, refused.Trigger, resetsAt.UnixMilli(), triggerUsageLimit)
+	}
+
+	h.o.RefreshFunc()()
+	var snap RuntimeSnapshotResult
+	waittest.Until(t, func() error {
+		snap = snapshot()
+		held := slices.IndexFunc(snap.Held, func(e SnapshotHeldEntry) bool {
+			return e.Identifier == "A-2" && e.Hold.Reason == SkipUsageLimit
+		})
+		if held < 0 || len(h.recorders["mock-b"].started()) == 0 {
+			return fmt.Errorf("held = %+v, mock-b sessions = %d, want A-2 held and B-1 started; log: %s", snap.Held, len(h.recorders["mock-b"].started()), h.logs.String())
+		}
+		return nil
+	})
+
+	held := snap.Held[slices.IndexFunc(snap.Held, func(e SnapshotHeldEntry) bool { return e.Identifier == "A-2" })]
+	if !held.Hold.ResetsAt.Equal(resetsAt) || held.Hold.AgentKind != "mock" || held.Hold.ModelOnly {
+		t.Errorf("A-2 hold = %+v, want resets_at %v on agent kind %q for every model", held.Hold, resetsAt, "mock")
+	}
+	if len(snap.BudgetExhausted) != 0 {
+		t.Errorf("budget_exhausted = %+v, want none after a refused run", snap.BudgetExhausted)
 	}
 }

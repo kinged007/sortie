@@ -14,7 +14,7 @@
 [![codecov](https://codecov.io/gh/sortie-ai/sortie/graph/badge.svg?token=K2TPXBCbvb)](https://codecov.io/gh/sortie-ai/sortie)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sortie-ai/sortie.svg)](https://pkg.go.dev/github.com/sortie-ai/sortie)
 
-[官网](https://sortie-ai.com) · [文档](https://docs.sortie-ai.com) · [Discord](https://discord.gg/MCNrc8Wf9M) · [参与贡献](CONTRIBUTING.md)
+[官网](https://sortie-ai.com) · [文档](https://docs.sortie-ai.com) · [GitHub Action](https://github.com/marketplace/actions/sortie-action) · [Discord](https://discord.gg/MCNrc8Wf9M) · [参与贡献](CONTRIBUTING.md)
 
 **[English](README.md) | 简体中文**
 
@@ -32,7 +32,7 @@ Sortie 就是这套基础设施。
 
 **工单系统：** GitHub Issues、GitLab Issues、Gitea Issues、Linear 和 Jira。
 
-**编程智能体：** Claude Code、Copilot、OpenCode、Codex、Kiro 和 Gemini。
+**编程智能体：** Claude Code、Copilot、OpenCode、Codex、Kiro、Gemini 和 Pi。
 
 ## 安装
 

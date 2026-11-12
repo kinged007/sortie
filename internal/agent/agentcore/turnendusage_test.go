@@ -6,21 +6,12 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// TestTurnEndUsage_FinalizeOrdering verifies that a non-nil recovered
-// figure emits exactly one token_usage event, positioned after every
-// event the caller emitted before calling Finalize and immediately
-// before the terminal event, with nothing following the terminal
-// event; the token_usage event's Usage equals the terminal event's
-// Usage and the returned TurnResult.Usage, its Model is recovered.Model
-// trimmed, its APIDurationMS is 0, and the terminal event's
-// APIDurationMS equals the apiDurationMS argument.
 func TestTurnEndUsage_FinalizeOrdering(t *testing.T) {
 	t.Parallel()
 
 	var events []domain.AgentEvent
 	emit := func(e domain.AgentEvent) { events = append(events, e) }
 
-	// A prior event the adapter emitted before calling Finalize.
 	events = append(events, domain.AgentEvent{Type: domain.EventToolResult})
 
 	u := NewTurnEndUsage()
@@ -67,10 +58,6 @@ func TestTurnEndUsage_FinalizeOrdering(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport verifies that a turn
-// finalized with a nil recovered figure emits no token_usage event, and
-// its terminal event and TurnResult carry Snapshot() (the zero value,
-// since no turn has settled a figure yet).
 func TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport(t *testing.T) {
 	t.Parallel()
 
@@ -104,10 +91,6 @@ func TestTurnEndUsage_FinalizeNilRecoveredEmitsNoReport(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_UsageMeasuredLatches verifies that TurnResult.UsageMeasured
-// is false on every turn before the first non-nil recovered figure, and
-// true on that turn and every later turn of the session, including a
-// later turn finalized with nil.
 func TestTurnEndUsage_UsageMeasuredLatches(t *testing.T) {
 	t.Parallel()
 
@@ -144,10 +127,6 @@ func TestTurnEndUsage_UsageMeasuredLatches(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_SnapshotNonDecreasing verifies that, over a rising-then-
-// falling sequence of recovered.Run values, Snapshot() and every
-// emitted Usage are componentwise non-decreasing, and TotalTokens
-// always equals InputTokens plus OutputTokens.
 func TestTurnEndUsage_SnapshotNonDecreasing(t *testing.T) {
 	t.Parallel()
 
@@ -160,7 +139,7 @@ func TestTurnEndUsage_SnapshotNonDecreasing(t *testing.T) {
 	sequence := []domain.TokenUsage{
 		{InputTokens: 10, OutputTokens: 2, CacheReadTokens: 1},
 		{InputTokens: 50, OutputTokens: 10, CacheReadTokens: 5},
-		{InputTokens: 30, OutputTokens: 4, CacheReadTokens: 2}, // falls relative to the previous turn
+		{InputTokens: 30, OutputTokens: 4, CacheReadTokens: 2},
 	}
 
 	var prevSnapshot domain.TokenUsage
@@ -200,8 +179,6 @@ func TestTurnEndUsage_SnapshotNonDecreasing(t *testing.T) {
 	}
 }
 
-// TestTurnEndUsage_FinalizeNilEmitPanics pins Finalize's documented
-// contract that a nil emit panics, mirroring FinalizeTurn.
 func TestTurnEndUsage_FinalizeNilEmitPanics(t *testing.T) {
 	t.Parallel()
 

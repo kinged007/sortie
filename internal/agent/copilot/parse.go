@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/redact"
 )
 
@@ -26,10 +28,9 @@ type rawEvent struct {
 }
 
 type rawUsage struct {
-	PremiumRequests int64          `json:"premiumRequests"`
-	TotalAPIDurMS   int64          `json:"totalApiDurationMs"`
-	SessionDurMS    int64          `json:"sessionDurationMs"`
-	CodeChanges     *rawCodeChange `json:"codeChanges,omitempty"`
+	TotalAPIDurMS int64          `json:"totalApiDurationMs"`
+	SessionDurMS  int64          `json:"sessionDurationMs"`
+	CodeChanges   *rawCodeChange `json:"codeChanges,omitempty"`
 }
 
 type rawCodeChange struct {
@@ -56,6 +57,8 @@ type rawToolRequest struct {
 type toolExecutionData struct {
 	ToolCallID    string              `json:"toolCallId"`
 	ToolName      string              `json:"toolName"`
+	MCPServerName string              `json:"mcpServerName,omitempty"`
+	MCPToolName   string              `json:"mcpToolName,omitempty"`
 	Arguments     json.RawMessage     `json:"arguments,omitempty"`
 	Model         string              `json:"model,omitempty"`
 	InteractionID string              `json:"interactionId,omitempty"`
@@ -63,6 +66,26 @@ type toolExecutionData struct {
 	Result        json.RawMessage     `json:"result,omitempty"`
 	Error         *toolExecutionError `json:"error,omitempty"`
 	ToolTelemetry json.RawMessage     `json:"toolTelemetry,omitempty"`
+}
+
+// toolMappings gives the kind and main-argument member of each Copilot CLI
+// tool the adapter reports an argument for.
+var toolMappings = map[string]agentcore.ToolMapping{
+	"bash":   {Kind: domain.ToolKindShell, Key: "command"},
+	"view":   {Kind: domain.ToolKindRead, Key: "path"},
+	"create": {Kind: domain.ToolKindEdit, Key: "path"},
+	"edit":   {Kind: domain.ToolKindEdit, Key: "path"},
+	"skill":  {Kind: domain.ToolKindSkill, Key: "skill"},
+}
+
+// toolCall maps a tool.execution_start payload to a tool call. An MCP call
+// is named from the server and tool members because toolName joins them
+// lossily.
+func (d toolExecutionData) toolCall() agentcore.ToolCall {
+	if d.MCPServerName != "" && d.MCPToolName != "" {
+		return agentcore.ToolCall{Name: agentcore.QualifiedToolName(d.MCPServerName, d.MCPToolName)}
+	}
+	return agentcore.MapToolCall(toolMappings, d.ToolName, d.Arguments)
 }
 
 // toolExecutionError is the error payload a tool.execution_complete event
@@ -84,12 +107,6 @@ type sessionWarningData struct {
 	Message     string `json:"message,omitempty"`
 }
 
-// sessionErrorData is the data payload of a session.error event: the
-// provider's own description of a failure the runtime could not recover from.
-type sessionErrorData struct {
-	Message string `json:"message,omitempty"`
-}
-
 // sessionTaskCompleteData is the data payload of a session.task_complete
 // event. Success is a pointer so a payload whose success field is absent
 // from the wire payload is distinguishable from one reporting an explicit
@@ -102,43 +119,6 @@ type sessionTaskCompleteData struct {
 // userMessageData is the data payload of a user.message event.
 type userMessageData struct {
 	IsAutopilotContinuation bool `json:"isAutopilotContinuation,omitempty"`
-}
-
-// shutdownEvent is one line of the copilot session-state events journal
-// (<session-state root>/<session id>/events.jsonl) whose Type is
-// "session.shutdown".
-type shutdownEvent struct {
-	Type string       `json:"type"`
-	Data shutdownData `json:"data"`
-}
-
-// shutdownData holds the two alternative token-count shapes a
-// session.shutdown record carries. ModelMetrics is preferred when
-// present and non-empty; TokenDetails is the fallback.
-type shutdownData struct {
-	TokenDetails map[string]shutdownTokenCount `json:"tokenDetails,omitempty"`
-	ModelMetrics map[string]shutdownModel      `json:"modelMetrics,omitempty"`
-}
-
-// shutdownTokenCount is one entry of a session.shutdown record's
-// tokenDetails map.
-type shutdownTokenCount struct {
-	TokenCount int64 `json:"tokenCount"`
-}
-
-// shutdownModel is one entry of a session.shutdown record's
-// modelMetrics map.
-type shutdownModel struct {
-	Usage shutdownModelUsage `json:"usage"`
-}
-
-// shutdownModelUsage holds one model's token counts from a
-// session.shutdown record's modelMetrics entry.
-type shutdownModelUsage struct {
-	InputTokens      int64 `json:"inputTokens"`
-	OutputTokens     int64 `json:"outputTokens"`
-	CacheReadTokens  int64 `json:"cacheReadTokens"`
-	CacheWriteTokens int64 `json:"cacheWriteTokens"`
 }
 
 // parseEvent parses a single JSONL line from Copilot CLI stdout into
@@ -179,14 +159,6 @@ func parseSessionWarningData(data json.RawMessage) (sessionWarningData, error) {
 	var d sessionWarningData
 	if err := json.Unmarshal(data, &d); err != nil {
 		return sessionWarningData{}, fmt.Errorf("parse session warning data: %w", err)
-	}
-	return d, nil
-}
-
-func parseSessionErrorData(data json.RawMessage) (sessionErrorData, error) {
-	var d sessionErrorData
-	if err := json.Unmarshal(data, &d); err != nil {
-		return sessionErrorData{}, fmt.Errorf("parse session error data: %w", err)
 	}
 	return d, nil
 }

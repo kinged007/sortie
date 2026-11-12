@@ -20,10 +20,11 @@ import (
 	"github.com/sortie-ai/sortie/internal/server/ui"
 )
 
-// SnapshotFunc returns a point-in-time capture of the orchestrator's
-// runtime state. The server calls this on each API request; it must
-// be safe to call from any goroutine.
-type SnapshotFunc func() (orchestrator.RuntimeSnapshotResult, error)
+// SnapshotFunc returns the orchestrator's last published runtime state, with
+// the time-derived fields computed at the call. It never blocks and is safe to
+// call from any goroutine. The result shares slices and maps with other reads,
+// so callers must not modify it.
+type SnapshotFunc func() orchestrator.RuntimeSnapshotResult
 
 // RefreshFunc signals the orchestrator to perform an immediate
 // poll+reconciliation cycle. Returns true if the signal was accepted,
@@ -60,7 +61,7 @@ type RunHistoryEntry struct {
 	// Attempt is the one-based retry attempt number.
 	Attempt int
 	// Status is the terminal run outcome: "succeeded", "failed",
-	// "cancelled", "ci_failed", "needs_person", or "budget_stopped".
+	// "cancelled", "ci_failed", "needs_person", "budget_stopped", or "usage_limited".
 	Status string
 	// WorkflowFile is the path to the workflow definition used.
 	WorkflowFile string
@@ -111,8 +112,20 @@ type RunHistoryEntry struct {
 	Tokens domain.TokenUsage
 	// TokensMeasured is false when the agent reported no usage.
 	TokensMeasured bool
-	// UnaccountedTurns counts turns whose usage the agent never reported.
-	UnaccountedTurns int
+	// UsageCompleteness is "complete", "lower_bound", or "unmeasured".
+	UsageCompleteness string
+	// UsageProvenance lists the run's usage sources, live strategy first; nil
+	// when the run was recorded before provenance was kept.
+	UsageProvenance []UsagePair
+	// VendorAmounts lists the amounts the run reported in a unit other than US
+	// dollars; nil when the run was recorded before provenance was kept.
+	VendorAmounts []VendorAmount
+	// UnmeasuredCause is why the run has no token figure; empty unless
+	// UsageCompleteness is "unmeasured".
+	UnmeasuredCause string
+	// UnmeasuredUnits lists the units the run reported, ascending; empty
+	// unless UnmeasuredCause is "amounts_only".
+	UnmeasuredUnits []string
 	// EstimatedCostUSD and CostStatus are the cost recorded when the run
 	// finished. CostStatus is empty when the run was recorded without one.
 	EstimatedCostUSD *float64
@@ -122,6 +135,9 @@ type RunHistoryEntry struct {
 	// ReviewMetadata is the self-review JSON as recorded; nil when
 	// self-review did not run.
 	ReviewMetadata *string
+	// Skills is the JSON array of the run's skill calls as recorded; nil when
+	// the run recorded none.
+	Skills *string
 	// OriginRecorded is false for a run recorded before the origin fields
 	// existed; Trigger, ReactionKind, SessionID, and SSHHost are then unknown.
 	OriginRecorded bool
@@ -137,6 +153,10 @@ type RunHistoryEntry struct {
 	// DispatchID keys the run's retained events: empty on the recorded CI
 	// result, nil for a run recorded before the dispatch ID existed.
 	DispatchID *string
+	// DeclaredOutcome and AgentText are as stored, empty when none.
+	// AgentText is masked when recorded and again by the server at serve time.
+	DeclaredOutcome string
+	AgentText       string
 	// ModelUsage is the run's per-model spend ordered by model; empty when
 	// the run recorded none.
 	ModelUsage []RunModelUsage
@@ -158,6 +178,42 @@ type RunModelUsage struct {
 	// UnratedRecorded is false for a part recorded without a price or priced
 	// before the classes were recorded.
 	UnratedRecorded bool
+	// PriceSource names where the part's price came from; empty when none is
+	// recorded.
+	PriceSource string
+}
+
+// UsagePair is one source a run's usage was read from and the strategy that
+// read it.
+type UsagePair struct {
+	Source, Strategy string
+}
+
+// VendorAmount is an amount a run reported in a unit other than US dollars.
+// Model is empty when the source attributed it to no model.
+type VendorAmount struct {
+	Unit, Model string
+	Amount      float64
+	LowerBound  bool
+}
+
+// UnitAmount is the sum of one unit's amounts over an issue's runs.
+type UnitAmount struct {
+	Unit       string
+	Amount     float64
+	LowerBound bool
+}
+
+// IssueProvenance is what an issue's recorded runs say about the origin of
+// their figures. UnmeasuredCause is empty when no run is unmeasured, and
+// AgentPricedUSD is nil when no share was priced from an agent-reported
+// amount. AgentPricedModels holds an empty name for an unknown model.
+type IssueProvenance struct {
+	UnmeasuredCause   string
+	UnmeasuredUnits   []string
+	VendorAmounts     []UnitAmount
+	AgentPricedUSD    *float64
+	AgentPricedModels []string
 }
 
 // RunHistoryQuery selects completed runs; a zero field matches every run.
@@ -262,6 +318,8 @@ type IssueRunTotals struct {
 	Usage orchestrator.SnapshotIssueUsage
 	// Tokens sums each token class over the measured runs.
 	Tokens domain.TokenUsage
+	// Provenance is what the runs say about the origin of the figures above.
+	Provenance IssueProvenance
 }
 
 // RunHistoryReader reads persisted run history. Runs come newest first, and
@@ -294,7 +352,8 @@ type DBPingFunc func(ctx context.Context) error
 // Params holds construction-time dependencies for [New].
 type Params struct {
 	// SnapshotFn returns the current runtime state. Called on each
-	// GET /api/v1/state and GET /api/v1/{identifier}.
+	// GET /api/v1/state, GET /api/v1/runs/issues, and
+	// GET /api/v1/{identifier}.
 	SnapshotFn SnapshotFunc
 
 	// WorkflowShapeFn returns the effective workflow shape. Called on
@@ -374,6 +433,10 @@ type Params struct {
 	// GET /api/v1/stats; nil answers 503.
 	Stats StatsFunc
 
+	// StatsSpan computes the report of one stretch of time. Called on each
+	// GET /api/v1/stats/span; nil answers 503.
+	StatsSpan SpanFunc
+
 	// ModelUse lists the agent kind and model pairs with a recorded run.
 	// Called on each GET /api/v1/prices; nil answers 503.
 	ModelUse ModelUseFunc
@@ -427,6 +490,7 @@ type Server struct {
 	runEventsFn      RunEventsFunc
 	runEventsAfterFn RunEventsAfterFunc
 	stats            StatsFunc
+	statsSpan        SpanFunc
 
 	modelUse           ModelUseFunc
 	configuredModelsFn func() []orchestrator.ConfiguredModel
@@ -480,6 +544,7 @@ func New(params Params) *Server {
 		runEventsFn:      params.RunEventsFn,
 		runEventsAfterFn: params.RunEventsAfterFn,
 		stats:            params.Stats,
+		statsSpan:        params.StatsSpan,
 
 		modelUse:           params.ModelUse,
 		configuredModelsFn: params.ConfiguredModelsFn,
@@ -514,6 +579,7 @@ func New(params Params) *Server {
 	mux.HandleFunc("/api/v1/runs/issues", s.routeIssueGroups)
 	mux.HandleFunc("/api/v1/runs/{dispatch_id}/events", s.routeRunEvents)
 	mux.HandleFunc("/api/v1/stats", s.routeStats)
+	mux.HandleFunc("/api/v1/stats/span", s.routeStatsSpan)
 	mux.HandleFunc("/api/v1/prices", s.routePrices)
 	mux.HandleFunc("/api/v1/refresh", s.routeRefresh)
 	mux.HandleFunc("/api/v1/retries/{identifier}/run", s.routeRetryNow)

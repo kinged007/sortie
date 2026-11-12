@@ -1,11 +1,18 @@
 package usagesource
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
+	"github.com/sortie-ai/sortie/internal/registry"
 )
 
 func setTempRoot(t *testing.T, root string) {
@@ -32,67 +39,323 @@ func assertTempRootEmpty(t *testing.T, root string) {
 	}
 }
 
-// TestSourcesConformToTheRegistryContract enumerates every source Sources
-// holds and proves each keeps the promise the registry's callers rely on:
-// its own kind is a name it recognizes, it never arms a remote launch, it
-// arms an assignment for a local launch only where it can identify the
-// runtime, and Close leaves no trace, retried or not.
-func TestSourcesConformToTheRegistryContract(t *testing.T) {
-	kinds := Sources.Kinds()
+func assertKiroAgentDefinition(t *testing.T, dir string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "sortie_verify.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(sortie_verify.json): %v", err)
+	}
+	var agent map[string]json.RawMessage
+	if err := json.Unmarshal(data, &agent); err != nil {
+		t.Fatalf("sortie_verify.json = %q, want a JSON object: %v", data, err)
+	}
+	if got := string(agent["tools"]); got != "[]" {
+		t.Errorf("sortie_verify.json tools = %q, want %q", got, "[]")
+	}
+	if _, ok := agent["model"]; ok {
+		t.Errorf("sortie_verify.json carries a model field, want none: the launch's own --model must stand")
+	}
+}
+
+func TestEveryDeclarationPassesTheRegistrationCheck(t *testing.T) {
+	t.Parallel()
+
+	declarations := map[string]Declaration{DefaultName: Default}
+	for _, kind := range Declarations.Kinds() {
+		declaration, err := Declarations.Get(kind)
+		if err != nil {
+			t.Fatalf("Declarations.Get(%q) error = %v", kind, err)
+		}
+		declarations[kind] = declaration
+	}
+
+	for name, declaration := range declarations {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := checkDeclaration(declaration, struct{}{}); err != nil {
+				t.Errorf("checkDeclaration(%q) = %v, want nil", name, err)
+			}
+		})
+	}
+}
+
+func TestDeclarationsRefuseWhatTheTransportCannotMeasure(t *testing.T) {
+	t.Parallel()
+
+	noPromptSpend := Default
+	noPromptSpend.PromptSpend = nil
+	nameOnly, mergeOnly := Default, Default
+	unreadAmount := Default
+	unreadAmount.SessionUpdateAmounts = nil
+	readerWithoutAmount := Default
+	readerWithoutAmount.Live.Spend.Amounts = nil
+	nameOnly.LaunchAddition = LaunchAddition{Name: "ADDITION_VARIABLE"}
+	mergeOnly.LaunchAddition = LaunchAddition{Merge: func(current string, _ bool) (string, bool) { return current, true }}
+	tests := []struct {
+		name        string
+		key         string
+		declaration Declaration
+	}{
+		{"zero live source", "refused-zero-live", Declaration{}},
+		{"a protocol live source that maps no spend", "refused-no-spend", Declaration{Live: usage.Source{Category: usage.SourceProtocol}}},
+		{"declared spend without a prompt reader", "refused-no-prompt-spend", noPromptSpend},
+		{"the reserved default key", DefaultName, Default},
+		{"a launch addition with a name and no merge", "refused-addition-name-only", nameOnly},
+		{"a launch addition with a merge and no name", "refused-addition-merge-only", mergeOnly},
+		{"a live amount with no reader", "refused-amount-no-reader", unreadAmount},
+		{"an amount reader with no live amount", "refused-reader-no-amount", readerWithoutAmount},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			panicked := registerPanics(tt.key, tt.declaration)
+
+			if !panicked {
+				t.Errorf("Declarations.Register(%q) did not panic, want a refusal", tt.key)
+			}
+			if tt.key != DefaultName && Declarations.Has(tt.key) {
+				t.Errorf("Declarations.Has(%q) = true, want a refused declaration stored nowhere", tt.key)
+			}
+		})
+	}
+}
+
+func registerPanics(key string, declaration Declaration) (panicked bool) {
+	defer func() { panicked = recover() != nil }()
+	Declarations.Register(key, declaration)
+	return false
+}
+
+func TestDeclarationLaunchesFollowTheConfiguredCommand(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		kind   string
+		target agentcore.LaunchTarget
+		want   bool
+	}{
+		{"executable with its flag", copilotHandshakeName, agentcore.LaunchTarget{Command: "copilot", Args: []string{"--acp"}}, true},
+		{"npm package through a launcher", geminiAgentName, agentcore.LaunchTarget{Command: "npx", Args: []string{"@google/gemini-cli@latest", "--acp"}}, true},
+		{"wrapper command", copilotHandshakeName, agentcore.LaunchTarget{Command: "env", Args: []string{"MODEL=x", "copilot", "--acp"}}, true},
+		{"npm package of the 2.x line through a launcher", opencodeHandshakeName, agentcore.LaunchTarget{Command: "npx", Args: []string{"-y", "@opencode/cli@2", "acp"}}, true},
+		{"another runtime's command", copilotHandshakeName, agentcore.LaunchTarget{Command: "gemini", Args: []string{"--acp"}}, false},
+		{"remote command named, ssh as the executable", kiroV2AgentName, agentcore.LaunchTarget{Command: "ssh", SSHHost: "worker", RemoteCommand: "kiro-cli acp --model x"}, true},
+		{"remote command naming nothing", kiroV2AgentName, agentcore.LaunchTarget{Command: "ssh", SSHHost: "worker", RemoteCommand: "agent --acp"}, false},
+		{"runtime named only in the ssh arguments", kiroV2AgentName, agentcore.LaunchTarget{Command: "ssh", Args: []string{"kiro-cli"}, SSHHost: "worker", RemoteCommand: "agent --acp"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			declaration, err := Declarations.Get(tt.kind)
+			if err != nil {
+				t.Fatalf("Declarations.Get(%q) error = %v", tt.kind, err)
+			}
+
+			if got := declaration.Launches(tt.target); got != tt.want {
+				t.Errorf("%q Launches(%+v) = %v, want %v", tt.kind, tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
+var verificationExecutables = map[string]string{
+	geminiAgentName:   geminiExecutableName,
+	copilotAgentName:  copilotExecutableName,
+	opencodeAgentName: opencodeExecutableName,
+	kiroAgentName:     kiroExecutableName,
+}
+
+func verificationClaimArgs(kind string) []string {
+	if kind == kiroAgentName {
+		return []string{"acp", "--model", "scripted-model"}
+	}
+	return []string{"--acp"}
+}
+
+func TestVerificationAdditionsConformToTheRegistryContract(t *testing.T) {
+	kinds := VerificationAdditions.Kinds()
 	if len(kinds) == 0 {
-		t.Fatal("Sources.Kinds() = empty, want at least one registered source")
+		t.Fatal("VerificationAdditions.Kinds() = empty, want at least one registered addition")
 	}
 
 	for _, kind := range kinds {
+		executable, ok := verificationExecutables[kind]
+		if !ok {
+			t.Errorf("verificationExecutables[%q] missing, want the executable that names this addition's runtime", kind)
+			continue
+		}
 		root := t.TempDir()
 		setTempRoot(t, root)
 
-		constructor, err := Sources.Get(kind)
+		constructor, err := VerificationAdditions.Get(kind)
 		if err != nil {
-			t.Fatalf("Sources.Get(%q) error = %v", kind, err)
+			t.Fatalf("VerificationAdditions.Get(%q) error = %v", kind, err)
+		}
+		if !constructor().Context().Declared() {
+			t.Errorf("%s Context().Declared() = false, want true", kind)
 		}
 
-		if fresh := constructor(); !fresh.Recognize(kind) {
-			t.Errorf("Recognize(%q) = false, want true: a source's own kind is a name it recognizes", kind)
+		refusals := map[string]agentcore.LaunchTarget{
+			"remote launch": {Command: "ssh", RemoteCommand: executable + " --acp", SSHHost: "worker"},
+			"unnamed":       {Command: "/opt/sortie-neutral/sortie-neutral-launch", Args: []string{"--acp"}},
 		}
-
-		remote := agentcore.LaunchTarget{Command: "ssh", RemoteCommand: "agent", SSHHost: "worker"}
-		for _, offeredRuntime := range []string{"", kind} {
+		if kind == opencodeAgentName {
+			delete(refusals, "remote launch")
+		}
+		for name, target := range refusals {
 			refused := constructor()
-			if assignments, claimed := refused.Claim(remote, offeredRuntime); claimed {
-				t.Errorf("Claim(remote, %q) = %v, true, want a refusal: this source reads a local filesystem", offeredRuntime, assignments)
+			if switches, claimed := refused.Claim(target); claimed {
+				t.Errorf("%s Claim(%s) = %v, true, want a refusal", kind, name, switches)
 			}
 			assertTempRootEmpty(t, root)
 			refused.Close()
 			assertTempRootEmpty(t, root)
 		}
 
-		neutral := agentcore.LaunchTarget{
-			Command:       "/opt/sortie-neutral/sortie-neutral-launch",
-			Args:          []string{"--acp"},
-			WorkspacePath: t.TempDir(),
+		claimant := constructor()
+		switches, claimed := claimant.Claim(agentcore.LaunchTarget{Command: executable, Args: verificationClaimArgs(kind)})
+		if !claimed || len(switches.Env)+len(switches.Args)+len(switches.Merges) == 0 {
+			t.Fatalf("%s Claim(%s --acp) = %v, %v, want a claim with at least one switch", kind, executable, switches, claimed)
 		}
+		claimant.Close()
+		assertTempRootEmpty(t, root)
+		claimant.Close()
+		assertTempRootEmpty(t, root)
+	}
+}
 
-		firstOffer := constructor()
-		if assignments, claimed := firstOffer.Claim(neutral, ""); claimed && len(assignments) != 0 {
-			t.Errorf("Claim(neutral, \"\") claimed with assignments %v, want no assignment: this source cannot identify the neutral launch",
-				assignments)
-		}
-		assertTempRootEmpty(t, root)
-		firstOffer.Close()
-		assertTempRootEmpty(t, root)
+func TestClaimVerificationRefusesAnAmbiguousOrOperatorSetLaunch(t *testing.T) {
+	tests := []struct {
+		name        string
+		target      agentcore.LaunchTarget
+		environ     []string
+		wantClaimed bool
+	}{
+		{"a named launch with nothing set", agentcore.LaunchTarget{Command: "copilot", Args: []string{"--acp"}}, []string{"PATH=/bin", "OPENCODE_CONFIG=/x"}, true},
+		{"a bare flag in Args", agentcore.LaunchTarget{Command: "copilot", Args: []string{"--acp", "--available-tools", "bash"}}, nil, false},
+		{"a flag with a value in Args", agentcore.LaunchTarget{Command: "copilot", Args: []string{"--acp", "--no-custom-instructions=true"}}, nil, false},
+		{"an environment document to merge into", agentcore.LaunchTarget{Command: "opencode", Args: []string{"acp"}}, []string{"OPENCODE_CONFIG_CONTENT={}"}, true},
+		{"an environment value that is not an object", agentcore.LaunchTarget{Command: "opencode", Args: []string{"acp"}}, []string{"OPENCODE_CONFIG_CONTENT=[1]"}, false},
+		{"a document assigned by an env program in the command", agentcore.LaunchTarget{Command: "env", Args: []string{"OPENCODE_CONFIG_CONTENT=x", "opencode", "acp"}}, nil, false},
+		{"a quoted document assigned by an env program over SSH", agentcore.LaunchTarget{Command: "ssh", SSHHost: "worker", RemoteCommand: `env 'OPENCODE_CONFIG_CONTENT={"permission":"allow"}' opencode acp`}, nil, false},
+		{"a plain switch set in another case", agentcore.LaunchTarget{Command: "gemini", Args: []string{"--acp"}}, []string{"gemini_system_md=/etc/system.md"}, runtime.GOOS != "windows"},
+		{"a file-backed switch already set", agentcore.LaunchTarget{Command: "gemini", Args: []string{"--acp"}}, []string{"GEMINI_SYSTEM_MD=/etc/system.md"}, false},
+		{"two runtimes named", agentcore.LaunchTarget{Command: "gemini", Args: []string{"copilot"}}, nil, false},
+		{"kiro with a model", agentcore.LaunchTarget{Command: "kiro-cli", Args: []string{"acp", "--model", "x"}}, nil, true},
+		{"kiro without a model", agentcore.LaunchTarget{Command: "kiro-cli", Args: []string{"acp"}}, nil, false},
+		{"kiro with an agent already chosen", agentcore.LaunchTarget{Command: "kiro-cli", Args: []string{"acp", "--model", "x", "--agent", "foo"}}, nil, false},
+		{"kiro with its config directory already set", agentcore.LaunchTarget{Command: "kiro-cli", Args: []string{"acp", "--model", "x"}}, []string{"KIRO_AGENT_CONFIG_DIR=/etc/kiro"}, false},
+	}
 
-		relaunch := constructor()
-		if _, claimed := relaunch.Claim(neutral, kind); !claimed {
-			t.Fatalf("Claim(neutral, %q) = false, want true: the relaunch offer claims exactly when Recognize accepts", kind)
-		}
-		relaunch.Close()
-		assertTempRootEmpty(t, root)
-		relaunch.Close()
-		assertTempRootEmpty(t, root)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			setTempRoot(t, root)
 
-		untouched := constructor()
-		untouched.Close()
-		assertTempRootEmpty(t, root)
+			addition, switches, claimed := ClaimVerification(tt.target, tt.environ)
+			if claimed != tt.wantClaimed {
+				t.Fatalf("ClaimVerification(%v, %v) claimed = %v, want %v", tt.target, tt.environ, claimed, tt.wantClaimed)
+			}
+			if claimed {
+				if len(switches.Env)+len(switches.Args) == 0 {
+					t.Errorf("ClaimVerification(%v) switches = %v, want at least one", tt.target, switches)
+				}
+				addition.Close()
+			}
+			assertTempRootEmpty(t, root)
+		})
+	}
+}
+
+func TestVerificationSwitchesPerRuntime(t *testing.T) {
+	tests := []struct {
+		name           string
+		kind           string
+		args           []string
+		target         agentcore.LaunchTarget
+		environ        []string
+		wantArgs       []string
+		wantEnv        []string
+		wantPromptIn   string
+		wantAgentDirIn string
+		wantKeeps      []registry.VerificationResidual
+	}{
+		{name: "copilot narrows the tools and drops custom instructions", kind: copilotAgentName,
+			wantArgs:  []string{"--available-tools", "view", "--no-custom-instructions"},
+			wantKeeps: []registry.VerificationResidual{registry.VerificationKeepsProjectInstructions, registry.VerificationKeepsUserInstructions}},
+		{name: "opencode denies every tool through inline configuration", kind: opencodeAgentName,
+			wantEnv: []string{"OPENCODE_CONFIG_CONTENT={\"permission\":{\"*\":\"deny\"}}"}},
+		{name: "opencode merges the denial into the document the environment holds", kind: opencodeAgentName,
+			environ: []string{`OPENCODE_CONFIG_CONTENT={"permission":{"read":"allow"}}`},
+			wantEnv: []string{`OPENCODE_CONFIG_CONTENT={"permission":{"read":"allow","*":"deny"}}`}},
+		{name: "opencode claims a remote list-form launch and merges into the configured document", kind: opencodeAgentName,
+			target: agentcore.LaunchTarget{Command: "ssh", SSHHost: "worker", RemoteCommand: "'opencode' 'acp'", RemoteArgv: []string{"opencode", "acp"},
+				ConfiguredEnv: []sshutil.EnvVar{{Name: "OPENCODE_CONFIG_CONTENT", Value: `{"model":"m"}`}}},
+			wantEnv: []string{`OPENCODE_CONFIG_CONTENT={"model":"m","permission":{"*":"deny"}}`}},
+		{name: "gemini points at a private system prompt file", kind: geminiAgentName,
+			wantPromptIn: "GEMINI_SYSTEM_MD="},
+		{name: "kiro selects a tool-less agent for a spaced --model", kind: kiroAgentName, args: []string{"acp", "--model", "x"},
+			wantArgs: []string{"--agent", "sortie_verify"}, wantAgentDirIn: "KIRO_AGENT_CONFIG_DIR="},
+		{name: "kiro selects a tool-less agent for an attached --model", kind: kiroAgentName, args: []string{"acp", "--model=x"},
+			wantArgs: []string{"--agent", "sortie_verify"}, wantAgentDirIn: "KIRO_AGENT_CONFIG_DIR="},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			setTempRoot(t, root)
+			args := tt.args
+			if args == nil {
+				args = []string{"--acp"}
+			}
+			target := tt.target
+			if target.Command == "" {
+				target = agentcore.LaunchTarget{Command: verificationExecutables[tt.kind], Args: args}
+			}
+
+			addition, switches, claimed := ClaimVerification(target, append([]string{}, tt.environ...))
+			if !claimed {
+				t.Fatalf("ClaimVerification(%v, %v) claimed = false, want true", target, tt.environ)
+			}
+			for _, residual := range tt.wantKeeps {
+				if !addition.Context().Keeps(residual) {
+					t.Errorf("%s Context().Keeps(%q) = false, want true", tt.kind, residual)
+				}
+			}
+			if !slices.Equal(switches.Args, tt.wantArgs) {
+				t.Errorf("%s Claim() Args = %q, want %q", tt.kind, switches.Args, tt.wantArgs)
+			}
+			if tt.wantPromptIn == "" && tt.wantAgentDirIn == "" && !slices.Equal(switches.Env, tt.wantEnv) {
+				t.Errorf("%s Claim() Env = %q, want %q", tt.kind, switches.Env, tt.wantEnv)
+			}
+			if tt.wantPromptIn != "" {
+				if len(switches.Env) != 1 || !strings.HasPrefix(switches.Env[0], tt.wantPromptIn) {
+					t.Fatalf("%s Claim() Env = %q, want one %s entry", tt.kind, switches.Env, tt.wantPromptIn)
+				}
+				prompt, err := os.ReadFile(strings.TrimPrefix(switches.Env[0], tt.wantPromptIn))
+				if err != nil {
+					t.Fatalf("ReadFile(%s): %v", switches.Env[0], err)
+				}
+				if string(prompt) != agentcore.VerificationSystemPrompt {
+					t.Errorf("%s system prompt file = %q, want %q", tt.kind, prompt, agentcore.VerificationSystemPrompt)
+				}
+			}
+
+			if tt.wantAgentDirIn != "" {
+				if len(switches.Env) != 1 || !strings.HasPrefix(switches.Env[0], tt.wantAgentDirIn) {
+					t.Fatalf("%s Claim() Env = %q, want one %s entry", tt.kind, switches.Env, tt.wantAgentDirIn)
+				}
+				assertKiroAgentDefinition(t, strings.TrimPrefix(switches.Env[0], tt.wantAgentDirIn))
+			}
+
+			addition.Close()
+			assertTempRootEmpty(t, root)
+		})
 	}
 }

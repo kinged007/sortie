@@ -2,8 +2,10 @@ import { Fragment } from "react";
 
 import { Code } from "@/components/Code";
 import { ArrowRightIcon } from "@/components/icons";
+import { MONO } from "@/components/ui/mono";
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
+import { Parts } from "@/components/Parts";
 import { StateBadge } from "@/components/StateBadge";
 import {
   Table,
@@ -23,7 +25,7 @@ function ruleName(rule: ShapeRule): ReactNode {
   return rule.name === undefined || rule.name === "" ? (
     <span className="text-ink-muted">unnamed</span>
   ) : (
-    <span className="font-mono">{rule.name}</span>
+    <span className={MONO}>{rule.name}</span>
   );
 }
 
@@ -38,10 +40,8 @@ function Fallback({ dispatch, agent }: FallbackProps) {
 
 interface StepProps {
   marker: ReactNode;
-  /** Whether a connector runs down from this step's marker to the next step. */
   hasNext: boolean;
   title: ReactNode;
-  /** A muted fact beside the title, such as the agent the stage runs. */
   aside?: ReactNode;
   detail: ReactNode;
 }
@@ -52,17 +52,22 @@ function Step({ marker, hasNext, title, aside, detail }: StepProps) {
       {hasNext ? (
         <span aria-hidden="true" className="absolute top-6 bottom-0 left-3 w-px bg-line-medium" />
       ) : undefined}
-      <span className="relative flex size-6 shrink-0 items-center justify-center rounded-full border border-line-medium bg-canvas text-body-sm text-ink-muted tabular-nums">
+      {/* Proportional digits center in the circle; a tabular 1 leans left. */}
+      <span className="relative flex size-6 shrink-0 items-center justify-center rounded-full border border-line-medium bg-canvas text-body-sm text-ink-muted">
         {marker}
       </span>
-      <div className="flex min-w-0 flex-col pt-xxs">
-        <span className="flex flex-wrap items-baseline gap-x-sm">
-          <span className="text-body-md text-ink">{title}</span>
-          {aside === undefined ? undefined : (
-            <span className="text-body-sm text-ink-muted">{aside}</span>
-          )}
+      <div className="flex min-w-0 flex-col">
+        {/* A row as tall as the marker centers the title on it, its aside on the title's baseline. */}
+        <span className="flex min-h-6 items-center">
+          <span className="flex flex-wrap items-baseline gap-x-sm">
+            <span className="text-body-md text-ink">{title}</span>
+            {aside === undefined ? undefined : (
+              <span className="text-body-sm text-ink-muted">{aside}</span>
+            )}
+          </span>
         </span>
-        <span className="text-body-sm text-ink-muted wrap-anywhere">{detail}</span>
+        {/* A line as tall as a label chip holds a chip in the text without growing. */}
+        <span className="text-body-sm leading-5 text-ink-muted wrap-anywhere">{detail}</span>
       </div>
     </li>
   );
@@ -136,7 +141,11 @@ function ChainList({ plan, rules, handoff, hasReactions }: ChainListProps) {
         aside={rule === undefined ? undefined : `${rule.agent_kind} agent`}
         detail={
           <>
-            {index === 0 ? "Starts on " : undefined}
+            {index === 0
+              ? "Starts on "
+              : rule?.selected_by === "stage"
+                ? "The hop adds "
+                : undefined}
             {rule === undefined ? undefined : selectionText(rule)}
             {alsoFrom.length === 0 ? undefined : (
               <span className="block">
@@ -170,7 +179,7 @@ function ChainList({ plan, rules, handoff, hasReactions }: ChainListProps) {
         hasNext={false}
         title={
           <>
-            Joins chain {join.chain} at <span className="font-mono">{join.stage}</span>
+            Joins chain {join.chain} at <span className={MONO}>{join.stage}</span>
           </>
         }
         detail={`Stage ${join.position} of ${join.length}`}
@@ -179,9 +188,17 @@ function ChainList({ plan, rules, handoff, hasReactions }: ChainListProps) {
   );
   return (
     <div className="flex flex-col gap-sm">
-      <h3 className="text-body-md font-medium text-ink">
-        Chain {plan.number}
-        <span className="ml-xs font-regular text-ink-muted">{fmtCount(plan.length)} stages</span>
+      <h3 className="text-body-md text-ink">
+        <Parts
+          parts={[
+            <span key="chain" className="font-medium">
+              Chain {plan.number}
+            </span>,
+            <span key="stages" className="text-ink-muted">
+              {fmtCount(plan.length)} stages
+            </span>,
+          ]}
+        />
       </h3>
       <ol>{steps}</ol>
     </div>
@@ -198,7 +215,6 @@ function hopNote(dispatch: ShapeDispatch): ReactNode {
   );
 }
 
-/** Props of {@link DispatchSection}. */
 export interface DispatchSectionProps {
   dispatch: ShapeDispatch;
   agent: ShapeAgent;
@@ -206,7 +222,6 @@ export interface DispatchSectionProps {
   hasReactions: boolean;
 }
 
-/** Renders Dispatch: the rules outside any chain as one table, then each stage chain as a numbered list ending on the handoff state. */
 export function DispatchSection({
   dispatch,
   agent,
@@ -255,7 +270,9 @@ export function DispatchSection({
               <TableRow key={index}>
                 <TableCell>{ruleName(rule)}</TableCell>
                 <TableCell>{selectionText(rule)}</TableCell>
-                <TableCell>{rule.agent_kind}</TableCell>
+                <TableCell>
+                  <span className={MONO}>{rule.agent_kind}</span>
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

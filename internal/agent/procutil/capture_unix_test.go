@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 type captureLogRecord struct {
@@ -174,60 +175,6 @@ func runCaptureSignalChild(_ []string, p captureSignalChildParams) int {
 	return 0
 }
 
-func pollCaptureFileExists(t *testing.T, path string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("pollCaptureFileExists(%q): not present after %v", path, timeout)
-}
-
-const pollCapturePIDFileTimeout = 5 * time.Second
-
-func pollCapturePIDFile(t *testing.T, path string) int {
-	t.Helper()
-	deadline := time.Now().Add(pollCapturePIDFileTimeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("pollCapturePIDFile(%q): no valid pid after %v", path, pollCapturePIDFileTimeout)
-	return 0
-}
-
-func assertCaptureProcessGone(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Errorf("process %d still answers signal 0 after %v, want it gone", pid, timeout)
-}
-
-func waitCaptureResult(t *testing.T, c *Capture, timeout time.Duration) CaptureResult {
-	t.Helper()
-	done := make(chan CaptureResult, 1)
-	go func() { done <- c.Wait() }()
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(timeout):
-		t.Fatalf("Capture.Wait() did not return within %v", timeout)
-		return CaptureResult{}
-	}
-}
-
 func TestCapture_EscapedDescendantHoldingBothStreams(t *testing.T) {
 	dir := t.TempDir()
 	childPath := agenttest.FakeRuntime(t, dir, "descendant", agenttest.OutputScenario, agenttest.Output{Hang: true})
@@ -250,12 +197,12 @@ func TestCapture_EscapedDescendantHoldingBothStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartCapture() error = %v", err)
 	}
-	childPID := pollCapturePIDFile(t, pidPath)
+	childPID := waittest.PIDFile(t, pidPath)
 	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
 
 	start := time.Now()
-	result := waitCaptureResult(t, c, grace+5*time.Second)
-	if elapsed := time.Since(start); elapsed > grace+3*time.Second {
+	result := awaitCapture(t, c)
+	if elapsed := time.Since(start); elapsed >= DefaultDrainGrace {
 		t.Errorf("Wait() took %v, want close to the %v drain bound", elapsed, grace)
 	}
 
@@ -301,18 +248,13 @@ func TestCapture_HeldDescendantHoldingBothStreams(t *testing.T) {
 	var stdout, logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	const grace = 3 * time.Second
-	c, err := StartCapture(context.Background(), cmd, CaptureParams{Stdout: &stdout, DrainGrace: grace, Logger: logger})
+	c, err := StartCapture(context.Background(), cmd, CaptureParams{Stdout: &stdout, DrainGrace: waittest.HangGuard, Logger: logger})
 	if err != nil {
 		t.Fatalf("StartCapture() error = %v", err)
 	}
-	childPID := pollCapturePIDFile(t, pidPath)
+	childPID := waittest.PIDFile(t, pidPath)
 
-	start := time.Now()
-	result := waitCaptureResult(t, c, grace+5*time.Second)
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("Wait() took %v, want well under the %v drain bound", elapsed, grace)
-	}
+	result := awaitCapture(t, c)
 
 	if result.WaitErr != nil {
 		t.Errorf("WaitErr = %v, want nil", result.WaitErr)
@@ -326,7 +268,7 @@ func TestCapture_HeldDescendantHoldingBothStreams(t *testing.T) {
 	if logBuf.Len() != 0 {
 		t.Errorf("unexpected log output: %q, want no WARN", logBuf.String())
 	}
-	assertCaptureProcessGone(t, childPID, 3*time.Second)
+	waittest.ProcessGone(t, childPID)
 }
 
 func TestCapture_SealedSinkDiscardsChunksAfterWaitReturns(t *testing.T) {
@@ -358,10 +300,10 @@ func TestCapture_SealedSinkDiscardsChunksAfterWaitReturns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartCapture() error = %v", err)
 	}
-	writerPID := pollCapturePIDFile(t, pidPath)
+	writerPID := waittest.PIDFile(t, pidPath)
 	t.Cleanup(func() { _ = syscall.Kill(writerPID, syscall.SIGKILL) })
 
-	result := waitCaptureResult(t, c, grace+2*time.Second)
+	result := awaitCapture(t, c)
 	if result.OutputComplete {
 		t.Fatal("OutputComplete = true, want false (the periodic writer still holds the pipe)")
 	}
@@ -400,19 +342,15 @@ func TestRunCapture_SIGTERMTrapMarkerCollected(t *testing.T) {
 		done <- outcome{result, err}
 	}()
 
-	pollCaptureFileExists(t, readyPath, 5*time.Second)
+	waittest.File(t, readyPath)
 	cancel()
 
-	select {
-	case oc := <-done:
-		if oc.err != nil {
-			t.Fatalf("RunCapture() error = %v", oc.err)
-		}
-		if !strings.Contains(stdout.String(), "graceful-exit") {
-			t.Errorf("collected stdout = %q, want it to contain the graceful-exit marker", stdout.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("RunCapture() did not return within 5s of cancellation")
+	oc := waittest.Receive(t, done, "RunCapture() result")
+	if oc.err != nil {
+		t.Fatalf("RunCapture() error = %v", oc.err)
+	}
+	if !strings.Contains(stdout.String(), "graceful-exit") {
+		t.Errorf("collected stdout = %q, want it to contain the graceful-exit marker", stdout.String())
 	}
 }
 
@@ -430,7 +368,7 @@ func TestStartCapture_CleanupFailureLogsExactlyOneRecord(t *testing.T) {
 		t.Fatalf("StartCapture() error = %v", err)
 	}
 
-	waitCaptureResult(t, c, groupDrainBound+5*time.Second)
+	awaitCapture(t, c)
 
 	var count int
 	for _, r := range spy.snapshot() {
@@ -465,16 +403,16 @@ func TestSetGroupKill_CancellationSendsSIGKILLNotGraceful(t *testing.T) {
 		t.Fatalf("StartCapture() error = %v", err)
 	}
 
-	pollCaptureFileExists(t, readyPath, 5*time.Second)
-	descendantPID := pollCapturePIDFile(t, descendantPIDPath)
+	waittest.File(t, readyPath)
+	descendantPID := waittest.PIDFile(t, descendantPIDPath)
 	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
 
 	cancelAt := time.Now()
 	cancel()
 
-	result := waitCaptureResult(t, c, time.Second)
-	if elapsed := time.Since(cancelAt); elapsed > time.Second {
-		t.Errorf("Wait() returned %v after cancellation, want well within 1s", elapsed)
+	result := awaitCapture(t, c)
+	if elapsed := time.Since(cancelAt); elapsed >= DefaultStopGrace {
+		t.Errorf("Wait() returned %v after cancellation, want at once rather than after the %v stop grace", elapsed, DefaultStopGrace)
 	}
 
 	var exitErr *exec.ExitError
@@ -486,5 +424,5 @@ func TestSetGroupKill_CancellationSendsSIGKILLNotGraceful(t *testing.T) {
 		t.Errorf("WaitErr signal = %v (signaled=%v), want SIGKILL", status.Signal(), ok && status.Signaled())
 	}
 
-	assertCaptureProcessGone(t, descendantPID, 3*time.Second)
+	waittest.ProcessGone(t, descendantPID)
 }

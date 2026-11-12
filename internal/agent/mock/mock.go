@@ -9,47 +9,39 @@ package mock
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/typeutil"
 )
+
+// usageSources declares the configured counts as a running total since the
+// session state began.
+var usageSources = usage.Sources{Live: usage.Source{
+	Category: usage.SourceOutput,
+	Strategy: usage.StrategyLive,
+	Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, DuringTurn: true},
+}}
 
 func init() {
 	registry.Agents.RegisterWithMeta("mock", NewMockAdapter, registry.AgentMeta{
-		MCPInjection:     registry.MCPInjectionUnsupported,
-		UsageArrival:     registry.UsageArrivalIncremental,
-		UsageAttribution: registry.UsageAttributionSessionTotal,
-		CredentialEnv:    registry.DeclareCredentialEnv(),
-		EffortForwarding: registry.EffortNotForwarded,
-		UsageSessionRules: []registry.UsageSessionRule{
-			{
-				// Shares the session's own read of report_token_usage so
-				// the two cannot disagree.
-				When: func(passthrough map[string]any, remote bool) bool {
-					return !boolFromConfig(passthrough, "report_token_usage", true)
-				},
-				Arrival:     registry.UsageArrivalNone,
-				Attribution: registry.UsageAttributionNone,
-			},
-			{
-				// Ordered after the report_token_usage rule: no usage
-				// event is emitted for a model to ride on when both
-				// keys are set.
-				When: func(passthrough map[string]any, remote bool) bool {
-					v, ok := passthrough["model_name"].(string)
-					return ok && v != ""
-				},
-				Arrival:     registry.UsageArrivalIncremental,
-				Attribution: registry.UsageAttributionPerModel,
-			},
-		},
+		MCPDialect:            registry.MCPDialectNone,
+		MCPDialectNoneReason:  "launches no process",
+		UsageLimitRecognition: registry.UsageLimitRecognized,
+		UsageSources:          usageSources,
+		CredentialEnv:         registry.DeclareCredentialEnv(),
+		EffortForwarding:      registry.EffortNotForwarded,
+		VerificationContext:   registry.DeclareVerificationContext(),
 	})
 }
 
-// Compile-time interface satisfaction check.
+const usageLimitOutcome = "usage_limit"
+
 var _ domain.AgentAdapter = (*MockAdapter)(nil)
 
 // MockAdapter is a configurable agent adapter for testing. It emits
@@ -79,6 +71,7 @@ type mockSettings struct {
 	toolCalls              []mockToolCall
 	reportTokenUsage       bool
 	credentialError        string
+	usageLimitResetsAt     time.Time
 }
 
 func (s *mockSessionState) accrueTurnUsage() {
@@ -102,30 +95,25 @@ type mockToolCall struct {
 	Error      bool
 }
 
-// NewMockAdapter creates a [MockAdapter]. Every settings key is optional
-// with a safe default; an empty block produces a mock that starts
-// successfully, emits 3 notifications plus token_usage and turn_completed
-// per turn, and stops cleanly.
+// NewMockAdapter creates a [MockAdapter]. Every settings key is optional;
+// an empty block starts a session that emits three notifications,
+// token_usage and turn_completed per turn and stops cleanly.
 //
-// Accepted settings keys: session_id, agent_pid, start_error,
-// turn_outcomes, events_per_turn, input_tokens_per_turn,
-// output_tokens_per_turn, turn_delay_ms, stop_error,
-// report_token_usage. input_tokens_per_turn counts all input including
-// cache reads, so cache_read_tokens_per_turn is a subset of it rather
-// than an addition to it. The adapter reports run-cumulative counts by
-// construction: each turn's contribution accrues onto the totals of
-// every prior turn in the same session.
-// report_token_usage defaults to true; when false, the adapter emits no
-// token_usage event, leaves [domain.TurnResult] Usage at the zero
-// value, and reports UsageMeasured false, simulating a runtime that
-// reported nothing. A verification session's turn emits no event,
-// consumes no turn_outcomes entry, and fails with credential_error when
-// it is set.
+// Token counts are cumulative over the session, and input_tokens_per_turn
+// already includes cache_read_tokens_per_turn. With report_token_usage false
+// the mock reports no usage, so a turn that served output, other than an
+// error outcome, carries SpendUnaccounted. The turn_outcomes entries are
+// completed, failed, cancelled, error, input_required, incomplete and
+// usage_limit; a usage_limit turn fails with [domain.ErrUsageLimit], accrues
+// nothing, and carries the RFC 3339 reset instant from usage_limit_resets_at.
+// A verification session's turn emits no event, consumes no turn_outcomes
+// entry, and fails with credential_error when it is set. A session resumes
+// only its configured session_id; any other resume starts a new session that
+// keeps that id.
 func NewMockAdapter() (domain.AgentAdapter, error) {
 	return &MockAdapter{}, nil
 }
 
-// parseSettings reads a session's settings block.
 func parseSettings(config map[string]any) mockSettings {
 	m := mockSettings{
 		sessionID:           "mock-session-001",
@@ -168,14 +156,20 @@ func parseSettings(config map[string]any) mockSettings {
 		}
 	}
 
-	m.eventsPerTurn = intFromConfig(config, "events_per_turn", m.eventsPerTurn)
-	m.inputTokensPerTurn = intFromConfig(config, "input_tokens_per_turn", m.inputTokensPerTurn)
-	m.outputTokensPerTurn = intFromConfig(config, "output_tokens_per_turn", m.outputTokensPerTurn)
-	m.cacheReadTokensPerTurn = intFromConfig(config, "cache_read_tokens_per_turn", m.cacheReadTokensPerTurn)
-	m.turnDelayMS = intFromConfig(config, "turn_delay_ms", m.turnDelayMS)
-	m.reportTokenUsage = boolFromConfig(config, "report_token_usage", m.reportTokenUsage)
+	m.eventsPerTurn = typeutil.IntFrom(config, "events_per_turn", m.eventsPerTurn)
+	m.inputTokensPerTurn = typeutil.IntFrom(config, "input_tokens_per_turn", m.inputTokensPerTurn)
+	m.outputTokensPerTurn = typeutil.IntFrom(config, "output_tokens_per_turn", m.outputTokensPerTurn)
+	m.cacheReadTokensPerTurn = typeutil.IntFrom(config, "cache_read_tokens_per_turn", m.cacheReadTokensPerTurn)
+	m.turnDelayMS = typeutil.IntFrom(config, "turn_delay_ms", m.turnDelayMS)
+	m.reportTokenUsage = typeutil.BoolFrom(config, "report_token_usage", m.reportTokenUsage)
 	if v, ok := config["model_name"].(string); ok {
 		m.modelName = v
+	}
+
+	if v, ok := config["usage_limit_resets_at"].(string); ok {
+		if resetsAt, err := time.Parse(time.RFC3339, v); err == nil {
+			m.usageLimitResetsAt = resetsAt.UTC()
+		}
 	}
 
 	m.apiDurationMS = int64FromConfig(config, "api_duration_ms", 0)
@@ -202,7 +196,7 @@ func parseSettings(config map[string]any) mockSettings {
 // StartSession returns a canned [domain.Session] or an error when the
 // session's settings carry start_error. Validates that
 // [domain.StartSessionParams.WorkspacePath] is non-empty.
-func (m *MockAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
+func (m *MockAdapter) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	settings := parseSettings(params.Settings)
 	if settings.startError != "" {
 		return domain.Session{}, &domain.AgentError{
@@ -218,10 +212,22 @@ func (m *MockAdapter) StartSession(_ context.Context, params domain.StartSession
 		}
 	}
 
+	probe := agentcore.ResumeProbeFunc[struct{}](func(_ context.Context, resumeID string) (agentcore.ResumeSignal[struct{}], *domain.AgentError) {
+		if resumeID == settings.sessionID {
+			return agentcore.ResumeSignal[struct{}]{Verdict: agentcore.ResumeCarried}, nil
+		}
+		return agentcore.ResumeSignal[struct{}]{Verdict: agentcore.ResumeReplaced}, nil
+	})
+	start, startErr := agentcore.ResolveSessionStart(ctx, params.ResumeSessionID, probe, slog.Default())
+	if startErr != nil {
+		return domain.Session{}, startErr
+	}
+
 	return domain.Session{
-		ID:       settings.sessionID,
-		AgentPID: settings.agentPID,
-		Internal: &mockSessionState{mockSettings: settings, credentialVerification: params.CredentialVerification},
+		ID:             settings.sessionID,
+		AgentPID:       settings.agentPID,
+		CarriedHistory: start.CarriedHistory(),
+		Internal:       &mockSessionState{mockSettings: settings, credentialVerification: params.CredentialVerification},
 	}, nil
 }
 
@@ -255,34 +261,18 @@ func (m *MockAdapter) RunTurn(ctx context.Context, session domain.Session, param
 		return result, nil
 	}
 
-	// Critical section: read and advance turn state.
-	m.mu.Lock()
-	currentIndex := m.turnIndex
-	m.turnIndex++
-	outcome := state.outcomeAt(currentIndex)
-	if state.reportTokenUsage {
-		state.accrueTurnUsage()
-	}
-	usage := state.usage
-	m.mu.Unlock()
+	outcome, cumulative := m.advanceTurn(state)
 
-	// Artificial delay (outside lock).
-	if state.turnDelayMS > 0 {
-		timer := time.NewTimer(time.Duration(state.turnDelayMS) * time.Millisecond)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-			params.OnEvent(domain.AgentEvent{
-				Type:      domain.EventTurnCancelled,
-				Timestamp: time.Now().UTC(),
-				Message:   "context cancelled",
-			})
-			return domain.TurnResult{
-				SessionID:  session.ID,
-				ExitReason: domain.EventTurnCancelled,
-			}, ctx.Err()
-		}
+	if !waitTurnDelay(ctx, state.turnDelayMS) {
+		params.OnEvent(domain.AgentEvent{
+			Type:      domain.EventTurnCancelled,
+			Timestamp: time.Now().UTC(),
+			Message:   "context cancelled",
+		})
+		return domain.TurnResult{
+			SessionID:  session.ID,
+			ExitReason: domain.EventTurnCancelled,
+		}, ctx.Err()
 	}
 
 	params.OnEvent(domain.AgentEvent{
@@ -305,7 +295,7 @@ func (m *MockAdapter) RunTurn(ctx context.Context, session domain.Session, param
 		tokenEvt := domain.AgentEvent{
 			Type:      domain.EventTokenUsage,
 			Timestamp: time.Now().UTC(),
-			Usage:     usage,
+			Usage:     cumulative,
 			Model:     state.modelName,
 			Message:   "mock token usage",
 		}
@@ -326,54 +316,122 @@ func (m *MockAdapter) RunTurn(ctx context.Context, session domain.Session, param
 		})
 	}
 
-	if outcome == "input_required" {
+	spend := turnSpend(state, outcome)
+
+	switch outcome {
+	case "input_required":
 		ev := agentcore.TurnEvidence{
 			Terminal:        agentcore.TerminalHumanInputRequired,
 			TerminalMessage: fmt.Sprintf("mock turn %s", outcome),
 		}
 		meta := agentcore.TurnMeta{
 			SessionID:     session.ID,
-			Usage:         usage,
+			Usage:         cumulative,
 			UsageMeasured: state.reportTokenUsage,
 		}
-		return agentcore.FinalizeTurn(params.OnEvent, nil, ev, meta, agentcore.TurnSpend{})
-	}
-
-	if outcome == "incomplete" {
+		return agentcore.FinalizeTurn(params.OnEvent, nil, ev, meta, spend)
+	case "incomplete":
 		ev := agentcore.TurnEvidence{
 			Terminal:        agentcore.TerminalIncomplete,
 			TerminalMessage: "mock turn incomplete",
 		}
 		meta := agentcore.TurnMeta{
 			SessionID:     session.ID,
-			Usage:         usage,
+			Usage:         cumulative,
 			UsageMeasured: state.reportTokenUsage,
 		}
-		return agentcore.FinalizeTurn(params.OnEvent, nil, ev, meta, agentcore.TurnSpend{})
-	}
-
-	exitReason, errKind, isError := outcomeToEvent(outcome)
-	params.OnEvent(domain.AgentEvent{
-		Type:      exitReason,
-		Timestamp: time.Now().UTC(),
-		Message:   fmt.Sprintf("mock turn %s", outcome),
-	})
-
-	turnResult := domain.TurnResult{
-		SessionID:     session.ID,
-		ExitReason:    exitReason,
-		Usage:         usage,
-		UsageMeasured: state.reportTokenUsage,
-	}
-
-	if isError {
-		return turnResult, &domain.AgentError{
-			Kind:    errKind,
+		return agentcore.FinalizeTurn(params.OnEvent, nil, ev, meta, spend)
+	case "error":
+		params.OnEvent(domain.AgentEvent{
+			Type:      domain.EventTurnEndedWithError,
+			Timestamp: time.Now().UTC(),
+			Message:   fmt.Sprintf("mock turn %s", outcome),
+		})
+		result := domain.TurnResult{
+			SessionID:     session.ID,
+			ExitReason:    domain.EventTurnEndedWithError,
+			Usage:         cumulative,
+			UsageMeasured: state.reportTokenUsage,
+		}
+		return result, &domain.AgentError{
+			Kind:    domain.ErrPortExit,
 			Message: fmt.Sprintf("mock turn %s", outcome),
 		}
 	}
 
-	return turnResult, nil
+	ev := agentcore.TurnEvidence{
+		Terminal:        scriptedTerminal(outcome),
+		TerminalMessage: fmt.Sprintf("mock turn %s", outcome),
+	}
+	if outcome == usageLimitOutcome {
+		ev.TerminalErrorKind = domain.ErrUsageLimit
+		ev.UsageLimit = &domain.UsageLimit{ResetsAt: state.usageLimitResetsAt}
+	}
+	// The terminal event carries no usage: the token_usage event above is
+	// the turn's one figure.
+	meta := agentcore.TurnMeta{SessionID: session.ID, UsageMeasured: state.reportTokenUsage}
+	result, agentErr := agentcore.FinalizeTurn(params.OnEvent, nil, ev, meta, spend)
+	result.Usage = cumulative
+	if agentErr == nil {
+		return result, nil
+	}
+	return result, agentErr
+}
+
+// advanceTurn takes the next turn's outcome and accrues its usage, returning
+// the session's cumulative usage after the turn.
+func (m *MockAdapter) advanceTurn(state *mockSessionState) (string, domain.TokenUsage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	outcome := state.outcomeAt(m.turnIndex)
+	m.turnIndex++
+	if state.reportTokenUsage && outcome != usageLimitOutcome {
+		state.accrueTurnUsage()
+	}
+	return outcome, state.usage
+}
+
+// waitTurnDelay waits delayMS and reports false when ctx ends first.
+func waitTurnDelay(ctx context.Context, delayMS int) bool {
+	if delayMS <= 0 {
+		return true
+	}
+	timer := time.NewTimer(time.Duration(delayMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// turnSpend is the spend evidence of a turn that served output: its amount
+// is settled when the mock reports usage and unknown when it does not. A
+// usage_limit turn was refused, so it spent nothing.
+func turnSpend(state *mockSessionState, outcome string) agentcore.TurnSpend {
+	var spend agentcore.TurnSpend
+	if outcome == usageLimitOutcome {
+		return spend
+	}
+	spend.MarkModelReached()
+	if state.reportTokenUsage {
+		spend.MarkSettled()
+	}
+	return spend
+}
+
+// scriptedTerminal maps a turn_outcomes entry that ends through the shared
+// disposition to the runtime's terminal report.
+func scriptedTerminal(outcome string) agentcore.TerminalReport {
+	switch outcome {
+	case "failed", usageLimitOutcome:
+		return agentcore.TerminalFailure
+	case "cancelled":
+		return agentcore.TerminalCancelled
+	default:
+		return agentcore.TerminalSuccess
+	}
 }
 
 // StopSession returns nil or an error when the session's settings carry
@@ -386,68 +444,12 @@ func (m *MockAdapter) StopSession(_ context.Context, session domain.Session) err
 	return nil
 }
 
-// outcomeAt returns the outcome string for the given turn index.
-// Falls back to "completed" when the index exceeds the configured
-// turn_outcomes slice.
+// outcomeAt returns "completed" past the end of the configured turn_outcomes.
 func (s mockSettings) outcomeAt(index int) string {
 	if index < len(s.turnOutcomes) {
 		return s.turnOutcomes[index]
 	}
 	return "completed"
-}
-
-// outcomeToEvent maps an outcome config string to the corresponding
-// terminal event type, error kind, and whether an error should be
-// returned to the caller.
-func outcomeToEvent(outcome string) (domain.AgentEventType, domain.AgentErrorKind, bool) {
-	switch outcome {
-	case "failed":
-		return domain.EventTurnFailed, domain.ErrTurnFailed, true
-	case "cancelled":
-		return domain.EventTurnCancelled, domain.ErrTurnCancelled, true
-	case "error":
-		return domain.EventTurnEndedWithError, domain.ErrPortExit, true
-	default:
-		return domain.EventTurnCompleted, "", false
-	}
-}
-
-// intFromConfig extracts an integer value from a config map, accepting
-// both int and float64 (JSON unmarshalling yields float64). Fractional
-// float64 values are rejected to prevent silent truncation. Returns
-// the fallback if the key is missing or has an unexpected type.
-func intFromConfig(config map[string]any, key string, fallback int) int {
-	v, ok := config[key]
-	if !ok {
-		return fallback
-	}
-	switch n := v.(type) {
-	case int:
-		return n
-	case float64:
-		if n != float64(int(n)) {
-			return fallback
-		}
-		return int(n)
-	default:
-		return fallback
-	}
-}
-
-// boolFromConfig extracts a boolean value from a config map, accepting
-// a Go bool (the type a YAML boolean reaches the constructor as).
-// Returns the fallback if the key is missing or has an unexpected
-// type.
-func boolFromConfig(config map[string]any, key string, fallback bool) bool {
-	v, ok := config[key]
-	if !ok {
-		return fallback
-	}
-	b, ok := v.(bool)
-	if !ok {
-		return fallback
-	}
-	return b
 }
 
 // int64FromConfig extracts an int64 value from a config map, accepting

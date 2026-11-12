@@ -8,7 +8,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // errCeilingStop distinguishes a ceiling stop from other cancellation causes.
@@ -57,13 +57,7 @@ type CeilingStopRequest struct {
 	SumSource string
 
 	// Usage is the confirming read behind the decision, nil for tokenSumSessionSpendAlone.
-	Usage *persistence.IssueTokenUsage
-}
-
-// issueTokenStore is the persistence contract [freezeIssueTokenBaseline]
-// and [enforceInFlightTokenCeiling] need.
-type issueTokenStore interface {
-	TokenUsageByIssue(ctx context.Context, issueID string) (persistence.IssueTokenUsage, error)
+	Usage *storage.IssueTokenUsage
 }
 
 // sessionUncachedTokens returns the running session's total tokens less its
@@ -83,8 +77,8 @@ func (e *RunningEntry) issueUncachedTokens() int64 {
 // baseline from the first usage event onward and the entry serves the issue's
 // spend whether or not a ceiling is set. Without a ceiling a failed read
 // emits nothing. Must run on the single-writer event loop, after
-// entry.UsageArrival has been assigned.
-func freezeIssueTokenBaseline(ctx context.Context, state *State, issueID string, store issueTokenStore, logger *slog.Logger) {
+// entry.UsageArrival and entry.CarriesTokenFigure have been assigned.
+func freezeIssueTokenBaseline(ctx context.Context, state *State, issueID string, store storage.RunHistoryStore, logger *slog.Logger) {
 	entry, ok := state.Running[issueID]
 	if !ok {
 		return
@@ -107,18 +101,18 @@ func freezeIssueTokenBaseline(ctx context.Context, state *State, issueID string,
 	}
 	entry.IssueTokensCompleted = usage.UncachedTokens
 	entry.IssueUsage = &usage
-	if entry.UsageArrival.ReportsAnyFigure() {
+	if entry.CarriesTokenFigure {
 		reachTokenWarning(state, issueID, entry, logger)
 	}
 }
 
 // warnCeilingUnboundAtDispatch records what the ceiling cannot bound at dispatch. A run
-// whose arrival reports no figure is unbounded whatever the baseline read
+// that can carry no token figure is unbounded whatever the baseline read
 // did, so a failed read rides on that record rather than claiming the
 // ceiling bounds this session.
 func warnCeilingUnboundAtDispatch(log *slog.Logger, budgetTokens int, entry *RunningEntry, readErr error) {
 	switch {
-	case !entry.UsageArrival.ReportsAnyFigure():
+	case !entry.CarriesTokenFigure:
 		attrs := []any{
 			slog.String("agent_kind", entry.AgentKind),
 			slog.String("usage_arrival", string(entry.UsageArrival)),
@@ -145,7 +139,7 @@ func warnCeilingUnboundAtDispatch(log *slog.Logger, budgetTokens int, entry *Run
 //
 // Must run on the single-writer event loop, after [HandleAgentEvent] has
 // applied the event's usage delta.
-func enforceInFlightTokenCeiling(ctx context.Context, state *State, issueID string, event domain.AgentEvent, store issueTokenStore, logger *slog.Logger) {
+func enforceInFlightTokenCeiling(ctx context.Context, state *State, issueID string, event domain.AgentEvent, store storage.RunHistoryStore, logger *slog.Logger) {
 	ceiling := state.MaxTokens
 	if ceiling <= 0 {
 		return
@@ -266,7 +260,7 @@ const (
 
 // requestTokenCeilingStop records the ceiling's decision and cancels the
 // worker context with [errCeilingStop]. usage is nil without a read.
-func requestTokenCeilingStop(entry *RunningEntry, ceiling int, usage *persistence.IssueTokenUsage, sumSource string) {
+func requestTokenCeilingStop(entry *RunningEntry, ceiling int, usage *storage.IssueTokenUsage, sumSource string) {
 	entry.CeilingStopRequest = &CeilingStopRequest{
 		Reason:               budgetReasonToken,
 		BudgetTokens:         ceiling,
@@ -328,7 +322,7 @@ func reportMoneyCeilingStop(log *slog.Logger, request *CeilingStopRequest) {
 // from being an issue's whole spend: sessions whose usage was never
 // recorded and turns that spent an amount nothing reported. Both are
 // always emitted together.
-func incompleteSpendAttrs(usage persistence.IssueTokenUsage) []any {
+func incompleteSpendAttrs(usage storage.IssueTokenUsage) []any {
 	return []any{
 		slog.Int("unmeasured_sessions", usage.UnmeasuredSessions),
 		slog.Int("unaccounted_turns", usage.UnaccountedTurns),
@@ -337,7 +331,7 @@ func incompleteSpendAttrs(usage persistence.IssueTokenUsage) []any {
 
 // warnTokenBudgetIncomplete records one issue whose summed spend is below
 // the ceiling but only a lower bound, so the dispatch proceeds anyway.
-func warnTokenBudgetIncomplete(log *slog.Logger, usage persistence.IssueTokenUsage, budgetTokens int) {
+func warnTokenBudgetIncomplete(log *slog.Logger, usage storage.IssueTokenUsage, budgetTokens int) {
 	attrs := append([]any{
 		slog.Int64("used_tokens", usage.UncachedTokens),
 		slog.Int64("budget_tokens", int64(budgetTokens)),
@@ -346,12 +340,12 @@ func warnTokenBudgetIncomplete(log *slog.Logger, usage persistence.IssueTokenUsa
 }
 
 // warnCeilingMeasuredNothing records one ended run whose ceiling was set
-// and whose arrival declared that figures report, yet recorded none. Must
+// and whose kind can carry a token figure, yet recorded none. Must
 // be called once per run from the exit path with the run's settled
-// verdict. A kind whose arrival reports no figure is announced at dispatch
+// verdict. A run that can carry no token figure is announced at dispatch
 // instead and skipped here.
 func warnCeilingMeasuredNothing(log *slog.Logger, entry *RunningEntry, budgetTokens int, measured bool) {
-	if budgetTokens <= 0 || measured || !entry.UsageArrival.ReportsAnyFigure() {
+	if budgetTokens <= 0 || measured || !entry.CarriesTokenFigure {
 		return
 	}
 	log.Warn("run reported no token usage, token ceiling could not bound it",

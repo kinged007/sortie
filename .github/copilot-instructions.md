@@ -7,11 +7,11 @@
 ```
 cmd/sortie -> internal/* (wiring only)
 server -> domain, orchestrator, config, redact, registry, sentence, runstats, pricing, server/ui
-orchestrator -> domain, config, persistence, workspace, workspacekit, registry, prompt, workflow, logging, redact, pricing, adapter-family packages that register no kind (scm/scmcore, agent/procutil); kind packages only via registry
+orchestrator -> domain, config, storage, workspace, workspacekit, registry, prompt, workflow, logging, redact, pricing, adapter-family packages that register no kind (scm/scmcore, agent/procutil); kind packages only via registry
 workflow -> config, prompt
-workspace -> domain, config, persistence, agent/procutil, workspacekit
-persistence -> domain, config
-runstats -> domain, persistence
+workspace -> domain, config, storage, agent/procutil, workspacekit
+storage/sqlite -> domain, config, storage
+runstats -> domain, storage
 pricing -> domain, config
 registry -> domain, typeutil
 tracker/*, scm/*, agent/*, notify/* -> domain, registry, logging, redact, trackermetrics, *kit/*util, packages under their own family root that register no kind; no cross-adapter imports
@@ -23,7 +23,8 @@ prompt -> domain, maputil
 httpkit, issuekit, trackermetrics -> domain, typeutil
 logging -> redact
 redact -> httpkit
-domain, maputil, typeutil, workspacekit, server/ui -> no internal deps
+domain, maputil, typeutil, workspacekit, waittest, storage, server/ui -> no internal deps
+test and test-support code (_test.go files, agenttest, tools/qualify) -> waittest
 ```
 
 ## 2. Concurrency safety
@@ -63,6 +64,7 @@ domain, maputil, typeutil, workspacekit, server/ui -> no internal deps
 - No adapter package imports another adapter package.
 - Adapter-specific names (`jira_*`, `claude_*`, paths, flags) don't appear in `orchestrator/` or `domain/`. Core uses generic names (`agent_*`, `tracker_*`, `session_*`).
 - Interface methods return normalized domain types; errors map into the spec's normalized categories (transport, auth, API, payload).
+- A one-process-per-turn agent adapter runs on `agentcore.NewForkPerTurnSession`. Flag a private turn loop (its own reader, wait goroutine, or select loop around a subprocess) and any copy of an `agentcore`, `procutil`, or `typeutil` helper; the right fix adds an optional hook to the shared skeleton, not a second copy.
 
 ## 8. Configuration & template safety
 
@@ -84,4 +86,4 @@ domain, maputil, typeutil, workspacekit, server/ui -> no internal deps
 
 ## Severity
 
-Critical: security, data loss, spec violation, layer/adapter boundary. Major: correctness, resource leak, swallowed error, missing test on critical path. Minor: style, naming, missing godoc. Info: non-blocking. Don't flag established patterns or equivalent rewrites.
+Critical: security, data loss, spec violation, layer/adapter boundary. Major: correctness, resource leak, swallowed error, missing test on critical path. Minor: style, naming, missing godoc. Info: non-blocking. Don't flag established patterns or equivalent rewrites, but a private turn loop or a copied shared helper is never an established pattern; flag it as a layer/adapter boundary violation.

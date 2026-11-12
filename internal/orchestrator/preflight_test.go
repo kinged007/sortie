@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -64,7 +65,7 @@ func validPreflightParams() PreflightParams {
 		AgentRegistry: &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionSupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectMCPServersJSON}, true
 			},
 		},
 	}
@@ -868,7 +869,7 @@ func TestValidateDispatchConfig_MCPConfigWarning(t *testing.T) {
 		params.AgentRegistry = &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionUnsupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectNone, MCPDialectNoneReason: "no tool server"}, true
 			},
 		}
 
@@ -903,7 +904,7 @@ func TestValidateDispatchConfig_MCPConfigWarning(t *testing.T) {
 		params.AgentRegistry = &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionUnsupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectNone, MCPDialectNoneReason: "no tool server"}, true
 			},
 		}
 
@@ -927,7 +928,7 @@ func TestValidateDispatchConfig_MCPConfigWarning(t *testing.T) {
 		params.AgentRegistry = &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionSupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectMCPServersJSON}, true
 			},
 		}
 
@@ -959,7 +960,7 @@ func TestValidateDispatchConfig_MCPConfigWarning(t *testing.T) {
 				if kind == "rule-agent" {
 					return registry.AgentMeta{}, false
 				}
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionUnsupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectNone, MCPDialectNoneReason: "no tool server"}, true
 			},
 		}
 
@@ -989,7 +990,7 @@ func TestValidateDispatchConfig_MCPConfigWarning(t *testing.T) {
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(kind string) (registry.AgentMeta, bool) {
 				if kind == "mock" {
-					return registry.AgentMeta{MCPInjection: registry.MCPInjectionUnsupported}, true
+					return registry.AgentMeta{MCPDialect: registry.MCPDialectNone, MCPDialectNoneReason: "no tool server"}, true
 				}
 				return registry.AgentMeta{}, true
 			},
@@ -1164,7 +1165,7 @@ func TestValidateDispatchConfig_NoToolChannelWarning(t *testing.T) {
 		params.AgentRegistry = &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionUnsupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectNone, MCPDialectNoneReason: "no tool server"}, true
 			},
 		}
 
@@ -1207,7 +1208,7 @@ func TestValidateDispatchConfig_NoToolChannelWarning(t *testing.T) {
 		params.AgentRegistry = &stubAgentRegistry{
 			getFunc: func(string) (registry.AgentConstructor, error) { return nil, nil },
 			metaFunc: func(string) (registry.AgentMeta, bool) {
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionTranslated}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectMCPServersJSON}, true
 			},
 		}
 
@@ -1242,7 +1243,7 @@ func TestValidateDispatchConfig_NoToolChannelWarning(t *testing.T) {
 				if kind == "rule-agent" {
 					return registry.AgentMeta{}, false
 				}
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionSupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectMCPServersJSON}, true
 			},
 		}
 
@@ -1260,16 +1261,20 @@ func TestValidateDispatchConfig_UsageReportingWarnings(t *testing.T) {
 
 	noneMeta := func(string) (registry.AgentMeta, bool) {
 		return registry.AgentMeta{
-			MCPInjection:     registry.MCPInjectionSupported,
-			UsageArrival:     registry.UsageArrivalNone,
-			UsageAttribution: registry.UsageAttributionNone,
+			MCPDialect:   registry.MCPDialectMCPServersJSON,
+			UsageSources: usage.Sources{Live: vendorOnlyLive},
 		}, true
 	}
 	reportingMeta := func(string) (registry.AgentMeta, bool) {
 		return registry.AgentMeta{
-			MCPInjection:     registry.MCPInjectionSupported,
-			UsageArrival:     registry.UsageArrivalIncremental,
-			UsageAttribution: registry.UsageAttributionPerModel,
+			MCPDialect:   registry.MCPDialectMCPServersJSON,
+			UsageSources: usage.Sources{Live: tokenLive},
+		}, true
+	}
+	journalMeta := func(string) (registry.AgentMeta, bool) {
+		return registry.AgentMeta{
+			MCPDialect:   registry.MCPDialectMCPServersJSON,
+			UsageSources: vendorOnlyJournalSources,
 		}, true
 	}
 	completeEntry := map[string]any{"input_per_mtok": 3.0, "output_per_mtok": 15.0}
@@ -1280,11 +1285,25 @@ func TestValidateDispatchConfig_UsageReportingWarnings(t *testing.T) {
 		maxCostUSD      float64
 		rates           map[string]any
 		priceRates      *pricing.Rates
+		sshHosts        bool
 		meta            func(string) (registry.AgentMeta, bool)
 		check           string
 		wantWarn        bool
 		noKindInMessage bool
 	}{
+		{
+			name:      "agent.max_tokens set against a records-only token source draws no warning for an SSH worker",
+			maxTokens: 50000,
+			sshHosts:  true,
+			meta:      journalMeta,
+			check:     "agent.kind.no_usage_reporting",
+		},
+		{
+			name:      "agent.max_tokens set against a records-only token source draws no warning for a local worker",
+			maxTokens: 50000,
+			meta:      journalMeta,
+			check:     "agent.kind.no_usage_reporting",
+		},
 		{
 			name:      "agent.max_tokens set against a kind resolving to no usage warns",
 			maxTokens: 50000,
@@ -1375,6 +1394,9 @@ func TestValidateDispatchConfig_UsageReportingWarnings(t *testing.T) {
 				}
 				if tt.rates != nil {
 					cfg.SetExtensionSection("token_rates", tt.rates)
+				}
+				if tt.sshHosts {
+					cfg.SetExtensionSection("worker", map[string]any{"ssh_hosts": []any{"host-1"}})
 				}
 				return cfg
 			}
@@ -1672,13 +1694,14 @@ func TestValidateDispatchConfig_MissingBlockMessage(t *testing.T) {
 			metaFunc: func(kind string) (registry.AgentMeta, bool) {
 				if kind == "kiro" {
 					return registry.AgentMeta{
-						MCPInjection: registry.MCPInjectionUnsupported,
+						MCPDialect:           registry.MCPDialectNone,
+						MCPDialectNoneReason: "no tool server",
 						ValidateAgentConfig: func(fields registry.AgentConfigFields) []registry.ValidationDiag {
 							return []registry.ValidationDiag{{Severity: "error", Check: "kiro.check", Message: "kiro-specific fault"}}
 						},
 					}, true
 				}
-				return registry.AgentMeta{MCPInjection: registry.MCPInjectionSupported}, true
+				return registry.AgentMeta{MCPDialect: registry.MCPDialectMCPServersJSON}, true
 			},
 		}
 

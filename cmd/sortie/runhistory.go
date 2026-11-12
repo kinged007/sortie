@@ -3,24 +3,34 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/server"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
+// runHistorySource is what the run-history reader reads: the run history
+// plus the run events, issue outcomes and pass activity recorded beside it.
+type runHistorySource interface {
+	storage.RunHistoryStore
+	storage.RunEventStore
+	storage.IssueOutcomeStore
+	storage.ReactionActivityStore
+}
+
 // runHistoryReader serves the HTTP server's run history from the store, so
-// the server never names a persistence type.
+// the server never names a storage type.
 type runHistoryReader struct {
-	store *persistence.Store
+	store runHistorySource
 }
 
 var _ server.RunHistoryReader = runHistoryReader{}
 
 // QueryRuns returns the runs matching q, newest first.
 func (r runHistoryReader) QueryRuns(ctx context.Context, q server.RunHistoryQuery) ([]server.RunHistoryEntry, error) {
-	runs, err := r.store.QueryRunHistory(ctx, persistence.RunHistoryFilter{
+	runs, err := r.store.QueryRunHistory(ctx, storage.RunHistoryFilter{
 		IssueID:         q.IssueID,
 		Identifier:      q.Identifier,
 		RuleName:        q.RuleName,
@@ -45,15 +55,18 @@ func (r runHistoryReader) QueryRuns(ctx context.Context, q server.RunHistoryQuer
 	if err != nil {
 		return nil, err
 	}
+	amounts, err := r.store.QueryRunReportedAmounts(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]server.RunHistoryEntry, len(runs))
 	for i, run := range runs {
-		out[i] = runHistoryEntry(run)
-		out[i].ModelUsage = runModelUsage(parts[run.ID])
+		out[i] = runHistoryEntry(run, parts[run.ID], amounts[run.ID])
 	}
 	return out, nil
 }
 
-func runModelUsage(parts []persistence.RunModelPart) []server.RunModelUsage {
+func runModelUsage(parts []storage.RunModelPart) []server.RunModelUsage {
 	out := make([]server.RunModelUsage, len(parts))
 	for i, p := range parts {
 		out[i] = server.RunModelUsage{
@@ -69,6 +82,7 @@ func runModelUsage(parts []persistence.RunModelPart) []server.RunModelUsage {
 			CostStatus:       p.CostStatus,
 			UnratedClasses:   p.UnratedClasses,
 			UnratedRecorded:  p.UnratedRecorded,
+			PriceSource:      p.PriceSource,
 		}
 	}
 	return out
@@ -76,7 +90,7 @@ func runModelUsage(parts []persistence.RunModelPart) []server.RunModelUsage {
 
 // QueryIssueGroups returns the issues whose runs match q, newest first.
 func (r runHistoryReader) QueryIssueGroups(ctx context.Context, q server.IssueGroupQuery) ([]server.IssueGroupKey, error) {
-	groups, err := r.store.QueryIssueGroups(ctx, persistence.IssueGroupFilter{
+	groups, err := r.store.QueryIssueGroups(ctx, storage.IssueGroupFilter{
 		IssueKey:    q.IssueKey,
 		Search:      q.Search,
 		RuleName:    q.RuleName,
@@ -102,6 +116,10 @@ func (r runHistoryReader) IssueTotals(ctx context.Context, issueID string) (serv
 	if err != nil {
 		return server.IssueRunTotals{}, fmt.Errorf("issue run totals: %w", err)
 	}
+	provenance, err := r.store.IssueSpendProvenance(ctx, issueID)
+	if err != nil {
+		return server.IssueRunTotals{}, fmt.Errorf("issue spend provenance: %w", err)
+	}
 	return server.IssueRunTotals{
 		Usage: *orchestrator.SnapshotIssueUsageOf(&usage),
 		Tokens: domain.TokenUsage{
@@ -110,7 +128,24 @@ func (r runHistoryReader) IssueTotals(ctx context.Context, issueID string) (serv
 			CacheReadTokens:  usage.CacheReadTokens,
 			CacheWriteTokens: usage.CacheWriteTokens,
 		},
+		Provenance: issueProvenance(provenance),
 	}, nil
+}
+
+// issueProvenance maps what an issue's recorded runs say about the origin of
+// their figures to the server reader type.
+func issueProvenance(p storage.IssueSpendProvenance) server.IssueProvenance {
+	amounts := make([]server.UnitAmount, len(p.VendorAmounts))
+	for i, a := range p.VendorAmounts {
+		amounts[i] = server.UnitAmount{Unit: a.Unit, Amount: a.Amount, LowerBound: a.LowerBound}
+	}
+	return server.IssueProvenance{
+		UnmeasuredCause:   string(p.UnmeasuredCause),
+		UnmeasuredUnits:   p.UnmeasuredUnits,
+		VendorAmounts:     amounts,
+		AgentPricedUSD:    p.AgentPricedUSD,
+		AgentPricedModels: p.AgentPricedModels,
+	}
 }
 
 // RunEvents returns one run's stored events, decoded, ascending by seq: all
@@ -145,9 +180,9 @@ func (r runHistoryReader) IssueOutcomes(ctx context.Context, issueIDs []string) 
 
 // PassActivities returns what the reactions recorded in each listed pass.
 func (r runHistoryReader) PassActivities(ctx context.Context, passes []server.PassRef) (map[server.PassKey]server.PassActivity, error) {
-	refs := make([]persistence.PassRef, len(passes))
+	refs := make([]storage.PassRef, len(passes))
 	for i, p := range passes {
-		refs[i] = persistence.PassRef{IssueID: p.IssueID, ChainID: p.ChainID, DispatchedAt: p.DispatchedAt}
+		refs[i] = storage.PassRef{IssueID: p.IssueID, ChainID: p.ChainID, DispatchedAt: p.DispatchedAt}
 	}
 	stored, err := r.store.PassActivities(ctx, refs)
 	if err != nil {
@@ -169,8 +204,8 @@ func (r runHistoryReader) PassActivities(ctx context.Context, passes []server.Pa
 	return out, nil
 }
 
-func runHistoryEntry(r persistence.RunHistory) server.RunHistoryEntry {
-	return server.RunHistoryEntry{
+func runHistoryEntry(r storage.RunHistory, parts []storage.RunModelPart, amounts []storage.ReportedAmount) server.RunHistoryEntry {
+	entry := server.RunHistoryEntry{
 		Identifier:       r.Identifier,
 		DisplayID:        r.DisplayID,
 		Attempt:          r.Attempt,
@@ -202,16 +237,70 @@ func runHistoryEntry(r persistence.RunHistory) server.RunHistoryEntry {
 			CacheWriteTokens: r.CacheWriteTokens,
 		},
 		TokensMeasured:       r.TokensMeasured,
-		UnaccountedTurns:     r.UnaccountedTurns,
 		EstimatedCostUSD:     r.EstimatedCostUSD,
 		CostStatus:           r.CostStatus,
 		StagePreviousOutcome: r.StagePreviousOutcome,
 		ReviewMetadata:       r.ReviewMetadata,
+		Skills:               r.Skills,
 		OriginRecorded:       r.OriginRecorded,
 		Trigger:              r.Trigger,
 		ReactionKind:         r.ReactionKind,
 		SessionID:            r.SessionID,
 		SSHHost:              r.SSHHost,
 		DispatchID:           r.DispatchID,
+		DeclaredOutcome:      r.DeclaredOutcome,
+		AgentText:            r.AgentText,
+		UsageCompleteness:    r.Completeness(),
+		ModelUsage:           runModelUsage(parts),
 	}
+	// A row recorded before provenance was kept has no sources or amounts to
+	// serve; an empty answer there would claim the run had none.
+	if r.UsageCompleteness != "" {
+		entry.UsageProvenance = usagePairs(r.UsageProvenance)
+		entry.VendorAmounts = vendorAmounts(amounts)
+	}
+	if entry.UsageCompleteness == storage.UsageUnmeasured {
+		units := reportedUnits(amounts)
+		cause := storage.UnmeasuredCauseOf(r.Status, r.UsageCompleteness, units)
+		entry.UnmeasuredCause = string(cause)
+		entry.UnmeasuredUnits = []string{}
+		if cause == storage.UnmeasuredAmountsOnly {
+			entry.UnmeasuredUnits = units
+		}
+	}
+	return entry
+}
+
+func usagePairs(text string) []server.UsagePair {
+	parsed := storage.ParseUsageProvenance(text)
+	pairs := make([]server.UsagePair, len(parsed))
+	for i, p := range parsed {
+		pairs[i] = server.UsagePair{Source: p.Source, Strategy: p.Strategy}
+	}
+	return pairs
+}
+
+// vendorAmounts keeps the amounts in a unit other than US dollars, in the
+// order the store returned them. US dollars are already priced into the
+// run's cost.
+func vendorAmounts(amounts []storage.ReportedAmount) []server.VendorAmount {
+	out := make([]server.VendorAmount, 0, len(amounts))
+	for _, a := range amounts {
+		if a.Unit == domain.UnitUSD {
+			continue
+		}
+		out = append(out, server.VendorAmount{Unit: a.Unit, Model: a.Model, Amount: a.Amount, LowerBound: a.LowerBound})
+	}
+	return out
+}
+
+// reportedUnits lists the distinct units of amounts in ascending order, US
+// dollars included.
+func reportedUnits(amounts []storage.ReportedAmount) []string {
+	units := make([]string, len(amounts))
+	for i, a := range amounts {
+		units[i] = a.Unit
+	}
+	slices.Sort(units)
+	return slices.Compact(units)
 }

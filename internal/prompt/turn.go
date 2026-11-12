@@ -21,7 +21,9 @@ const DefaultContinuationPrompt = "Continue working on this task. Review the cur
 //
 // Continuation turns omit this suffix because the instruction persists
 // in the agent's conversation history from turn 1.
-const RuntimeStatusSuffix = `If you determine that you cannot make further progress on this task without human
+const RuntimeStatusSuffix = `## Report your status
+
+If you determine that you cannot make further progress on this task without human
 intervention, or if your work is complete and requires human review, or if you
 determine that the requested outcome already held and you changed nothing, signal
 the orchestrator by running the following, replacing STATUS with exactly one of
@@ -49,12 +51,12 @@ whole file under 1024 bytes.`
 // BuildTurnPrompt returns the rendered prompt for a single turn within a
 // worker session. turnNumber 1 is the initial turn; turnNumber 2 and above
 // are continuation turns. If a continuation turn renders to empty output,
-// [DefaultContinuationPrompt] is returned as a fallback.
+// [DefaultContinuationPrompt] is returned as a fallback and builtin is true.
 //
 // Safe for concurrent use because the underlying [Template.Render] is safe.
-func BuildTurnPrompt(tmpl *Template, issue map[string]any, attempt any, turnNumber, maxTurns int, opts ...RenderOption) (string, error) {
+func BuildTurnPrompt(tmpl *Template, issue map[string]any, attempt any, turnNumber, maxTurns int, opts ...RenderOption) (prompt string, builtin bool, err error) {
 	if turnNumber < 1 {
-		return "", fmt.Errorf("invalid turn number %d: must be >= 1", turnNumber)
+		return "", false, fmt.Errorf("invalid turn number %d: must be >= 1", turnNumber)
 	}
 
 	isContinuation := turnNumber > 1
@@ -66,12 +68,12 @@ func BuildTurnPrompt(tmpl *Template, issue map[string]any, attempt any, turnNumb
 
 	rendered, err := tmpl.Render(issue, attempt, rc, opts...)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	if isContinuation && strings.TrimSpace(rendered) == "" {
-		return DefaultContinuationPrompt, nil
+		return DefaultContinuationPrompt, true, nil
 	}
 
-	return rendered, nil
+	return rendered, false, nil
 }

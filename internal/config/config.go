@@ -42,6 +42,10 @@ type ServiceConfig struct {
 	// Zero-value (Enabled == false) means self-review is disabled.
 	SelfReview SelfReviewConfig
 
+	// CommentFeed holds the issue comment feed configuration.
+	// Zero-value (Enabled == false) means the feed is disabled.
+	CommentFeed CommentFeedConfig
+
 	// Reactions maps reaction kind to its configuration. An empty map
 	// means no reactions are configured. Keys are lowercase kind strings
 	// (e.g. "review_comments"). The "ci_failure" key, if present in
@@ -303,6 +307,11 @@ type AgentConfig struct {
 	// of the current UTC calendar day; 0 disables it. Non-negative and
 	// finite.
 	MaxDailyCostUSD float64
+
+	// MaxWeeklyCostUSD is the instance ceiling in USD on the estimated cost of
+	// the current UTC week, Monday 00:00 to the next Monday 00:00; 0 disables
+	// it. Non-negative and finite.
+	MaxWeeklyCostUSD float64
 
 	// MaxMonthlyCostUSD is the instance ceiling in USD on the estimated
 	// cost of the current UTC calendar month; 0 disables it.
@@ -582,6 +591,7 @@ var knownTopLevelKeys = map[string]bool{
 	"agent":         true,
 	"db_path":       true,
 	"self_review":   true,
+	"comment_feed":  true,
 	"reactions":     true,
 	"dispatch":      true,
 	"notifications": true,
@@ -598,6 +608,9 @@ var knownTopLevelKeys = map[string]bool{
 // retired agent kind onto the replacement kind, rewriting raw in place
 // as it does for environment overrides. A conversion the retired kind
 // cannot carry returns a [*ConfigError].
+//
+// Under [WithLiteralSettings] the values of the keys a kind lists load
+// as written, with no $VAR resolution.
 func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceConfig, error) {
 	if raw == nil {
 		raw = map[string]any{}
@@ -621,8 +634,14 @@ func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceC
 		}
 	}
 
+	var literals heldSettings
+	literals.hold(extensions, options.literalSettings)
+	for _, rule := range dispatchRuleMaps(raw) {
+		literals.hold(ruleSettingsKeys(rule), options.literalSettings)
+	}
 	preResolution := resolveExtensionEnvRefs(extensions)
 	preResolution = resolveRuleBlockEnvRefs(raw, preResolution)
+	literals.restore()
 
 	var conversions []AgentKindConversion
 	if options.retiredAgents != nil {
@@ -731,6 +750,11 @@ func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceC
 		return ServiceConfig{}, err
 	}
 
+	commentFeed, err := buildCommentFeedConfig(raw)
+	if err != nil {
+		return ServiceConfig{}, err
+	}
+
 	reactions, err := buildReactionsConfig(extractSubMap(raw, "reactions"))
 	if err != nil {
 		return ServiceConfig{}, err
@@ -771,6 +795,7 @@ func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceC
 		Agent:                   agent,
 		CIFeedback:              ciFeedback,
 		SelfReview:              selfReview,
+		CommentFeed:             commentFeed,
 		Reactions:               reactions,
 		LabelCommands:           labelCommands,
 		DBPath:                  dbPath,
@@ -1278,6 +1303,11 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		return AgentConfig{}, err
 	}
 
+	maxWeeklyCostUSD, err := coerceNonNegativeFiniteFloat(m, "max_weekly_cost_usd", "agent.max_weekly_cost_usd")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+
 	maxMonthlyCostUSD, err := coerceNonNegativeFiniteFloat(m, "max_monthly_cost_usd", "agent.max_monthly_cost_usd")
 	if err != nil {
 		return AgentConfig{}, err
@@ -1332,6 +1362,7 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		MaxTokens:              maxTokens,
 		MaxCostUSD:             maxCostUSD,
 		MaxDailyCostUSD:        maxDailyCostUSD,
+		MaxWeeklyCostUSD:       maxWeeklyCostUSD,
 		MaxMonthlyCostUSD:      maxMonthlyCostUSD,
 		TokenWarningPercent:    tokenWarningPercent,
 		MaxConsecutiveAbsences: maxConsecutiveAbsences,
@@ -1509,6 +1540,83 @@ func buildSelfReviewConfig(m map[string]any) (SelfReviewConfig, error) {
 	}, nil
 }
 
+// buildCommentFeedConfig reads the comment_feed block from the raw top-level
+// map rather than from [extractSubMap], which hides a present value that is
+// not a map. Every key is validated even when the feed is disabled, so
+// `sortie validate` checks the block offline.
+func buildCommentFeedConfig(raw map[string]any) (CommentFeedConfig, error) {
+	cfg := CommentFeedConfig{Enabled: true, Authors: CommentFeedAuthorsMembers}
+
+	block, exists := raw["comment_feed"]
+	if !exists || block == nil {
+		return cfg, nil
+	}
+	m, ok := block.(map[string]any)
+	if !ok {
+		return CommentFeedConfig{}, &ConfigError{
+			Field:   "comment_feed",
+			Message: "must be a map, got " + describeExtensionValue(block),
+		}
+	}
+
+	if v, exists := m["enabled"]; exists && v != nil {
+		enabled, ok := v.(bool)
+		if !ok {
+			return CommentFeedConfig{}, &ConfigError{
+				Field:   "comment_feed.enabled",
+				Message: "must be a boolean, got " + describeExtensionValue(v),
+			}
+		}
+		cfg.Enabled = enabled
+	}
+
+	authors, fault := typeutil.StringField(m, "authors")
+	if fault != nil {
+		return CommentFeedConfig{}, &ConfigError{Field: "comment_feed.authors", Message: fault.Reason()}
+	}
+	if v := m["authors"]; v != nil {
+		switch CommentFeedAuthors(authors) {
+		case CommentFeedAuthorsMembers, CommentFeedAuthorsAll:
+			cfg.Authors = CommentFeedAuthors(authors)
+		default:
+			return CommentFeedConfig{}, &ConfigError{
+				Field:   "comment_feed.authors",
+				Message: "must be \"members\" or \"all\"",
+			}
+		}
+	}
+
+	var err error
+	if cfg.IncludeAuthors, err = commentFeedAuthorList(m, "include_authors"); err != nil {
+		return CommentFeedConfig{}, err
+	}
+	if cfg.ExcludeAuthors, err = commentFeedAuthorList(m, "exclude_authors"); err != nil {
+		return CommentFeedConfig{}, err
+	}
+	return cfg, nil
+}
+
+func commentFeedAuthorList(m map[string]any, key string) ([]string, error) {
+	field := "comment_feed." + key
+	v, exists := m[key]
+	if !exists || v == nil {
+		return nil, nil
+	}
+	items, ok := v.([]any)
+	if !ok {
+		return nil, &ConfigError{Field: field, Message: "must be a list of non-empty strings, got " + describeExtensionValue(v)}
+	}
+	authors := make([]string, 0, len(items))
+	for _, item := range items {
+		author, ok := item.(string)
+		if !ok || author == "" {
+			return nil, &ConfigError{Field: field, Message: "must be a list of non-empty strings"}
+		}
+		authors = append(authors, author)
+	}
+	return authors, nil
+}
+
 // ValidateHandoffState reports a [*ConfigError] when handoffState
 // collides with an active or terminal state. Comparison is
 // case-insensitive and an empty handoffState is always valid.
@@ -1633,6 +1741,41 @@ func resolveExtensionEnvRefs(extensions map[string]any) map[string]string {
 		extensions[k] = resolveExtensionEnvValue(k, v, &snapshot)
 	}
 	return snapshot
+}
+
+type heldSetting struct {
+	block map[string]any
+	key   string
+	value any
+}
+
+// heldSettings keeps literal settings values out of the $VAR resolution walkers.
+type heldSettings []heldSetting
+
+// hold takes out of each kind block in blocks the keys lookup lists for
+// that kind. A nil lookup holds nothing.
+func (h *heldSettings) hold(blocks map[string]any, lookup LiteralSettingsLookup) {
+	if lookup == nil {
+		return
+	}
+	for kind, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range lookup(kind) {
+			if held, present := block[key]; present {
+				*h = append(*h, heldSetting{block: block, key: key, value: held})
+				delete(block, key)
+			}
+		}
+	}
+}
+
+func (h heldSettings) restore() {
+	for _, held := range h {
+		held.block[held.key] = held.value
+	}
 }
 
 // dispatchRuleMaps returns the dispatch.rules elements of raw, a nil map
@@ -1966,6 +2109,34 @@ func mapVal(m map[string]any, key string) any {
 		return nil
 	}
 	return m[key]
+}
+
+// CommentFeedAuthors selects whose comments the comment feed delivers.
+type CommentFeedAuthors string
+
+const (
+	// CommentFeedAuthorsMembers delivers comments from project members.
+	CommentFeedAuthorsMembers CommentFeedAuthors = "members"
+	// CommentFeedAuthorsAll delivers comments from every identified author.
+	CommentFeedAuthorsAll CommentFeedAuthors = "all"
+)
+
+// CommentFeedConfig holds the issue comment feed configuration. Author
+// entries match the comment author identity exactly and case-sensitively,
+// and an entry in both lists is excluded.
+type CommentFeedConfig struct {
+	// Enabled activates the feed. Default true.
+	Enabled bool
+
+	// Authors is the author scope. Default [CommentFeedAuthorsMembers].
+	Authors CommentFeedAuthors
+
+	// IncludeAuthors lists identities delivered without a kind or access
+	// check.
+	IncludeAuthors []string
+
+	// ExcludeAuthors lists identities never delivered.
+	ExcludeAuthors []string
 }
 
 // SelfReviewConfig holds self-review loop configuration. When Enabled

@@ -195,6 +195,12 @@ func TestDecodeRuntimeProfile(t *testing.T) {
 			},
 		},
 		{
+			name: "a measured surface whose asking_args equal args without an asking_value is rejected",
+			mutate: func(doc map[string]any) {
+				doc["entry_points"].(map[string]any)["protocol"].(map[string]any)["asking_args"] = []string{"--acp"}
+			},
+		},
+		{
 			name: "an entry_points asking_args entry carrying a placeholder outside the allowed set is rejected",
 			mutate: func(doc map[string]any) {
 				doc["entry_points"].(map[string]any)["protocol"].(map[string]any)["asking_args"] = []string{"--acp", "{bogus}"}
@@ -268,6 +274,24 @@ func TestDecodeRuntimeProfile(t *testing.T) {
 			name: "a discriminated locator missing its discriminator key is rejected",
 			mutate: func(doc map[string]any) {
 				doc["recognizers"].(map[string]any)["native_stream_json"].(map[string]any)["locator"].(map[string]any)["discriminator_key"] = ""
+			},
+		},
+		{
+			name: "a discriminated locator carrying both discriminator_key and discriminator_path is rejected",
+			mutate: func(doc map[string]any) {
+				doc["recognizers"].(map[string]any)["native_stream_json"].(map[string]any)["locator"].(map[string]any)["discriminator_path"] = []string{"error", "type"}
+			},
+		},
+		{
+			name: "a token_locator with a mode outside the closed set is rejected",
+			mutate: func(doc map[string]any) {
+				doc["recognizers"].(map[string]any)["native_stream_json"].(map[string]any)["token_locator"] = map[string]any{"mode": "last_value"}
+			},
+		},
+		{
+			name: "a discriminated token_locator missing its discriminator value is rejected",
+			mutate: func(doc map[string]any) {
+				doc["recognizers"].(map[string]any)["native_stream_json"].(map[string]any)["token_locator"] = map[string]any{"mode": "discriminated", "discriminator_key": "type"}
 			},
 		},
 		{
@@ -641,6 +665,27 @@ func TestRecognizerTerminal(t *testing.T) {
 			output:     `{"type":"result","status":"success"}`,
 			want:       Terminal{EndTurn: true},
 			wantOK:     true,
+		},
+		{
+			name: "error_locator: a line it selects recognizes Error though the terminal locator selects none",
+			recognizer: Recognizer{
+				Locator:      discriminatedRecognizer.Locator,
+				ErrorLocator: TerminalLocator{Mode: "discriminated", DiscriminatorKey: "type", DiscriminatorValue: "error"},
+			},
+			output: `{"type":"error","error":{"message":"x"}}`,
+			want:   Terminal{Error: true},
+			wantOK: true,
+		},
+		{
+			name: "limit_locator: a line it selects wins over an error_locator selecting the same line",
+			recognizer: Recognizer{
+				Locator:      discriminatedRecognizer.Locator,
+				ErrorLocator: TerminalLocator{Mode: "discriminated", DiscriminatorKey: "type", DiscriminatorValue: "error"},
+				LimitLocator: TerminalLocator{Mode: "discriminated", DiscriminatorPath: []string{"error", "type"}, DiscriminatorValue: "output-limit"},
+			},
+			output: `{"type":"error","error":{"type":"output-limit"}}`,
+			want:   Terminal{Case: evidence.CaseLimitReached},
+			wantOK: true,
 		},
 		{
 			name:       "discriminated: a type result line with status refusal recognizes the mapped case",
@@ -1214,6 +1259,7 @@ func validProfileDocWithTokenPaths() map[string]any {
 	recognizer["token_paths"] = []any{
 		map[string]any{"path": []string{"usage", "total_tokens"}, "kind": tokenPathKindSpend},
 	}
+	recognizer["token_locator"] = map[string]any{"mode": "discriminated", "discriminator_key": "type", "discriminator_value": "checkpoint"}
 	return doc
 }
 
@@ -1604,5 +1650,91 @@ func TestNotInducibleReasonStillPinsItsCase(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "pairs only with case") {
 		t.Errorf("Decode() error = %v, want it to name the mismatched pairing", err)
+	}
+}
+
+func TestDecodeRuntimeProfileModelEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		envName    string
+		envValue   string
+		modelArgs  []string
+		protoArgs  []string
+		askingEnv  string
+		failingEnv string
+		wantSub    string
+		wantAccept bool
+	}{
+		{name: "a JSON object value with one model placeholder loads", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}"}`, wantAccept: true},
+		{name: "a value with another placeholder is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{prompt}"}`, wantSub: "model_env"},
+		{name: "a value without a placeholder is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"x"}`, wantSub: "model_env"},
+		{name: "a value with the model placeholder twice is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}","small_model":"{model}"}`, wantSub: "model_env"},
+		{name: "a name that is not a bare variable name is rejected", envName: "BAD NAME", envValue: `{"model":"{model}"}`, wantSub: "model_env"},
+		{name: "model_args alongside model_env is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}"}`, modelArgs: []string{"--model", "{model}"}, wantSub: "model_args"},
+		{name: "an asking_value without the model placeholder is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}"}`, askingEnv: `{"model":"x"}`, wantSub: "model_env"},
+		{name: "a failing_value without the upstream placeholder is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}"}`, failingEnv: `{"model":"x"}`, wantSub: "model_env"},
+		{name: "an entry point carrying the model alongside model_env is rejected", envName: "OPENCODE_CONFIG_CONTENT", envValue: `{"model":"{model}"}`, protoArgs: []string{"--acp", "--model", "{model}"}, wantSub: "entry_points[protocol]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			doc := cloneProfileDoc(t, validProfileDoc())
+			doc["model_args"] = []string{}
+			if tt.modelArgs != nil {
+				doc["model_args"] = tt.modelArgs
+			}
+			modelEnv := map[string]any{"name": tt.envName, "value": tt.envValue}
+			if tt.askingEnv != "" {
+				modelEnv["asking_value"] = tt.askingEnv
+			}
+			if tt.failingEnv != "" {
+				modelEnv["failing_value"] = tt.failingEnv
+			}
+			doc["model_env"] = modelEnv
+			if tt.protoArgs != nil {
+				doc["entry_points"].(map[string]any)["protocol"] = map[string]any{"args": tt.protoArgs, "asking_args": append(slices.Clone(tt.protoArgs), "--ask")}
+			}
+			data := marshalProfileDoc(t, doc)
+
+			_, err := Decode(data)
+
+			if tt.wantAccept {
+				if err != nil {
+					t.Fatalf("Decode(%s) = _, %v, want nil", data, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("Decode(%s) = _, %v, want an error naming %q", data, err, tt.wantSub)
+			}
+		})
+	}
+}
+
+func docWithScopedDeclaration(declared, notInducible string) map[string]any {
+	doc := validProfileDoc()
+	doc["declarations"] = []any{map[string]any{"capability": "retry_classification", "case": "human_input", "reason": evidence.DeclaredGapNeverProduced, "surface": declared}}
+	doc["not_inducible_cases"] = []any{map[string]any{"surface": notInducible, "case": "human_input", "reason": evidence.NotInducibleTerminalVocabularyClosed}}
+	return doc
+}
+func TestScopedDeclaration(t *testing.T) {
+	t.Parallel()
+	for _, surfaces := range [][2]string{{"aggregate", "native_stream_json"}, {"protocol", "protocol"}} {
+		if _, err := Decode(marshalProfileDoc(t, docWithScopedDeclaration(surfaces[0], surfaces[1]))); err == nil {
+			t.Errorf("Decode(declared on %q, not_inducible_cases on %q) = nil error, want a rejection", surfaces[0], surfaces[1])
+		}
+	}
+	p, err := Decode(marshalProfileDoc(t, docWithScopedDeclaration("protocol", "native_stream_json")))
+	if err != nil {
+		t.Fatalf("Decode(declared on protocol, not_inducible_cases on native_stream_json) = _, %v, want nil", err)
+	}
+	protocol := p.CaseExclusion(evidence.SurfaceProtocol, evidence.CapabilityRetryClassification, evidence.CaseHumanInput)
+	native := p.CaseExclusion(evidence.SurfaceNativeStreamJSON, evidence.CapabilityRetryClassification, evidence.CaseHumanInput)
+	if protocol != evidence.ExclusionNotApplicable || native == evidence.ExclusionNotApplicable {
+		t.Errorf("CaseExclusion(human_input) = %v on protocol, %v on native_stream_json, want %v on protocol only", protocol, native, evidence.ExclusionNotApplicable)
 	}
 }

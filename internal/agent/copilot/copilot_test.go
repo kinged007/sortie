@@ -6,50 +6,50 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 var copilotUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
-// turnCounterScenario names the fake runtime scenario that answers its
-// first invocation with a fixed stdout payload and every later
-// invocation with nothing, tracked by a marker file's existence. It
-// pins a per-turn signal that a session's second turn must not inherit
-// from its first.
-const turnCounterScenario = "copilot.turn-counter"
+const firstTurnOnlyScenario = "copilot.turn-counter"
 
-// turnCounterOutput parameterizes turnCounterScenario.
-type turnCounterOutput struct {
+type firstTurnOnlyOutput struct {
 	CounterFile string
 	Stdout      string
 }
 
-// fakeScenarios collects every non-default fake-runtime scenario this
-// package's tests register. Platform-specific test files add their own
-// entries via init.
+// Other test files of this package add their scenarios here from init.
 var fakeScenarios = map[string]agenttest.Scenario{
-	turnCounterScenario: agenttest.Typed(runTurnCounterScenario),
+	firstTurnOnlyScenario: agenttest.Typed(runFirstTurnOnlyScenario),
 }
 
 func TestMain(m *testing.M) {
+	// A fake runtime's turn pulls quota with the host environment, so an
+	// inherited GitHub token would reach the real endpoint; the live suite
+	// keeps it.
+	if os.Getenv("SORTIE_COPILOT_TEST") != "1" {
+		for _, name := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
+			_ = os.Unsetenv(name)
+		}
+	}
 	agenttest.Main(m, fakeScenarios)
 }
 
-func runTurnCounterScenario(_ []string, params turnCounterOutput) int {
+func runFirstTurnOnlyScenario(_ []string, params firstTurnOnlyOutput) int {
 	if _, err := os.Stat(params.CounterFile); err == nil {
 		return 0
 	}
@@ -60,26 +60,20 @@ func runTurnCounterScenario(_ []string, params turnCounterOutput) int {
 	return agenttest.Output{Stdout: params.Stdout}.Run()
 }
 
-// firstTurnOnlyBinary returns a fake copilot runtime that writes stdout
-// on its first invocation and produces no output on every later
-// invocation.
 func firstTurnOnlyBinary(t *testing.T, stdout string) string {
 	t.Helper()
 	dir := t.TempDir()
-	return agenttest.FakeRuntime(t, dir, "copilot", turnCounterScenario, turnCounterOutput{
+	return agenttest.FakeRuntime(t, dir, "copilot", firstTurnOnlyScenario, firstTurnOnlyOutput{
 		CounterFile: filepath.Join(dir, "turn-count"),
 		Stdout:      stdout,
 	})
 }
 
-// fakeCopilotBinary creates a fake copilot runtime that exits 0 for any
-// invocation (including the --version canary check).
 func fakeCopilotBinary(t *testing.T) string {
 	t.Helper()
 	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{})
 }
 
-// requireAgentError asserts err is a *domain.AgentError with the given Kind.
 func requireAgentError(t *testing.T, err error, wantKind domain.AgentErrorKind) {
 	t.Helper()
 	if err == nil {
@@ -106,9 +100,22 @@ func TestNewCopilotAdapter(t *testing.T) {
 	}
 }
 
+func stageHeldSession(t *testing.T, sessionID string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("COPILOT_HOME", home)
+	path := filepath.Join(home, "session-state", sessionID, "events.jsonl")
+	if err := errors.Join(os.MkdirAll(filepath.Dir(path), 0o755), os.WriteFile(path, nil, 0o600)); err != nil {
+		t.Fatalf("staging journal %q: %v", path, err)
+	}
+}
+
 func startSettingsSession(t *testing.T, adapter domain.AgentAdapter, settings map[string]any, resumeID string) *sessionState {
 	t.Helper()
 
+	if resumeID != "" {
+		stageHeldSession(t, resumeID)
+	}
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath:   t.TempDir(),
 		AgentConfig:     domain.AgentConfig{Command: fakeCopilotBinary(t)},
@@ -122,8 +129,6 @@ func startSettingsSession(t *testing.T, adapter domain.AgentAdapter, settings ma
 }
 
 func TestStartSession_SettingsArePerSession(t *testing.T) {
-	t.Parallel()
-
 	adapter, _ := NewCopilotAdapter()
 	first := startSettingsSession(t, adapter, map[string]any{
 		"model": "gpt-5", "effort": "high", "max_autopilot_continues": float64(15), "agent": "custom",
@@ -231,8 +236,6 @@ func TestStartSession(t *testing.T) {
 }
 
 func TestStartSession_NewSession(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
-
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, _ := NewCopilotAdapter()
@@ -246,8 +249,6 @@ func TestStartSession_NewSession(t *testing.T) {
 		t.Fatalf("StartSession() error = %v", err)
 	}
 
-	// The adapter assigns a v4 UUID session ID itself in StartSession,
-	// so it is never empty and no launch falls back to --continue.
 	if !copilotUUIDPattern.MatchString(session.ID) {
 		t.Errorf("session.ID = %q, want a v4 UUID", session.ID)
 	}
@@ -260,10 +261,7 @@ func TestStartSession_NewSession(t *testing.T) {
 		t.Errorf("state.copilotSessionID = %q, want %q", state.copilotSessionID, session.ID)
 	}
 	if state.target.WorkspacePath != workspace {
-		// t.TempDir() may return a path through a symlink; compare with os.Stat.
-		if state.target.WorkspacePath != filepath.Clean(workspace) {
-			t.Errorf("state.target.WorkspacePath = %q, want %q", state.target.WorkspacePath, workspace)
-		}
+		t.Errorf("state.target.WorkspacePath = %q, want %q", state.target.WorkspacePath, workspace)
 	}
 	if state.isContinuation {
 		t.Error("state.isContinuation = true, want false for a new session")
@@ -273,70 +271,48 @@ func TestStartSession_NewSession(t *testing.T) {
 	}
 }
 
-func TestStartSession_ResumeSessionID(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
-	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-
+func TestSessionContinuity(t *testing.T) {
 	adapter, _ := NewCopilotAdapter()
-	fakeBin := fakeCopilotBinary(t)
-	const resumeID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
 
-	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
-		WorkspacePath:   t.TempDir(),
-		AgentConfig:     domain.AgentConfig{Command: fakeBin},
-		ResumeSessionID: resumeID,
+	agenttest.AssertSessionContinuity(t, func(t *testing.T, held, resumeID string) (domain.Session, error) {
+		stageHeldSession(t, held)
+		params := domain.StartSessionParams{WorkspacePath: t.TempDir(), AgentConfig: domain.AgentConfig{Command: fakeCopilotBinary(t)}, ResumeSessionID: resumeID}
+		return adapter.StartSession(context.Background(), params)
 	})
-	if err != nil {
-		t.Fatalf("StartSession() error = %v", err)
-	}
-
-	if session.ID != resumeID {
-		t.Errorf("session.ID = %q, want %q", session.ID, resumeID)
-	}
-
-	state := session.Internal.(*sessionState)
-	if state.copilotSessionID != resumeID {
-		t.Errorf("state.copilotSessionID = %q, want %q", state.copilotSessionID, resumeID)
-	}
 }
 
 func TestStartSession_DefaultCommand(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, _ := NewCopilotAdapter()
-	// Empty command falls back to "copilot". In CI, copilot is likely
-	// absent, so ErrAgentNotFound is expected. If copilot is installed,
-	// the session may succeed; either outcome is acceptable.
 	_, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{},
 	})
 	if err == nil {
-		return // copilot is on PATH, which is fine
+		return // a host with copilot installed starts the session
 	}
 	requireAgentError(t, err, domain.ErrAgentNotFound)
 }
 
 func TestStartSession_SSHMode(t *testing.T) {
-	t.Parallel()
-
-	// SSH mode requires ssh on PATH; skip otherwise.
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("ssh not available on PATH")
-	}
+	sshPath := agenttest.NewSSHStandIn(t, t.TempDir(), agenttest.SSHStandIn{PATH: os.Getenv("PATH"), Forward: agenttest.SSHForwardAllocated})
+	t.Setenv("PATH", filepath.Dir(sshPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	adapter, _ := NewCopilotAdapter()
 	workspace := t.TempDir()
+	hostPath := agenttest.WriteSeededMCPConfig(t, workspace)
 	session, lookupErr := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: workspace,
 		AgentConfig:   domain.AgentConfig{Command: "copilot"},
 		SSHHost:       "dev-host.example.com",
+		MCPConfigPath: hostPath,
+		Settings:      map[string]any{"mcp_config": "/op/mcp.json"},
 	})
 	if lookupErr != nil {
 		t.Fatalf("StartSession() (SSH mode) error = %v", lookupErr)
 	}
+	t.Cleanup(func() { _ = adapter.StopSession(t.Context(), session) })
 
 	state := session.Internal.(*sessionState)
 	if state.target.SSHHost != "dev-host.example.com" {
@@ -348,13 +324,41 @@ func TestStartSession_SSHMode(t *testing.T) {
 	if state.target.Command != sshPath {
 		t.Errorf("state.target.Command = %q, want %q (ssh binary)", state.target.Command, sshPath)
 	}
+
+	args := buildArgs(state, 1, "do work", state.passthrough)
+
+	for _, hostFile := range []string{hostPath, "/op/mcp.json"} {
+		if i := slices.IndexFunc(args, func(arg string) bool { return strings.Contains(arg, hostFile) }); i >= 0 {
+			t.Errorf("buildArgs() (SSH mode) carries host path %q in argument %q, want none: [%s]", hostFile, args[i], strings.Join(args, " "))
+		}
+	}
 }
 
-// TestStartSession_SSHHostWhitespaceOnly verifies that a whitespace-only
-// SSHHost value is trimmed to empty and the session falls through to the
-// local subprocess path, not SSH mode.
+func TestPlaceMCPConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		document string
+		want     []string
+	}{
+		{"document becomes the inline flag value", `{"mcpServers":{}}`, []string{"--additional-mcp-config", `{"mcpServers":{}}`}},
+		{"no document places nothing", "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			late := placeMCPConfig(mcpconfig.Delivery{Document: []byte(tt.document)})
+
+			if !slices.Equal(late.Args, tt.want) || len(late.Env) != 0 {
+				t.Errorf("placeMCPConfig(%q) = %+v, want args %q and no env", tt.document, late, tt.want)
+			}
+		})
+	}
+}
+
 func TestStartSession_SSHHostWhitespaceOnly(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, _ := NewCopilotAdapter()
@@ -364,7 +368,7 @@ func TestStartSession_SSHHostWhitespaceOnly(t *testing.T) {
 	session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
 		WorkspacePath: workspace,
 		AgentConfig:   domain.AgentConfig{Command: fakeBin},
-		SSHHost:       "   ", // whitespace-only: must be treated as local (no SSH host)
+		SSHHost:       "   ",
 	})
 	if err != nil {
 		t.Fatalf("StartSession(SSHHost=%q) error = %v", "   ", err)
@@ -379,8 +383,6 @@ func TestStartSession_SSHHostWhitespaceOnly(t *testing.T) {
 	}
 }
 
-// fakeCopilotBinaryWithOutput creates a fake copilot runtime that
-// writes content to stdout and exits with the given exit code.
 func fakeCopilotBinaryWithOutput(t *testing.T, content string, exitCode int) string {
 	t.Helper()
 	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{
@@ -389,8 +391,6 @@ func fakeCopilotBinaryWithOutput(t *testing.T, content string, exitCode int) str
 	})
 }
 
-// newTestSession starts a session backed by fakeCopilotBinary.
-// The caller must set GH_TOKEN (or another auth env var) before calling.
 func newTestSession(t *testing.T, workspace string) (domain.AgentAdapter, domain.Session) {
 	t.Helper()
 	adapter, err := NewCopilotAdapter()
@@ -407,7 +407,6 @@ func newTestSession(t *testing.T, workspace string) (domain.AgentAdapter, domain
 	return adapter, session
 }
 
-// loadTestFixture reads a testdata fixture file and returns its content.
 func loadTestFixture(t *testing.T, name string) string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", name))
@@ -417,7 +416,6 @@ func loadTestFixture(t *testing.T, name string) string {
 	return string(data)
 }
 
-// hasEventType returns true if any event in events matches typ.
 func hasEventType(events []domain.AgentEvent, typ domain.AgentEventType) bool {
 	for _, e := range events {
 		if e.Type == typ {
@@ -427,8 +425,17 @@ func hasEventType(events []domain.AgentEvent, typ domain.AgentEventType) bool {
 	return false
 }
 
-// findEventByType returns the first event matching typ and true, or a zero
-// value and false when no matching event exists.
+func assertNoTokenUsageAfter(t *testing.T, events []domain.AgentEvent, terminal domain.AgentEventType) {
+	t.Helper()
+	at := slices.IndexFunc(events, func(e domain.AgentEvent) bool { return e.Type == terminal })
+	if at < 0 {
+		return
+	}
+	if slices.ContainsFunc(events[at+1:], func(e domain.AgentEvent) bool { return e.Type == domain.EventTokenUsage }) {
+		t.Errorf("phantom EventTokenUsage emitted after %s", terminal)
+	}
+}
+
 func findEventByType(events []domain.AgentEvent, typ domain.AgentEventType) (domain.AgentEvent, bool) {
 	for _, e := range events {
 		if e.Type == typ {
@@ -439,12 +446,9 @@ func findEventByType(events []domain.AgentEvent, typ domain.AgentEventType) (dom
 }
 
 func TestRunTurn_HappyPath(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-	// Isolate the session-state journal root: without this, recoverUsage
-	// resolves the real user home directory, and a session id collision
-	// with an unrelated on-disk journal would leak a real model name into
-	// this test's AssertModelReported("") expectation.
+	// A journal read resolves the real user home otherwise, and a journal
+	// there under the same session id would leak real usage into the turn.
 	t.Setenv("COPILOT_HOME", t.TempDir())
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -469,7 +473,6 @@ func TestRunTurn_HappyPath(t *testing.T) {
 	if result.SessionID != wantSessionID {
 		t.Errorf("result.SessionID = %q, want %q", result.SessionID, wantSessionID)
 	}
-	// Session ID captured from result event for subsequent turns.
 	if state.copilotSessionID != wantSessionID {
 		t.Errorf("state.copilotSessionID = %q, want %q", state.copilotSessionID, wantSessionID)
 	}
@@ -483,10 +486,8 @@ func TestRunTurn_HappyPath(t *testing.T) {
 		}
 	}
 
-	// EventTurnCompleted must carry APIDurationMS from result.totalApiDurationMs.
-	// simple_session.jsonl has totalApiDurationMs: 6866.
 	if e, ok := findEventByType(events, domain.EventTurnCompleted); ok {
-		const wantAPIDurationMS int64 = 6866
+		const wantAPIDurationMS int64 = 6866 // simple_session.jsonl's totalApiDurationMs
 		if e.APIDurationMS != wantAPIDurationMS {
 			t.Errorf("EventTurnCompleted.APIDurationMS = %d, want %d", e.APIDurationMS, wantAPIDurationMS)
 		}
@@ -494,17 +495,7 @@ func TestRunTurn_HappyPath(t *testing.T) {
 		t.Error("EventTurnCompleted not found in events")
 	}
 
-	// No phantom EventTokenUsage should follow the final turn-completion event.
-	for i, e := range events {
-		if e.Type == domain.EventTurnCompleted {
-			for _, after := range events[i+1:] {
-				if after.Type == domain.EventTokenUsage {
-					t.Error("phantom EventTokenUsage emitted after EventTurnCompleted")
-				}
-			}
-			break
-		}
-	}
+	assertNoTokenUsageAfter(t, events, domain.EventTurnCompleted)
 
 	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
 		Terminal:     agentcore.TerminalSuccess,
@@ -513,13 +504,10 @@ func TestRunTurn_HappyPath(t *testing.T) {
 		Work:         agentcore.WorkPresent,
 	}, result, err)
 
-	// No session-state journal exists under COPILOT_HOME, so recoverUsage
-	// finds nothing to recover and the turn reports no measurement.
 	agenttest.AssertMeasurementAbsent(t, events, result)
 }
 
 func TestRunTurn_ExitCode127(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -538,7 +526,6 @@ func TestRunTurn_ExitCode127(t *testing.T) {
 }
 
 func TestRunTurn_NonZeroExitNoResult(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -589,10 +576,6 @@ func TestRunTurn_NoOutputExitZero(t *testing.T) {
 	}
 }
 
-// TestRunTurn_SingleSignalNoTerminalCompletes drives a stream carrying
-// only one of the two declared signals, exiting zero with no terminal
-// result event, and pins that each signal alone is sufficient to report
-// turn_completed.
 func TestRunTurn_SingleSignalNoTerminalCompletes(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -630,12 +613,6 @@ func TestRunTurn_SingleSignalNoTerminalCompletes(t *testing.T) {
 	}
 }
 
-// TestRunTurn_NoOutputTokensNoResultCompletes pins a regression fixture:
-// a stream carrying assistant output and completed tool activity, no
-// per-message output-token field anywhere, and no terminal result
-// event, still reports turn_completed. The fixture itself is asserted to
-// carry no output-token field, so a future revert to token-count
-// derivation fails this test rather than passing it.
 func TestRunTurn_NoOutputTokensNoResultCompletes(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -664,13 +641,6 @@ func TestRunTurn_NoOutputTokensNoResultCompletes(t *testing.T) {
 	}
 }
 
-// TestRunTurn_WorkSignalsObservedAcrossFixtureCorpus drives the committed
-// testdata/ corpus and pins that each field the copilot WorkSignals
-// declaration sets true is observed by at least one committed fixture:
-// simple_session.jsonl carries assistant content and no tool call record
-// at all, and tool_only_no_assistant_content.jsonl carries a tool call and
-// no assistant.message record at all, so each fixture's own shape
-// attributes the observation to a single field.
 func TestRunTurn_WorkSignalsObservedAcrossFixtureCorpus(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -706,10 +676,6 @@ func TestRunTurn_WorkSignalsObservedAcrossFixtureCorpus(t *testing.T) {
 	})
 }
 
-// TestRunTurn_SecondTurnFailsAfterFirstTurnBothSignals pins that a
-// session's second turn, whose stream carries neither declared signal,
-// reports turn_failed even though the first turn on the same session
-// carried both assistant output and completed tool activity.
 func TestRunTurn_SecondTurnFailsAfterFirstTurnBothSignals(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -760,8 +726,6 @@ func TestRunTurn_PartialOutputNoResultExitZero(t *testing.T) {
 	if !hasEventType(events, domain.EventTurnCompleted) {
 		t.Error("EventTurnCompleted not delivered for partial-output exit 0")
 	}
-	// No result event means no session id, so recoverUsage never attempts
-	// a journal read: the turn reports no figure.
 	agenttest.AssertMeasurementAbsent(t, events, result)
 
 	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
@@ -804,14 +768,12 @@ func TestRunTurn_StderrWarnOnNoOutputExitZero(t *testing.T) {
 }
 
 func TestRunTurn_ContextCancelled(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
-	// state.target.Command is fakeCopilotBinary: exits 0 immediately, no output.
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancel before RunTurn
+	cancel()
 
 	var events []domain.AgentEvent
 	_, err := adapter.RunTurn(ctx, session, domain.RunTurnParams{
@@ -825,7 +787,6 @@ func TestRunTurn_ContextCancelled(t *testing.T) {
 }
 
 func TestRunTurn_MalformedLines(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -846,12 +807,11 @@ func TestRunTurn_MalformedLines(t *testing.T) {
 }
 
 func TestRunTurn_ToolUseEvents(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
-	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_session.jsonl"), 0)
+	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_calls_mapped.jsonl"), 0)
 
 	var events []domain.AgentEvent
 	result, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
@@ -865,31 +825,35 @@ func TestRunTurn_ToolUseEvents(t *testing.T) {
 		t.Errorf("result.ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCompleted)
 	}
 
-	var toolEvent *domain.AgentEvent
-	for i := range events {
-		if events[i].Type == domain.EventToolResult {
-			toolEvent = &events[i]
-			break
+	type call struct {
+		name     string
+		kind     domain.ToolKind
+		argument string
+	}
+	want := []call{
+		{"bash", domain.ToolKindShell, "go test ./..."},
+		{"view", domain.ToolKindRead, "/tmp/copilot-test/main.go"},
+		{"edit", domain.ToolKindEdit, "/tmp/copilot-test/main.go"},
+		{"skill", domain.ToolKindSkill, "demo-skill"},
+		{"github-mcp-server.get_issue", "", ""},
+		{"grep", "", ""},
+	}
+	var got []call
+	for _, e := range events {
+		if e.Type == domain.EventToolResult {
+			got = append(got, call{e.ToolName, e.ToolKind, e.ToolArgument})
 		}
 	}
-	if toolEvent == nil {
-		t.Fatal("EventToolResult not delivered for tool use session")
-	}
-	if toolEvent.ToolName == "" {
-		t.Error("EventToolResult.ToolName is empty")
+	if !slices.Equal(got, want) {
+		t.Errorf("tool_result calls = %+v, want %+v", got, want)
 	}
 
 	dispositiontest.AssertWorkEvidenceConsistent(t, events, result, err)
 }
 
-// TestRunTurn_ToolDeniedContinuesTurn drives a tool.execution_complete
-// event whose error.code is "denied", the CLI's own non-interactive
-// permission policy refusing a tool call and continuing the session. With
-// --no-ask-user closing the human-question path unconditionally, every
-// recognized request here is a permission request with no reply channel,
-// so the turn must continue rather than end.
+// With --no-ask-user every recognized request is a permission request with
+// no reply channel, so the runtime's own refusal must not end the turn.
 func TestRunTurn_ToolDeniedContinuesTurn(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	const deniedJSONL = `{"type":"tool.execution_complete","data":{"toolCallId":"tc-1","toolName":"bash","success":false,"error":{"code":"denied","message":"denied by policy"}}}
@@ -925,10 +889,8 @@ func TestRunTurn_ToolDeniedContinuesTurn(t *testing.T) {
 }
 
 func TestRunTurn_NonZeroResultExitCode(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	// JSONL with a result event reporting a non-zero exit code.
 	const failResultJSONL = `{"type":"result","timestamp":"2026-03-30T22:19:28.097Z","sessionId":"cc990fc2-1234-5678-9abc-def012345678","exitCode":1,"usage":{"premiumRequests":0,"totalApiDurationMs":0,"sessionDurationMs":0}}`
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -991,7 +953,6 @@ func runFailedTurn(t *testing.T, adapter domain.AgentAdapter, session domain.Ses
 }
 
 func TestRunTurn_SessionErrorMessageIsFailureReason(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	longMessage := strings.Repeat("provider detail ", 512)
@@ -1057,7 +1018,6 @@ func TestRunTurn_SessionErrorMessageIsFailureReason(t *testing.T) {
 }
 
 func TestRunTurn_SessionErrorEmitsBlankPing(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -1081,7 +1041,6 @@ func TestRunTurn_SessionErrorEmitsBlankPing(t *testing.T) {
 }
 
 func TestRunTurn_SessionErrorMessageDoesNotLeakIntoNextTurn(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -1104,14 +1063,9 @@ func TestRunTurn_SessionErrorMessageDoesNotLeakIntoNextTurn(t *testing.T) {
 	}
 }
 
-// TestRunTurn_TurnFailed_APIDurationMS verifies that EventTurnFailed carries
-// APIDurationMS from the result event's totalApiDurationMs field, and that no
-// phantom EventTokenUsage follows it.
 func TestRunTurn_TurnFailed_APIDurationMS(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	// Result event with non-zero totalApiDurationMs and a non-zero exit code.
 	const failJSONL = `{"type":"result","timestamp":"2026-03-30T22:19:28.097Z","sessionId":"cc990fc2-1234-5678-9abc-def012345678","exitCode":1,"usage":{"premiumRequests":2,"totalApiDurationMs":5000,"sessionDurationMs":9000}}`
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -1125,7 +1079,6 @@ func TestRunTurn_TurnFailed_APIDurationMS(t *testing.T) {
 
 	requireAgentError(t, err, domain.ErrTurnFailed)
 
-	// EventTurnFailed must carry APIDurationMS from the result event.
 	e, ok := findEventByType(events, domain.EventTurnFailed)
 	if !ok {
 		t.Fatal("EventTurnFailed not delivered")
@@ -1135,30 +1088,16 @@ func TestRunTurn_TurnFailed_APIDurationMS(t *testing.T) {
 		t.Errorf("EventTurnFailed.APIDurationMS = %d, want %d", e.APIDurationMS, wantAPIDurationMS)
 	}
 
-	// No phantom EventTokenUsage should follow EventTurnFailed.
-	for i, ev := range events {
-		if ev.Type == domain.EventTurnFailed {
-			for _, after := range events[i+1:] {
-				if after.Type == domain.EventTokenUsage {
-					t.Error("phantom EventTokenUsage emitted after EventTurnFailed")
-				}
-			}
-			break
-		}
-	}
+	assertNoTokenUsageAfter(t, events, domain.EventTurnFailed)
 }
 
-// TestRunTurn_ContextCancelledBeforeStart verifies that RunTurn emits
-// EventTurnCancelled and returns ErrTurnCancelled when the context is already
-// done before cmd.Start is called.
 func TestRunTurn_ContextCancelledBeforeStart(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancel before RunTurn
+	cancel()
 
 	var events []domain.AgentEvent
 	result, err := adapter.RunTurn(ctx, session, domain.RunTurnParams{
@@ -1167,27 +1106,11 @@ func TestRunTurn_ContextCancelledBeforeStart(t *testing.T) {
 			events = append(events, e)
 		},
 	})
-	if err == nil {
-		t.Fatal("expected error on pre-cancelled context, got nil")
-	}
-	var agentErr *domain.AgentError
-	if !errors.As(err, &agentErr) {
-		t.Fatalf("error type = %T, want *domain.AgentError", err)
-	}
-	if agentErr.Kind != domain.ErrTurnCancelled {
-		t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnCancelled)
-	}
+	requireAgentError(t, err, domain.ErrTurnCancelled)
 	if result.ExitReason != domain.EventTurnCancelled {
 		t.Errorf("ExitReason = %q, want %q", result.ExitReason, domain.EventTurnCancelled)
 	}
-	var foundCancel bool
-	for _, e := range events {
-		if e.Type == domain.EventTurnCancelled {
-			foundCancel = true
-			break
-		}
-	}
-	if !foundCancel {
+	if !hasEventType(events, domain.EventTurnCancelled) {
 		t.Error("EventTurnCancelled not delivered on pre-cancelled context")
 	}
 }
@@ -1199,7 +1122,6 @@ func TestStopSession_NilProc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCopilotAdapter: %v", err)
 	}
-	// Bare session with no running subprocess (proc == nil).
 	session := domain.Session{
 		Internal: &sessionState{
 			target: agentcore.LaunchTarget{WorkspacePath: t.TempDir()},
@@ -1211,10 +1133,8 @@ func TestStopSession_NilProc(t *testing.T) {
 }
 
 func TestStopSession_TerminatesProcess(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
-	// Fake runtime that blocks until it is killed.
 	hangBin := agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{Hang: true})
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -1237,27 +1157,15 @@ func TestStopSession_TerminatesProcess(t *testing.T) {
 		})
 	}()
 
-	// Wait until RunTurn has started the subprocess.
-	select {
-	case <-processStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for process to start")
-	}
+	waittest.Receive(t, processStarted, "process start")
 
 	if err := adapter.StopSession(context.Background(), session); err != nil {
 		t.Fatalf("StopSession() error = %v", err)
 	}
 
-	// Verify RunTurn unblocked after StopSession terminated the process.
-	select {
-	case <-runDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunTurn did not return after StopSession")
-	}
+	waittest.Receive(t, runDone, "RunTurn return after StopSession")
 }
 
-// fakeCopilotBinaryWithStderrAndExit creates a fake copilot runtime
-// that writes stderrLine to stderr and exits with exitCode.
 func fakeCopilotBinaryWithStderrAndExit(t *testing.T, stderrLine string, exitCode int) string {
 	t.Helper()
 	return agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{
@@ -1266,9 +1174,6 @@ func fakeCopilotBinaryWithStderrAndExit(t *testing.T, stderrLine string, exitCod
 	})
 }
 
-// TestRunTurn_StderrWarnOnExitCode127 verifies that when the subprocess
-// writes to stderr and exits with code 127, the stderr lines are
-// re-emitted at WARN level.
 func TestRunTurn_StderrWarnOnExitCode127(t *testing.T) {
 	// No t.Parallel(): installs a global slog default.
 	spy := agenttest.InstallLogSpy(t)
@@ -1296,9 +1201,6 @@ func TestRunTurn_StderrWarnOnExitCode127(t *testing.T) {
 	}
 }
 
-// TestRunTurn_StderrWarnOnNonZeroExit verifies that when the subprocess
-// writes to stderr and exits non-zero (not 127) without a result event,
-// the stderr lines are re-emitted at WARN level.
 func TestRunTurn_StderrWarnOnNonZeroExit(t *testing.T) {
 	// No t.Parallel(): installs a global slog default.
 	spy := agenttest.InstallLogSpy(t)
@@ -1326,8 +1228,6 @@ func TestRunTurn_StderrWarnOnNonZeroExit(t *testing.T) {
 	}
 }
 
-// TestRunTurn_StderrNoWarnOnSuccess verifies that when the subprocess
-// succeeds, stderr lines are not re-emitted at WARN level.
 func TestRunTurn_StderrNoWarnOnSuccess(t *testing.T) {
 	// No t.Parallel(): installs a global slog default.
 	spy := agenttest.InstallLogSpy(t)
@@ -1359,103 +1259,18 @@ func TestRunTurn_StderrNoWarnOnSuccess(t *testing.T) {
 	}
 }
 
-// journalPath returns the events.jsonl path readSessionUsage resolves
-// for sessionID when COPILOT_HOME is set to copilotHome.
-func journalPath(copilotHome, sessionID string) string {
-	return filepath.Join(copilotHome, "session-state", sessionID, "events.jsonl")
-}
+const streamCheckpointLine = `{"type":"session.usage_checkpoint","data":{"accountingSnapshot":{"modelMetrics":{"claude-sonnet-5":{"usage":{"inputTokens":193011,"outputTokens":596,"cacheReadTokens":154053,"cacheWriteTokens":38948,"reasoningTokens":149}}}}}}`
 
-// writeJournal writes content to path, creating parent directories as
-// needed.
-func writeJournal(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile(%q): %v", path, err)
-	}
-}
-
-// TestAssertUsageReporting proves copilot-cli's registered
-// usage-reporting declaration (turn_end, per_model) and its
-// remote session rule (none, none) against real event streams: a
-// local turn whose journal read supplies the only figure, and a
-// remote turn whose read is skipped entirely. Both cases run in one
-// call to AssertUsageReporting so the assertion's own rule-coverage
-// check confirms the declared pair and the remote rule are each
-// reached exactly once.
 func TestAssertUsageReporting(t *testing.T) {
-	// No t.Parallel(): t.Setenv is incompatible with it.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+	t.Setenv("COPILOT_HOME", t.TempDir())
 
-	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
-	fixture := loadTestFixture(t, "session_shutdown.jsonl")
-	lines := strings.Split(strings.TrimRight(fixture, "\n"), "\n")
-	if len(lines) < 1 {
-		t.Fatalf("session_shutdown.jsonl has %d lines, want at least 1", len(lines))
-	}
-
-	runTurn := func(remote bool) (events []domain.AgentEvent, result domain.TurnResult) {
-		copilotHome := t.TempDir()
-		t.Setenv("COPILOT_HOME", copilotHome)
-		writeJournal(t, journalPath(copilotHome, sessionID), lines[0]+"\n")
-
-		adapter, session := newTestSession(t, t.TempDir())
-		state := session.Internal.(*sessionState)
-		state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), 0)
-		if remote {
-			// Simulate SSH mode without spawning a real ssh subprocess:
-			// recoverUsage's remote gate reads only RemoteCommand, and
-			// the command stays the fake local binary above.
-			state.target.RemoteCommand = "copilot"
-		}
-
-		result, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-			Prompt:  "read main.go",
-			OnEvent: func(e domain.AgentEvent) { events = append(events, e) },
-		})
-		if err != nil {
-			t.Fatalf("RunTurn() error = %v", err)
-		}
-		return events, result
-	}
-
-	localEvents, localResult := runTurn(false)
-	remoteEvents, remoteResult := runTurn(true)
-
-	agenttest.AssertUsageReporting(t, "copilot-cli", []agenttest.UsageReportingCase{
-		{Name: "local, journal supplies the only figure", Events: localEvents, Result: localResult},
-		{Name: "remote, journal read skipped", Remote: true, Events: remoteEvents, Result: remoteResult},
-	})
-}
-
-// TestRunTurn_SessionStateRecovery_FirstRecord drives RunTurn with a
-// temporary session-state root containing one session.shutdown record
-// captured from Copilot CLI 1.0.78, whose modelMetrics reports
-// inputTokens 193011, outputTokens 596, cacheReadTokens 154053 for
-// claude-sonnet-5. It asserts the turn emits exactly one token_usage
-// event, positioned after the last tool_result and before
-// turn_completed, carrying the recovered totals, the model, and no
-// APIDurationMS, while the terminal event alone carries the turn's
-// APIDurationMS.
-func TestRunTurn_SessionStateRecovery_FirstRecord(t *testing.T) {
-	// No t.Parallel(): t.Setenv is incompatible with it.
-	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-	copilotHome := t.TempDir()
-	t.Setenv("COPILOT_HOME", copilotHome)
-
-	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
-	fixture := loadTestFixture(t, "session_shutdown.jsonl")
-	lines := strings.Split(strings.TrimRight(fixture, "\n"), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("session_shutdown.jsonl has %d lines, want at least 2", len(lines))
-	}
-	writeJournal(t, journalPath(copilotHome, sessionID), lines[0]+"\n")
+	lines := strings.Split(strings.TrimRight(loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), "\n"), "\n")
+	resultAt := len(lines) - 1
+	stdout := strings.Join(slices.Concat(lines[:resultAt], []string{streamCheckpointLine}, lines[resultAt:]), "\n") + "\n"
 
 	adapter, session := newTestSession(t, t.TempDir())
-	state := session.Internal.(*sessionState)
-	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), 0)
+	session.Internal.(*sessionState).target.Command = fakeCopilotBinaryWithOutput(t, stdout, 0)
 
 	var events []domain.AgentEvent
 	result, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
@@ -1465,441 +1280,32 @@ func TestRunTurn_SessionStateRecovery_FirstRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
-	if result.SessionID != sessionID {
-		t.Fatalf("result.SessionID = %q, want %q", result.SessionID, sessionID)
-	}
 
-	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
-	if result.Usage != wantUsage {
-		t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantUsage)
-	}
-	if !result.UsageMeasured {
-		t.Error("TurnResult.UsageMeasured = false, want true")
-	}
-
-	assertSingleUsageReportBeforeTerminal(t, events, wantUsage, "claude-sonnet-5", 4200)
-	agenttest.AssertUsageContract(t, events)
+	agenttest.AssertUsageReporting(t, "copilot-cli", []agenttest.UsageReportingCase{
+		{Name: "checkpoint supplies the figure", Events: events, Result: result},
+	})
 }
 
-func TestRunTurn_SessionStateRecovery_ResumeHandOver(t *testing.T) {
+func TestRunTurn_UnnormalizableCheckpointSupersedesEarlierOne(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
+	t.Setenv("COPILOT_HOME", t.TempDir())
 
-	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
-	const sonnet = "claude-sonnet-5"
-	lines := func(fixture string) []string {
-		return strings.Split(strings.TrimRight(loadTestFixture(t, fixture), "\n"), "\n")
-	}
-	single, multi := lines("session_shutdown.jsonl"), lines("session_shutdown_two_models.jsonl")
-	journal := func(records []string, n int) string { return strings.Join(records[:n], "\n") + "\n" }
-	stream := loadTestFixture(t, "tool_use_no_output_tokens.jsonl")
-
-	record1 := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
-	record2 := domain.TokenUsage{InputTokens: 271924, OutputTokens: 696, TotalTokens: 272620, CacheReadTokens: 232332, CacheWriteTokens: 39578}
-	record2LessRecord1 := domain.TokenUsage{InputTokens: 78913, OutputTokens: 100, TotalTokens: 79013, CacheReadTokens: 78279, CacheWriteTokens: 630}
-	sonnet1 := map[string]domain.TokenUsage{sonnet: record1}
-	sonnet2 := map[string]domain.TokenUsage{sonnet: record2}
-	sonnetRun := map[string]domain.TokenUsage{sonnet: record2LessRecord1}
-
-	multi1 := map[string]domain.TokenUsage{
-		sonnet:           {InputTokens: 1000, OutputTokens: 100, TotalTokens: 1100, CacheReadTokens: 600, CacheWriteTokens: 200},
-		"claude-haiku-4": {InputTokens: 400, OutputTokens: 40, TotalTokens: 440, CacheReadTokens: 100},
-	}
-	multi2 := map[string]domain.TokenUsage{
-		sonnet:           {InputTokens: 1600, OutputTokens: 150, TotalTokens: 1750, CacheReadTokens: 900, CacheWriteTokens: 300},
-		"claude-haiku-4": {InputTokens: 700, OutputTokens: 90, TotalTokens: 790, CacheReadTokens: 200},
-		"claude-opus-4":  {InputTokens: 50, OutputTokens: 10, TotalTokens: 60},
-	}
-	multi1Total := domain.TokenUsage{InputTokens: 1400, OutputTokens: 140, TotalTokens: 1540, CacheReadTokens: 700, CacheWriteTokens: 200}
-	multi2Total := domain.TokenUsage{InputTokens: 2350, OutputTokens: 250, TotalTokens: 2600, CacheReadTokens: 1100, CacheWriteTokens: 300}
-	multi2LessMulti1 := domain.TokenUsage{InputTokens: 950, OutputTokens: 110, TotalTokens: 1060, CacheReadTokens: 400, CacheWriteTokens: 100}
-	multi2LessMulti1ByModel := map[string]domain.TokenUsage{
-		sonnet:           {InputTokens: 600, OutputTokens: 50, TotalTokens: 650, CacheReadTokens: 300, CacheWriteTokens: 100},
-		"claude-haiku-4": {InputTokens: 300, OutputTokens: 50, TotalTokens: 350, CacheReadTokens: 100},
-		"claude-opus-4":  {InputTokens: 50, OutputTokens: 10, TotalTokens: 60},
-	}
-
-	tests := []struct {
-		name                          string
-		records                       []string
-		resume                        *domain.TokenUsage
-		resumeByModel                 map[string]domain.TokenUsage
-		recordsAtStart, recordsAtTurn int
-		wantUsage                     domain.TokenUsage
-		wantByModel                   map[string]domain.TokenUsage
-		wantResume                    domain.TokenUsage
-		wantResumeByModel             map[string]domain.TokenUsage
-		wantMeasured                  bool
-	}{
-		{"resume usage r1 and r2 appended reports r2 less r1", single, &record1, sonnet1, 1, 2, record2LessRecord1, sonnetRun, record2, sonnet2, true},
-		{"resume usage r2 and nothing appended reports no figure", single, &record2, sonnet2, 2, 2, domain.TokenUsage{}, nil, record2, sonnet2, false},
-		{"no resume usage reads r1 at start and reports r2 less r1", single, nil, nil, 1, 2, record2LessRecord1, sonnetRun, record2, sonnet2, true},
-		{"models split by name and a new model counts whole", multi, &multi1Total, multi1, 1, 2, multi2LessMulti1, multi2LessMulti1ByModel, multi2Total, multi2, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			copilotHome := t.TempDir()
-			t.Setenv("COPILOT_HOME", copilotHome)
-			path := journalPath(copilotHome, sessionID)
-			writeJournal(t, path, journal(tt.records, tt.recordsAtStart))
-
-			adapter, err := NewCopilotAdapter()
-			if err != nil {
-				t.Fatalf("NewCopilotAdapter: %v", err)
-			}
-			session, err := adapter.StartSession(context.Background(), domain.StartSessionParams{
-				WorkspacePath:      t.TempDir(),
-				AgentConfig:        domain.AgentConfig{Command: fakeCopilotBinaryWithOutput(t, stream, 0)},
-				ResumeSessionID:    sessionID,
-				ResumeUsage:        tt.resume,
-				ResumeUsageByModel: tt.resumeByModel,
-			})
-			if err != nil {
-				t.Fatalf("StartSession: %v", err)
-			}
-			writeJournal(t, path, journal(tt.records, tt.recordsAtTurn))
-
-			var events []domain.AgentEvent
-			result, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-				Prompt:  "read main.go",
-				OnEvent: func(e domain.AgentEvent) { events = append(events, e) },
-			})
-			if err != nil {
-				t.Fatalf("RunTurn() error = %v", err)
-			}
-
-			if result.Usage != tt.wantUsage || result.UsageMeasured != tt.wantMeasured {
-				t.Errorf("RunTurn() = usage %+v, measured %v, want %+v, %v", result.Usage, result.UsageMeasured, tt.wantUsage, tt.wantMeasured)
-			}
-			wantUnaccounted := !tt.wantMeasured
-			if result.ResumeUsage == nil || *result.ResumeUsage != tt.wantResume || result.SpendUnaccounted != wantUnaccounted {
-				t.Errorf("RunTurn() = resume usage %+v, spend unaccounted %v, want %+v, %v", result.ResumeUsage, result.SpendUnaccounted, tt.wantResume, wantUnaccounted)
-			}
-			if !maps.Equal(result.ResumeUsageByModel, tt.wantResumeByModel) {
-				t.Errorf("RunTurn() resume usage by model = %+v, want %+v", result.ResumeUsageByModel, tt.wantResumeByModel)
-			}
-			if tt.wantMeasured {
-				assertSingleUsageReportBeforeTerminal(t, events, tt.wantUsage, sonnet, 4200)
-				for _, e := range events {
-					if e.Type == domain.EventTokenUsage && !maps.Equal(e.UsageByModel, tt.wantByModel) {
-						t.Errorf("token_usage event UsageByModel = %+v, want %+v", e.UsageByModel, tt.wantByModel)
-					}
-				}
-			}
-		})
-	}
-}
-
-// assertSingleUsageReportBeforeTerminal fails t unless events carries
-// exactly one token_usage event, positioned after the last tool_result
-// and immediately before the turn_completed event, carrying wantUsage,
-// wantModel, and no APIDurationMS; and unless turn_completed itself
-// carries wantUsage and wantAPIDurationMS.
-func assertSingleUsageReportBeforeTerminal(t *testing.T, events []domain.AgentEvent, wantUsage domain.TokenUsage, wantModel string, wantAPIDurationMS int64) {
-	t.Helper()
-
-	lastToolResult, usageIdx, completedIdx := -1, -1, -1
-	usageCount := 0
-	for i, e := range events {
-		switch e.Type {
-		case domain.EventToolResult:
-			lastToolResult = i
-		case domain.EventTokenUsage:
-			usageIdx = i
-			usageCount++
-		case domain.EventTurnCompleted:
-			completedIdx = i
-		}
-	}
-	if usageCount != 1 {
-		t.Fatalf("token_usage event count = %d, want 1", usageCount)
-	}
-	if completedIdx < 0 {
-		t.Fatal("no turn_completed event delivered")
-	}
-	if usageIdx <= lastToolResult {
-		t.Errorf("token_usage event at index %d, want after the last tool_result at index %d", usageIdx, lastToolResult)
-	}
-	if usageIdx != completedIdx-1 {
-		t.Errorf("token_usage event at index %d, want immediately before turn_completed at index %d", usageIdx, completedIdx)
-	}
-
-	usageEvent := events[usageIdx]
-	if usageEvent.Usage != wantUsage {
-		t.Errorf("token_usage event Usage = %+v, want %+v", usageEvent.Usage, wantUsage)
-	}
-	if usageEvent.Model != wantModel {
-		t.Errorf("token_usage event Model = %q, want %q", usageEvent.Model, wantModel)
-	}
-	if usageEvent.APIDurationMS != 0 {
-		t.Errorf("token_usage event APIDurationMS = %d, want 0", usageEvent.APIDurationMS)
-	}
-
-	completed := events[completedIdx]
-	if completed.Usage != wantUsage {
-		t.Errorf("turn_completed event Usage = %+v, want %+v", completed.Usage, wantUsage)
-	}
-	if completed.APIDurationMS != wantAPIDurationMS {
-		t.Errorf("turn_completed event APIDurationMS = %d, want %d", completed.APIDurationMS, wantAPIDurationMS)
-	}
-}
-
-// TestRunTurn_SessionStateRecovery_JournalGoneNextTurn drives two
-// turns on the same session: the first recovers a figure from the
-// journal's first captured record, and the journal file is removed
-// before the second turn's own OnFinalize runs. It asserts the second
-// turn emits no token_usage event and returns UsageMeasured true with
-// Usage equal to the first turn's, per the accepted repeat-without-a-
-// new-record behavior this run cannot distinguish from a truly idle
-// turn.
-func TestRunTurn_SessionStateRecovery_JournalGoneNextTurn(t *testing.T) {
-	// No t.Parallel(): t.Setenv is incompatible with it.
-	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-	copilotHome := t.TempDir()
-	t.Setenv("COPILOT_HOME", copilotHome)
-
-	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
-	fixture := loadTestFixture(t, "session_shutdown.jsonl")
-	lines := strings.Split(strings.TrimRight(fixture, "\n"), "\n")
-	if len(lines) < 1 {
-		t.Fatalf("session_shutdown.jsonl has %d lines, want at least 1", len(lines))
-	}
-	journal := journalPath(copilotHome, sessionID)
-	writeJournal(t, journal, lines[0]+"\n")
-
+	unnormalizable := strings.Replace(streamCheckpointLine, `"inputTokens":193011`, `"inputTokens":null`, 1)
 	adapter, session := newTestSession(t, t.TempDir())
 	state := session.Internal.(*sessionState)
-	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), 0)
+	state.target.Command = fakeCopilotBinaryWithOutput(t, streamCheckpointLine+"\n"+unnormalizable+"\n"+`{"type":"result","sessionId":"s","exitCode":1}`+"\n", 0)
 
-	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "read main.go",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn(first) error = %v", err)
-	}
-	wantUsage := domain.TokenUsage{InputTokens: 193011, OutputTokens: 596, TotalTokens: 193607, CacheReadTokens: 154053, CacheWriteTokens: 38948}
-	if result1.Usage != wantUsage {
-		t.Fatalf("RunTurn(first).Usage = %+v, want %+v", result1.Usage, wantUsage)
-	}
-	if !result1.UsageMeasured {
-		t.Fatal("RunTurn(first).UsageMeasured = false, want true")
-	}
+	_, _ = adapter.RunTurn(context.Background(), session, domain.RunTurnParams{Prompt: "p", OnEvent: func(domain.AgentEvent) {}})
 
-	if err := os.Remove(journal); err != nil {
-		t.Fatalf("os.Remove(journal): %v", err)
+	if state.turnReading == nil || len(state.turnReading.ByModel) != 1 || state.turnReading.ByModel[0].Input != nil {
+		t.Errorf("turnReading = %+v, want the later checkpoint with input unknown", state.turnReading)
 	}
-
-	var events2 []domain.AgentEvent
-	result2, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "read main.go",
-		OnEvent: func(e domain.AgentEvent) { events2 = append(events2, e) },
-	})
-	if err != nil {
-		t.Fatalf("RunTurn(second) error = %v", err)
-	}
-	if result2.Usage != wantUsage {
-		t.Errorf("RunTurn(second).Usage = %+v, want %+v (equal to the first turn's)", result2.Usage, wantUsage)
-	}
-	if !result2.UsageMeasured {
-		t.Error("RunTurn(second).UsageMeasured = false, want true")
-	}
-	for _, e := range events2 {
-		if e.Type == domain.EventTokenUsage {
-			t.Errorf("RunTurn(second) emitted a token_usage event %+v, want none (journal file gone)", e)
-		}
+	if state.turnReplied {
+		t.Error("turnReplied = true after a result with exit code 1, want false")
 	}
 }
 
-// TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn drives two turns on
-// one local session whose COPILOT_HOME holds a captured session.shutdown
-// record: the first turn recovers a usage figure from the journal and
-// measures the run, and the second turn is cancelled via context before it
-// completes. It asserts the second turn's UsageMeasured stays true, its
-// Usage equals the first turn's, and no token_usage event fires on the
-// cancelled turn.
-func TestRunTurn_UsageMeasuredPersistsAcrossCancelledTurn(t *testing.T) {
-	// No t.Parallel(): t.Setenv is incompatible with it.
-	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-	copilotHome := t.TempDir()
-	t.Setenv("COPILOT_HOME", copilotHome)
-
-	const sessionID = "aa778ea0-6eab-4ce9-b87e-11d6d33dab4f"
-	fixture := loadTestFixture(t, "session_shutdown.jsonl")
-	lines := strings.Split(strings.TrimRight(fixture, "\n"), "\n")
-	if len(lines) < 1 {
-		t.Fatalf("session_shutdown.jsonl has %d lines, want at least 1", len(lines))
-	}
-	writeJournal(t, journalPath(copilotHome, sessionID), lines[0]+"\n")
-
-	adapter, session := newTestSession(t, t.TempDir())
-	state := session.Internal.(*sessionState)
-	state.target.Command = fakeCopilotBinaryWithOutput(t, loadTestFixture(t, "tool_use_no_output_tokens.jsonl"), 0)
-
-	result1, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-		Prompt:  "read main.go",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn(first) error = %v", err)
-	}
-	if !result1.UsageMeasured {
-		t.Fatal("RunTurn(first).UsageMeasured = false, want true")
-	}
-	if result1.Usage == (domain.TokenUsage{}) {
-		t.Fatal("RunTurn(first).Usage is zero, want non-zero")
-	}
-
-	state.target.Command = agenttest.FakeRuntime(t, t.TempDir(), "copilot", agenttest.OutputScenario, agenttest.Output{Hang: true})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	var events2 []domain.AgentEvent
-	var result2 domain.TurnResult
-	var runErr error
-	done := make(chan struct{})
-	go func() {
-		result2, runErr = adapter.RunTurn(ctx, session, domain.RunTurnParams{
-			Prompt: "read main.go",
-			OnEvent: func(e domain.AgentEvent) {
-				events2 = append(events2, e)
-				if e.Type == domain.EventSessionStarted {
-					cancel()
-				}
-			},
-		})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunTurn(second) did not return within 10s")
-	}
-
-	requireAgentError(t, runErr, domain.ErrTurnCancelled)
-	if !result2.UsageMeasured {
-		t.Error("RunTurn(second).UsageMeasured = false, want true (measured on the first turn)")
-	}
-	if result2.Usage != result1.Usage {
-		t.Errorf("RunTurn(second).Usage = %+v, want %+v (equal to the first turn's)", result2.Usage, result1.Usage)
-	}
-	for _, e := range events2 {
-		if e.Type == domain.EventTokenUsage {
-			t.Errorf("RunTurn(second) emitted a token_usage event %+v, want none", e)
-		}
-	}
-}
-
-// TestRunTurn_SessionStateRecovery_Degradation drives
-// sessionState.recoverUsage directly (bypassing the subprocess) to
-// exercise the three read-skipping conditions: an absent events file,
-// a session id that fails the path-segment check, and SSH mode. In
-// every case recoverUsage returns nil, and only the path-segment
-// rejection logs a Warn.
-func TestRunTurn_SessionStateRecovery_Degradation(t *testing.T) {
-	t.Run("events file absent", func(t *testing.T) {
-		t.Setenv("COPILOT_HOME", t.TempDir())
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		state := &sessionState{
-			target:           agentcore.LaunchTarget{WorkspacePath: t.TempDir()},
-			copilotSessionID: "no-file-session",
-		}
-
-		got, _, _, _ := state.recoverUsage(logger)
-		if got != nil {
-			t.Errorf("recoverUsage() = %+v, want nil (events file absent)", got)
-		}
-		if strings.Contains(buf.String(), "level=WARN") {
-			t.Errorf("unexpected WARN log for a merely-absent events file: %s", buf.String())
-		}
-	})
-
-	t.Run("session id contains a path separator", func(t *testing.T) {
-		t.Setenv("COPILOT_HOME", t.TempDir())
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		state := &sessionState{
-			target:           agentcore.LaunchTarget{WorkspacePath: t.TempDir()},
-			copilotSessionID: "abc/../def",
-		}
-
-		got, _, _, _ := state.recoverUsage(logger)
-		if got != nil {
-			t.Errorf("recoverUsage() = %+v, want nil (invalid session id)", got)
-		}
-		if warnCount := strings.Count(buf.String(), "level=WARN"); warnCount != 1 {
-			t.Errorf("WARN log count = %d, want 1 (path-separator rejection)", warnCount)
-		}
-
-		state.recoverUsage(logger)
-		if warnCount := strings.Count(buf.String(), "level=WARN"); warnCount != 1 {
-			t.Errorf("WARN log count after second call = %d, want 1 (not repeated)", warnCount)
-		}
-	})
-
-	t.Run("SSH mode skips the read", func(t *testing.T) {
-		t.Setenv("COPILOT_HOME", t.TempDir())
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		state := &sessionState{
-			target: agentcore.LaunchTarget{
-				WorkspacePath: t.TempDir(),
-				RemoteCommand: "copilot",
-				SSHHost:       "dev-host.example.com",
-			},
-			copilotSessionID: "valid-session-id",
-		}
-
-		got, _, _, _ := state.recoverUsage(logger)
-		if got != nil {
-			t.Errorf("recoverUsage() = %+v, want nil (remote launch)", got)
-		}
-		if buf.Len() != 0 {
-			t.Errorf("unexpected log output in SSH mode: %s", buf.String())
-		}
-	})
-}
-
-func TestRunTurn_SessionStateRecovery_FirstReadAttempt(t *testing.T) {
-	t.Run("zero baseline counts the first record whole after a missed read", func(t *testing.T) {
-		root := t.TempDir()
-		t.Setenv("COPILOT_HOME", root)
-		logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		state := &sessionState{
-			target:           agentcore.LaunchTarget{WorkspacePath: t.TempDir()},
-			copilotSessionID: "created-session",
-			resume:           *agentcore.NewResumeBaseline(&domain.TokenUsage{}, nil),
-		}
-
-		if first, _, _, _ := state.recoverUsage(logger); first != nil {
-			t.Fatalf("first recoverUsage() = %+v, want nil (no journal yet)", first)
-		}
-
-		writeJournal(t, journalPath(root, "created-session"), loadTestFixture(t, "session_shutdown.jsonl"))
-		second, _, _, _ := state.recoverUsage(logger)
-		if second == nil {
-			t.Fatal("second recoverUsage() = nil, want a recovered figure")
-		}
-		if second.Run.InputTokens != 271924 {
-			t.Errorf("second recoverUsage().Run.InputTokens = %d, want 271924 (zero baseline)", second.Run.InputTokens)
-		}
-		if second.Model != "claude-sonnet-5" {
-			t.Errorf("second recoverUsage().Model = %q, want %q", second.Model, "claude-sonnet-5")
-		}
-	})
-}
-
-// TestRunTurn_SuccessfulResultZeroOutputTokens pins that a successful
-// result event completes the turn even when this turn's own output
-// tokens are zero, because a positive terminal report is authoritative
-// and never consults Work.
 func TestRunTurn_SuccessfulResultZeroOutputTokens(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	const successJSONL = `{"type":"session.task_complete","data":{"summary":"done","success":true}}
@@ -1927,12 +1333,7 @@ func TestRunTurn_SuccessfulResultZeroOutputTokens(t *testing.T) {
 	}, result, err)
 }
 
-// TestRunTurn_SuccessMessageStaysEmpty is the regression pin for the
-// success-message mapping: copilot's result event carries no completion
-// text, so the emitted turn_completed event's message stays empty
-// unchanged, even on a turn that produced real assistant output.
 func TestRunTurn_SuccessMessageStaysEmpty(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 	t.Setenv("COPILOT_HOME", t.TempDir())
 
@@ -1960,13 +1361,7 @@ func TestRunTurn_SuccessMessageStaysEmpty(t *testing.T) {
 	}
 }
 
-// TestRunTurn_WorkPredicateIsPerTurn pins that the work predicate reads
-// this turn's own output tokens, not the run cumulative. The first turn
-// produces output and completes; the second turn, on the same session,
-// produces none and must fail rather than inherit the first turn's
-// evidence.
 func TestRunTurn_WorkPredicateIsPerTurn(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	adapter, session := newTestSession(t, t.TempDir())
@@ -1994,50 +1389,7 @@ func TestRunTurn_WorkPredicateIsPerTurn(t *testing.T) {
 	requireAgentError(t, err, domain.ErrPortExit)
 }
 
-// TestRunTurn_PremiumRequestsLoggedOnce pins the premium_requests side
-// effect: the Info log keeps firing on exactly today's condition, a
-// result event carrying a non-nil usage object, exactly once per turn.
-func TestRunTurn_PremiumRequestsLoggedOnce(t *testing.T) {
-	// No t.Parallel(): installs a global slog default; t.Setenv is also
-	// incompatible with t.Parallel.
-	spy := agenttest.InstallLogSpy(t)
-	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
-
-	const successJSONL = `{"type":"session.task_complete","data":{"summary":"done","success":true}}
-{"type":"result","timestamp":"2026-04-08T00:00:01Z","sessionId":"premium-session","exitCode":0,"usage":{"premiumRequests":3,"totalApiDurationMs":10}}`
-
-	adapter, session := newTestSession(t, t.TempDir())
-	state := session.Internal.(*sessionState)
-	state.target.Command = fakeCopilotBinaryWithOutput(t, successJSONL, 0)
-
-	_, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	var premiumCount int
-	for _, e := range spy.Entries() {
-		if e.Msg == "copilot turn completed" {
-			premiumCount++
-		}
-	}
-	if premiumCount != 1 {
-		t.Errorf("premium_requests Info line count = %d, want 1", premiumCount)
-	}
-}
-
-// TestRunTurn_CompleteVersusIncompleteDisposition drives the two endings
-// the autopilot continuation ceiling makes indistinguishable at the exit
-// code and process-exit level: a stream that reports session.task_complete
-// before its terminal result, and a stream that reaches the same
-// exitCode:0 result without ever reporting it. Both pin their disposition
-// against agentcore.DecideTurn, and the test additionally asserts the two
-// ExitReason values differ, since a discriminator that both endings
-// satisfy would defeat the point of the fix.
 func TestRunTurn_CompleteVersusIncompleteDisposition(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 	t.Setenv("COPILOT_HOME", t.TempDir())
 
@@ -2082,12 +1434,7 @@ func TestRunTurn_CompleteVersusIncompleteDisposition(t *testing.T) {
 	}
 }
 
-// TestRunTurn_TaskCompleteSuccessFalse pins the session.task_complete
-// "success: false" ending: it surfaces as a domain.ErrTurnFailed carrying
-// completionFailureMessage's rendering of the report's own summary, not
-// the generic zero-work or non-zero-exit message.
 func TestRunTurn_TaskCompleteSuccessFalse(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	const summary = "ran into a blocker"
@@ -2113,12 +1460,7 @@ func TestRunTurn_TaskCompleteSuccessFalse(t *testing.T) {
 	}, result, err)
 }
 
-// TestRunTurn_TaskCompleteSuccessKeyAbsent pins the adapter-level ending
-// for a session.task_complete report whose payload carries no success key
-// at all: the turn completes, since the parsed *bool stays nil and the
-// adapter's default success posture applies.
 func TestRunTurn_TaskCompleteSuccessKeyAbsent(t *testing.T) {
-	// t.Setenv is incompatible with t.Parallel.
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
 	const stream = `{"type":"session.task_complete","data":{"summary":"all set"}}
@@ -2141,21 +1483,9 @@ func TestRunTurn_TaskCompleteSuccessKeyAbsent(t *testing.T) {
 	dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{Terminal: agentcore.TerminalSuccess}, result, err)
 }
 
-// TestRunTurn_IncompleteEndingLogsContinuationCounts pins the diagnostic
-// attributes on the adapter's own "copilot turn ended without a
-// task-completion report" warning: autopilot_continuations_observed
-// counts the isAutopilotContinuation lines this turn actually saw, and
-// max_autopilot_continues reports the session's effective ceiling.
-//
-// agenttest.LogSpy only extracts the "line" attribute it was built for
-// (see TestLogSpy_Handle_OtherAttrsIgnored in that package) and has no
-// way to report other attributes' values, so this test installs its own
-// buffer-backed slog.TextHandler as the default logger instead, the
-// pattern this project's own testing guidance documents for asserting on
-// structured log output.
 func TestRunTurn_IncompleteEndingLogsContinuationCounts(t *testing.T) {
-	// No t.Parallel() at the top level: installs a global slog default;
-	// t.Setenv is also incompatible with t.Parallel.
+	// No t.Parallel(): installs a global slog default. agenttest.LogSpy
+	// reports only the "line" attribute, and this test reads others.
 	var logOutput bytes.Buffer
 	previousDefault := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})))

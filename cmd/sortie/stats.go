@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/runstats"
 	"github.com/sortie-ai/sortie/internal/server"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
@@ -38,24 +40,116 @@ type statsSource struct {
 	// stages supplies the stage chains chain_funnels reads; nil serves an
 	// empty chain_funnels.
 	stages func() runstats.Stages
+
+	// running snapshots the running sessions' turn records; nil serves none,
+	// which is what the command reads, because it has no live process.
+	running func() []runstats.RunningSession
 }
 
-// report opens dbPath read-only and aggregates the runs completed in
-// [since, until). Each call opens its own connection, so concurrent calls
-// share nothing and a long scan never holds the orchestrator's store.
-func (src statsSource) report(ctx context.Context, since, until *time.Time, generatedAt time.Time) (runstats.Report, error) {
-	store, err := persistence.OpenReadOnly(ctx, src.dbPath)
+// report opens dbPath read-only and aggregates the runs completed within r,
+// with the spend series in period p. Each call opens its own connection, so
+// concurrent calls share nothing and a long scan never holds the
+// orchestrator's store.
+func (src statsSource) report(ctx context.Context, r runstats.Range, p runstats.Period, generatedAt time.Time) (runstats.Report, error) {
+	store, err := openStoreReadOnly(ctx, src.dbPath)
 	if err != nil {
 		return runstats.Report{}, fmt.Errorf("open database %s: %w", src.dbPath, err)
 	}
 	defer store.Close() //nolint:errcheck,gosec // read-only handle; close error is non-actionable
 
+	return src.aggregate(ctx, store, r, p, generatedAt)
+}
+
+// span opens dbPath read-only and reports the sessions with turns that ended
+// in [since, until), a nil until being open.
+func (src statsSource) span(ctx context.Context, since time.Time, until *time.Time, generatedAt time.Time) (runstats.SpanReport, error) {
+	store, err := openStoreReadOnly(ctx, src.dbPath)
+	if err != nil {
+		return runstats.SpanReport{}, fmt.Errorf("open database %s: %w", src.dbPath, err)
+	}
+	defer store.Close() //nolint:errcheck,gosec // read-only handle; close error is non-actionable
+
+	caps, err := store.RunHistoryCapabilities(ctx)
+	if err != nil {
+		return runstats.SpanReport{}, err
+	}
+	span := runstats.NewSpan(caps, since, until, generatedAt, src.snapshot())
+	windowSince, windowUntil := span.Window()
+	if err := scanSpend(ctx, store, caps, windowSince, windowUntil, span.AddTurn, span.AddUntrackedRun); err != nil {
+		return runstats.SpanReport{}, err
+	}
+	return span.Report(), nil
+}
+
+// snapshot takes the running sessions' records. It MUST precede every scan of
+// stored turns: a session writes its run row on exit before it releases its
+// records, so with the scan first a session exiting between the two reads
+// would be in neither.
+func (src statsSource) snapshot() []runstats.RunningSession {
+	if src.running == nil {
+		return nil
+	}
+	return src.running()
+}
+
+// scanSpend reads the stored turns and the runs recorded without turn records
+// within [since, until).
+func scanSpend(
+	ctx context.Context,
+	store storage.RunTurnStore,
+	caps storage.RunHistoryCapabilities,
+	since, until *time.Time,
+	addTurn func(storage.RunTurnRow) error,
+	addUntracked func(storage.UntrackedRunRow) error,
+) error {
+	if caps.HasRunTurns {
+		if err := store.ScanRunTurnsRange(ctx, since, until, addTurn); err != nil {
+			return err
+		}
+	}
+	return store.ScanUntrackedRunsRange(ctx, caps, since, until, addUntracked)
+}
+
+// runningSessions maps the orchestrator's turn records to the spend series'
+// input, which keeps runstats free of an orchestrator import.
+func runningSessions(sessions []orchestrator.SessionTurns) []runstats.RunningSession {
+	running := make([]runstats.RunningSession, len(sessions))
+	for i, session := range sessions {
+		running[i] = runstats.RunningSession{
+			DispatchID:        session.DispatchID,
+			IssueID:           session.IssueID,
+			Identifier:        session.Identifier,
+			DisplayID:         session.DisplayID,
+			IssueTitle:        session.IssueTitle,
+			RuleName:          session.RuleName,
+			AgentKind:         session.AgentKind,
+			UsageCompleteness: session.UsageCompleteness,
+			CostStatus:        session.CostStatus,
+			CostUSD:           session.CostUSD,
+			AgentPricedUSD:    session.AgentPricedUSD,
+			Turns:             session.Turns,
+		}
+	}
+	return running
+}
+
+// statsStore is what a stats report reads: the run history, the turn records,
+// and the live passes the stage funnels count.
+type statsStore interface {
+	storage.RunHistoryStore
+	storage.RunTurnStore
+	storage.LivePassStore
+}
+
+func (src statsSource) aggregate(ctx context.Context, store statsStore, r runstats.Range, p runstats.Period, generatedAt time.Time) (runstats.Report, error) {
 	caps, err := store.RunHistoryCapabilities(ctx)
 	if err != nil {
 		return runstats.Report{}, err
 	}
 
+	running := src.snapshot()
 	agg := runstats.New(caps)
+	agg.SetSpend(r, p, generatedAt, running)
 	if src.stages != nil {
 		stages := src.stages()
 		if len(stages.Chains) > 0 && caps.FunnelBreakdown() {
@@ -67,10 +161,14 @@ func (src statsSource) report(ctx context.Context, since, until *time.Time, gene
 		}
 		agg.SetStages(stages)
 	}
-	if err := store.ScanRunHistoryRange(ctx, caps, since, until, agg.Add); err != nil {
+	if err := store.ScanRunHistoryRange(ctx, caps, r.Since, r.Until, agg.Add); err != nil {
 		return runstats.Report{}, err
 	}
-	return agg.Report(generatedAt, src.workflowPath, src.dbPath, since, until), nil
+	spendSince, spendUntil := agg.SpendWindow()
+	if err := scanSpend(ctx, store, caps, spendSince, spendUntil, agg.AddTurn, agg.AddUntrackedRun); err != nil {
+		return runstats.Report{}, err
+	}
+	return agg.Report(generatedAt, src.workflowPath, src.dbPath, r.Since, r.Until), nil
 }
 
 // dispatchStages joins the dispatch section to the stages chain_funnels
@@ -87,14 +185,14 @@ func dispatchStages(d config.DispatchConfig) runstats.Stages {
 
 // livePasses maps the persisted live passes to the stage pass records
 // chain_funnels counts.
-func livePasses(passes []persistence.LivePass) []runstats.LivePass {
+func livePasses(passes []storage.LivePass) []runstats.LivePass {
 	live := make([]runstats.LivePass, len(passes))
 	for i, pass := range passes {
 		live[i] = runstats.LivePass{
 			ChainID:      pass.ChainID,
 			RuleName:     pass.RuleName,
 			PreviousRule: pass.StagePrevious,
-			BudgetHeld:   pass.Kind == persistence.LivePassBudget,
+			BudgetHeld:   pass.Kind == storage.LivePassBudget,
 		}
 	}
 	return live
@@ -114,13 +212,42 @@ func formatFloatDash(v *float64, format string) string {
 	return fmt.Sprintf(format, *v)
 }
 
-// formatCostDash renders a nullable USD figure with [server.FormatCost],
-// or "-" when v is nil.
-func formatCostDash(v *float64) string {
+// formatCostDash renders a nullable USD figure with [server.FormatCost], or
+// with [server.FormatCostCut] when lowerBound is set so the figure never
+// rounds up past the spend it bounds, or "-" when v is nil.
+func formatCostDash(v *float64, lowerBound bool) string {
 	if v == nil {
 		return "-"
 	}
+	if lowerBound {
+		return server.FormatCostCut(*v)
+	}
 	return server.FormatCost(*v)
+}
+
+// statsLineLabel pads a summary line's label to the report's label width and
+// marks the line as a lower bound when its figure counts only part of its
+// runs.
+func statsLineLabel(name string, lowerBound bool) string {
+	if lowerBound {
+		name += " (lower bound)"
+	}
+	return fmt.Sprintf("%-24s", name)
+}
+
+// statsLowerBoundCell names the figures of g that count only part of its
+// runs, or "-" when none does.
+func statsLowerBoundCell(g runstats.Group) string {
+	switch {
+	case g.TokensLowerBound && g.CostLowerBound:
+		return "tokens, cost"
+	case g.TokensLowerBound:
+		return "tokens"
+	case g.CostLowerBound:
+		return "cost"
+	default:
+		return "-"
+	}
 }
 
 // formatSecondsDash renders a nullable seconds figure with
@@ -163,7 +290,7 @@ func formatTokensTotalDash(t *runstats.Tokens) string {
 // section title, a header row, and one row per group. isOutcomeTable
 // selects the "share" column for the outcome breakdown; every other
 // breakdown carries "succeeded" and "success rate" instead. full selects
-// the turns, total tokens, and cost columns.
+// the turns, total tokens, cost, and lower bound columns.
 //
 // Cells are tab-separated and flushed through a tabwriter so every column
 // lines up at the width of its widest cell. A row is never written
@@ -200,6 +327,7 @@ var noHopReasonWords = map[string]string{
 	"run_failed":       "failed run",
 	"needs_person":     "needs a person",
 	"budget_held":      "budget held",
+	"usage_limited":    "usage limit",
 	"operator_stopped": "stopped by an operator",
 	"verdict_withheld": "verdict withheld",
 }
@@ -253,7 +381,7 @@ func statsGroupHeader(full, isOutcomeTable bool) []string {
 	}
 	header = append(header, "p50", "p95", "mean")
 	if full {
-		header = append(header, "turns", "total tokens", "cost")
+		header = append(header, "turns", "total tokens", "cost", "lower bound")
 	}
 	return header
 }
@@ -273,7 +401,8 @@ func statsGroupCells(g runstats.Group, full, isOutcomeTable bool) []string {
 		cells = append(cells,
 			formatFloatDash(g.MeanTurns, "%.1f"),
 			formatTokensTotalDash(g.Tokens),
-			formatCostDash(g.CostUSD))
+			formatCostDash(g.CostUSD, g.CostLowerBound),
+			statsLowerBoundCell(g))
 	}
 	return cells
 }
@@ -342,6 +471,21 @@ func statsFootnotes(s runstats.Summary, chains int) []string {
 			"note: the cost figures skip %d of these runs, because Sortie had no price for the models they used when they were recorded.",
 			s.CostUnpricedRuns))
 	}
+	if s.TokensLowerBoundRuns > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"note: the token figures count only part of %d of these runs, because some of their turns were not fully counted.",
+			s.TokensLowerBoundRuns))
+	}
+	if s.CostPartialRuns > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"note: the cost figures count only part of %d of these runs, because part of their spend was not counted or had no price.",
+			s.CostPartialRuns))
+	}
+	if s.AgentPricedUSD != nil {
+		lines = append(lines, fmt.Sprintf(
+			"note: the cost figures include %s that the coding agent reported for models Sortie had no price for when the runs were recorded.",
+			server.FormatCost(*s.AgentPricedUSD)))
+	}
 	if chains > statsChainTextRows {
 		lines = append(lines, fmt.Sprintf(
 			"note: the breakdown by stage chain shows the %d stage chains with the most runs; --format json lists all %d.",
@@ -398,12 +542,14 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 	if full {
 		fmt.Fprintf(stdout, "turns (succeeded)       %s\n", //nolint:errcheck // stdout write failure is unrecoverable
 			formatFloatDash(report.Summary.MeanTurnsSucceeded, "%.1f"))
-		fmt.Fprintf(stdout, "tokens (measured runs)  %s\n", formatStatsTokens(report.Summary.Tokens)) //nolint:errcheck // stdout write failure is unrecoverable
+		fmt.Fprintf(stdout, "%s%s\n", statsLineLabel("tokens", report.Summary.TokensLowerBound), formatStatsTokens(report.Summary.Tokens)) //nolint:errcheck // stdout write failure is unrecoverable
+		costLabel := statsLineLabel("cost", report.Summary.CostLowerBound)
 		if report.Summary.CostUSD != nil {
-			fmt.Fprintf(stdout, "cost (measured runs)    %s   per succeeded run %s\n", //nolint:errcheck // stdout write failure is unrecoverable
-				server.FormatCost(*report.Summary.CostUSD), formatCostDash(report.Summary.CostPerSucceededRunUSD))
+			fmt.Fprintf(stdout, "%s%s   per succeeded run %s\n", costLabel, //nolint:errcheck // stdout write failure is unrecoverable
+				formatCostDash(report.Summary.CostUSD, report.Summary.CostLowerBound),
+				formatCostDash(report.Summary.CostPerSucceededRunUSD, report.Summary.CostLowerBound))
 		} else {
-			fmt.Fprintln(stdout, "cost (measured runs)    -   per succeeded run -") //nolint:errcheck // stdout write failure is unrecoverable
+			fmt.Fprintf(stdout, "%s-   per succeeded run -\n", costLabel) //nolint:errcheck // stdout write failure is unrecoverable
 		}
 	}
 	fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
@@ -419,6 +565,10 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 		if len(report.ByModel) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 			renderStatsGroupTable(stdout, "by model", "model", report.ByModel, full, false)
+		}
+		if len(report.ByProvenance) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsGroupTable(stdout, "by usage provenance", "provenance", report.ByProvenance, full, false)
 		}
 		if len(report.ByChain) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
@@ -525,7 +675,7 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		emitDiags(stdout, stderr, "text", mapManagerError(err), nil)
 		return 1
 	}
-	cfg, err := config.NewServiceConfig(wf.Config)
+	cfg, err := config.NewServiceConfig(wf.Config, config.WithLiteralSettings(registry.LiteralSettingsOf))
 	if err != nil {
 		emitDiags(stdout, stderr, "text", mapManagerError(err), nil)
 		return 1
@@ -544,7 +694,8 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 		workflowPath: path,
 		stages:       func() runstats.Stages { return dispatchStages(dispatch) },
 	}
-	report, err := src.report(ctx, since, until, now)
+	rng := runstats.Range{Since: since, Until: until, SinceIsDuration: runstats.IsDurationBound(*sinceRaw)}
+	report, err := src.report(ctx, rng, "", now)
 	if err != nil {
 		fmt.Fprintf(stderr, "sortie stats: %s\n", err) //nolint:errcheck // stderr write failure is unrecoverable
 		return 1

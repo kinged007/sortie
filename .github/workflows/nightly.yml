@@ -36,6 +36,8 @@ jobs:
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
       KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      SORTIE_OPENCODE_MODEL: openrouter/openai/gpt-5-nano
 
     strategy:
       fail-fast: false
@@ -71,7 +73,7 @@ jobs:
             guard: SORTIE_COPILOT_TEST
             run_filter: ^TestIntegration_ScriptedModel$
             test_path: ./internal/agent/copilot/...
-            timeout: 300s
+            timeout: 600s
             node: true
             install: npm install -g @github/copilot
             version_cmd: copilot --version
@@ -102,9 +104,111 @@ jobs:
             install: npm install -g @google/gemini-cli
             version_cmd: gemini --version
             source: "npm: @google/gemini-cli (unpinned, installs latest)"
-            clientprotocol_command: "gemini --acp --skip-trust --approval-mode yolo"
-            clientprotocol_asking_command: "gemini --acp"
+            clientprotocol_command: "gemini --acp --skip-trust --approval-mode yolo -m gemini-2.5-flash"
+            clientprotocol_ssh_command: "gemini --acp --skip-trust --approval-mode yolo -m gemini-2.5-flash"
+            clientprotocol_ssh_install: npm install -g @google/gemini-cli
+            clientprotocol_http_tools: "1"
+            clientprotocol_asking_command: "gemini --acp -m gemini-2.5-flash"
             clientprotocol_model_base_url_env: GOOGLE_GEMINI_BASE_URL
+            clientprotocol_profile: tools/qualify/profiles/gemini-cli.json
+            clientprotocol_usage_limit_answer: testdata/usage_limit/gemini_daily_quota_answer.json
+            clientprotocol_spend_declaration: gemini-cli
+
+          - name: GitHub Copilot CLI - ACP
+            adapter: acp-copilot
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: COPILOT_PROVIDER_API_KEY
+            run_filter: '^TestIntegration_ScriptedModel$'
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 600s
+            node: true
+            install: npm install -g @github/copilot
+            version_cmd: copilot --version
+            source: "npm: @github/copilot (unpinned, installs latest)"
+            clientprotocol_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=scripted-model copilot --acp --allow-all-tools"
+            clientprotocol_asking_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=scripted-model copilot --acp"
+            clientprotocol_ssh_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=scripted-model copilot --acp --allow-all-tools"
+            clientprotocol_ssh_install: npm install -g @github/copilot
+            clientprotocol_http_tools: "1"
+            clientprotocol_model_base_url_env: COPILOT_PROVIDER_BASE_URL
+            clientprotocol_user_instructions: .copilot/copilot-instructions.md
+            clientprotocol_profile: tools/qualify/profiles/copilot-cli.json
+            clientprotocol_spend_declaration: Copilot
+            clientprotocol_usage_limit_answer: testdata/usage_limit/copilot_rate_limit_answer.json
+            clientprotocol_config_option: testdata/config_option/copilot_agent.json
+
+          - name: GitHub Copilot CLI - ACP (default declaration)
+            adapter: acp-copilot-default
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: COPILOT_PROVIDER_API_KEY
+            run_filter: '^TestIntegration_ScriptedModel$'
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 600s
+            node: true
+            install: npm install -g @github/copilot
+            version_cmd: copilot --version
+            source: "npm: @github/copilot (unpinned, installs latest)"
+            clientprotocol_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=claude-sonnet-4.5 copilot --acp --allow-all-tools"
+            clientprotocol_asking_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=claude-sonnet-4.5 copilot --acp"
+            clientprotocol_ssh_command: "env COPILOT_PROVIDER_TYPE=anthropic COPILOT_OFFLINE=1 COPILOT_MODEL=claude-sonnet-4.5 copilot --acp --allow-all-tools"
+            clientprotocol_ssh_install: npm install -g @github/copilot
+            clientprotocol_http_tools: "1"
+            clientprotocol_model_base_url_env: COPILOT_PROVIDER_BASE_URL
+            clientprotocol_user_instructions: .copilot/copilot-instructions.md
+            clientprotocol_profile: tools/qualify/profiles/copilot-cli.json
+            clientprotocol_spend_declaration: default
+
+          - name: OpenCode - ACP
+            adapter: acp-opencode
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: GOOGLE_GENERATIVE_AI_API_KEY
+            run_filter: ^TestIntegration_ScriptedModel$
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 300s
+            node: true
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
+            version_cmd: opencode --version
+            source: "npm: @opencode/cli@2 (latest 2.x)"
+            clientprotocol_command: "opencode acp"
+            clientprotocol_ssh_command: "opencode acp"
+            clientprotocol_ssh_install: npm install -g --ignore-scripts=false @opencode/cli@2
+            clientprotocol_http_tools: "1"
+            clientprotocol_model_base_url_env: OPENCODE_CONFIG
+            clientprotocol_model_document: '{"$schema":"https://opencode.ai/config.json","model":"scripted/scripted-model","provider":{"scripted":{"npm":"@ai-sdk/google","name":"scripted","options":{"baseURL":"{url}/v1beta","apiKey":"{env:GOOGLE_GENERATIVE_AI_API_KEY}"},"models":{"scripted-model":{"name":"scripted-model"}}}}}'
+            clientprotocol_profile: tools/qualify/profiles/opencode.json
+            clientprotocol_spend_declaration: OpenCode
+            clientprotocol_reported_model_prefix: scripted/
+            clientprotocol_status_call: '{"name":"execute","arguments":{"code":"return await tools[\"sortie-tools\"].sortie_status()"}}'
+            clientprotocol_usage_limit_answer: testdata/usage_limit/opencode_free_limit_answer.json
+            clientprotocol_effort: high
+
+          - name: Kiro CLI - ACP (scripted)
+            adapter: acp-kiro
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: KIRO_API_KEY
+            run_filter: ^TestIntegration_ScriptedModel$
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 900s
+            node: false
+            install: curl -fsSL https://cli.kiro.dev/install | bash
+            version_cmd: kiro-cli --version
+            source: "curl https://cli.kiro.dev/install (unpinned, installs latest)"
+            clientprotocol_command: "kiro-cli acp -a --model scripted-model"
+            clientprotocol_ssh_command: "kiro-cli acp -a --model scripted-model"
+            clientprotocol_ssh_install: |
+              d=$(mktemp -d)
+              curl -fsSL https://prod.download.cli.kiro.dev/stable/latest/kirocli-x86_64-linux.tar.gz | tar -xz -C "$d"
+              KIRO_CLI_INSTALL_GLOBAL=1 "$d/kirocli/install.sh"
+              rm -rf "$d"
+            clientprotocol_http_tools: "1"
+            clientprotocol_model_document_path: .kiro/settings/cli.json
+            clientprotocol_model_document: '{"api.krs.service":{"endpoint":"{url}","region":"us-east-1"},"api.cps.service":{"endpoint":"{url}","region":"us-east-1"},"api.codewhisperer.service":{"endpoint":"{url}","region":"us-east-1"}}'
+            clientprotocol_profile: tools/qualify/profiles/kiro-cli.json
+            clientprotocol_spend_declaration: Kiro CLI Agent
 
           - name: Jira
             adapter: jira
@@ -269,6 +373,19 @@ jobs:
           SORTIE_CLIENTPROTOCOL_ASKING_COMMAND: ${{ matrix.clientprotocol_asking_command }}
           SORTIE_CLIENTPROTOCOL_PROFILE: ${{ matrix.clientprotocol_profile }}
           SORTIE_CLIENTPROTOCOL_MODEL_BASE_URL_ENV: ${{ matrix.clientprotocol_model_base_url_env }}
+          SORTIE_CLIENTPROTOCOL_USER_INSTRUCTIONS: ${{ matrix.clientprotocol_user_instructions }}
+          SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT: ${{ matrix.clientprotocol_model_document }}
+          SORTIE_CLIENTPROTOCOL_MODEL_DOCUMENT_PATH: ${{ matrix.clientprotocol_model_document_path }}
+          SORTIE_CLIENTPROTOCOL_SPEND_DECLARATION: ${{ matrix.clientprotocol_spend_declaration }}
+          SORTIE_CLIENTPROTOCOL_REPORTED_MODEL_PREFIX: ${{ matrix.clientprotocol_reported_model_prefix }}
+          SORTIE_CLIENTPROTOCOL_STATUS_CALL: ${{ matrix.clientprotocol_status_call }}
+          SORTIE_CLIENTPROTOCOL_USAGE_LIMIT_ANSWER: ${{ matrix.clientprotocol_usage_limit_answer }}
+          SORTIE_CLIENTPROTOCOL_EFFORT: ${{ matrix.clientprotocol_effort }}
+          SORTIE_CLIENTPROTOCOL_CONFIG_OPTION: ${{ matrix.clientprotocol_config_option }}
+          SORTIE_CLIENTPROTOCOL_SSH_COMMAND: ${{ matrix.clientprotocol_ssh_command }}
+          SORTIE_CLIENTPROTOCOL_SSH_INSTALL: ${{ matrix.clientprotocol_ssh_install }}
+          SORTIE_CLIENTPROTOCOL_HTTP_TOOLS: ${{ matrix.clientprotocol_http_tools }}
+          RUNTIME_ENV: ${{ matrix.runtime_env }}
           GH_TOKEN: ${{ secrets.SORTIE_COPILOT_TOKEN }}
         run: |
           # The runner's default bash uses -e; disable it so a failing test is
@@ -295,6 +412,10 @@ jobs:
           fi
           echo "ADAPTER_VERSION=${VER}" >> "$GITHUB_ENV"
 
+          # Inherited rather than assigned in the command, so Sortie still
+          # merges its own settings into the runtime's variable.
+          if [ -n "${RUNTIME_ENV}" ]; then export "${RUNTIME_ENV}"; fi
+
           # A suite can skip its live cases when the credential is missing,
           # and a shard that ran nothing concludes success, which the
           # incident history later counts as a pass.
@@ -316,8 +437,7 @@ jobs:
           export "${GUARD}=1"
 
           # The refused-credential case's coordinate name follows the
-          # guard's own name; opencode sets none, since its suite
-          # defaults to the runtime's free model.
+          # guard's own name.
           if [ -n "${CREDENTIAL_ENV}" ]; then
             export "${GUARD%_TEST}_CREDENTIAL_ENV=${CREDENTIAL_ENV}"
           fi
@@ -435,6 +555,7 @@ jobs:
             adapter: opencode
             kind: agent
             guard: SORTIE_OPENCODE_TEST
+            credential_env: OPENROUTER_API_KEY
             run_filter: Integration
             skip_filter: ^TestIntegration_ScriptedModel$
             tier: live
@@ -462,6 +583,23 @@ jobs:
             clientprotocol_command: "gemini --acp --skip-trust --approval-mode yolo"
             clientprotocol_profile: tools/qualify/profiles/gemini-cli.json
 
+          - name: GitHub Copilot CLI - ACP (live)
+            adapter: acp-copilot
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: GH_TOKEN
+            run_filter: Integration
+            skip_filter: ^TestIntegration_ScriptedModel$
+            tier: live
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 900s
+            node: true
+            install: npm install -g @github/copilot
+            version_cmd: copilot --version
+            source: "npm: @github/copilot (unpinned, installs latest)"
+            clientprotocol_command: "copilot --acp --allow-all --model claude-haiku-4.5"
+            clientprotocol_profile: tools/qualify/profiles/copilot-cli.json
+
           - name: Kiro - ACP (live)
             adapter: acp-kiro
             kind: agent
@@ -478,6 +616,24 @@ jobs:
             source: "curl https://cli.kiro.dev/install (unpinned, installs latest)"
             clientprotocol_command: "kiro-cli acp -a"
             clientprotocol_profile: tools/qualify/profiles/kiro-cli.json
+
+          - name: OpenCode - ACP (live)
+            adapter: acp-opencode
+            kind: agent
+            guard: SORTIE_CLIENTPROTOCOL_TEST
+            credential_env: OPENROUTER_API_KEY
+            run_filter: Integration
+            skip_filter: ^TestIntegration_ScriptedModel$
+            tier: live
+            test_path: ./internal/agent/clientprotocol/...
+            timeout: 900s
+            node: true
+            install: npm install -g --ignore-scripts=false @opencode/cli@2
+            version_cmd: opencode --version
+            source: "npm: @opencode/cli@2 (latest 2.x)"
+            clientprotocol_command: opencode acp
+            runtime_env: 'OPENCODE_CONFIG_CONTENT={"model":"openrouter/openai/gpt-5-nano"}'
+            clientprotocol_profile: tools/qualify/profiles/opencode.json
 
     steps: *integration-steps
 

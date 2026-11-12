@@ -19,7 +19,7 @@ export function fmtDuration(seconds: number | null | undefined): string {
     return UNKNOWN;
   }
   if (seconds < 1) {
-    return "under 1s";
+    return "< 1s";
   }
   if (seconds < 10) {
     return `${(Math.round(seconds * 10) / 10).toFixed(1).replace(/\.0$/, "")}s`;
@@ -66,7 +66,10 @@ export function fmtTokens(n: number | null | undefined): string {
 }
 
 function millions(n: number): string {
-  const hundredths = Math.floor((n + 5_000) / 10_000);
+  return hundredthsOfMillion(Math.floor((n + 5_000) / 10_000));
+}
+
+function hundredthsOfMillion(hundredths: number): string {
   const whole = Math.floor(hundredths / 100);
   const frac = hundredths % 100;
   if (frac === 0) {
@@ -78,25 +81,31 @@ function millions(n: number): string {
   return `${whole}.${String(frac).padStart(2, "0")}M`;
 }
 
-/** Writes an integer with comma-separated thousands. */
+/** Words a token figure cut rather than rounded, so the text never exceeds the count it bounds: 1,699,999 reads "1.69M", 902,999 reads "902K". */
+export function fmtTokensCut(n: number): string {
+  if (n >= 1_000_000) {
+    return hundredthsOfMillion(Math.floor(n / 10_000));
+  }
+  if (n >= 1_000) {
+    return `${Math.floor(n / 1_000)}K`;
+  }
+  return String(Math.trunc(n));
+}
+
 export function fmtCount(n: number): string {
   const digits = String(Math.abs(Math.trunc(n)));
   const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return n < 0 ? `-${grouped}` : grouped;
 }
 
-/** Writes the count and the noun form the count calls for. */
 export function plural(n: number, one: string, many: string): string {
   return `${fmtCount(n)} ${n === 1 ? one : many}`;
 }
 
-/** A count with the noun form and the verb form the count calls for. */
 export interface Agreement {
-  /** The count as written, with thousands separators. */
   count: string;
   noun: string;
   verb: string;
-  /** The count and the noun, as `plural` writes them. */
   subject: string;
 }
 
@@ -110,20 +119,17 @@ export function pluralVerb(
   return { count: fmtCount(n), noun, verb, subject: plural(n, nouns[0], nouns[1]) };
 }
 
-/**
- * Writes dollars with two decimals below $100 and as whole dollars with
- * thousands separators from $100. A cost above zero and below one cent reads
- * "under $0.01", so only a cost of zero reads "$0.00".
- */
+const DOLLARS = new Intl.NumberFormat("en-US", {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** Two decimals with thousands separators at every size; a cost above zero and below one cent reads "under $0.01", so only zero reads "$0.00". */
 export function fmtMoney(usd: number): string {
   if (usd > 0 && usd < 0.01) {
     return "under $0.01";
   }
-  const cents = Math.round(usd * 100);
-  if (cents >= 10_000) {
-    return `$${fmtCount(Math.round(usd))}`;
-  }
-  return `$${(cents / 100).toFixed(2)}`;
+  return `$${DOLLARS.format(Math.round(usd * 100) / 100)}`;
 }
 
 const EXACT = new Intl.NumberFormat("en-US", {
@@ -138,37 +144,20 @@ function exactDigits(usd: number): { value: number; whole: string; fraction: str
   return { value: Number(plain), whole, fraction };
 }
 
-/**
- * Writes the exact amount of a cost in plain decimal with thousands separators
- * and at least two fraction digits: 4.2 reads "$4.20", 4.203125 "$4.203125",
- * 0.0045000000000000005 "$0.0045", 1234.5 "$1,234.50".
- */
+/** Writes the exact amount of a cost in plain decimal with thousands separators and at least two fraction digits: 4.2 reads "$4.20", 4.203125 "$4.203125", 0.0045000000000000005 "$0.0045", 1234.5 "$1,234.50". */
 export function fmtMoneyExact(usd: number): string {
   const { whole, fraction } = exactDigits(usd);
   return `$${fmtCount(Number(whole))}.${fraction.padEnd(2, "0")}`;
 }
 
-/**
- * Writes the amount of a lower-bound cost cut, never rounded up, so the text
- * never exceeds the spend it bounds. Below one cent the cut falls after the
- * first non-zero digit ("$0.004"), below $100 after two fraction digits (4.205
- * reads "$4.20"), and from $100 before the decimal point (149.6 reads "$149").
- */
+/** Cut, never rounded up, so the text never exceeds the spend it bounds: after the first non-zero digit below one cent ("$0.004"), else after two decimals (4.205 reads "$4.20"). */
 export function fmtMoneyCut(usd: number): string {
   const { value, whole, fraction } = exactDigits(usd);
   const grouped = fmtCount(Number(whole));
-  if (value >= 100) {
-    return `$${grouped}`;
-  }
   if (value > 0 && value < 0.01) {
     return `$${grouped}.${/^0*[1-9]/.exec(fraction)?.[0] ?? fraction}`;
   }
   return `$${grouped}.${fraction.padEnd(2, "0").slice(0, 2)}`;
-}
-
-/** Words a cost that is a lower bound: "at least" before the amount `fmtMoneyCut` writes. */
-export function fmtMoneyAtLeast(usd: number): string {
-  return `at least ${fmtMoneyCut(usd)}`;
 }
 
 const RATE = new Intl.NumberFormat("en-US", {
@@ -191,14 +180,54 @@ function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-/**
- * Writes a share of runs as a whole percent. A ratio strictly between 0 and 1
- * never rounds to either end, so "100%" means every run and "0%" none.
- */
+/** A ratio strictly between 0 and 1 never rounds to either end, so "100%" means every run and "0%" none. */
 export function fmtPercent(ratio: number): string {
   const percent = Math.round(ratio * 100);
   const isPartial = ratio > 0 && ratio < 1;
   return `${isPartial ? Math.min(99, Math.max(1, percent)) : percent}%`;
+}
+
+/** Rounds a half away from zero after dropping float noise, so 0.94 - 0.935 counts as the half it is and a decline keeps its sign. */
+function roundHalfAway(x: number): number {
+  const clean = Number(x.toPrecision(12));
+  return Math.sign(clean) * Math.round(Math.abs(clean));
+}
+
+/** Words how far a figure moved against the same figure of an earlier range: a signed whole percent below double and a multiple from double up. Zero is unsigned, and an earlier figure of zero or less states no change. */
+export function fmtChange(now: number | null, before: number | null): string | null {
+  if (now === null || before === null || before <= 0) {
+    return null;
+  }
+  const ratio = now / before;
+  if (ratio >= 2) {
+    return `${ratio.toFixed(1)}x`;
+  }
+  const percent = roundHalfAway(((now - before) / before) * 100);
+  return `${percent > 0 ? "+" : ""}${percent}%`;
+}
+
+/** Words how far a rate moved in whole percentage points of the unrounded rates, so two rates that both read "99%" can still differ by a point. Zero is unsigned. */
+export function fmtPoints(now: number | null, before: number | null): string | null {
+  if (now === null || before === null) {
+    return null;
+  }
+  const points = roundHalfAway((now - before) * 100);
+  return `${points > 0 ? "+" : ""}${points} pts`;
+}
+
+/** Writes a quantity with en-US digit grouping and at most two fraction digits, trailing zeros dropped. */
+export function fmtAmount(n: number): string {
+  return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+/** Writes a vendor-unit amount with at most two fraction digits and digit grouping, rounded, or cut when it is a lower bound so the text never exceeds the amount it bounds. */
+export function fmtVendorAmount(amount: number, lowerBound: boolean): string {
+  if (!lowerBound) {
+    return fmtAmount(amount);
+  }
+  const { whole, fraction } = exactDigits(amount);
+  const cut = fraction.slice(0, 2).replace(/0+$/, "");
+  return cut === "" ? fmtCount(Number(whole)) : `${fmtCount(Number(whole))}.${cut}`;
 }
 
 /** Writes a mean with one decimal place, "4.0" included. */
@@ -230,6 +259,15 @@ export function fmtDate(at: Instant): string {
   return `${WEEKDAY.format(date)} ${date.getDate()} ${MONTH.format(date)}`;
 }
 
+const WEEKDAY_SHORT = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+const MONTH_SHORT = new Intl.DateTimeFormat("en-US", { month: "short" });
+
+/** Writes a date as "Fri 23 Oct" in the browser's time zone, short enough for a table cell. */
+function fmtDay(at: number): string {
+  const date = new Date(at);
+  return `${WEEKDAY_SHORT.format(date)} ${date.getDate()} ${MONTH_SHORT.format(date)}`;
+}
+
 /** Writes the age of an instant as a duration under an hour, else as its clock time. */
 export function fmtAgo(since: Instant, at: number = now()): string {
   const date = toDate(since);
@@ -247,12 +285,13 @@ export function fmtStamp(at: string): string {
     return UNKNOWN;
   }
   const isToday = localMidnight(instant).getTime() === localMidnight(now()).getTime();
-  return isToday ? fmtClock(instant) : `${fmtDate(instant)}, ${fmtClock(instant)}`;
+  return isToday ? fmtClock(instant) : `${fmtDay(instant)}, ${fmtClock(instant)}`;
 }
 
 const UTC_WEEKDAY = new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" });
 const UTC_MONTH = new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC" });
 const UTC_MONTH_SHORT = new Intl.DateTimeFormat("en-US", { month: "short", timeZone: "UTC" });
+const UTC_WEEKDAY_SHORT = new Intl.DateTimeFormat("en-US", { weekday: "short", timeZone: "UTC" });
 
 function utcClock(date: Date): string {
   return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
@@ -266,6 +305,16 @@ export function fmtUtcStamp(at: string): string {
   }
   const date = new Date(instant);
   return `${UTC_WEEKDAY.format(date)} ${date.getUTCDate()} ${UTC_MONTH.format(date)}, ${utcClock(date)} UTC`;
+}
+
+/** Writes the UTC date of an instant as "Wed 28 Oct", the form `fmtStamp` gives a day other than today; an unparsable instant reads as `fmtStamp` reads it. */
+export function fmtUtcDay(at: string): string {
+  const instant = parseInstant(at);
+  if (instant === null) {
+    return UNKNOWN;
+  }
+  const date = new Date(instant);
+  return `${UTC_WEEKDAY_SHORT.format(date)} ${date.getUTCDate()} ${UTC_MONTH_SHORT.format(date)}`;
 }
 
 /** Writes the 24-hour `HH:MM` of an instant in UTC; an unparsable instant reads as `fmtStamp` reads it. */
@@ -298,14 +347,14 @@ export function fmtUtcPeriodTick(start: string, period: "day" | "month"): string
     : `${UTC_MONTH_SHORT.format(date)} ${date.getUTCFullYear()}`;
 }
 
-/** Writes `HH:MM:SS` for an instant on the server's current day, else the date and `HH:MM:SS`, as fmtStamp does with `HH:MM`. */
+/** Writes `HH:MM:SS` for an instant on the server's current day, else the short date and `HH:MM:SS`, as fmtStamp does with `HH:MM`. */
 export function fmtStampSec(at: string): string {
   const instant = parseInstant(at);
   if (instant === null) {
     return UNKNOWN;
   }
   const isToday = localMidnight(instant).getTime() === localMidnight(now()).getTime();
-  return isToday ? fmtClockSec(instant) : `${fmtDate(instant)}, ${fmtClockSec(instant)}`;
+  return isToday ? fmtClockSec(instant) : `${fmtDay(instant)}, ${fmtClockSec(instant)}`;
 }
 
 const DESCRIBE_SUFFIX = /-\d+-g[0-9a-f]+(-dirty)?$/;

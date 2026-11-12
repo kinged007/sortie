@@ -1,6 +1,7 @@
-import { Link, useMatch } from "react-router";
+import { useMatch } from "react-router";
 
 import { useStateQuery } from "@/api/queries";
+import { Link } from "@/components/carried-links";
 import { TriangleAlertIcon } from "@/components/icons";
 import { fmtClock } from "@/lib/format";
 
@@ -54,7 +55,6 @@ function failingChecks(state: StateResponse): CheckLine[] {
   return checks.filter((check) => check.status === "fail");
 }
 
-/** Renders one line per failing health check under the top bar, or nothing while every check passes. */
 export function DegradedBanner() {
   const { data } = useStateQuery();
   const isOnHealth = useMatch("/health") !== null;
@@ -66,9 +66,12 @@ export function DegradedBanner() {
   return (
     <div
       role="status"
-      className="mb-lg flex items-start gap-sm rounded-xl bg-error-container p-md text-body-md text-ink"
+      className="mb-xxl flex items-start gap-sm rounded-xl border border-error-border bg-error-container p-md text-body-md text-ink"
     >
-      <TriangleAlertIcon className="mt-xxs text-error" />
+      {/* A box one line tall centers the icon on the banner's first line. */}
+      <span className="flex h-lh shrink-0 items-center">
+        <TriangleAlertIcon className="text-error" />
+      </span>
       <div className="min-w-0 wrap-anywhere">
         {lines.map((line) => (
           <div key={line.label}>

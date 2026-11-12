@@ -1,7 +1,8 @@
 // Package redact masks secret values Sortie has learned about in text it
 // logs, stores, or shows an operator. Every credential a launch, a log
-// record, or a stored row can carry is registered here once known,
-// add-only for the life of the process, and [Mask] replaces every
+// record, or a stored row can carry is registered here once known and
+// kept for the life of the process, except a per-session credential its
+// owner removes when the session ends, and [Mask] replaces every
 // registered value wherever it later occurs.
 package redact
 
@@ -65,6 +66,20 @@ func IsSecretName(name string) bool {
 // <credential>" value such as "Bearer <token>".
 func Add(source, value string) {
 	addPieces(source, selectPieces(value), hasNonSpace(value))
+}
+
+// Remove unregisters the pieces [Add] registered for value. It is for a
+// credential whose lifetime ended, such as a per-session token, so the
+// registry does not grow with every session.
+func Remove(value string) {
+	pieces := selectPieces(value)
+	if len(pieces) == 0 {
+		return
+	}
+	registerMu.Lock()
+	defer registerMu.Unlock()
+	kept := slices.DeleteFunc(currentValuesLocked(), func(v string) bool { return slices.Contains(pieces, v) })
+	registered.Store(&kept)
 }
 
 // AddNamed registers value as a credential when name follows the

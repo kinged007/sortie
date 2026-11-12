@@ -2,6 +2,7 @@ import { useSearchParams } from "react-router";
 
 import { ChipGroup } from "@/components/ui/chip-group";
 import { PHASES, chipCounts, isPhase } from "@/lib/active-rows";
+import { plural } from "@/lib/format";
 
 import type { ChipGroupItem } from "@/components/ui/chip-group";
 import type { Filterable, Phase } from "@/lib/active-rows";
@@ -17,25 +18,30 @@ const LABELS: Record<Phase, string> = {
   ended_today: "Ended today",
 };
 
-/** Props of {@link PhaseFilter}. */
 export interface PhaseFilterProps {
   /** The rows the rule menu already narrowed; the counts and the "All" chip read them. */
   rows: readonly Filterable[];
 }
 
-/**
- * Renders the lifecycle chips above a list of rows. The choice lives in the
- * `phase` search parameter; a chip shows while it has rows or is chosen, and the
- * row of chips shows while more than one phase is present or one is chosen.
- */
-export function PhaseFilter({ rows }: PhaseFilterProps) {
+function useLifecycle(rows: readonly Filterable[]) {
   const [params, setParams] = useSearchParams();
   const raw = params.get(PHASE_PARAM);
   const chosen = isPhase(raw) ? raw : "";
   const counts = chipCounts(rows);
+  // With fewer than two phases present there is nothing to choose between.
   const present = PHASES.filter((phase) => counts[phase] > 0);
+  return { chosen, counts, isShown: present.length >= 2 || chosen !== "", setParams };
+}
 
-  if (present.length < 2 && chosen === "") {
+/** The count of the rows while {@link PhaseFilter} shows no chips, which then count them. */
+export function PhaseCount({ rows }: PhaseFilterProps) {
+  const { isShown } = useLifecycle(rows);
+  return isShown ? undefined : plural(rows.length, "issue", "issues");
+}
+
+export function PhaseFilter({ rows }: PhaseFilterProps) {
+  const { chosen, counts, isShown, setParams } = useLifecycle(rows);
+  if (!isShown) {
     return undefined;
   }
 

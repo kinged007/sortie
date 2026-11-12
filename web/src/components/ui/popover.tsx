@@ -4,40 +4,33 @@ import { cn } from "@/lib/cn";
 
 import type { ReactNode } from "react";
 
-/** Props of {@link Popover}. */
 export type PopoverProps = BasePopover.Root.Props;
 
-/** Holds the open state of a popover; control it with `open` and `onOpenChange`. */
 export function Popover(props: PopoverProps) {
   return <BasePopover.Root {...props} />;
 }
 
-/** Props of {@link PopoverTrigger}. */
 export type PopoverTriggerProps = BasePopover.Trigger.Props;
 
-/** Renders the button that opens the popover. */
 export function PopoverTrigger(props: PopoverTriggerProps) {
   return <BasePopover.Trigger {...props} />;
 }
 
-/** Props of {@link PopoverPopup}. */
 export interface PopoverPopupProps {
-  /** Accessible name of the popup. */
   "aria-label"?: string;
   children: ReactNode;
   side?: BasePopover.Positioner.Props["side"];
   align?: BasePopover.Positioner.Props["align"];
+  /** Whether the popup opens onto the content of the panel whose title line holds its trigger. */
+  isOnPanelContent?: boolean;
   className?: string;
 }
 
-/**
- * Renders the floating panel below its trigger by default; it rises 4 px from the
- * trigger's side on entry.
- */
 export function PopoverPopup({
   children,
   side = "bottom",
   align = "start",
+  isOnPanelContent = false,
   className,
   ...rest
 }: PopoverPopupProps) {
@@ -46,12 +39,16 @@ export function PopoverPopup({
       <BasePopover.Positioner
         side={side}
         align={align}
-        sideOffset={4}
+        sideOffset={isOnPanelContent ? 0 : 4}
         className="z-(--z-dropdown) outline-hidden"
       >
         <BasePopover.Popup
           className={cn(
-            "origin-(--transform-origin) rounded-lg border border-line bg-canvas text-ink shadow-lg outline-hidden",
+            // Clipped to its rounding, so a field or a row at its edge keeps the corners.
+            "origin-(--transform-origin) overflow-clip rounded-lg border border-line bg-canvas text-ink shadow-lg outline-hidden",
+            // The panel's controls overhang its title line; the popup starts that much closer.
+            isOnPanelContent &&
+              "data-[side=bottom]:mt-[calc(var(--spacing-sm)-(var(--size-control)-var(--text-h7--line-height))/2)] data-[side=top]:mb-[calc(var(--spacing-sm)-(var(--size-control)-var(--text-h7--line-height))/2)]",
             "transition-[opacity,translate] duration-(--duration-enter-small) ease-enter",
             "data-ending-style:duration-(--duration-exit) data-ending-style:ease-exit",
             "data-starting-style:opacity-0 data-ending-style:opacity-0",

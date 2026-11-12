@@ -9,7 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // TestStdoutReader_StreamDeliversEachLineOnceInOrder asserts that every
@@ -36,11 +39,7 @@ func TestStdoutReader_StreamDeliversEachLineOnceInOrder(t *testing.T) {
 		}
 	}
 
-	select {
-	case <-r.Done():
-	case <-time.After(1 * time.Second):
-		t.Fatal("Done() did not close after Stream() closed")
-	}
+	waittest.Receive(t, r.Done(), "Done() after Stream() closed")
 	if err := r.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil (clean end of file)", err)
 	}
@@ -84,11 +83,7 @@ func TestStdoutReader_AbandonOneShot(t *testing.T) {
 
 		for range r.Stream() {
 		}
-		select {
-		case <-r.Done():
-		case <-time.After(1 * time.Second):
-			t.Fatal("Done() did not close after Stream() closed")
-		}
+		waittest.Receive(t, r.Done(), "Done() after Stream() closed")
 
 		r.Abandon(50 * time.Millisecond)
 		if got := buf.String(); got != "" {
@@ -164,34 +159,32 @@ func TestStdoutReader_Err(t *testing.T) {
 
 	t.Run("ErrStdoutAbandoned when Abandon fires first", func(t *testing.T) {
 		t.Parallel()
-		pr, pw := io.Pipe()
-		t.Cleanup(func() { pw.Close() }) //nolint:errcheck // best-effort
+		synctest.Test(t, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			t.Cleanup(func() { pw.Close() }) //nolint:errcheck // best-effort
 
-		r := NewStdoutReader(pr, slog.New(slog.DiscardHandler))
+			r := NewStdoutReader(pr, slog.New(slog.DiscardHandler))
 
-		// Abandon only takes effect once the scan goroutine is parked
-		// delivering a scanned line: a goroutine still blocked inside its
-		// first Read, as one would be over a pipe nothing has ever
-		// written to, is released only by closing the underlying reader,
-		// not by Abandon alone. Writing one line first reproduces the
-		// state Abandon is actually invoked against in production: a
-		// descendant still holding the handle open after everything the
-		// direct child wrote has already been scanned.
-		if _, err := pw.Write([]byte("parked line\n")); err != nil {
-			t.Fatalf("pw.Write() = %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
+			// Abandon only takes effect once the scan goroutine is parked
+			// delivering a scanned line: a goroutine still blocked inside its
+			// first Read, as one would be over a pipe nothing has ever
+			// written to, is released only by closing the underlying reader,
+			// not by Abandon alone. Writing one line first reproduces the
+			// state Abandon is actually invoked against in production: a
+			// descendant still holding the handle open after everything the
+			// direct child wrote has already been scanned.
+			if _, err := pw.Write([]byte("parked line\n")); err != nil {
+				t.Fatalf("pw.Write() = %v", err)
+			}
+			synctest.Wait()
 
-		r.Abandon(50 * time.Millisecond)
+			r.Abandon(50 * time.Millisecond)
 
-		select {
-		case <-r.Done():
-		case <-time.After(2 * time.Second):
-			t.Fatal("Done() did not close after Abandon()")
-		}
-		if err := r.Err(); !errors.Is(err, ErrStdoutAbandoned) {
-			t.Errorf("Err() = %v, want %v", err, ErrStdoutAbandoned)
-		}
+			waittest.Receive(t, r.Done(), "Done() after Abandon()")
+			if err := r.Err(); !errors.Is(err, ErrStdoutAbandoned) {
+				t.Errorf("Err() = %v, want %v", err, ErrStdoutAbandoned)
+			}
+		})
 	})
 }
 
@@ -201,28 +194,21 @@ func TestStdoutReader_Err(t *testing.T) {
 func TestStdoutReader_AbandonReleasesAParkedSend(t *testing.T) {
 	t.Parallel()
 
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { pw.Close() }) //nolint:errcheck // best-effort
+	synctest.Test(t, func(t *testing.T) {
+		pr, pw := io.Pipe()
+		t.Cleanup(func() { pw.Close() }) //nolint:errcheck // best-effort
 
-	r := NewStdoutReader(pr, slog.New(slog.DiscardHandler))
+		r := NewStdoutReader(pr, slog.New(slog.DiscardHandler))
 
-	if _, err := pw.Write([]byte("parked line\n")); err != nil {
-		t.Fatalf("pw.Write() = %v", err)
-	}
+		if _, err := pw.Write([]byte("parked line\n")); err != nil {
+			t.Fatalf("pw.Write() = %v", err)
+		}
+		synctest.Wait()
 
-	// Give the scan goroutine a chance to reach the parked send before
-	// abandoning; a race here only makes the test slower, never wrong,
-	// because Abandon's effect is what closes Done regardless of whether
-	// the goroutine had already reached the send.
-	time.Sleep(50 * time.Millisecond)
+		r.Abandon(50 * time.Millisecond)
 
-	r.Abandon(50 * time.Millisecond)
-
-	select {
-	case <-r.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() did not close after Abandon() released a goroutine parked on a send")
-	}
+		waittest.Receive(t, r.Done(), "Done() after Abandon() released a goroutine parked on a send")
+	})
 }
 
 // failingReader always returns err from Read.
@@ -262,7 +248,7 @@ func TestStdoutReader_AbandonWhileParkedInRead(t *testing.T) {
 	src := newParkedReader()
 	r := NewStdoutReader(src, slog.New(slog.DiscardHandler))
 
-	<-src.entered
+	waittest.Receive(t, src.entered, "the scan entering Read")
 	r.Abandon(time.Second)
 
 	if err := r.Err(); !errors.Is(err, ErrStdoutAbandoned) {
@@ -271,11 +257,7 @@ func TestStdoutReader_AbandonWhileParkedInRead(t *testing.T) {
 
 	close(src.release)
 
-	select {
-	case <-r.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("Done() did not close after the read was released")
-	}
+	waittest.Receive(t, r.Done(), "Done() after the read was released")
 
 	if err := r.Err(); !errors.Is(err, ErrStdoutAbandoned) {
 		t.Errorf("Err() after the scan ended = %v, want ErrStdoutAbandoned; "+
@@ -296,7 +278,7 @@ func TestStdoutReader_AbandonAfterScanEndedIsNoOp(t *testing.T) {
 
 	for range r.Stream() {
 	}
-	<-r.Done()
+	waittest.Receive(t, r.Done(), "Done()")
 
 	r.Abandon(time.Second)
 
@@ -319,7 +301,7 @@ func TestStdoutReader_ErrIsRaceFreeBeforeDone(t *testing.T) {
 	src := newParkedReader()
 	r := NewStdoutReader(src, slog.New(slog.DiscardHandler))
 
-	<-src.entered
+	waittest.Receive(t, src.entered, "the scan entering Read")
 
 	stop := make(chan struct{})
 	polling := make(chan struct{})
@@ -338,9 +320,9 @@ func TestStdoutReader_ErrIsRaceFreeBeforeDone(t *testing.T) {
 	// Released while the poller is still running, so the scan's write of
 	// its outcome overlaps the reads.
 	close(src.release)
-	<-r.Done()
+	waittest.Receive(t, r.Done(), "Done()")
 	close(stop)
-	<-polling
+	waittest.Receive(t, polling, "the Err() poller stopping")
 
 	if err := r.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil (clean end of the released read)", err)

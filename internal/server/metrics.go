@@ -604,8 +604,7 @@ func (p *PromMetrics) IncDispatchRuleMatch(layer, rule string) {
 }
 
 // IncCandidateHolds increments the counter of candidates the dispatch
-// loop held. reason is "blocked_by", "blockers_unresolved",
-// "blockers_not_read", or "blockers_incomplete".
+// loop held.
 func (p *PromMetrics) IncCandidateHolds(reason string) {
 	p.candidateHoldsTotal.WithLabelValues(reason).Inc()
 }

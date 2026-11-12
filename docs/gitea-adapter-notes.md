@@ -16,7 +16,9 @@ Gitea serves no GraphQL. The REST surface is the whole contract, so anything the
 
 **No workflow states.** A Gitea issue is open or closed; there is no transition graph and no close-reason field. The adapter derives workflow state from repository labels and couples that to the native flag: a terminal transition also closes the issue, an active transition on a closed issue reopens it. An open issue with no state label is in no state and is never dispatched: labeling an issue is how an operator hands it to Sortie. A closed issue reads terminal whatever its labels, as the terminal label it carries or else as the first configured terminal state, so a workflow names at least one terminal state. This is deliberately the same convention the GitHub adapter uses, so operator configuration is uniform across the open/closed trackers.
 
-**No review decision.** Gitea has no aggregate review verdict, so `GetReviewDecision` folds one out of the review list plus the pull request's requested-reviewers signal: latest decision per reviewer wins, any standing changes-requested loses, otherwise any approval wins, otherwise a non-empty requested-reviewer list means review-required. Ordering depends on the review timestamp parsing; a value that will not parse fails the read rather than silently sorting to the epoch.
+**No review decision.** Gitea has no aggregate review verdict, so `GetReviewDecision` folds one out of the review list, the pull request's requested-reviewers signal, and the base branch's `required_approvals`: latest decision per reviewer wins, any standing changes-requested loses, review-required when `required_approvals` exceeds the number of official approvals, otherwise any approval wins, otherwise a non-empty requested-reviewer list means review-requested, which is not a wait on approval. The base branch comes from a separate branch read, encoded as the branch delete encodes it, and a 404 means no rule. Stale approvals count: Gitea counts one unless the rule sets ignore-stale-approvals, a setting only the admin-only protection route shows. Ordering depends on the review timestamp parsing; a value that will not parse fails the read rather than silently sorting to the epoch.
+
+**The user's type is not always rendered.** Newer Gitea renders the user's type on a comment's author (`User`, `Organization`, or `Bot`), and the adapter reads `User` as a person and `Bot` as a bot. Forgejo and older Gitea render no type, and the kind is empty there, never a person: a bot on those servers cannot be told from a human by the payload, and no username pattern stands in for it.
 
 **No priority, no issue type, no parent.** None of these concepts exist. The corresponding domain fields are always empty. Do not add a synthetic mapping for them.
 
@@ -76,6 +78,8 @@ Three different shapes coexist, and picking the wrong helper truncates results w
 - The reviews, review-comments, and timeline routes emit **no** `Link` header. The link-following paginator stops at the first response without one, which would silently truncate a multi-page read to page one. These go through the page-number paginator, wrapped by the package's own helper so the parameter names, the page ceiling, and the conversion to the SCM error boundary are pinned in one place.
 - The per-issue comments route is unpaginated and returns the whole list in one response, ignoring any page-size parameter.
 
+The comments route takes a `since` filter, which the change read uses. The server compares the comment's update time at whole seconds and includes the boundary second, so the point is truncated to the second and a comment updated in that second is read again. The filtered result stays in creation order.
+
 The instance clamps the requested page size to its own configured maximum, which an operator can lower, so never assume the size you asked for is the size you got; iterate on the pagination signal.
 
 Because the timeline is oldest-first and read forward to the cap, an unusually long timeline truncates its *newest* entries, which is exactly where a label command lives. The adapter warns on reaching the cap.
@@ -89,6 +93,18 @@ An already-merged pull request and a stale expected-head SHA are both rejections
 Gitea's own delete-branch-after-merge and merge-when-checks-succeed options stay unused: Sortie keeps the two-step merge-then-delete flow and gates CI itself.
 
 Branch names are percent-encoded, slashes included. Deleting an already-absent branch is a not-found error that the caller treats as a successful no-op.
+
+## Comment author write access reads the assignee list
+
+**The collaborator permission route cannot answer for another account.** It answers only a site administrator, a repository administrator, or the account asked about; a token whose account can write but does not administer gets `403` for every other login, and no token scope changes that, because scopes only narrow. It also reports one repository-wide level that no per-unit team grant raises, so a member of a team with write on code and issues reads as `read` or `none`. The collaborator list and check report membership without a level, and team membership needs an organization owner.
+
+**The issue-assignee list is the substitute.** Any account that can read the repository may read it, and the lookup grants a login that appears in it, matched whole and ignoring letter case. The login is never sent. The list is one unpaginated array of active accounts. It holds the accounts whose access level is write or above, the owner of a repository a user owns, and, on an organization repository, members of the repository's teams that can read issues or pull requests, so team members below write count as granted there. A site administrator who holds no collaboration or team on the repository is absent.
+
+**Its `404` is a failure.** The list is read for the repository, not for the author, so a `404` means the repository is not readable, and the lookup returns it as an error instead of refusing. A `403` from a scoped token without repository read arrives as an auth error. The token needs `read:repository` or `write:repository`.
+
+**The single-account assignee route cannot replace the list.** `GET /repos/{owner}/{repo}/assignees/{assignee}` also counts any account that may read pull requests, so it would grant accounts the list refuses.
+
+**Unobserved.** The list on an organization repository is read from the source, because the lab has no organization.
 
 ## The auto-merge scope preflight cannot verify a scope
 

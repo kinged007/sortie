@@ -3,6 +3,7 @@ package gitlab
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/url"
 	"strconv"
@@ -19,10 +20,13 @@ type gitlabReviewer struct {
 	State string     `json:"state"`
 }
 
-// gitlabApprovals is the merge-request approvals response, decoding
-// only the Community Edition field the review-decision fold reads.
+// gitlabApprovals is the merge-request approvals response, decoding only
+// the fields the review-decision fold reads. ApprovalsLeft is the approvals
+// the merge gate still requires; Community Edition omits it, which decodes
+// as 0, so an instance without approval rules never reports an unmet rule.
 type gitlabApprovals struct {
-	Approved bool `json:"approved"`
+	Approved      bool `json:"approved"`
+	ApprovalsLeft int  `json:"approvals_left"`
 }
 
 // gitlabUserDetail is the GET /users/:id response, decoding only the
@@ -86,43 +90,18 @@ func (a *GitLabSCMAdapter) fetchNotes(ctx context.Context, prNumber int, owner, 
 // cached, so a route that recovers reclassifies the user on the next
 // call.
 func (a *GitLabSCMAdapter) resolveBotFlag(ctx context.Context, userID int64) (bool, error) {
-	if userID <= 0 {
-		return false, nil
+	bot, err := a.bots.lookup(ctx, userID)
+	if err == nil {
+		return bot, nil
 	}
-
-	a.mu.Lock()
-	cached, hit := a.botCache[userID]
-	a.mu.Unlock()
-	if hit {
-		return cached, nil
-	}
-
-	path := "/users/" + strconv.FormatInt(userID, 10)
-	body, _, err := a.client.Get(ctx, path, nil)
-	if err != nil {
-		scmErr := scmcore.AsSCMError(err)
-		if scmErr.Kind == domain.ErrSCMNotFound {
-			a.mu.Lock()
-			a.botCache[userID] = false
-			a.mu.Unlock()
-			return false, nil
-		}
-		return false, scmErr
-	}
-
-	var detail gitlabUserDetail
-	if jsonErr := json.Unmarshal(body, &detail); jsonErr != nil {
+	if te, ok := errors.AsType[*domain.TrackerError](err); ok && te.Kind == domain.ErrTrackerPayload {
 		return false, &domain.SCMError{
 			Kind:    domain.ErrSCMPayload,
-			Message: "failed to parse user response",
-			Err:     jsonErr,
+			Message: te.Message,
+			Err:     te.Err,
 		}
 	}
-
-	a.mu.Lock()
-	a.botCache[userID] = detail.Bot
-	a.mu.Unlock()
-	return detail.Bot, nil
+	return false, scmcore.AsSCMError(err)
 }
 
 // normalizeNotes maps notes to [domain.ReviewComment] values.
@@ -274,7 +253,12 @@ func (a *GitLabSCMAdapter) FetchBotReviewComments(ctx context.Context, prNumber 
 
 // GetReviewDecision returns the aggregated review decision for the
 // given merge request, folding the reviewer states and the approvals
-// payload.
+// payload through [scmcore.FoldReviewDecision].
+//
+// Enterprise Edition reports an unmet approval rule as approvals_left above
+// zero, which yields [domain.ReviewDecisionReviewRequired] with or without a
+// reviewer. Community Edition has no approval rules, so an assigned reviewer
+// who has not approved yields [domain.ReviewDecisionReviewRequested].
 //
 // A requested_changes reviewer short-circuits to
 // [domain.ReviewDecisionChangesRequested] before the approvals read,
@@ -308,11 +292,9 @@ func (a *GitLabSCMAdapter) GetReviewDecision(ctx context.Context, prNumber int, 
 		}
 	}
 
-	if approvals.Approved {
-		return domain.ReviewDecisionApproved, nil
-	}
-	if len(reviewers) > 0 {
-		return domain.ReviewDecisionReviewRequired, nil
-	}
-	return domain.ReviewDecisionNotRequired, nil
+	return scmcore.FoldReviewDecision(scmcore.ReviewFacts{
+		ApprovalRuleUnmet: approvals.ApprovalsLeft > 0,
+		Approved:          approvals.Approved,
+		ReviewerRequested: len(reviewers) > 0,
+	}), nil
 }

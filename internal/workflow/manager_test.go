@@ -25,6 +25,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func validWorkflow(intervalMS int) []byte {
@@ -73,15 +74,22 @@ func writeWorkflow(t *testing.T, path string, content []byte) {
 	t.Fatalf("rename temp to target: %v", err)
 }
 
-func pollUntil(fn func() bool) bool {
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if fn() {
-			return true
+func intervalIs(mgr *Manager, want int) func() error {
+	return func() error {
+		if got := mgr.Config().Polling.IntervalMS; got != want {
+			return fmt.Errorf("Polling.IntervalMS = %d, want %d", got, want)
 		}
-		time.Sleep(20 * time.Millisecond)
+		return nil
 	}
-	return false
+}
+
+func loadErrorSet(mgr *Manager) func() error {
+	return func() error {
+		if mgr.LastLoadError() == nil {
+			return errors.New("LastLoadError is nil, want the reload failure")
+		}
+		return nil
+	}
 }
 
 func mustWriteFile(t *testing.T, path string, content []byte) {
@@ -531,18 +539,9 @@ func TestManager_WatchPicksUpChange(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	// Give the watcher time to register.
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, validWorkflow(10000))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 10000
-	})
-	if !ok {
-		t.Errorf("config not updated within timeout: Polling.IntervalMS = %d, want 10000",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 10000))
 }
 
 // TestManager_WatchInvalidRetainsGood verifies that an invalid workflow
@@ -565,18 +564,9 @@ func TestManager_WatchInvalidRetainsGood(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[bad yaml\n---\nprompt\n"))
 
-	// Wait until the reload actually fired; confirmed by LastLoadError becoming
-	// set; then assert the last-known-good config was preserved.
-	ok := pollUntil(func() bool {
-		return mgr.LastLoadError() != nil
-	})
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	if mgr.Config().Polling.IntervalMS != 5000 {
 		t.Errorf("after invalid reload: Polling.IntervalMS = %d, want 5000",
@@ -602,8 +592,6 @@ func TestManager_ConcurrentReadSafety(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Readers spin until the reload is confirmed to have completed, ensuring
 	// concurrent access actually overlaps with the write under -race.
 	var reloaded atomic.Bool
@@ -622,18 +610,14 @@ func TestManager_ConcurrentReadSafety(t *testing.T) {
 
 	writeWorkflow(t, path, validWorkflow(7777))
 
-	ok := pollUntil(func() bool {
-		if mgr.Config().Polling.IntervalMS == 7777 {
+	waittest.Until(t, func() error {
+		err := intervalIs(mgr, 7777)()
+		if err == nil {
 			reloaded.Store(true)
-			return true
 		}
-		return false
+		return err
 	})
 	wg.Wait()
-
-	if !ok {
-		t.Error("config not updated within timeout: Polling.IntervalMS did not reach 7777")
-	}
 }
 
 func TestManager_DebounceCoalescence(t *testing.T) {
@@ -654,8 +638,6 @@ func TestManager_DebounceCoalescence(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Write 5 times in rapid succession.
 	for i := range 5 {
 		val := 2000 + i*1000 // 2000, 3000, 4000, 5000, 6000
@@ -663,13 +645,7 @@ func TestManager_DebounceCoalescence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 6000
-	})
-	if !ok {
-		t.Errorf("debounce did not coalesce to last value: Polling.IntervalMS = %d, want 6000",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 6000))
 }
 
 func TestManager_DeleteAndRecreate(t *testing.T) {
@@ -690,31 +666,17 @@ func TestManager_DeleteAndRecreate(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Simulate editor delete-and-recreate.
 	mustRemove(t, path)
 	time.Sleep(50 * time.Millisecond)
 	writeWorkflow(t, path, validWorkflow(8888))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 8888
-	})
-	if !ok {
-		t.Errorf("after delete+recreate: Polling.IntervalMS = %d, want 8888",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 8888))
 
 	// Confirm watcher is still alive; write a third value.
 	writeWorkflow(t, path, validWorkflow(9999))
 
-	ok = pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 9999
-	})
-	if !ok {
-		t.Errorf("after second write: Polling.IntervalMS = %d, want 9999",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 9999))
 }
 
 func TestManager_ContextCancellation(t *testing.T) {
@@ -736,19 +698,13 @@ func TestManager_ContextCancellation(t *testing.T) {
 
 	cancel()
 
-	// Stop should not hang. If it does, the test will time out.
 	done := make(chan struct{})
 	go func() {
 		mgr.Stop()
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// ok
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop() did not return within 2s after context cancellation")
-	}
+	waittest.Receive(t, done, "Stop() return after context cancellation")
 }
 
 func TestManager_StopIdempotent(t *testing.T) {
@@ -791,10 +747,8 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[bad\n---\nprompt\n"))
-	time.Sleep(300 * time.Millisecond)
+	waittest.Until(t, loadErrorSet(mgr))
 
 	if mgr.Config().Polling.IntervalMS != 5000 {
 		t.Fatalf("after invalid reload: Polling.IntervalMS = %d, want 5000",
@@ -804,13 +758,7 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 	// Write valid content again; the watcher should recover.
 	writeWorkflow(t, path, validWorkflow(7777))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 7777
-	})
-	if !ok {
-		t.Errorf("recovery after invalid reload failed: Polling.IntervalMS = %d, want 7777",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 7777))
 	if mgr.LastLoadError() != nil {
 		t.Errorf("after recovery: LastLoadError = %v, want nil", mgr.LastLoadError())
 	}
@@ -1008,14 +956,9 @@ func TestManager_SetLogger(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[invalid\n---\nprompt\n"))
 
-	ok := pollUntil(func() bool { return mgr.LastLoadError() != nil })
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	// Stop before reading buffers to ensure the watcher goroutine has exited
 	// and no concurrent writes remain.
@@ -1055,14 +998,9 @@ func TestManager_SetLoggerNil(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[invalid\n---\nprompt\n"))
 
-	ok := pollUntil(func() bool { return mgr.LastLoadError() != nil })
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	mgr.Stop()
 
@@ -1091,8 +1029,6 @@ func TestManager_SetLoggerConcurrentWithReload(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -1103,7 +1039,7 @@ func TestManager_SetLoggerConcurrentWithReload(t *testing.T) {
 
 	for i := range 5 {
 		writeWorkflow(t, path, validWorkflow(5000+i))
-		time.Sleep(40 * time.Millisecond)
+		waittest.Until(t, intervalIs(mgr, 5000+i))
 	}
 
 	stop.Store(true)
@@ -1551,5 +1487,47 @@ func TestManager_LabelCommandsRecordsNoBranchAdvisory(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestManager_WithLiteralSettings_KeepsListedKeyLiteral(t *testing.T) {
+	t.Parallel()
+
+	const doc = `{"$schema":"https://opencode.ai/config.json","model":"$m"}`
+	path := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	mustWriteFile(t, path, fmt.Appendf(nil, `---
+agent:
+  kind: testkind
+testkind:
+  env: {DOC: '%[1]s'}
+  other: $PATH
+dispatch:
+  rules:
+    - name: r
+      match: {labels: [cheap]}
+      testkind:
+        env: {DOC: '%[1]s'}
+---
+Prompt.
+`, doc))
+
+	mgr, err := NewManager(path, testLogger(), WithLiteralSettings(func(string) []string { return []string{"env"} }))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	mgr.Stop()
+	cfg := mgr.Config()
+
+	for _, rule := range []string{"", "r"} {
+		got := config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: "testkind", RuleName: rule}, "").Passthrough
+		if env, _ := got["env"].(map[string]any); env["DOC"] != doc {
+			t.Errorf("rule %q env DOC = %q, want %q", rule, env["DOC"], doc)
+		}
+		if got["other"] != os.Getenv("PATH") {
+			t.Errorf("rule %q other = %q, want $PATH resolved", rule, got["other"])
+		}
+	}
+	if refs := cfg.ExtensionEnvRefPaths("testkind"); !refs["other"] || refs["env.DOC"] {
+		t.Errorf("ExtensionEnvRefPaths(testkind) = %v, want other recorded and env.DOC not", refs)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/tools/qualify/evidence"
@@ -318,30 +317,4 @@ func TestInduceRetryableTransportNative(t *testing.T) {
 	if want := evidence.SemanticEvidencePath(semanticTestSurface); g.obs.EvidencePath != want {
 		t.Errorf("induceRetryableTransport(...) evidence path = %q, want %q", g.obs.EvidencePath, want)
 	}
-}
-
-func TestAwaitProbeStarted(t *testing.T) {
-	t.Parallel()
-
-	t.Run("the marker appears before the deadline", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		go func() {
-			time.Sleep(30 * time.Millisecond)
-			_ = os.WriteFile(dir+"/"+probeStartedMarker, nil, 0o600)
-		}()
-		if !awaitProbeStarted(dir, time.Now().Add(2*time.Second)) {
-			t.Error("awaitProbeStarted(...) = false, want true once the marker appears")
-		}
-	})
-
-	t.Run("the deadline passes with no marker", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		if awaitProbeStarted(dir, time.Now().Add(20*time.Millisecond)) {
-			t.Error("awaitProbeStarted(...) = true, want false: no marker was ever written")
-		}
-	})
 }

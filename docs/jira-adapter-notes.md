@@ -40,7 +40,9 @@ The fragment is wrapped in parentheses when it is appended, and that is load-bea
 
 Priority reads the priority object's id, never its name. Names are workflow text an admin can edit; the id is the numeric scheme the domain's integer priority expects. A non-integer id yields no priority rather than a guess.
 
-Timestamps are stored verbatim as strings and the adapter parses nothing. Anything downstream that does parse them must accept Jira's millisecond-and-offset form as well as RFC 3339. Do not assume RFC 3339 alone.
+Timestamps are stored verbatim as strings. Only the comment change read parses one, the comment's `created`, to order its result. Anything that parses them must accept Jira's millisecond-and-offset form as well as RFC 3339. Do not assume RFC 3339 alone.
+
+A comment's author identity is the account ID on Cloud and the username on Data Center, never the display name, which stays the display author. The kind comes from the Cloud account type: `atlassian` reads as a person, `app` is an app's own account and reads as a bot, and `customer` reads as external. Data Center sends no account type, so every named author reads as a person, service-desk customers and automation users included.
 
 `BranchName` is always empty. The core REST issue payload does not carry it, and the only source is the development-information surface at `/rest/dev-status/`, which answers only when a source control tool is connected to the site. Note the path: it sits outside the versioned `/rest/api/` tree, which is why searching the REST API reference for a branch field turns up nothing and why people conclude the data does not exist. Nothing in the adapter calls it, and anything that starts to should treat it as a surface with its own rules rather than another issue route.
 
@@ -62,12 +64,6 @@ On Server the same fields are plain strings carrying wiki markup, passed through
 
 Comment creation mirrors the split. On Cloud the text is split on newlines into one paragraph node per line, because a single node with embedded newlines does not render as line breaks.
 
-A comment that carries agent text keeps the split and ends in a literal block. On Cloud the paragraph nodes for Sortie's text are followed by one `codeBlock` node holding one text node with the whole literal, newlines included.
-
-On Server the body is the text, two line feeds, `{noformat}`, a line feed, the literal, a line feed, and `{noformat}`. The closing marker is matched without regard to letter case, so the adapter inserts U+200B after every `{` that starts the word `noformat` in the literal; otherwise the literal could end the block early. Server also parses `[~user]` mentions inside a `{noformat}` block, so the adapter inserts U+200B after every `[` followed by `~`. The text stays as written but notifies nobody.
-
-Server rendering is covered by a request-body test only. Whether the renderer closes on a case-insensitive match is unchecked, and the integration suite cannot post a version 2 comment because it refuses a Cloud host.
-
 ## Label writes
 
 A label edit answers 204 with no body, so neither an add nor a removal can confirm itself; the shared label writers read the issue's labels (`GET /issue/{key}?fields=labels`) after every Jira write. Removal sends one `PUT` whose `update.labels` holds one `{"remove": name}` entry per matching spelling the read found, so an issue carrying `Stage-Plan` and `stage-plan` loses both in one request. The adapter never sends `fields.labels`, the replace form, which would drop a label a person adds between the read and the write.
@@ -78,9 +74,11 @@ Atlassian documents eventual consistency for its search endpoints only. Nothing 
 
 ## Pagination
 
-Cloud search is cursor based, Server search is offset based, and comments are offset based on both. A read-path change usually touches three loops.
+Cloud search is cursor based, Server search is offset based, and comments are offset based on both. A read-path change usually touches more than one loop.
 
 One known weakness: the cursor walk treats an absent cursor as the end of the walk, and the decoder never reports a missing one, so a result set truncated by a dropped cursor is indistinguishable from a complete one. The Linear adapter raises a missing-cursor error in the same situation; this one does not.
+
+The comment change read walks newest first and stops after the first page holding a comment the previous read returned on its newest page. A new comment or an edit on the pages it reads is seen; an edit to a comment older than those pages is not. The issue's `updated` field is no change probe, because Sortie's own writes move it.
 
 ## Rate limits, retries, and errors
 

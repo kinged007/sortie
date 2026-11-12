@@ -33,12 +33,17 @@ function faviconUrl(condition: Condition | undefined): string {
   return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 
-function titleFor(condition: Condition | undefined, attention: number): string {
+function titleFor(
+  condition: Condition | undefined,
+  attention: number,
+  project: string | undefined,
+): string {
   if (condition === undefined) {
     return BASE_TITLE;
   }
   const prefix = attention > 0 ? `(${attention}) ` : "";
-  return `${prefix}${conditionWord(condition)} - ${BASE_TITLE}`;
+  const named = project === undefined || project === "" ? "" : `${project} - `;
+  return `${prefix}${conditionWord(condition)} - ${named}${BASE_TITLE}`;
 }
 
 function iconLink(): HTMLLinkElement {
@@ -54,12 +59,12 @@ function iconLink(): HTMLLinkElement {
   return link;
 }
 
-/**
- * Sets the document title and favicon from the condition and the attention
- * count. Pass `undefined` before the first state response. While live
- * updates are paused the last title and icon stay.
- */
-export function useDocumentStatus(condition: Condition | undefined, attention: number): void {
+/** Pass `undefined` for the condition before the first state response and for the project while the state serves none; while live updates are paused the last title and icon stay. */
+export function useDocumentStatus(
+  condition: Condition | undefined,
+  attention: number,
+  project: string | undefined,
+): void {
   const { paused: frozen } = useLive();
   const applied = useRef<{ title: string; icon: string } | null>(null);
 
@@ -67,9 +72,12 @@ export function useDocumentStatus(condition: Condition | undefined, attention: n
     if (frozen && applied.current !== null) {
       return;
     }
-    const next = { title: titleFor(condition, attention), icon: faviconUrl(condition) };
-    applied.current = next;
+    const next = {
+      title: titleFor(condition, attention, project),
+      icon: faviconUrl(condition),
+    };
+    applied.current = condition === undefined ? null : next;
     document.title = next.title;
     iconLink().href = next.icon;
-  }, [condition, attention, frozen]);
+  }, [condition, attention, project, frozen]);
 }

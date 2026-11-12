@@ -41,6 +41,7 @@ package gitlab
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,11 +53,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/httpkit"
 	"github.com/sortie-ai/sortie/internal/issuekit"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/scm/scmcore"
 	"github.com/sortie-ai/sortie/internal/trackermetrics"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
@@ -73,6 +76,10 @@ func init() {
 
 // Compile-time interface satisfaction check.
 var _ domain.TrackerAdapter = (*GitLabAdapter)(nil)
+var _ domain.CommentChangeReader = (*GitLabAdapter)(nil)
+var _ domain.CommentAuthorKindReader = (*GitLabAdapter)(nil)
+var _ domain.CommentAuthorAccessReader = (*GitLabAdapter)(nil)
+var _ domain.ProjectLinker = (*GitLabAdapter)(nil)
 
 // maxPages is the upper bound on paginated fetches. At 100 items per page
 // this allows up to 20,000 results before the adapter stops and returns
@@ -87,17 +94,21 @@ const stateBatchSize = 50
 
 // GitLabAdapter implements [domain.TrackerAdapter] against the GitLab REST
 // API v4. All fields except metrics are set once at construction and never
-// mutated, and the embedded state source is safe for concurrent use, so the
-// adapter is safe for concurrent use.
+// mutated, and the embedded state source and the bot lookup are safe for
+// concurrent use, so the adapter is safe for concurrent use.
 type GitLabAdapter struct {
 	*issuekit.StateSource
 
 	client      *httpkit.Client
 	project     string
 	projectPath string
+	projectURL  string
 	model       *issuekit.LabelStateModel
 	log         *slog.Logger
 	metrics     domain.Metrics
+	bots        *botFlags
+	kinds       *authorKinds
+	access      *scmcore.WriteAccessCache
 
 	// queryFilter holds the validated tracker.query_filter parameters, or
 	// nil when the key is unset. Never mutated after construction.
@@ -390,13 +401,33 @@ func NewGitLabAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 		client:           client,
 		project:          project,
 		projectPath:      projectPath,
+		projectURL:       projectWebURL(parsedEndpoint.Base, project),
 		model:            model,
 		log:              log,
+		bots:             newBotFlags(client),
+		kinds:            newAuthorKinds(),
 		queryFilter:      queryFilter,
 		stateLabelCasing: stateLabelCasing,
 	}
+	adapter.access = scmcore.NewWriteAccessCache(adapter.lookupWriteAccess)
 	adapter.warnUnresolvedFilterLabels(context.Background())
 	return adapter, nil
+}
+
+// ProjectURL returns the web address of the configured project.
+func (a *GitLabAdapter) ProjectURL() string {
+	return a.projectURL
+}
+
+// projectWebURL returns the project's page under the instance's web base. A
+// numeric project id has no path to name, so it uses the instance's
+// /projects/<id> route, which GitLab resolves to the project's page.
+func projectWebURL(endpointBase, project string) string {
+	webBase := strings.TrimSuffix(endpointBase, "/api/v4")
+	if isAllASCIIDigits(project) {
+		return webBase + "/projects/" + project
+	}
+	return webBase + "/" + project
 }
 
 // configuredStateNames returns the union of activeStates, terminalStates,
@@ -546,8 +577,10 @@ func (a *GitLabAdapter) paginateIssues(ctx context.Context, path string, params 
 // Gitea comments route, the GitLab notes route paginates and must be
 // routed through the paginator.
 //
-// A decode failure returns [domain.ErrTrackerPayload].
-func (a *GitLabAdapter) paginateNotes(ctx context.Context, path string, params url.Values) ([]gitlabNote, error) {
+// A non-nil stop ends the walk after the first page it returns true for,
+// that page's notes included. A decode failure returns
+// [domain.ErrTrackerPayload].
+func (a *GitLabAdapter) paginateNotes(ctx context.Context, path string, params url.Values, stop func(page []gitlabNote) bool) ([]gitlabNote, error) {
 	paginator := httpkit.NewLinkPaginator(a.client, path, params, func(body []byte) ([]gitlabNote, error) {
 		var raw []gitlabNote
 		if err := json.Unmarshal(body, &raw); err != nil {
@@ -566,6 +599,7 @@ func (a *GitLabAdapter) paginateNotes(ctx context.Context, path string, params u
 				slog.String("endpoint", path))
 		},
 	})
+	paginator.StopWhen(stop)
 
 	return paginator.All(ctx)
 }
@@ -755,11 +789,194 @@ func (a *GitLabAdapter) fetchComments(ctx context.Context, issueID string) ([]do
 		"per_page":        {"100"},
 	}
 
-	raw, err := a.paginateNotes(ctx, path, params)
+	raw, err := a.paginateNotes(ctx, path, params, nil)
 	if err != nil {
 		return nil, err
 	}
 	return normalizeComments(raw), nil
+}
+
+// FetchIssueCommentChanges reads the issue's comments through the notes
+// route newest first by update time, down to the first page that reaches a
+// note updated before since, and fills each comment's author kind through
+// the per-user route.
+//
+// The point is the newest update time the read saw. Notes updated exactly
+// at the point are returned again, so the result may hold notes that did
+// not change. A note whose author has no positive id reports
+// [domain.CommentAuthorUnknown]. The route's 304 answer is charged against
+// the rate limit, so no conditional request is sent.
+func (a *GitLabAdapter) FetchIssueCommentChanges(ctx context.Context, issueID string, since domain.CommentReadPoint) (domain.CommentChanges, error) {
+	var changes domain.CommentChanges
+	err := trackermetrics.Track(a.metrics, "fetch_comments", func() error {
+		read, readErr := a.readCommentChanges(ctx, issueID, since)
+		if readErr != nil {
+			return readErr
+		}
+		changes = read
+		return nil
+	})
+	return changes, err
+}
+
+func (a *GitLabAdapter) readCommentChanges(ctx context.Context, issueID string, since domain.CommentReadPoint) (domain.CommentChanges, error) {
+	n, ok := parseIID(issueID)
+	if !ok {
+		return domain.CommentChanges{}, &domain.TrackerError{
+			Kind:    domain.ErrTrackerNotFound,
+			Message: fmt.Sprintf("issue not found: %s", issueID),
+		}
+	}
+
+	path := "/projects/" + a.projectPath + "/issues/" + strconv.Itoa(n) + "/notes"
+	params := url.Values{
+		"activity_filter": {"only_comments"},
+		"order_by":        {"updated_at"},
+		"sort":            {"desc"},
+		"per_page":        {"100"},
+	}
+	point := decodeCommentPoint(since)
+
+	var stopErr error
+	walked, err := a.paginateNotes(ctx, path, params, func(page []gitlabNote) bool {
+		reached, err := pageReachesBefore(page, point)
+		stopErr = err
+		return reached || err != nil
+	})
+	if err != nil {
+		return domain.CommentChanges{}, err
+	}
+	if stopErr != nil {
+		return domain.CommentChanges{}, stopErr
+	}
+
+	kept, newest, err := changedNotes(walked, point)
+	if err != nil {
+		return domain.CommentChanges{}, err
+	}
+	kinds, err := a.noteAuthorKinds(ctx, kept)
+	if err != nil {
+		return domain.CommentChanges{}, err
+	}
+
+	// kept holds no system note, so normalizeComments maps it one to one.
+	comments := normalizeComments(kept)
+	for i, note := range kept {
+		comments[i].AuthorKind = kinds[note.Author.ID]
+	}
+
+	next := domain.CommentReadPoint("")
+	if !newest.IsZero() {
+		next = domain.CommentReadPoint(newest.UTC().Format(time.RFC3339Nano))
+	}
+	return domain.CommentChanges{Comments: comments, Next: next}, nil
+}
+
+// decodeCommentPoint returns the instant a point names, or the zero time
+// for an empty point or one this adapter did not return.
+func decodeCommentPoint(since domain.CommentReadPoint) time.Time {
+	point, err := time.Parse(time.RFC3339Nano, string(since))
+	if err != nil {
+		return time.Time{}
+	}
+	return point
+}
+
+// parseNoteTime accepts the forms [domain.Comment] documents for its
+// timestamps, so a passed-through UpdatedAt always parses for the caller.
+func parseNoteTime(text string) (time.Time, error) {
+	return domain.Comment{CreatedAt: text}.CreatedTime()
+}
+
+func notePayloadError(field string, err error) error {
+	return &domain.TrackerError{
+		Kind:    domain.ErrTrackerPayload,
+		Message: "failed to parse note " + field,
+		Err:     err,
+	}
+}
+
+// pageReachesBefore reports whether the page's last note, the oldest of a
+// newest-first page, was updated before point. It is never true for a zero
+// point.
+func pageReachesBefore(page []gitlabNote, point time.Time) (bool, error) {
+	if point.IsZero() || len(page) == 0 {
+		return false, nil
+	}
+	updated, err := parseNoteTime(page[len(page)-1].UpdatedAt)
+	if err != nil {
+		return false, notePayloadError("updated_at", err)
+	}
+	return updated.Before(point), nil
+}
+
+// datedNote is a note with its parsed creation time, for ordering.
+type datedNote struct {
+	gitlabNote
+	created time.Time
+}
+
+// changedNotes returns the walked notes updated at or after point, system
+// notes excluded and each note id kept once, oldest created first with ties
+// by ascending id, together with the newest update time of point and every
+// walked note.
+func changedNotes(walked []gitlabNote, point time.Time) ([]gitlabNote, time.Time, error) {
+	newest := point
+	seen := make(map[int64]struct{}, len(walked))
+	dated := make([]datedNote, 0, len(walked))
+	for _, note := range walked {
+		updated, err := parseNoteTime(note.UpdatedAt)
+		if err != nil {
+			return nil, time.Time{}, notePayloadError("updated_at", err)
+		}
+		if updated.After(newest) {
+			newest = updated
+		}
+		if updated.Before(point) || note.System {
+			continue
+		}
+		if _, dup := seen[note.ID]; dup {
+			continue
+		}
+		seen[note.ID] = struct{}{}
+
+		created, err := parseNoteTime(note.CreatedAt)
+		if err != nil {
+			return nil, time.Time{}, notePayloadError("created_at", err)
+		}
+		dated = append(dated, datedNote{gitlabNote: note, created: created})
+	}
+
+	slices.SortFunc(dated, func(a, b datedNote) int {
+		return cmp.Or(a.created.Compare(b.created), cmp.Compare(a.ID, b.ID))
+	})
+	kept := make([]gitlabNote, len(dated))
+	for i, note := range dated {
+		kept[i] = note.gitlabNote
+	}
+	return kept, newest, nil
+}
+
+// noteAuthorKinds resolves the kind of each distinct author with a
+// positive id, in order of first appearance. A lookup failure fails the
+// whole call.
+func (a *GitLabAdapter) noteAuthorKinds(ctx context.Context, notes []gitlabNote) (map[int64]domain.CommentAuthorKind, error) {
+	kinds := make(map[int64]domain.CommentAuthorKind)
+	for _, note := range notes {
+		id := note.Author.ID
+		if _, done := kinds[id]; done || id <= 0 {
+			continue
+		}
+		bot, err := a.bots.lookup(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		kinds[id] = domain.CommentAuthorPerson
+		if bot {
+			kinds[id] = domain.CommentAuthorBot
+		}
+	}
+	return kinds, nil
 }
 
 // FetchIssueByID returns a fully populated issue including comments.
@@ -1125,7 +1342,8 @@ func (a *GitLabAdapter) setClosed(path string) func(ctx context.Context, closed 
 	}
 }
 
-// CommentIssue posts text verbatim as a new issue note. No Markdown
+// CommentIssue posts text verbatim as a new issue note and returns the
+// created note's identity, the decimal form of its numeric id. No Markdown
 // conversion, no escaping, and no truncation are applied. issueID is
 // guarded through [parseIID] before any request; a rejected value or a
 // missing iid returns [domain.ErrTrackerNotFound].
@@ -1137,24 +1355,23 @@ func (a *GitLabAdapter) setClosed(path string) func(ctx context.Context, closed 
 // success. Whenever GitLab executed one or more quick actions, whether or
 // not a note was also created, the executed command keys are logged at
 // WARN; the note text itself is never logged.
-func (a *GitLabAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, text)
+func (a *GitLabAdapter) CommentIssue(ctx context.Context, issueID, text string) (string, error) {
+	var commentID string
+	err := trackermetrics.Track(a.metrics, "comment", func() error {
+		var postErr error
+		commentID, postErr = a.postComment(ctx, issueID, text)
+		return postErr
 	})
+	if err != nil {
+		return "", err
+	}
+	return commentID, nil
 }
 
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GitLabAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
-	})
-}
-
-func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) error {
+func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) (string, error) {
 	n, ok := parseIID(issueID)
 	if !ok {
-		return &domain.TrackerError{
+		return "", &domain.TrackerError{
 			Kind:    domain.ErrTrackerNotFound,
 			Message: fmt.Sprintf("issue not found: %s", issueID),
 		}
@@ -1163,7 +1380,7 @@ func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) e
 
 	payload, err := json.Marshal(map[string]string{"body": body})
 	if err != nil {
-		return &domain.TrackerError{
+		return "", &domain.TrackerError{
 			Kind:    domain.ErrTrackerPayload,
 			Message: "failed to marshal comment payload",
 			Err:     err,
@@ -1172,12 +1389,12 @@ func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) e
 
 	respBody, err := a.client.Send(ctx, http.MethodPost, path, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	var created gitlabNoteCreated
 	if err := json.Unmarshal(respBody, &created); err != nil {
-		return &domain.TrackerError{
+		return "", &domain.TrackerError{
 			Kind:    domain.ErrTrackerPayload,
 			Message: "failed to parse note-creation response",
 			Err:     err,
@@ -1196,12 +1413,12 @@ func (a *GitLabAdapter) postComment(ctx context.Context, issueID, body string) e
 	}
 
 	if created.ID == nil {
-		return &domain.TrackerError{
+		return "", &domain.TrackerError{
 			Kind:    domain.ErrTrackerPayload,
 			Message: fmt.Sprintf("gitlab created no note for issue %s: the comment body was consumed as quick actions", issueID),
 		}
 	}
-	return nil
+	return strconv.FormatInt(*created.ID, 10), nil
 }
 
 // AddLabel attaches label to the issue, resolving its canonical stored

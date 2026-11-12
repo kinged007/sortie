@@ -16,9 +16,9 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 func TestNewState(t *testing.T) {
@@ -89,9 +89,6 @@ func TestNewState(t *testing.T) {
 			}
 			if s.AgentTotals != tt.totals {
 				t.Errorf("AgentTotals = %+v, want %+v", s.AgentTotals, tt.totals)
-			}
-			if s.AgentRateLimits != nil {
-				t.Errorf("AgentRateLimits = %v, want nil", s.AgentRateLimits)
 			}
 
 			if s.MaxConcurrentByState == nil {
@@ -271,8 +268,11 @@ func TestRuntimeSnapshot(t *testing.T) {
 		if result.AgentTotals.SecondsRunning != 42.5 {
 			t.Errorf("AgentTotals.SecondsRunning = %f, want 42.5", result.AgentTotals.SecondsRunning)
 		}
-		if result.RateLimits != nil {
-			t.Errorf("RateLimits = %v, want nil", result.RateLimits)
+		if result.UsageWindows == nil {
+			t.Error("UsageWindows = nil, want non-nil empty map")
+		}
+		if len(result.UsageWindows) != 0 {
+			t.Errorf("len(UsageWindows) = %d, want 0", len(result.UsageWindows))
 		}
 	})
 
@@ -436,45 +436,33 @@ func TestRuntimeSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("rate limits present with isolation", func(t *testing.T) {
+	t.Run("kind with every window reset", func(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 10, 0, nil, AgentTotals{})
-		origData := map[string]any{
-			"requests_remaining": 42,
-			"reset_at":           "2026-03-24T13:00:00Z",
-		}
-		state.AgentRateLimits = &RateLimitSnapshot{
-			Data:       origData,
-			ReceivedAt: fixedNow,
+		older := fixedNow.Add(-3 * time.Hour)
+		newest := fixedNow.Add(-time.Hour)
+		state.UsageWindows = map[string][]domain.UsageWindow{
+			"claude-code": {
+				{Key: "five_hour", Label: "5-hour limit", ResetsAt: fixedNow.Add(-30 * time.Minute), ReportedAt: older},
+				{Key: "seven_day", Label: "Weekly limit", ResetsAt: fixedNow, ReportedAt: newest},
+			},
 		}
 
 		result := RuntimeSnapshot(state, fixedNow)
 
-		if result.RateLimits == nil {
-			t.Fatal("RateLimits = nil, want non-nil")
+		got, ok := result.UsageWindows["claude-code"]
+		if !ok {
+			t.Fatal("UsageWindows[claude-code] missing, want the kind served after all its windows reset")
 		}
-		if got, ok := result.RateLimits["requests_remaining"]; !ok || got != 42 {
-			t.Errorf("RateLimits[requests_remaining] = %v, want 42", got)
+		if got.Windows == nil {
+			t.Error("Windows = nil, want non-nil empty slice")
 		}
-		if got, ok := result.RateLimits["reset_at"]; !ok || got != "2026-03-24T13:00:00Z" {
-			t.Errorf("RateLimits[reset_at] = %v, want %q", got, "2026-03-24T13:00:00Z")
+		if len(got.Windows) != 0 {
+			t.Errorf("len(Windows) = %d, want 0 (windows reset at or before now are not served)", len(got.Windows))
 		}
-
-		origData["injected_key"] = "should not appear"
-		if _, leaked := result.RateLimits["injected_key"]; leaked {
-			t.Error("RateLimits contains injected_key after original mutation — shallow copy isolation failed")
-		}
-	})
-
-	t.Run("rate limits nil", func(t *testing.T) {
-		t.Parallel()
-
-		state := NewState(5000, 10, 0, nil, AgentTotals{})
-		result := RuntimeSnapshot(state, fixedNow)
-
-		if result.RateLimits != nil {
-			t.Errorf("RateLimits = %v, want nil", result.RateLimits)
+		if !got.ReportedAt.Equal(newest) {
+			t.Errorf("ReportedAt = %v, want %v (newest report of every held window)", got.ReportedAt, newest)
 		}
 	})
 
@@ -1061,6 +1049,31 @@ func TestRuntimeSnapshot_StagePosition(t *testing.T) {
 	}
 }
 
+func TestRecordIssueRead(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	steps := []struct {
+		name      string
+		startedAt time.Time
+		read      string
+		want      string
+	}{
+		{"first read after dispatch", now, "ai:in-progress", "ai:in-progress"},
+		{"equal start is refused", now, "ai:done", "ai:in-progress"},
+		{"older start is refused", now.Add(-time.Second), "ai:done", "ai:in-progress"},
+	}
+	entry := &RunningEntry{Issue: domain.Issue{State: "ai:ready", Labels: []string{"ai:ready"}}}
+
+	for _, step := range steps {
+		recordIssueRead(entry, domain.IssueStateAndLabels{State: step.read, Labels: []string{step.read}}, step.startedAt)
+
+		if entry.Issue.State != step.want || !slices.Equal(entry.Issue.Labels, []string{step.want}) {
+			t.Errorf("%s: recordIssueRead state, labels = %q, %q, want %q for both", step.name, entry.Issue.State, entry.Issue.Labels, step.want)
+		}
+	}
+}
+
 func TestRuntimeSnapshot_PendingReactionWatchEndsAt(t *testing.T) {
 	t.Parallel()
 
@@ -1076,6 +1089,7 @@ func TestRuntimeSnapshot_PendingReactionWatchEndsAt(t *testing.T) {
 		{"ci without a recorded head counts from creation", PendingReaction{Kind: ReactionKindCI}, at(24 * time.Hour)},
 		{"review counts from the restart", PendingReaction{Kind: ReactionKindReview, WatchRestartedAt: created.Add(20 * time.Minute)}, at(50 * time.Minute)},
 		{"kind without a window", PendingReaction{Kind: ReactionKindMergeCompletion}, nil},
+		{"review awaiting approval has no end", PendingReaction{Kind: ReactionKindReview, LastCheck: &ReactionCheck{Comments: &CommentCheck{AwaitingApproval: true}}}, nil},
 	}
 
 	for _, tt := range tests {
@@ -2258,7 +2272,7 @@ func TestPopulateParked(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 4, 0, nil, AgentTotals{})
-		rows := []persistence.ParkedIssue{
+		rows := []storage.ParkedIssue{
 			{IssueID: "id-2", Identifier: "PROJ-2", Reason: parkReasonHandoffAbsence, Label: "needs-human", ParkedAt: "2026-08-17T01:00:00Z"},
 		}
 
@@ -2273,7 +2287,7 @@ func TestPopulateParked(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 4, 0, nil, AgentTotals{})
-		rows := []persistence.ParkedIssue{
+		rows := []storage.ParkedIssue{
 			{IssueID: "", Identifier: "PROJ-MALFORMED", Reason: parkReasonAgentBlocked, ParkedAt: "2026-08-17T00:00:00Z"},
 			{IssueID: "id-3", Identifier: "PROJ-3", Reason: parkReasonAgentBlocked, ParkedAt: "2026-08-17T00:00:00Z"},
 		}
@@ -2296,7 +2310,7 @@ func TestPopulateParked(t *testing.T) {
 		t.Parallel()
 
 		state := NewState(5000, 4, 0, nil, AgentTotals{})
-		PopulateParked(state, []persistence.ParkedIssue{
+		PopulateParked(state, []storage.ParkedIssue{
 			{IssueID: "id-4", Identifier: "PROJ-4", Reason: parkReasonAgentBlocked, ParkedAt: "2026-08-17T00:00:00Z"},
 		}, nil)
 
@@ -2480,16 +2494,18 @@ func TestRuntimeSnapshot_AgentTotalsExclusionCounts(t *testing.T) {
 
 	state := NewState(5000, 4, 0, nil, AgentTotals{UnmeasuredSessions: 5})
 	state.Running["unreported-inc"] = &RunningEntry{
-		Identifier:   "PROJ-1",
-		Issue:        domain.Issue{ID: "unreported-inc", State: "In Progress"},
-		StartedAt:    fixedNow.Add(-time.Minute),
-		UsageArrival: registry.UsageArrivalIncremental,
+		Identifier:         "PROJ-1",
+		Issue:              domain.Issue{ID: "unreported-inc", State: "In Progress"},
+		StartedAt:          fixedNow.Add(-time.Minute),
+		UsageArrival:       registry.UsageArrivalIncremental,
+		CarriesTokenFigure: true,
 	}
 	state.Running["unreported-turnend"] = &RunningEntry{
-		Identifier:   "PROJ-2",
-		Issue:        domain.Issue{ID: "unreported-turnend", State: "In Progress"},
-		StartedAt:    fixedNow.Add(-time.Minute),
-		UsageArrival: registry.UsageArrivalTurnEnd,
+		Identifier:         "PROJ-2",
+		Issue:              domain.Issue{ID: "unreported-turnend", State: "In Progress"},
+		StartedAt:          fixedNow.Add(-time.Minute),
+		UsageArrival:       registry.UsageArrivalTurnEnd,
+		CarriesTokenFigure: true,
 	}
 	state.Running["no-arrival-1"] = &RunningEntry{
 		Identifier:   "PROJ-3",
@@ -2504,11 +2520,12 @@ func TestRuntimeSnapshot_AgentTotalsExclusionCounts(t *testing.T) {
 		UsageArrival: registry.UsageArrivalNone,
 	}
 	state.Running["measured"] = &RunningEntry{
-		Identifier:    "PROJ-5",
-		Issue:         domain.Issue{ID: "measured", State: "In Progress"},
-		StartedAt:     fixedNow.Add(-time.Minute),
-		UsageArrival:  registry.UsageArrivalIncremental,
-		UsageMeasured: true,
+		Identifier:         "PROJ-5",
+		Issue:              domain.Issue{ID: "measured", State: "In Progress"},
+		StartedAt:          fixedNow.Add(-time.Minute),
+		UsageArrival:       registry.UsageArrivalIncremental,
+		UsageMeasured:      true,
+		CarriesTokenFigure: true,
 	}
 
 	result := RuntimeSnapshot(state, fixedNow)
@@ -2639,6 +2656,7 @@ func TestRuntimeSnapshot_TokensAwaited(t *testing.T) {
 		turnCount        int
 		lastEvent        domain.AgentEventType
 		usageMeasured    bool
+		carriesNoFigure  bool
 		wantAwaited      bool
 		wantUnreported   int
 		wantNonReporting int
@@ -2692,6 +2710,12 @@ func TestRuntimeSnapshot_TokensAwaited(t *testing.T) {
 			usageMeasured: true,
 		},
 		{
+			name:             "turn_end session that carries no token figure is non-reporting",
+			arrival:          registry.UsageArrivalTurnEnd,
+			carriesNoFigure:  true,
+			wantNonReporting: 1,
+		},
+		{
 			name:             "arrival none is non-reporting whatever the turn",
 			arrival:          registry.UsageArrivalNone,
 			wantNonReporting: 1,
@@ -2704,13 +2728,14 @@ func TestRuntimeSnapshot_TokensAwaited(t *testing.T) {
 
 			state := NewState(5000, 4, 0, nil, AgentTotals{})
 			state.Running["iss"] = &RunningEntry{
-				Identifier:     "PROJ-1",
-				Issue:          domain.Issue{ID: "iss", State: "In Progress"},
-				StartedAt:      fixedNow.Add(-time.Minute),
-				TurnCount:      tt.turnCount,
-				LastAgentEvent: tt.lastEvent,
-				UsageArrival:   tt.arrival,
-				UsageMeasured:  tt.usageMeasured,
+				Identifier:         "PROJ-1",
+				Issue:              domain.Issue{ID: "iss", State: "In Progress"},
+				StartedAt:          fixedNow.Add(-time.Minute),
+				TurnCount:          tt.turnCount,
+				LastAgentEvent:     tt.lastEvent,
+				UsageArrival:       tt.arrival,
+				UsageMeasured:      tt.usageMeasured,
+				CarriesTokenFigure: tt.arrival.ReportsAnyFigure() && !tt.carriesNoFigure,
 			}
 
 			result := RuntimeSnapshot(state, fixedNow)
@@ -2808,4 +2833,110 @@ func TestBuildAutoMergeReactionConfig_OmittedEscalationResolvesToLabel(t *testin
 	if got.Escalation != "label" {
 		t.Errorf("BuildAutoMergeReactionConfig(omitted escalation).Escalation = %q, want %q", got.Escalation, "label")
 	}
+}
+
+func TestSnapshotCapture_TimeDerivedFieldsFollowTheRead(t *testing.T) {
+	t.Parallel()
+
+	t0 := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+	t2 := t1.Add(2 * time.Minute)
+	reported := t0.Add(30 * time.Second)
+
+	state := NewState(5000, 10, 0, nil, AgentTotals{SecondsRunning: 100})
+	state.Running["started"] = &RunningEntry{Issue: domain.Issue{ID: "started"}, StartedAt: t0}
+	state.Running["unstarted"] = &RunningEntry{Issue: domain.Issue{ID: "unstarted"}}
+	state.UsageWindows = map[string][]domain.UsageWindow{"kind-a": {
+		{Key: "resets", ResetsAt: t1.Add(time.Minute), ReportedAt: reported},
+		{Key: "open", ReportedAt: reported.Add(-time.Second)},
+	}}
+	c := captureSnapshot(state)
+
+	at1 := c.at(t1.In(time.FixedZone("UTC+3", 3*3600)))
+	at2 := c.at(t2)
+
+	tests := []struct {
+		name     string
+		got      RuntimeSnapshotResult
+		now      time.Time
+		wantKeys []string
+	}{
+		{"first read", at1, t1, []string{"resets", "open"}},
+		{"second read", at2, t2, []string{"open"}},
+	}
+	for _, tt := range tests {
+		if tt.got.GeneratedAt.Location() != time.UTC || !tt.got.GeneratedAt.Equal(tt.now) {
+			t.Errorf("%s: GeneratedAt = %v, want %v in UTC", tt.name, tt.got.GeneratedAt, tt.now)
+		}
+		if want := 100 + tt.now.Sub(t0).Seconds(); tt.got.AgentTotals.SecondsRunning != want {
+			t.Errorf("%s: SecondsRunning = %v, want %v", tt.name, tt.got.AgentTotals.SecondsRunning, want)
+		}
+		w := tt.got.UsageWindows["kind-a"]
+		var keys []string
+		for _, uw := range w.Windows {
+			keys = append(keys, uw.Key)
+		}
+		if !slices.Equal(keys, tt.wantKeys) || !w.ReportedAt.Equal(reported) {
+			t.Errorf("%s: window keys = %v, ReportedAt = %v, want %v, %v", tt.name, keys, w.ReportedAt, tt.wantKeys, reported)
+		}
+	}
+}
+
+func TestSnapshotCapture_RelayedInstant(t *testing.T) {
+	t.Parallel()
+
+	t0 := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+	const timeoutMS = 60000
+	timeout := timeoutMS * time.Millisecond
+
+	tests := []struct {
+		name     string
+		cell     *relayedInstant
+		observed time.Time
+		want     time.Time
+	}{
+		{"nil cell", nil, time.Time{}, t0},
+		{"cell at the applied instant", &relayedInstant{}, t0, t0},
+		{"cell after the applied instant", &relayedInstant{}, t1, t1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := NewState(5000, 10, 0, nil, AgentTotals{})
+			state.StallTimeoutMS = timeoutMS
+			entry := &RunningEntry{Issue: domain.Issue{ID: "a"}, LastAgentTimestamp: t0, relayed: tt.cell}
+			state.Running["a"] = entry
+			c := captureSnapshot(state)
+			tt.cell.observe(tt.observed)
+
+			row := c.at(t1.Add(time.Hour)).Running[0]
+
+			got := []time.Time{row.LastAgentTimestamp, row.StallReference, row.QuietAt, row.StallAt, stallReference(entry)}
+			want := []time.Time{tt.want, tt.want, tt.want.Add(timeout / 2), tt.want.Add(timeout), tt.want}
+			for i := range got {
+				if !got[i].Equal(want[i]) {
+					t.Errorf("read instant %d = %v, want %v", i, got[i], want[i])
+				}
+			}
+			if captured := c.result.Running[0]; !captured.LastAgentTimestamp.Equal(t0) || !captured.StallReference.Equal(t0) {
+				t.Errorf("capture holds %v and %v, want %v for both", captured.LastAgentTimestamp, captured.StallReference, t0)
+			}
+		})
+	}
+
+	t.Run("observe ignores an earlier or zero instant", func(t *testing.T) {
+		t.Parallel()
+
+		cell := &relayedInstant{}
+		cell.observe(t1)
+
+		cell.observe(t0)
+		cell.observe(time.Time{})
+
+		if got := cell.load(); !got.Equal(t1) {
+			t.Errorf("load() = %v, want %v", got, t1)
+		}
+	})
 }

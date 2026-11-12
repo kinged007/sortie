@@ -12,6 +12,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/scm/scmcore"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -71,7 +72,9 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 		rkey := ReactionKey(pending.IssueID, ReactionKindReview)
 
 		// A standing escalation is never aged out; its own facts end it.
-		if ttl > 0 && !pending.escalationStands() && now.Sub(watchWindowStart(pending)) > ttl {
+		windowElapsed := ttl > 0 && !pending.escalationStands() && now.Sub(watchWindowStart(pending)) > ttl
+
+		dropWatch := func() {
 			cancelReactionTriage(pending)
 			// A spent counter outlives the drop: an entry re-seeded by
 			// another kind's worker exit would otherwise open a fresh
@@ -82,10 +85,26 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 				delete(state.ReactionAttempts, rkey)
 			}
 			delete(state.ReactionHandedOffComments, rkey)
+		}
+		dropWindowElapsed := func() {
+			dropWatch()
 			entryLog.Warn("review watch window elapsed, dropping",
 				slog.Int64("window_ms", int64(ttl/time.Millisecond)),
 				slog.Int64("age_ms", int64(now.Sub(watchWindowStart(pending))/time.Millisecond)),
 			)
+		}
+		dropEnded := func() {
+			dropWatch()
+			entryLog.Info("pull request awaiting approval ended, dropping",
+				slog.Int("pr_number", reviewData.PRNumber),
+			)
+		}
+
+		// A watch waiting on an approval outlives its window: the person who
+		// approves takes longer than the window, and the pull request read
+		// below ends the wait when the pull request ends.
+		if windowElapsed && !awaits(pending.LastCheck) {
+			dropWindowElapsed()
 			continue
 		}
 
@@ -105,12 +124,23 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 			continue
 		}
 
-		if pending.escalationStands() {
+		// The decision arm below reuses this pass's pull request read so a
+		// pass reads the pull request at most once.
+		var read pullRequestRead
+		switch {
+		case pending.escalationStands():
 			if watchStandingPullRequest(ctx, state, params.Store, params.SCMAdapter, key, pending, true, now, pollInterval, entryLog) {
 				continue
 			}
-		} else {
-			readPullRequestURL(ctx, params.SCMAdapter, pending, entryLog)
+			read.made = true
+		case awaits(pending.LastCheck):
+			read = readPullRequest(ctx, params.SCMAdapter, pending, entryLog)
+			if pullRequestEnded(read.status, read.err) {
+				dropEnded()
+				continue
+			}
+		default:
+			read = readPullRequestURL(ctx, params.SCMAdapter, pending, entryLog)
 		}
 
 		// Fetch reviews from SCM.
@@ -156,9 +186,47 @@ func reconcileReviewComments(state *State, params ReconcileParams, log *slog.Log
 			// against the next episode that recomputes the same set.
 			cancelReactionTriage(pending)
 			endEscalationAndCounter(ctx, state, params.Store, pending, entryLog)
+
+			awaiting := awaits(pending.LastCheck)
+			decision, decisionErr := params.SCMAdapter.GetReviewDecision(ctx, reviewData.PRNumber, reviewData.Owner, reviewData.Repo)
+			if decisionErr != nil {
+				entryLog.WarnContext(ctx, "review decision fetch failed",
+					slog.Any("error", decisionErr),
+					slog.Int("pr_number", reviewData.PRNumber),
+				)
+			} else {
+				awaiting = decision == domain.ReviewDecisionReviewRequired
+			}
+
+			// A reading written without a pull request read of this pass
+			// would show a merged pull request as waiting on approval.
+			if awaiting && !awaits(pending.LastCheck) {
+				if !read.made {
+					read = readPullRequest(ctx, params.SCMAdapter, pending, entryLog)
+				}
+				if pullRequestEnded(read.status, read.err) {
+					dropEnded()
+					continue
+				}
+				if read.err != nil {
+					awaiting = false
+				}
+			}
+
+			if windowElapsed && !awaiting {
+				dropWindowElapsed()
+				continue
+			}
+
 			pending.PendingRetryAt = now.Add(pollInterval)
 			pending.LastCheck = commentReactionCheck(now, 0, 0)
+			pending.LastCheck.Comments.AwaitingApproval = awaiting
 			requeueReaction(state, key, pending, waitPollInterval)
+			continue
+		}
+
+		if windowElapsed {
+			dropWindowElapsed()
 			continue
 		}
 
@@ -408,11 +476,15 @@ func applyReviewEscalation(
 		)
 	}
 
-	commentText := buildReviewEscalationComment(reviewData, turnCount)
-	if trigger == EscalationTriggerTriage {
-		commentText = buildTriageEscalationComment("review", fmt.Sprintf("PR #%d", reviewData.PRNumber))
+	var facts domain.MessageFacts = domain.ReviewEscalationFacts{
+		PRNumber: reviewData.PRNumber,
+		Branch:   reviewData.Branch,
+		Turns:    turnCount,
 	}
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationReviewComments, pending, commentText))
+	if trigger == EscalationTriggerTriage {
+		facts = domain.TriageEscalationFacts{PRNumber: reviewData.PRNumber}
+	}
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationReviewComments, pending, facts))
 
 	if params.ReviewConfig.Escalation == "label" {
 		label := params.ReviewConfig.EscalationLabel
@@ -455,15 +527,6 @@ func applyReviewEscalation(
 	})
 }
 
-// buildReviewEscalationComment builds a plain-text escalation comment
-// for review fixes that exceeded the turn budget.
-func buildReviewEscalationComment(reviewData *ReviewReactionData, turnCount int) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Review fix continuation turns exhausted for PR #%d on branch %s.\n", reviewData.PRNumber, reviewData.Branch)
-	fmt.Fprintf(&b, "%d continuation turns attempted. Remaining review comments require human attention.", turnCount)
-	return b.String()
-}
-
 // buildReviewFingerprint constructs a deterministic fingerprint from the
 // set of non-outdated review comments. The fingerprint is the lowercase
 // hex SHA-256 hash of sorted, newline-joined comment IDs. Returns an
@@ -481,16 +544,6 @@ func buildReviewFingerprint(comments []domain.ReviewComment) string {
 
 	h := sha256.Sum256([]byte(strings.Join(ids, "\n")))
 	return fmt.Sprintf("%x", h)
-}
-
-// handedOffCommentWriter persists the comment IDs a run was given.
-type handedOffCommentWriter interface {
-	AddReactionHandedOffComments(ctx context.Context, issueID, kind string, commentIDs []string) error
-}
-
-// handedOffCommentReader loads the comment IDs an issue's runs were given.
-type handedOffCommentReader interface {
-	ListReactionHandedOffComments(ctx context.Context, issueID, kind string) ([]string, error)
 }
 
 // commentTemplateKey returns the prompt variable that carries the comments
@@ -539,7 +592,7 @@ func countCurrentComments(comments []domain.ReviewComment) int {
 // loadHandedOffComments caches the stored handed-off set of the issue and
 // kind unless the key is already cached. A key with no rows is cached as
 // empty.
-func loadHandedOffComments(ctx context.Context, state *State, store handedOffCommentReader, issueID, kind string) error {
+func loadHandedOffComments(ctx context.Context, state *State, store storage.ReactionHandoffStore, issueID, kind string) error {
 	rkey := ReactionKey(issueID, kind)
 	if _, loaded := state.ReactionHandedOffComments[rkey]; loaded {
 		return nil
@@ -695,7 +748,7 @@ func countCommentsOutsideRuns(state *State, issueID, kind string, comments []dom
 // key gains the absent IDs and only those are stored. For an uncached key
 // every ID is stored and the key stays uncached, because a partial key
 // would read as authoritative. A store error keeps the cache.
-func recordHandedOffComments(ctx context.Context, state *State, store handedOffCommentWriter, issueID, kind string, commentIDs []string, log *slog.Logger) {
+func recordHandedOffComments(ctx context.Context, state *State, store storage.ReactionHandoffStore, issueID, kind string, commentIDs []string, log *slog.Logger) {
 	toStore := commentIDs
 	if cached, loaded := state.ReactionHandedOffComments[ReactionKey(issueID, kind)]; loaded {
 		toStore = nil

@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { SearchIcon, XIcon } from "@/components/icons";
 import { Hint } from "@/components/ui/hint";
+import { MONO } from "@/components/ui/mono";
 import {
   Table,
   TableBody,
@@ -14,6 +15,7 @@ import {
 import { useTableSort } from "@/components/use-table-sort";
 import { fmtCount, fmtRate, fmtStamp } from "@/lib/format";
 import { layerLabel, UNSET_RATE, UNSET_RATE_FROM_INPUT } from "@/lib/rates";
+import { Panel } from "@/components/Panel";
 
 import type { ClassRateResponse, ModelPriceResponse } from "@/api/types.gen";
 import type { SortColumn } from "@/components/use-table-sort";
@@ -23,7 +25,7 @@ const TABLE_LAYERS: readonly string[] = ["operator_table", "fetched", "embedded"
 const COLUMN_COUNT = 9;
 
 const SEARCH_FIELD =
-  "h-(--size-control) w-80 max-w-full rounded-lg border border-line bg-field pr-xl pl-[calc(var(--spacing-sm)+var(--size-icon)+var(--spacing-xs))] text-body-md text-ink outline-none transition-colors duration-(--duration-feedback) placeholder:text-ink-muted hover:border-line-medium focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring";
+  "h-(--size-control) w-56 max-w-full rounded-lg @xl:w-80 border border-line bg-field pr-xl pl-[calc(var(--spacing-sm)+var(--size-icon)+var(--spacing-xs))] text-body-md text-ink outline-none transition-colors duration-(--duration-feedback) placeholder:text-ink-muted hover:border-line-medium focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring";
 
 function rateClasses(row: ModelPriceResponse): ClassRateResponse[] {
   return [row.input, row.output, row.cache_read, row.cache_write];
@@ -60,7 +62,7 @@ interface RateCellProps {
 function RateCell({ rate, isMixed }: RateCellProps) {
   const words = rateWords(rate);
   return (
-    <TableCell look="number">
+    <TableCell look="number" isWrapping>
       {isMixed && rate.layer !== null ? <Hint hint={layerLabel(rate.layer)}>{words}</Hint> : words}
     </TableCell>
   );
@@ -77,9 +79,19 @@ function ModelRow({ row }: ModelRowProps) {
   const isMixed = layers.size > 1;
   return (
     <TableRow>
-      <TableCell>{row.model === "" ? "Model not reported" : row.model}</TableCell>
-      <TableCell>{row.agent_kind}</TableCell>
-      <TableCell>{pricedByText(row)}</TableCell>
+      <TableCell>
+        {row.model === "" ? (
+          MODEL_NOT_REPORTED
+        ) : (
+          <span className={`block max-w-[208px] truncate ${MONO}`} title={row.model}>
+            {row.model}
+          </span>
+        )}
+      </TableCell>
+      <TableCell>
+        <span className={MONO}>{row.agent_kind}</span>
+      </TableCell>
+      <TableCell isWrapping>{pricedByText(row)}</TableCell>
       <RateCell rate={row.input} isMixed={isMixed} />
       <RateCell rate={row.output} isMixed={isMixed} />
       <RateCell rate={row.cache_read} isMixed={isMixed} />
@@ -94,8 +106,10 @@ function rateValue(rate: ClassRateResponse): number | null {
   return rate.from_input ? null : rate.per_mtok;
 }
 
+const MODEL_NOT_REPORTED = "Model not reported";
+
 const SORT_COLUMNS: readonly SortColumn<ModelPriceResponse>[] = [
-  { id: "model", value: (row) => row.model },
+  { id: "model", value: (row) => (row.model === "" ? MODEL_NOT_REPORTED : row.model) },
   { id: "agent", value: (row) => row.agent_kind },
   { id: "layer", value: (row) => pricedByText(row) ?? null },
   { id: "input", value: (row) => rateValue(row.input) },
@@ -122,7 +136,7 @@ function ModelSearch({ query, onQueryChange }: ModelSearchProps) {
   }
 
   return (
-    <label className="relative flex items-center">
+    <label className="relative flex min-w-0 items-center">
       <span className="sr-only">Search models</span>
       <SearchIcon className="pointer-events-none absolute left-sm text-ink-muted" />
       <input
@@ -148,12 +162,10 @@ function ModelSearch({ query, onQueryChange }: ModelSearchProps) {
   );
 }
 
-/** Props of {@link ModelsTable}. */
 export interface ModelsTableProps {
   rows: readonly ModelPriceResponse[];
 }
 
-/** Renders the rates the next run of each agent kind and model gets, in the order served until a column is sorted. */
 export function ModelsTable({ rows }: ModelsTableProps) {
   const [query, setQuery] = useState("");
   const needle = query.trim().toLowerCase();
@@ -162,11 +174,8 @@ export function ModelsTable({ rows }: ModelsTableProps) {
     needle === "" ? ordered : ordered.filter((row) => row.model.toLowerCase().includes(needle));
 
   return (
-    <section className="mt-xl flex flex-col gap-sm">
-      <div className="flex justify-end">
-        <ModelSearch query={query} onQueryChange={setQuery} />
-      </div>
-      <Table title="Models">
+    <Panel title="Models" right={<ModelSearch query={query} onQueryChange={setQuery} />}>
+      <Table frozenColumns={1}>
         <TableHeader>
           <SortableHead columnId="model" sort={sort}>
             Model
@@ -178,16 +187,16 @@ export function ModelsTable({ rows }: ModelsTableProps) {
             Priced by
           </SortableHead>
           <SortableHead columnId="input" sort={sort} align="right">
-            Input per 1M
+            Input
           </SortableHead>
           <SortableHead columnId="output" sort={sort} align="right">
-            Output per 1M
+            Output
           </SortableHead>
           <SortableHead columnId="cache_read" sort={sort} align="right">
-            Cache read per 1M
+            Cache read
           </SortableHead>
           <SortableHead columnId="cache_write" sort={sort} align="right">
-            Cache write per 1M
+            Cache write
           </SortableHead>
           <SortableHead columnId="last_used" sort={sort}>
             Last used
@@ -209,6 +218,7 @@ export function ModelsTable({ rows }: ModelsTableProps) {
           ) : undefined}
         </TableBody>
       </Table>
-    </section>
+      <p className="text-body-sm text-ink-muted">Prices are per 1 million tokens.</p>
+    </Panel>
   );
 }

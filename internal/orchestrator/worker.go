@@ -11,10 +11,13 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
+	"github.com/sortie-ai/sortie/internal/commentfeed"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
@@ -22,6 +25,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/storage"
 	"github.com/sortie-ai/sortie/internal/workspace"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
@@ -105,6 +109,14 @@ type WorkerResult struct {
 	// returned when the worker exits on it; else nil.
 	StartupError error
 
+	// UnstartedResumeID is the session an exit before session start was
+	// asked to resume; else empty.
+	UnstartedResumeID string
+
+	// CancelCause is the worker context's cancellation cause on a cancelled
+	// exit; nil otherwise.
+	CancelCause error
+
 	// StoppedByCeiling is true when the worker context's cancellation
 	// cause is a budget ceiling's own in-flight stop request.
 	StoppedByCeiling bool
@@ -119,6 +131,10 @@ type WorkerResult struct {
 	// TurnsCompleted.
 	TurnsStarted int
 
+	// LastPromptAt is when the worker counted its last started turn, before
+	// that turn's prompt was sent; zero when TurnsStarted is 0.
+	LastPromptAt time.Time
+
 	// SessionID is the accepted session identifier at the moment report
 	// hands this result to [WorkerDeps.OnExit]. It is empty when the
 	// working session never started, or started with an empty identifier
@@ -126,19 +142,19 @@ type WorkerResult struct {
 	// continuation retries.
 	SessionID string
 
-	// ResumeUsage is the ResumeUsage of the last TurnResult the working
-	// session returned, nil when that turn reported none. When the working
-	// session returned no TurnResult it is WorkerDeps.ResumeUsage. A later
-	// run resuming SessionID starts from it.
-	ResumeUsage *domain.TokenUsage
-
-	// ResumeUsageByModel is the per-model split of ResumeUsage, set by the
-	// same rule.
-	ResumeUsageByModel map[string]domain.TokenUsage
-
 	// UsageByModel is the worker mirror's per-model totals, which sum to
 	// Usage in every class.
 	UsageByModel map[string]domain.TokenUsage
+
+	// UsageProvenance is the union of the provenance of every turn result
+	// the worker folded, the credential verification step's included. Nil
+	// when no turn settled a token figure.
+	UsageProvenance []domain.UsageProvenance
+
+	// ReportedAmounts is the worker mirror's run-cumulative amounts the
+	// runtime reported, each in its own unit, sorted by unit then model.
+	// Nil when the run reported none.
+	ReportedAmounts []domain.ReportedAmount
 
 	// WorkspacePath is the workspace directory for this attempt, empty if
 	// preparation failed.
@@ -228,11 +244,10 @@ type WorkerResult struct {
 // SessionToolRegistryFunc builds the first-turn tool advertisement.
 type SessionToolRegistryFunc func(ctx context.Context, issueID, workspacePath string) (*domain.ToolRegistry, error)
 
-// AgentToolChannelFunc reports whether a session of the given kind, in the
-// given mode, can execute the registry's tools. remote is true for SSH. A
-// nil [WorkerDeps.AgentToolChannelFunc] means the answer is unknown, not
-// that no channel exists.
-type AgentToolChannelFunc func(kind string, remote bool) bool
+// AgentToolChannelFunc reports whether a session of the given kind can
+// execute the registry's tools. A nil [WorkerDeps.AgentToolChannelFunc]
+// means the answer is unknown, not that no channel exists.
+type AgentToolChannelFunc func(kind string) bool
 
 // SSHEnvNamesFunc returns the env var names to carry into a remote session
 // of the given kind: the kind's declared credential names plus the
@@ -328,6 +343,10 @@ type WorkerDeps struct {
 	// AgentSettings is the settings block resolved for this attempt.
 	AgentSettings config.AgentSettings
 
+	// UsageLimitNotified reports that the dispatch is a retry after a provider
+	// usage-limit refusal, which publishes no session.started event.
+	UsageLimitNotified bool
+
 	// OnEvent relays agent events to the serialized event loop. Called from
 	// the worker goroutine; must be concurrency-safe.
 	OnEvent func(issueID string, event domain.AgentEvent)
@@ -336,9 +355,19 @@ type WorkerDeps struct {
 	// the goroutine returns. Must be concurrency-safe.
 	OnExit func(issueID string, result WorkerResult)
 
+	// OnWorkspaceReady reports the prepared workspace path before the agent
+	// starts. Called from the worker goroutine; must be concurrency-safe.
+	// Nil disables it.
+	OnWorkspaceReady func(issueID, path string)
+
 	// OnTurnStarted reports turnsStarted before each turn runs. Called from
 	// the worker goroutine; must be concurrency-safe. Nil disables it.
 	OnTurnStarted func(issueID string, turnsStarted int)
+
+	// OnIssueRead reports the state and labels read right after the
+	// in-progress transition, with the instant the read started. Called from
+	// the worker goroutine; must be concurrency-safe. Nil disables the read.
+	OnIssueRead func(issueID string, read domain.IssueStateAndLabels, startedAt time.Time)
 
 	// OnUnaccountedTurns reports the run's cumulative count of turns that
 	// spent tokens no figure was proven to cover, each time a turn changes it.
@@ -346,18 +375,22 @@ type WorkerDeps struct {
 	// disables it.
 	OnUnaccountedTurns func(issueID string, unaccountedTurns int)
 
+	// CommentFeedStore backs the comment feed's posted and given records. Nil
+	// turns the feed off for the attempt.
+	CommentFeedStore commentfeed.Store
+
+	// OnCommentsGiven reports the rows of comments delivered to the agent, each
+	// stamped with its conversation. Called from the worker goroutine; must be
+	// concurrency-safe. Nil turns the feed off for the attempt.
+	OnCommentsGiven func(issueID string, rows []storage.GivenComment)
+
+	// CommentFeedAccessDenied latches, for the process, that the tracker token
+	// was refused the author access lookup. Nil latches per run only.
+	CommentFeedAccessDenied *atomic.Bool
+
 	// ResumeSessionID is the previous attempt's session ID, non-empty on
 	// continuation retries so the adapter can resume the conversation.
 	ResumeSessionID string
-
-	// ResumeUsage is the figure the previous run recorded for
-	// ResumeSessionID's session, passed to StartSession unchanged. Nil
-	// when ResumeSessionID is empty or that run recorded none.
-	ResumeUsage *domain.TokenUsage
-
-	// ResumeUsageByModel is the per-model split of ResumeUsage, passed to
-	// StartSession unchanged.
-	ResumeUsageByModel map[string]domain.TokenUsage
 
 	// DispatchID fences session identity to this worker attempt.
 	DispatchID string
@@ -371,8 +404,8 @@ type WorkerDeps struct {
 	// worker falls back to ToolRegistry. Optional.
 	SessionToolRegistryFunc SessionToolRegistryFunc
 
-	// AgentToolChannelFunc reports whether the session's kind and mode can
-	// reach the tools the advertisement would name. Nil means unknown, and
+	// AgentToolChannelFunc reports whether the session's kind can reach
+	// the tools the advertisement would name. Nil means unknown, and
 	// the worker withholds the advertisement rather than name uncallable
 	// tools. Optional.
 	AgentToolChannelFunc AgentToolChannelFunc
@@ -426,6 +459,10 @@ type WorkerDeps struct {
 	// the worker goroutine; must be concurrency-safe. May be nil when
 	// self-review is not configured.
 	OnProgress func(selfReviewProgressMsg)
+
+	// VerificationCache holds the credential proofs shared by the runs of one
+	// orchestrator. Nil verifies the credential on every run.
+	VerificationCache *verificationCache
 }
 
 // normalizeAttempt converts the nullable attempt to a plain integer; nil
@@ -663,6 +700,8 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		localUsageByModel = map[string]domain.TokenUsage{}
 		localModelName    string
 		localRequestCount int
+		localProvenance   []domain.UsageProvenance
+		localAmounts      []domain.ReportedAmount
 	)
 
 	// localCurrentModel is metricModel for the worker's local mirror.
@@ -677,7 +716,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			return true
 		}
 		if !discardWarned {
-			logger.Warn("token usage discarded: agent kind declares this session reports none",
+			logger.Warn("token usage discarded: agent kind attaches no source that counts tokens",
 				slog.String("agent_kind", agentKind),
 			)
 			discardWarned = true
@@ -689,6 +728,9 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	// worker mirror. A rejected measurement reports false so the caller
 	// skips the state-file write.
 	foldRelayedEvent := func(event domain.AgentEvent) (measurementArrived bool) {
+		if event.ReportedAmounts != nil {
+			localAmounts = usage.MergeAmounts(localAmounts, event.ReportedAmounts)
+		}
 		measurementArrived = event.Type == domain.EventTokenUsage || hasUsage(event.Usage)
 		if measurementArrived && !admitMeasurement() {
 			return false
@@ -710,6 +752,14 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	}
 
 	foldTurnResult := func(result domain.TurnResult) (carriesMeasurement bool) {
+		for _, member := range result.UsageProvenance {
+			if !slices.Contains(localProvenance, member) {
+				localProvenance = append(localProvenance, member)
+			}
+		}
+		if result.ReportedAmounts != nil {
+			localAmounts = usage.MergeAmounts(localAmounts, result.ReportedAmounts)
+		}
 		if result.SessionID != previousSessionID {
 			localCoverable = 0
 		}
@@ -747,23 +797,42 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	// reported guards against double-reporting from the panic recovery.
 	reported := false
 
-	// Every working TurnResult replaces resumeUsage, nil included: a turn
-	// that ended without a reading must not hand its predecessor's figure
-	// on, because the runtime may have saved calls that figure omits.
-	resumeUsage := deps.ResumeUsage
-	resumeUsageByModel := deps.ResumeUsageByModel
+	feed := newCommentFeed(ctx, issue.ID, cfg, deps, logger)
 
 	var acceptedSessionID string
+	var sessionStarted bool
+	var lastPromptAt time.Time
 
 	// cancelledAtEnding is read right after the call that last ended a run attempt.
 	var cancelledAtEnding bool
 
+	var cacheKey verificationKey
+	var cacheKeyed bool
+	var workingTurnProven bool
+
+	credentialProofVoided := func(result WorkerResult) bool {
+		return result.ExitKind == WorkerExitError && (!workingTurnProven || refusesCredential(result.Error))
+	}
+
 	report := func(result WorkerResult) {
+		if cacheKeyed && credentialProofVoided(result) {
+			deps.VerificationCache.evict(cacheKey)
+		}
 		result.StoppedByCeiling = result.ExitKind == WorkerExitCancelled && errors.Is(context.Cause(ctx), errCeilingStop)
+		if result.ExitKind == WorkerExitCancelled {
+			result.CancelCause = context.Cause(ctx)
+		}
 		result.SessionID = acceptedSessionID
-		result.ResumeUsage = resumeUsage
-		result.ResumeUsageByModel = resumeUsageByModel
+		if !sessionStarted {
+			result.UnstartedResumeID = deps.ResumeSessionID
+		}
+		result.LastPromptAt = lastPromptAt
+		if feed != nil {
+			feed.Finish(acceptedSessionID)
+		}
 		result.UsageByModel = maps.Clone(localUsageByModel)
+		result.UsageProvenance = slices.Clone(localProvenance)
+		result.ReportedAmounts = slices.Clone(localAmounts)
 		reported = true
 		deps.OnExit(issue.ID, result)
 	}
@@ -812,6 +881,17 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					slog.String("in_progress_state", cfg.Tracker.InProgressState),
 				)
 				deps.Metrics.IncDispatchTransitions(outcomeSuccess)
+				if deps.OnIssueRead != nil {
+					readStartedAt := time.Now()
+					reads, readErr := deps.TrackerAdapter.FetchIssueStatesAndLabelsByIDs(ctx, []string{issue.ID})
+					if readErr != nil {
+						logger.Warn("issue read after in-progress transition failed",
+							slog.Any("error", readErr),
+						)
+					} else if read, ok := reads[issue.ID]; ok {
+						deps.OnIssueRead(issue.ID, read, readStartedAt)
+					}
+				}
 			}
 		}
 	}
@@ -828,7 +908,6 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	var turnsStarted int
 	var observedIssueState string
 	var session domain.Session
-	var sessionStarted bool
 	var mcpConfigPath string
 	var sessionStartedAt time.Time
 	var handoffEvidenceBaseline *workspace.HandoffEvidenceBaseline
@@ -836,6 +915,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 
 	defer func() {
 		if r := recover(); r != nil {
+			panicErr := fmt.Errorf("worker panic: %v", r)
 			if sessionStarted {
 				stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
 			}
@@ -851,6 +931,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					HookTimeoutMS: cfg.Hooks.TimeoutMS,
 					Logger:        logger,
 					SSHHost:       deps.SSHHost,
+					RunOutcome:    string(workerRunOutcome(ctx, WorkerExitError, panicErr, "")),
 				})
 			}
 			if !reported {
@@ -858,7 +939,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 					IssueID:            issue.ID,
 					Identifier:         issue.Identifier,
 					ExitKind:           WorkerExitError,
-					Error:              fmt.Errorf("worker panic: %v", r),
+					Error:              panicErr,
 					TurnsCompleted:     turnsCompleted,
 					TurnsStarted:       turnsStarted,
 					WorkspacePath:      workspacePath,
@@ -950,10 +1031,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 
 	workspacePath = wsResult.Path
 	logger.Info("workspace prepared", slog.String("workspace", wsResult.Path))
+	if deps.OnWorkspaceReady != nil {
+		deps.OnWorkspaceReady(issue.ID, wsResult.Path)
+	}
 
 	// finishWorkspace runs the after_run hook best-effort on every exit path
 	// after successful preparation.
-	finishWorkspace := func() {
+	finishWorkspace := func(outcome RunOutcome) {
 		// A dispatch with no setup hook has no teardown hook to run.
 		if !deps.Posture.RunsSetupHooks() {
 			return
@@ -967,6 +1051,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			HookTimeoutMS: cfg.Hooks.TimeoutMS,
 			Logger:        logger,
 			SSHHost:       deps.SSHHost,
+			RunOutcome:    string(outcome),
 		})
 	}
 
@@ -975,12 +1060,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	} else {
 		execPath, execErr := resolveToolServerBinary(deps.MCPServerBinary)
 		if execErr != nil {
-			finishWorkspace()
+			mcpErr := fmt.Errorf("mcp config generation: %w", execErr)
+			finishWorkspace(workerRunOutcome(ctx, WorkerExitError, mcpErr, ""))
 			report(WorkerResult{
 				IssueID:          issue.ID,
 				Identifier:       issue.Identifier,
 				ExitKind:         WorkerExitError,
-				Error:            fmt.Errorf("mcp config generation: %w", execErr),
+				Error:            mcpErr,
 				WorkspacePath:    wsResult.Path,
 				AgentAdapter:     agentKind,
 				Attempt:          attempt,
@@ -1008,12 +1094,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			ProcessEnv:            CollectSortieEnv(),
 		})
 		if genErr != nil {
-			finishWorkspace()
+			mcpErr := fmt.Errorf("mcp config generation: %w", genErr)
+			finishWorkspace(workerRunOutcome(ctx, WorkerExitError, mcpErr, ""))
 			report(WorkerResult{
 				IssueID:          issue.ID,
 				Identifier:       issue.Identifier,
 				ExitKind:         WorkerExitError,
-				Error:            fmt.Errorf("mcp config generation: %w", genErr),
+				Error:            mcpErr,
 				WorkspacePath:    wsResult.Path,
 				AgentAdapter:     agentKind,
 				Attempt:          attempt,
@@ -1047,7 +1134,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	}
 
 	if ctx.Err() != nil {
-		finishWorkspace()
+		finishWorkspace(workerRunOutcome(ctx, WorkerExitCancelled, nil, ""))
 		report(WorkerResult{
 			IssueID:          issue.ID,
 			Identifier:       issue.Identifier,
@@ -1075,8 +1162,6 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		WorkspacePath:            wsResult.Path,
 		AgentConfig:              toDomainAgentConfig(cfg, agentKind, remote),
 		ResumeSessionID:          deps.ResumeSessionID,
-		ResumeUsage:              deps.ResumeUsage,
-		ResumeUsageByModel:       deps.ResumeUsageByModel,
 		SSHHost:                  deps.SSHHost,
 		SSHStrictHostKeyChecking: deps.SSHStrictHostKeyChecking,
 		SSHEnvNames:              sshEnvNames,
@@ -1084,11 +1169,20 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		Settings:                 deps.AgentSettings.Passthrough,
 	}
 
-	deps.OnEvent(issue.ID, domain.AgentEvent{
-		Type:      domain.EventNotification,
-		Timestamp: time.Now().UTC(),
-		Message:   "verifying the agent credential",
-	})
+	cacheKey, cacheKeyed = verificationKeyFor(agentKind, params)
+	var provenAt time.Time
+	var verificationSkipped bool
+	if cacheKeyed {
+		provenAt, verificationSkipped = deps.VerificationCache.fresh(cacheKey, time.Now())
+	}
+
+	if !verificationSkipped {
+		deps.OnEvent(issue.ID, domain.AgentEvent{
+			Type:      domain.EventNotification,
+			Timestamp: time.Now().UTC(),
+			Message:   "verifying the agent credential",
+		})
+	}
 
 	relayVerificationEvent := func(event domain.AgentEvent) {
 		foldRelayedEvent(event)
@@ -1119,55 +1213,68 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 
 	redact.AddEnviron(config.DotEnvEntries())
 
-	verificationStarted := time.Now()
-	verificationResult, verificationErr := agentcore.VerifyCredential(ctx, deps.AgentAdapter, agentcore.CredentialVerification{
-		Session:   params,
-		Issue:     issue,
-		TurnBound: time.Duration(effectiveTurnTimeoutMS(cfg.Agent.TurnTimeoutMS)) * time.Millisecond,
-		StopBound: stopSessionDeadline(cfg),
-		OnRequest: func() { localMeasured = false },
-		OnEvent:   relayVerificationEvent,
-		Logger:    logger,
-	})
-	cancelledAtEnding = ctx.Err() != nil
-
-	foldTurnResult(verificationResult)
-
-	verificationSpend := localLastUsage
-	verificationUsageByModel := maps.Clone(localUsageByModel)
-
-	if verificationErr != nil {
-		finishWorkspace()
-		report(WorkerResult{
-			IssueID:          issue.ID,
-			Identifier:       issue.Identifier,
-			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
-			Error:            fmt.Errorf("agent session start: %w", verificationErr),
-			StartupError:     verificationErr,
-			WorkspacePath:    wsResult.Path,
-			AgentAdapter:     agentKind,
-			Attempt:          attempt,
-			SSHHost:          deps.SSHHost,
-			Usage:            localUsage,
-			UsageMeasured:    localMeasured,
-			UnaccountedTurns: localUnaccounted,
-			ModelName:        localModelName,
-			APIRequestCount:  localRequestCount,
+	var verificationSpend domain.TokenUsage
+	var verificationUsageByModel map[string]domain.TokenUsage
+	var verificationAmounts []domain.ReportedAmount
+	if verificationSkipped {
+		logger.Info("agent credential verification skipped", slog.Time("proven_at", provenAt.UTC()))
+	} else {
+		verificationStarted := time.Now()
+		verificationResult, verificationErr := agentcore.VerifyCredential(ctx, deps.AgentAdapter, agentcore.CredentialVerification{
+			Session:   params,
+			Issue:     issue,
+			TurnBound: time.Duration(effectiveTurnTimeoutMS(cfg.Agent.TurnTimeoutMS)) * time.Millisecond,
+			StopBound: stopSessionDeadline(cfg),
+			OnRequest: func() { localMeasured = false },
+			OnEvent:   relayVerificationEvent,
+			Logger:    logger,
 		})
-		return
-	}
+		cancelledAtEnding = ctx.Err() != nil
 
-	logger.Info("agent credential verified", slog.Int64("duration_ms", time.Since(verificationStarted).Milliseconds()))
+		foldTurnResult(verificationResult)
+
+		verificationSpend = localLastUsage
+		verificationUsageByModel = maps.Clone(localUsageByModel)
+		verificationAmounts = localAmounts
+
+		if verificationErr != nil {
+			startErr := fmt.Errorf("agent session start: %w", verificationErr)
+			finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), startErr, ""))
+			report(WorkerResult{
+				IssueID:          issue.ID,
+				Identifier:       issue.Identifier,
+				ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
+				Error:            startErr,
+				StartupError:     verificationErr,
+				WorkspacePath:    wsResult.Path,
+				AgentAdapter:     agentKind,
+				Attempt:          attempt,
+				SSHHost:          deps.SSHHost,
+				Usage:            localUsage,
+				UsageMeasured:    localMeasured,
+				UnaccountedTurns: localUnaccounted,
+				ModelName:        localModelName,
+				APIRequestCount:  localRequestCount,
+			})
+			return
+		}
+
+		logger.Info("agent credential verified", slog.Int64("duration_ms", time.Since(verificationStarted).Milliseconds()))
+		if cacheKeyed && !cancelledAtEnding {
+			deps.VerificationCache.record(cacheKey, time.Now())
+		}
+	}
 
 	session, err = deps.AgentAdapter.StartSession(ctx, params)
 	cancelledAtEnding = ctx.Err() != nil
 	if err != nil {
-		finishWorkspace()
+		startErr := fmt.Errorf("agent session start: %w", err)
+		finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), startErr, ""))
 		report(WorkerResult{
 			IssueID:          issue.ID,
 			Identifier:       issue.Identifier,
 			ExitKind:         exitKindAtEnding(ctx, cancelledAtEnding),
-			Error:            fmt.Errorf("agent session start: %w", err),
+			Error:            startErr,
 			StartupError:     err,
 			WorkspacePath:    wsResult.Path,
 			AgentAdapter:     agentKind,
@@ -1189,6 +1296,25 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	acceptedSessionID = session.ID
 	writeDispatchIdentity(acceptedSessionID)
 
+	selectComments := func(turn int) commentfeed.Selection {
+		sel, err := feed.Select(ctx, commentfeed.Conversation{ID: acceptedSessionID, Carried: session.CarriedHistory})
+		if err != nil {
+			logger.Warn("issue comment feed read failed", slog.Int("turn_number", turn), slog.Any("error", err))
+			return commentfeed.Selection{}
+		}
+		return sel
+	}
+	deliverComments := func(turn int, sel commentfeed.Selection, placed []commentfeed.Pending) {
+		feed.Delivered(acceptedSessionID, lastPromptAt, commentfeed.ChannelNextPrompt, placed)
+		if len(placed) > 0 {
+			logger.Info("issue comments delivered",
+				slog.Int("turn_number", turn),
+				slog.Int("new_comments", len(sel.New)),
+				slog.Int("earlier_comments", len(sel.Earlier)),
+			)
+		}
+	}
+
 	sessionStartedAt = time.Now().UTC()
 
 	maxTurns := cfg.Agent.TurnLimit()
@@ -1198,6 +1324,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	turnNumber := 1
 	activeStates := cfg.Tracker.ActiveStates
 	stageOption := prompt.WithStage(stageRenderFrom(ctx))
+	parkContext, hasPark := parkRenderFrom(ctx)
 
 	publishWorkerState := func(turn int) error {
 		if mcpConfigPath == "" {
@@ -1225,15 +1352,12 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	}
 
 	relayTurnEvent := func(event domain.AgentEvent) {
-		// Defensive copy in the worker goroutine, before the event crosses
-		// the goroutine boundary, so the orchestrator never iterates a map
-		// the adapter may still mutate.
-		if event.RateLimits != nil {
-			event.RateLimits = maps.Clone(event.RateLimits)
-		}
 		event.Usage = applyUsageOffset(event.Usage, verificationSpend)
 		if event.UsageByModel != nil {
 			event.UsageByModel = agentcore.AddUsageByModel(event.UsageByModel, verificationUsageByModel)
+		}
+		if event.ReportedAmounts != nil {
+			event.ReportedAmounts = usage.AddAmounts(event.ReportedAmounts, verificationAmounts)
 		}
 		if foldRelayedEvent(event) {
 			if err := publishWorkerState(turnNumber); err != nil {
@@ -1251,9 +1375,10 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	// through an event; on the last turn no later write would carry it, so
 	// the file would keep denying a measurement that exists.
 	handleTurnResult := func(result domain.TurnResult) {
-		resumeUsage = result.ResumeUsage
-		resumeUsageByModel = result.ResumeUsageByModel
 		result.Usage = applyUsageOffset(result.Usage, verificationSpend)
+		if result.ReportedAmounts != nil {
+			result.ReportedAmounts = usage.AddAmounts(result.ReportedAmounts, verificationAmounts)
+		}
 		if foldTurnResult(result) {
 			if err := publishWorkerState(turnNumber); err != nil {
 				logger.Warn("failed to write status state file after turn result", slog.Any("error", err))
@@ -1287,7 +1412,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	for {
 		if ctx.Err() != nil {
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
-			finishWorkspace()
+			finishWorkspace(workerRunOutcome(ctx, WorkerExitCancelled, nil, ""))
 			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
@@ -1309,28 +1434,49 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 
 		issueMap := issue.ToTemplateMap()
-		var rendered string
-		var err error
-		switch {
-		case deps.ReactionKind != "":
-			rendered, err = prompt.BuildReactionTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, continuation, stageOption)
-			if turnNumber == 1 {
-				presentedComments = carriedCommentIDs(continuation)
+		// Place may call this more than once; it must stay free of effects
+		// beyond its result and presentedComments, assigned on every call.
+		renderTurn := func(sel commentfeed.Selection) (string, bool, error) {
+			feedOption := prompt.WithCommentFeed(commentFeedContextOf(sel))
+			switch {
+			case deps.ReactionKind != "":
+				out, builtin, err := prompt.BuildReactionTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, continuation, stageOption, feedOption)
+				if turnNumber == 1 {
+					presentedComments = carriedCommentIDs(continuation)
+				}
+				return out, builtin, err
+			case turnNumber == 1:
+				options := []prompt.RenderOption{stageOption}
+				if hasPark {
+					park := parkContext
+					if feed != nil {
+						park.Comments = pendingTemplateComments(sel)
+					}
+					options = append(options, prompt.WithPark(park))
+				}
+				options = append(options, feedOption)
+				out, presented, err := renderFirstTurnPrompt(tmpl, issueMap, attemptInt, maxTurns, continuation, options...)
+				presentedComments = presented
+				return out, false, err
+			default:
+				return prompt.BuildTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, stageOption, feedOption)
 			}
-		case turnNumber == 1:
-			rendered, presentedComments, err = renderFirstTurnPrompt(tmpl, issueMap, attemptInt, maxTurns, continuation, stageOption)
-		default:
-			rendered, err = prompt.BuildTurnPrompt(tmpl, issueMap, attemptInt, turnNumber, maxTurns, stageOption)
 		}
+		var sel commentfeed.Selection
+		if feed != nil {
+			sel = selectComments(turnNumber)
+		}
+		rendered, placed, err := commentfeed.Place(renderTurn, sel)
 		cancelledAtEnding = ctx.Err() != nil
 		if err != nil {
+			renderErr := fmt.Errorf("prompt render (turn %d): %w", turnNumber, err)
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
-			finishWorkspace()
+			finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), renderErr, ""))
 			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
 				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
-				Error:              fmt.Errorf("prompt render (turn %d): %w", turnNumber, err),
+				Error:              renderErr,
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
 				WorkspacePath:      wsResult.Path,
@@ -1348,14 +1494,13 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		}
 
 		if turnNumber == 1 {
-			remote := strings.TrimSpace(deps.SSHHost) != ""
 			switch {
 			case deps.AgentToolChannelFunc == nil:
 				logger.Warn("tool channel unknown for agent kind, withholding tool advertisement",
 					slog.String("agent_kind", agentKind))
-			case !deps.AgentToolChannelFunc(agentKind, remote):
+			case !deps.AgentToolChannelFunc(agentKind) || session.NoToolChannel:
 				logger.Info("no tool execution channel for this session, withholding tool advertisement",
-					slog.String("agent_kind", agentKind), slog.Bool("remote", remote))
+					slog.String("agent_kind", agentKind))
 			default:
 				if deps.SessionToolRegistryFunc != nil {
 					sessionReg, err := deps.SessionToolRegistryFunc(ctx, issue.ID, wsResult.Path)
@@ -1371,8 +1516,15 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			rendered += "\n\n" + prompt.RuntimeStatusSuffix
 		}
 
+		// A skipped verification never flipped the mark, and a run under
+		// arrival none would otherwise report a measured zero.
+		if verificationSkipped && turnNumber == 1 {
+			localMeasured = false
+		}
+
 		logger.Info("turn started", slog.Int("turn_number", turnNumber), slog.Int("max_turns", maxTurns))
 		turnsStarted++
+		lastPromptAt = time.Now().UTC()
 		if deps.OnTurnStarted != nil {
 			deps.OnTurnStarted(issue.ID, turnsStarted)
 		}
@@ -1386,6 +1538,10 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			)
 		}
 
+		if feed != nil {
+			deliverComments(turnNumber, sel, placed)
+		}
+
 		turnResult, err := runBoundedTurn(ctx, deps.AgentAdapter, session, domain.RunTurnParams{
 			Prompt:  rendered,
 			Issue:   issue,
@@ -1396,13 +1552,14 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 		handleTurnResult(turnResult)
 
 		if err != nil {
+			turnErr := fmt.Errorf("agent turn %d: %w", turnNumber, err)
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
-			finishWorkspace()
+			finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), turnErr, ""))
 			report(WorkerResult{
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
 				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
-				Error:              fmt.Errorf("agent turn %d: %w", turnNumber, err),
+				Error:              turnErr,
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
 				WorkspacePath:      wsResult.Path,
@@ -1419,13 +1576,21 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			return
 		}
 
+		if isTurnSuccess(turnResult.ExitReason) && !cancelledAtEnding {
+			workingTurnProven = true
+			if cacheKeyed {
+				deps.VerificationCache.record(cacheKey, time.Now())
+			}
+		}
+
 		turnsCompleted++
 		logger.Info("turn completed", slog.Int("turn_number", turnNumber), slog.Int("max_turns", maxTurns))
 
 		// Non-success exit reasons (timeout, max_tokens, etc.) are terminal.
 		if !isTurnSuccess(turnResult.ExitReason) {
+			turnErr := fmt.Errorf("agent turn %d ended: %s", turnNumber, turnResult.ExitReason)
 			stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
-			finishWorkspace()
+			finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), turnErr, ""))
 			logger.Warn("turn exit reason indicates failure",
 				slog.Int("turn_number", turnNumber),
 				slog.Any("exit_reason", turnResult.ExitReason),
@@ -1434,7 +1599,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				IssueID:            issue.ID,
 				Identifier:         issue.Identifier,
 				ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
-				Error:              fmt.Errorf("agent turn %d ended: %s", turnNumber, turnResult.ExitReason),
+				Error:              turnErr,
 				TurnsCompleted:     turnsCompleted,
 				TurnsStarted:       turnsStarted,
 				WorkspacePath:      wsResult.Path,
@@ -1468,13 +1633,14 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			refreshed, err := deps.TrackerAdapter.FetchIssueStatesByIDs(runContextFrom(ctx), []string{issue.ID})
 			cancelledAtEnding = ctx.Err() != nil
 			if err != nil {
+				refreshErr := fmt.Errorf("issue state refresh (turn %d): %w", turnNumber, err)
 				stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
-				finishWorkspace()
+				finishWorkspace(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), refreshErr, ""))
 				report(WorkerResult{
 					IssueID:            issue.ID,
 					Identifier:         issue.Identifier,
 					ExitKind:           exitKindAtEnding(ctx, cancelledAtEnding),
-					Error:              fmt.Errorf("issue state refresh (turn %d): %w", turnNumber, err),
+					Error:              refreshErr,
 					TurnsCompleted:     turnsCompleted,
 					TurnsStarted:       turnsStarted,
 					WorkspacePath:      wsResult.Path,
@@ -1535,6 +1701,19 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			workspace.CleanupStatusFile(wsResult.Path, logger)
 		}
 		var phaseStatus workspace.StatusFile
+		var reviewSel commentfeed.Selection
+		var reviewPlaced []commentfeed.Pending
+		var preparePrompt func(string) string
+		if feed != nil {
+			preparePrompt = func(reviewPrompt string) string {
+				reviewSel = selectComments(turnsStarted + 1)
+				prepared, placed, _ := commentfeed.Place(func(commentfeed.Selection) (string, bool, error) {
+					return reviewPrompt, true, nil
+				}, reviewSel)
+				reviewPlaced = placed
+				return prepared
+			}
+		}
 		reviewMeta, phaseStatus, cancelledAtEnding, phaseErr = runSelfReviewLoop(ctx, RunSelfReviewParams{
 			Session:       session,
 			Issue:         issue,
@@ -1548,11 +1727,17 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			OnProgress:   deps.OnProgress,
 			OnTurnStarted: func() {
 				turnsStarted++
+				lastPromptAt = time.Now().UTC()
 				writeDispatchIdentity(acceptedSessionID)
 				if deps.OnTurnStarted != nil {
 					deps.OnTurnStarted(issue.ID, turnsStarted)
 				}
+				if feed != nil {
+					deliverComments(turnsStarted, reviewSel, reviewPlaced)
+					reviewSel, reviewPlaced = commentfeed.Selection{}, nil
+				}
 			},
+			PreparePrompt:  preparePrompt,
 			Logger:         logger,
 			Metrics:        deps.Metrics,
 			TurnsCompleted: &turnsCompleted,
@@ -1612,6 +1797,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				SSHHost:               deps.SSHHost,
 				SelfReviewStatus:      selfReviewStatus,
 				SelfReviewSummaryPath: selfReviewSummaryPath,
+				RunOutcome:            string(workerRunOutcome(ctx, exitKindAtEnding(ctx, cancelledAtEnding), phaseErr, "")),
 			})
 		}
 		report(WorkerResult{
@@ -1652,6 +1838,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 				SSHHost:               deps.SSHHost,
 				SelfReviewStatus:      selfReviewStatus,
 				SelfReviewSummaryPath: selfReviewSummaryPath,
+				RunOutcome:            string(workerRunOutcome(ctx, WorkerExitCancelled, nil, "")),
 			})
 		}
 		report(WorkerResult{
@@ -1676,6 +1863,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	}
 
 	stopSessionBestEffort(ctx, deps.AgentAdapter, session, cfg, logger)
+	declared := declaredToken(pendingSoftStopReason != "", pendingSoftStopReason)
 	if deps.Posture.RunsSetupHooks() {
 		workspace.Finish(ctx, workspace.FinishParams{
 			Path:                  wsResult.Path,
@@ -1688,6 +1876,7 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 			SSHHost:               deps.SSHHost,
 			SelfReviewStatus:      selfReviewStatus,
 			SelfReviewSummaryPath: selfReviewSummaryPath,
+			RunOutcome:            string(workerRunOutcome(ctx, WorkerExitNormal, nil, declared)),
 		})
 	}
 
@@ -1723,6 +1912,37 @@ func RunWorkerAttempt(ctx context.Context, issue domain.Issue, attempt *int, dep
 	})
 }
 
+// newCommentFeed returns the attempt's comment feed, or nil when the feed is
+// off for it. The configuration is the attempt-start snapshot, so a reload
+// never changes the feed inside a run.
+func newCommentFeed(ctx context.Context, issueID string, cfg config.ServiceConfig, deps WorkerDeps, logger *slog.Logger) *commentfeed.Run {
+	if !cfg.CommentFeed.Enabled || deps.OnCommentsGiven == nil || deps.CommentFeedStore == nil {
+		return nil
+	}
+	var posting commentfeed.PostingWaiter
+	if deps.Router != nil {
+		posting = deps.Router
+	}
+	read, hasRead := dispatchCommentReadFrom(ctx)
+	return commentfeed.NewRun(commentfeed.RunParams{
+		Config:  cfg.CommentFeed,
+		IssueID: issueID,
+		Source: commentfeed.NewTrackerSource(commentfeed.TrackerSourceParams{
+			Tracker:         deps.TrackerAdapter,
+			TrackerKind:     cfg.Tracker.Kind,
+			Store:           deps.CommentFeedStore,
+			Posting:         posting,
+			DispatchRead:    read,
+			HasDispatchRead: hasRead,
+			AccessDenied:    deps.CommentFeedAccessDenied,
+			Logger:          logger,
+		}),
+		Store:  deps.CommentFeedStore,
+		Report: func(rows []storage.GivenComment) { deps.OnCommentsGiven(issueID, rows) },
+		Logger: logger,
+	})
+}
+
 // renderFirstTurnPrompt renders the first turn's template output and
 // reports, per reaction kind, the comment IDs that output presented to the
 // agent. A kind's IDs count as presented when rendering without that
@@ -1738,7 +1958,8 @@ func renderFirstTurnPrompt(tmpl *prompt.Template, issueMap map[string]any, attem
 		if seed != nil {
 			opts = append(opts, prompt.WithContinuationContext(seed))
 		}
-		return prompt.BuildTurnPrompt(tmpl, issueMap, attempt, 1, maxTurns, opts...)
+		out, _, err := prompt.BuildTurnPrompt(tmpl, issueMap, attempt, 1, maxTurns, opts...)
+		return out, err
 	}
 
 	unseeded, err := render(nil)
@@ -1874,9 +2095,3 @@ func buildToolAdvertisement(reg *domain.ToolRegistry, project string) string {
 
 	return sb.String()
 }
-
-// dispatchComment is the tracker comment text posted on every session
-// dispatch, for every agent kind and every tracker kind alike: a
-// business reader of the issue needs only that a session started, not
-// an internal integration name or a dispatch counter.
-const dispatchComment = "Sortie session started."

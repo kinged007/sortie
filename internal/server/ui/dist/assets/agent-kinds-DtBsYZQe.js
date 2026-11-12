@@ -1,0 +1,1 @@
+function e(e){let t=new Map([[e.agent.kind,e.agent.usage_arrival]]),{dispatch:n}=e;n.default!==null&&t.set(n.default.agent_kind,n.default.usage_arrival);for(let e of n.rules??[])t.set(e.agent_kind,e.usage_arrival);return[...t].sort(([e],[t])=>e<t?-1:+(e>t))}export{e as t};

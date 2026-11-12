@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // Scenario is the body of a fake runtime. It runs inside a re-executed copy of
@@ -26,18 +28,21 @@ const OutputScenario = "agenttest.output"
 
 // Output parameterizes [OutputScenario]: the runtime writes Stdout, then
 // Stderr, and exits with ExitCode, or stays alive until killed when Hang is set.
+// When ReadyFile is non-empty, the runtime creates it before writing anything,
+// so a test can wait for the process to be running.
 // When WhenArg is non-empty, this behavior runs only for a launch whose
 // arguments include it; any other launch writes nothing and exits 0. When
 // Version is non-empty, a launch whose arguments include --version writes
 // it and a newline to standard output and exits 0 instead, whatever else
 // its arguments carry.
 type Output struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
-	Hang     bool
-	WhenArg  string
-	Version  string
+	Stdout    string
+	Stderr    string
+	ExitCode  int
+	Hang      bool
+	WhenArg   string
+	Version   string
+	ReadyFile string
 }
 
 type fakeConfig struct {
@@ -106,6 +111,12 @@ func Typed[P any](run func(args []string, params P) int) Scenario {
 // status. A failed write ends the runtime with status 2 instead of ExitCode, so
 // a fixture never reports the success of output the test never received.
 func (o Output) Run() int {
+	if o.ReadyFile != "" {
+		if err := os.WriteFile(o.ReadyFile, []byte("ready"), 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "fake runtime: write ready file: %v\n", err)
+			return 2
+		}
+	}
 	if _, err := io.WriteString(os.Stdout, o.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "fake runtime: write stdout: %v\n", err)
 		return 2
@@ -178,28 +189,16 @@ func FakeRuntime(t testing.TB, dir, name, scenario string, params any) string {
 }
 
 // removeEventually deletes path, retrying while the file system says it is still
-// in use. It never fails the test: turning a slow handle into a hard failure
-// here would trade one flake for another.
+// in use, and fails the test if it stays in use for [waittest.HangGuard].
 func removeEventually(t testing.TB, path string) {
 	t.Helper()
 
-	const (
-		budget   = 2 * time.Second
-		interval = 20 * time.Millisecond
-	)
-
-	deadline := time.Now().Add(budget)
-	for {
-		err := os.Remove(path)
-		if err == nil || errors.Is(err, fs.ErrNotExist) {
-			return
+	waittest.Until(t, func() error {
+		if err := os.Remove(path); !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
-		if !time.Now().Before(deadline) {
-			t.Logf("FakeRuntime: could not remove %s after %s: %v", path, budget, err)
-			return
-		}
-		time.Sleep(interval)
-	}
+		return nil
+	})
 }
 
 func runScenario(config []byte, scenarios map[string]Scenario) int {
@@ -217,6 +216,9 @@ func runScenario(config []byte, scenarios map[string]Scenario) int {
 	}
 	if cfg.Scenario == MCPRelayScenario {
 		run = Typed(runMCPRelay)
+	}
+	if cfg.Scenario == SSHStandInScenario {
+		run = Typed(runSSHStandIn)
 	}
 	if run == nil {
 		fmt.Fprintf(os.Stderr, "fake runtime: unknown scenario %q\n", cfg.Scenario)

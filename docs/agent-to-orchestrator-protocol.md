@@ -243,10 +243,10 @@ An absent statement is the same as a status file that holds only the token. A on
 
 #### 2.7.4 Where the reason goes
 
-The orchestrator publishes the statement only with the `session.stopped` event, which a soft stop on any of the three recognized values produces:
+The orchestrator publishes the statement with the `session.stopped` event, which a soft stop on any of the three recognized values produces unless the orchestrator withholds a `needs-human-review` handoff, and stores the same text with the run, where the run row of the HTTP API serves it, a withheld `needs-human-review` run included, and the dashboard shows the statement beside the run on the issue page, the session view, and History. Notifications carry it as follows:
 
-- **Tracker comment.** When a `notifications` entry of kind `tracker_comment` lists `session.stopped`, or the deprecated `tracker.comments.on_completion` setting is on, the stop comment carries the statement after Sortie's own text as one literal block: the comment that accompanies the park for `blocked`, and the completion comment for `no-change-needed` and `needs-human-review`. The tracker shows the block as literal text and acts on nothing inside it. Sortie's own text never changes.
-- **Slack and webhook.** Every Slack or webhook entry that lists `session.stopped` receives the statement apart from the message body. Slack appends it after the body with `&`, `<`, and `>` escaped; the webhook carries it in the `agent_text` key.
+- **Tracker comment.** When a `notifications` entry of kind `tracker_comment` lists `session.stopped`, or the deprecated `tracker.comments.on_completion` setting is on, the stop comment carries the statement after Sortie's own text and a blank line: the comment that accompanies the park for `blocked`, and the completion comment for `no-change-needed` and `needs-human-review`. Sortie's own text never changes.
+- **Slack, Telegram, Discord, and webhook.** Every Slack, Telegram, Discord, or webhook entry that lists `session.stopped` receives the statement. Slack, Telegram, and Discord append it after the body as written; the webhook carries it in the `agent_text` key.
 
 A `session.failed` event never carries a statement, including a `needs-human-review` run whose handoff evidence withheld the transition. Neither does an `agent.message` notification.
 
@@ -384,9 +384,9 @@ The re-dispatch and re-block cycle is an expected operational pattern:
 2. Orchestrator reads the signal, exits normally, releases claim, records a park, and applies the parking label.
 3. A human acts on the issue: either moves it to a different tracker state, or removes the parking label the orchestrator has confirmed reached the tracker.
 4. The next poll tick observes the state change or the confirmed label's removal and lifts the park.
-5. If the issue is now active and eligible, the orchestrator dispatches a new worker run for it.
+5. If the issue is now active and eligible, the orchestrator reads its comments and dispatches a new worker run for it. When the read fails, the issue waits for a later poll tick and no run starts.
 6. Pre-dispatch cleanup (Section 3.4) removes the stale `.sortie/status` file.
-7. Agent begins fresh work. If still blocked, it writes `blocked` again.
+7. The run continues the agent session that stopped, where the parked run recorded one and the agent kind can resume it, and its first prompt renders the `park` template variable: the statement the agent gave when it wrote `blocked` as `park.statement`, and the comments as `park.comments`: with the comment feed off, the comments written after the parked run sent its last prompt, less the ones Sortie posted; with the feed on, the run's pending comments, those earlier sessions on the issue were given first, then the new ones. If still blocked, the agent writes `blocked` again.
 
 An update to the issue that is neither a state change nor a removal of the confirmed parking label, for example adding a comment while leaving both the state and the label untouched, does not lift the park.
 
@@ -442,11 +442,13 @@ The ordering of first-turn suffixes is:
 
 This ordering places the protocol instructions at the end, closest to the agent's point of attention, and avoids interleaving with tool documentation.
 
-The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to write it, the exact command to use, and what to write after the value. It does not explain the orchestrator's internal logic.
+The injected text SHOULD be concise and imperative. It tells the agent what the file is, when to write it, the exact command to use, and what to write after the value. It does not explain the orchestrator's internal logic. It opens with its own level-2 heading, `## Report your status`, so it reads as a section of its own instead of continuing the tool advertisement's last tool or the template's last section.
 
 Example injection text:
 
 ```
+## Report your status
+
 If you determine that you cannot make further progress on this task without human
 intervention, or if your work is complete and requires human review, or if you
 determine that the requested outcome already held and you changed nothing, signal
@@ -589,7 +591,9 @@ An agent that rapidly creates and overwrites the status file cannot degrade orch
 
 The status token comes from a fixed vocabulary and carries no sensitive data. The orchestrator logs it, and that logging does not create an information leakage vector.
 
-The statement is agent-authored text, and the orchestrator publishes it in a tracker comment that people outside the deployment may read, and to every Slack or webhook entry subscribed to `session.stopped` (Section 2.7.4). Before publication the orchestrator masks every registered secret, the credential values it holds for its own configuration. It masks only those secrets. It does not detect token-shaped strings, host paths, or other sensitive content, so what keeps those out of the statement is the injected instruction to name files by repository path and never include credentials (Section 4.1), which is a request to the agent and not a guarantee. The tracker comment holds the statement in one literal block, which keeps a mention, link, markup, or command inside it from taking effect.
+The statement is agent-authored text, and the orchestrator publishes it in a tracker comment that people outside the deployment may read, and to every notification entry subscribed to `session.stopped` (Section 2.7.4). Before publication the orchestrator masks every registered secret, the credential values it holds for its own configuration. It masks only those secrets. It does not detect token-shaped strings, host paths, or other sensitive content, so what keeps those out of the statement is the injected instruction to name files by repository path and never include credentials (Section 4.1), which is a request to the agent and not a guarantee.
+
+The statement also reaches the state database and the run row of the HTTP API, even when no `session.stopped` subscriber exists and for a `needs-human-review` run whose handoff the orchestrator withheld. The orchestrator masks it before it stores the statement and again when it builds the response, so a secret registered after the run is masked too. The stored statement also reaches the prompt of the first run after a person releases a park, as `park.statement`, whether or not any destination posted it as a comment.
 
 ## 8. Implementation guidance
 
@@ -649,7 +653,7 @@ An implementation conforms to this specification if it satisfies all of the foll
 8. A link, a wrong entry type, or an entry replaced while being opened, at the workspace directory, the `.sortie/` directory, or the status file, is treated as a read error per Section 7.2.
 9. Every removal named in item 5, not the pre-dispatch cleanup alone, applies the same rejection, and every one tolerates a failed removal without changing the run's control flow, per Section 3.4.
 10. The orchestrator parks the issue on `blocked` where the dispatch drives issue state, and holds it out of dispatch until it observes a release per Section 2.3.1 and Section 3.5.
-11. The orchestrator reads at most 1024 bytes of the file, keeps the statement of the token that ends the run, and publishes it only after the normalization and masking of Section 2.7.2, only with `session.stopped`, and as the literal block and separate fields Section 2.7.4 describes.
+11. The orchestrator reads at most 1024 bytes of the file, keeps the statement of the token that ends the run, and publishes it only after the normalization and masking of Section 2.7.2, with `session.stopped` after the body in each rendering, and in the webhook's `agent_text` key (Section 2.7.4), and stores the same text with the run.
 
 ## References
 

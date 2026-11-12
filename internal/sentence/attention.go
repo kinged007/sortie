@@ -304,15 +304,11 @@ func preflightItem(cause orchestrator.AttentionCause) AttentionItem {
 
 func spendCeilingItem(cause orchestrator.AttentionCause) AttentionItem {
 	status := cause.Spend
-	template, reason, configKey := "attn_spend_daily", orchestrator.SkipDailySpendCeiling, "agent.max_daily_cost_usd"
-	if status.Window == orchestrator.SpendWindowMonthly {
-		template, reason, configKey = "attn_spend_monthly", orchestrator.SkipMonthlySpendCeiling, "agent.max_monthly_cost_usd"
-	}
-	return failingCheckItem(cause, template,
+	return failingCheckItem(cause, "attn_spend_"+string(status.Window),
 		map[string]any{"Used": status.UsedUSD, "AtLeast": !status.UsedComplete, "Budget": status.BudgetUSD},
 		AttentionEvidence{
-			Reason:          string(reason),
-			ConfigKey:       configKey,
+			Reason:          string(status.Window.SkipReason()),
+			ConfigKey:       status.Window.Setting(),
 			UsedUSD:         new(status.UsedUSD),
 			UsedUSDComplete: new(status.UsedComplete),
 			BudgetUSD:       new(status.BudgetUSD),

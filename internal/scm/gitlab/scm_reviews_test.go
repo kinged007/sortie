@@ -613,7 +613,8 @@ func TestGetReviewDecision_ArmOrder(t *testing.T) {
 		want             domain.ReviewDecision
 	}{
 		{"approved", "reviewers_no_changes_requested.json", "approvals_approved_true.json", domain.ReviewDecisionApproved},
-		{"a reviewer with no approval is review-required", "reviewers_no_changes_requested.json", "approvals_approved_false.json", domain.ReviewDecisionReviewRequired},
+		{"a reviewer with no approval and no approval rule is review-requested", "reviewers_no_changes_requested.json", "approvals_approved_false.json", domain.ReviewDecisionReviewRequested},
+		{"an unmet approval rule is review-required without a reviewer", "reviewers_empty.json", "approvals_left_unmet.json", domain.ReviewDecisionReviewRequired},
 		{"no reviewers and no approval is not-required", "reviewers_empty.json", "approvals_approved_false.json", domain.ReviewDecisionNotRequired},
 	}
 	for _, tt := range tests {
@@ -699,27 +700,36 @@ func TestGetReviewDecision_ErrorStatuses(t *testing.T) {
 		}
 	})
 
-	t.Run("a malformed approvals body is a payload error", func(t *testing.T) {
-		t.Parallel()
+	approvalsBodies := []struct {
+		name string
+		body []byte
+	}{
+		{"a malformed approvals body is a payload error", []byte(`not valid json {{{`)},
+		{"a non-integer approvals_left is a payload error", loadFixture(t, "approvals_left_string.json")},
+	}
+	for _, tt := range approvalsBodies {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		reviewersBody := loadFixture(t, "reviewers_no_changes_requested.json")
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case strings.HasSuffix(r.URL.Path, "/approvals"):
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`not valid json {{{`))
-			case strings.HasSuffix(r.URL.Path, "/reviewers"):
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write(reviewersBody)
-			default:
-				t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-				w.WriteHeader(http.StatusNotFound)
-			}
-		}))
-		defer srv.Close()
+			reviewersBody := loadFixture(t, "reviewers_no_changes_requested.json")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/approvals"):
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(tt.body)
+				case strings.HasSuffix(r.URL.Path, "/reviewers"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(reviewersBody)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
 
-		adapter := mustSCMAdapter(t, srv.URL)
-		_, err := adapter.GetReviewDecision(context.Background(), testPRNumber, scmOwner, scmRepo)
-		adaptertest.AssertSCMErrorKind(t, err, domain.ErrSCMPayload)
-	})
+			adapter := mustSCMAdapter(t, srv.URL)
+			_, err := adapter.GetReviewDecision(context.Background(), testPRNumber, scmOwner, scmRepo)
+			adaptertest.AssertSCMErrorKind(t, err, domain.ErrSCMPayload)
+		})
+	}
 }

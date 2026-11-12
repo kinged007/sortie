@@ -1396,6 +1396,9 @@ func TestFetchIssueComments(t *testing.T) {
 			if r.URL.RawQuery != "" {
 				t.Errorf("unexpected query string %q on the unpaginated comments route", r.URL.RawQuery)
 			}
+			if got := r.Header.Get("If-None-Match"); got != "" {
+				t.Errorf("If-None-Match = %q, want none on the full read", got)
+			}
 			w.WriteHeader(http.StatusOK)
 			w.Write(loadFixture(t, "comments_two.json")) //nolint:errcheck // test helper
 		})
@@ -1472,6 +1475,73 @@ func TestFetchIssueComments(t *testing.T) {
 		_, err := a.FetchIssueComments(context.Background(), "999")
 		assertTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 	})
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	botComment := domain.Comment{
+		ID: "9003", Author: "renovate-bot", AuthorID: "renovate-bot", AuthorKind: domain.CommentAuthorBot,
+		Body: "Rebased onto main.", CreatedAt: "2026-01-17T08:00:00Z", UpdatedAt: "2026-01-17T08:00:00Z",
+	}
+	editedComment := domain.Comment{
+		ID: "9002", Author: "bob", AuthorID: "bob", AuthorKind: domain.CommentAuthorPerson,
+		Body: "Please fix the indentation and the import order.", CreatedAt: "2026-01-16T11:30:00Z", UpdatedAt: "2026-01-18T10:15:00Z",
+	}
+
+	tests := []struct {
+		name      string
+		since     domain.CommentReadPoint
+		fixture   string
+		wantSince string
+		want      []domain.Comment
+		wantNext  domain.CommentReadPoint
+		wantKind  domain.TrackerErrorKind
+	}{
+		{"new comment", "2026-01-16T11:30:00Z", "comment_changes_new.json", "2026-01-16T11:30:00Z", []domain.Comment{botComment}, "2026-01-17T08:00:00Z", ""},
+		{"edited comment", "2026-01-17T08:00:00Z", "comment_changes_edited.json", "2026-01-17T08:00:00Z", []domain.Comment{editedComment}, "2026-01-18T10:15:00Z", ""},
+		{"unchanged list keeps the point", "2026-01-17T08:00:00.5Z", "comment_changes_new.json", "2026-01-17T08:00:00Z", []domain.Comment{botComment}, "2026-01-17T08:00:00.5Z", ""},
+		{"undecodable point reads the full list", "x", "comment_changes_new.json", "", []domain.Comment{botComment}, "2026-01-17T08:00:00Z", ""},
+		{"unparseable updated_at", "2026-01-16T11:30:00Z", "comment_changes_bad_updated_at.json", "2026-01-16T11:30:00Z", nil, "", domain.ErrTrackerPayload},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := loadFixture(t, tt.fixture)
+			mux := newPreflightMux(t)
+			var mu sync.Mutex
+			var queries []url.Values
+			mux.HandleFunc("GET /api/v1/repos/"+testOwner+"/"+testRepo+"/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				queries = append(queries, r.URL.Query())
+				mu.Unlock()
+				w.Write(fixture) //nolint:errcheck // test helper
+			})
+			a := mustAdapter(t, mux)
+
+			got, err := a.FetchIssueCommentChanges(context.Background(), "42", tt.since)
+
+			if tt.wantKind != "" {
+				assertTrackerErrorKind(t, err, tt.wantKind)
+			} else if err != nil {
+				t.Fatalf("FetchIssueCommentChanges(%q): %v", tt.since, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(queries) != 1 {
+				t.Fatalf("FetchIssueCommentChanges(%q) sent %d requests, want 1", tt.since, len(queries))
+			}
+			if q := queries[0]; q.Get("since") != tt.wantSince || len(q) > 1 {
+				t.Errorf("FetchIssueCommentChanges(%q) query = %v, want only since=%q", tt.since, q, tt.wantSince)
+			}
+			if !slices.Equal(got.Comments, tt.want) || got.Next != tt.wantNext {
+				t.Errorf("FetchIssueCommentChanges(%q) = %+v, want {%+v %q}", tt.since, got, tt.want, tt.wantNext)
+			}
+			adaptertest.AssertCommentsAscending(t, got.Comments)
+		})
+	}
 }
 
 func TestFetchIssueStatesByIDs(t *testing.T) {
@@ -1678,85 +1748,48 @@ func TestTransitionIssue(t *testing.T) {
 func TestCommentIssue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("posts the markdown body verbatim and returns nil on 201", func(t *testing.T) {
+	t.Run("posts the markdown body verbatim and returns the created comment's identity", func(t *testing.T) {
 		t.Parallel()
 
 		const markdown = "## Status update\n\n- retried the failing step\n- **no repro** locally\n"
+		const commentsPath = "/api/v1/repos/" + testOwner + "/" + testRepo + "/issues/42/comments"
+		const created = `{"id":7312450,"user":{"login":"sortie-bot"},"body":"status update","created_at":"2026-08-04T12:00:00Z"}`
+		const listed = `[{"id":9001,"user":{"login":"alice"},"body":"Looks good.","created_at":"2026-01-15T10:00:00Z"},` + created + `]`
 
 		mux := newPreflightMux(t)
 		var gotBody struct {
 			Body string `json:"body"`
 		}
-		var calls atomic.Int32
-		mux.HandleFunc("POST /api/v1/repos/"+testOwner+"/"+testRepo+"/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-			calls.Add(1)
+		var requests atomic.Int32
+		mux.HandleFunc("POST "+commentsPath, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
 			decodeRequestBody(t, r, &gotBody)
 			w.WriteHeader(http.StatusCreated)
-			w.Write([]byte(`{"id":1}`)) //nolint:errcheck // test helper
+			w.Write([]byte(created)) //nolint:errcheck // test helper
+		})
+		mux.HandleFunc("GET "+commentsPath, func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			w.Write([]byte(listed)) //nolint:errcheck // test helper
 		})
 		a := mustAdapter(t, mux)
 
-		if err := a.CommentIssue(context.Background(), "42", markdown); err != nil {
+		id, err := a.CommentIssue(context.Background(), "42", markdown)
+		if err != nil {
 			t.Fatalf("CommentIssue: %v", err)
+		}
+		if got := requests.Load(); got != 1 {
+			t.Errorf("request count during CommentIssue = %d, want 1", got)
 		}
 		if gotBody.Body != markdown {
 			t.Errorf("comment body = %q, want %q (verbatim, no conversion)", gotBody.Body, markdown)
 		}
-		if got := calls.Load(); got != 1 {
-			t.Errorf("call count = %d, want 1", got)
+
+		comments, err := a.FetchIssueComments(context.Background(), "42")
+		if err != nil {
+			t.Fatalf("FetchIssueComments: %v", err)
 		}
+		adaptertest.AssertPostedCommentListed(t, id, comments)
 	})
-}
-
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			bodies := make(chan string, 1)
-			mux := newPreflightMux(t)
-			mux.HandleFunc("POST /api/v1/repos/"+testOwner+"/"+testRepo+"/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-				var payload struct {
-					Body string `json:"body"`
-				}
-				json.NewDecoder(r.Body).Decode(&payload) //nolint:errcheck // asserted through the received body
-				bodies <- payload.Body
-				w.WriteHeader(http.StatusCreated)
-				w.Write([]byte(`{"id":1}`)) //nolint:errcheck // test helper
-			})
-			a := mustAdapter(t, mux)
-
-			if err := a.CommentIssueWithLiteral(context.Background(), "42", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			if got := <-bodies; got != tt.want {
-				t.Errorf("comment body = %q, want %q", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestWriteErrorMapping(t *testing.T) {
@@ -1770,6 +1803,7 @@ func TestWriteErrorMapping(t *testing.T) {
 	}{
 		{"403 forbidden maps to auth error", http.StatusForbidden, "error_403.json", domain.ErrTrackerAuth},
 		{"422 unprocessable maps to payload error", http.StatusUnprocessableEntity, "error_422.json", domain.ErrTrackerPayload},
+		{"201 without a comment id maps to payload error", http.StatusCreated, "comment_created_no_id.json", domain.ErrTrackerPayload},
 	}
 
 	for _, tt := range tests {
@@ -1783,8 +1817,11 @@ func TestWriteErrorMapping(t *testing.T) {
 			})
 			a := mustAdapter(t, mux)
 
-			err := a.CommentIssue(context.Background(), "42", "body")
+			id, err := a.CommentIssue(context.Background(), "42", "body")
 			assertTrackerErrorKind(t, err, tt.wantKind)
+			if id != "" {
+				t.Errorf("CommentIssue identity = %q, want empty on error", id)
+			}
 		})
 	}
 }
@@ -2207,4 +2244,35 @@ func TestEnsureLabelID(t *testing.T) {
 		_, err := a.ensureLabelID(context.Background(), map[string]int64{}, "still-missing")
 		assertTrackerErrorKind(t, err, domain.ErrTrackerAuth)
 	})
+}
+
+func TestNewGiteaAdapter_ProjectURL(t *testing.T) {
+	t.Parallel()
+
+	mux := newPreflightMux(t)
+	root := http.NewServeMux()
+	root.Handle("/gitea/", http.StripPrefix("/gitea", mux))
+	root.Handle("/", mux)
+	srv := httptest.NewServer(root)
+	t.Cleanup(srv.Close)
+
+	tests := []struct{ name, endpoint, want string }{
+		{"bare host", srv.URL, srv.URL + "/acme/widgets"},
+		{"api suffix is dropped", srv.URL + "/api/v1", srv.URL + "/acme/widgets"},
+		{"subpath install keeps its subpath", srv.URL + "/gitea/api/v1", srv.URL + "/gitea/acme/widgets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			adapter, err := NewGiteaAdapter(validConfig(tt.endpoint))
+			if err != nil {
+				t.Fatalf("NewGiteaAdapter(%q): %v", tt.endpoint, err)
+			}
+
+			if got := adapter.(*GiteaAdapter).ProjectURL(); got != tt.want {
+				t.Errorf("ProjectURL() with endpoint %q = %q, want %q", tt.endpoint, got, tt.want)
+			}
+		})
+	}
 }

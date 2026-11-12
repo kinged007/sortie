@@ -51,6 +51,12 @@ const (
 		"{{else if eq .Ahead \"run\"}} after the current run ends{{end}}"
 )
 
+// Fragments shared by the hold templates.
+const (
+	blockersTerminal = "{{if .Several}}every blocker reaches{{else}}the blocker reaches{{end}} a terminal state"
+	resetsIn         = "{{if .HasReset}}, resets in {{duration .ResetsIn}}{{end}}"
+)
+
 // errorDetail ends a run-error sentence with the text the stored error
 // carried, when it carried any.
 const errorDetail = "{{if .Detail}}: {{.Detail}}{{end}}."
@@ -214,6 +220,10 @@ var table = map[string]parts{
 		short: "Waiting on review of #{{.PR}}",
 		long:  "Waiting on review of PR #{{.PR}}" + commentsOf + "; " + nextCheck + "." + usedCount,
 	},
+	"wait_review_approval": {
+		short: "Waiting on approval of #{{.PR}}",
+		long:  "Waiting on approval of PR #{{.PR}}; " + nextCheck + "." + usedCount,
+	},
 	"wait_bot": {
 		short: "Waiting on bot review of #{{.PR}}",
 		long:  "Waiting on bot review of PR #{{.PR}}{{if .Bots}} by {{.Bots}}{{end}}" + commentsOf + "; " + nextCheck + "." + usedCount,
@@ -291,6 +301,12 @@ var table = map[string]parts{
 			"so it starts no agent session for any issue while sessions already running finish.",
 		clears: "Clears once the UTC day ends, or after `agent.max_daily_cost_usd` is raised above the day's spend or removed.",
 	},
+	"attn_spend_weekly": {
+		reason: "Weekly spend ceiling reached",
+		why: "Sortie has spent {{if .AtLeast}}at least {{end}}{{usd .Used}} in estimated cost this UTC week against the weekly ceiling of {{usd .Budget}}, " +
+			"so it starts no agent session for any issue while sessions already running finish.",
+		clears: "Clears once the UTC week ends at the start of Monday, or after `agent.max_weekly_cost_usd` is raised above the week's spend or removed.",
+	},
 	"attn_spend_monthly": {
 		reason: "Monthly spend ceiling reached",
 		why: "Sortie has spent {{if .AtLeast}}at least {{end}}{{usd .Used}} in estimated cost this UTC month against the monthly ceiling of {{usd .Budget}}, " +
@@ -316,11 +332,11 @@ var table = map[string]parts{
 	},
 	"attn_escalated_bot_review": {
 		reason: "Bot review escalated on #{{.PR}}",
-		why: ifTrigger(orchestrator.EscalationTriggerTriage) + "Sortie escalated review bot comments on PR #{{.PR}}" + triageAsked + "." +
+		why: ifTrigger(orchestrator.EscalationTriggerTriage) + "Sortie escalated bot review comments on PR #{{.PR}}" + triageAsked + "." +
 			"{{else}}Sortie used " + triesOfMax + " bot review fix runs on PR #{{.PR}}, " +
-			"and the pull request still holds review bot comments on its code that no Sortie run was given.{{end}}",
-		clears: "Clears when " + ifTrigger(orchestrator.EscalationTriggerTriage) + "the review bot comments on PR #{{.PR}} change" +
-			"{{else}}no review bot comment on the code of PR #{{.PR}} is left that no Sortie run was given{{end}}, when the pull request merges or closes" +
+			"and the pull request still holds bot review comments on its code that no Sortie run was given.{{end}}",
+		clears: "Clears when " + ifTrigger(orchestrator.EscalationTriggerTriage) + "the bot review comments on PR #{{.PR}} change" +
+			"{{else}}no bot review comment on the code of PR #{{.PR}} is left that no Sortie run was given{{end}}, when the pull request merges or closes" +
 			onBudget(", when Sortie restarts with `reactions.bot_review.max_continuation_turns` above {{count .Tries}}") +
 			", or when " + terminalExit + ".",
 	},
@@ -355,6 +371,72 @@ var table = map[string]parts{
 		long:  "Moved from stage {{.Source}} to stage {{.Target}}, and Sortie added `{{.Label}}`; {{.Target}} starts when a poll tick reads that label on the issue.",
 	},
 
+	"hold_blocked_by": {
+		short:  "Blocked by {{list .Blockers}}",
+		long:   "Blocked by {{series .Blockers}}. Sortie dispatches the issue once " + blockersTerminal + ".",
+		clears: "Released when " + blockersTerminal + ".",
+	},
+	"hold_blockers_unresolved": {
+		short:  "Blockers not read: a tracker request failed",
+		long:   "Sortie could not read the issue's blockers because a tracker request failed, and it dispatches no issue whose blockers it has not read. A later poll reads them again.",
+		clears: "Released by the next successful read of its blockers.",
+	},
+	"hold_blockers_not_read": {
+		short:  "Blockers not read on this poll",
+		long:   "Each poll reads the blockers of a limited number of issues, taking them in turn, and this poll did not read the issue's. A later poll reads them.",
+		clears: "Released when a later poll reads its blockers and finds none open.",
+	},
+	"hold_blockers_incomplete": {
+		short:  "Blocker list incomplete",
+		long:   "The tracker returned an incomplete list of the issue's blockers, and Sortie dispatches no issue whose blockers it cannot check.",
+		clears: "Released when the tracker returns the whole blocker list and none is open.",
+	},
+	"hold_agent_slots_global": {
+		short:  "No free agent slot: {{count .Used}} of {{count .Limit}} running",
+		long:   "All agent slots are taken: {{count .Used}} of {{count .Limit}} under `agent.max_concurrent_agents`. Sortie dispatches the issue once a running session ends.",
+		clears: "Released when a running session ends.",
+	},
+	"hold_agent_slots_state": {
+		short:  "No free agent slot for {{.State}}: {{count .Used}} of {{count .Limit}} running",
+		long:   "All agent slots for {{.State}} are taken: {{count .Used}} of {{count .Limit}} under `agent.max_concurrent_agents_by_state`. Sortie dispatches the issue once one of those sessions ends or its issue leaves {{.State}}.",
+		clears: "Released when one of those sessions ends or its issue leaves {{.State}}.",
+	},
+	"hold_ssh_hosts": {
+		short:  "No free SSH host",
+		long:   "Every SSH host runs as many sessions as its per-host limit allows. Sortie dispatches the issue once a session on one of them ends.",
+		clears: "Released when a session on an SSH host ends.",
+	},
+	"hold_spend_daily": {
+		short:  "Daily spend ceiling reached" + resetsIn,
+		long:   "The daily spend ceiling is reached, so Sortie starts no agent session for any issue until the UTC day ends.",
+		clears: "Released once the UTC day ends, or after `agent.max_daily_cost_usd` is raised above the day's spend or removed.",
+	},
+	"hold_spend_weekly": {
+		short:  "Weekly spend ceiling reached" + resetsIn,
+		long:   "The weekly spend ceiling is reached, so Sortie starts no agent session for any issue until the UTC week ends at the start of Monday.",
+		clears: "Released once the UTC week ends at the start of Monday, or after `agent.max_weekly_cost_usd` is raised above the week's spend or removed.",
+	},
+	"hold_spend_monthly": {
+		short:  "Monthly spend ceiling reached" + resetsIn,
+		long:   "The monthly spend ceiling is reached, so Sortie starts no agent session for any issue until the UTC month ends.",
+		clears: "Released once the UTC month ends, or after `agent.max_monthly_cost_usd` is raised above the month's spend or removed.",
+	},
+	"hold_usage_limit": {
+		short:  "Usage limit reached for {{if .ModelOnly}}{{or .Model \"the default model\"}} on {{end}}{{.AgentKind}}" + resetsIn,
+		long:   "The agent provider refused a {{.AgentKind}} session because the account's usage limit{{if .ModelOnly}} for {{or .Model \"the default model\"}}{{end}} is reached. Sortie starts no {{.AgentKind}} session{{if .ModelOnly}} on that model{{end}} until the limit resets, and issues routed to other agents{{if .ModelOnly}} or models{{end}} keep dispatching.",
+		clears: "Released once the usage limit resets.",
+	},
+	"hold_stage_hop": {
+		short:  "Waiting to confirm the stage move",
+		long:   "Sortie dispatches the next stage once a read of the issue confirms the stage move, and the latest read did not. A later poll reads the issue again.",
+		clears: "Released when a later poll reads the issue in an active state.",
+	},
+	"hold_park_comments": {
+		short:  "Waiting to read the comments since the park",
+		long:   "Sortie gives the next run the comments posted since the issue was parked, and the latest read of them failed. A later poll reads them again.",
+		clears: "Released when a later poll reads the issue's comments.",
+	},
+
 	"ended_handed": {
 		short: "Handed off to {{.State}}",
 		long:  "Handed off: Sortie moved the issue to {{.State}}.",
@@ -386,7 +468,7 @@ var table = map[string]parts{
 	"next_if_review_comments": {condition: "{{if .Settle}}When the new review comments on " + thePR + " settle" + inNext +
 		"{{else}}If a check" + inNext + " finds new review comments on " + thePR + "{{end}}"},
 	"next_if_bot_comments": {condition: "If a check" + inNext + " finds " +
-		"{{if .Spent}}a new review bot comment on the code of " + thePR + "{{else}}new review bot comments on " + thePR + "{{end}}"},
+		"{{if .Spent}}a new bot review comment on the code of " + thePR + "{{else}}new bot review comments on " + thePR + "{{end}}"},
 	"next_if_merge_conflict": {condition: "If a check" + inNext + " finds a new merge conflict on " + thePR},
 	"next_when_merge_ready": {condition: "When a check" + inNext + " finds that " + thePR + " " +
 		"{{if .RequireCI}}passes CI and meets its other merge conditions{{else}}meets its merge conditions{{end}}"},
@@ -458,7 +540,8 @@ var table = map[string]parts{
 	"run_error_turn_outcome_unknown":  {text: "The agent ended {{.Turn}} with an outcome Sortie could not read" + errorDetail},
 	"run_error_turn_token_limit":      {text: "The agent ended {{.Turn}} because a token limit was reached" + errorDetail},
 	"run_error_turn_request_limit":    {text: "The agent ended {{.Turn}} because it used up its request limit" + errorDetail},
-	"run_error_credential_unverified": {text: "The agent could not confirm its credential before the first turn" + errorDetail},
+	"run_error_usage_limit":           {text: "The agent provider refused the run because the account's usage limit is reached" + errorDetail},
+	"run_error_credential_unverified": {text: "The agent's credential was refused or could not be confirmed" + errorDetail},
 	"run_error_agent_other":           {text: "The agent reported an error" + errorDetail},
 	"run_error_turn_ended":            {text: "The agent ended {{.Turn}} early{{if .Detail}} ({{.Detail}}){{end}}."},
 	"run_error_stage_stopped":         {text: "Sortie stopped the run while {{.Doing}}."},
@@ -466,6 +549,13 @@ var table = map[string]parts{
 	"run_error_stage":                 {text: "Sortie hit an error while {{.Doing}}" + errorDetail},
 	"run_error_panic":                 {text: "Sortie hit an internal error while running the agent" + errorDetail},
 	"run_error_stopped":               {text: "Sortie stopped the run before it finished."},
+	"run_error_ci_failed":             {text: "The CI checks failed on commit {{.Ref}}."},
+	"run_error_money_ceiling":         {text: "Sortie stopped the run because the issue's estimated cost, {{.Used}}, reached its limit of {{.Budget}}."},
+	"run_error_token_ceiling":         {text: "Sortie stopped the run because the issue used {{tokens .Used}} tokens, reaching its limit of {{tokens .Budget}}."},
+	"run_error_stall":                 {text: "The agent sent no event within the stall timeout, so Sortie stopped the run."},
+	"run_error_shutdown":              {text: "Sortie stopped the run because the service was shutting down."},
+	"run_error_terminal":              {text: "Sortie stopped the run because the issue moved to {{.State}}, a final state."},
+	"run_error_inactive":              {text: "Sortie stopped the run because the issue is no longer in an active state{{if .State}} (now {{.State}}){{end}}."},
 	"run_error_out_of_time":           {text: "The run ran out of time."},
 
 	"stall_marker": {

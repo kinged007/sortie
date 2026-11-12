@@ -72,22 +72,6 @@ func buildADFComment(text string) map[string]any {
 	return adfCommentDocument(adfParagraphs(text))
 }
 
-// buildADFLiteralComment is [buildADFComment] with one codeBlock node
-// after the paragraphs. The block holds literal as a single text node,
-// which Jira renders without interpreting any markup, mention, or link.
-func buildADFLiteralComment(text, literal string) map[string]any {
-	content := append(adfParagraphs(text), map[string]any{
-		"type": "codeBlock",
-		"content": []any{
-			map[string]any{
-				"type": "text",
-				"text": literal,
-			},
-		},
-	})
-	return adfCommentDocument(content)
-}
-
 func adfParagraphs(text string) []any {
 	lines := strings.Split(text, "\n")
 	paragraphs := make([]any, 0, len(lines))

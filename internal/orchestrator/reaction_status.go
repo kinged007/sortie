@@ -53,20 +53,36 @@ func notePullRequestURL(entry *PendingReaction, status domain.PRMergeStatus) {
 	}
 }
 
+// pullRequestRead is the outcome of one mergeability read. made is false
+// when no read happened.
+type pullRequestRead struct {
+	status domain.PRMergeStatus
+	made   bool
+	err    error
+}
+
 // readPullRequestURL reads entry's pull request once and keeps its link when
-// entry holds none. A failed read is logged at Debug and changes nothing
-// else: no backoff, no wait reason, no PendingAttempts.
-func readPullRequestURL(ctx context.Context, scm domain.SCMAdapter, entry *PendingReaction, log *slog.Logger) {
+// entry holds none, reporting the read it made. A failed read is logged at
+// Debug and changes nothing else: no backoff, no wait reason, no
+// PendingAttempts.
+func readPullRequestURL(ctx context.Context, scm domain.SCMAdapter, entry *PendingReaction, log *slog.Logger) pullRequestRead {
 	if entry.PullRequestURL != "" {
-		return
+		return pullRequestRead{}
 	}
+	return readPullRequest(ctx, scm, entry, log)
+}
+
+// readPullRequest reads entry's pull request and keeps its link, whether or
+// not entry already holds one.
+func readPullRequest(ctx context.Context, scm domain.SCMAdapter, entry *PendingReaction, log *slog.Logger) pullRequestRead {
 	pr := pullRequestOf(entry)
 	status, err := scm.GetMergeability(ctx, pr.Number, pr.Owner, pr.Repo)
 	if err != nil {
 		log.DebugContext(ctx, "pull request link read failed", slog.Any("error", err))
-		return
+		return pullRequestRead{made: true, err: err}
 	}
 	notePullRequestURL(entry, status)
+	return pullRequestRead{status: status, made: true}
 }
 
 // pullRequestRef is the pull request a pending reaction's kind data records.

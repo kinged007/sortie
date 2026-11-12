@@ -8,14 +8,14 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const (
 	holdPath     = "/v1/messages"
 	holdAuxBody  = `{"model":"scripted-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	holdTurnBody = `{"model":"scripted-model","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"read_file","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]}`
-	holdWait     = 5 * time.Second
 )
 
 type holdReply struct {
@@ -51,28 +51,6 @@ func postModelInBackground(ctx context.Context, url, body string) <-chan holdRep
 	return reply
 }
 
-func awaitHolding(t *testing.T, srv *Server) {
-	t.Helper()
-
-	select {
-	case <-srv.holding():
-	case <-time.After(holdWait):
-		t.Fatalf("holding() still open %s after the turn request was sent", holdWait)
-	}
-}
-
-func awaitReply(t *testing.T, reply <-chan holdReply) holdReply {
-	t.Helper()
-
-	select {
-	case got := <-reply:
-		return got
-	case <-time.After(holdWait):
-		t.Fatalf("no reply within %s", holdWait)
-		return holdReply{}
-	}
-}
-
 func heldExchanges(srv *Server) []Exchange {
 	var held []Exchange
 	for _, ex := range srv.Exchanges() {
@@ -100,7 +78,7 @@ func TestHoldOpensOnlyForTheTurnRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	postModelInBackground(ctx, srv.URL(), holdTurnBody)
-	awaitHolding(t, srv)
+	waittest.Receive(t, srv.holding(), "holding() after the turn request was sent")
 
 	held := heldExchanges(srv)
 	if len(held) != 1 || held[0].Step != 0 {
@@ -115,13 +93,13 @@ func TestHoldEndsQuietlyWhenTheClientDisconnects(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	reply := postModelInBackground(ctx, srv.URL(), holdTurnBody)
-	awaitHolding(t, srv)
+	waittest.Receive(t, srv.holding(), "holding() after the turn request was sent")
 
 	cancel()
-	awaitReply(t, reply)
+	waittest.Receive(t, reply, "model reply")
 
-	if open := srv.awaitHolds(holdWait); len(open) != 0 {
-		t.Errorf("awaitHolds(%s) = %d open holds after the client disconnected, want none", holdWait, len(open))
+	if open := srv.awaitHolds(waittest.HangGuard); len(open) != 0 {
+		t.Errorf("awaitHolds(%s) = %d open holds after the client disconnected, want none", waittest.HangGuard, len(open))
 	}
 	if failures := reporter.snapshot(); len(failures) != 0 {
 		t.Errorf("failures after a client disconnect = %q, want none", failures)
@@ -136,10 +114,10 @@ func TestHoldReleaseAnswersConnectedClientWithTheWireError(t *testing.T) {
 
 	srv, reporter := startHeld(t)
 	reply := postModelInBackground(t.Context(), srv.URL(), holdTurnBody)
-	awaitHolding(t, srv)
+	waittest.Receive(t, srv.holding(), "holding() after the turn request was sent")
 
 	srv.release()
-	got := awaitReply(t, reply)
+	got := waittest.Receive(t, reply, "model reply")
 
 	if got.err != nil {
 		t.Fatalf("released request error = %v", got.err)

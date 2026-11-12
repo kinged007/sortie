@@ -1,13 +1,15 @@
 package sentence
 
 import (
+	"iter"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 const (
@@ -20,7 +22,24 @@ var (
 	agentTurn      = regexp.MustCompile(`(?s)^agent turn (\d+): (.*)$`)
 	agentKindChain = regexp.MustCompile(`(?s)^agent: ([a-z_]+): (.*)$`)
 	turnStage      = regexp.MustCompile(`(?s)^(prompt render|issue state refresh) \(turn (\d+)\): (.*)$`)
+
+	// errorStems are the prefixes a worker and an adapter put in front of an
+	// error's own text; a person reads the sentence in their place.
+	errorStems = regexp.MustCompile(`^(?:agent turn \d+: |agent session start: |agent: [a-z_]+: )+`)
+
+	ciFailure    = regexp.MustCompile(`^CI checks failed on ref (.+)$`)
+	moneyCeiling = regexp.MustCompile(`^money ceiling reached: used (\S+) of (\S+)$`)
+	tokenCeiling = regexp.MustCompile(`^token ceiling reached: used (\d+) of (\d+) tokens$`)
+	nonWord      = regexp.MustCompile(`[^\pL\pN]+`)
 )
+
+// fillerWords carry no information of their own when a detail is compared
+// with the sentence it would follow.
+var fillerWords = map[string]bool{
+	"a": true, "an": true, "the": true, "you": true, "your": true, "youve": true, "it": true, "its": true,
+	"is": true, "are": true, "was": true, "has": true, "have": true, "been": true, "be": true,
+	"of": true, "to": true, "hit": true,
+}
 
 // agentErrorKinds are the adapter error kinds that have a run-error sentence.
 var agentErrorKinds = []domain.AgentErrorKind{
@@ -28,7 +47,7 @@ var agentErrorKinds = []domain.AgentErrorKind{
 	domain.ErrTurnTimeout, domain.ErrPortExit, domain.ErrResponseError, domain.ErrTurnFailed,
 	domain.ErrTurnCancelled, domain.ErrTurnInputRequired, domain.ErrTurnIncomplete,
 	domain.ErrTurnRefused, domain.ErrTurnOutcomeUnknown, domain.ErrTurnTokenLimit,
-	domain.ErrTurnRequestLimit, domain.ErrCredentialUnverified,
+	domain.ErrTurnRequestLimit, domain.ErrCredentialUnverified, domain.ErrUsageLimit,
 }
 
 // stagePrefixes maps the stage a worker named in front of an error to what
@@ -39,10 +58,11 @@ var stagePrefixes = []struct{ prefix, doing string }{
 }
 
 // RunError returns the text a person reads for a stored run or retry error.
-// A withheld handoff, an agent turn error chain and a worker stage error read
-// as one plain sentence, also when a retry entry wrapped them as a worker
-// exit; any other error is returned unchanged. The stored value stays the key
-// that run history queries match on.
+// A withheld handoff, an agent turn error chain, a worker stage error, a
+// failed CI check, a budget stop and the reason the orchestrator cancelled a
+// run read as one plain sentence, also when a retry entry wrapped them as a
+// worker exit; any other error is returned unchanged. The stored value stays
+// the key that run history queries match on.
 func RunError(stored string) string {
 	unwrapped := strings.TrimPrefix(stored, orchestrator.WorkerExitedErrorPrefix)
 	if text, ok := withheldHandoffText(unwrapped); ok {
@@ -51,21 +71,57 @@ func RunError(stored string) string {
 	if text, ok := workerErrorText(unwrapped); ok {
 		return text
 	}
+	if text, ok := orchestratorStopText(unwrapped); ok {
+		return text
+	}
 	return stored
 }
 
+// orchestratorStopText words the errors the orchestrator itself records: a
+// failed CI check, a budget stop, and the reason it cancelled a run.
+func orchestratorStopText(stored string) (string, bool) {
+	if m := ciFailure.FindStringSubmatch(stored); m != nil {
+		return render("run_error_ci_failed", "text", map[string]any{"Ref": m[1]}), true
+	}
+	if m := moneyCeiling.FindStringSubmatch(stored); m != nil {
+		return render("run_error_money_ceiling", "text", map[string]any{"Used": m[1], "Budget": m[2]}), true
+	}
+	if m := tokenCeiling.FindStringSubmatch(stored); m != nil {
+		used, usedErr := strconv.ParseInt(m[1], 10, 64)
+		budget, budgetErr := strconv.ParseInt(m[2], 10, 64)
+		if usedErr == nil && budgetErr == nil {
+			return render("run_error_token_ceiling", "text", map[string]any{"Used": &used, "Budget": &budget}), true
+		}
+	}
+	switch stored {
+	case orchestrator.StallCancelError:
+		return render("run_error_stall", "text", nil), true
+	case orchestrator.ShutdownCancelError:
+		return render("run_error_shutdown", "text", nil), true
+	case strings.TrimSuffix(orchestrator.InactiveCancelErrorPrefix, ": "):
+		return render("run_error_inactive", "text", map[string]any{"State": ""}), true
+	}
+	if state, ok := strings.CutPrefix(stored, orchestrator.TerminalCancelErrorPrefix); ok {
+		return render("run_error_terminal", "text", map[string]any{"State": state}), true
+	}
+	if state, ok := strings.CutPrefix(stored, orchestrator.InactiveCancelErrorPrefix); ok {
+		return render("run_error_inactive", "text", map[string]any{"State": state}), true
+	}
+	return "", false
+}
+
 func withheldHandoffText(stored string) (string, bool) {
-	rest, withheld := strings.CutPrefix(stored, persistence.HandoffAbsenceErrorPrefix)
+	rest, withheld := strings.CutPrefix(stored, storage.HandoffAbsenceErrorPrefix)
 	if !withheld {
 		return "", false
 	}
 	switch {
-	case strings.HasPrefix(rest, persistence.HandoffVerdictAbsence):
+	case strings.HasPrefix(rest, storage.HandoffVerdictAbsence):
 		return render("run_error_absence", "text", nil), true
-	case strings.HasPrefix(rest, persistence.HandoffVerdictUndetermined):
+	case strings.HasPrefix(rest, storage.HandoffVerdictUndetermined):
 		return render("run_error_undetermined", "text", nil), true
 	}
-	return render("run_error_withheld", "text", map[string]any{"Detail": detailOf(rest)}), true
+	return renderRunError("run_error_withheld", map[string]any{"Detail": detailOf(rest)}), true
 }
 
 func workerErrorText(stored string) (string, bool) {
@@ -91,7 +147,7 @@ func workerErrorText(stored string) (string, bool) {
 		}
 	}
 	if rest, ok := strings.CutPrefix(stored, "worker panic: "); ok {
-		return render("run_error_panic", "text", map[string]any{"Detail": detailOf(rest)}), true
+		return renderRunError("run_error_panic", map[string]any{"Detail": detailOf(rest)}), true
 	}
 	switch stored {
 	case contextCanceled:
@@ -119,13 +175,13 @@ func agentErrorText(turn string, start bool, chain string) string {
 		case hasContextError(chain, contextDeadline):
 			return render("run_error_out_of_time", "text", nil)
 		}
-		return render("run_error_agent_other", "text", data)
+		return renderRunError("run_error_agent_other", data)
 	}
 	data["Detail"] = detailOf(m[2])
 	if !slices.Contains(agentErrorKinds, domain.AgentErrorKind(m[1])) {
-		return render("run_error_agent_other", "text", data)
+		return renderRunError("run_error_agent_other", data)
 	}
-	return render("run_error_"+m[1], "text", data)
+	return renderRunError("run_error_"+m[1], data)
 }
 
 func turnEndedText(turn, reason string) string {
@@ -145,11 +201,11 @@ func stageText(doing, cause string) string {
 	data := map[string]any{"Doing": doing, "Detail": detailOf(cause)}
 	switch {
 	case hasContextError(cause, contextCanceled):
-		return render("run_error_stage_stopped", "text", data)
+		return renderRunError("run_error_stage_stopped", data)
 	case hasContextError(cause, contextDeadline):
-		return render("run_error_stage_timeout", "text", data)
+		return renderRunError("run_error_stage_timeout", data)
 	}
-	return render("run_error_stage", "text", data)
+	return renderRunError("run_error_stage", data)
 }
 
 func hasContextError(chain, noise string) bool {
@@ -157,9 +213,11 @@ func hasContextError(chain, noise string) bool {
 }
 
 // detailOf returns the text of an error chain worth showing a person: the
-// chain without a closing context error, which only says why the chain ended,
-// and without a closing period, which the sentence supplies.
+// chain without the worker and adapter stems in front of it, without a closing
+// context error, which only says why the chain ended, and without a closing
+// period, which the sentence supplies.
 func detailOf(chain string) string {
+	chain = errorStems.ReplaceAllString(chain, "")
 	for _, noise := range []string{contextCanceled, contextDeadline} {
 		if chain == noise {
 			return ""
@@ -167,4 +225,37 @@ func detailOf(chain string) string {
 		chain = strings.TrimSuffix(chain, ": "+noise)
 	}
 	return strings.TrimSuffix(strings.TrimSpace(chain), ".")
+}
+
+// renderRunError renders a run-error sentence that ends in its detail. A
+// detail that only restates the sentence is left out, so the reader gets the
+// reason once.
+func renderRunError(name string, data map[string]any) string {
+	detail, _ := data["Detail"].(string)
+	if detail != "" {
+		data["Detail"] = ""
+		if !restates(render(name, "text", data), detail) {
+			data["Detail"] = detail
+		}
+	}
+	return render(name, "text", data)
+}
+
+// restates reports whether every word of detail, filler aside, already
+// appears in sentence.
+func restates(sentence, detail string) bool {
+	known := make(map[string]bool)
+	for word := range words(sentence) {
+		known[word] = true
+	}
+	for word := range words(detail) {
+		if !fillerWords[word] && !known[word] {
+			return false
+		}
+	}
+	return true
+}
+
+func words(text string) iter.Seq[string] {
+	return slices.Values(strings.Fields(nonWord.ReplaceAllString(strings.ReplaceAll(strings.ToLower(text), "'", ""), " ")))
 }

@@ -90,6 +90,7 @@ Hook environment variables available only to `after_run`:
 
 - `SORTIE_SELF_REVIEW_STATUS`: self-review outcome for the current run: `"disabled"`, `"passed"`, `"cap_reached"`, or `"error"`. Defaults to `"disabled"` when self-review is not configured.
 - `SORTIE_SELF_REVIEW_SUMMARY_PATH`: absolute path to `.sortie/review_summary.md` in the workspace. Absent when self-review did not run or summary was not written.
+- `SORTIE_RUN_OUTCOME`: how the attempt ended: `"succeeded"`, `"stopped"` (the run needed input, stopped at a budget or a usage limit, or the agent declared `blocked`), `"failed"`, or `"cancelled"`. The orchestrator sets it in every mode, and it overrides a same-named variable of the parent environment. The value is decided before the handoff evidence verdict (Section 9.4.1), so an attempt whose handoff the policy then withholds reads `"succeeded"` in the hook and is recorded as failed. A cancellation that lands while the hook runs can make the hook read `"failed"` for an attempt recorded as cancelled. A hook that commits and pushes can skip every value other than `"succeeded"`.
 
 #### 9.4.1 Handoff Evidence Baseline
 

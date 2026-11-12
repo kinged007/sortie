@@ -12,8 +12,9 @@ import (
 	"testing"
 
 	"github.com/sortie-ai/sortie/internal/orchestrator"
-	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/server"
+	"github.com/sortie-ai/sortie/internal/storage"
+	"github.com/sortie-ai/sortie/internal/storage/sqlite"
 )
 
 type runRef struct {
@@ -21,22 +22,22 @@ type runRef struct {
 }
 
 type runsHarness struct {
-	store *persistence.Store
+	store orchestrator.OrchestratorStore
 	url   string
 }
 
 func newRunsHarness(t *testing.T, snap orchestrator.RuntimeSnapshotResult) *runsHarness {
 	t.Helper()
-	store, err := persistence.Open(t.Context(), ":memory:")
+	store, err := sqlite.Open(t.Context(), ":memory:")
 	if err != nil {
-		t.Fatalf("persistence.Open: %v", err)
+		t.Fatalf("sqlite.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	if err := store.Migrate(t.Context()); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	srv := server.New(server.Params{
-		SnapshotFn: func() (orchestrator.RuntimeSnapshotResult, error) { return snap, nil },
+		SnapshotFn: func() orchestrator.RuntimeSnapshotResult { return snap },
 		RefreshFn:  func() bool { return true },
 		RunHistory: runHistoryReader{store: store},
 	})
@@ -45,13 +46,21 @@ func newRunsHarness(t *testing.T, snap orchestrator.RuntimeSnapshotResult) *runs
 	return &runsHarness{store: store, url: ts.URL}
 }
 
-func (h *runsHarness) append(t *testing.T, run persistence.RunHistory) int64 {
+func (h *runsHarness) append(t *testing.T, run storage.RunHistory) int64 {
 	t.Helper()
 	got, err := h.store.AppendRunHistory(t.Context(), run)
 	if err != nil {
 		t.Fatalf("AppendRunHistory(%q): %v", run.Identifier, err)
 	}
 	return got.ID
+}
+
+func (h *runsHarness) appendWithUsage(t *testing.T, run storage.RunHistory, dispatchID string) {
+	t.Helper()
+	run.DispatchID = &dispatchID
+	if _, err := h.store.AppendRunHistoryWithEvents(t.Context(), run, nil, storage.RunEventLimits{}); err != nil {
+		t.Fatalf("AppendRunHistoryWithEvents(%q): %v", run.Identifier, err)
+	}
 }
 
 func (h *runsHarness) get(t *testing.T, route string, out any) int {
@@ -93,7 +102,7 @@ func (h *runsHarness) drain(t *testing.T, query string, afterFirstPage func()) (
 	return nil, nil
 }
 
-func (h *runsHarness) recordOutcome(t *testing.T, outcome persistence.IssueOutcome) {
+func (h *runsHarness) recordOutcome(t *testing.T, outcome storage.IssueOutcome) {
 	t.Helper()
 	if err := h.store.RecordIssueOutcome(t.Context(), outcome); err != nil {
 		t.Fatalf("RecordIssueOutcome(%q): %v", outcome.IssueID, err)
@@ -109,8 +118,8 @@ func issueOutcomeMember(t *testing.T, where string, row map[string]any) any {
 	return member
 }
 
-func runRow(issueID, identifier string) persistence.RunHistory {
-	return persistence.RunHistory{IssueID: issueID, Identifier: identifier, AgentAdapter: "claude-code", Status: "succeeded", RuleName: "implement", CompletedAt: "2026-03-01T09:00:00Z", TokensMeasured: true}
+func runRow(issueID, identifier string) storage.RunHistory {
+	return storage.RunHistory{IssueID: issueID, Identifier: identifier, AgentAdapter: "claude-code", Status: "succeeded", RuleName: "implement", CompletedAt: "2026-03-01T09:00:00Z", TokensMeasured: true}
 }
 
 func TestRunHistoryPagesWithoutGapsOrRepeats(t *testing.T) {
@@ -167,7 +176,7 @@ func TestRunHistoryFilters(t *testing.T) {
 			}
 			for _, issueID := range []string{tt.hit, tt.miss} {
 				if at, ended := endedAt[issueID]; ended {
-					h.recordOutcome(t, persistence.IssueOutcome{IssueID: issueID, Kind: persistence.IssueOutcomeTerminal, ObservedAt: at, State: "Done"})
+					h.recordOutcome(t, storage.IssueOutcome{IssueID: issueID, Kind: storage.IssueOutcomeTerminal, ObservedAt: at, State: "Done"})
 				}
 			}
 			seed(tt.miss)
@@ -191,31 +200,31 @@ func TestRunHistoryServesIssueOutcome(t *testing.T) {
 	const at = "2026-03-02T10:00:00Z"
 	tests := []struct {
 		name   string
-		stored *persistence.IssueOutcome
+		stored *storage.IssueOutcome
 		want   any
 	}{
 		{name: "none while the issue runs"},
 		{
 			name:   "handed off",
-			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeHandedOff, ObservedAt: at, State: "In Review"},
+			stored: &storage.IssueOutcome{Kind: storage.IssueOutcomeHandedOff, ObservedAt: at, State: "In Review"},
 			want: map[string]any{"kind": "handed_off", "observed_at": at, "state": "In Review",
 				"status_text": "Handed off to In Review", "status_text_full": "Handed off: Sortie moved the issue to In Review."},
 		},
 		{
 			name:   "terminal",
-			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeTerminal, ObservedAt: at, State: "Done"},
+			stored: &storage.IssueOutcome{Kind: storage.IssueOutcomeTerminal, ObservedAt: at, State: "Done"},
 			want: map[string]any{"kind": "terminal", "observed_at": at, "state": "Done",
 				"status_text": "Reached Done", "status_text_full": "Reached the tracker state Done."},
 		},
 		{
 			name:   "merged by auto-merge",
-			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge", PRNumber: 88, PRRepository: "acme/api"},
+			stored: &storage.IssueOutcome{Kind: storage.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge", PRNumber: 88, PRRepository: "acme/api"},
 			want: map[string]any{"kind": "merged", "observed_at": at, "merge_path": "auto_merge", "pull_request": map[string]any{"number": 88.0, "repository": "acme/api"},
 				"status_text": "Merged #88", "status_text_full": "Ended merged: auto-merge merged PR #88."},
 		},
 		{
 			name:   "merged by merge completion",
-			stored: &persistence.IssueOutcome{Kind: persistence.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge-completion", PRNumber: 89, PRRepository: "acme/web"},
+			stored: &storage.IssueOutcome{Kind: storage.IssueOutcomeMerged, ObservedAt: at, MergeReactionKind: "merge-completion", PRNumber: 89, PRRepository: "acme/web"},
 			want: map[string]any{"kind": "merged", "observed_at": at, "merge_path": "merge_completion", "pull_request": map[string]any{"number": 89.0, "repository": "acme/web"},
 				"status_text": "Merged #89", "status_text_full": "Ended merged: merge completion saw PR #89 merge."},
 		},
@@ -277,35 +286,64 @@ func TestRunHistoryServesCostAndOrigin(t *testing.T) {
 	measured := runRow("i-0", "OTHER-0")
 	measured.EstimatedCostUSD, measured.CostStatus = new(0.010035), "estimated"
 	measured.Trigger, measured.ReactionKind, measured.InputTokens, measured.OutputTokens, measured.TotalTokens, measured.CacheReadTokens, measured.CacheWriteTokens = new("ci_fix"), "ci", 1000, 500, 1500, 200, 100
-	measured.DispatchID = new("d-1")
-	measured.ModelUsage = map[string]persistence.ModelTokens{"m-a": {InputTokens: 1000, OutputTokens: 500, CacheReadTokens: 200, CacheWriteTokens: 100}}
-	measured.ModelCosts = map[string]persistence.ModelCost{"m-a": {EstimatedCostUSD: new(0.010035), CostStatus: "partial", UnratedClasses: []string{"cache_write"}}}
+	measured.DeclaredOutcome, measured.AgentText = "blocked", "Which one should the API expose?"
+	measured.ModelUsage = map[string]storage.ModelTokens{"m-a": {InputTokens: 1000, OutputTokens: 500, CacheReadTokens: 200, CacheWriteTokens: 100}}
+	measured.ModelCosts = map[string]storage.ModelCost{"m-a": {EstimatedCostUSD: new(0.010035), CostStatus: "partial", PriceSource: "agent", UnratedClasses: []string{"cache_write"}}}
+	measured.UnaccountedTurns = 2
 	unmeasured := runRow("i-0", "OTHER-0")
 	unmeasured.TokensMeasured, unmeasured.CostStatus = false, "unmeasured"
+	creditsOnly := unmeasured
+	creditsOnly.UsageCompleteness = storage.UsageUnmeasured
+	creditsOnly.ReportedAmounts = []storage.ReportedAmount{
+		{Unit: "credits", Model: "m-b", Amount: 1.5, LowerBound: true},
+		{Unit: "credits", Amount: 3},
+		{Unit: "USD", Amount: 0.2},
+	}
 
 	h := newRunsHarness(t, orchestrator.RuntimeSnapshotResult{})
-	if _, err := h.store.AppendRunHistoryWithEvents(t.Context(), measured, nil, persistence.RunEventLimits{}); err != nil {
-		t.Fatalf("AppendRunHistoryWithEvents(%q): %v", measured.Identifier, err)
-	}
+	h.appendWithUsage(t, measured, "d-1")
 	h.append(t, unmeasured)
+	h.appendWithUsage(t, creditsOnly, "d-2")
 	var body struct{ Runs []map[string]any }
-	if status := h.get(t, "/api/v1/runs", &body); status != http.StatusOK || len(body.Runs) != 2 {
-		t.Fatalf("GET /api/v1/runs = %d with %d runs, want %d with 2", status, len(body.Runs), http.StatusOK)
+	if status := h.get(t, "/api/v1/runs", &body); status != http.StatusOK || len(body.Runs) != 3 {
+		t.Fatalf("GET /api/v1/runs = %d with %d runs, want %d with 3", status, len(body.Runs), http.StatusOK)
 	}
 
+	noTokens := tokens(nil, nil, nil, nil, nil)
 	wants := []map[string]any{
-		{"tokens": tokens(nil, nil, nil, nil, nil), "estimated_cost_usd": nil, "cost_status": "unmeasured", "model_usage": []any{}, "trigger": nil, "reaction_kind": "", "reaction_config_key": ""},
+		{"tokens": noTokens, "estimated_cost_usd": nil, "cost_status": "unmeasured", "model_usage": []any{}, "usage_completeness": "unmeasured", "usage_provenance": []any{},
+			"vendor_amounts": []any{
+				map[string]any{"unit": "credits", "model": "", "amount": 3.0, "lower_bound": false},
+				map[string]any{"unit": "credits", "model": "m-b", "amount": 1.5, "lower_bound": true},
+			}, "unmeasured_cause": "amounts_only", "unmeasured_units": []any{"USD", "credits"}},
+		{"tokens": noTokens, "estimated_cost_usd": nil, "cost_status": "unmeasured", "model_usage": []any{}, "trigger": nil, "reaction_kind": "", "reaction_config_key": "", "declared_outcome": nil, "agent_text": nil,
+			"usage_completeness": "unmeasured", "usage_provenance": nil, "vendor_amounts": nil, "unmeasured_cause": "unknown", "unmeasured_units": []any{}},
 		{"tokens": tokens(1000.0, 500.0, 1500.0, 200.0, 100.0), "estimated_cost_usd": 0.010035, "cost_status": "estimated", "trigger": "ci_fix",
 			"model_usage": []any{map[string]any{
 				"model": "m-a", "tokens": tokens(1000.0, 500.0, 1500.0, 200.0, 100.0), "uncached_tokens": 1300.0,
-				"estimated_cost_usd": 0.010035, "cost_status": "partial", "unrated_classes": []any{"cache_write"},
-			}}, "reaction_kind": "ci", "reaction_config_key": "ci_failure"},
+				"estimated_cost_usd": 0.010035, "cost_status": "partial", "unrated_classes": []any{"cache_write"}, "price_source": "agent",
+			}}, "usage_completeness": "lower_bound", "usage_provenance": nil, "vendor_amounts": nil, "unmeasured_cause": nil, "unmeasured_units": []any{},
+			"reaction_kind": "ci", "reaction_config_key": "ci_failure", "declared_outcome": "blocked", "agent_text": "Which one should the API expose?"},
 	}
 	for i, want := range wants {
 		for member, wantValue := range want {
 			if got := body.Runs[i][member]; !reflect.DeepEqual(got, wantValue) {
 				t.Errorf("GET /api/v1/runs runs[%d].%s = %v, want %v", i, member, got, wantValue)
 			}
+		}
+	}
+
+	var detail struct {
+		History struct{ Totals map[string]any }
+	}
+	h.get(t, "/api/v1/OTHER-0", &detail)
+	wantTotals := map[string]any{
+		"unmeasured_cause": "mixed", "unmeasured_units": []any{}, "agent_priced_usd": 0.010035, "agent_priced_models": []any{"m-a"},
+		"vendor_amounts": []any{map[string]any{"unit": "credits", "amount": 4.5, "lower_bound": true}},
+	}
+	for member, wantValue := range wantTotals {
+		if got := detail.History.Totals[member]; !reflect.DeepEqual(got, wantValue) {
+			t.Errorf("GET /api/v1/OTHER-0 history.totals.%s = %v, want %v", member, got, wantValue)
 		}
 	}
 }

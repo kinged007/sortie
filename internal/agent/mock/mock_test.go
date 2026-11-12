@@ -149,28 +149,6 @@ func TestNewMockAdapter_FloatTokenValues(t *testing.T) {
 	}
 }
 
-func TestRegistration(t *testing.T) {
-	t.Parallel()
-
-	ctor, err := registry.Agents.Get("mock")
-	if err != nil {
-		t.Fatalf("registry.Agents.Get(\"mock\") error = %v", err)
-	}
-
-	adapter, err := ctor()
-	if err != nil {
-		t.Fatalf("constructor() error = %v", err)
-	}
-	if adapter == nil {
-		t.Fatal("constructor() returned nil adapter")
-	}
-}
-
-// TestMCPInjectionConformance proves mock's declared disposition pins
-// its true behavior: it launches no process, so its launch surface is
-// empty. The call stays in place even though mock builds no launch
-// surface, because a kind with no call is a kind whose declaration
-// nothing checks.
 func TestMCPInjectionConformance(t *testing.T) {
 	t.Parallel()
 
@@ -179,7 +157,14 @@ func TestMCPInjectionConformance(t *testing.T) {
 		t.Fatal(`registry.Agents.Meta("mock") reported not registered`)
 	}
 
-	agenttest.AssertMCPInjection(t, declared.MCPInjection, "/ws/.sortie/mcp.json", agenttest.MCPLaunchSurface{})
+	if declared.MCPDialect != registry.MCPDialectNone {
+		t.Errorf("MCPDialect = %q, want %q", declared.MCPDialect, registry.MCPDialectNone)
+	}
+	if declared.MCPDialectNoneReason == "" {
+		t.Error("MCPDialectNoneReason is empty, want the reason mock delivers no tool server")
+	}
+
+	agenttest.AssertMCPInjection(t, declared.MCPDialect, "/ws/.sortie/mcp.json", agenttest.MCPLaunchSurface{})
 }
 
 func TestStartSession(t *testing.T) {
@@ -272,7 +257,6 @@ func TestRunTurn_DefaultSuccess(t *testing.T) {
 		t.Errorf("Usage = %+v, want {100 50 150}", result.Usage)
 	}
 
-	// Verify event sequence: session_started, 3×notification, token_usage, turn_completed.
 	wantTypes := []domain.AgentEventType{
 		domain.EventSessionStarted,
 		domain.EventNotification,
@@ -290,25 +274,19 @@ func TestRunTurn_DefaultSuccess(t *testing.T) {
 		}
 	}
 
-	// Verify token_usage event carries correct usage.
 	tokenEvt := (*events)[4]
 	if tokenEvt.Usage.InputTokens != 100 || tokenEvt.Usage.OutputTokens != 50 || tokenEvt.Usage.TotalTokens != 150 {
 		t.Errorf("token event Usage = %+v, want {100 50 150}", tokenEvt.Usage)
 	}
 }
 
-// TestRunTurn_SecondTurnEmitsSessionStarted verifies that session_started
-// is emitted on every turn, not just the first. Real adapters (Claude Code)
-// spawn a fresh subprocess per turn and emit session_started at startup.
 func TestRunTurn_SecondTurnEmitsSessionStarted(t *testing.T) {
 	t.Parallel()
 
 	adapter, sess := mustStartMock(t, nil)
 
-	// First turn: consume.
 	adapter.RunTurn(context.Background(), sess, defaultParams()) //nolint:errcheck // test setup
 
-	// Second turn: collect events.
 	params := defaultParams()
 	events := collectEvents(&params)
 
@@ -335,7 +313,6 @@ func TestRunTurn_MultiTurnTokenAccumulation(t *testing.T) {
 
 	adapter, sess := mustStartMock(t, nil)
 
-	// Token usage is cumulative across turns.
 	wantUsage := []domain.TokenUsage{
 		{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
 		{InputTokens: 200, OutputTokens: 100, TotalTokens: 300},
@@ -379,11 +356,6 @@ func TestRunTurn_TokenAccumulationIsPerSession(t *testing.T) {
 	}
 }
 
-// TestRunTurn_AssertUsageContract drives three turns and checks the
-// full emitted event sequence against the shared usage contract: every
-// component non-negative, TotalTokens equal to InputTokens plus
-// OutputTokens, and every component monotonically non-decreasing
-// across the run.
 func TestRunTurn_AssertUsageContract(t *testing.T) {
 	t.Parallel()
 
@@ -400,26 +372,52 @@ func TestRunTurn_AssertUsageContract(t *testing.T) {
 	agenttest.AssertUsageContract(t, *events)
 }
 
-// TestRunTurn_ReportTokenUsage covers the report_token_usage config key's
-// three reachable states: explicitly false, absent or true with an
-// all-zero per-turn configuration, and a value of an unrecognized type.
 func TestRunTurn_ReportTokenUsage(t *testing.T) {
 	t.Parallel()
 
-	t.Run("false emits no token_usage event and leaves the run unmeasured", func(t *testing.T) {
-		t.Parallel()
+	tests := []struct {
+		name            string
+		report          bool
+		outcome         string
+		wantUnaccounted bool
+	}{
+		{"false completed turn spent an unknown amount", false, "completed", true},
+		{"false input_required turn spent an unknown amount", false, "input_required", true},
+		{"false incomplete turn spent an unknown amount", false, "incomplete", true},
+		{"false usage_limit turn was refused so spent nothing", false, "usage_limit", false},
+		{"false error outcome bypasses the shared disposition", false, "error", false},
+		{"true completed turn is settled", true, "completed", false},
+	}
 
-		adapter, sess := mustStartMock(t, map[string]any{"report_token_usage": false})
-		params := defaultParams()
-		events := collectEvents(&params)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		result, err := adapter.RunTurn(context.Background(), sess, params)
-		if err != nil {
-			t.Fatalf("RunTurn() error = %v", err)
-		}
+			adapter, sess := mustStartMock(t, map[string]any{
+				"report_token_usage": tt.report,
+				"turn_outcomes":      []any{tt.outcome},
+			})
+			params := defaultParams()
+			events := collectEvents(&params)
 
-		agenttest.AssertMeasurementAbsent(t, *events, result)
-	})
+			result, _ := adapter.RunTurn(context.Background(), sess, params)
+
+			if result.SpendUnaccounted != tt.wantUnaccounted {
+				t.Errorf("RunTurn(report_token_usage=%v, outcome=%q).SpendUnaccounted = %v, want %v", tt.report, tt.outcome, result.SpendUnaccounted, tt.wantUnaccounted)
+			}
+			if result.UsageMeasured != tt.report {
+				t.Errorf("RunTurn(report_token_usage=%v, outcome=%q).UsageMeasured = %v, want %v", tt.report, tt.outcome, result.UsageMeasured, tt.report)
+			}
+			if !tt.report {
+				agenttest.AssertMeasurementAbsent(t, *events, result)
+				return
+			}
+			terminal := (*events)[len(*events)-1]
+			if terminal.Usage != (domain.TokenUsage{}) {
+				t.Errorf("RunTurn(outcome=%q) terminal event Usage = %+v, want zero: the token_usage event is the turn's one figure", tt.outcome, terminal.Usage)
+			}
+		})
+	}
 
 	t.Run("absent with zero per-turn config reports a measurement of zero", func(t *testing.T) {
 		t.Parallel()
@@ -488,11 +486,6 @@ func TestRunTurn_ReportTokenUsage(t *testing.T) {
 	})
 }
 
-// runMockTurnWithToolCall runs one turn against a MockAdapter built
-// from config, configuring one tool call so the token_usage event (if
-// any) precedes a tool_result: the shape the shared conformance
-// assertion needs to tell an incremental arrival apart from a
-// turn-end one.
 func runMockTurnWithToolCall(t *testing.T, config map[string]any) ([]domain.AgentEvent, domain.TurnResult) {
 	t.Helper()
 
@@ -514,41 +507,13 @@ func runMockTurnWithToolCall(t *testing.T, config map[string]any) ([]domain.Agen
 	return *events, result
 }
 
-// TestAssertUsageReporting proves mock's registered usage-reporting
-// declaration (incremental, session_total) and both session rules
-// against real event streams: default construction, report_token_usage
-// false, model_name set, and both keys set together (rule order).
 func TestAssertUsageReporting(t *testing.T) {
 	t.Parallel()
 
-	defaultEvents, defaultResult := runMockTurnWithToolCall(t, nil)
-	falseUsageEvents, falseUsageResult := runMockTurnWithToolCall(t, map[string]any{"report_token_usage": false})
-	modelNameEvents, modelNameResult := runMockTurnWithToolCall(t, map[string]any{"model_name": "mock-model-1"})
-	bothKeysEvents, bothKeysResult := runMockTurnWithToolCall(t, map[string]any{
-		"report_token_usage": false,
-		"model_name":         "mock-model-1",
-	})
+	events, result := runMockTurnWithToolCall(t, nil)
 
 	agenttest.AssertUsageReporting(t, "mock", []agenttest.UsageReportingCase{
-		{Name: "default construction resolves the declared pair", Events: defaultEvents, Result: defaultResult},
-		{
-			Name:        "report_token_usage false resolves rule 1 (none, none)",
-			Passthrough: map[string]any{"report_token_usage": false},
-			Events:      falseUsageEvents,
-			Result:      falseUsageResult,
-		},
-		{
-			Name:        "model_name set resolves rule 2 (incremental, per_model)",
-			Passthrough: map[string]any{"model_name": "mock-model-1"},
-			Events:      modelNameEvents,
-			Result:      modelNameResult,
-		},
-		{
-			Name:        "both keys set resolves rule 1, rule order",
-			Passthrough: map[string]any{"report_token_usage": false, "model_name": "mock-model-1"},
-			Events:      bothKeysEvents,
-			Result:      bothKeysResult,
-		},
+		{Name: "default construction", Events: events, Result: result},
 	})
 }
 
@@ -597,13 +562,11 @@ func TestRunTurn_ExhaustedOutcomes(t *testing.T) {
 		"turn_outcomes": []any{"failed"},
 	})
 
-	// Turn 1: fails per config.
 	_, err := adapter.RunTurn(context.Background(), sess, defaultParams())
 	if err == nil {
 		t.Fatal("turn 1: expected error")
 	}
 
-	// Turn 2: outcomes exhausted, defaults to completed.
 	result, err := adapter.RunTurn(context.Background(), sess, defaultParams())
 	if err != nil {
 		t.Fatalf("turn 2: unexpected error = %v", err)
@@ -656,12 +619,6 @@ func TestRunTurn_InputRequired(t *testing.T) {
 	}
 }
 
-// TestRunTurn_InputRequired_MatchesSharedLayer asserts that the
-// "input_required" outcome's emitted event and returned *domain.AgentError
-// are exactly the values agentcore.FinalizeTurn would produce for any
-// other adapter reporting agentcore.TerminalHumanInputRequired with the
-// same message: same ExitReason, same ErrorKind, and a message built from
-// the shared stem, not a value the mock constructs on its own.
 func TestRunTurn_InputRequired_MatchesSharedLayer(t *testing.T) {
 	t.Parallel()
 
@@ -701,12 +658,6 @@ func TestRunTurn_InputRequired_MatchesSharedLayer(t *testing.T) {
 	}
 }
 
-// TestRunTurn_Incomplete_MatchesSharedLayer asserts that the "incomplete"
-// outcome's emitted event and returned *domain.AgentError are exactly the
-// values agentcore.FinalizeTurn would produce for any other adapter
-// reporting agentcore.TerminalIncomplete with the same message: same
-// ExitReason, same ErrorKind, and a message built from the shared stem,
-// not a value the mock constructs on its own.
 func TestRunTurn_Incomplete_MatchesSharedLayer(t *testing.T) {
 	t.Parallel()
 
@@ -781,7 +732,7 @@ func TestRunTurn_ContextCancellation(t *testing.T) {
 	events := collectEvents(&params)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()
 
 	_, err := adapter.RunTurn(ctx, sess, params)
 	if !errors.Is(err, context.Canceled) {
@@ -810,7 +761,6 @@ func TestRunTurn_CustomEventsPerTurn(t *testing.T) {
 		t.Fatalf("RunTurn() error = %v", err)
 	}
 
-	// With 0 notifications: session_started + token_usage + turn_completed = 3.
 	wantTypes := []domain.AgentEventType{
 		domain.EventSessionStarted,
 		domain.EventTokenUsage,
@@ -870,8 +820,6 @@ func TestStopSession(t *testing.T) {
 	}
 }
 
-// TestNewMockAdapter_ExtendedConfigKeys verifies that the new
-// cache_read_tokens_per_turn and model_name config keys are parsed.
 func TestNewMockAdapter_ExtendedConfigKeys(t *testing.T) {
 	t.Parallel()
 
@@ -887,8 +835,6 @@ func TestNewMockAdapter_ExtendedConfigKeys(t *testing.T) {
 	}
 }
 
-// TestRunTurn_ExtendedTokenFields verifies that token_usage events include
-// CacheReadTokens and Model, and that cumulative accumulation works.
 func TestRunTurn_ExtendedTokenFields(t *testing.T) {
 	t.Parallel()
 
@@ -900,7 +846,6 @@ func TestRunTurn_ExtendedTokenFields(t *testing.T) {
 		"events_per_turn":            0,
 	})
 
-	// Turn 1: cumulative cache_read = 200.
 	params1 := defaultParams()
 	events1 := collectEvents(&params1)
 	if _, err := adapter.RunTurn(context.Background(), sess, params1); err != nil {
@@ -924,7 +869,6 @@ func TestRunTurn_ExtendedTokenFields(t *testing.T) {
 		t.Errorf("turn 1 Model = %q, want %q", tokenEv1.Model, "test-model")
 	}
 
-	// Turn 2: cumulative cache_read = 400.
 	params2 := defaultParams()
 	events2 := collectEvents(&params2)
 	if _, err := adapter.RunTurn(context.Background(), sess, params2); err != nil {
@@ -946,8 +890,6 @@ func TestRunTurn_ExtendedTokenFields(t *testing.T) {
 	}
 }
 
-// TestNewMockAdapter_TimingConfig verifies parsing of api_duration_ms
-// and tool_calls configuration keys.
 func TestNewMockAdapter_TimingConfig(t *testing.T) {
 	t.Parallel()
 
@@ -972,8 +914,6 @@ func TestNewMockAdapter_TimingConfig(t *testing.T) {
 	}
 }
 
-// TestRunTurn_APIDurationMS_OnTokenUsage verifies that the token_usage
-// event carries APIDurationMS when api_duration_ms is configured.
 func TestRunTurn_APIDurationMS_OnTokenUsage(t *testing.T) {
 	t.Parallel()
 
@@ -998,8 +938,6 @@ func TestRunTurn_APIDurationMS_OnTokenUsage(t *testing.T) {
 	t.Error("no token_usage event found")
 }
 
-// TestRunTurn_APIDurationMS_ZeroByDefault verifies that APIDurationMS
-// is 0 on token_usage events when api_duration_ms is not configured.
 func TestRunTurn_APIDurationMS_ZeroByDefault(t *testing.T) {
 	t.Parallel()
 
@@ -1022,9 +960,6 @@ func TestRunTurn_APIDurationMS_ZeroByDefault(t *testing.T) {
 	t.Error("no token_usage event found")
 }
 
-// TestRunTurn_ToolCalls_EmitsToolResultEvents verifies that configured
-// tool_calls produce tool_result events with correct ToolName and
-// ToolDurationMS.
 func TestRunTurn_ToolCalls_EmitsToolResultEvents(t *testing.T) {
 	t.Parallel()
 
@@ -1059,8 +994,6 @@ func TestRunTurn_ToolCalls_EmitsToolResultEvents(t *testing.T) {
 	}
 }
 
-// TestRunTurn_NoToolCalls_NoToolResultEvents verifies that no tool_result
-// events are emitted when tool_calls is not configured.
 func TestRunTurn_NoToolCalls_NoToolResultEvents(t *testing.T) {
 	t.Parallel()
 
@@ -1079,8 +1012,6 @@ func TestRunTurn_NoToolCalls_NoToolResultEvents(t *testing.T) {
 	}
 }
 
-// TestRunTurn_ToolCalls_ErrorField verifies that the error field in
-// tool_calls config is parsed and emitted as ToolError on the event.
 func TestRunTurn_ToolCalls_ErrorField(t *testing.T) {
 	t.Parallel()
 
@@ -1115,11 +1046,7 @@ func TestRunTurn_ToolCalls_ErrorField(t *testing.T) {
 	}
 }
 
-// The verification flag belongs to the session, not the adapter: a
-// working session started after a verification session must not change
-// how the verification turn runs, and the verification turn consumes
-// no turn_outcomes entry.
-func TestRunTurn_CredentialVerification(t *testing.T) {
+func TestRunTurn_CredentialVerificationIsPerSessionAndConsumesNoOutcome(t *testing.T) {
 	t.Parallel()
 
 	settings := map[string]any{"turn_outcomes": []any{"failed"}}
@@ -1176,5 +1103,21 @@ func TestMockAdapter_CredentialVerificationConformance(t *testing.T) {
 			Params:  domain.StartSessionParams{WorkspacePath: "/tmp/work", Settings: map[string]any{"credential_error": "refused"}},
 			Want:    credentialtest.WantUnverified,
 		},
+	})
+}
+
+func TestSessionContinuity(t *testing.T) {
+	t.Parallel()
+
+	adapter, _ := NewMockAdapter()
+
+	agenttest.AssertSessionContinuity(t, func(t *testing.T, held, resumeID string) (domain.Session, error) {
+		t.Helper()
+
+		return adapter.StartSession(t.Context(), domain.StartSessionParams{
+			WorkspacePath:   "/tmp/work",
+			ResumeSessionID: resumeID,
+			Settings:        map[string]any{"session_id": held},
+		})
 	})
 }

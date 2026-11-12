@@ -6,11 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const inheritedEffortLevel = "low"
@@ -25,23 +25,6 @@ type failureCounter struct{ failures int }
 func (*failureCounter) Helper() {}
 
 func (f *failureCounter) Errorf(string, ...any) { f.failures++ }
-
-func awaitRecordedEnv(t *testing.T, path string) map[string]string {
-	t.Helper()
-
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			var values map[string]string
-			if json.Unmarshal(data, &values) == nil {
-				return values
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("no environment recording appeared at %s within 60s", path)
-	return nil
-}
 
 func recordedEffortEnv(t *testing.T, passthrough map[string]any, verification bool, mutate func(*sessionState)) string {
 	t.Helper()
@@ -80,7 +63,15 @@ func recordedEffortEnv(t *testing.T, passthrough map[string]any, verification bo
 		_, _ = adapter.RunTurn(ctx, session, domain.RunTurnParams{Prompt: "probe", OnEvent: func(domain.AgentEvent) {}})
 	}()
 
-	return awaitRecordedEnv(t, recording)[effortEnvName]
+	var values map[string]string
+	waittest.Until(t, func() error {
+		data, err := os.ReadFile(recording)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(data, &values)
+	})
+	return values[effortEnvName]
 }
 
 func assertEffortEnvWithheld(t errorReporter, got string) {

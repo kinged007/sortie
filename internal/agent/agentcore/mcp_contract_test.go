@@ -1,6 +1,7 @@
 package agentcore
 
 import (
+	"cmp"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,30 +12,15 @@ import (
 	"testing"
 )
 
-// mcpContractRegistryImportPath is the import path the checker
-// resolves the "registry" package qualifier from, per file, rather
-// than assuming the literal identifier "registry".
-const mcpContractRegistryImportPath = "github.com/sortie-ai/sortie/internal/registry"
+const (
+	mcpContractRegistryImportPath  = "github.com/sortie-ai/sortie/internal/registry"
+	mcpContractAgentcoreImportPath = "github.com/sortie-ai/sortie/internal/agent/agentcore"
+	mcpToolDeliveryFunc            = "ResolveToolDelivery"
+	mcpToolDeliveryDialectArg      = 3
+	mcpContractUndeclaredSelector  = "MCPDialectUndeclared"
+	mcpContractNoneSelector        = "MCPDialectNone"
+)
 
-// mcpConfigPathIdentifier is the bare identifier the injection rules
-// look for across a package's non-test files. Files feeding the check are
-// parsed without comments, so a doc comment naming the field, as
-// opencode's package godoc does, is never a reference.
-const mcpConfigPathIdentifier = "MCPConfigPath"
-
-// mcpContractUndeclaredSelector is the selector name a meta literal
-// carries when a package spells the zero value out explicitly rather
-// than omitting the key; it is treated identically to an omitted key.
-const mcpContractUndeclaredSelector = "MCPInjectionUndeclared"
-
-// mcpContractAllowlist names the packages under internal/agent/ this
-// check exempts, and why: each is a support package that registers no
-// agent kind. The exemption is belt alongside braces, because
-// checkMCPContractPackage already draws no violation from a package
-// that registers nothing; naming them keeps a later change to
-// registration detection from starting to judge them. What puts a
-// package under the rules is registering a kind, never its absence
-// from this map.
 var mcpContractAllowlist = map[string]string{
 	"agentcore":       "the shared decision package itself; registers no agent kind",
 	"agenttest":       "the conformance-assertion package itself; registers no agent kind",
@@ -43,24 +29,21 @@ var mcpContractAllowlist = map[string]string{
 	"sshutil":         "SSH helper package; registers no agent kind",
 }
 
-// mcpContractViolation describes one place a package breaks the MCP
-// injection declaration invariant.
 type mcpContractViolation struct {
 	pos  token.Position
 	text string
 }
 
-// mcpContractPackage carries one package's identity and its parsed
-// non-test files.
 type mcpContractPackage struct {
 	dirName string
 	files   []*ast.File
 }
 
-// mcpCompositeLitKeyValue returns the value expression of the field
-// keyed by the given identifier name in the composite literal expr
-// denotes, or nil when expr is not such a literal or carries no such
-// key.
+type mcpDeliveryCall struct {
+	pos     token.Position
+	dialect string
+}
+
 func mcpCompositeLitKeyValue(expr ast.Expr, key string) ast.Expr {
 	lit, ok := expr.(*ast.CompositeLit)
 	if !ok {
@@ -78,80 +61,50 @@ func mcpCompositeLitKeyValue(expr ast.Expr, key string) ast.Expr {
 	return nil
 }
 
-// mcpPackageReferencesIdentifier reports whether any file in files
-// reads name as the trailing field of a selector expression, which is
-// the form an adapter takes when it reads the worker-generated path
-// off its start-session parameters. Three shapes are deliberately not
-// reads, because none of them hands anything to the agent process: a
-// declaration of a field with the same name, a bare identifier, and
-// the target of a plain assignment. A package matching only one of
-// them must neither satisfy the supported rule nor breach the
-// unsupported one. The match stays syntactic, resolving no symbol, so
-// this check does not become a type-checking pass.
-func mcpPackageReferencesIdentifier(files []*ast.File, name string) bool {
-	for _, file := range files {
-		if fileReadsSelector(file, name) {
-			return true
-		}
+func mcpRegistrySelector(expr ast.Expr, registryIdent string) string {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return ""
 	}
-	return false
+	if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == registryIdent {
+		return sel.Sel.Name
+	}
+	return ""
 }
 
-// fileReadsSelector reports whether file contains a selector
-// expression naming name in a position that reads it. Assignment
-// targets are collected first and excluded from the second pass.
-// Compound assignments are left in, since an operator such as += reads
-// the field before it writes it, as is an increment for the same
-// reason. A plain assignment and a range clause are the only two
-// statement forms whose target can be a selector, so collecting both
-// closes the set.
-func fileReadsSelector(file *ast.File, name string) bool {
-	assigned := make(map[ast.Node]bool)
-	ast.Inspect(file, func(n ast.Node) bool {
-		switch stmt := n.(type) {
-		case *ast.AssignStmt:
-			if stmt.Tok != token.ASSIGN {
-				return true
-			}
-			for _, lhs := range stmt.Lhs {
-				assigned[lhs] = true
-			}
-		case *ast.RangeStmt:
-			if stmt.Tok != token.ASSIGN {
-				return true
-			}
-			if stmt.Key != nil {
-				assigned[stmt.Key] = true
-			}
-			if stmt.Value != nil {
-				assigned[stmt.Value] = true
-			}
+func mcpToolDeliveryCalls(fset *token.FileSet, files []*ast.File) []mcpDeliveryCall {
+	var calls []mcpDeliveryCall
+	for _, file := range files {
+		agentcoreIdent := resolveImportName(file, mcpContractAgentcoreImportPath)
+		if agentcoreIdent == "" {
+			continue
 		}
-		return true
-	})
+		registryIdent := resolveImportName(file, mcpContractRegistryImportPath)
 
-	found := false
-	ast.Inspect(file, func(n ast.Node) bool {
-		if found {
-			return false
-		}
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != name || assigned[sel] {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != mcpToolDeliveryFunc {
+				return true
+			}
+			if ident, ok := sel.X.(*ast.Ident); !ok || ident.Name != agentcoreIdent {
+				return true
+			}
+
+			found := mcpDeliveryCall{pos: fset.Position(call.Pos())}
+			if registryIdent != "" && len(call.Args) > mcpToolDeliveryDialectArg {
+				found.dialect = mcpRegistrySelector(call.Args[mcpToolDeliveryDialectArg], registryIdent)
+			}
+			calls = append(calls, found)
 			return true
-		}
-		found = true
-		return false
-	})
-	return found
+		})
+	}
+	return calls
 }
 
-// mcpRegistrationFacts scans every file of one package for a call to
-// registry.Agents.Register or registry.Agents.RegisterWithMeta,
-// resolving the "registry" qualifier from each file's own imports. It
-// reports whether the package registers an agent kind at all, and,
-// for RegisterWithMeta, the selector name of the MCPInjection value
-// carried in the meta literal ("" when Register was used, or when the
-// literal carries no MCPInjection key).
 func mcpRegistrationFacts(fset *token.FileSet, files []*ast.File) (registers bool, declared string, pos token.Position) {
 	for _, file := range files {
 		registryIdent := resolveImportName(file, mcpContractRegistryImportPath)
@@ -187,14 +140,7 @@ func mcpRegistrationFacts(fset *token.FileSet, files []*ast.File) (registers boo
 				if len(call.Args) < 3 {
 					return true
 				}
-				val := mcpCompositeLitKeyValue(call.Args[2], "MCPInjection")
-				sel, ok := val.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if selIdent, ok := sel.X.(*ast.Ident); ok && selIdent.Name == registryIdent {
-					declared = sel.Sel.Name
-				}
+				declared = mcpRegistrySelector(mcpCompositeLitKeyValue(call.Args[2], "MCPDialect"), registryIdent)
 			}
 			return true
 		})
@@ -202,11 +148,6 @@ func mcpRegistrationFacts(fset *token.FileSet, files []*ast.File) (registers boo
 	return registers, declared, pos
 }
 
-// checkMCPContractPackage evaluates the MCP injection rules against pkg,
-// honoring the allowlist entries in mcpContractAllowlist. A package
-// this walk never observes registering an agent kind draws no
-// violation, since only a registering package can declare a
-// disposition at all.
 func checkMCPContractPackage(fset *token.FileSet, pkg mcpContractPackage) []mcpContractViolation {
 	if _, exempt := mcpContractAllowlist[pkg.dirName]; exempt {
 		return nil
@@ -218,41 +159,39 @@ func checkMCPContractPackage(fset *token.FileSet, pkg mcpContractPackage) []mcpC
 	}
 
 	if declared == "" || declared == mcpContractUndeclaredSelector {
-		return []mcpContractViolation{{
-			pos:  pos,
-			text: "registers an agent kind but declares no non-empty MCPInjection",
-		}}
+		return []mcpContractViolation{{pos: pos, text: "registers an agent kind but declares no non-empty MCPDialect"}}
 	}
 
-	referencesPath := mcpPackageReferencesIdentifier(pkg.files, mcpConfigPathIdentifier)
+	calls := mcpToolDeliveryCalls(fset, pkg.files)
 
 	var violations []mcpContractViolation
-	switch declared {
-	case "MCPInjectionUnsupported":
-		if referencesPath {
+	if declared == mcpContractNoneSelector {
+		for _, call := range calls {
 			violations = append(violations, mcpContractViolation{
-				pos:  pos,
-				text: "declares MCPInjectionUnsupported but non-test files reference " + mcpConfigPathIdentifier,
+				pos:  call.pos,
+				text: "declares " + declared + " but calls agentcore." + mcpToolDeliveryFunc,
 			})
 		}
-	case "MCPInjectionSupported", "MCPInjectionTranslated":
-		if !referencesPath {
+		return violations
+	}
+
+	if len(calls) == 0 {
+		violations = append(violations, mcpContractViolation{
+			pos:  pos,
+			text: "declares " + declared + " but never calls agentcore." + mcpToolDeliveryFunc,
+		})
+	}
+	for _, call := range calls {
+		if call.dialect != declared {
 			violations = append(violations, mcpContractViolation{
-				pos:  pos,
-				text: "declares " + declared + " but non-test files never reference " + mcpConfigPathIdentifier,
+				pos:  call.pos,
+				text: "declares " + declared + " but agentcore." + mcpToolDeliveryFunc + " does not receive that registry constant as its dialect",
 			})
 		}
 	}
 	return violations
 }
 
-// TestMCPInjectionContractInvariant walks the non-test Go files under
-// internal/agent/, grouped by package directory, and fails when a
-// package outside mcpContractAllowlist registers an agent kind and
-// either declares no non-empty MCPInjection, declares
-// MCPInjectionUnsupported while its non-test files reference
-// MCPConfigPath, or declares MCPInjectionSupported while its non-test
-// files never reference it.
 func TestMCPInjectionContractInvariant(t *testing.T) {
 	root := ".."
 
@@ -269,10 +208,7 @@ func TestMCPInjectionContractInvariant(t *testing.T) {
 			if d.Name() == "testdata" {
 				return filepath.SkipDir
 			}
-			// An allowlisted directory is not pruned here, only exempted
-			// by checkMCPContractPackage when its own package is judged.
-			// Pruning would also hide any package nested below it, which
-			// would let a registering package escape the walk entirely.
+			// Pruning an allowlisted directory would also hide packages nested below it.
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
@@ -311,15 +247,32 @@ func TestMCPInjectionContractInvariant(t *testing.T) {
 	}
 }
 
-// TestCheckMCPContractPackage_DetectsViolations pins the checker's own
-// logic against inline source fixtures, independent of the current
-// state of any adapter package, so a regression in a rule is caught
-// even when every real adapter happens to comply. Each fixture is
-// parsed the same way the walking test parses production files:
-// without comments, so the negative fixture proves comment immunity
-// rather than merely asserting it.
 func TestCheckMCPContractPackage_DetectsViolations(t *testing.T) {
 	t.Parallel()
+
+	const header = `package fixture
+
+import (
+	"github.com/sortie-ai/sortie/internal/agent/agentcore"
+	"github.com/sortie-ai/sortie/internal/registry"
+)
+`
+	register := func(meta string) string {
+		return `
+func init() {
+	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{` + meta + `})
+}
+`
+	}
+	start := func(body string) string {
+		return "\nfunc start() {\n\t" + body + "\n}\n"
+	}
+	const (
+		deliveringMeta = "MCPDialect: registry.MCPDialectMCPServersTOML,"
+		none           = "MCPDialect: registry.MCPDialectNone,"
+		deliverTOML    = "agentcore.ResolveToolDelivery(ctx, params, target, registry.MCPDialectMCPServersTOML, logger)"
+		deliverJSON    = "agentcore.ResolveToolDelivery(ctx, params, target, registry.MCPDialectMCPServersJSON, logger)"
+	)
 
 	tests := []struct {
 		name      string
@@ -328,370 +281,45 @@ func TestCheckMCPContractPackage_DetectsViolations(t *testing.T) {
 		wantCount int
 	}{
 		{
-			name:    "a kind registered through plain Register declares nothing",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.Register("fixture", newFixtureAdapter)
-}
-`,
+			name:      "a RegisterWithMeta literal omitting MCPDialect declares nothing",
+			src:       header + register("RequiresCommand: true,"),
 			wantCount: 1,
 		},
 		{
-			name:    "a RegisterWithMeta literal omitting MCPInjection declares nothing",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		RequiresCommand: true,
-	})
-}
-`,
+			name:      "a delivering dialect with no ResolveToolDelivery call",
+			src:       header + register(deliveringMeta),
 			wantCount: 1,
 		},
 		{
-			name:    "a literal spelling out the zero value is still undeclared",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUndeclared,
-	})
-}
-`,
+			name:      "a delivering dialect passing its own constant",
+			src:       header + register(deliveringMeta) + start(deliverTOML),
+			wantCount: 0,
+		},
+		{
+			name:      "a call passing a different dialect constant",
+			src:       header + register(deliveringMeta) + start(deliverJSON),
 			wantCount: 1,
 		},
 		{
-			name:    "declares unsupported but a non-test file references MCPConfigPath",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-
-func start(params domain.StartSessionParams) string {
-	return params.MCPConfigPath
-}
-`,
+			name:      "a call passing a variable instead of a registry constant",
+			src:       header + register(deliveringMeta) + start("agentcore.ResolveToolDelivery(ctx, params, target, dialect, logger)"),
 			wantCount: 1,
 		},
 		{
-			name:    "declares supported but no non-test file ever references MCPConfigPath",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-`,
+			name:      "an allowlisted package registering without a dialect",
+			dirName:   "procutil",
+			src:       header + "\nfunc init() {\n\tregistry.Agents.Register(\"fixture\", newFixtureAdapter)\n}\n",
+			wantCount: 0,
+		},
+		{
+			name:      "none without a call",
+			src:       header + register(none),
+			wantCount: 0,
+		},
+		{
+			name:      "none calling ResolveToolDelivery",
+			src:       header + register(none) + start(deliverTOML),
 			wantCount: 1,
-		},
-		{
-			// The doc comment names MCPConfigPath, but the check parses
-			// without comments, so this fixture must draw zero violations.
-			// Without this fixture, nothing stops a later rewrite from
-			// parsing comments and taking opencode's package godoc with it.
-			name:    "a comment-only mention of MCPConfigPath is not a reference",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-// MCPConfigPath is ignored; this adapter passes no MCP argument.
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-`,
-			wantCount: 0,
-		},
-		{
-			name:    "a compliant Supported package referencing MCPConfigPath in real code is accepted",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func useParams(params domain.StartSessionParams) []string {
-	return []string{"--mcp-config", params.MCPConfigPath}
-}
-`,
-			wantCount: 0,
-		},
-		{
-			// A field named MCPConfigPath is a declaration, not a read.
-			// The package hands nothing to the agent process, so an
-			// unsupported declaration is not in breach.
-			name:    "declaring a field of the same name is not a read",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-
-type sessionParams struct {
-	MCPConfigPath string
-}
-`,
-			wantCount: 0,
-		},
-		{
-			// The mirror of the case above: a declaration must not let a
-			// package claim supported without ever reading the path.
-			name:    "declaring a field of the same name does not satisfy supported",
-			dirName: "fixture",
-			src: `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-type sessionParams struct {
-	MCPConfigPath string
-}
-`,
-			wantCount: 1,
-		},
-		{
-			// Assigning to the field on a by-value parameter writes to a
-			// local copy and hands nothing over, so it is not a read.
-			name:    "writing the field is not a read",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-
-func start(params domain.StartSessionParams) {
-	params.MCPConfigPath = ""
-}
-`,
-			wantCount: 0,
-		},
-		{
-			// The mirror: a write must not let a package claim supported.
-			name:    "writing the field does not satisfy supported",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func start(params domain.StartSessionParams) {
-	params.MCPConfigPath = ""
-}
-`,
-			wantCount: 1,
-		},
-		{
-			// A read on the right-hand side of an assignment is still a
-			// read; only the target of one is excluded.
-			name:    "reading the field on an assignment right-hand side satisfies supported",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func start(params domain.StartSessionParams) string {
-	var path string
-	path = params.MCPConfigPath
-	return path
-}
-`,
-			wantCount: 0,
-		},
-		{
-			// A range clause with "=" assigns to existing lvalues, so a
-			// selector used as its target is written, not read.
-			name:    "a range-assignment target is not a read",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-
-func start(params domain.StartSessionParams, xs []string) {
-	for _, params.MCPConfigPath = range xs {
-	}
-}
-`,
-			wantCount: 0,
-		},
-		{
-			name:    "a range-assignment target does not satisfy supported",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func start(params domain.StartSessionParams, xs []string) {
-	for _, params.MCPConfigPath = range xs {
-	}
-}
-`,
-			wantCount: 1,
-		},
-		{
-			// A single-target range clause assigns to the key, which is
-			// the other of the two branches a range target can take.
-			name:    "a range key target is not a read",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionUnsupported,
-	})
-}
-
-func start(params domain.StartSessionParams, xs map[string]int) {
-	for params.MCPConfigPath = range xs {
-	}
-}
-`,
-			wantCount: 0,
-		},
-		{
-			name:    "a range key target does not satisfy supported",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func start(params domain.StartSessionParams, xs map[string]int) {
-	for params.MCPConfigPath, _ = range xs {
-	}
-}
-`,
-			wantCount: 1,
-		},
-		{
-			// Ranging over the field reads it; only a target is excluded.
-			name:    "ranging over the field is a read",
-			dirName: "fixture",
-			src: `package fixture
-
-import (
-	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/registry"
-)
-
-func init() {
-	registry.Agents.RegisterWithMeta("fixture", newFixtureAdapter, registry.AgentMeta{
-		MCPInjection: registry.MCPInjectionSupported,
-	})
-}
-
-func start(params domain.StartSessionParams) int {
-	n := 0
-	for range params.MCPConfigPath {
-		n++
-	}
-	return n
-}
-`,
-			wantCount: 0,
-		},
-		{
-			name:    "a package this walk never observed registering draws no violation",
-			dirName: "fixture",
-			src: `package fixture
-
-func helper() string {
-	return "no registration here"
-}
-`,
-			wantCount: 0,
 		},
 	}
 
@@ -705,38 +333,10 @@ func helper() string {
 				t.Fatalf("parser.ParseFile: %v", err)
 			}
 
-			pkg := mcpContractPackage{dirName: tt.dirName, files: []*ast.File{file}}
-			got := checkMCPContractPackage(fset, pkg)
+			got := checkMCPContractPackage(fset, mcpContractPackage{dirName: cmp.Or(tt.dirName, "fixture"), files: []*ast.File{file}})
 			if len(got) != tt.wantCount {
 				t.Errorf("checkMCPContractPackage() returned %d violations, want %d: %+v", len(got), tt.wantCount, got)
 			}
 		})
-	}
-}
-
-// TestCheckMCPContractPackage_AllowlistedPackageDrawsNoViolation pins
-// that a package named in mcpContractAllowlist is exempt from every
-// rule, even one whose fixture would otherwise declare no injection.
-func TestCheckMCPContractPackage_AllowlistedPackageDrawsNoViolation(t *testing.T) {
-	t.Parallel()
-
-	const src = `package fixture
-
-import "github.com/sortie-ai/sortie/internal/registry"
-
-func init() {
-	registry.Agents.Register("fixture", newFixtureAdapter)
-}
-`
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parser.ParseFile: %v", err)
-	}
-
-	pkg := mcpContractPackage{dirName: "procutil", files: []*ast.File{file}}
-	got := checkMCPContractPackage(fset, pkg)
-	if len(got) != 0 {
-		t.Errorf("checkMCPContractPackage() for an allowlisted dirName returned %d violations, want 0: %+v", len(got), got)
 	}
 }

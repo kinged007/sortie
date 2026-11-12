@@ -20,6 +20,7 @@ import (
 	"maps"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/issuekit"
@@ -39,12 +40,20 @@ func init() {
 
 // Compile-time interface satisfaction check.
 var _ domain.TrackerAdapter = (*LinearAdapter)(nil)
+var _ domain.CommentChangeReader = (*LinearAdapter)(nil)
+var _ domain.ProjectLinker = (*LinearAdapter)(nil)
 
 // defaultEndpoint is the Linear GraphQL endpoint used when the config omits it.
 const defaultEndpoint = "https://api.linear.app/graphql"
 
 // topLevelPageSize is the page size for top-level issue connections.
 const topLevelPageSize = 50
+
+// commentUpdateLookback is how far before a read point the change read starts
+// its update-time filter. Linear stamps updatedAt before the comment is
+// committed, so a comment stamped before the point can still commit after the
+// read that produced it.
+const commentUpdateLookback = 30 * time.Second
 
 // stateBatchChunkSize is the maximum number of ids or numbers per state-batch
 // request.
@@ -57,6 +66,7 @@ type LinearAdapter struct {
 	*issuekit.StateSource
 	client      graphQLClient
 	project     string
+	projectURL  string // team page from the preflight; "" when absent
 	queryFilter map[string]any
 	casingCache map[string]string
 	log         *slog.Logger
@@ -138,7 +148,7 @@ func NewLinearAdapter(config map[string]any) (domain.TrackerAdapter, error) {
 // the team-state casing cache. It is the seam shared by the production
 // constructor and offline tests.
 func newAdapter(client graphQLClient, project string, states domain.TrackerStates, queryFilter map[string]any, log *slog.Logger) (domain.TrackerAdapter, error) {
-	casingCache, err := runPreflight(context.Background(), client, project, states.Active, states.Terminal, states.Handoff, log)
+	casingCache, projectURL, err := runPreflight(context.Background(), client, project, states.Active, states.Terminal, states.Handoff, log)
 	if err != nil {
 		return nil, err
 	}
@@ -147,10 +157,17 @@ func newAdapter(client graphQLClient, project string, states domain.TrackerState
 		StateSource: issuekit.NewStateSource(states),
 		client:      client,
 		project:     project,
+		projectURL:  projectURL,
 		queryFilter: queryFilter,
 		casingCache: casingCache,
 		log:         log,
 	}, nil
+}
+
+// ProjectURL returns the web address of the configured team, or "" when the
+// team response names no workspace.
+func (a *LinearAdapter) ProjectURL() string {
+	return a.projectURL
 }
 
 // parseQueryFilter decodes the operator-supplied query_filter into an
@@ -425,20 +442,110 @@ func (a *LinearAdapter) collectComments(ctx context.Context, issueID string, inl
 func (a *LinearAdapter) FetchIssueComments(ctx context.Context, issueID string) ([]domain.Comment, error) {
 	comments := make([]domain.Comment, 0)
 	err := trackermetrics.Track(a.metrics, "fetch_comments", func() error {
-		variables := map[string]any{
-			"id":    issueID,
-			"first": topLevelPageSize,
-		}
-		nodes, fetchErr := paginate(ctx, a.client, queryIssueComments, variables, decodeCommentsPage, a.log)
+		fetched, fetchErr := a.fetchComments(ctx, issueID)
 		if fetchErr != nil {
 			return fetchErr
 		}
-		normalized := normalizeComments(nodes)
-		sortCommentsByCreatedAt(normalized)
-		comments = normalized
+		comments = fetched
 		return nil
 	})
 	return comments, err
+}
+
+// fetchComments walks every comment page and returns the comments sorted
+// ascending by creation time.
+func (a *LinearAdapter) fetchComments(ctx context.Context, issueID string) ([]domain.Comment, error) {
+	variables := map[string]any{
+		"id":    issueID,
+		"first": topLevelPageSize,
+	}
+	nodes, err := paginate(ctx, a.client, queryIssueComments, variables, decodeCommentsPage, a.log)
+	if err != nil {
+		return nil, err
+	}
+	comments := normalizeComments(nodes)
+	sortCommentsByCreatedAt(comments)
+	return comments, nil
+}
+
+// FetchIssueCommentChanges returns the comments updated at or after the
+// instant since names, minus a short lookback, with a point naming the newest
+// update time seen. Comments updated at the point's instant are read again;
+// an empty or undecodable since reads every comment.
+func (a *LinearAdapter) FetchIssueCommentChanges(ctx context.Context, issueID string, since domain.CommentReadPoint) (domain.CommentChanges, error) {
+	var changes domain.CommentChanges
+	err := trackermetrics.Track(a.metrics, "fetch_comments", func() error {
+		read, readErr := a.readCommentChanges(ctx, issueID, since)
+		if readErr != nil {
+			return readErr
+		}
+		changes = read
+		return nil
+	})
+	return changes, err
+}
+
+func (a *LinearAdapter) readCommentChanges(ctx context.Context, issueID string, since domain.CommentReadPoint) (domain.CommentChanges, error) {
+	point := decodeCommentPoint(since)
+
+	var comments []domain.Comment
+	var err error
+	if point.IsZero() {
+		comments, err = a.fetchComments(ctx, issueID)
+	} else {
+		comments, err = a.fetchCommentsUpdatedSince(ctx, issueID, point.Add(-commentUpdateLookback))
+	}
+	if err != nil {
+		return domain.CommentChanges{}, err
+	}
+
+	newest := point
+	for _, comment := range comments {
+		updated, parseErr := comment.UpdatedTime()
+		if parseErr != nil {
+			return domain.CommentChanges{}, &domain.TrackerError{
+				Kind:    domain.ErrTrackerPayload,
+				Message: fmt.Sprintf("linear graphql: comment %s has an unparseable updatedAt", comment.ID),
+				Err:     parseErr,
+			}
+		}
+		if updated.After(newest) {
+			newest = updated
+		}
+	}
+
+	next := domain.CommentReadPoint("")
+	if !newest.IsZero() {
+		next = domain.CommentReadPoint(newest.UTC().Format(time.RFC3339Nano))
+	}
+	return domain.CommentChanges{Comments: comments, Next: next}, nil
+}
+
+// fetchCommentsUpdatedSince walks the comments updated at or after from and
+// returns them sorted ascending by creation time.
+func (a *LinearAdapter) fetchCommentsUpdatedSince(ctx context.Context, issueID string, from time.Time) ([]domain.Comment, error) {
+	variables := map[string]any{
+		"id":     issueID,
+		"first":  topLevelPageSize,
+		"filter": map[string]any{"updatedAt": map[string]any{"gte": from.UTC().Format(time.RFC3339Nano)}},
+	}
+	nodes, err := paginate(ctx, a.client, queryIssueCommentChanges, variables, decodeCommentsPage, a.log)
+	if err != nil {
+		return nil, err
+	}
+	comments := normalizeComments(nodes)
+	sortCommentsByCreatedAt(comments)
+	return comments, nil
+}
+
+// decodeCommentPoint returns the instant a point names, or the zero time when
+// the point is empty or not in the form a read produces.
+func decodeCommentPoint(since domain.CommentReadPoint) time.Time {
+	point, err := time.Parse(time.RFC3339Nano, string(since))
+	if err != nil {
+		return time.Time{}
+	}
+	return point
 }
 
 // FetchIssueStatesByIDs returns the current state for each requested UUID,
@@ -692,30 +799,45 @@ func (a *LinearAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 	})
 }
 
-// CommentIssue posts text as a markdown comment on the issue. The body is sent
-// verbatim with no wrapping or escaping; issueID is passed verbatim.
+// CommentIssue posts text as a markdown comment on the issue and returns the
+// created comment's identity. The body is sent verbatim with no wrapping or
+// escaping; issueID is passed verbatim.
 //
 // The method performs no internal retry because commentCreate is not
 // idempotent and the orchestrator owns retry policy.
-func (a *LinearAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, text)
+func (a *LinearAdapter) CommentIssue(ctx context.Context, issueID, text string) (string, error) {
+	var commentID string
+	err := trackermetrics.Track(a.metrics, "comment", func() error {
+		id, err := a.postComment(ctx, issueID, text)
+		commentID = id
+		return err
 	})
+	if err != nil {
+		return "", err
+	}
+	return commentID, nil
 }
 
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *LinearAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
-	})
-}
-
-func (a *LinearAdapter) postComment(ctx context.Context, issueID, body string) error {
-	return runMutation(ctx, a.client, a.log, queryCommentCreate, map[string]any{
+func (a *LinearAdapter) postComment(ctx context.Context, issueID, body string) (string, error) {
+	var commentID string
+	decode := func(raw []byte) ([]graphQLError, bool, error) {
+		errs, success, comment, err := decodeCommentCreate(raw)
+		commentID = comment
+		return errs, success, err
+	}
+	if err := runMutation(ctx, a.client, a.log, queryCommentCreate, map[string]any{
 		"issueId": issueID,
 		"body":    body,
-	}, decodeCommentCreateSuccess)
+	}, decode); err != nil {
+		return "", err
+	}
+	if commentID == "" {
+		return "", &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "linear graphql: commentCreate reported success but returned no comment id",
+		}
+	}
+	return commentID, nil
 }
 
 // AddLabel attaches the named label to the issue, creating the label
@@ -1024,13 +1146,17 @@ func (a *LinearAdapter) createLabel(ctx context.Context, teamID, name string) (s
 	return labelID, nil
 }
 
-// decodeCommentCreateSuccess decodes a commentCreate mutation response.
-func decodeCommentCreateSuccess(body []byte) ([]graphQLError, bool, error) {
+// decodeCommentCreate decodes a commentCreate mutation response and returns the
+// created comment's id, empty when the payload carries no comment.
+func decodeCommentCreate(body []byte) (errs []graphQLError, success bool, commentID string, err error) {
 	var resp graphQLResponse[commentCreateData]
 	if err := unmarshal(body, &resp); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	return resp.Errors, resp.Data.CommentCreate.Success, nil
+	if c := resp.Data.CommentCreate.Comment; c != nil {
+		commentID = c.ID
+	}
+	return resp.Errors, resp.Data.CommentCreate.Success, commentID, nil
 }
 
 // isRejection reports whether err is the tracker refusing a write as not found

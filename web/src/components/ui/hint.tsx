@@ -1,34 +1,52 @@
 import { Popover as BasePopover } from "@base-ui/react/popover";
 
-import type { ReactNode } from "react";
+import { TOOLTIP_COLLISION_PADDING, TOOLTIP_POPUP } from "@/components/ui/tooltip";
+import { cn } from "@/lib/cn";
 
-/** Props of {@link Hint}. */
+import type { MouseEvent, ReactNode } from "react";
+
+// A hint can sit inside a clickable row; opening it must not also activate the row.
+function keepClickInside(event: MouseEvent) {
+  event.stopPropagation();
+}
+
 export interface HintProps {
   hint: ReactNode;
   children: ReactNode;
+  /** Hover delay before the hint opens, in ms; omitted, Base UI's default applies. */
+  delay?: number;
 }
 
-/**
- * Renders text with a dotted underline that opens a short note on hover, on
- * keyboard activation and on tap. It is a popover rather than a tooltip because
- * touch devices never open a tooltip.
- */
-export function Hint({ hint, children }: HintProps) {
+/** A popover rather than a tooltip, because touch devices never open a tooltip. */
+export function Hint({ hint, children, delay }: HintProps) {
   return (
     <BasePopover.Root>
       <BasePopover.Trigger
         openOnHover
+        delay={delay}
+        onClick={keepClickInside}
         className="cursor-help underline decoration-line-strong decoration-dotted underline-offset-4 transition-colors duration-(--duration-feedback) outline-none hover:decoration-ink-body focus-visible:rounded-xs focus-visible:outline-2 focus-visible:outline-focus-ring data-popup-open:decoration-ink-body"
       >
         {children}
       </BasePopover.Trigger>
-      <BasePopover.Portal>
-        <BasePopover.Positioner side="top" sideOffset={4} className="z-(--z-tooltip)">
-          <BasePopover.Popup className="max-w-72 rounded bg-surface-inverse px-xs py-xxs text-body-sm text-on-dark shadow-lg outline-hidden transition-opacity duration-(--duration-enter-small) data-ending-style:opacity-0 data-starting-style:opacity-0">
-            {hint}
-          </BasePopover.Popup>
-        </BasePopover.Positioner>
-      </BasePopover.Portal>
+      <HintPopup hint={hint} />
     </BasePopover.Root>
+  );
+}
+
+function HintPopup({ hint }: { hint: ReactNode }) {
+  return (
+    <BasePopover.Portal>
+      <BasePopover.Positioner
+        side="top"
+        sideOffset={4}
+        collisionPadding={TOOLTIP_COLLISION_PADDING}
+        className="z-(--z-tooltip)"
+      >
+        <BasePopover.Popup className={cn(TOOLTIP_POPUP, "outline-hidden")}>
+          {hint}
+        </BasePopover.Popup>
+      </BasePopover.Positioner>
+    </BasePopover.Portal>
   );
 }

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func mustClient(t *testing.T, opts ClientOptions) *Client {
@@ -683,11 +683,8 @@ func TestClient_GetStream_streamsWithoutBuffering(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := mustClient(t, ClientOptions{BaseURL: srv.URL})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
 	var received int64
-	err := c.GetStream(ctx, "/log", func(r io.Reader) error {
+	err := c.GetStream(waittest.Context(t), "/log", func(r io.Reader) error {
 		first := make([]byte, 1)
 		if _, err := io.ReadFull(r, first); err != nil {
 			return err

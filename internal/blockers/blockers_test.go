@@ -41,9 +41,8 @@ func (fakeTrackerAdapter) FetchIssueComments(context.Context, string) ([]domain.
 	return nil, nil
 }
 func (fakeTrackerAdapter) TransitionIssue(context.Context, string, string) error { return nil }
-func (fakeTrackerAdapter) CommentIssue(context.Context, string, string) error    { return nil }
-func (fakeTrackerAdapter) CommentIssueWithLiteral(context.Context, string, string, string) error {
-	return nil
+func (fakeTrackerAdapter) CommentIssue(context.Context, string, string) (string, error) {
+	return "comment-1", nil
 }
 func (fakeTrackerAdapter) AddLabel(context.Context, string, string) error { return nil }
 

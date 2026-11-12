@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -587,6 +589,97 @@ func TestFetchIssueComments(t *testing.T) {
 		_, err := a.FetchIssueComments(ctx, "99999")
 		requireTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 	})
+}
+
+func TestFetchIssueComments_DerivedIdentity(t *testing.T) {
+	t.Parallel()
+
+	a := newAdapter(t, fixture("comments_without_id.json"), nil)
+
+	comments, err := a.FetchIssueComments(context.Background(), "20001")
+	if err != nil {
+		t.Fatalf("FetchIssueComments: %v", err)
+	}
+
+	wantIDs := []string{
+		"f7a151bb6f7abd57a1b3277e26bfca0b6dc0d21b0193d62a51c5ef02779aa627",
+		"7d1a19ffbf94f2e9f69b266cecfbab410573b7465f4a8fc4bb44072c5ce71fbb",
+		"07542c7211c17a66799180b75041dd752d5e97cf77aaa1e3cc8a1a6cf0ee0ab5",
+		"c9",
+	}
+	gotIDs := make([]string, len(comments))
+	for i, c := range comments {
+		gotIDs[i] = c.ID
+		if c.AuthorID != c.Author || c.AuthorKind != domain.CommentAuthorPerson {
+			t.Errorf("comment[%d] (AuthorID, AuthorKind) = (%q, %q), want (%q, %q)",
+				i, c.AuthorID, c.AuthorKind, c.Author, domain.CommentAuthorPerson)
+		}
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Errorf("FetchIssueComments IDs = %q, want %q", gotIDs, wantIDs)
+	}
+}
+
+func TestFetchIssueCommentChanges(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	a := newAdapter(t, fixture("comments_without_id.json"), nil)
+	if _, err := a.CommentIssue(ctx, "20001", "session dispatched"); err != nil {
+		t.Fatalf("CommentIssue: %v", err)
+	}
+
+	issue, err := a.FetchIssueByID(ctx, "20001")
+	if err != nil {
+		t.Fatalf("FetchIssueByID: %v", err)
+	}
+	listed, err := a.FetchIssueComments(ctx, "20001")
+	if err != nil {
+		t.Fatalf("FetchIssueComments: %v", err)
+	}
+	changes, err := a.FetchIssueCommentChanges(ctx, "20001", "2026-03-01T10:05:00Z")
+	if err != nil {
+		t.Fatalf("FetchIssueCommentChanges: %v", err)
+	}
+
+	if len(listed) != 5 || !slices.Equal(issue.Comments, listed) {
+		t.Fatalf("FetchIssueByID comments %v, want FetchIssueComments %v (5 comments)", issue.Comments, listed)
+	}
+	// The two identical 10:05 comments swap: equal creation times order by ID.
+	wantOrder := []domain.Comment{listed[0], listed[2], listed[1], listed[3], listed[4]}
+	if !slices.Equal(changes.Comments, wantOrder) {
+		t.Errorf("FetchIssueCommentChanges comments = %v, want oldest first with ties by ID %v", changes.Comments, wantOrder)
+	}
+	if changes.Next != "" {
+		t.Errorf("FetchIssueCommentChanges Next = %q, want zero point", changes.Next)
+	}
+}
+
+func TestFetchIssueCommentChanges_RejectsMalformedComments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		comments string
+	}{
+		{"unparseable created_at", `[{"id": "c1", "author": "alice", "body": "hi", "created_at": "yesterday"}]`},
+		{"duplicate id", `[{"id": "c1", "author": "alice", "body": "hi", "created_at": "2026-03-01T10:00:00Z"},
+			{"id": "c1", "author": "bob", "body": "me too", "created_at": "2026-03-01T10:05:00Z"}]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "issues.json")
+			issues := `[{"id": "1", "identifier": "PROJ-1", "title": "t", "state": "To Do", "comments": ` + tt.comments + `}]`
+			if err := os.WriteFile(path, []byte(issues), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := newAdapter(t, path, nil).FetchIssueCommentChanges(context.Background(), "1", "")
+			requireTrackerErrorKind(t, err, domain.ErrTrackerPayload)
+		})
+	}
 }
 
 func TestNormalization(t *testing.T) {
@@ -1197,52 +1290,6 @@ func TestLabelWrites_UnknownIssueIsNotFound(t *testing.T) {
 	}
 }
 
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			a := newAdapter(t, fixture("basic.json"), nil)
-			if err := a.CommentIssueWithLiteral(context.Background(), "10002", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			comments, err := a.FetchIssueComments(context.Background(), "10002")
-			if err != nil {
-				t.Fatalf("FetchIssueComments: %v", err)
-			}
-			if len(comments) != 1 {
-				t.Fatalf("comment count = %d, want 1", len(comments))
-			}
-			if comments[0].Body != tt.want {
-				t.Errorf("comment body = %q, want %q", comments[0].Body, tt.want)
-			}
-		})
-	}
-}
-
 func TestCommentIssue(t *testing.T) {
 	t.Parallel()
 
@@ -1252,7 +1299,8 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a := newAdapter(t, fixture("basic.json"), nil)
-		if err := a.CommentIssue(ctx, "10001", "session dispatched"); err != nil {
+		id, err := a.CommentIssue(ctx, "10001", "session dispatched")
+		if err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 
@@ -1261,7 +1309,6 @@ func TestCommentIssue(t *testing.T) {
 			t.Fatalf("FetchIssueComments: %v", err)
 		}
 
-		// basic.json has 1 existing comment on 10001; we added 1 more.
 		if len(comments) != 2 {
 			t.Fatalf("comment count = %d, want 2", len(comments))
 		}
@@ -1272,13 +1319,23 @@ func TestCommentIssue(t *testing.T) {
 		if last.CreatedAt == "" {
 			t.Error("last comment CreatedAt is empty, want RFC3339 timestamp")
 		}
+		adaptertest.AssertPostedCommentListed(t, id, comments)
+		if id == "c1" {
+			t.Errorf("CommentIssue identity = %q, equals the fixture comment's id", id)
+		}
+
+		issue, err := a.FetchIssueByID(ctx, "10001")
+		if err != nil {
+			t.Fatalf("FetchIssueByID: %v", err)
+		}
+		adaptertest.AssertPostedCommentListed(t, id, issue.Comments)
 	})
 
 	t.Run("comment appended after existing fixture comments", func(t *testing.T) {
 		t.Parallel()
 
 		a := newAdapter(t, fixture("basic.json"), nil)
-		if err := a.CommentIssue(ctx, "10001", "new comment"); err != nil {
+		if _, err := a.CommentIssue(ctx, "10001", "new comment"); err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 
@@ -1287,11 +1344,9 @@ func TestCommentIssue(t *testing.T) {
 			t.Fatalf("FetchIssueComments: %v", err)
 		}
 
-		// Fixture comment must remain first.
 		if comments[0].Body != "Needs SSO support." {
 			t.Errorf("comments[0].Body = %q, want %q", comments[0].Body, "Needs SSO support.")
 		}
-		// Injected comment is last.
 		if comments[len(comments)-1].Body != "new comment" {
 			t.Errorf("last comment = %q, want %q", comments[len(comments)-1].Body, "new comment")
 		}
@@ -1303,7 +1358,7 @@ func TestCommentIssue(t *testing.T) {
 		a := newAdapter(t, fixture("basic.json"), nil)
 
 		for _, text := range []string{"first", "second", "third"} {
-			if err := a.CommentIssue(ctx, "10002", text); err != nil {
+			if _, err := a.CommentIssue(ctx, "10002", text); err != nil {
 				t.Fatalf("CommentIssue(%q): %v", text, err)
 			}
 		}
@@ -1313,7 +1368,6 @@ func TestCommentIssue(t *testing.T) {
 			t.Fatalf("FetchIssueComments: %v", err)
 		}
 
-		// 10002 has 0 existing comments in fixture.
 		if len(comments) != 3 {
 			t.Fatalf("comment count = %d, want 3", len(comments))
 		}
@@ -1328,7 +1382,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a := newAdapter(t, fixture("basic.json"), nil)
-		if err := a.CommentIssue(ctx, "10001", "isolated"); err != nil {
+		if _, err := a.CommentIssue(ctx, "10001", "isolated"); err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 
@@ -1347,7 +1401,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a := newAdapter(t, fixture("basic.json"), nil)
-		err := a.CommentIssue(ctx, "nonexistent", "text")
+		_, err := a.CommentIssue(ctx, "nonexistent", "text")
 		requireTrackerErrorKind(t, err, domain.ErrTrackerNotFound)
 	})
 
@@ -1355,7 +1409,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a := newAdapter(t, "testdata/does_not_exist.json", nil)
-		err := a.CommentIssue(ctx, "10001", "text")
+		_, err := a.CommentIssue(ctx, "10001", "text")
 		requireTrackerErrorKind(t, err, domain.ErrTrackerPayload)
 	})
 
@@ -1363,7 +1417,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a, spy := newAdapterWithMetrics(t, fixture("basic.json"))
-		if err := a.CommentIssue(ctx, "10001", "track me"); err != nil {
+		if _, err := a.CommentIssue(ctx, "10001", "track me"); err != nil {
 			t.Fatalf("CommentIssue: %v", err)
 		}
 		requireSingleCall(t, spy, "comment", "success")
@@ -1373,7 +1427,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a, spy := newAdapterWithMetrics(t, fixture("basic.json"))
-		_ = a.CommentIssue(ctx, "nonexistent", "text")
+		_, _ = a.CommentIssue(ctx, "nonexistent", "text")
 		requireSingleCall(t, spy, "comment", "error")
 	})
 
@@ -1381,7 +1435,7 @@ func TestCommentIssue(t *testing.T) {
 		t.Parallel()
 
 		a, spy := newAdapterWithMetrics(t, "testdata/does_not_exist.json")
-		_ = a.CommentIssue(ctx, "10001", "text")
+		_, _ = a.CommentIssue(ctx, "10001", "text")
 		requireSingleCall(t, spy, "comment", "error")
 	})
 
@@ -1396,7 +1450,7 @@ func TestCommentIssue(t *testing.T) {
 		for i := range goroutines {
 			go func(n int) {
 				defer wg.Done()
-				_ = a.CommentIssue(ctx, "10001", fmt.Sprintf("goroutine %d", n))
+				_, _ = a.CommentIssue(ctx, "10001", fmt.Sprintf("goroutine %d", n))
 			}(i)
 		}
 		wg.Wait()
@@ -1405,7 +1459,6 @@ func TestCommentIssue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FetchIssueComments: %v", err)
 		}
-		// 1 existing + 20 injected.
 		if len(comments) != 21 {
 			t.Errorf("comment count = %d, want 21", len(comments))
 		}

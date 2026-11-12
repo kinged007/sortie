@@ -11,7 +11,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
-	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/storage"
 )
 
 // autoMergePendingBackoffBase is the base interval for auto-merge
@@ -292,7 +292,7 @@ func reconcileAutoMerge(state *State, params ReconcileParams, log *slog.Logger, 
 
 		state.ReactionAttempts[rkey]++
 		recordReactionActivity(ctx, params.Store, pending.IssueID, pending.StageLineage,
-			persistence.ReactionActivityAction, []string{ReactionKindAutoMerge}, now, entryLog)
+			storage.ReactionActivityAction, []string{ReactionKindAutoMerge}, now, entryLog)
 
 		if err != nil {
 			handleMergeError(state, params, key, pending, autoMergeData, fingerprint, err, now, pollInterval, entryLog, ctx, metrics)
@@ -402,8 +402,13 @@ func postAutoMergeSuccess(state *State, params ReconcileParams, pending *Pending
 		})
 	}
 
-	commentText := buildAutoMergeComment(autoMergeData, mergeResult, params.AutoMergeConfig.Strategy)
-	delivery := params.Router.Route(reactionNotification(domain.EventAutoMergeMerged, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventAutoMergeMerged, pending, domain.AutoMergedFacts{
+		Owner:    autoMergeData.Owner,
+		Repo:     autoMergeData.Repo,
+		PRNumber: autoMergeData.PRNumber,
+		Strategy: params.AutoMergeConfig.Strategy,
+		SHA:      mergeResult.SHA,
+	}))
 	commentLog := log
 	deliverDetached(ctx, &state.TrackerOpsWg, delivery, log, func(received bool, err error) {
 		if received && err != nil {
@@ -418,19 +423,6 @@ func postAutoMergeSuccess(state *State, params ReconcileParams, pending *Pending
 			slog.Any("error", err),
 		)
 	}
-}
-
-// buildAutoMergeComment returns the tracker comment template used on a
-// successful auto-merge. The merge-commit line appears only when the
-// merge result carries a commit identifier.
-func buildAutoMergeComment(autoMergeData *AutoMergeReactionData, mergeResult domain.MergeResult, strategy domain.MergeStrategy) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Sortie auto-merged PR #%d (%s/%s).\n", autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo)
-	fmt.Fprintf(&b, "Strategy: %s.", string(strategy))
-	if mergeResult.SHA != "" {
-		fmt.Fprintf(&b, "\nMerge commit: %s.", mergeResult.SHA)
-	}
-	return b.String()
 }
 
 // handleMergeError routes a failing MergePR call to the disposition
@@ -568,8 +560,10 @@ func applyAutoMergeEscalation(
 		slog.Int("pr_number", autoMergeData.PRNumber),
 	)
 
-	commentText := buildAutoMergeEscalationComment(autoMergeData, turnCount)
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationAutoMerge, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationAutoMerge, pending, domain.AutoMergeEscalationFacts{
+		PRNumber: autoMergeData.PRNumber,
+		Turns:    turnCount,
+	}))
 
 	if params.AutoMergeConfig.Escalation == "label" {
 		label := params.AutoMergeConfig.EscalationLabel
@@ -599,14 +593,4 @@ func applyAutoMergeEscalation(
 	})
 
 	metrics.IncAutoMergeReactions("escalated")
-}
-
-// buildAutoMergeEscalationComment returns the escalation comment used
-// when MaxRetries is exhausted.
-func buildAutoMergeEscalationComment(autoMergeData *AutoMergeReactionData, turnCount int) string {
-	return fmt.Sprintf(
-		"Sortie auto_merge attempted %d time(s) and could not complete the merge for PR #%d. Manual merge required.",
-		turnCount,
-		autoMergeData.PRNumber,
-	)
 }

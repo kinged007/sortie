@@ -1,15 +1,17 @@
-import { StandingMark } from "@/components/Lane";
+import { IssueTitleLink } from "@/components/IssueTitleLink";
+import { MarkSlot } from "@/components/Lane";
+import { Parts } from "@/components/Parts";
+import { MONO } from "@/components/ui/mono";
 import { cn } from "@/lib/cn";
 import { fmtClock, parseInstant } from "@/lib/format";
 import { timeCell } from "@/lib/active-rows";
-import { rowStyles, secondLineColor } from "@/lib/rows";
+import { ROW_GRID, rowStyles, secondLineColor } from "@/lib/rows";
 import { stateWord } from "@/lib/run-status";
 
 import { activeNavKey } from "./rows";
 
 import type { ActiveRow as ActiveRowModel } from "@/lib/active-rows";
 
-/** Props of {@link ActiveRow}. */
 export interface ActiveRowProps {
   row: ActiveRowModel;
   /** Server-clock time in epoch milliseconds that the time cell measures against. */
@@ -20,34 +22,42 @@ export interface ActiveRowProps {
   onOpen: (row: ActiveRowModel) => void;
 }
 
-/**
- * Renders one active issue on two lines beside the one word of where it stands
- * and a time cell. A click opens the peek of the issue.
- */
 export function ActiveRow({ row, now, isSelected, showSelection, onOpen }: ActiveRowProps) {
   const isLook = isSelected && showSelection;
   const hasTitle = row.title !== null;
-  const meta = [hasTitle ? row.displayKey : null, row.route, row.agentKind]
-    .filter((part) => part !== null)
-    .join(" · ");
+  const meta = [
+    hasTitle ? row.displayKey : null,
+    row.route === null ? null : (
+      <span key="route" className={MONO}>
+        {row.route}
+      </span>
+    ),
+    row.agentKind === null ? null : (
+      <span key="agent" className={MONO}>
+        {row.agentKind}
+      </span>
+    ),
+  ].filter((part) => part !== null);
   const base = parseInstant(row.timeBase);
 
   return (
     <li
       data-nav-key={activeNavKey(row.issueId)}
       onClick={() => onOpen(row)}
-      className={cn(
-        "grid grid-cols-[auto_minmax(0,1fr)] gap-x-sm gap-y-xxs px-md py-sm md:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_auto] md:gap-x-md wrap-anywhere",
-        rowStyles(isLook, true),
-      )}
+      className={cn(ROW_GRID, rowStyles(isLook, true, row.mark === "needs"))}
     >
-      <span className="flex w-(--size-icon) items-center justify-center self-center">
-        <StandingMark marker={row.mark} />
-      </span>
+      <MarkSlot marker={row.mark} />
       <div className="min-w-0">
-        <p className="text-body-md font-medium text-ink">{row.title ?? row.displayKey}</p>
-        {meta === "" ? undefined : (
-          <p className={cn("text-body-sm tabular-nums", secondLineColor(isLook))}>{meta}</p>
+        <p className="text-body-md font-medium text-ink">
+          <IssueTitleLink identifier={row.identifier}>{row.title ?? row.displayKey}</IssueTitleLink>
+        </p>
+        {meta.length === 0 ? undefined : (
+          <p className={cn("text-body-sm tabular-nums", secondLineColor(isLook))}>
+            <Parts parts={meta} />
+          </p>
+        )}
+        {row.holdText === null ? undefined : (
+          <p className={cn("text-body-sm", secondLineColor(isLook))}>{row.holdText}</p>
         )}
       </div>
       <p

@@ -7,13 +7,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func init() {
@@ -65,57 +65,6 @@ func runEscalationDescendant(_ []string, p escalationDescendantParams) int {
 	return 0
 }
 
-func pollEscalationPID(t *testing.T, path string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(string(data)); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("pollEscalationPID(%q) = no PID after %v, want a PID", path, timeout)
-	return 0
-}
-
-func pollEscalationFile(path string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return false
-}
-
-func processAliveForTest(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = proc.Release() }()
-	if runtime.GOOS == "windows" {
-		return true
-	}
-	return proc.Signal(syscall.Signal(0)) == nil
-}
-
-func pollProcessGone(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if !processAliveForTest(pid) {
-			return true
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 const escalationGrace = 5 * time.Second
 
 func TestArmGroupEscalation_ForceTerminatesStubbornGroupMember(t *testing.T) {
@@ -145,15 +94,12 @@ func TestArmGroupEscalation_ForceTerminatesStubbornGroupMember(t *testing.T) {
 
 	t.Cleanup(func() { _ = group.Kill() })
 
-	descendantPID := pollEscalationPID(t, pidFile, 5*time.Second)
+	descendantPID := waittest.PIDFile(t, pidFile)
 
 	cancel()
 	_ = cmd.Wait() //nolint:errcheck // a cancelled command reports the cancellation, not a fault
 
-	wait := escalationGrace + groupDrainBound + 2*time.Second
-	if !pollProcessGone(descendantPID, wait) {
-		t.Errorf("descendant %d still alive %v after cancellation, want gone (grace %v + drain bound %v)", descendantPID, wait, escalationGrace, groupDrainBound)
-	}
+	waittest.ProcessGone(t, descendantPID)
 }
 
 func TestArmGroupEscalation_GroupDrainedInsideGraceSendsNoForceSignal(t *testing.T) {
@@ -184,22 +130,18 @@ func TestArmGroupEscalation_GroupDrainedInsideGraceSendsNoForceSignal(t *testing
 
 	t.Cleanup(func() { _ = group.Kill() })
 
-	descendantPID := pollEscalationPID(t, pidFile, 5*time.Second)
+	descendantPID := waittest.PIDFile(t, pidFile)
 
 	forceSends, waitForQuiet := armEscalationForceSendProbe(t, cmd.Process.Pid)
 	reaper := StartReaper(cmd, nil)
 
 	cancelledAt := time.Now()
 	cancel()
-	awaitDone(t, reaper, escalationGrace+groupDrainBound+10*time.Second)
+	waittest.Receive(t, reaper.Done(), "reaper Done()")
 	sendsAtRelease := forceSends.Load()
 
-	if !pollEscalationFile(marker, 5*time.Second) {
-		t.Fatalf("descendant did not write %q, want it to have caught and exited on the graceful signal well inside the %v grace", marker, escalationGrace)
-	}
-	if !pollProcessGone(descendantPID, 5*time.Second) {
-		t.Fatalf("descendant %d still alive after exiting on the graceful signal, want gone", descendantPID)
-	}
+	waittest.File(t, marker)
+	waittest.ProcessGone(t, descendantPID)
 
 	floor := cancelledAt.Add(escalationGrace + groupDrainBound)
 	waitForQuiet(500*time.Millisecond, floor, escalationGrace+groupDrainBound+10*time.Second)
