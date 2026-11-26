@@ -4,7 +4,7 @@ Working notes for anyone changing Sortie's Pi adapter in `internal/agent/pi`: wh
 
 ## Where to get the volatile facts
 
-Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the 0.85.1 schema, so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
+Nothing here pins a flag list or a model name. Read the argument surface off `pi --help` on the version you are targeting, and take the provider and authentication surface from the documentation the installed release ships. The adapter's `command.go` defines what Sortie sends and `parse.go` defines what it reads; the event vocabulary checked there is the pi schema verified against 0.85.1 and 1.6.1 (a message `content` is accepted as a string or a list of parts; in 1.6.1 a `system` message carries string content and every other role carries a list of parts), so re-derive it from a live run after any version bump rather than extending the accepted set on the assumption that a new type is harmless.
 
 ## The surface Sortie drives
 
@@ -85,7 +85,7 @@ The adapter builds the same ssh argument vector the other fork-per-turn kinds us
 
 ## Sortie's own tools
 
-pi has no MCP transport. The kind registers `MCPInjectionUnsupported` and delivers nothing: the generated `.sortie/mcp.json` is never read, Sortie's tools are never advertised to a pi session, and nothing in the session can call them. A workflow that needs Sortie's own tools must not run on this kind; the tool set the agent works with is whatever pi itself provides, narrowed by `allowed_tools` and `denied_tools`.
+The adapter has no channel through which to hand a tool server to pi, so the kind registers `MCPDialectNone` and delivers nothing: the generated `.sortie/mcp.json` is never read, Sortie's tools are never advertised to a pi session, and nothing in the session can call them. A workflow that needs Sortie's own tools must not run on this kind; the tool set the agent works with is whatever pi itself provides, narrowed by `allowed_tools` and `denied_tools`.
 
 `mcp_config` is not a key of the `pi` block. Writing it is an unknown-key fault, reported by `sortie validate` under `pi.mcp_config.unknown_key` and refused at construction, rather than a warning about a value that goes nowhere. Two preflight warnings still describe the situation: `agent.kind.no_tool_channel` fires for every workflow on this kind, because there is no local-launch channel to advertise one through, and `agent.mcp_config` fires as well when a `mcp_config` key is configured for it. Both are warnings; the run proceeds.
 

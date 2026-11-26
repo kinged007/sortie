@@ -9,6 +9,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/prompt"
 )
 
 // Park reason and unpark trigger values, shared by both parking triggers
@@ -40,24 +41,63 @@ type parkObserverStore interface {
 	MarkParkedIssueLabelApplied(ctx context.Context, issueID string) error
 }
 
+// parkHandOver is what a park keeps from the run it follows for the first
+// run after a person releases it.
+type parkHandOver struct {
+	SessionID  string
+	TemplateID string // "" for the workflow body template
+	Statement  string
+}
+
+// parkHandOverOf derives the hand-over from the record of the run a park
+// follows. The statement always carries over. The session and template carry
+// over only from a run with no reaction kind that ended normally, because a
+// retry policy starts a new session after any other run, so resuming one of
+// those sessions would resume a suspect conversation.
+func parkHandOverOf(run persistence.RunHistory) parkHandOver {
+	handOver := parkHandOver{Statement: run.AgentText}
+	if run.ReactionKind != "" || !endedNormally(run) {
+		return handOver
+	}
+	handOver.SessionID = run.SessionID
+	handOver.TemplateID = run.TemplateID
+	return handOver
+}
+
+// endedNormally reports whether run succeeded or failed only because its
+// handoff was withheld for lack of observed work.
+func endedNormally(run persistence.RunHistory) bool {
+	switch run.Status {
+	case "succeeded":
+		return true
+	case "failed":
+		return run.Error != nil && strings.HasPrefix(*run.Error, persistence.HandoffAbsenceErrorPrefix)
+	default:
+		return false
+	}
+}
+
 // parkedRun is the run a park follows: its dispatch rule, its frozen stage
-// lineage (pass dispatch time included), its agent kind, and its configured
-// model. The zero value records no run.
+// lineage (pass dispatch time included), its agent kind, its configured
+// model, and what it hands to the first run after a release. The zero value
+// records no run.
 type parkedRun struct {
 	RuleName        string
 	StageLineage    StageLineage
 	AgentKind       string
 	ConfiguredModel string
+	HandOver        parkHandOver
 }
 
 // parkedRunOf returns the run row describes: AgentKind from AgentAdapter,
-// StageLineage through [stageLineageOf].
+// StageLineage through [stageLineageOf], HandOver through [parkHandOverOf].
 func parkedRunOf(row persistence.RunHistory) parkedRun {
 	return parkedRun{
 		RuleName:        row.RuleName,
 		StageLineage:    stageLineageOf(row),
 		AgentKind:       row.AgentAdapter,
 		ConfiguredModel: row.ConfiguredModel,
+		HandOver:        parkHandOverOf(row),
 	}
 }
 
@@ -83,7 +123,8 @@ type parkIssueParams struct {
 
 // parkIssue records the park, releases the claim, cancels and deletes any
 // pending retry, resets the issue's stage hop count, and starts the detached
-// parking-label write.
+// parking-label write. A new park replaces a pending release of the same
+// issue, since the full-replace upsert clears the row's release columns.
 func parkIssue(state *State, params parkIssueParams) {
 	ctx := params.Ctx
 	if ctx == nil {
@@ -117,7 +158,12 @@ func parkIssue(state *State, params parkIssueParams) {
 		StageLineage:    params.Run.StageLineage,
 		AgentKind:       params.Run.AgentKind,
 		ConfiguredModel: params.Run.ConfiguredModel,
+
+		SessionID:  params.Run.HandOver.SessionID,
+		TemplateID: params.Run.HandOver.TemplateID,
+		Statement:  params.Run.HandOver.Statement,
 	}
+	delete(state.ParkReleases, params.IssueID)
 	state.Parked[params.IssueID] = entry
 
 	if err := params.Store.UpsertParkedIssue(ctx, parkedIssueRow(params.IssueID, entry)); err != nil {
@@ -163,9 +209,17 @@ func parkIssue(state *State, params parkIssueParams) {
 	})
 }
 
-// unparkIssue lifts the park, deletes the persisted row, and resets the
-// issue's stage hop count. It is a no-op when issueID is absent from
-// state.Parked.
+// isReleaseGesture reports whether trigger is a person's release, as opposed
+// to a worker exit that observed work.
+func isReleaseGesture(trigger string) bool {
+	return trigger == unparkTriggerLabelRemoved || trigger == unparkTriggerStateChanged
+}
+
+// unparkIssue lifts the park, resets the absence sequence and the issue's
+// stage hop count, and settles the persisted row. A person's release moves
+// the entry to state.ParkReleases and keeps the row, with its release
+// columns set, until [consumeParkRelease] runs; any other trigger deletes the
+// row. It is a no-op when issueID is absent from state.Parked.
 func unparkIssue(ctx context.Context, state *State, issueID, trigger string, store ParkStore, log *slog.Logger) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -180,7 +234,14 @@ func unparkIssue(ctx context.Context, state *State, issueID, trigger string, sto
 	}
 	delete(state.Parked, issueID)
 
-	if err := store.DeleteParkedIssue(ctx, issueID); err != nil {
+	if isReleaseGesture(trigger) {
+		entry.ReleasedAt = time.Now().UTC().Truncate(time.Second)
+		entry.ReleaseGesture = trigger
+		state.ParkReleases[issueID] = entry
+		if err := store.UpsertParkedIssue(ctx, parkedIssueRow(issueID, entry)); err != nil {
+			log.Error("failed to persist park release", slog.Any("error", err))
+		}
+	} else if err := store.DeleteParkedIssue(ctx, issueID); err != nil {
 		log.Error("failed to delete park record", slog.Any("error", err))
 	}
 	if err := store.ResetHandoffAbsenceSequence(ctx, issueID); err != nil {
@@ -194,9 +255,54 @@ func unparkIssue(ctx context.Context, state *State, issueID, trigger string, sto
 	)
 }
 
-// PopulateParked loads persisted park records into state.Parked. Called
-// during startup recovery, before the event loop starts, beside
-// [PopulateRetries].
+// consumeParkRelease deletes the pending release of issueID from
+// state.ParkReleases and its persisted row. It is a no-op when none is
+// pending. A failed delete is logged and the runtime deletion stands.
+func consumeParkRelease(ctx context.Context, state *State, store ParkStore, issueID string, log *slog.Logger) {
+	if _, ok := state.ParkReleases[issueID]; !ok {
+		return
+	}
+	delete(state.ParkReleases, issueID)
+	if err := store.DeleteParkedIssue(ctx, issueID); err != nil {
+		log.Error("failed to delete park release", slog.Any("error", err))
+	}
+}
+
+// parkContextOf builds the park render context from a pending release and
+// the issue's comments. The window keeps a comment created at or after the
+// park's whole second, and keeps one whose time does not parse so a possible
+// answer is never dropped; a zero park time keeps every comment.
+func parkContextOf(release *ParkedEntry, comments []domain.Comment) prompt.ParkContext {
+	boundary := release.ParkedAt.UTC().Truncate(time.Second)
+	kept := make([]domain.Comment, 0, len(comments))
+	for _, c := range comments {
+		created, err := c.CreatedTime()
+		if release.ParkedAt.IsZero() || err != nil || !created.Before(boundary) {
+			kept = append(kept, c)
+		}
+	}
+	return prompt.ParkContext{
+		Reason:     release.Reason,
+		Statement:  release.Statement,
+		ParkedAt:   formatWholeSecondUTC(release.ParkedAt),
+		ReleasedAt: formatWholeSecondUTC(release.ReleasedAt),
+		Gesture:    release.ReleaseGesture,
+		Comments:   domain.CommentTemplateMaps(kept),
+	}
+}
+
+// formatWholeSecondUTC renders t as RFC 3339 in UTC truncated to the whole
+// second, or "" for the zero time.
+func formatWholeSecondUTC(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Truncate(time.Second).Format(time.RFC3339)
+}
+
+// PopulateParked loads persisted park records into state.Parked, and rows
+// a person already released into state.ParkReleases. Called during startup
+// recovery, before the event loop starts, beside [PopulateRetries].
 func PopulateParked(state *State, rows []persistence.ParkedIssue, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
@@ -213,7 +319,7 @@ func PopulateParked(state *State, rows []persistence.ParkedIssue, log *slog.Logg
 			parkedAt = time.Time{}
 		}
 
-		state.Parked[row.IssueID] = &ParkedEntry{
+		entry := &ParkedEntry{
 			Identifier: row.Identifier,
 			DisplayID:  row.DisplayID,
 			IssueIdentity: IssueIdentity{
@@ -237,7 +343,18 @@ func PopulateParked(state *State, rows []persistence.ParkedIssue, log *slog.Logg
 			},
 			AgentKind:       row.AgentKind,
 			ConfiguredModel: row.ConfiguredModel,
+
+			SessionID:  row.SessionID,
+			TemplateID: row.TemplateID,
+			Statement:  row.Statement,
 		}
+		if row.ReleasedAt == "" {
+			state.Parked[row.IssueID] = entry
+			continue
+		}
+		entry.ReleasedAt, _ = time.Parse(time.RFC3339, row.ReleasedAt)
+		entry.ReleaseGesture = row.ReleaseGesture
+		state.ParkReleases[row.IssueID] = entry
 	}
 }
 
@@ -323,5 +440,11 @@ func parkedIssueRow(issueID string, entry *ParkedEntry) persistence.ParkedIssue 
 		StagePreviousOutcome: entry.StageLineage.PreviousOutcome,
 		ChainID:              entry.StageLineage.ChainID,
 		DispatchedAt:         formatDispatchedAt(entry.StageLineage.DispatchedAt),
+
+		SessionID:      entry.SessionID,
+		TemplateID:     entry.TemplateID,
+		Statement:      entry.Statement,
+		ReleasedAt:     formatWholeSecondUTC(entry.ReleasedAt),
+		ReleaseGesture: entry.ReleaseGesture,
 	}
 }

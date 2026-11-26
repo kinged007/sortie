@@ -13,6 +13,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestPopulateRetries(t *testing.T) {
@@ -397,11 +398,7 @@ func TestActivateReconstructedRetries(t *testing.T) {
 
 		HandleRetryTimer(state, issueID, params)
 
-		select {
-		case <-workerCalled:
-		case <-time.After(time.Second):
-			t.Fatal("worker goroutine did not execute within 1 second")
-		}
+		waittest.Receive(t, workerCalled, "worker goroutine execution")
 
 		entry, ok := state.Running["id-startup"]
 		if !ok {
@@ -716,6 +713,10 @@ func (s *recoveryTrackerStub) SetTrackerStates(func() domain.TrackerStates) {}
 func (s *recoveryTrackerStub) FetchIssueByID(_ context.Context, _ string) (domain.Issue, error) {
 	return domain.Issue{}, nil
 }
+func (s *recoveryTrackerStub) FetchIssueStatesAndLabelsByIDs(context.Context, []string) (map[string]domain.IssueStateAndLabels, error) {
+	return nil, nil
+}
+
 func (s *recoveryTrackerStub) FetchIssueStatesByIDs(_ context.Context, ids []string) (map[string]string, error) {
 	s.fetchedIDs = append(s.fetchedIDs, ids...)
 	if s.err != nil {
@@ -739,9 +740,6 @@ func (s *recoveryTrackerStub) TransitionIssue(_ context.Context, _ string, _ str
 	return nil
 }
 func (s *recoveryTrackerStub) CommentIssue(_ context.Context, _ string, _ string) error {
-	return nil
-}
-func (s *recoveryTrackerStub) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
 	return nil
 }
 func (s *recoveryTrackerStub) AddLabel(_ context.Context, _ string, _ string) error {

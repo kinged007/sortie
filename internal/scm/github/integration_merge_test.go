@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // TestSCMAdapter_MergeFlow_Integration exercises all five auto-merge SCM
@@ -74,21 +75,21 @@ func TestSCMAdapter_MergeFlow_Integration(t *testing.T) {
 		// mergeability asynchronously after PR creation.
 		const maxAttempts = 5
 		var status domain.PRMergeStatus
-		for attempt := range maxAttempts {
+		attempt := 0
+		_ = waittest.UntilWithin(maxAttempts*2*time.Second, 2*time.Second, func() error {
 			var mergeErr error
 			status, mergeErr = a.GetMergeability(ctx, prNumber, owner, repo)
 			if mergeErr != nil {
 				t.Fatalf("GetMergeability(PR #%d): %v", prNumber, mergeErr)
 			}
+			attempt++
 			t.Logf("GetMergeability attempt %d: mergeability=%q headSHA=%q branch=%q",
-				attempt+1, status.Mergeability, status.HeadSHA, status.BranchName)
-			if status.Mergeability != domain.MergeabilityUnknown {
-				break
+				attempt, status.Mergeability, status.HeadSHA, status.BranchName)
+			if status.Mergeability == domain.MergeabilityUnknown {
+				return errors.New("mergeability is still unknown")
 			}
-			if attempt < maxAttempts-1 {
-				time.Sleep(2 * time.Second)
-			}
-		}
+			return nil
+		})
 
 		validStates := map[domain.MergeabilityState]bool{
 			domain.MergeabilityClean:    true,

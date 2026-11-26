@@ -1,10 +1,4 @@
--- Migration 32: first run after a stage hop on run history
---
--- Within one issue the lowest id among the rows of a hop is the hop's first
--- run, because one issue runs one run at a time and a row is appended at the
--- run's exit. The rule reads neither trigger nor reaction_kind, so a first
--- run recorded before migration 28 with a NULL trigger still anchors its hop.
-
+-- The lowest id of a hop is its first run: an issue runs one run at a time.
 ALTER TABLE run_history ADD COLUMN first_after_hop INTEGER NOT NULL DEFAULT 0;
 
 UPDATE run_history SET first_after_hop = 1

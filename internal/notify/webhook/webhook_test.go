@@ -1,13 +1,9 @@
 package webhook
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
-	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,9 +13,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// captureServer starts an httptest.Server that records the last request
-// body and returns the given status code.
-func captureServer(t *testing.T, statusCode int) (server *httptest.Server, body func() []byte) {
+func captureServer(t *testing.T) (server *httptest.Server, body func() []byte) {
 	t.Helper()
 	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,22 +22,12 @@ func captureServer(t *testing.T, statusCode int) (server *httptest.Server, body 
 			t.Errorf("captureServer: read body: %v", err)
 		}
 		captured = b
-		w.WriteHeader(statusCode)
+		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, func() []byte { return captured }
 }
 
-// slogCapture returns a slog.Logger backed by a bytes.Buffer at Debug
-// level and a function that retrieves the captured output.
-func slogCapture() (*slog.Logger, func() string) {
-	var buf bytes.Buffer
-	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	return slog.New(h), func() string { return buf.String() }
-}
-
-// makeNotification builds a test Notification with recognizable field
-// values that can be checked in the posted body.
 func makeNotification() domain.Notification {
 	return domain.Notification{
 		Envelope: domain.NotificationEnvelope{
@@ -91,10 +75,6 @@ func TestWebhook_NewNotifier_MissingURL(t *testing.T) {
 	}
 }
 
-// TestWebhook_NewNotifier_WrongTypeVsAbsentURL covers the distinction
-// between a wrong-typed url and an absent one: the type fault carries the
-// typed-fault message, while the absent key keeps its existing "url is
-// required" message.
 func TestWebhook_NewNotifier_WrongTypeVsAbsentURL(t *testing.T) {
 	t.Parallel()
 
@@ -128,7 +108,7 @@ func TestWebhook_NewNotifier_WrongTypeVsAbsentURL(t *testing.T) {
 func TestWebhook_NewNotifier_ValidURL(t *testing.T) {
 	t.Parallel()
 
-	srv, _ := captureServer(t, http.StatusOK)
+	srv, _ := captureServer(t)
 
 	n, err := newNotifier(map[string]any{"url": srv.URL})
 	if err != nil {
@@ -142,7 +122,7 @@ func TestWebhook_NewNotifier_ValidURL(t *testing.T) {
 func TestWebhook_Send_PostsEnvelopeAndMessage(t *testing.T) {
 	t.Parallel()
 
-	srv, getBody := captureServer(t, http.StatusOK)
+	srv, getBody := captureServer(t)
 
 	n, err := newNotifier(map[string]any{"url": srv.URL})
 	if err != nil {
@@ -199,7 +179,7 @@ func TestWebhook_Send_PostsEnvelopeAndMessage(t *testing.T) {
 func TestWebhook_Send_EmptySessionIDPostsEmptyString(t *testing.T) {
 	t.Parallel()
 
-	srv, getBody := captureServer(t, http.StatusOK)
+	srv, getBody := captureServer(t)
 
 	n, err := newNotifier(map[string]any{"url": srv.URL})
 	if err != nil {
@@ -229,89 +209,6 @@ func TestWebhook_Send_EmptySessionIDPostsEmptyString(t *testing.T) {
 	}
 }
 
-func TestWebhook_Send_Non2xxReturnsClassifiedError(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name       string
-		statusCode int
-	}{
-		{name: "401 unauthorized", statusCode: http.StatusUnauthorized},
-		{name: "403 forbidden", statusCode: http.StatusForbidden},
-		{name: "429 rate limited", statusCode: http.StatusTooManyRequests},
-		{name: "500 server error", statusCode: http.StatusInternalServerError},
-		{name: "404 client error", statusCode: http.StatusNotFound},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			srv, _ := captureServer(t, tt.statusCode)
-
-			n, err := newNotifier(map[string]any{"url": srv.URL})
-			if err != nil {
-				t.Fatalf("newNotifier: %v", err)
-			}
-
-			err = n.Send(context.Background(), makeNotification())
-			if err == nil {
-				t.Fatalf("Send(status %d) = nil, want error", tt.statusCode)
-			}
-
-			var se *sendError
-			if !errors.As(err, &se) {
-				t.Fatalf("Send error type = %T, want *sendError", err)
-			}
-			if se.Category == "" {
-				t.Error("sendError.Category is empty, want a non-empty category string")
-			}
-		})
-	}
-}
-
-func connectionDroppingURL(t *testing.T) string {
-	t.Helper()
-	// Held open for the whole test: a closed port can be reused by a parallel test's server.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_ = conn.Close()
-		}
-	}()
-	return "http://" + ln.Addr().String()
-}
-
-func TestWebhook_Send_TransportFailureReturnsClassifiedError(t *testing.T) {
-	t.Parallel()
-
-	n, err := newNotifier(map[string]any{"url": connectionDroppingURL(t)})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	err = n.Send(context.Background(), makeNotification())
-	if err == nil {
-		t.Fatal("Send(closed server) = nil, want transport error")
-	}
-
-	var se *sendError
-	if !errors.As(err, &se) {
-		t.Fatalf("Send error type = %T, want *sendError", err)
-	}
-	if se.Category == "" {
-		t.Error("sendError.Category is empty")
-	}
-}
-
 func TestWebhook_Send_ContextCancellationReturnsError(t *testing.T) {
 	t.Parallel()
 
@@ -331,65 +228,6 @@ func TestWebhook_Send_ContextCancellationReturnsError(t *testing.T) {
 	err = n.Send(ctx, makeNotification())
 	if err == nil {
 		t.Fatal("Send(cancelled ctx) = nil, want error")
-	}
-}
-
-func TestWebhook_ErrorRedaction_URLAbsentFromError(t *testing.T) {
-	t.Parallel()
-
-	// Use a real httptest server that returns a non-2xx response. The
-	// classified sendError must not echo the server URL or any secret.
-	srv, _ := captureServer(t, http.StatusInternalServerError)
-	const secretToken = "token123"
-	webhookURL := srv.URL + "/" + secretToken
-
-	n, err := newNotifier(map[string]any{"url": webhookURL})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	sendErr := n.Send(context.Background(), makeNotification())
-	if sendErr == nil {
-		t.Fatal("Send(500 response) = nil, want error")
-	}
-
-	errText := sendErr.Error()
-	if strings.Contains(errText, webhookURL) {
-		t.Errorf("error message contains URL %q: %q", webhookURL, errText)
-	}
-	if strings.Contains(errText, secretToken) {
-		t.Errorf("error message contains secret token: %q", errText)
-	}
-}
-
-func TestWebhook_ErrorRedaction_URLAbsentFromLog(t *testing.T) {
-	t.Parallel()
-
-	srv, _ := captureServer(t, http.StatusUnauthorized)
-	const secretToken = "token456"
-	webhookURL := srv.URL + "/" + secretToken
-
-	logger, getLog := slogCapture()
-
-	n, err := newNotifier(map[string]any{"url": webhookURL})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	sendErr := n.Send(context.Background(), makeNotification())
-	if sendErr == nil {
-		t.Fatal("Send(401 response) = nil, want error")
-	}
-
-	// Simulate what the sidecar does: log the classified error. The
-	// message field must not embed the URL.
-	logger.Error("send failed", slog.Any("error", sendErr))
-	logOutput := getLog()
-	if strings.Contains(logOutput, webhookURL) {
-		t.Errorf("log output contains URL %q: %q", webhookURL, logOutput)
-	}
-	if strings.Contains(logOutput, secretToken) {
-		t.Errorf("log output contains secret token: %q", logOutput)
 	}
 }
 
@@ -459,7 +297,7 @@ func TestWebhook_Send_EventType(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			srv, getBody := captureServer(t, http.StatusOK)
+			srv, getBody := captureServer(t)
 			n, err := newNotifier(map[string]any{"url": srv.URL})
 			if err != nil {
 				t.Fatalf("newNotifier: %v", err)
@@ -520,7 +358,7 @@ func TestWebhook_Send_AgentText(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			srv, getBody := captureServer(t, http.StatusOK)
+			srv, getBody := captureServer(t)
 			n, err := newNotifier(map[string]any{"url": srv.URL})
 			if err != nil {
 				t.Fatalf("newNotifier: %v", err)

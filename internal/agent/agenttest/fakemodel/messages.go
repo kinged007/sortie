@@ -27,7 +27,7 @@ func (messagesCodec) credentialHeaders() []string {
 	return []string{"x-api-key", "Authorization"}
 }
 
-func (messagesCodec) route(method, path string) (route, bool) {
+func (messagesCodec) route(method, path string, _ http.Header) (route, bool) {
 	return route{}, method == http.MethodPost && path == "/v1/messages"
 }
 

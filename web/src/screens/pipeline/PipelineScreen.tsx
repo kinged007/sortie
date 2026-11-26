@@ -5,7 +5,6 @@ import { useEndedQuery, useStateQuery } from "@/api/queries";
 import { useHold, useNow } from "@/app/live";
 import { useShortcuts } from "@/app/keys";
 import { ActiveHead } from "@/components/ActiveHead";
-import { CheckIcon, MinusIcon, XIcon } from "@/components/icons";
 import { PhaseFilter } from "@/components/PhaseFilter";
 import { RuleFilter } from "@/components/RuleFilter";
 import { StatusMark } from "@/components/StatusMark";
@@ -90,19 +89,25 @@ function Legend({ hasReactions, hasChains }: LegendProps) {
   return (
     <div className="flex flex-wrap gap-md px-md pt-sm text-body-sm text-ink-muted">
       <span className="inline-flex items-center gap-xs">
-        <i aria-hidden="true" className={cn(swatch, "bg-track-done")} />
-        agent running
+        <i aria-hidden="true" className={cn(swatch, "bg-ink-body")} />
+        passed
       </span>
       <span className="inline-flex items-center gap-xs">
-        <i aria-hidden="true" className={cn(swatch, "border-[2.5px] border-track-done")} />
-        waiting on a signal
+        <i
+          aria-hidden="true"
+          className={cn(swatch, "border-[1.5px] border-dashed border-ink-body")}
+        />
+        waiting
       </span>
       <span className="inline-flex items-center gap-xs">
         <i aria-hidden="true" className={cn(swatch, "border-[1.5px] border-ink-muted")} />
         retry scheduled
       </span>
       <span className="inline-flex items-center gap-xs">
-        <i aria-hidden="true" className={cn(swatch, "bg-warning-fill")} />
+        <i
+          aria-hidden="true"
+          className={cn(swatch, "border-[1.5px] border-warning bg-warning-container")}
+        />
         needs attention
       </span>
       <span className="inline-flex items-center gap-xs">
@@ -110,46 +115,25 @@ function Legend({ hasReactions, hasChains }: LegendProps) {
           aria-hidden="true"
           className={cn(
             swatch,
-            "border-2 border-track-done bg-[radial-gradient(circle,var(--color-track-done)_0_2.5px,var(--color-canvas)_2.5px)]",
+            "border-2 border-ink-body bg-[radial-gradient(circle,var(--color-ink-body)_0_2.5px,var(--color-canvas)_2.5px)]",
           )}
         />
-        ended today
+        ended
       </span>
       {hasReactions ? (
-        <>
-          <span className="inline-flex items-center gap-xs">
-            <i
-              aria-hidden="true"
-              className={cn(swatch, "border-[1.5px] border-dashed border-track-done")}
-            />
-            a reaction waiting
-          </span>
-          <span className="inline-flex items-center gap-xs">
-            <XIcon aria-hidden="true" className="size-3 text-ink-body" />
-            an escalated reaction
-          </span>
-          <span className="inline-flex items-center gap-xs">
-            <CheckIcon aria-hidden="true" className="size-3 text-ink-body" />
-            Sortie acted
-          </span>
-          <span className="inline-flex items-center gap-xs">
-            <MinusIcon aria-hidden="true" className="size-3 text-ink-muted" />
-            nothing to act on
-          </span>
-          <span className="inline-flex items-center gap-xs">
-            <i
-              aria-hidden="true"
-              className={cn(swatch, "border-[1.5px] border-track-todo bg-canvas")}
-            />
-            no record
-          </span>
-        </>
+        <span className="inline-flex items-center gap-xs">
+          <i
+            aria-hidden="true"
+            className={cn(swatch, "border-[1.5px] border-ink-faint bg-canvas")}
+          />
+          no record
+        </span>
       ) : undefined}
       {hasChains ? (
         <span className="inline-flex items-center gap-xs">
           <i
             aria-hidden="true"
-            className="inline-block h-1 w-6 rounded-full bg-[linear-gradient(to_right,var(--color-track-done)_60%,var(--color-track-todo)_60%)]"
+            className="inline-block h-1 w-6 rounded-full bg-[linear-gradient(to_right,var(--color-ink-body)_60%,var(--color-ink-faint)_60%)]"
           />
           stages done
         </span>
@@ -432,11 +416,7 @@ function PipelineBody({ state }: PipelineBodyProps) {
   );
 }
 
-/**
- * Renders the Pipeline: every active issue and every issue that ended today as
- * one lane across the stations of the workflow. While a peek is open it
- * renders the data as it was when the peek opened.
- */
+/** While a peek is open it renders the data as it was when the peek opened. */
 export function PipelineScreen() {
   const { data: state } = useStateQuery();
   return state === undefined ? undefined : <PipelineBody state={state} />;

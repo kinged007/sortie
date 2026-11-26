@@ -2,17 +2,20 @@ package orchestrator
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// spyMetrics records all domain.Metrics method calls for assertion.
 type spyMetrics struct {
 	mu sync.Mutex
 
@@ -40,6 +43,9 @@ type spyMetrics struct {
 	budgetExhaustions     []string
 	runsStoppedByBudget   []string
 	budgetExhaustedIssues []budgetExhaustedIssuesCall
+	agentRuntimeModels    []string
+	workerExitModels      []string
+	preparedModels        []string
 }
 
 type budgetExhaustedIssuesCall struct {
@@ -49,6 +55,7 @@ type budgetExhaustedIssuesCall struct {
 
 type tokenCall struct {
 	tokenType string
+	model     string
 	count     int64
 }
 
@@ -98,16 +105,23 @@ func (s *spyMetrics) SetActiveSessionsElapsed(seconds float64) {
 	s.activeSessionElapsed = append(s.activeSessionElapsed, seconds)
 }
 
-func (s *spyMetrics) AddTokens(tokenType string, count int64) {
+func (s *spyMetrics) AddTokens(tokenType string, model string, count int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tokens = append(s.tokens, tokenCall{tokenType, count})
+	s.tokens = append(s.tokens, tokenCall{tokenType, model, count})
 }
 
-func (s *spyMetrics) AddAgentRuntime(seconds float64) {
+func (s *spyMetrics) AddAgentRuntime(model string, seconds float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.agentRuntime = append(s.agentRuntime, seconds)
+	s.agentRuntimeModels = append(s.agentRuntimeModels, model)
+}
+
+func (s *spyMetrics) PrepareModel(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preparedModels = append(s.preparedModels, model)
 }
 
 func (s *spyMetrics) IncDispatches(outcome string) {
@@ -116,10 +130,11 @@ func (s *spyMetrics) IncDispatches(outcome string) {
 	s.dispatches = append(s.dispatches, outcome)
 }
 
-func (s *spyMetrics) IncWorkerExits(exitType string) {
+func (s *spyMetrics) IncWorkerExits(exitType string, model string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workerExits = append(s.workerExits, exitType)
+	s.workerExitModels = append(s.workerExitModels, model)
 }
 
 func (s *spyMetrics) IncRetries(trigger string) {
@@ -249,6 +264,87 @@ func (s *spyMetrics) SetBudgetExhaustedIssues(reason string, count int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.budgetExhaustedIssues = append(s.budgetExhaustedIssues, budgetExhaustedIssuesCall{reason, count})
+}
+
+func TestMetricModel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, carrier, reported, configured, want string }{
+		{name: "carrier wins", carrier: "carrier", reported: "reported", configured: "configured", want: "carrier"},
+		{name: "empty carrier keeps the reported model", reported: "reported", configured: "configured", want: "reported"},
+		{name: "only configured", configured: "configured", want: "configured"},
+		{name: "nothing set"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			entry := &RunningEntry{ModelName: tt.reported, ConfiguredModel: tt.configured}
+			if got := metricModel(tt.carrier, entry); got != tt.want {
+				t.Errorf("metricModel(%q, reported %q, configured %q) = %q, want %q", tt.carrier, tt.reported, tt.configured, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfiguredModels(t *testing.T) {
+	t.Parallel()
+
+	ruleModel := func(kind, model string) config.DispatchRule {
+		return config.DispatchRule{Name: "r", SettingsKind: kind, Settings: map[string]any{"model": model}}
+	}
+	tests := []struct {
+		name     string
+		topLevel map[string]any
+		rules    []config.DispatchRule
+		want     []ConfiguredModel
+	}{
+		{name: "top-level kind block without dispatch", topLevel: map[string]any{"model": "m-kind"}, want: []ConfiguredModel{{"kind-a", "m-kind"}}},
+		{name: "rule model under its own kind", topLevel: map[string]any{"model": "m-kind"}, rules: []config.DispatchRule{ruleModel("kind-b", "m-rule")}, want: []ConfiguredModel{{"kind-a", "m-kind"}, {"kind-b", "m-rule"}}},
+		{name: "block without a model", want: []ConfiguredModel{{"kind-a", ""}}},
+		{name: "model shared by two kinds", topLevel: map[string]any{"model": "m"}, rules: []config.DispatchRule{ruleModel("kind-b", "m")}, want: []ConfiguredModel{{"kind-a", "m"}, {"kind-b", "m"}}},
+		{name: "model shared by two blocks of one kind", topLevel: map[string]any{"model": "m"}, rules: []config.DispatchRule{ruleModel("kind-a", "m")}, want: []ConfiguredModel{{"kind-a", "m"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := configuredModels(settingsConfig(tt.topLevel, tt.rules...))
+
+			slices.SortFunc(got, func(a, b ConfiguredModel) int {
+				return cmp.Or(cmp.Compare(a.AgentKind, b.AgentKind), cmp.Compare(a.Model, b.Model))
+			})
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("configuredModels() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func assertTokenModels(t *testing.T, spy *spyMetrics, want string) {
+	t.Helper()
+	for _, call := range spy.tokens {
+		if call.model != want {
+			t.Errorf("AddTokens(%q) model = %q, want %q", call.tokenType, call.model, want)
+		}
+	}
+}
+
+func exitMetrics(t *testing.T, state *State, result WorkerResult, elapsed time.Duration, activeStates ...string) *spyMetrics {
+	t.Helper()
+	spy := &spyMetrics{}
+	HandleWorkerExit(state, result, HandleWorkerExitParams{
+		Store:             &mockExitStore{},
+		MaxRetryBackoffMS: 300_000,
+		OnRetryFire:       noopRetryFire,
+		NowFunc:           func() time.Time { return baseTime.Add(elapsed) },
+		Logger:            discardLogger(),
+		Metrics:           spy,
+		ActiveStates:      activeStates,
+	})
+	return spy
 }
 
 func TestActiveElapsedSeconds(t *testing.T) {
@@ -437,8 +533,9 @@ func TestUpdateGauges_BudgetLevels(t *testing.T) {
 		}
 		o.updateGauges(now)
 
-		if len(spy.budgetExhaustedIssues) != 2 {
-			t.Fatalf("SetBudgetExhaustedIssues call count = %d, want 2 (one per declared reason)", len(spy.budgetExhaustedIssues))
+		wantReasons := []string{budgetReasonSession, budgetReasonToken, budgetReasonMoney}
+		if len(spy.budgetExhaustedIssues) != len(wantReasons) {
+			t.Fatalf("SetBudgetExhaustedIssues call count = %d, want %d (one per declared reason)", len(spy.budgetExhaustedIssues), len(wantReasons))
 		}
 		got := make(map[string]int, len(spy.budgetExhaustedIssues))
 		for _, c := range spy.budgetExhaustedIssues {
@@ -447,7 +544,7 @@ func TestUpdateGauges_BudgetLevels(t *testing.T) {
 		// The reasons are named literally rather than iterated from
 		// knownBudgetReasons, so a constant missing from that list would
 		// still fail this assertion.
-		for _, reason := range []string{budgetReasonSession, budgetReasonToken} {
+		for _, reason := range wantReasons {
 			count, ok := got[reason]
 			if !ok {
 				t.Errorf("SetBudgetExhaustedIssues never called for %q, want called with 0", reason)
@@ -557,11 +654,13 @@ func TestHandleAgentEvent_TokenMetrics(t *testing.T) {
 		t.Parallel()
 
 		spy := &spyMetrics{}
-		state, _ := newStateWithEntry("TOK-1")
+		state, entry := newStateWithEntry("TOK-1")
+		entry.ConfiguredModel = "configured-model"
 
 		HandleAgentEvent(state, "TOK-1", domain.AgentEvent{
 			Type:      domain.EventTokenUsage,
 			Timestamp: time.Now().UTC(),
+			Model:     "event-model",
 			Usage:     domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
 		}, slog.Default(), spy)
 
@@ -574,6 +673,40 @@ func TestHandleAgentEvent_TokenMetrics(t *testing.T) {
 		if spy.tokens[1].tokenType != "output" || spy.tokens[1].count != 50 {
 			t.Errorf("tokens[1] = %+v, want {output 50}", spy.tokens[1])
 		}
+		assertTokenModels(t, spy, "event-model")
+		if got := slices.Compact(slices.Sorted(slices.Values(spy.preparedModels))); !slices.Equal(got, []string{"event-model"}) {
+			t.Errorf("PrepareModel models = %q, want [event-model]", got)
+		}
+	})
+
+	t.Run("a run that used two models increments each series by its share", func(t *testing.T) {
+		t.Parallel()
+
+		spy := &spyMetrics{}
+		state, _ := newStateWithEntry("TOK-5")
+
+		HandleAgentEvent(state, "TOK-5", domain.AgentEvent{
+			Type:         domain.EventTokenUsage,
+			Timestamp:    time.Now().UTC(),
+			Model:        "carrier-model",
+			Usage:        domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CacheReadTokens: 20},
+			UsageByModel: map[string]domain.TokenUsage{"sub-model": {InputTokens: 30, OutputTokens: 10, TotalTokens: 40}},
+		}, slog.Default(), spy)
+
+		got := map[string]int64{}
+		for _, call := range spy.tokens {
+			got[call.model+"/"+call.tokenType] += call.count
+		}
+		want := map[string]int64{
+			"sub-model/input":          30,
+			"sub-model/output":         10,
+			"carrier-model/input":      70,
+			"carrier-model/output":     40,
+			"carrier-model/cache_read": 20,
+		}
+		if !maps.Equal(got, want) {
+			t.Errorf("AddTokens increments by model/type = %v, want %v", got, want)
+		}
 	})
 
 	t.Run("zero deltas skip AddTokens", func(t *testing.T) {
@@ -581,7 +714,6 @@ func TestHandleAgentEvent_TokenMetrics(t *testing.T) {
 
 		spy := &spyMetrics{}
 		state, entry := newStateWithEntry("TOK-2")
-		// Pre-fill so deltas are zero.
 		entry.LastReportedInputTokens = 100
 		entry.LastReportedOutputTokens = 50
 		entry.LastReportedTotalTokens = 150
@@ -618,7 +750,6 @@ func TestHandleAgentEvent_TokenMetrics(t *testing.T) {
 
 		state, _ := newStateWithEntry("TOK-4")
 
-		// Should not panic.
 		HandleAgentEvent(state, "TOK-4", domain.AgentEvent{
 			Type:      domain.EventTokenUsage,
 			Timestamp: time.Now().UTC(),
@@ -633,26 +764,18 @@ func TestHandleWorkerExitMetrics(t *testing.T) {
 	t.Run("normal exit records exit type and duration", func(t *testing.T) {
 		t.Parallel()
 
-		spy := &spyMetrics{}
-		store := &mockExitStore{}
 		state := exitState(t, "EX-1", nil)
 		state.Running["EX-1"].Issue = domain.Issue{
 			ID: "EX-1", Identifier: "EX-1-ident", State: "In Progress",
 		}
 
-		HandleWorkerExit(state, WorkerResult{
+		spy := exitMetrics(t, state, WorkerResult{
 			IssueID:    "EX-1",
 			Identifier: "EX-1-ident",
 			ExitKind:   WorkerExitNormal,
-		}, HandleWorkerExitParams{
-			Store:             store,
-			MaxRetryBackoffMS: 300_000,
-			OnRetryFire:       noopRetryFire,
-			NowFunc:           func() time.Time { return baseTime.Add(120 * time.Second) },
-			Logger:            discardLogger(),
-			Metrics:           spy,
-			ActiveStates:      []string{"In Progress"},
-		})
+			ModelName:  "worker-model",
+			Usage:      domain.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		}, 120*time.Second, "In Progress")
 
 		if len(spy.workerExits) != 1 || spy.workerExits[0] != "normal" {
 			t.Errorf("IncWorkerExits = %v, want [normal]", spy.workerExits)
@@ -669,28 +792,24 @@ func TestHandleWorkerExitMetrics(t *testing.T) {
 		if len(spy.agentRuntime) != 1 || spy.agentRuntime[0] != 120 {
 			t.Errorf("AddAgentRuntime = %v, want [120]", spy.agentRuntime)
 		}
+		if len(spy.tokens) == 0 {
+			t.Fatal("AddTokens call count = 0, want the reconciliation delta")
+		}
+		assertTokenModels(t, spy, "worker-model")
+		if want := []string{"worker-model"}; !slices.Equal(spy.workerExitModels, want) || !slices.Equal(spy.agentRuntimeModels, want) {
+			t.Errorf("IncWorkerExits, AddAgentRuntime models = %q, %q, want %q for both", spy.workerExitModels, spy.agentRuntimeModels, want)
+		}
 	})
 
 	t.Run("error exit records error type", func(t *testing.T) {
 		t.Parallel()
 
-		spy := &spyMetrics{}
-		store := &mockExitStore{}
-		state := exitState(t, "EX-2", nil)
-
-		HandleWorkerExit(state, WorkerResult{
+		spy := exitMetrics(t, exitState(t, "EX-2", nil), WorkerResult{
 			IssueID:    "EX-2",
 			Identifier: "EX-2-ident",
 			ExitKind:   WorkerExitError,
 			Error:      &domain.AgentError{Kind: domain.ErrTurnTimeout, Message: "test"},
-		}, HandleWorkerExitParams{
-			Store:             store,
-			MaxRetryBackoffMS: 300_000,
-			OnRetryFire:       noopRetryFire,
-			NowFunc:           func() time.Time { return baseTime.Add(60 * time.Second) },
-			Logger:            discardLogger(),
-			Metrics:           spy,
-		})
+		}, 60*time.Second)
 
 		if len(spy.workerExits) != 1 || spy.workerExits[0] != "error" {
 			t.Errorf("IncWorkerExits = %v, want [error]", spy.workerExits)
@@ -703,22 +822,11 @@ func TestHandleWorkerExitMetrics(t *testing.T) {
 	t.Run("cancelled exit records cancelled type", func(t *testing.T) {
 		t.Parallel()
 
-		spy := &spyMetrics{}
-		store := &mockExitStore{}
-		state := exitState(t, "EX-3", nil)
-
-		HandleWorkerExit(state, WorkerResult{
+		spy := exitMetrics(t, exitState(t, "EX-3", nil), WorkerResult{
 			IssueID:    "EX-3",
 			Identifier: "EX-3-ident",
 			ExitKind:   WorkerExitCancelled,
-		}, HandleWorkerExitParams{
-			Store:             store,
-			MaxRetryBackoffMS: 300_000,
-			OnRetryFire:       noopRetryFire,
-			NowFunc:           func() time.Time { return baseTime.Add(10 * time.Second) },
-			Logger:            discardLogger(),
-			Metrics:           spy,
-		})
+		}, 10*time.Second)
 
 		if len(spy.workerExits) != 1 || spy.workerExits[0] != "cancelled" {
 			t.Errorf("IncWorkerExits = %v, want [cancelled]", spy.workerExits)
@@ -822,7 +930,6 @@ func TestHandleWorkerExitMetrics(t *testing.T) {
 		store := &mockExitStore{}
 		state := exitState(t, "EX-7", nil)
 
-		// Should not panic.
 		HandleWorkerExit(state, WorkerResult{
 			IssueID:    "EX-7",
 			Identifier: "EX-7-ident",
@@ -872,7 +979,7 @@ func TestHandleRetryTimerMetrics(t *testing.T) {
 			AgentAdapterByKind: func(_ string) (domain.AgentAdapter, error) {
 				return &mockAgentAdapter{}, nil
 			},
-			ResolveAttemptSettings: func(_ DispatchResolution, _ string) AttemptSettings {
+			ResolveAttemptSettings: func(_ DispatchResolution) AttemptSettings {
 				return AttemptSettings{}
 			},
 			OnRetryFire: noopRetryFire,
@@ -1141,7 +1248,6 @@ func TestReconcileMetrics(t *testing.T) {
 			StartedAt:  now.Add(-10 * time.Second),
 		}
 
-		// Should not panic.
 		ReconcileRunningIssues(state, ReconcileParams{
 			TrackerAdapter: &mockReconcileTracker{
 				states: map[string]string{"NP-1": "In Progress"},

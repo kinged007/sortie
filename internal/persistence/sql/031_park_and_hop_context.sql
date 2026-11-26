@@ -1,10 +1,4 @@
--- Migration 31: run context and issue facts on parked issues, issue facts
--- on stage hops
---
--- An empty agent_adapter marks a synthetic run_history row, not an agent run.
--- Timestamps are compared through unixepoch because their precision and
--- offset vary.
-
+-- Timestamps vary in precision and offset, so they compare through unixepoch.
 ALTER TABLE parked_issues ADD COLUMN rule_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE parked_issues ADD COLUMN agent_kind TEXT NOT NULL DEFAULT '';
 ALTER TABLE parked_issues ADD COLUMN configured_model TEXT NOT NULL DEFAULT '';

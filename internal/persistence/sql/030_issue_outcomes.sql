@@ -1,5 +1,3 @@
--- Migration 30: how each issue's latest work ended
-
 CREATE TABLE issue_outcomes (
     issue_id            TEXT    PRIMARY KEY,
     kind                TEXT    NOT NULL,

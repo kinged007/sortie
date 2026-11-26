@@ -413,32 +413,62 @@ func (a *JiraAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []stri
 
 	var statesByID map[string]string
 	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
-		fetchedStates := make(map[string]string, len(issueIDs))
-		for start := 0; start < len(issueIDs); start += batchSize {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			end := min(start+batchSize, len(issueIDs))
-			batch := issueIDs[start:end]
-
-			jql := buildIDINJQL(batch)
-			if jql == "" {
-				continue
-			}
-
-			issues, err := a.paginatedSearch(ctx, jql, "status")
-			if err != nil {
-				return err
-			}
-			for _, iss := range issues {
-				fetchedStates[iss.ID] = iss.State
-			}
+		reads, fetchErr := a.fetchStatesByIDs(ctx, issueIDs, "status")
+		if fetchErr != nil {
+			return fetchErr
 		}
-		statesByID = fetchedStates
+		statesByID = issuekit.StatesOf(reads)
 		return nil
 	})
 	return statesByID, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the current state and labels for
+// each requested issue ID (Jira internal numeric ID). Issues not found are
+// omitted from the result map. Sends the same batched requests as
+// FetchIssueStatesByIDs, with the labels field added. The queryFilter is
+// intentionally not applied.
+func (a *JiraAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	if len(issueIDs) == 0 {
+		return map[string]domain.IssueStateAndLabels{}, nil
+	}
+
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		var fetchErr error
+		reads, fetchErr = a.fetchStatesByIDs(ctx, issueIDs, "status,labels")
+		return fetchErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return reads, nil
+}
+
+// fetchStatesByIDs reads the requested fields of each issue ID in batches of
+// batchSize and reports the state and labels the response carries.
+func (a *JiraAdapter) fetchStatesByIDs(ctx context.Context, issueIDs []string, fields string) (map[string]domain.IssueStateAndLabels, error) {
+	reads := make(map[string]domain.IssueStateAndLabels, len(issueIDs))
+	for start := 0; start < len(issueIDs); start += batchSize {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		end := min(start+batchSize, len(issueIDs))
+		jql := buildIDINJQL(issueIDs[start:end])
+		if jql == "" {
+			continue
+		}
+
+		issues, err := a.paginatedSearch(ctx, jql, fields)
+		if err != nil {
+			return nil, err
+		}
+		for _, iss := range issues {
+			reads[iss.ID] = domain.IssueStateAndLabels{State: iss.State, Labels: iss.Labels}
+		}
+	}
+	return reads, nil
 }
 
 // FetchIssueStatesByIdentifiers returns the current state for each
@@ -557,18 +587,6 @@ func (a *JiraAdapter) CommentIssue(ctx context.Context, issueID string, text str
 	})
 }
 
-// CommentIssueWithLiteral posts text followed by literal as a literal
-// block. On version "3" the block is an ADF codeBlock node holding one
-// text node. On version "2" it is a {noformat} block whose content has
-// a zero-width space inserted after every brace that starts a
-// case-insensitive "noformat", so the content cannot close the block,
-// and after every bracket that opens a [~user] mention.
-func (a *JiraAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, literalCommentPayload(a.apiVersion, text, literal))
-	})
-}
-
 func (a *JiraAdapter) postComment(ctx context.Context, issueID string, body any) error {
 	path := a.basePath + "/issue/" + url.PathEscape(issueID) + "/comment"
 
@@ -594,35 +612,6 @@ func commentPayload(apiVersion, text string) any {
 		return map[string]any{"body": text}
 	}
 	return buildADFComment(text)
-}
-
-// literalCommentPayload is [commentPayload] for a comment that ends in a
-// literal block.
-func literalCommentPayload(apiVersion, text, literal string) any {
-	if apiVersion == "2" {
-		return map[string]any{"body": text + "\n\n{noformat}\n" + inertNoformatContent(literal) + "\n{noformat}"}
-	}
-	return buildADFLiteralComment(text, literal)
-}
-
-// inertNoformatContent inserts a zero-width space after every brace that
-// starts the word noformat, in any letter case, so wiki markup inside the
-// block cannot terminate it. It also inserts one after every bracket that
-// opens a [~user] mention, because Jira Server parses mentions inside a
-// {noformat} block and would notify that user.
-func inertNoformatContent(literal string) string {
-	const word = "noformat"
-	var out strings.Builder
-	for i := 0; i < len(literal); i++ {
-		out.WriteByte(literal[i])
-		rest := literal[i+1:]
-		switch {
-		case literal[i] == '{' && len(rest) >= len(word) && strings.EqualFold(rest[:len(word)], word),
-			literal[i] == '[' && strings.HasPrefix(rest, "~"):
-			out.WriteString("\u200b")
-		}
-	}
-	return out.String()
 }
 
 // SetMetrics configures the metrics recorder for tracker API call

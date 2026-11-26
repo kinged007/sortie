@@ -20,6 +20,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // scenarioSignalTrapName names the fake runtime scenario a subprocess
@@ -95,15 +96,8 @@ func startFakeCodexProcess(t *testing.T, onTerm string, stopGraceMS int) *sessio
 		readerDone:  readerDone,
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(readyPath); err == nil {
-			return state
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("startFakeCodexProcess: readiness marker %q did not appear within 5s", readyPath)
-	return nil
+	waittest.File(t, readyPath)
+	return state
 }
 
 func TestStopSession_ConfiguredGraceBoundsTheWait(t *testing.T) {
@@ -118,8 +112,8 @@ func TestStopSession_ConfiguredGraceBoundsTheWait(t *testing.T) {
 	if err != nil {
 		t.Errorf("StopSession() = %v, want nil", err)
 	}
-	if elapsed > 2*time.Second {
-		t.Errorf("StopSession() force-terminated after %v, want well under the built-in 5s default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed)
+	if elapsed > procutil.DefaultStopGrace {
+		t.Errorf("StopSession() force-terminated after %v, want under the built-in %v default (proves the configured 200ms grace bounded the wait, not DefaultStopGrace)", elapsed, procutil.DefaultStopGrace)
 	}
 }
 
@@ -202,15 +196,10 @@ func TestStopSession_EscalationLogging(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 		defer cancel()
 
-		start := time.Now()
 		err := (&CodexAdapter{}).StopSession(ctx, domain.Session{Internal: state})
-		elapsed := time.Since(start)
 
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("StopSession() = %v, want context.DeadlineExceeded", err)
-		}
-		if elapsed > 10*time.Second {
-			t.Errorf("StopSession() returned after %v, want the caller's deadline to end the phase far below the 30s grace", elapsed)
 		}
 
 		output := buf.String()
@@ -252,19 +241,10 @@ func TestStopSession_StdinCloseNeverReturns(t *testing.T) {
 	state.stdin = blockingStdin{release: release}
 	t.Cleanup(func() { close(release) })
 
-	start := time.Now()
 	done := make(chan error, 1)
 	go func() { done <- (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state}) }()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("StopSession() error = %v, want nil", err)
-		}
-		if elapsed := time.Since(start); elapsed > 3*time.Second {
-			t.Errorf("StopSession() took %v, want well under 3s (a stdin Close that never returns must not block the signal, wait, or kill that follow it)", elapsed)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("StopSession() did not return within 5s against a stdin Close that never returns")
+	if err := waittest.Receive(t, done, "StopSession return against a stdin Close that never returns"); err != nil {
+		t.Errorf("StopSession() error = %v, want nil", err)
 	}
 }

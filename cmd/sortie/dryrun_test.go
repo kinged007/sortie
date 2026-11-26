@@ -372,18 +372,18 @@ func (f *dryRunFakeTracker) FetchIssuesByStates(context.Context, []string) ([]do
 func (f *dryRunFakeTracker) FetchIssueStatesByIDs(context.Context, []string) (map[string]string, error) {
 	return nil, nil
 }
+func (f *dryRunFakeTracker) FetchIssueStatesAndLabelsByIDs(context.Context, []string) (map[string]domain.IssueStateAndLabels, error) {
+	return nil, nil
+}
 func (f *dryRunFakeTracker) FetchIssueStatesByIdentifiers(context.Context, []string) (map[string]string, error) {
 	return nil, nil
 }
 func (f *dryRunFakeTracker) FetchIssueComments(context.Context, string) ([]domain.Comment, error) {
-	return nil, nil
+	return []domain.Comment{}, nil
 }
 func (f *dryRunFakeTracker) TransitionIssue(context.Context, string, string) error { return nil }
 func (f *dryRunFakeTracker) CommentIssue(context.Context, string, string) error    { return nil }
-func (f *dryRunFakeTracker) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
-	return nil
-}
-func (f *dryRunFakeTracker) AddLabel(context.Context, string, string) error { return nil }
+func (f *dryRunFakeTracker) AddLabel(context.Context, string, string) error        { return nil }
 
 func (f *dryRunFakeTracker) RemoveLabel(_ context.Context, _ string, _ string) error { return nil }
 

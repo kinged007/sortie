@@ -155,8 +155,17 @@
         "text": {
           "type": "string"
         },
+        "tool_argument": {
+          "type": "string"
+        },
         "tool_error": {
           "type": "boolean"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "tool_line": {
+          "type": "string"
         },
         "tool_name": {
           "type": "string"
@@ -179,6 +188,32 @@
         "event",
         "message",
         "text"
+      ],
+      "type": "object"
+    },
+    "AgentUsageWindowsResponse": {
+      "properties": {
+        "reported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "windows": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UsageWindowResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "reported_at",
+        "windows"
       ],
       "type": "object"
     },
@@ -219,6 +254,9 @@
         "budget_tokens": {
           "type": "integer"
         },
+        "budget_usd": {
+          "type": "number"
+        },
         "config_key": {
           "type": "string"
         },
@@ -249,6 +287,10 @@
         "reason": {
           "type": "string"
         },
+        "resets_at": {
+          "format": "date-time",
+          "type": "string"
+        },
         "used_attempts": {
           "type": "integer"
         },
@@ -259,6 +301,12 @@
           "type": "integer"
         },
         "used_tokens_complete": {
+          "type": "boolean"
+        },
+        "used_usd": {
+          "type": "number"
+        },
+        "used_usd_complete": {
           "type": "boolean"
         }
       },
@@ -362,6 +410,16 @@
           "anyOf": [
             {
               "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_usd": {
+          "anyOf": [
+            {
+              "type": "number"
             },
             {
               "type": "null"
@@ -477,6 +535,26 @@
               "type": "null"
             }
           ]
+        },
+        "used_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_usd_complete": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -488,6 +566,9 @@
         "budget_sessions",
         "used_tokens",
         "budget_tokens",
+        "used_usd",
+        "used_usd_complete",
+        "budget_usd",
         "unmeasured_sessions",
         "stopped_in_flight",
         "exhausted_at",
@@ -500,6 +581,22 @@
     },
     "ChainGroup": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
+        "cost_partial_runs": {
+          "type": "integer"
+        },
         "cost_per_succeeded_run_usd": {
           "anyOf": [
             {
@@ -580,8 +677,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -597,6 +723,13 @@
         "cost_per_succeeded_run_usd",
         "tokens_unmeasured_runs",
         "cost_unpriced_runs",
+        "cost_partial_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units",
         "issue",
         "stages",
         "last_hop"
@@ -635,6 +768,39 @@
         "queued",
         "requested_at",
         "outcome_text"
+      ],
+      "type": "object"
+    },
+    "ClassRateResponse": {
+      "properties": {
+        "from_input": {
+          "type": "boolean"
+        },
+        "layer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "per_mtok": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "per_mtok",
+        "layer",
+        "from_input"
       ],
       "type": "object"
     },
@@ -886,6 +1052,22 @@
     },
     "Group": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
+        "cost_partial_runs": {
+          "type": "integer"
+        },
         "cost_per_succeeded_run_usd": {
           "anyOf": [
             {
@@ -947,8 +1129,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -963,7 +1174,14 @@
         "cost_usd",
         "cost_per_succeeded_run_usd",
         "tokens_unmeasured_runs",
-        "cost_unpriced_runs"
+        "cost_unpriced_runs",
+        "cost_partial_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units"
       ],
       "type": "object"
     },
@@ -1032,8 +1250,79 @@
       ],
       "type": "object"
     },
+    "HeldIssueResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "hold": {
+          "$ref": "#/$defs/HoldResponse"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "issue_labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issue_title": {
+          "type": "string"
+        },
+        "issue_type": {
+          "type": "string"
+        },
+        "issue_url": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "status_text_full": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier",
+        "hold",
+        "status_text",
+        "status_text_full"
+      ],
+      "type": "object"
+    },
     "HistoryTotalsResponse": {
       "properties": {
+        "agent_priced_models": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cost_status": {
           "type": "string"
         },
@@ -1066,8 +1355,44 @@
             }
           ]
         },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vendor_amounts": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UnitAmountResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1077,7 +1402,139 @@
         "uncached_tokens",
         "tokens_complete",
         "estimated_cost_usd",
-        "cost_status"
+        "cost_status",
+        "unmeasured_cause",
+        "unmeasured_units",
+        "vendor_amounts",
+        "agent_priced_usd",
+        "agent_priced_models"
+      ],
+      "type": "object"
+    },
+    "HoldBlockerResponse": {
+      "properties": {
+        "display_identifier": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "issue_identifier": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issue_id",
+        "issue_identifier"
+      ],
+      "type": "object"
+    },
+    "HoldResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "blockers": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/HoldBlockerResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "held_since": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "model_only": {
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "agent_slots_full",
+            "ssh_hosts_full",
+            "blockers_not_read",
+            "blockers_unresolved",
+            "blockers_incomplete",
+            "blocked_by",
+            "daily_spend_ceiling",
+            "weekly_spend_ceiling",
+            "monthly_spend_ceiling",
+            "stage_hop_unconfirmed",
+            "usage_limit",
+            "park_comments_unread"
+          ],
+          "type": "string"
+        },
+        "reason_text": {
+          "type": "string"
+        },
+        "release_text": {
+          "type": "string"
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldSlotResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "reason",
+        "held_since",
+        "blockers",
+        "slot",
+        "resets_at",
+        "reason_text",
+        "release_text"
+      ],
+      "type": "object"
+    },
+    "HoldSlotResponse": {
+      "properties": {
+        "limit": {
+          "type": "integer"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "used": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope",
+        "used",
+        "limit"
       ],
       "type": "object"
     },
@@ -1570,6 +2027,162 @@
       ],
       "type": "object"
     },
+    "ModelPriceResponse": {
+      "properties": {
+        "agent_kind": {
+          "type": "string"
+        },
+        "cache_read": {
+          "$ref": "#/$defs/ClassRateResponse"
+        },
+        "cache_write": {
+          "$ref": "#/$defs/ClassRateResponse"
+        },
+        "cost_status": {
+          "type": "string"
+        },
+        "entry_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input": {
+          "$ref": "#/$defs/ClassRateResponse"
+        },
+        "last_used_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "layer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "output": {
+          "$ref": "#/$defs/ClassRateResponse"
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "table_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unrated_classes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "agent_kind",
+        "model",
+        "table_key",
+        "layer",
+        "entry_key",
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "cost_status",
+        "unrated_classes",
+        "last_used_at",
+        "runs"
+      ],
+      "type": "object"
+    },
+    "ModelUsageResponse": {
+      "properties": {
+        "cost_status": {
+          "type": "string"
+        },
+        "estimated_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "price_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenInfo"
+        },
+        "uncached_tokens": {
+          "type": "integer"
+        },
+        "unrated_classes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "model",
+        "tokens",
+        "uncached_tokens",
+        "estimated_cost_usd",
+        "cost_status",
+        "unrated_classes",
+        "price_source"
+      ],
+      "type": "object"
+    },
     "NextOutcomeResponse": {
       "properties": {
         "condition": {
@@ -1945,6 +2558,65 @@
       ],
       "type": "object"
     },
+    "PricesResponse": {
+      "properties": {
+        "embedded": {
+          "$ref": "#/$defs/TableSourceResponse"
+        },
+        "fetched": {
+          "$ref": "#/$defs/TableSourceResponse"
+        },
+        "generated_at": {
+          "type": "string"
+        },
+        "models": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ModelPriceResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TableSourceResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "table_in_force": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TableInForceResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token_rates": {
+          "$ref": "#/$defs/TokenRatesSourceResponse"
+        }
+      },
+      "required": [
+        "generated_at",
+        "table_in_force",
+        "token_rates",
+        "operator",
+        "fetched",
+        "embedded",
+        "models"
+      ],
+      "type": "object"
+    },
     "PullRequestResponse": {
       "properties": {
         "branch": {
@@ -1974,6 +2646,9 @@
         "actionable_comments": {
           "type": "integer"
         },
+        "awaiting_approval": {
+          "type": "boolean"
+        },
         "failing": {
           "type": "integer"
         },
@@ -1982,6 +2657,9 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "handled": {
+          "type": "boolean"
         },
         "head_sha": {
           "type": "string"
@@ -2143,6 +2821,19 @@
             }
           ]
         },
+        "by_provenance": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "by_rule": {
           "anyOf": [
             {
@@ -2237,6 +2928,26 @@
             }
           ]
         },
+        "skill_calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillCallReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Spend"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "summary": {
           "$ref": "#/$defs/Summary"
         },
@@ -2276,6 +2987,7 @@
         "schema_tier",
         "warnings",
         "summary",
+        "spend",
         "by_status",
         "by_adapter",
         "by_rule",
@@ -2285,6 +2997,8 @@
         "chain_funnels",
         "by_trigger",
         "by_origin",
+        "by_provenance",
+        "skill_calls",
         "self_review"
       ],
       "type": "object"
@@ -2473,8 +3187,17 @@
         "text": {
           "type": "string"
         },
+        "tool_argument": {
+          "type": "string"
+        },
         "tool_error": {
           "type": "boolean"
+        },
+        "tool_kind": {
+          "type": "string"
+        },
+        "tool_line": {
+          "type": "string"
         },
         "tool_name": {
           "type": "string"
@@ -2558,6 +3281,16 @@
         "agent_kind": {
           "type": "string"
         },
+        "agent_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "attempt": {
           "type": "integer"
         },
@@ -2575,6 +3308,16 @@
         },
         "cost_status": {
           "type": "string"
+        },
+        "declared_outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "dispatch_id": {
           "anyOf": [
@@ -2644,6 +3387,19 @@
         "model_name": {
           "type": "string"
         },
+        "model_usage": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ModelUsageResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "origin_recorded": {
           "type": "boolean"
         },
@@ -2706,6 +3462,12 @@
             }
           ]
         },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/SkillCall"
+          },
+          "type": "array"
+        },
         "ssh_host": {
           "anyOf": [
             {
@@ -2750,9 +3512,6 @@
         "tokens": {
           "$ref": "#/$defs/TokenInfo"
         },
-        "tokens_measured": {
-          "type": "boolean"
-        },
         "trigger": {
           "anyOf": [
             {
@@ -2766,13 +3525,62 @@
         "turns_completed": {
           "type": "integer"
         },
-        "unaccounted_turns": {
-          "type": "integer"
-        },
         "uncached_tokens": {
           "anyOf": [
             {
               "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage_completeness": {
+          "type": "string"
+        },
+        "usage_provenance": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/UsageSourceResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vendor_amounts": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/VendorAmountResponse"
+              },
+              "type": "array"
             },
             {
               "type": "null"
@@ -2790,14 +3598,14 @@
         "attempt",
         "status",
         "error",
+        "declared_outcome",
+        "agent_text",
         "started_at",
         "completed_at",
         "dispatched_at",
         "turns_completed",
         "tokens",
         "uncached_tokens",
-        "tokens_measured",
-        "unaccounted_turns",
         "estimated_cost_usd",
         "cost_status",
         "self_review",
@@ -2807,7 +3615,13 @@
         "reaction_config_key",
         "session_id",
         "ssh_host",
+        "usage_completeness",
+        "usage_provenance",
+        "vendor_amounts",
+        "unmeasured_cause",
+        "unmeasured_units",
         "dispatch_id",
+        "model_usage",
         "stage_chain",
         "issue_outcome",
         "pr_loop"
@@ -2856,6 +3670,16 @@
           "anyOf": [
             {
               "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "budget_usd": {
+          "anyOf": [
+            {
+              "type": "number"
             },
             {
               "type": "null"
@@ -2946,16 +3770,6 @@
         "issue_type": {
           "type": "string"
         },
-        "issue_uncached_tokens": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "issue_url": {
           "type": "string"
         },
@@ -3019,6 +3833,12 @@
         },
         "session_id": {
           "type": "string"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/SkillCall"
+          },
+          "type": "array"
         },
         "ssh_host": {
           "type": "string"
@@ -3212,8 +4032,8 @@
         "unmeasured_sessions",
         "used_tokens",
         "used_tokens_complete",
-        "issue_uncached_tokens",
         "budget_tokens",
+        "budget_usd",
         "estimated_cost_usd",
         "cost_status",
         "issue_estimated_cost_usd",
@@ -3403,6 +4223,16 @@
             }
           ]
         },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_retry_backoff_ms": {
           "type": "integer"
         },
@@ -3451,6 +4281,7 @@
         "max_retry_backoff_ms",
         "max_sessions",
         "max_tokens",
+        "max_cost_usd",
         "max_concurrent_agents",
         "max_concurrent_agents_by_state"
       ],
@@ -3892,6 +4723,9 @@
         "no_change_state": {
           "type": "string"
         },
+        "project": {
+          "type": "string"
+        },
         "terminal_states": {
           "anyOf": [
             {
@@ -3945,6 +4779,68 @@
       ],
       "type": "object"
     },
+    "SkillCall": {
+      "properties": {
+        "skill": {
+          "type": "string"
+        },
+        "tool_error": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "skill"
+      ],
+      "type": "object"
+    },
+    "SkillCallReport": {
+      "properties": {
+        "by_skill": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SkillCount"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unrecorded_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "unrecorded_runs",
+        "by_skill"
+      ],
+      "type": "object"
+    },
+    "SkillCount": {
+      "properties": {
+        "calls": {
+          "type": "integer"
+        },
+        "failed_calls": {
+          "type": "integer"
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "skill": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "runs",
+        "calls",
+        "failed_calls"
+      ],
+      "type": "object"
+    },
     "SnapshotAgentTotals": {
       "properties": {
         "cache_read_tokens": {
@@ -3988,6 +4884,152 @@
       ],
       "type": "object"
     },
+    "Spend": {
+      "properties": {
+        "buckets": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SpendBucket"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "period": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "period",
+        "buckets"
+      ],
+      "type": "object"
+    },
+    "SpendBucket": {
+      "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
+        "cost_partial_runs": {
+          "type": "integer"
+        },
+        "cost_unpriced_runs": {
+          "type": "integer"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "type": "integer"
+        },
+        "start": {
+          "type": "string"
+        },
+        "tokens_unmeasured_runs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "runs",
+        "cost_usd",
+        "tokens_unmeasured_runs",
+        "cost_unpriced_runs",
+        "cost_partial_runs",
+        "cost_lower_bound",
+        "agent_priced_usd"
+      ],
+      "type": "object"
+    },
+    "SpendCeilingResponse": {
+      "properties": {
+        "daily": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpendWindowResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "monthly": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpendWindowResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "weekly": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpendWindowResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "daily",
+        "weekly",
+        "monthly"
+      ],
+      "type": "object"
+    },
+    "SpendWindowResponse": {
+      "properties": {
+        "budget_usd": {
+          "type": "number"
+        },
+        "holds_dispatch": {
+          "type": "boolean"
+        },
+        "resets_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "used_usd": {
+          "type": "number"
+        },
+        "used_usd_complete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budget_usd",
+        "used_usd",
+        "used_usd_complete",
+        "holds_dispatch",
+        "resets_at"
+      ],
+      "type": "object"
+    },
     "StageHopResponse": {
       "properties": {
         "agent_kind": {
@@ -4009,6 +5051,16 @@
         },
         "display_identifier": {
           "type": "string"
+        },
+        "hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "hopped_at": {
           "anyOf": [
@@ -4083,6 +5135,7 @@
         "hopped_at",
         "dispatched_at",
         "stage_position",
+        "hold",
         "status_text",
         "status_text_full"
       ],
@@ -4147,6 +5200,9 @@
         "budget_exhausted": {
           "type": "integer"
         },
+        "held": {
+          "type": "integer"
+        },
         "parked": {
           "type": "integer"
         },
@@ -4167,6 +5223,7 @@
         "parked",
         "pending_reactions",
         "between_stages",
+        "held",
         "attention"
       ],
       "type": "object"
@@ -4281,6 +5338,19 @@
         "health": {
           "$ref": "#/$defs/StateHealthResponse"
         },
+        "held": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/HeldIssueResponse"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "parked": {
           "anyOf": [
             {
@@ -4308,15 +5378,10 @@
           ]
         },
         "rate_limits": {
-          "anyOf": [
-            {
-              "additionalProperties": {},
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentUsageWindowsResponse"
+          },
+          "type": "object"
         },
         "retrying": {
           "anyOf": [
@@ -4343,6 +5408,9 @@
               "type": "null"
             }
           ]
+        },
+        "spend_ceiling": {
+          "$ref": "#/$defs/SpendCeilingResponse"
         },
         "started_at": {
           "anyOf": [
@@ -4371,6 +5439,7 @@
         "pending_reactions",
         "between_stages",
         "active",
+        "held",
         "attention",
         "agent_totals",
         "rate_limits"
@@ -4379,7 +5448,23 @@
     },
     "Summary": {
       "properties": {
+        "agent_priced_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cancelled": {
+          "type": "integer"
+        },
+        "cost_lower_bound": {
+          "type": "boolean"
+        },
+        "cost_partial_runs": {
           "type": "integer"
         },
         "cost_per_succeeded_run_usd": {
@@ -4449,8 +5534,37 @@
             }
           ]
         },
+        "tokens_lower_bound": {
+          "type": "boolean"
+        },
+        "tokens_lower_bound_runs": {
+          "type": "integer"
+        },
         "tokens_unmeasured_runs": {
           "type": "integer"
+        },
+        "unmeasured_cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unmeasured_units": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "zero_duration_runs": {
           "type": "integer"
@@ -4472,7 +5586,151 @@
         "zero_duration_runs",
         "duration_excluded_runs",
         "cost_unpriced_runs",
-        "tokens_unmeasured_runs"
+        "cost_partial_runs",
+        "tokens_unmeasured_runs",
+        "tokens_lower_bound_runs",
+        "tokens_lower_bound",
+        "cost_lower_bound",
+        "agent_priced_usd",
+        "unmeasured_cause",
+        "unmeasured_units"
+      ],
+      "type": "object"
+    },
+    "TableInForceResponse": {
+      "properties": {
+        "age_days": {
+          "type": "integer"
+        },
+        "as_of": {
+          "type": "string"
+        },
+        "layer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "layer",
+        "as_of",
+        "age_days"
+      ],
+      "type": "object"
+    },
+    "TableSourceResponse": {
+      "properties": {
+        "address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "as_of": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failures": {
+          "type": "integer"
+        },
+        "file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "in_force": {
+          "type": "boolean"
+        },
+        "models": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_try_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "off_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "in_force",
+        "off_by",
+        "file",
+        "address",
+        "version",
+        "as_of",
+        "models",
+        "next_try_at",
+        "failures",
+        "failed_at",
+        "error"
       ],
       "type": "object"
     },
@@ -4582,6 +5840,9 @@
               "type": "null"
             }
           ]
+        },
+        "per_kind": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -4589,7 +5850,34 @@
         "output_per_mtok",
         "cache_read_per_mtok",
         "cache_write_per_mtok",
-        "complete"
+        "complete",
+        "per_kind"
+      ],
+      "type": "object"
+    },
+    "TokenRatesSourceResponse": {
+      "properties": {
+        "kind_entries": {
+          "type": "integer"
+        },
+        "model_entries": {
+          "type": "integer"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind_entries",
+        "model_entries",
+        "version"
       ],
       "type": "object"
     },
@@ -4621,6 +5909,148 @@
         "cache_read",
         "cache_write",
         "uncached"
+      ],
+      "type": "object"
+    },
+    "UnitAmountResponse": {
+      "properties": {
+        "amount": {
+          "type": "number"
+        },
+        "lower_bound": {
+          "type": "boolean"
+        },
+        "unit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "amount",
+        "lower_bound"
+      ],
+      "type": "object"
+    },
+    "UsageSourceResponse": {
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "UsageWindowAmountResponse": {
+      "properties": {
+        "limit": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "used": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "used",
+        "limit",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "UsageWindowResponse": {
+      "properties": {
+        "amount": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageWindowAmountResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "reported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "allowed",
+                "warning",
+                "exhausted"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "used_percent": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "used_percent",
+        "status",
+        "resets_at",
+        "reported_at",
+        "amount"
+      ],
+      "type": "object"
+    },
+    "VendorAmountResponse": {
+      "properties": {
+        "amount": {
+          "type": "number"
+        },
+        "lower_bound": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "unit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "model",
+        "amount",
+        "lower_bound"
       ],
       "type": "object"
     },

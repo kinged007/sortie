@@ -89,20 +89,18 @@ function reactionRows(reactions: ShapeReactions): Row[] {
     );
     rows.push({
       kind: "label_commands",
-      limit: labels.length === 0 ? "—" : joinLabels(labels, " "),
-      escalation: "—",
+      limit: labels.length === 0 ? "–" : joinLabels(labels, " "),
+      escalation: "–",
     });
   }
   return rows;
 }
 
-/** Props of {@link ReactionsSection}. */
 export interface ReactionsSectionProps {
   reactions: ShapeReactions;
   handoffState: string | undefined;
 }
 
-/** Renders Reactions: one table row per configured pull request reaction, in a fixed order, above the restart note. */
 export function ReactionsSection({ reactions, handoffState }: ReactionsSectionProps) {
   const rows = reactionRows(reactions);
   const handoff =

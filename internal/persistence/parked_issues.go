@@ -35,15 +35,30 @@ type ParkedIssue struct {
 	StagePreviousOutcome string
 	ChainID              string
 	DispatchedAt         string // RFC 3339 with nanoseconds, UTC
+
+	// SessionID, TemplateID, and Statement are what the park hands to the
+	// first run after a release; each is empty when the park recorded none.
+	// TemplateID is empty for the workflow body template.
+	SessionID  string
+	TemplateID string
+	Statement  string
+
+	// ReleasedAt (RFC 3339 UTC, whole seconds) and ReleaseGesture
+	// ("label_removed" or "state_changed") record a person's release; both
+	// are empty while the park holds.
+	ReleasedAt     string
+	ReleaseGesture string
 }
 
 // UpsertParkedIssue persists a park record using upsert semantics. If a
-// record for entry.IssueID already exists, it is replaced entirely.
+// record for entry.IssueID already exists, it is replaced entirely, release
+// columns included.
 func (s *Store) UpsertParkedIssue(ctx context.Context, entry ParkedIssue) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO parked_issues (issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at, issue_title, issue_url,
-			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels,
+			session_id, template_id, statement, released_at, release_gesture)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (issue_id) DO UPDATE SET
 			identifier             = excluded.identifier,
 			display_id             = excluded.display_id,
@@ -62,12 +77,18 @@ func (s *Store) UpsertParkedIssue(ctx context.Context, entry ParkedIssue) error 
 			chain_id               = excluded.chain_id,
 			dispatched_at          = excluded.dispatched_at,
 			issue_type             = excluded.issue_type,
-			issue_labels           = excluded.issue_labels`,
+			issue_labels           = excluded.issue_labels,
+			session_id             = excluded.session_id,
+			template_id            = excluded.template_id,
+			statement              = excluded.statement,
+			released_at            = excluded.released_at,
+			release_gesture        = excluded.release_gesture`,
 		entry.IssueID, entry.Identifier, entry.DisplayID, entry.Reason, entry.ParkedState,
 		entry.Label, entry.LabelApplied, entry.ParkedAt, entry.IssueTitle, entry.IssueURL,
 		entry.RuleName, entry.AgentKind, entry.ConfiguredModel, entry.StagePrevious,
 		entry.StagePreviousOutcome, entry.ChainID, entry.DispatchedAt, entry.IssueType,
 		encodeIssueLabels(entry.IssueLabels),
+		entry.SessionID, entry.TemplateID, entry.Statement, entry.ReleasedAt, entry.ReleaseGesture,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert parked issue %q: %w", entry.IssueID, err)
@@ -102,7 +123,8 @@ func (s *Store) DeleteParkedIssue(ctx context.Context, issueID string) error {
 func (s *Store) ListParkedIssues(ctx context.Context) ([]ParkedIssue, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT issue_id, identifier, display_id, reason, parked_state, label, label_applied, parked_at, issue_title, issue_url,
-			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels
+			rule_name, agent_kind, configured_model, stage_previous, stage_previous_outcome, chain_id, dispatched_at, issue_type, issue_labels,
+			session_id, template_id, statement, released_at, release_gesture
 		FROM parked_issues`)
 	if err != nil {
 		return nil, fmt.Errorf("list parked issues: %w", err)
@@ -117,7 +139,8 @@ func (s *Store) ListParkedIssues(ctx context.Context) ([]ParkedIssue, error) {
 		if err := rows.Scan(&e.IssueID, &e.Identifier, &displayID, &e.Reason, &e.ParkedState,
 			&e.Label, &e.LabelApplied, &e.ParkedAt, &e.IssueTitle, &e.IssueURL,
 			&e.RuleName, &e.AgentKind, &e.ConfiguredModel, &e.StagePrevious, &e.StagePreviousOutcome,
-			&e.ChainID, &e.DispatchedAt, &e.IssueType, &labels); err != nil {
+			&e.ChainID, &e.DispatchedAt, &e.IssueType, &labels,
+			&e.SessionID, &e.TemplateID, &e.Statement, &e.ReleasedAt, &e.ReleaseGesture); err != nil {
 			return nil, fmt.Errorf("scan parked issue: %w", err)
 		}
 		e.DisplayID = displayID.String

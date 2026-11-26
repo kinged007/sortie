@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func issueWithPriority(id string, p *int, createdAt string) domain.Issue {
@@ -809,60 +809,34 @@ func TestScheduleRetry(t *testing.T) {
 		entry.TimerHandle.Stop()
 	})
 
-	t.Run("timer fires callback with correct issueID", func(t *testing.T) {
-		t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		issueID string
+		delayMS int64
+	}{
+		{name: "timer fires callback with correct issueID", issueID: "ISS-FIRE", delayMS: 1},
+		{name: "zero delay fires nearly immediately", issueID: "ISS-ZERO", delayMS: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		s := newTestState()
-		var mu sync.Mutex
-		var fired string
+			s := newTestState()
+			fired := make(chan string, 1)
 
-		ScheduleRetry(s, ScheduleRetryParams{
-			IssueID:    "ISS-FIRE",
-			Identifier: "ISS-FIRE",
-			Attempt:    1,
-			DelayMS:    1, // fires quickly
-		}, func(issueID string) {
-			mu.Lock()
-			fired = issueID
-			mu.Unlock()
-		})
+			ScheduleRetry(s, ScheduleRetryParams{
+				IssueID:    tt.issueID,
+				Identifier: tt.issueID,
+				Attempt:    1,
+				DelayMS:    tt.delayMS,
+			}, func(issueID string) {
+				fired <- issueID
+			})
 
-		// Wait for timer to fire.
-		time.Sleep(50 * time.Millisecond)
-
-		mu.Lock()
-		got := fired
-		mu.Unlock()
-
-		if got != "ISS-FIRE" {
-			t.Errorf("onFire callback received issueID = %q, want %q", got, "ISS-FIRE")
-		}
-	})
-
-	t.Run("zero delay fires nearly immediately", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestState()
-		ch := make(chan string, 1)
-
-		ScheduleRetry(s, ScheduleRetryParams{
-			IssueID:    "ISS-ZERO",
-			Identifier: "ISS-ZERO",
-			Attempt:    1,
-			DelayMS:    0,
-		}, func(issueID string) {
-			ch <- issueID
-		})
-
-		select {
-		case got := <-ch:
-			if got != "ISS-ZERO" {
-				t.Errorf("onFire callback received issueID = %q, want %q", got, "ISS-ZERO")
+			if got := waittest.Receive(t, fired, "retry timer fire"); got != tt.issueID {
+				t.Errorf("onFire callback received issueID = %q, want %q", got, tt.issueID)
 			}
-		case <-time.After(time.Second):
-			t.Error("zero-delay timer did not fire within 1 second")
-		}
-	})
+		})
+	}
 }
 
 func TestRetrySlotIncumbent(t *testing.T) {
@@ -966,12 +940,7 @@ func TestDispatchIssue(t *testing.T) {
 			close(workerDone)
 		})
 
-		// Wait for worker to execute.
-		select {
-		case <-workerDone:
-		case <-time.After(time.Second):
-			t.Fatal("worker goroutine did not execute within 1 second")
-		}
+		waittest.Receive(t, workerDone, "worker goroutine execution")
 
 		if _, claimed := s.Claimed[issue.ID]; !claimed {
 			t.Error("DispatchIssue() did not add issue to Claimed set")
@@ -1069,11 +1038,7 @@ func TestDispatchIssue(t *testing.T) {
 		entry.CancelFunc()
 		<-workerDone
 
-		select {
-		case <-entry.WorkerDone:
-		case <-time.After(time.Second):
-			t.Fatal("RunningEntry.WorkerDone did not close within 1 second of cancellation")
-		}
+		waittest.Receive(t, entry.WorkerDone, "RunningEntry.WorkerDone closing after cancellation")
 	})
 
 	t.Run("StartedAt is recent UTC", func(t *testing.T) {
@@ -1150,19 +1115,15 @@ func TestDispatchIssue(t *testing.T) {
 			ch <- workerArgs{ctx: ctx, issue: iss, attempt: att}
 		})
 
-		select {
-		case args := <-ch:
-			if args.ctx == nil {
-				t.Error("worker received nil context")
-			}
-			if args.issue.ID != issue.ID {
-				t.Errorf("worker received issue.ID = %q, want %q", args.issue.ID, issue.ID)
-			}
-			if args.attempt == nil || *args.attempt != 2 {
-				t.Errorf("worker received attempt = %v, want pointer to 2", args.attempt)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("worker goroutine did not execute within 1 second")
+		args := waittest.Receive(t, ch, "worker goroutine execution")
+		if args.ctx == nil {
+			t.Error("worker received nil context")
+		}
+		if args.issue.ID != issue.ID {
+			t.Errorf("worker received issue.ID = %q, want %q", args.issue.ID, issue.ID)
+		}
+		if args.attempt == nil || *args.attempt != 2 {
+			t.Errorf("worker received attempt = %v, want pointer to 2", args.attempt)
 		}
 	})
 
@@ -1176,23 +1137,13 @@ func TestDispatchIssue(t *testing.T) {
 			ch <- ctx
 		})
 
-		var workerCtx context.Context
-		select {
-		case workerCtx = <-ch:
-		case <-time.After(time.Second):
-			t.Fatal("worker did not execute within 1 second")
-		}
+		workerCtx := waittest.Receive(t, ch, "worker execution")
 
 		// Cancel via the stored CancelFunc.
 		entry := s.Running["ISS-CTX"]
 		entry.CancelFunc()
 
-		select {
-		case <-workerCtx.Done():
-			// expected
-		case <-time.After(time.Second):
-			t.Error("worker context was not cancelled by CancelFunc")
-		}
+		waittest.Receive(t, workerCtx.Done(), "worker context cancellation by CancelFunc")
 	})
 
 	t.Run("existing retry entry is cleared on dispatch", func(t *testing.T) {
@@ -1255,9 +1206,9 @@ func TestDispatchIssue_TokenCeilingContexts(t *testing.T) {
 		wantRunDone bool
 	}{
 		{
-			name:      "TokenCeilingCancelFunc cancels the worker context with the ceiling cause and leaves the run context live",
-			trigger:   func(entry *RunningEntry) { entry.TokenCeilingCancelFunc() },
-			wantCause: errTokenCeilingStop,
+			name:      "CeilingCancelFunc cancels the worker context with the ceiling cause and leaves the run context live",
+			trigger:   func(entry *RunningEntry) { entry.CeilingCancelFunc() },
+			wantCause: errCeilingStop,
 		},
 		{
 			name:        "CancelFunc cancels both the run and worker contexts with context.Canceled",
@@ -1277,24 +1228,15 @@ func TestDispatchIssue_TokenCeilingContexts(t *testing.T) {
 				ch <- ctx
 			})
 
-			var workerCtx context.Context
-			select {
-			case workerCtx = <-ch:
-			case <-time.After(time.Second):
-				t.Fatal("worker did not execute within 1 second")
-			}
+			workerCtx := waittest.Receive(t, ch, "worker execution")
 
 			entry := s.Running["ISS-TC"]
-			if entry.TokenCeilingCancelFunc == nil {
-				t.Fatal("RunningEntry.TokenCeilingCancelFunc = nil, want non-nil")
+			if entry.CeilingCancelFunc == nil {
+				t.Fatal("RunningEntry.CeilingCancelFunc = nil, want non-nil")
 			}
 			tt.trigger(entry)
 
-			select {
-			case <-workerCtx.Done():
-			case <-time.After(time.Second):
-				t.Fatal("worker context was not cancelled")
-			}
+			waittest.Receive(t, workerCtx.Done(), "worker context cancellation")
 			if cause := context.Cause(workerCtx); !errors.Is(cause, tt.wantCause) {
 				t.Errorf("context.Cause(workerCtx) = %v, want %v", cause, tt.wantCause)
 			}
@@ -1337,15 +1279,11 @@ func TestDispatchIssue_DispatchID(t *testing.T) {
 
 		want := map[string]bool{idA: true, idB: true}
 		for range 2 {
-			select {
-			case got := <-ch:
-				if !want[got] {
-					t.Errorf("dispatchIDFromContext(workerCtx) = %q, want one of %q or %q", got, idA, idB)
-				}
-				delete(want, got)
-			case <-time.After(time.Second):
-				t.Fatal("worker goroutine did not execute within 1 second")
+			got := waittest.Receive(t, ch, "worker goroutine execution")
+			if !want[got] {
+				t.Errorf("dispatchIDFromContext(workerCtx) = %q, want one of %q or %q", got, idA, idB)
 			}
+			delete(want, got)
 		}
 		if len(want) != 0 {
 			t.Errorf("worker contexts did not carry both dispatch IDs; missing %v", want)
@@ -1363,24 +1301,16 @@ func TestDispatchIssue_DispatchID(t *testing.T) {
 
 		DispatchIssue(context.Background(), s, testIssue("ISS-DID-REDISPATCH"), nil, "", worker)
 		first := s.Running["ISS-DID-REDISPATCH"].DispatchID
-		select {
-		case got := <-ch:
-			if got != first {
-				t.Fatalf("first dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, first)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("first worker goroutine did not execute within 1 second")
+		got := waittest.Receive(t, ch, "first worker goroutine execution")
+		if got != first {
+			t.Fatalf("first dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, first)
 		}
 
 		DispatchIssue(context.Background(), s, testIssue("ISS-DID-REDISPATCH"), nil, "", worker)
 		second := s.Running["ISS-DID-REDISPATCH"].DispatchID
-		select {
-		case got := <-ch:
-			if got != second {
-				t.Fatalf("second dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, second)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("second worker goroutine did not execute within 1 second")
+		got = waittest.Receive(t, ch, "second worker goroutine execution")
+		if got != second {
+			t.Fatalf("second dispatch: dispatchIDFromContext(ctx) = %q, want %q", got, second)
 		}
 
 		if first == "" || second == "" {

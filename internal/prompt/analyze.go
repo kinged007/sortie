@@ -52,14 +52,16 @@ type TemplateWarning struct {
 
 // coreKeys lists the top-level template variables [Template.Render]
 // always populates, independent of [continuationKeys].
-var coreKeys = []string{"issue", "attempt", "run", "stage"}
+var coreKeys = []string{"issue", "attempt", "run", "stage", "park"}
 
 // topLevelOrder is coreKeys followed by every entry of continuationKeys,
 // in that order. It fixes the enumeration order used by topLevelList.
 var topLevelOrder = func() []string {
 	order := make([]string, 0, len(coreKeys)+len(continuationKeys))
 	order = append(order, coreKeys...)
-	order = append(order, continuationKeys...)
+	for _, k := range continuationKeys {
+		order = append(order, k.name)
+	}
 	return order
 }()
 
@@ -117,6 +119,14 @@ var templateFieldSchema = map[string]map[string]map[string]bool{
 		"current":          nil,
 		"previous":         nil,
 		"previous_outcome": nil,
+	},
+	"park": {
+		"reason":      nil,
+		"statement":   nil,
+		"parked_at":   nil,
+		"released_at": nil,
+		"gesture":     nil,
+		"comments":    nil,
 	},
 	"attempt": nil,
 	"ci_failure": {

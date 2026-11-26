@@ -126,8 +126,6 @@ Two more properties of that route: it defaults to **newest-first**, so ascending
 
 Internal notes are passed through. They are genuine human comments, and an operator who does not want them in prompts controls that by not writing them.
 
-**A note that carries agent text must not expose it to slash commands.** A recognized slash command at the start of a line in a note body runs as a quick action, so a literal `/close` in agent text would close the issue. A comment that carries agent text is therefore the text, a blank line, a Markdown fence, the literal, and the same fence, with the fence one backtick longer than the longest backtick run in the literal and at least three. GitLab extracts quick actions from rendered Markdown paragraphs only, so no line inside the fence runs, whatever it starts with. The guard for Sortie's own text is unchanged: a body consumed entirely as quick actions creates no note and is reported as a payload error.
-
 **There is a true batch state lookup**, which neither sibling adapter has: one request resolves many issues by their internal ids. Reconciliation for N running issues costs one request instead of N. Two caveats: the batch must request all states so a just-closed issue is still reported, and it must be **chunked**, because the request is a query string and a long enough one meets a URI-length limit imposed by the front-end web server rather than by GitLab.
 
 ## Pagination
@@ -189,6 +187,8 @@ The unstable mergeability state is never emitted, by design rather than omission
 Two of the four fields it does return are **computed for the calling token**, not for the merge request: the same merge request reports one thing to the approver and the opposite to a different token in the same second. Ignore them. Only the identity-independent approval flag and the approver list are usable.
 
 So the decision is folded from the approvals payload plus the per-reviewer review states, in the same spirit as the Gitea fold. Changes-requested is tested first, so a later approval by a second reviewer cannot silently clear an outstanding block.
+
+Enterprise adds `approvals_left` to the same payload, the number of approvals the merge gate still needs. The fold reads it: a value above zero is review-required whether or not a reviewer is assigned. Community omits the field, which decodes as zero, so the fold never reports review-required there, and an assigned reviewer folds to review-requested, which auto-merge still defers on. A negative value is not unmet, and a value that is not an integer fails the read. Enterprise reports the approved flag as true when no rule applies, so approved does not prove a person approved.
 
 The load-bearing arm is the last one: with no reviewer assigned, the decision is **not-required**, which lets auto-merge proceed. That is a deliberate widening of the merge gate, and it is forced: the floor has no approval rules, so it can never *require* an approval, and a merge request with no reviewer is genuinely unreviewed rather than pending. An operator who wants review enforced on the floor must assign a reviewer, because the platform offers no server-side alternative.
 

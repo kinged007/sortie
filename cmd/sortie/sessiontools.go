@@ -55,6 +55,9 @@ type SessionToolParams struct {
 	// MaxTokens is the agent.max_tokens ceiling reported by cost_budget.
 	MaxTokens int
 
+	// MaxCostUSD is the agent.max_cost_usd ceiling reported by cost_budget.
+	MaxCostUSD float64
+
 	// MaxSessions is the agent.max_sessions ceiling reported by
 	// cost_budget.
 	MaxSessions int
@@ -115,7 +118,7 @@ func BuildSessionToolRegistry(ctx context.Context, logger *slog.Logger, params S
 		} else {
 			store = openedStore
 			reg.Register(history.New(buildHistoryQuery(store), params.IssueID))
-			reg.Register(budget.New(buildBudgetQuery(store), params.IssueID, params.DispatchID, params.MaxTokens, params.MaxSessions, params.TokenWarningThreshold))
+			reg.Register(budget.New(buildBudgetQuery(store), params.IssueID, params.DispatchID, params.MaxTokens, params.MaxSessions, params.TokenWarningThreshold, params.MaxCostUSD))
 		}
 	}
 

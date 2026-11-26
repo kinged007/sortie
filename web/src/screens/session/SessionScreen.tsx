@@ -1,9 +1,10 @@
 import { useMemo } from "react";
 import { useParams } from "react-router";
 
-import { useStateQuery } from "@/api/queries";
+import { useIssueQuery, useStateQuery } from "@/api/queries";
 import { useHold, useLive, useNow } from "@/app/live";
 import { useRunEvents } from "@/app/run-events";
+import { AgentStatement } from "@/components/AgentStatement";
 import { TriangleAlertIcon } from "@/components/icons";
 import { Panel } from "@/components/Panel";
 import { ServedText } from "@/components/ServedText";
@@ -11,87 +12,69 @@ import { StallNotice } from "@/components/StallNotice";
 import { useSessionRun } from "@/components/use-session-run";
 import { routeText } from "@/lib/active-rows";
 import { fmtClock, fmtDuration, parseInstant, plural } from "@/lib/format";
+import { latestSessionOf } from "@/lib/issue-link";
 import { agentLabel, modelLabel, startLabel } from "@/lib/labels";
 import { runRouteText } from "@/lib/lane";
-import { runStatus } from "@/lib/run-status";
+import { agentStatement, runOutcome } from "@/lib/run-status";
 
 import { EventPane } from "./EventPane";
-import { SessionPanel, UsagePanel } from "./SessionPanels";
+import { ModelCostPanel, SessionPanel, SkillsPanel, UsagePanel } from "./SessionPanels";
 import { SessionsPanel } from "./SessionsPanel";
 import { timelineOf, turnBarsOf } from "./timeline";
 import { TokensChart, TokensLegend } from "./TokensChart";
 
-import type { ConfigResponse } from "@/api/types.gen";
-import type { RunItem, RunLog } from "@/stream/core";
+import type { ConfigResponse, IssueDetailResponse, RunResponse } from "@/api/types.gen";
+import type { RunLog } from "@/stream/core";
 import type { ResolvedSession } from "./SessionPanels";
 
-const SAYING_EVENTS: ReadonlySet<string> = new Set([
-  "notification",
-  "other_message",
-  "turn_completed",
-  "turn_failed",
-  "turn_cancelled",
-  "turn_ended_with_error",
-  "turn_input_required",
-]);
-
-/** The newest message an event of the run carries, which often says why the agent stopped. */
-function lastMessageOf(items: readonly RunItem[]): string | null {
-  for (const item of [...items].reverse()) {
-    if (
-      item.kind === "event" &&
-      SAYING_EVENTS.has(item.event.event) &&
-      item.event.message.trim() !== ""
-    ) {
-      return item.event.message;
-    }
-  }
-  return null;
-}
-
 interface EndNoticeProps {
-  status: string;
-  error: string;
-  lastMessage: string | null;
+  run: RunResponse;
+  /** The issue's served sentence on what happens next, given only for the issue's newest session. */
+  nextStep: string | null;
 }
 
-function LastMessage({ message }: { message: string | null }) {
-  if (message === null) {
+function EndNotice({ run, nextStep }: EndNoticeProps) {
+  const statement = agentStatement(run);
+  const hasError = !!run.error;
+  if (!hasError && statement === null && nextStep === null) {
     return undefined;
   }
-  return (
-    <span className="mt-xs block text-ink-body">
-      <span className="text-ink-muted">Last message from the agent: </span>
-      <ServedText text={message} />
-    </span>
+  const isAlarmed = runOutcome(run).mark === "failed";
+  const content = (
+    <div className="flex min-w-0 flex-col gap-xs">
+      {hasError ? <span>{run.error}</span> : undefined}
+      {statement === null ? undefined : <AgentStatement text={statement} />}
+      {nextStep === null ? undefined : (
+        <span>
+          <ServedText text={nextStep} />
+        </span>
+      )}
+    </div>
   );
-}
-
-/** Renders why a finished session ended under the page head, alarmed only when the run failed. */
-function EndNotice({ status, error, lastMessage }: EndNoticeProps) {
-  const { word, mark } = runStatus(status);
-  if (mark === "failed") {
+  if (isAlarmed) {
     return (
       <div
         role="status"
-        className="mb-lg flex items-start gap-sm rounded-xl bg-error-container p-md text-body-md text-ink"
+        className="mb-lg flex items-start gap-sm rounded-xl bg-error-container p-md text-body-md text-ink wrap-anywhere"
       >
         <TriangleAlertIcon className="mt-xxs shrink-0 text-error" />
-        <p className="min-w-0 wrap-anywhere">
-          <strong className="font-bold text-error">{word}</strong>
-          {` ${error}`}
-          <LastMessage message={lastMessage} />
-        </p>
+        {content}
       </div>
     );
   }
   return (
-    <p className="mb-lg rounded-xl border border-solid border-line-strong bg-surface px-md py-sm text-body-md text-ink-body wrap-anywhere">
-      <strong className="font-bold text-ink">{word}</strong>
-      {` ${error}`}
-      <LastMessage message={lastMessage} />
-    </p>
+    <div className="mb-lg rounded-xl border border-solid border-line-strong bg-surface px-md py-sm text-body-md text-ink-body wrap-anywhere">
+      {content}
+    </div>
   );
+}
+
+function nextStepOf(detail: IssueDetailResponse | undefined, dispatchId: string): string | null {
+  if (detail === undefined || detail.status_text_full === "") {
+    return null;
+  }
+  const latest = latestSessionOf(detail);
+  return latest?.dispatchId === dispatchId ? detail.status_text_full : null;
 }
 
 interface KickerProps {
@@ -122,7 +105,10 @@ function Fact({ mono = false, children }: FactProps) {
 function statusText(session: ResolvedSession, config: ConfigResponse | undefined): string {
   if (session.kind === "finished") {
     const { run } = session;
-    return `${runStatus(run.status).word}, ${plural(run.turns_completed, "turn", "turns")}`;
+    const { word } = runOutcome(run);
+    return run.turns_completed < 1
+      ? word
+      : `${word}, ${plural(run.turns_completed, "turn", "turns")}`;
   }
   const turns = session.running.turn_count;
   if (turns < 1) {
@@ -174,6 +160,7 @@ interface SessionBodyProps {
 
 function SessionBody({ identifier, dispatchId, session, log, config }: SessionBodyProps) {
   const { paused } = useLive();
+  const { data: detail } = useIssueQuery(identifier);
   const held = useHold(log, paused);
   const timeline = useMemo(() => timelineOf(held.items), [held.items]);
   const isLive = session.kind === "live";
@@ -182,6 +169,8 @@ function SessionBody({ identifier, dispatchId, session, log, config }: SessionBo
   const isChartShown = bars.filter((bar) => !bar.inProgress).length >= 2;
   const stallFull = isLive ? session.running.stall_text_full : null;
   const stallOff = isLive ? session.running.stall_off_text : null;
+  const modelUsage = session.kind === "finished" ? (session.run.model_usage ?? []) : [];
+  const skills = (session.kind === "live" ? session.running.skills : session.run.skills) ?? [];
 
   return (
     <>
@@ -194,12 +183,8 @@ function SessionBody({ identifier, dispatchId, session, log, config }: SessionBo
       {stallFull === null && stallOff !== null ? (
         <StallNotice text={stallOff} isStalled={false} />
       ) : undefined}
-      {session.kind === "finished" && session.run.error ? (
-        <EndNotice
-          status={session.run.status}
-          error={session.run.error}
-          lastMessage={lastMessageOf(held.items)}
-        />
+      {session.kind === "finished" ? (
+        <EndNotice run={session.run} nextStep={nextStepOf(detail, dispatchId)} />
       ) : undefined}
       <div className="flex flex-col gap-xl xl:grid xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start xl:gap-xxxl">
         <div className="flex min-w-0 flex-col gap-xl">
@@ -208,7 +193,10 @@ function SessionBody({ identifier, dispatchId, session, log, config }: SessionBo
               timeline={timeline}
               end={
                 session.kind === "finished"
-                  ? { at: session.run.completed_at, status: session.run.status }
+                  ? {
+                      status: session.run.status,
+                      declared_outcome: session.run.declared_outcome,
+                    }
                   : null
               }
               isNotRetained={held.notRetained}
@@ -224,6 +212,8 @@ function SessionBody({ identifier, dispatchId, session, log, config }: SessionBo
         </div>
         <div className="flex min-w-0 flex-col gap-xl">
           <UsagePanel session={session} />
+          {modelUsage.length > 0 ? <ModelCostPanel parts={modelUsage} /> : undefined}
+          {skills.length > 0 ? <SkillsPanel skills={skills} /> : undefined}
           <SessionPanel session={session} config={config} />
           <SessionsPanel identifier={identifier} dispatchId={dispatchId} />
         </div>
@@ -270,11 +260,6 @@ function SessionView({ identifier, dispatchId }: SessionViewProps) {
   );
 }
 
-/**
- * Renders the session view of one agent run at
- * `/issues/{identifier}/sessions/{dispatchId}`: the header facts, the retained
- * then live events, tokens per turn, and the usage and session panels.
- */
 export function SessionScreen() {
   const { identifier, dispatchId } = useParams();
   return identifier === undefined || dispatchId === undefined ? undefined : (

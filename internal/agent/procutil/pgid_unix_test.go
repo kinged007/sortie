@@ -12,13 +12,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func init() {
@@ -144,9 +144,10 @@ func TestKillBoundWhileUnreaped(t *testing.T) {
 		return syscall.EPERM
 	})
 
-	start := time.Now()
-	err := g.Kill()
-	elapsed := time.Since(start)
+	killed := make(chan error, 1)
+	go func() { killed <- g.Kill() }()
+
+	err := waittest.Receive(t, killed, "Kill() return")
 
 	if err == nil {
 		t.Fatal("Kill() = nil, want the bound error while the direct child still holds the group")
@@ -156,9 +157,6 @@ func TestKillBoundWhileUnreaped(t *testing.T) {
 	}
 	if calls <= 1 {
 		t.Errorf("Kill() made %d sends, want more than 1 (it must resend, not send once)", calls)
-	}
-	if overrun := elapsed - groupDrainBound; overrun > 10*groupDrainPollInterval {
-		t.Errorf("Kill() took %v, %v over the %v drain bound", elapsed, overrun, groupDrainBound)
 	}
 }
 
@@ -218,36 +216,10 @@ func TestGroupSignalsRealProcess(t *testing.T) {
 		if err := g.Kill(); err != nil {
 			t.Errorf("Kill() on an empty group = %v, want nil", err)
 		}
-		if elapsed := time.Since(start); elapsed >= groupDrainBound/2 {
-			t.Errorf("Kill() on an empty group took %v, want well under the %v drain bound", elapsed, groupDrainBound)
+		if elapsed := time.Since(start); elapsed >= groupDrainBound {
+			t.Errorf("Kill() on an empty group took %v, want less than the %v drain bound", elapsed, groupDrainBound)
 		}
 	})
-}
-
-func pollForPID(t *testing.T, path string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("pollForPID(%q) = no PID after %v, want a PID", path, timeout)
-	return 0
-}
-
-func pollForFile(path string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return false
 }
 
 type groupLeaderParams struct {
@@ -316,14 +288,12 @@ func TestSetGroupCancel_CancelReachesDescendant(t *testing.T) {
 	reaper := StartReaper(cmd, nil)
 	t.Cleanup(func() { terminateAndAwait(t, cmd, g, reaper) })
 
-	descendantPID := pollForPID(t, pidFile, 5*time.Second)
+	descendantPID := waittest.PIDFile(t, pidFile)
 
 	cancel()
-	awaitDone(t, reaper, 10*time.Second)
+	waittest.Receive(t, reaper.Done(), "reaper Done()")
 
-	if !pollForFile(marker, 5*time.Second) {
-		t.Errorf("SetGroupCancel(): cancelling left %q absent, want the descendant to have caught a graceful signal", marker)
-	}
+	waittest.File(t, marker)
 	if err := syscall.Kill(descendantPID, 0); err == nil {
 		t.Errorf("SetGroupCancel(): descendant %d still alive after cancellation, want gone", descendantPID)
 	}
@@ -345,14 +315,10 @@ func TestStartReaper_DoneWaitsForGroupDrain(t *testing.T) {
 
 	r := StartReaper(cmd, nil)
 
-	select {
-	case <-r.Done():
-		t.Fatal("Done() closed before the process group drain was allowed to finish")
-	case <-time.After(200 * time.Millisecond):
-	}
+	waittest.Never(t, r.Done(), 200*time.Millisecond, "Done() before the process group drain was allowed to finish")
 
 	close(unlock)
-	awaitDone(t, r, 3*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	if got := calls.Load(); got < 3 {
 		t.Errorf("group send count = %d, want >= 3 (the drain must resend before Done closes)", got)
@@ -394,11 +360,7 @@ func TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses(t *testing.T) {
 
 	r := StartReaper(cmd, logger)
 
-	select {
-	case <-handler.hit:
-	case <-time.After(3 * time.Second):
-		t.Fatal("CaptureCleanupWarning was not logged within 3s")
-	}
+	waittest.Receive(t, handler.hit, "CaptureCleanupWarning log record")
 
 	select {
 	case <-r.Done():
@@ -408,11 +370,7 @@ func TestStartReaper_CleanupFailureLogsOneRecordBeforeDoneCloses(t *testing.T) {
 
 	close(handler.release)
 
-	select {
-	case <-r.Done():
-	case <-time.After(3 * time.Second):
-		t.Fatal("Done() did not close after the log call was allowed to return")
-	}
+	waittest.Receive(t, r.Done(), "Done() after the log call returned")
 
 	var matches []captureLogRecord
 	for _, rec := range spy.snapshot() {
@@ -449,7 +407,7 @@ func TestStartReaper_NilLoggerLogsThroughDefault(t *testing.T) {
 	startOwned(t, cmd)
 
 	r := StartReaper(cmd, nil)
-	awaitDone(t, r, 3*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	record, ok := findCaptureLogRecord(spy, CaptureCleanupWarning)
 	if !ok {

@@ -20,12 +20,14 @@ const recentEventsLimit = 50
 // runEventResponse is one served event: its position, its time and type, the
 // members its type carries, and its sentence.
 type runEventResponse struct {
-	event orchestrator.RunEvent
-	text  string
+	event    orchestrator.RunEvent
+	text     string
+	toolLine string
 }
 
-// MarshalJSON writes seq, at, event, the members of the event's payload, and
-// text. The payload encoder alone decides which members an event carries.
+// MarshalJSON writes seq, at, event, the members of the event's payload, text,
+// and tool_line when the event has one. The payload encoder alone decides
+// which members an event carries.
 func (r runEventResponse) MarshalJSON() ([]byte, error) {
 	head, err := json.Marshal(struct {
 		Seq   int64     `json:"seq"`
@@ -47,6 +49,14 @@ func (r runEventResponse) MarshalJSON() ([]byte, error) {
 	out.Write(payload[1 : len(payload)-1])
 	out.WriteString(`,"text":`)
 	out.Write(text)
+	if r.toolLine != "" {
+		toolLine, err := json.Marshal(r.toolLine)
+		if err != nil {
+			return nil, err
+		}
+		out.WriteString(`,"tool_line":`)
+		out.Write(toolLine)
+	}
 	out.WriteByte('}')
 	return out.Bytes(), nil
 }
@@ -58,14 +68,16 @@ type runEventsResponse struct {
 	Events     []runEventResponse `json:"events"`
 }
 
-// servedEvents builds the served form of events: each message masked again,
-// since a secret may have been registered after the event was retained, and
-// each event worded. It never returns nil.
+// servedEvents builds the served form of events: each message and tool text
+// masked again, since a secret may have been registered after the event was
+// retained, and each event worded. It never returns nil.
 func servedEvents(events []orchestrator.RunEvent) []runEventResponse {
 	served := make([]runEventResponse, len(events))
 	for i, event := range events {
 		event.Message = redact.Mask(event.Message)
-		served[i] = runEventResponse{event: event, text: sentence.Event(event)}
+		event.ToolName = redact.Mask(event.ToolName)
+		event.ToolArgument = redact.Mask(event.ToolArgument)
+		served[i] = runEventResponse{event: event, text: sentence.Event(event), toolLine: sentence.ToolLine(event)}
 	}
 	return served
 }

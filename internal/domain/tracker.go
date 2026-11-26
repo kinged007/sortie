@@ -21,6 +21,13 @@ type TrackerStates struct {
 	InProgress string
 }
 
+// IssueStateAndLabels is an issue's tracker state and labels as one by-ID
+// read reports them.
+type IssueStateAndLabels struct {
+	State  string   // as FetchIssueStatesByIDs reports it; empty: no configured state
+	Labels []string // every label, normalized as Issue.Labels; empty: none
+}
+
 // TrackerAdapter defines the contract that all issue tracker
 // integrations must satisfy.
 //
@@ -44,7 +51,7 @@ type TrackerAdapter interface {
 	FetchCandidateIssues(ctx context.Context) ([]Issue, error)
 
 	// FetchIssueByID returns a single fully-populated issue including
-	// comments.
+	// comments, oldest first.
 	//
 	// Used for pre-dispatch revalidation and prompt rendering. Returns
 	// a [*TrackerError] with Kind [ErrTrackerNotFound] if the issue
@@ -65,8 +72,20 @@ type TrackerAdapter interface {
 	// The returned map is keyed by issue ID with the value being the
 	// current state name. Issues not found in the tracker are omitted
 	// from the map (not an error). An empty state means the issue reads no
-	// configured state. Used for active-run reconciliation.
+	// configured state.
 	FetchIssueStatesByIDs(ctx context.Context, issueIDs []string) (map[string]string, error)
+
+	// FetchIssueStatesAndLabelsByIDs returns the current state and labels of
+	// each requested issue ID, keyed by issue ID.
+	//
+	// An issue is omitted exactly when FetchIssueStatesByIDs omits it. A
+	// returned entry carries the issue's complete label set; an adapter that
+	// cannot read every label of an issue it would return fails the call. The
+	// query filter is not applied. It sends no request FetchIssueStatesByIDs
+	// would not send for the same IDs, except for further pages of an issue's
+	// labels. An empty issueIDs returns an empty map and sends no request; on
+	// error the map is nil.
+	FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]IssueStateAndLabels, error)
 
 	// FetchIssueStatesByIdentifiers returns the current state for each
 	// requested issue identifier (human-readable key, e.g. "PROJ-123").
@@ -77,10 +96,12 @@ type TrackerAdapter interface {
 	// cleanup.
 	FetchIssueStatesByIdentifiers(ctx context.Context, identifiers []string) (map[string]string, error)
 
-	// FetchIssueComments returns comments for the specified issue.
+	// FetchIssueComments returns comments for the specified issue, oldest
+	// first.
 	//
-	// Used for continuation runs and the agent workpad pattern.
-	// Returns an empty non-nil slice when no comments exist.
+	// Used for continuation runs, the first run after a person releases a
+	// park, and the agent workpad pattern. Returns an empty non-nil slice
+	// when no comments exist.
 	// Returns a [*TrackerError] with Kind [ErrTrackerNotFound]
 	// if the issue does not exist.
 	FetchIssueComments(ctx context.Context, issueID string) ([]Comment, error)
@@ -123,13 +144,6 @@ type TrackerAdapter interface {
 	//
 	// All errors are non-fatal; the orchestrator logs WARN and continues.
 	CommentIssue(ctx context.Context, issueID string, text string) error
-
-	// CommentIssueWithLiteral posts text followed by literal rendered as the
-	// tracker's literal block, so the tracker shows literal verbatim and acts
-	// on nothing in it. literal is non-empty valid UTF-8 holding no C0
-	// control character other than tab and line feed, and no DEL. Errors and
-	// cancellation behave as [TrackerAdapter.CommentIssue] documents.
-	CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error
 
 	// AddLabel adds a label to the specified issue and removes no other
 	// label. A tracker that models a label group as single-select may

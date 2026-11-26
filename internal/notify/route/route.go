@@ -1,11 +1,11 @@
 // Package route selects the destinations of an outbound event and
 // delivers it to them. A [Router] turns the notifications configuration
 // and the deprecated tracker comment settings into one subscription
-// table, owns the Slack and webhook destinations the main process
-// builds, and wraps the tracker adapter as the built-in tracker_comment
-// destination.
+// table, owns the notifier destinations the main process builds, and
+// wraps the tracker adapter as the built-in tracker_comment destination,
+// which posts the public rendering of an event.
 //
-// The package registers no notifier kind and imports no notifier
+// The package registers no notifier kind and imports no notifier kind
 // package: the caller supplies a [NotifierLookup], so the orchestrator
 // can publish events without resolving a kind itself. Start with
 // [NewRouter], then call [Router.Update] on every configuration

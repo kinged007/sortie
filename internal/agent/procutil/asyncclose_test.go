@@ -4,7 +4,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
-	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // blockingCloser is an io.Closer whose Close blocks until the test
@@ -38,11 +39,7 @@ func TestCloseWithoutWaiting_ReturnsAtOnceForABlockingCloser(t *testing.T) {
 		close(returned)
 	}()
 
-	select {
-	case <-returned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("CloseWithoutWaiting() did not return within 2s against a closer whose Close blocks forever")
-	}
+	waittest.Receive(t, returned, "CloseWithoutWaiting() return against a closer whose Close blocks forever")
 
 	select {
 	case <-closer.closed:
@@ -51,11 +48,7 @@ func TestCloseWithoutWaiting_ReturnsAtOnceForABlockingCloser(t *testing.T) {
 	}
 
 	close(closer.release)
-	select {
-	case <-closer.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("closer.Close() did not complete after being released")
-	}
+	waittest.Receive(t, closer.closed, "closer.Close() completion after release")
 }
 
 // countingCloser records how many times Close was called and returns
@@ -80,22 +73,14 @@ func TestCloseWithoutWaiting_StillClosesAnOrdinaryCloser(t *testing.T) {
 	wantErr := errors.New("close failed")
 	closer := &countingCloser{err: wantErr}
 
-	done := make(chan struct{})
-	go func() {
-		CloseWithoutWaiting(closer)
-		close(done)
-	}()
+	go CloseWithoutWaiting(closer)
 
-	// CloseWithoutWaiting runs Close on its own goroutine, so its own
-	// return gives no synchronization with that goroutine's Close call;
-	// poll for the call to land instead of asserting on a single sample.
-	deadline := time.Now().Add(2 * time.Second)
-	for closer.calls.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("closer.Close() was never called within 2s")
+	waittest.Until(t, func() error {
+		if closer.calls.Load() == 0 {
+			return errors.New("closer.Close() was never called")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return nil
+	})
 
 	if got := closer.calls.Load(); got != 1 {
 		t.Errorf("closer.Close() was called %d times, want 1", got)
@@ -113,9 +98,5 @@ func TestCloseWithoutWaiting_NilDoesNothing(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("CloseWithoutWaiting(nil) did not return within 2s")
-	}
+	waittest.Receive(t, done, "CloseWithoutWaiting(nil) return")
 }

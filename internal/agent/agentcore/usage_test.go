@@ -31,55 +31,12 @@ func TestRunUsage_SetTurnProvisional_ReplacesInFlightContribution(t *testing.T) 
 	}
 }
 
-func TestRunUsage_AddTurn_AddsToSettledAndClearsProvisional(t *testing.T) {
-	t.Parallel()
-
-	u := NewRunUsage()
-	u.SetTurnProvisional(domain.TokenUsage{InputTokens: 100, OutputTokens: 50})
-	got := u.AddTurn(domain.TokenUsage{InputTokens: 100, OutputTokens: 50})
-
-	if got.InputTokens != 100 || got.OutputTokens != 50 {
-		t.Errorf("got %+v, want settled (100, 50)", got)
-	}
-
-	// Provisional is cleared: the next snapshot reflects only settled.
-	next := u.SetTurnProvisional(domain.TokenUsage{})
-	if next.InputTokens != 100 || next.OutputTokens != 50 {
-		t.Errorf("after AddTurn, provisional not cleared: got %+v", next)
-	}
-}
-
-func TestRunUsage_ClampsNegativeComponents(t *testing.T) {
-	t.Parallel()
-
-	u := NewRunUsage()
-	got := u.SetRunCumulative(domain.TokenUsage{InputTokens: -5, OutputTokens: -10, CacheReadTokens: -3})
-
-	if got.InputTokens != 0 || got.OutputTokens != 0 || got.CacheReadTokens != 0 {
-		t.Errorf("got %+v, want all zero (clamped)", got)
-	}
-}
-
-func TestRunUsage_TotalAlwaysInputPlusOutput(t *testing.T) {
-	t.Parallel()
-
-	u := NewRunUsage()
-	got := u.AddTurn(domain.TokenUsage{InputTokens: 30, OutputTokens: 12, TotalTokens: 999})
-
-	if got.TotalTokens != got.InputTokens+got.OutputTokens {
-		t.Errorf("TotalTokens = %d, want InputTokens+OutputTokens = %d",
-			got.TotalTokens, got.InputTokens+got.OutputTokens)
-	}
-}
-
 func TestRunUsage_NeverLowersASnapshot(t *testing.T) {
 	t.Parallel()
 
 	u := NewRunUsage()
-	u.AddTurn(domain.TokenUsage{InputTokens: 100, OutputTokens: 50})
+	u.SetRunCumulative(domain.TokenUsage{InputTokens: 100, OutputTokens: 50}, nil)
 
-	// A later provisional estimate smaller than the settled high-water
-	// mark must not lower the reported snapshot.
 	got := u.SetTurnProvisional(domain.TokenUsage{InputTokens: 1, OutputTokens: 1})
 
 	if got.InputTokens < 100 || got.OutputTokens < 50 {
@@ -100,8 +57,7 @@ func TestRunUsage_ClampsNegativeComponents_AllMethods(t *testing.T) {
 		call func(u *RunUsage) domain.TokenUsage
 	}{
 		{"SetTurnProvisional", func(u *RunUsage) domain.TokenUsage { return u.SetTurnProvisional(negative) }},
-		{"AddTurn", func(u *RunUsage) domain.TokenUsage { return u.AddTurn(negative) }},
-		{"SetRunCumulative", func(u *RunUsage) domain.TokenUsage { return u.SetRunCumulative(negative) }},
+		{"SetRunCumulative", func(u *RunUsage) domain.TokenUsage { return u.SetRunCumulative(negative, nil) }},
 	}
 
 	for _, tt := range tests {
@@ -122,18 +78,14 @@ func TestRunUsage_ClampsNegativeComponents_AllMethods(t *testing.T) {
 func TestRunUsage_TotalAlwaysInputPlusOutput_AllMethods(t *testing.T) {
 	t.Parallel()
 
-	// TotalTokens is deliberately set to a bogus value on the input to
-	// prove every method recomputes it rather than trusting a
-	// caller-supplied total.
-	in := domain.TokenUsage{InputTokens: 30, OutputTokens: 12, TotalTokens: 999}
+	bogusTotal := domain.TokenUsage{InputTokens: 30, OutputTokens: 12, TotalTokens: 999}
 
 	tests := []struct {
 		name string
 		call func(u *RunUsage) domain.TokenUsage
 	}{
-		{"SetTurnProvisional", func(u *RunUsage) domain.TokenUsage { return u.SetTurnProvisional(in) }},
-		{"AddTurn", func(u *RunUsage) domain.TokenUsage { return u.AddTurn(in) }},
-		{"SetRunCumulative", func(u *RunUsage) domain.TokenUsage { return u.SetRunCumulative(in) }},
+		{"SetTurnProvisional", func(u *RunUsage) domain.TokenUsage { return u.SetTurnProvisional(bogusTotal) }},
+		{"SetRunCumulative", func(u *RunUsage) domain.TokenUsage { return u.SetRunCumulative(bogusTotal, nil) }},
 	}
 
 	for _, tt := range tests {
@@ -142,17 +94,12 @@ func TestRunUsage_TotalAlwaysInputPlusOutput_AllMethods(t *testing.T) {
 			got := tt.call(NewRunUsage())
 			if got.TotalTokens != got.InputTokens+got.OutputTokens {
 				t.Errorf("%s(%+v).TotalTokens = %d, want InputTokens+OutputTokens = %d",
-					tt.name, in, got.TotalTokens, got.InputTokens+got.OutputTokens)
+					tt.name, bogusTotal, got.TotalTokens, got.InputTokens+got.OutputTokens)
 			}
 		})
 	}
 }
 
-// TestRunUsage_SetTurnProvisional_DoesNotAccumulate verifies that three
-// successive SetTurnProvisional calls each replace the in-flight
-// contribution rather than summing it: the third call's snapshot must
-// equal its own argument (settled is still zero), not the sum of all
-// three arguments.
 func TestRunUsage_SetTurnProvisional_DoesNotAccumulate(t *testing.T) {
 	t.Parallel()
 
@@ -167,74 +114,25 @@ func TestRunUsage_SetTurnProvisional_DoesNotAccumulate(t *testing.T) {
 	}
 }
 
-// TestRunUsage_AddTurn_AccumulatesAcrossMultipleTurns verifies that
-// AddTurn adds each argument to the running settled total rather than
-// replacing it.
-func TestRunUsage_AddTurn_AccumulatesAcrossMultipleTurns(t *testing.T) {
-	t.Parallel()
-
-	u := NewRunUsage()
-	u.AddTurn(domain.TokenUsage{InputTokens: 100, OutputTokens: 50})
-	u.AddTurn(domain.TokenUsage{InputTokens: 30, OutputTokens: 10})
-	got := u.AddTurn(domain.TokenUsage{InputTokens: 5, OutputTokens: 2})
-
-	want := domain.TokenUsage{InputTokens: 135, OutputTokens: 62, TotalTokens: 197}
-	if got != want {
-		t.Errorf("AddTurn() after three calls = %+v, want %+v (settled total)", got, want)
-	}
-}
-
-// TestRunUsage_SetRunCumulative_ReplacesSettledAndClearsProvisional
-// verifies both halves of SetRunCumulative's contract: it replaces the
-// settled total outright (an earlier AddTurn contribution does not
-// survive), and it clears any in-flight provisional contribution (a
-// subsequent SetTurnProvisional(zero) reports only the replaced total).
 func TestRunUsage_SetRunCumulative_ReplacesSettledAndClearsProvisional(t *testing.T) {
 	t.Parallel()
 
 	u := NewRunUsage()
+	u.SetRunCumulative(domain.TokenUsage{InputTokens: 150, OutputTokens: 60}, nil)
 	u.SetTurnProvisional(domain.TokenUsage{InputTokens: 9, OutputTokens: 9})
 
-	got := u.SetRunCumulative(domain.TokenUsage{InputTokens: 200, OutputTokens: 80, CacheReadTokens: 5})
+	got := u.SetRunCumulative(domain.TokenUsage{InputTokens: 200, OutputTokens: 80, CacheReadTokens: 5}, nil)
 	want := domain.TokenUsage{InputTokens: 200, OutputTokens: 80, CacheReadTokens: 5, TotalTokens: 280}
 	if got != want {
 		t.Errorf("SetRunCumulative() = %+v, want %+v (replaces settled outright)", got, want)
 	}
 
-	// The stale provisional contribution from before SetRunCumulative must
-	// not resurface: a zero provisional now reports exactly the replaced
-	// total.
 	next := u.SetTurnProvisional(domain.TokenUsage{})
 	if next != want {
 		t.Errorf("after SetRunCumulative, SetTurnProvisional(zero) = %+v, want %+v (provisional cleared)", next, want)
 	}
 }
 
-// TestRunUsage_AddTurn_ClearsProvisional mirrors the
-// SetRunCumulative case for AddTurn: a provisional contribution set
-// before AddTurn must not survive it.
-func TestRunUsage_AddTurn_ClearsProvisional(t *testing.T) {
-	t.Parallel()
-
-	u := NewRunUsage()
-	u.SetTurnProvisional(domain.TokenUsage{InputTokens: 40, OutputTokens: 40})
-	got := u.AddTurn(domain.TokenUsage{InputTokens: 100, OutputTokens: 50})
-
-	want := domain.TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150}
-	if got != want {
-		t.Errorf("AddTurn() after provisional set = %+v, want %+v (provisional discarded, not added)", got, want)
-	}
-}
-
-// TestRunUsage_MonotonicSnapshot_AcrossMixedCallSequence drives every
-// method in a sequence engineered to produce a componentwise-lower raw
-// value at several points, checking after each call that the returned
-// snapshot equals Snapshot() at that instant and is componentwise
-// greater than or equal to the immediately preceding snapshot. The
-// final snapshot must equal the componentwise maximum observed across
-// the whole sequence: both components peak when SetTurnProvisional(300,
-// 5) is added to the settled total left by the prior SetRunCumulative
-// (50, 200), reporting (350, 205).
 func TestRunUsage_MonotonicSnapshot_AcrossMixedCallSequence(t *testing.T) {
 	t.Parallel()
 
@@ -252,11 +150,11 @@ func TestRunUsage_MonotonicSnapshot_AcrossMixedCallSequence(t *testing.T) {
 		prev = got
 	}
 
-	checkStep(t, "AddTurn(100,50)", u.AddTurn(domain.TokenUsage{InputTokens: 100, OutputTokens: 50}))
+	checkStep(t, "SetRunCumulative(100,50)", u.SetRunCumulative(domain.TokenUsage{InputTokens: 100, OutputTokens: 50}, nil))
 	checkStep(t, "SetTurnProvisional(1,1) lower", u.SetTurnProvisional(domain.TokenUsage{InputTokens: 1, OutputTokens: 1}))
-	checkStep(t, "SetRunCumulative(50,200) mixed", u.SetRunCumulative(domain.TokenUsage{InputTokens: 50, OutputTokens: 200}))
+	checkStep(t, "SetRunCumulative(50,200) mixed", u.SetRunCumulative(domain.TokenUsage{InputTokens: 50, OutputTokens: 200}, nil))
 	checkStep(t, "SetTurnProvisional(300,5) mixed", u.SetTurnProvisional(domain.TokenUsage{InputTokens: 300, OutputTokens: 5}))
-	checkStep(t, "AddTurn(0,0) no-op delta", u.AddTurn(domain.TokenUsage{}))
+	checkStep(t, "SetRunCumulative(0,0) lower", u.SetRunCumulative(domain.TokenUsage{}, nil))
 
 	want := domain.TokenUsage{InputTokens: 350, OutputTokens: 205}
 	want.TotalTokens = want.InputTokens + want.OutputTokens

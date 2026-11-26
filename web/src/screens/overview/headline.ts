@@ -3,13 +3,12 @@ import { fmtClock, pluralVerb } from "@/lib/format";
 
 import type { StateResponse } from "@/api/types.gen";
 
-/** A run of headline text; `strong` is a bold count, `attention` and `critical` color a lead phrase. */
+/** A run of headline text; `strong` is a bold count, `critical` colors a lead phrase. */
 export interface Segment {
   text: string;
-  emphasis?: "strong" | "attention" | "critical";
+  emphasis?: "strong" | "critical";
 }
 
-/** The page's heading and the lede sentence under it. */
 export interface Headline {
   heading: Segment[];
   lede: Segment[];
@@ -29,7 +28,6 @@ function kindWord(configKey: string): string {
   return KIND_WORDS.get(configKey) ?? configKey.replaceAll("_", " ");
 }
 
-/** Joins words with commas and a last "or" or "and". */
 function joinWords(words: readonly string[], conjunction: "and" | "or"): string {
   const last = words.at(-1);
   if (last === undefined || words.length === 1) {
@@ -113,21 +111,11 @@ function lede(clauses: Segment[][], lead: string): Segment[] {
 
 function firstRunLede(state: StateResponse): string {
   const { subject } = pluralVerb(state.counts.running, ["issue", "issues"], ["is", "are"]);
-  const parts = [
-    state.started_at === null ? undefined : `Started at ${fmtClock(state.started_at)}`,
-    `${subject} picked up`,
-    "no finished runs yet",
-  ].filter((part) => part !== undefined);
-  return `${parts.join(" · ")}.`;
+  const started = state.started_at === null ? "" : `Started at ${fmtClock(state.started_at)}. `;
+  return `${started}${subject} picked up, with no finished runs yet.`;
 }
 
-/**
- * Words the Overview heading and its lede from the served state.
- *
- * A first run, with no run on record, reads as picking up only while an agent
- * runs and nothing needs attention; a failing health check or a critical item
- * reads as degraded.
- */
+/** A first run, with no run on record, reads as picking up only while an agent runs and nothing needs attention or waits on a person; a failing health check or a critical item reads as degraded. */
 export function buildHeadline(state: StateResponse, isFirstRun: boolean): Headline {
   const items = (state.attention ?? []).filter((item) => item.acknowledged_at === null);
   const acknowledged = (state.attention ?? []).length - items.length;
@@ -136,7 +124,13 @@ export function buildHeadline(state: StateResponse, isFirstRun: boolean): Headli
   const isDegraded = condition(state) === "degraded" || critical > 0;
   const others = items.length - critical;
 
-  if (isFirstRun && state.counts.running > 0 && items.length === 0 && !isDegraded) {
+  if (
+    isFirstRun &&
+    state.counts.running > 0 &&
+    items.length === 0 &&
+    acknowledged === 0 &&
+    !isDegraded
+  ) {
     return {
       heading: [{ text: "Sortie is picking up its first issues." }],
       lede: [{ text: firstRunLede(state) }],
@@ -149,11 +143,7 @@ export function buildHeadline(state: StateResponse, isFirstRun: boolean): Headli
       heading: [
         { text: "Sortie is degraded", emphasis: "critical" },
         ...(others > 0
-          ? [
-              { text: ", and " },
-              { text: more.count, emphasis: "attention" as const },
-              { text: ` more ${more.noun} ${more.verb} attention.` },
-            ]
+          ? [{ text: `, and ${more.count} more ${more.noun} ${more.verb} attention.` }]
           : [{ text: ", and nothing else needs attention." }]),
       ],
       lede: lede(clauses, "Everything else is handled: "),
@@ -162,11 +152,19 @@ export function buildHeadline(state: StateResponse, isFirstRun: boolean): Headli
   if (items.length > 0) {
     const needs = pluralVerb(items.length, ["item", "items"], ["needs", "need"]);
     return {
-      heading: [
-        { text: needs.count, emphasis: "attention" },
-        { text: ` ${needs.noun} ${needs.verb} attention.` },
-      ],
+      heading: [{ text: `${needs.count} ${needs.noun} ${needs.verb} attention.` }],
       lede: lede(clauses, "Everything else is handled: "),
+    };
+  }
+  if (acknowledged > 0) {
+    const held = pluralVerb(
+      acknowledged,
+      ["acknowledged item", "acknowledged items"],
+      ["waits", "wait"],
+    );
+    return {
+      heading: [{ text: `${held.count} ${held.noun} ${held.verb} on a person.` }],
+      lede: lede(handledClauses(state, 0), ""),
     };
   }
   return { heading: [{ text: "Nothing needs attention." }], lede: lede(clauses, "") };

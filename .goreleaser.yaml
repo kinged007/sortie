@@ -60,6 +60,7 @@ archives:
     files:
       - LICENSE*
       - README*
+      - NOTICE*
 
 checksum:
   name_template: "checksums.txt"

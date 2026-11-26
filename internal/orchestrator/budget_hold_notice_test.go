@@ -3,7 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"strings"
+	"reflect"
 	"testing"
 	"time"
 
@@ -18,190 +18,6 @@ func mustParseRFC3339(t *testing.T, value string) time.Time {
 		t.Fatalf("time.Parse(%q): %v", value, err)
 	}
 	return parsed
-}
-
-func TestBuildBudgetHoldComment(t *testing.T) {
-	t.Parallel()
-
-	recordedAt := mustParseRFC3339(t, "2026-08-25T09:14:03Z")
-	usedTokens := int64(128400)
-	zeroTokens := int64(0)
-	threeUnmeasured := 3
-	zeroUnmeasured := 0
-	zeroStopped := 0
-	oneStopped := 1
-	twoStopped := 2
-
-	tests := []struct {
-		name     string
-		entry    *BudgetExhaustedEntry
-		want     string
-		wantLine string
-	}{
-		{
-			name: "session-only hold",
-			entry: &BudgetExhaustedEntry{
-				Reason:         budgetReasonSession,
-				UsedSessions:   4,
-				BudgetSessions: 3,
-				ExhaustedAt:    recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: session budget (agent.max_sessions)\n" +
-				"Sessions: 4 of 3\n" +
-				"Raising agent.max_sessions raises this ceiling.",
-		},
-		{
-			name: "hold exhausted on both axes places Tokens before Sessions",
-			entry: &BudgetExhaustedEntry{
-				Reason:         budgetReasonToken,
-				UsedSessions:   5,
-				BudgetSessions: 3,
-				UsedTokens:     &usedTokens,
-				BudgetTokens:   100000,
-				ExhaustedAt:    recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: token budget (agent.max_tokens)\n" +
-				"Tokens: 128400 of 100000\n" +
-				"Sessions: 5 of 3\n" +
-				"Raising agent.max_tokens raises this ceiling.",
-		},
-		{
-			name:     "no usage reported prints the Tokens line as not measured",
-			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &threeUnmeasured, BudgetTokens: 500000, ExhaustedAt: recordedAt},
-			wantLine: "Tokens: not measured of 500000",
-		},
-		{
-			name:     "an unaccounted turn on a zero sum prints the Tokens line as not measured",
-			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &zeroUnmeasured, UnaccountedTurns: 1, BudgetTokens: 500000, ExhaustedAt: recordedAt},
-			wantLine: "Tokens: not measured of 500000",
-		},
-		{
-			name:     "measured zero prints the Tokens line as 0",
-			entry:    &BudgetExhaustedEntry{Reason: budgetReasonSession, UsedTokens: &zeroTokens, UnmeasuredSessions: &zeroUnmeasured, BudgetTokens: 500000, ExhaustedAt: recordedAt},
-			wantLine: "Tokens: 0 of 500000",
-		},
-		{
-			name: "reason absent from budgetHoldCeilingWords omits the Ceiling and closing lines",
-			entry: &BudgetExhaustedEntry{
-				Reason:         "some_future_reason",
-				UsedSessions:   4,
-				BudgetSessions: 3,
-				ExhaustedAt:    recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Sessions: 4 of 3",
-		},
-		{
-			name: "one stopped-in-flight session renders the line in singular form",
-			entry: &BudgetExhaustedEntry{
-				Reason:          budgetReasonToken,
-				UsedSessions:    5,
-				BudgetSessions:  3,
-				UsedTokens:      &usedTokens,
-				BudgetTokens:    100000,
-				StoppedInFlight: &oneStopped,
-				ExhaustedAt:     recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: token budget (agent.max_tokens)\n" +
-				"Tokens: 128400 of 100000\n" +
-				"Sessions: 5 of 3\n" +
-				"Stopped in flight: 1 session\n" +
-				"Raising agent.max_tokens raises this ceiling.",
-		},
-		{
-			name: "two stopped-in-flight sessions render the line in plural form",
-			entry: &BudgetExhaustedEntry{
-				Reason:          budgetReasonToken,
-				UsedSessions:    5,
-				BudgetSessions:  3,
-				UsedTokens:      &usedTokens,
-				BudgetTokens:    100000,
-				StoppedInFlight: &twoStopped,
-				ExhaustedAt:     recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: token budget (agent.max_tokens)\n" +
-				"Tokens: 128400 of 100000\n" +
-				"Sessions: 5 of 3\n" +
-				"Stopped in flight: 2 sessions\n" +
-				"Raising agent.max_tokens raises this ceiling.",
-		},
-		{
-			name: "zero stopped-in-flight renders a body byte-identical to the no-stops golden",
-			entry: &BudgetExhaustedEntry{
-				Reason:          budgetReasonToken,
-				UsedSessions:    5,
-				BudgetSessions:  3,
-				UsedTokens:      &usedTokens,
-				BudgetTokens:    100000,
-				StoppedInFlight: &zeroStopped,
-				ExhaustedAt:     recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: token budget (agent.max_tokens)\n" +
-				"Tokens: 128400 of 100000\n" +
-				"Sessions: 5 of 3\n" +
-				"Raising agent.max_tokens raises this ceiling.",
-		},
-		{
-			name: "unset session ceiling omits the Sessions line and nil StoppedInFlight omits the Stopped in flight line",
-			entry: &BudgetExhaustedEntry{
-				Reason:       budgetReasonToken,
-				UsedSessions: 5,
-				UsedTokens:   &usedTokens,
-				BudgetTokens: 100000,
-				ExhaustedAt:  recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: token budget (agent.max_tokens)\n" +
-				"Tokens: 128400 of 100000\n" +
-				"Raising agent.max_tokens raises this ceiling.",
-		},
-		{
-			name: "session-reason hold with stopped-in-flight sessions renders the line too: the gate is data availability, not the firing reason",
-			entry: &BudgetExhaustedEntry{
-				Reason:          budgetReasonSession,
-				UsedSessions:    4,
-				BudgetSessions:  3,
-				StoppedInFlight: &oneStopped,
-				ExhaustedAt:     recordedAt,
-			},
-			want: "Sortie stopped dispatching this issue.\n" +
-				"Recorded: 2026-08-25T09:14:03Z\n" +
-				"Ceiling: session budget (agent.max_sessions)\n" +
-				"Sessions: 4 of 3\n" +
-				"Stopped in flight: 1 session\n" +
-				"Raising agent.max_sessions raises this ceiling.",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := buildBudgetHoldComment(tt.entry)
-
-			if tt.wantLine != "" {
-				if !strings.Contains(got, tt.wantLine) {
-					t.Errorf("buildBudgetHoldComment(%+v) =\n%q\nwant a line %q", tt.entry, got, tt.wantLine)
-				}
-				return
-			}
-			if got != tt.want {
-				t.Errorf("buildBudgetHoldComment(%+v) =\n%q\nwant\n%q", tt.entry, got, tt.want)
-			}
-		})
-	}
 }
 
 func TestBudgetHoldNoticeAllowed(t *testing.T) {
@@ -355,7 +171,7 @@ func TestBuildBudgetHoldComment_CrossLaneParity(t *testing.T) {
 	rebuildStore := &stubStore{
 		tokenExhaustedIDs: []string{issueID},
 		tokenExhaustedUsage: map[string]persistence.IssueTokenUsage{
-			issueID: {TotalTokens: 128400, Sessions: 5, StoppedInFlight: 2},
+			issueID: {TotalTokens: 128400, UncachedTokens: 128400, Sessions: 5, StoppedInFlight: 2},
 		},
 	}
 	rebuildState := NewState(60000, 10, 0, nil, AgentTotals{})
@@ -374,13 +190,13 @@ func TestBuildBudgetHoldComment_CrossLaneParity(t *testing.T) {
 		t.Fatal("rebuild lane: BudgetExhausted entry missing after handleTick")
 	}
 
-	retryBody := buildBudgetHoldComment(retryEntry)
-	rebuildBody := buildBudgetHoldComment(rebuildEntry)
-	if retryBody != rebuildBody {
-		t.Errorf("retry-lane body =\n%q\nrebuild-lane body =\n%q\nwant identical bodies for the same IssueTokenUsage", retryBody, rebuildBody)
+	retryFacts := budgetHeldNotification(issueID, retryEntry).Message.Facts
+	rebuildFacts := budgetHeldNotification(issueID, rebuildEntry).Message.Facts
+	if !reflect.DeepEqual(retryFacts, rebuildFacts) {
+		t.Errorf("retry-lane facts = %+v, rebuild-lane facts = %+v, want identical facts for the same IssueTokenUsage", retryFacts, rebuildFacts)
 	}
-	if !strings.Contains(retryBody, "Stopped in flight: 2 sessions") {
-		t.Errorf("retry-lane body = %q, want it to contain the Stopped in flight line", retryBody)
+	if facts, ok := retryFacts.(domain.BudgetHeldFacts); !ok || facts.StoppedInFlight == nil || *facts.StoppedInFlight != 2 {
+		t.Errorf("retry-lane facts = %+v, want StoppedInFlight 2", retryFacts)
 	}
 }
 

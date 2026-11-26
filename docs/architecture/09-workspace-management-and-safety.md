@@ -90,6 +90,7 @@ Hook environment variables available only to `after_run`:
 
 - `SORTIE_SELF_REVIEW_STATUS`: self-review outcome for the current run: `"disabled"`, `"passed"`, `"cap_reached"`, or `"error"`. Defaults to `"disabled"` when self-review is not configured.
 - `SORTIE_SELF_REVIEW_SUMMARY_PATH`: absolute path to `.sortie/review_summary.md` in the workspace. Absent when self-review did not run or summary was not written.
+- `SORTIE_RUN_OUTCOME`: how the attempt ended: `"succeeded"`, `"stopped"` (the run needed input, stopped at a budget or a usage limit, or the agent declared `blocked`), `"failed"`, or `"cancelled"`. The orchestrator sets it in every mode, and it overrides a same-named variable of the parent environment. The value is decided before the handoff evidence verdict (Section 9.4.1), so an attempt whose handoff the policy then withholds reads `"succeeded"` in the hook and is recorded as failed. A cancellation that lands while the hook runs can make the hook read `"failed"` for an attempt recorded as cancelled. A hook that commits and pushes can skip every value other than `"succeeded"`.
 
 #### 9.4.1 Handoff Evidence Baseline
 
@@ -122,6 +123,8 @@ Environment variables, in addition to the four every hook receives and the `SORT
 - `SORTIE_REACTION_RESULT`: absolute path the command writes its one-object JSON answer to. The file does not exist when the command starts.
 
 Both paths sit in a fresh temporary directory created per run and removed when the run returns. The directory is outside the workspace, so no stale result file from an earlier run can be read as this run's answer and no externally authored text lands where the agent reads.
+
+Sortie records every answer it applies, once per run, in a durable record keyed by the issue, the reaction kind, and the subject's fingerprint, so the dashboard and the API read a `handled` answer after a restart. A recorded answer is never replayed: the record serves only reads, and a subject whose dispatched mark never landed is triaged again from scratch. Runs in flight stay runtime-only.
 
 Triage runs in flight at one time are capped at `max(agent.max_concurrent_agents, 1)` across every issue and kind. An entry that finds the cap reached starts nothing and is reconsidered on the next tick. The cap adds to agent concurrency rather than sharing it: triage runs are not subtracted from agent slots, so a host configured for N agents reaches a worst case of N agent processes and N triage subprocesses at the same time. An operator sizing a host accounts for both. Deriving the cap from the free agent slots instead would drive it to zero exactly when every slot is busy, which is when a triage run that resolves a subject without an agent is worth the most.
 

@@ -16,6 +16,7 @@ const (
 	AttentionKindReactionEscalated    = "reaction_escalated"
 	AttentionKindWorkflowReloadFailed = "workflow_reload_failed"
 	AttentionKindPreflightFailed      = "preflight_failed"
+	AttentionKindSpendCeilingReached  = "spend_ceiling_reached"
 )
 
 // AttentionCause is one thing that needs a person, with the identity its
@@ -31,6 +32,7 @@ type AttentionCause struct {
 	Reaction  *SnapshotPendingReaction
 	Workflow  *SnapshotWorkflowHealth
 	Preflight *SnapshotHealthCheck
+	Spend     *SpendCeilingStatus
 }
 
 // AttentionCauses returns every cause in snap and health that needs a person,
@@ -46,6 +48,11 @@ func AttentionCauses(snap RuntimeSnapshotResult, health *SnapshotHealth) []Atten
 	for _, row := range snap.PendingReactions {
 		if row.EscalatedAt != nil {
 			causes = append(causes, escalationCause(row))
+		}
+	}
+	for _, status := range snap.SpendCeilings {
+		if status.Holding {
+			causes = append(causes, spendCeilingCause(status))
 		}
 	}
 	if health == nil {
@@ -80,8 +87,11 @@ func parkedCause(row SnapshotParkedEntry) AttentionCause {
 
 func budgetCause(row SnapshotBudgetEntry) AttentionCause {
 	ceiling := strconv.Itoa(row.BudgetSessions)
-	if row.Reason == budgetReasonToken {
+	switch row.Reason {
+	case budgetReasonToken:
 		ceiling = strconv.FormatInt(row.BudgetTokens, 10)
+	case budgetReasonMoney:
+		ceiling = strconv.FormatFloat(row.BudgetUSD, 'f', -1, 64)
 	}
 	since := row.ExhaustedAt.UTC()
 	return AttentionCause{
@@ -89,6 +99,17 @@ func budgetCause(row SnapshotBudgetEntry) AttentionCause {
 		Kind:   AttentionKindBudgetHeld,
 		Since:  &since,
 		Budget: &row,
+	}
+}
+
+func spendCeilingCause(status SpendCeilingStatus) AttentionCause {
+	since := status.HoldingSince.UTC()
+	return AttentionCause{
+		ID: attentionID(AttentionKindSpendCeilingReached, string(status.Window),
+			status.WindowStart.UTC().Format(time.RFC3339), strconv.FormatFloat(status.BudgetUSD, 'f', -1, 64)),
+		Kind:  AttentionKindSpendCeilingReached,
+		Since: &since,
+		Spend: &status,
 	}
 }
 

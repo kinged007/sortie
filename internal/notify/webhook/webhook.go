@@ -3,32 +3,20 @@
 // an operator-configured URL, using the generic notifier vocabulary so
 // the body is backend-neutral. This is an outbound POST backend and is
 // distinct from inbound tracker webhook ingress.
-//
-// The package builds on [httpkit.Client] with a mandatory per-call
-// timeout, classifies its own transport and non-2xx errors, and never
-// logs the endpoint URL, request body, or response body.
 package webhook
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
-	"github.com/sortie-ai/sortie/internal/httpkit"
+	"github.com/sortie-ai/sortie/internal/notify/notifyhttp"
+	"github.com/sortie-ai/sortie/internal/notify/render"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
 var _ domain.Notifier = (*notifier)(nil)
-
-// sendTimeout bounds each outbound POST so a slow endpoint cannot stall
-// the agent turn.
-const sendTimeout = 10 * time.Second
 
 func init() {
 	registry.Notifiers.Register("webhook", newNotifier)
@@ -36,7 +24,7 @@ func init() {
 
 // notifier posts notifications to a configured webhook URL.
 type notifier struct {
-	client *httpkit.Client
+	client *notifyhttp.Client
 }
 
 // newNotifier constructs a webhook [domain.Notifier] from the entry's
@@ -44,21 +32,11 @@ type notifier struct {
 // value (including a secret reference that resolved to the empty string)
 // is rejected.
 func newNotifier(config map[string]any) (domain.Notifier, error) {
-	rawURL, fault := typeutil.StringField(config, "url")
-	if fault != nil {
-		return nil, fmt.Errorf("webhook notifier: %w", fault)
+	endpoint, err := typeutil.RequiredString(config, "url")
+	if err != nil {
+		return nil, fmt.Errorf("webhook notifier: %w", err)
 	}
-	endpoint := strings.TrimSpace(rawURL)
-	if endpoint == "" {
-		return nil, fmt.Errorf("webhook notifier: url is required")
-	}
-
-	client := httpkit.NewClient(httpkit.ClientOptions{
-		BaseURL:           endpoint,
-		Timeout:           sendTimeout,
-		ClassifyError:     classifyHTTPError,
-		ClassifyTransport: classifyTransport,
-	})
+	client := notifyhttp.NewClient(endpoint)
 	return &notifier{client: client}, nil
 }
 
@@ -103,6 +81,7 @@ type wireStage struct {
 // 2xx response. A non-2xx response or a transport failure yields a
 // classified error that omits the URL, request body, and response body.
 func (n *notifier) Send(ctx context.Context, notification domain.Notification) error {
+	text := render.Notification(notification)
 	payload := wirePayload{
 		NotificationID: notification.Envelope.NotificationID,
 		Timestamp:      notification.Envelope.Timestamp,
@@ -114,13 +93,13 @@ func (n *notifier) Send(ctx context.Context, notification domain.Notification) e
 		Attempt:        notification.Envelope.Attempt,
 		Agent:          notification.Envelope.Agent,
 		Severity:       notification.Message.Severity,
-		Title:          notification.Message.Title,
-		Body:           notification.Message.Body,
+		Title:          text.Title,
+		Body:           text.Body,
 		Category:       notification.Message.Category,
 	}
 	if notification.Envelope.EventType.FromOrchestrator() {
 		payload.EventType = string(notification.Envelope.EventType)
-		payload.AgentText = notification.Message.AgentText
+		payload.AgentText = text.AgentText
 	}
 	if stage := notification.Envelope.Stage; stage != (domain.StageTransition{}) {
 		payload.Stage = &wireStage{
@@ -132,13 +111,5 @@ func (n *notifier) Send(ctx context.Context, notification domain.Notification) e
 		}
 	}
 
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("webhook notifier: encode payload: %w", err)
-	}
-
-	if _, err := n.client.Send(ctx, http.MethodPost, "", bytes.NewReader(encoded)); err != nil {
-		return err
-	}
-	return nil
+	return n.client.PostJSON(ctx, payload)
 }

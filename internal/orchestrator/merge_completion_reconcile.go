@@ -536,8 +536,13 @@ func applyMergeCompletionEscalation(
 	log *slog.Logger,
 	ctx context.Context,
 ) {
-	commentText := buildMergeCompletionEscalationComment(data, params.MergeCompletionConfig.TargetState, attempts)
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeCompletion, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeCompletion, pending, domain.MergeCompletionFacts{
+		Owner:       data.Owner,
+		Repo:        data.Repo,
+		PRNumber:    data.PRNumber,
+		TargetState: params.MergeCompletionConfig.TargetState,
+		Attempts:    attempts,
+	}))
 
 	if params.MergeCompletionConfig.Escalation == "label" {
 		issueID := pending.IssueID
@@ -637,12 +642,13 @@ func escalateMergeCompletionMissingSHA(
 		}
 	}
 
-	commentText := buildMergeCompletionMissingSHAEscalationComment(
-		data,
-		params.MergeCompletionConfig.TargetState,
-		waited,
-	)
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeCompletion, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeCompletion, pending, domain.MergeCompletionMissingSHAFacts{
+		Owner:       data.Owner,
+		Repo:        data.Repo,
+		PRNumber:    data.PRNumber,
+		TargetState: params.MergeCompletionConfig.TargetState,
+		Waited:      waited,
+	}))
 	label := params.MergeCompletionConfig.EscalationLabel
 	labels := params.MergeCompletionConfig.Escalation == "label"
 
@@ -664,8 +670,8 @@ func escalateMergeCompletionMissingSHA(
 			return
 		}
 
-		// Only the tracker comment decides the marker, so a slow Slack or
-		// webhook send must not spend the shared deadline first.
+		// Only the tracker comment decides the marker, so a slow
+		// operator-destination send must not spend the shared deadline first.
 		trackerDelivery, others := delivery.SplitTrackerComment()
 		var sends sync.WaitGroup
 		defer sends.Wait()
@@ -684,39 +690,4 @@ func escalateMergeCompletionMissingSHA(
 		}
 		markDelivered(dctx)
 	})
-}
-
-// buildMergeCompletionEscalationComment returns the plain-text escalation
-// comment used when a merge-completion transition cannot be performed.
-// It names the pull request number, repository, configured target
-// state, and the number of transition calls made, and no internal
-// symbol, table, or file path.
-func buildMergeCompletionEscalationComment(data *MergeCompletionReactionData, targetState string, attempts int) string {
-	return fmt.Sprintf(
-		"Sortie attempted %d time(s) and could not transition the issue to %q after PR #%d (%s/%s) merged. Manual transition required.",
-		attempts,
-		targetState,
-		data.PRNumber,
-		data.Owner,
-		data.Repo,
-	)
-}
-
-// buildMergeCompletionMissingSHAEscalationComment returns the operator-facing
-// explanation used after the missing-SHA grace period. It includes the
-// affected repository and pull request, elapsed wait, escalation reason, and
-// the manual follow-up.
-func buildMergeCompletionMissingSHAEscalationComment(
-	data *MergeCompletionReactionData,
-	targetState string,
-	waited time.Duration,
-) string {
-	return fmt.Sprintf(
-		"Sortie waited %s for %s/%s PR #%d: the pull request is reported merged but no merge commit identifier was provided. Sortie keeps watching and transitions this issue to %q if the forge reports the commit. Verify the merge in the forge and transition this issue manually if appropriate.",
-		waited.Round(time.Second),
-		data.Owner,
-		data.Repo,
-		data.PRNumber,
-		targetState,
-	)
 }

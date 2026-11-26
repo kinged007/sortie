@@ -63,6 +63,11 @@ type RunEvent struct {
 	DurationMS int64
 	ToolError  bool
 
+	// ToolKind and ToolArgument are set on tool_result events only; both are
+	// empty for an other tool and for an event stored without them.
+	ToolKind     domain.ToolKind
+	ToolArgument string
+
 	// Usage is nil while the run's usage is unmeasured. It is read only on
 	// the turn-ending types.
 	Usage *domain.TokenUsage
@@ -109,6 +114,9 @@ type runEventPayload struct {
 	DurationMS int64           `json:"duration_ms,omitempty"`
 	ToolError  *bool           `json:"tool_error,omitempty"`
 	Usage      json.RawMessage `json:"usage,omitempty"`
+
+	ToolKind     string `json:"tool_kind,omitempty"`
+	ToolArgument string `json:"tool_argument,omitempty"`
 }
 
 type runEventUsage struct {
@@ -129,6 +137,8 @@ func (e RunEvent) Payload() []byte {
 		payload.SessionID = &e.SessionID
 	case e.Event == domain.EventToolResult:
 		payload.ToolName = e.ToolName
+		payload.ToolKind = string(e.ToolKind)
+		payload.ToolArgument = e.ToolArgument
 		payload.DurationMS = max(e.DurationMS, 0)
 		payload.ToolError = &e.ToolError
 	case isTurnTerminalEvent(e.Event):
@@ -181,13 +191,15 @@ func RunEventsFromRows(rows []persistence.RunEvent) ([]RunEvent, error) {
 		}
 
 		event := RunEvent{
-			Seq:        row.Seq,
-			At:         at.UTC(),
-			Event:      domain.AgentEventType(row.Event),
-			Message:    payload.Message,
-			ToolName:   payload.ToolName,
-			DurationMS: payload.DurationMS,
-			size:       row.Size,
+			Seq:          row.Seq,
+			At:           at.UTC(),
+			Event:        domain.AgentEventType(row.Event),
+			Message:      payload.Message,
+			ToolName:     payload.ToolName,
+			DurationMS:   payload.DurationMS,
+			ToolKind:     domain.ToolKind(payload.ToolKind),
+			ToolArgument: payload.ToolArgument,
+			size:         row.Size,
 		}
 		if payload.SessionID != nil {
 			event.SessionID = *payload.SessionID
@@ -387,6 +399,8 @@ func retainEvent(entry *RunningEntry, event domain.AgentEvent) {
 		retained.SessionID = event.SessionID
 	case event.Type == domain.EventToolResult:
 		retained.ToolName = event.ToolName
+		retained.ToolKind = event.ToolKind
+		retained.ToolArgument = event.ToolArgument
 		retained.DurationMS = event.ToolDurationMS
 		retained.ToolError = event.ToolError
 	case isTurnTerminalEvent(event.Type) && entry.UsageMeasured:

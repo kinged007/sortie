@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 )
@@ -342,16 +344,16 @@ func TestReconcileMergeConflict_LiveAPI_E2E(t *testing.T) {
 	// GitHub computes mergeability asynchronously; the PR may initially return
 	// mergeable_state=unknown and needs a few ticks before it reports dirty.
 	const maxTicks = 8
-	for range maxTicks {
+	_ = waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, func() error {
 		if _, present := state.PendingReactions[rkey]; !present {
-			break
+			return nil
 		}
 
 		reconcileMergeConflicts(state, params, discardLogger(), ctx, metrics)
 
 		if metrics.checks["dispatched"] > 0 {
 			t.Logf("merge-conflict continuation dispatched; exiting tick loop")
-			break
+			return nil
 		}
 
 		// Clear the deferral so the next tick re-evaluates mergeability.
@@ -359,9 +361,8 @@ func TestReconcileMergeConflict_LiveAPI_E2E(t *testing.T) {
 			pending.PendingRetryAt = time.Time{}
 			state.PendingReactions[rkey] = pending
 		}
-
-		time.Sleep(2 * time.Second)
-	}
+		return errors.New("no merge-conflict continuation dispatched")
+	})
 
 	// Exactly one continuation dispatched for the conflicted PR.
 	if metrics.checks["dispatched"] != 1 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -110,6 +111,7 @@ func runValidate(_ context.Context, args []string, stdout io.Writer, stderr io.W
 		ConfigFunc:      mgr.Config,
 		TrackerRegistry: registry.Trackers,
 		AgentRegistry:   registry.Agents,
+		RatesFunc:       mgr.Rates,
 	}
 
 	validation := orchestrator.ValidateDispatchConfig(preflightParams)
@@ -197,7 +199,7 @@ func writeJSON(w io.Writer, v any) error {
 // more validateDiag entries. Dispatch-section *ConfigError values
 // arrive here unchanged from BuildDispatchConfig and route through
 // the "config." + Field arm, producing entries such as
-// "config.dispatch.rules[0].agent". Per-rule template parse failures
+// "config.dispatch.rules[0].agent", unless the error names its own Check. Per-rule template parse failures
 // arrive as *prompt.TemplateError and route through "template_parse"
 // with the offending absolute path included verbatim.
 func mapManagerError(err error) []validateDiag {
@@ -210,7 +212,7 @@ func mapManagerError(err error) []validateDiag {
 	}
 
 	if ce, ok := errors.AsType[*config.ConfigError](err); ok {
-		return []validateDiag{{Severity: "error", Check: "config." + ce.Field, Message: ce.Message}}
+		return []validateDiag{{Severity: "error", Check: cmp.Or(ce.Check, "config."+ce.Field), Message: ce.Message}}
 	}
 
 	if _, ok := errors.AsType[*prompt.TemplateError](err); ok {

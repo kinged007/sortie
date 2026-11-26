@@ -1,5 +1,8 @@
+import { useId } from "react";
+
 import { useStateQuery } from "@/api/queries";
 import { useLive, useNow } from "@/app/live";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/cn";
 import { fmtClockSec, fmtDue, parseInstant } from "@/lib/format";
 
@@ -8,8 +11,8 @@ import type { StateResponse } from "@/api/types.gen";
 type Tone = "live" | "idle" | "error";
 
 interface Indicator {
-  text: string;
-  detail?: string;
+  word: string;
+  tip: string;
   tone: Tone;
 }
 
@@ -17,6 +20,12 @@ const TONE_DOT: Record<Tone, string> = {
   live: "bg-success-fill",
   idle: "bg-ink-muted",
   error: "bg-error-fill",
+};
+
+const TONE_WORD: Record<Tone, string> = {
+  live: "text-success",
+  idle: "text-ink",
+  error: "text-ink",
 };
 
 function nextPoll(state: StateResponse | undefined, now: number): string | null {
@@ -37,43 +46,42 @@ interface IndicatorInput {
 function indicatorFor(input: IndicatorInput): Indicator {
   const { state, now } = input;
   if (input.paused) {
-    return { text: "Paused", detail: "press P to resume", tone: "idle" };
+    return { word: "Paused", tip: "Paused. Press P to resume.", tone: "idle" };
   }
   if (input.isHolding) {
-    return { text: "Holding still while you read", tone: "idle" };
+    return { word: "Holding", tip: "Holding still while you read.", tone: "idle" };
   }
   if (!input.isStreamOpen) {
-    return { text: "Reconnecting", tone: "idle" };
+    return { word: "Reconnecting", tip: "Reconnecting to live updates.", tone: "idle" };
   }
   if (input.hasFailed) {
-    const detail =
-      input.lastUpdateAt === null ? undefined : `last update ${fmtClockSec(input.lastUpdateAt)}`;
-    return { text: "Not updating", detail, tone: "error" };
+    const since =
+      input.lastUpdateAt === null ? "" : `, last update ${fmtClockSec(input.lastUpdateAt)}`;
+    return { word: "Not updating", tip: `Not updating${since}.`, tone: "error" };
   }
   const next = nextPoll(state, now);
   if (state?.health?.poll.status === "fail") {
-    return { text: "Poll failing", detail: `next try ${next ?? "unknown"}`, tone: "error" };
+    return {
+      word: "Poll failing",
+      tip: `Poll failing, next try ${next ?? "unknown"}.`,
+      tone: "error",
+    };
   }
-  return {
-    text: "Live",
-    detail: next === null ? undefined : `next poll ${next}`,
-    tone: "live",
-  };
+  const poll = next === null ? "" : `, next poll ${next}`;
+  return { word: "Live", tip: `Live${poll}. Press P to pause.`, tone: "live" };
 }
 
-/** Props of {@link LiveIndicator}. */
 export interface LiveIndicatorProps {
   /** True while the peek holds Overview still. */
   isHolding: boolean;
   onTogglePause: () => void;
 }
 
-/** Renders the button that says how fresh the screen is and pauses or resumes live updates. */
 export function LiveIndicator({ isHolding, onTogglePause }: LiveIndicatorProps) {
   const { paused, streamStatus } = useLive();
   const { data, isError, dataUpdatedAt } = useStateQuery();
   const now = useNow();
-  const { text, detail, tone } = indicatorFor({
+  const { word, tip, tone } = indicatorFor({
     paused,
     isHolding,
     isStreamOpen: streamStatus === "open",
@@ -83,21 +91,33 @@ export function LiveIndicator({ isHolding, onTogglePause }: LiveIndicatorProps) 
     now,
   });
 
+  const tipId = useId();
+
   return (
-    <button
-      type="button"
-      onClick={onTogglePause}
-      title="Pause or resume live updates (P)"
-      className="inline-flex h-(--size-control) cursor-pointer items-center gap-xs rounded-lg px-sm text-ink-body transition-colors duration-(--duration-feedback) hover:bg-state-hover hover:text-ink focus-visible:-outline-offset-1 focus-visible:outline-2 focus-visible:outline-focus-ring active:bg-state-pressed"
-    >
-      <span aria-hidden="true" className={cn("size-xs shrink-0 rounded-full", TONE_DOT[tone])} />
-      <span>{text}</span>
-      {detail === undefined ? undefined : (
-        <>
-          {" "}
-          <span>{detail}</span>
-        </>
-      )}
-    </button>
+    <>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              onClick={onTogglePause}
+              aria-describedby={tipId}
+              className="inline-flex h-(--size-control) cursor-pointer items-center gap-xs rounded-lg px-sm text-body-sm whitespace-nowrap transition-colors duration-(--duration-feedback) hover:bg-state-hover focus-visible:-outline-offset-1 focus-visible:outline-2 focus-visible:outline-focus-ring active:bg-state-pressed"
+            />
+          }
+        >
+          <span className="text-ink-muted">Events</span>
+          <span
+            aria-hidden="true"
+            className={cn("size-xs shrink-0 rounded-full", TONE_DOT[tone])}
+          />
+          <span className={cn("font-medium", TONE_WORD[tone])}>{word}</span>
+        </TooltipTrigger>
+        <TooltipPopup>{tip}</TooltipPopup>
+      </Tooltip>
+      <span id={tipId} className="sr-only">
+        {tip}
+      </span>
+    </>
   );
 }

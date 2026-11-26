@@ -415,7 +415,7 @@ jq -nc --arg label "$SEEDED_JOURNAL_LABEL" '{add_labels: $label}' |
 jq -nc --arg label "$SEEDED_JOURNAL_LABEL" '{remove_labels: $label}' |
 	gitlab_call PUT "/projects/${PRIMARY_ID}/merge_requests/${MR_IID}" "$PUBLISHED_TOKEN" >/dev/null
 
-# The draft merge request: blocked mergeability, review required, no
+# The draft merge request: blocked mergeability, a reviewer assigned, no
 # pipeline on its head.
 log "seeding the draft merge request fixture"
 create_branch "forge-draft" "$DEFAULT_BRANCH"

@@ -36,8 +36,9 @@ type runsResponse struct {
 	NextCursor *string       `json:"next_cursor"`
 }
 
-// runResponse is the JSON wire format for one finished run. The token and
-// origin members are null where the row does not record them.
+// runResponse is the JSON wire format for one finished run. The token, usage
+// provenance, vendor amount, and origin members are null where the row does
+// not record them.
 type runResponse struct {
 	RunID                int64               `json:"run_id"`
 	IssueID              string              `json:"issue_id"`
@@ -48,6 +49,8 @@ type runResponse struct {
 	Attempt              int                 `json:"attempt"`
 	Status               string              `json:"status"`
 	Error                *string             `json:"error"`
+	DeclaredOutcome      *string             `json:"declared_outcome"`
+	AgentText            *string             `json:"agent_text"`
 	RuleName             string              `json:"rule_name,omitempty"`
 	AgentKind            string              `json:"agent_kind,omitempty"`
 	ConfiguredModel      string              `json:"configured_model,omitempty"`
@@ -60,8 +63,6 @@ type runResponse struct {
 	TurnsCompleted       int                 `json:"turns_completed"`
 	Tokens               tokenInfo           `json:"tokens"`
 	UncachedTokens       *int64              `json:"uncached_tokens"`
-	TokensMeasured       bool                `json:"tokens_measured"`
-	UnaccountedTurns     int                 `json:"unaccounted_turns"`
 	EstimatedCostUSD     *float64            `json:"estimated_cost_usd"`
 	CostStatus           string              `json:"cost_status"`
 	ChainID              string              `json:"chain_id,omitempty"`
@@ -77,9 +78,34 @@ type runResponse struct {
 	SessionID            *string             `json:"session_id"`
 	SSHHost              *string             `json:"ssh_host"`
 
+	// UsageCompleteness is "complete", "lower_bound", or "unmeasured"; it is
+	// always set.
+	UsageCompleteness string `json:"usage_completeness"`
+
+	// UsageProvenance is null for a run recorded before provenance was kept
+	// and [] for a run with no source.
+	UsageProvenance []usageSourceResponse `json:"usage_provenance"`
+
+	// VendorAmounts is null for a run recorded before provenance was kept.
+	VendorAmounts []vendorAmountResponse `json:"vendor_amounts"`
+
+	// UnmeasuredCause is null unless UsageCompleteness is "unmeasured".
+	UnmeasuredCause *string `json:"unmeasured_cause"`
+
+	// UnmeasuredUnits is ascending and [] unless UnmeasuredCause is
+	// "amounts_only".
+	UnmeasuredUnits []string `json:"unmeasured_units"`
+
 	// DispatchID is "" on the recorded CI result and null for a run recorded
 	// before the dispatch ID existed.
 	DispatchID *string `json:"dispatch_id"`
+
+	// ModelUsage is the run's cost per model; [] when the run recorded none.
+	ModelUsage []modelUsageResponse `json:"model_usage"`
+
+	// Skills is every skill call of the run in completion order; absent when
+	// the run recorded none.
+	Skills []domain.SkillCall `json:"skills,omitempty"`
 
 	// StageChain is the chain the run's rule stood on; null when the run has
 	// no rule, its rule is on no chain, or no workflow shape is held.
@@ -92,6 +118,42 @@ type runResponse struct {
 	// run's pass; null on the runs the per-issue history and the issue
 	// groups serve, and when the server holds no workflow shape.
 	PRLoop map[string]prLoopStationResponse `json:"pr_loop"`
+}
+
+// usageSourceResponse is one source a run's usage was read from and the
+// strategy that read it.
+type usageSourceResponse struct {
+	Source   string `json:"source"`   // "protocol", "output", or "journal"
+	Strategy string `json:"strategy"` // "live" or "records"
+}
+
+// vendorAmountResponse is an amount a run reported in a unit other than US
+// dollars. Model is "" when the source attributed it to no model.
+type vendorAmountResponse struct {
+	Unit       string  `json:"unit"`
+	Model      string  `json:"model"`
+	Amount     float64 `json:"amount"`
+	LowerBound bool    `json:"lower_bound"`
+}
+
+// unitAmountResponse is the sum of one unit's amounts over an issue's runs.
+type unitAmountResponse struct {
+	Unit       string  `json:"unit"`
+	Amount     float64 `json:"amount"`
+	LowerBound bool    `json:"lower_bound"`
+}
+
+// modelUsageResponse is one model's part of a finished run's spend.
+// UnratedClasses is null for a part recorded without its unrated classes, and
+// PriceSource is null for a part recorded without one.
+type modelUsageResponse struct {
+	Model            string    `json:"model"`
+	Tokens           tokenInfo `json:"tokens"`
+	UncachedTokens   int64     `json:"uncached_tokens"`
+	EstimatedCostUSD *float64  `json:"estimated_cost_usd"`
+	CostStatus       string    `json:"cost_status"`
+	UnratedClasses   []string  `json:"unrated_classes"`
+	PriceSource      *string   `json:"price_source"` // "operator", "fetched", "embedded", or "agent"
 }
 
 // issueOutcomeResponse is how an issue's latest work ended. State is present
@@ -135,6 +197,8 @@ type lastStageResponse struct {
 }
 
 // historyTotalsResponse is an issue's spend over all of its runs.
+// UnmeasuredCause is null when no run is unmeasured, and AgentPricedUSD is
+// null when no share was priced from an agent-reported amount.
 type historyTotalsResponse struct {
 	RunCount         int       `json:"run_count"`
 	UnmeasuredRuns   int       `json:"unmeasured_runs"`
@@ -143,6 +207,20 @@ type historyTotalsResponse struct {
 	TokensComplete   bool      `json:"tokens_complete"`
 	EstimatedCostUSD *float64  `json:"estimated_cost_usd"`
 	CostStatus       string    `json:"cost_status"`
+
+	UnmeasuredCause *string `json:"unmeasured_cause"`
+
+	// UnmeasuredUnits is ascending and [] unless UnmeasuredCause is
+	// "amounts_only".
+	UnmeasuredUnits []string `json:"unmeasured_units"`
+
+	// VendorAmounts is per unit, ascending; [] when none.
+	VendorAmounts []unitAmountResponse `json:"vendor_amounts"`
+
+	AgentPricedUSD *float64 `json:"agent_priced_usd"`
+
+	// AgentPricedModels is ascending, "" for an unknown model; [] when none.
+	AgentPricedModels []string `json:"agent_priced_models"`
 }
 
 // hopDecisionResponse is the target rule and result one run's exit reached.
@@ -243,7 +321,7 @@ func parseRunsQuery(values url.Values) (RunHistoryQuery, error) {
 // toRunResponse converts a run to its wire format, masking the free-text
 // members at serve time so a value registered as a secret after the run is
 // masked too. chains are the dispatch chains of the configuration in effect.
-func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runResponse {
+func toRunResponse(e RunHistoryEntry, chains [][]string) runResponse {
 	resp := runResponse{
 		RunID:                e.ID,
 		IssueID:              e.IssueID,
@@ -262,8 +340,11 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 		StartedAt:            e.StartedAt,
 		CompletedAt:          e.CompletedAt,
 		TurnsCompleted:       e.TurnsCompleted,
-		TokensMeasured:       e.TokensMeasured,
-		UnaccountedTurns:     e.UnaccountedTurns,
+		UsageCompleteness:    e.UsageCompleteness,
+		UsageProvenance:      usageSourcesOf(e.UsageProvenance),
+		VendorAmounts:        vendorAmountsOf(e.VendorAmounts),
+		UnmeasuredCause:      textOrNil(e.UnmeasuredCause),
+		UnmeasuredUnits:      append([]string{}, e.UnmeasuredUnits...),
 		ChainID:              e.ChainID,
 		StagePrevious:        e.StagePrevious,
 		StagePreviousOutcome: e.StagePreviousOutcome,
@@ -273,6 +354,12 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 		OriginRecorded:       e.OriginRecorded,
 		StageChain:           orchestrator.StageChainOf(chains, e.RuleName, e.StagePrevious),
 		DispatchID:           copyText(e.DispatchID),
+		ModelUsage:           toModelUsageResponses(e.ModelUsage),
+		Skills:               toSkillCalls(e.Skills),
+		DeclaredOutcome:      textOrNil(e.DeclaredOutcome),
+	}
+	if e.AgentText != "" {
+		resp.AgentText = new(redact.Mask(e.AgentText))
 	}
 	if e.Error != nil {
 		resp.Error = new(redact.Mask(sentence.RunError(*e.Error)))
@@ -290,7 +377,7 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 		}
 		resp.UncachedTokens = new(domain.TokenUsage{TotalTokens: e.Tokens.TotalTokens, CacheReadTokens: e.Tokens.CacheReadTokens}.Uncached())
 	}
-	resp.EstimatedCostUSD, resp.CostStatus = runCostOf(e, rates)
+	resp.EstimatedCostUSD, resp.CostStatus = servedCost(e.EstimatedCostUSD, e.CostStatus)
 
 	if e.OriginRecorded {
 		resp.Trigger = copyText(e.Trigger)
@@ -300,6 +387,67 @@ func toRunResponse(e RunHistoryEntry, rates TokenRates, chains [][]string) runRe
 		resp.SSHHost = new(e.SSHHost)
 	}
 	return resp
+}
+
+// toModelUsageResponses converts a run's parts to their wire format; it
+// returns an empty slice, never nil, so the member serves [] and not null.
+func toModelUsageResponses(parts []RunModelUsage) []modelUsageResponse {
+	out := make([]modelUsageResponse, len(parts))
+	for i, p := range parts {
+		out[i] = modelUsageResponse{
+			Model: p.Model,
+			Tokens: tokenInfo{
+				InputTokens:      new(p.Tokens.InputTokens),
+				OutputTokens:     new(p.Tokens.OutputTokens),
+				TotalTokens:      new(p.Tokens.TotalTokens),
+				CacheReadTokens:  new(p.Tokens.CacheReadTokens),
+				CacheWriteTokens: new(p.Tokens.CacheWriteTokens),
+			},
+			UncachedTokens: p.Tokens.Uncached(),
+		}
+		out[i].EstimatedCostUSD, out[i].CostStatus = servedCost(p.EstimatedCostUSD, p.CostStatus)
+		out[i].PriceSource = textOrNil(p.PriceSource)
+		if p.UnratedRecorded {
+			out[i].UnratedClasses = append([]string{}, p.UnratedClasses...)
+		}
+	}
+	return out
+}
+
+// usageSourcesOf converts a run's usage sources; nil stays nil so the member
+// serves null for a run recorded before provenance was kept, and a known
+// empty list serves [].
+func usageSourcesOf(pairs []UsagePair) []usageSourceResponse {
+	if pairs == nil {
+		return nil
+	}
+	out := make([]usageSourceResponse, len(pairs))
+	for i, p := range pairs {
+		out[i] = usageSourceResponse(p)
+	}
+	return out
+}
+
+// vendorAmountsOf converts a run's vendor amounts with the same nil rule as
+// [usageSourcesOf].
+func vendorAmountsOf(amounts []VendorAmount) []vendorAmountResponse {
+	if amounts == nil {
+		return nil
+	}
+	out := make([]vendorAmountResponse, len(amounts))
+	for i, a := range amounts {
+		out[i] = vendorAmountResponse(a)
+	}
+	return out
+}
+
+// unitAmountsOf converts an issue's per-unit sums; it never returns nil.
+func unitAmountsOf(amounts []UnitAmount) []unitAmountResponse {
+	out := make([]unitAmountResponse, len(amounts))
+	for i, a := range amounts {
+		out[i] = unitAmountResponse(a)
+	}
+	return out
 }
 
 // copyText returns a pointer to a copy of *s, or nil for nil.
@@ -331,10 +479,23 @@ func toSelfReviewResponse(metadata *string) *selfReviewResponse {
 	}
 }
 
-func toRunResponses(rows []RunHistoryEntry, rates TokenRates, chains [][]string) []runResponse {
+// toSkillCalls decodes the recorded skill calls; a value that is absent, empty,
+// or does not decode reads as none.
+func toSkillCalls(skills *string) []domain.SkillCall {
+	if skills == nil {
+		return nil
+	}
+	var calls []domain.SkillCall
+	if err := json.Unmarshal([]byte(*skills), &calls); err != nil || len(calls) == 0 {
+		return nil
+	}
+	return calls
+}
+
+func toRunResponses(rows []RunHistoryEntry, chains [][]string) []runResponse {
 	runs := make([]runResponse, len(rows))
 	for i, row := range rows {
-		runs[i] = toRunResponse(row, rates, chains)
+		runs[i] = toRunResponse(row, chains)
 	}
 	return runs
 }
@@ -408,7 +569,7 @@ func distinctIssueIDs(rows []RunHistoryEntry) []string {
 // historyTotalsOf converts an issue's totals to their wire format. A token
 // sum that is zero while the spend is incomplete serves null, because the
 // zero would stand in for spend Sortie does not know.
-func historyTotalsOf(t IssueRunTotals, rates TokenRates) historyTotalsResponse {
+func historyTotalsOf(t IssueRunTotals) historyTotalsResponse {
 	complete := t.Usage.UnmeasuredSessions == 0 && t.Usage.UnaccountedTurns == 0
 	known := func(sum int64) *int64 {
 		if sum == 0 && !complete {
@@ -423,15 +584,21 @@ func historyTotalsOf(t IssueRunTotals, rates TokenRates) historyTotalsResponse {
 		CacheReadTokens:  known(t.Tokens.CacheReadTokens),
 		CacheWriteTokens: known(t.Tokens.CacheWriteTokens),
 	}
-	cost, status := issueCostFromKinds(t.Usage.ByKind, tokens.TotalTokens, complete, sessionCostPart{}, rates)
+	cost, status := issueCost(&t.Usage, tokens.TotalTokens, complete, sessionCostPart{})
 	return historyTotalsResponse{
 		RunCount:         t.Usage.Sessions,
 		UnmeasuredRuns:   t.Usage.UnmeasuredSessions,
 		Tokens:           tokens,
-		UncachedTokens:   known(domain.TokenUsage{TotalTokens: t.Usage.TotalTokens, CacheReadTokens: t.Tokens.CacheReadTokens}.Uncached()),
+		UncachedTokens:   known(t.Usage.UncachedTokens),
 		TokensComplete:   complete,
 		EstimatedCostUSD: cost,
 		CostStatus:       status,
+
+		UnmeasuredCause:   textOrNil(t.Provenance.UnmeasuredCause),
+		UnmeasuredUnits:   append([]string{}, t.Provenance.UnmeasuredUnits...),
+		VendorAmounts:     unitAmountsOf(t.Provenance.VendorAmounts),
+		AgentPricedUSD:    t.Provenance.AgentPricedUSD,
+		AgentPricedModels: append([]string{}, t.Provenance.AgentPricedModels...),
 	}
 }
 
@@ -519,7 +686,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		s.historyReadFailed(w, r, err)
 		return
 	}
-	runs := toRunResponses(rows, s.tokenRates, chains)
+	runs := toRunResponses(rows, chains)
 	attachIssueOutcomes(runs, outcomes)
 	attachRunPRLoops(runs, rows, loops)
 	writeJSON(w, s.logger, http.StatusOK, runsResponse{Runs: runs, NextCursor: next})

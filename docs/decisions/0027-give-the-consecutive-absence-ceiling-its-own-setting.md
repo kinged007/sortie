@@ -43,13 +43,13 @@ Chosen option: **give the consecutive-absence ceiling its own setting, defaulted
 
 `agent.max_sessions` keeps counting every completed run for an issue, unconditionally, and keeps blocking dispatch at the ceiling. It is a cost ceiling and it stays absolute. Nothing an issue produces buys it more budget.
 
-This also settles the proposal to count only failed and cancelled runs toward it. Beyond driver 2, the terminal status recorded for a run is not a progress signal: the successful value is recorded for a blocked soft stop, for a run that does not drive issue state, for a run whose evidence was not determinable, and for every run under the `off` evidence policy. Exempting that value would let an issue consume unbounded effort while recording almost nothing the budget could count.
+This also settles the proposal to count only failed and cancelled runs toward it. Beyond the fact that a ceiling which forgives spend no longer bounds it, the terminal status recorded for a run is not a progress signal: the successful value is recorded for a blocked soft stop, for a run that does not drive issue state, for a run whose evidence was not determinable, and for every run under the `off` evidence policy. Exempting that value would let an issue consume unbounded effort while recording almost nothing the budget could count.
 
 ### The new setting
 
 A new integer field, `agent.max_consecutive_absences`, bounds the count of consecutive observed absences that ADR-0020 defined. It sits beside `agent.max_sessions` and `agent.max_tokens`, is overridable through `SORTIE_AGENT_MAX_CONSECUTIVE_ABSENCES`, and is re-read on live reload like its siblings. Its default is three, which is the value the ceiling already took wherever no effort budget was configured, and the effort budget is unlimited by default.
 
-The field departs from the shape its two siblings share in one respect, deliberately. `0` does not mean unlimited; it is rejected as a configuration error naming the field, as any negative value is. Driver 5 forbids an unbounded absence sequence, so a value expressing one is not an option an operator may select. The complete escape already exists and is better: setting the evidence policy to `off` computes no verdict at all, so no absence is ever observed and no count ever advances. That escape costs no inspection, where an unlimited ceiling would inspect every run and act on nothing.
+The field departs from the shape its two siblings share in one respect, deliberately. `0` does not mean unlimited; it is rejected as a configuration error naming the field, as any negative value is. Repeated absence must still terminate, so a value expressing one is not an option an operator may select. The complete escape already exists and is better: setting the evidence policy to `off` computes no verdict at all, so no absence is ever observed and no count ever advances. That escape costs no inspection, where an unlimited ceiling would inspect every run and act on nothing.
 
 Everything else about the mechanism is unchanged. The count is still consecutive, any run that produces evidence still resets it, reaching the ceiling still parks the issue under the escalation label the recovery paths already use, and no new state, field or tracker transition is introduced.
 
@@ -82,7 +82,7 @@ The decoupling also changes what a sensible effort budget looks like. An operato
 
 **Derive the consecutive-absence ceiling from the effort budget by a stated rule other than identity.** A capped derivation, so that a generous effort budget cannot loosen the guard, is the strongest form and it fixes one direction of the collision. Rejected because it fixes only that direction. The reported failure runs the other way: an operator setting a low value to bound a loop still imposes it as a cost ceiling, and no rule computed from that value removes the ceiling the value itself is. A derivation also has no defensible arithmetic behind it, because the two quantities have different units, runs over a lifetime against runs in a row, and it leaves the operator setting one number and receiving a second, differently-valued ceiling they cannot see.
 
-**Redefine the effort budget to count only runs that did not advance the work.** This is the proposal the failure most naturally suggests, and it is wrong in the direction that matters. Drivers 2 and 3 rule it out on principle, and the recorded terminal status makes it unworkable in practice for the reason given above. It also repairs the wrong instrument: the runaway guard the proposal is reaching for already exists, is already progress-aware, and already parks loudly.
+**Redefine the effort budget to count only runs that did not advance the work.** This is the proposal the failure most naturally suggests, and it is wrong in the direction that matters. It fails on principle, because a ceiling that forgives spend leaves total spend unbounded and progress buys a cheaper attempt in comparable practice, never a larger budget. The recorded terminal status makes it unworkable in practice for the reason given above. It also repairs the wrong instrument: the runaway guard the proposal is reaching for already exists, is already progress-aware, and already parks loudly.
 
 **Change the effort budget's default value.** Recorded because it is the smallest possible change. Rejected because the default is already unlimited, so no default can decouple two ceilings that share a value once the operator sets one.
 
@@ -93,7 +93,7 @@ The decoupling also changes what a sensible effort budget looks like. An operato
 - The two ceilings can be tuned against each other. A deployment may hold a generous lifetime cost cap and a tight runaway guard at the same time, which no configuration expressed before.
 - The multi-phase workflow shape stops being incompatible with a runaway guard. Bounding a loop no longer requires accepting a lifetime cost ceiling of the same size.
 - The value the guard uses becomes visible. It was a constant reachable only by reading the source and only in the case where no effort budget was set.
-- The system now carries the two-counter split in the form driver 4 describes: a monotonic total whose outcome is a stop, and a consecutive counter that success clears and whose outcome is a park.
+- The system now carries the settled two-counter split: a monotonic total whose outcome is a stop, and a consecutive counter that success clears and whose outcome is a park.
 - Nothing about the absence mechanism itself changes, so ADR-0020's verdict, reset rule, park and escape hatch all keep their meaning.
 
 ### Negative

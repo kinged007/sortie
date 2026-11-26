@@ -15,7 +15,7 @@ Run the coding agents you already use on tasks from your issue tracker - in para
 [![Go Reference](https://pkg.go.dev/badge/github.com/sortie-ai/sortie.svg)](https://pkg.go.dev/github.com/sortie-ai/sortie)
 [![Release](https://img.shields.io/github/v/release/kinged007/sortie?label=release)](https://github.com/kinged007/sortie/releases)
 
-[Website](https://sortie-ai.com) · [Documentation](https://docs.sortie-ai.com) · [Discord](https://discord.gg/MCNrc8Wf9M) · [Contributing](CONTRIBUTING.md)
+[Website](https://sortie-ai.com) · [Documentation](https://docs.sortie-ai.com) · [GitHub Action](https://github.com/marketplace/actions/sortie-action) · [Discord](https://discord.gg/MCNrc8Wf9M) · [Contributing](CONTRIBUTING.md)
 
 **English | [简体中文](README.zh-CN.md)**
 

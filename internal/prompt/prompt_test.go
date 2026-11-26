@@ -925,3 +925,28 @@ func TestRender_LabelFix(t *testing.T) {
 		}
 	})
 }
+
+func TestRenderEveryTopLevelKeyWithoutOptions(t *testing.T) {
+	t.Parallel()
+
+	var body strings.Builder
+	for _, key := range topLevelOrder {
+		body.WriteString("{{ with .")
+		body.WriteString(key)
+		body.WriteString(" }}{{ end }}")
+	}
+	body.WriteString("{{ if .park }}park set{{ else }}park nil{{ end }}")
+	tmpl, err := Parse(body.String(), "WORKFLOW.md", 0)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	got, err := tmpl.Render(map[string]any{}, nil, RunContext{})
+	if err != nil {
+		t.Fatalf("Render without options: %v", err)
+	}
+
+	if want := "park nil"; got != want {
+		t.Errorf("Render without options = %q, want %q", got, want)
+	}
+}

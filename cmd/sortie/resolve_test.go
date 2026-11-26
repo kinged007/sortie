@@ -208,6 +208,8 @@ agent:
 db_path: "%s"
 file:
   path: issues.json
+price_table:
+  fetch: false
 ---
 Do {{ .issue.title }}.
 `, dbPath)

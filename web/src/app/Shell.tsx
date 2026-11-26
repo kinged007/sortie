@@ -12,7 +12,7 @@ import { useLive } from "@/app/live";
 import { NarrowBar } from "@/app/NarrowBar";
 import { Rail } from "@/app/Rail";
 import { ShortcutsDialog } from "@/app/ShortcutsDialog";
-import { TopBar } from "@/app/TopBar";
+import { PageBreadcrumb, TopBar } from "@/app/TopBar";
 import { activeViewPath } from "@/components/ActiveHead";
 import { IssuePeek } from "@/components/IssuePeek";
 import { toast, Toaster } from "@/components/toaster";
@@ -28,6 +28,12 @@ import { attentionKey, endedKey, markRead } from "@/lib/unread";
 import type { Binding } from "@/app/keys";
 import type { ScreenEntry } from "@/app/Rail";
 import type { RunsResponse } from "@/api/types.gen";
+
+const PAGE_COLUMN = "mx-auto w-full px-xxxl max-xl:px-lg max-md:px-md";
+const WIDE_PAGE_COLUMN = cn(
+  PAGE_COLUMN,
+  "max-w-[calc(var(--container-wide)+2*var(--spacing-xxxl))]",
+);
 
 const NO_ANSWER = "Sortie did not answer. Nothing changed.";
 
@@ -59,7 +65,11 @@ function ShellFrame({ screens }: ShellFrameProps) {
   const noticedVersion = useRef<string | null>(null);
   const isOverlayOpen = isPaletteOpen || isShortcutsOpen;
 
-  useDocumentStatus(data === undefined ? undefined : condition(data), data?.counts.attention ?? 0);
+  useDocumentStatus(
+    data === undefined ? undefined : condition(data),
+    data?.counts.attention ?? 0,
+    data?.config?.tracker.project,
+  );
 
   useEffect(() => {
     if (versionNotice === null || noticedVersion.current === versionNotice) {
@@ -164,28 +174,21 @@ function ShellFrame({ screens }: ShellFrameProps) {
   useShortcuts(bindings);
 
   const handleOpenPalette = () => setIsPaletteOpen(true);
+  const pageColumn = isPipeline ? PAGE_COLUMN : WIDE_PAGE_COLUMN;
 
   return (
     <div className="grid min-h-screen grid-cols-1 md:grid-cols-[var(--spacing-nav-rail)_minmax(0,1fr)]">
-      <Rail
-        screens={screens}
-        onOpenPalette={handleOpenPalette}
-        onOpenShortcuts={() => setIsShortcutsOpen(true)}
-      />
+      <Rail screens={screens} onOpenShortcuts={() => setIsShortcutsOpen(true)} />
       <div className="min-w-0">
         <NarrowBar onOpenPalette={handleOpenPalette} />
-        <div
-          className={cn(
-            "mx-auto w-full px-xxxl pt-xl pb-xxxl max-xl:px-lg max-md:px-md max-md:pt-md",
-            !isPipeline && "max-w-[calc(var(--container-wide)+2*var(--spacing-xxxl))]",
-          )}
-        >
-          <TopBar
-            screens={screens}
-            isHolding={(isOverview || isPipeline) && peek.identifier !== null}
-            onTogglePause={handleTogglePause}
-            onOpenPalette={handleOpenPalette}
-          />
+        <TopBar
+          className={pageColumn}
+          isHolding={(isOverview || isPipeline) && peek.identifier !== null}
+          onTogglePause={handleTogglePause}
+          onOpenPalette={handleOpenPalette}
+        />
+        <div className={cn(pageColumn, "pt-xl pb-xxxl max-md:pt-md")}>
+          <PageBreadcrumb screens={screens} />
           <DegradedBanner />
           <main id="main">
             {data !== undefined ? (
@@ -215,18 +218,11 @@ function ShellFrame({ screens }: ShellFrameProps) {
   );
 }
 
-/** Props of {@link Shell}. */
 export interface ShellProps {
   screens: ScreenEntry[];
 }
 
-/**
- * Renders the application frame around the routed screen: rail, narrow-screen
- * bar, top bar, degraded banner, the loading and not-answering states, the
- * peek, the palette and shortcut map, and the toaster. It owns the shortcuts
- * that act on every route. It must sit inside the query client, live-update,
- * and router providers.
- */
+/** Must sit inside the query client, live-update, and router providers. */
 export function Shell({ screens }: ShellProps) {
   return (
     <>

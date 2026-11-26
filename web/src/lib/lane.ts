@@ -1,7 +1,15 @@
-import { routeText, rowMark, timeBaseOf, timeText } from "@/lib/active-rows";
-import { fmtStamp, parseInstant } from "@/lib/format";
+import {
+  awaitsApproval,
+  isRowKind,
+  routeText,
+  rowMark,
+  timeBaseOf,
+  timeText,
+} from "@/lib/active-rows";
+import { fmtStamp, parseInstant, upperFirst } from "@/lib/format";
 import { reactionLabel, reactionShortLabel } from "@/lib/labels";
-import { outcomeMark, runStatus } from "@/lib/run-status";
+import { endingWord, hasSeveralTerminalStates } from "@/lib/ended";
+import { runStatus, stateWord } from "@/lib/run-status";
 
 import type { Deciding } from "@/lib/active-rows";
 import type {
@@ -17,7 +25,6 @@ import type {
 } from "@/api/types.gen";
 import type { Mark, StateMark } from "@/lib/run-status";
 
-/** What a station stands for on the way from the tracker to the end of a pull request. */
 export type StationKind = "tracker" | "agent" | "handoff" | "reaction" | "end";
 
 /** One place an issue can stand; stations depend on the configuration alone, never on an issue. */
@@ -27,6 +34,8 @@ export interface Station {
   label: string;
   /** The form a header too narrow for the label uses; absent when the label is already short. */
   short?: string;
+  /** Set on the end station of a workflow that lists two or more terminal states. */
+  labelFromEnding?: true;
 }
 
 const AGENT_KEY = "agent";
@@ -41,11 +50,7 @@ const REACTION_ORDER = [
   "label_commands",
 ] as const satisfies readonly (keyof ShapeReactions)[];
 
-/**
- * Lists the stations of a workflow in order: the tracker, one agent station
- * for all agent work, the handoff state, one station per configured reaction,
- * and the end once any reaction exists. Stage names never become stations.
- */
+/** One agent station holds all agent work; stage names never become stations. */
 export function stationsOf(config: ConfigResponse): Station[] {
   const stations: Station[] = [
     { key: "tracker", kind: "tracker", label: "Tracker" },
@@ -53,7 +58,7 @@ export function stationsOf(config: ConfigResponse): Station[] {
   ];
   const handoff = config.tracker.handoff_state;
   if (handoff !== undefined && handoff !== "") {
-    stations.push({ key: "handoff", kind: "handoff", label: handoff });
+    stations.push({ key: "handoff", kind: "handoff", label: upperFirst(handoff) });
   }
   const reactions = REACTION_ORDER.filter((key) => config.reactions[key] !== undefined);
   for (const key of reactions) {
@@ -66,7 +71,14 @@ export function stationsOf(config: ConfigResponse): Station[] {
     });
   }
   if (reactions.length > 0) {
-    stations.push({ key: "end", kind: "end", label: endLabelOf(config) });
+    stations.push({
+      key: "end",
+      kind: "end",
+      label: endLabelOf(config),
+      ...(hasSeveralTerminalStates(config.tracker.terminal_states)
+        ? { labelFromEnding: true as const }
+        : {}),
+    });
   }
   return stations;
 }
@@ -78,7 +90,7 @@ function endLabelOf(config: ConfigResponse): string {
   const terminal = config.tracker.terminal_states ?? [];
   const isEveryMergeTerminal =
     config.reactions.auto_merge === undefined || config.reactions.merge_completion !== undefined;
-  return terminal.length === 1 && isEveryMergeTerminal ? (terminal[0] ?? "End") : "End";
+  return terminal.length === 1 && isEveryMergeTerminal ? upperFirst(terminal[0] ?? "End") : "End";
 }
 
 function pendingEntryOf(
@@ -92,11 +104,7 @@ function pendingEntryOf(
   );
 }
 
-/**
- * Picks the state row that decides where an issue stands, from the issue's
- * status and its entry in the state's `active` list. A finished issue, an
- * unknown status, and a status whose row is absent decide nothing.
- */
+/** A finished issue, an unknown status, and a status whose row is absent decide nothing. */
 export function decidingOf(
   detail: IssueDetailResponse,
   active: ActiveIssueResponse | undefined,
@@ -125,7 +133,6 @@ export function decidingOf(
   }
 }
 
-/** What {@link standingOf} reads: the deciding row, or the recorded ending when there is none. */
 export interface StandingInput {
   deciding: Deciding | null;
   outcome: IssueOutcomeResponse | null;
@@ -138,11 +145,12 @@ export interface StandingInput {
 /** What a lane draws at the station it stands on: a status mark, or the ring of an issue that ended today. */
 export type LaneMarker = StateMark | "ended";
 
-/** Where an issue stands: a station key, its mark, and the time shown beside it. */
 export interface Standing {
   station: string;
   mark: LaneMarker | null;
   time: string | null;
+  /** The name the station takes in this issue's lane only; null keeps the station's own. */
+  label: string | null;
 }
 
 function reactionKeyOf(deciding: Deciding): string | undefined {
@@ -157,9 +165,19 @@ function reactionKeyOf(deciding: Deciding): string | undefined {
   }
 }
 
+type PendingReading = Pick<PendingReactionResponse, "config_key" | "escalated_at" | "last_check">;
+
+// A handled triage closes the work its station stands for, so the row waits on nothing there.
+function holdsStation(row: PendingReading): boolean {
+  return row.escalated_at !== null || row.last_check?.handled !== true;
+}
+
 function decidingStation(deciding: Deciding, stations: readonly Station[]): string {
   const reactionKey = reactionKeyOf(deciding);
-  const keyed = stations.find((s) => s.kind === "reaction" && s.key === reactionKey);
+  const keyed =
+    deciding.kind === "pending_reactions" && !holdsStation(deciding.entry)
+      ? undefined
+      : stations.find((s) => s.kind === "reaction" && s.key === reactionKey);
   if (keyed !== undefined) {
     return keyed.key;
   }
@@ -181,18 +199,24 @@ function outcomeStation(kind: string, stations: readonly Station[]): Station | u
     : (stations.find((s) => s.kind === wanted) ?? stations.at(-1));
 }
 
-/**
- * Places an issue on the stations. The deciding row wins; an issue with none
- * stands where its recorded ending puts it. It returns `null` when neither
- * exists, so a finished issue without a recorded ending has no marker.
- */
+function endingStationLabel(outcome: IssueOutcomeResponse): string | null {
+  if (outcome.kind === "merged") {
+    return "Merged";
+  }
+  return outcome.kind === "terminal" && outcome.state !== undefined && outcome.state !== ""
+    ? upperFirst(outcome.state)
+    : null;
+}
+
+/** Returns `null` when neither exists, so a finished issue without a recorded ending has no marker. The `label` of the standing renames the station for this issue only, and only when the station takes its name from the ending. */
 export function standingOf(input: StandingInput, stations: readonly Station[]): Standing | null {
   const { deciding, outcome, issueId, attention, now } = input;
   if (deciding !== null) {
     return {
       station: decidingStation(deciding, stations),
-      mark: rowMark(deciding.kind, issueId, attention).mark,
+      mark: rowMark(deciding.kind, issueId, attention, awaitsApproval(deciding)),
       time: timeText(deciding.kind, timeBaseOf(deciding), now),
+      label: null,
     };
   }
   if (outcome === null) {
@@ -203,23 +227,57 @@ export function standingOf(input: StandingInput, stations: readonly Station[]): 
     ? null
     : {
         station: station.key,
-        mark: outcomeMark(outcome.kind),
+        mark: endingMarker(outcome.kind),
         time: fmtStamp(outcome.observed_at),
+        label: station.labelFromEnding === true ? endingStationLabel(outcome) : null,
       };
 }
 
-/** How a station reads against the issue's standing. */
+export function endingMarker(kind: string | undefined): LaneMarker | null {
+  switch (kind) {
+    case "handed_off":
+      return "handed";
+    case "merged":
+    case "terminal":
+      return "ended";
+    default:
+      return null;
+  }
+}
+
+export function issueStanding(
+  issueId: string,
+  status: string,
+  outcome: IssueOutcomeResponse | null,
+  attention: readonly AttentionItemResponse[],
+  awaitingApproval: boolean,
+): { marker: LaneMarker | null; word: string } {
+  if (status === "history") {
+    return {
+      marker: endingMarker(outcome?.kind),
+      word: outcome === null ? "Ended" : endingWord(outcome),
+    };
+  }
+  if (!isRowKind(status)) {
+    return { marker: null, word: "" };
+  }
+  const mark = rowMark(status, issueId, attention, awaitingApproval);
+  return { marker: mark, word: stateWord(mark) };
+}
+
 export type StationState =
   | "passed"
   | "current"
   | "ahead"
   | "waiting"
+  | "approval"
+  | "needs"
   | "escalated"
   | "acted"
   | "quiet"
   | "idle";
 
-/** A {@link Station} with its state, and the mark and time of the issue standing on it. */
+/** On the current station, `label` is the standing's label when it has one. */
 export interface LaneStation extends Station {
   state: StationState;
   mark: LaneMarker | null;
@@ -232,17 +290,21 @@ type PrLoop = Record<string, PrLoopStationResponse> | null;
 
 type Reading = Pick<LaneStation, "state" | "continuations">;
 
+function holdingStateOf(rows: readonly PendingReading[]): StationState {
+  if (rows.some((r) => r.escalated_at !== null)) {
+    return "needs";
+  }
+  return rows.some((r) => r.last_check?.awaiting_approval === true) ? "approval" : "waiting";
+}
+
 function reactionReadingOf(
   station: Station,
-  pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
+  pending: readonly PendingReading[],
   prLoop: PrLoop,
 ): Reading {
-  const rows = pending.filter((r) => r.config_key === station.key);
+  const rows = pending.filter((r) => r.config_key === station.key && holdsStation(r));
   if (rows.length > 0) {
-    return {
-      state: rows.some((r) => r.escalated_at !== null) ? "escalated" : "waiting",
-      continuations: 0,
-    };
+    return { state: holdingStateOf(rows), continuations: 0 };
   }
   const served: PrLoopStationResponse | undefined =
     prLoop !== null && Object.hasOwn(prLoop, station.key) ? prLoop[station.key] : undefined;
@@ -262,7 +324,7 @@ function readingOf(
   station: Station,
   index: number,
   current: number,
-  pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
+  pending: readonly PendingReading[],
   prLoop: PrLoop,
 ): Reading {
   if (station.kind === "reaction") {
@@ -274,17 +336,11 @@ function readingOf(
   return { state: index < current ? "passed" : "ahead", continuations: 0 };
 }
 
-/**
- * Gives each station its state against the standing: the current station
- * carries the standing's mark and time. A reaction station reads waiting or
- * escalated while a pull request row is pending on it; with none, it reads
- * from the served `prLoop` as escalated, acted, quiet, or idle for no record.
- * The rest read passed or ahead.
- */
+/** The current station takes the standing's label over its own; a reaction station reads from the pending pull request row while one exists, else from the served `prLoop`. */
 export function laneOf(
   stations: readonly Station[],
   standing: Standing | null,
-  pending: readonly Pick<PendingReactionResponse, "config_key" | "escalated_at">[],
+  pending: readonly PendingReading[],
   prLoop: PrLoop,
 ): LaneStation[] {
   const current = standing === null ? -1 : stations.findIndex((s) => s.key === standing.station);
@@ -292,6 +348,7 @@ export function laneOf(
     standing !== null && index === current
       ? {
           ...station,
+          label: standing.label ?? station.label,
           state: "current",
           mark: standing.mark,
           time: standing.time,
@@ -306,7 +363,6 @@ export function laneOf(
   );
 }
 
-/** The stage chain an issue is on and the stage it stands at. */
 export interface StagePosition {
   chain: readonly string[];
   current: string;
@@ -326,10 +382,7 @@ function chainSourceOf(
   return { chain: last.chain, current: last.rule };
 }
 
-/**
- * Reads a place in a stage chain from a chain source. It returns `null` when
- * there is no source, no chain, or the current stage is not on the chain.
- */
+/** Returns `null` when there is no source, no chain, or the current stage is not on the chain. */
 export function positionFrom(
   source: { chain: readonly string[] | null; current: string } | null,
 ): StagePosition | null {
@@ -339,11 +392,7 @@ export function positionFrom(
   return { chain: source.chain, current: source.current };
 }
 
-/**
- * Reads the issue's place in its stage chain: from the deciding row while one
- * exists, from `history.last_stage` for a finished issue. It returns `null`
- * when the issue has no chain or its current stage is not on it.
- */
+/** Reads from the deciding row while one exists, from `history.last_stage` for a finished issue; `null` when the issue has no chain or its current stage is not on it. */
 export function positionOf(
   detail: IssueDetailResponse,
   deciding: Deciding | null,
@@ -351,10 +400,7 @@ export function positionOf(
   return positionFrom(chainSourceOf(detail, deciding));
 }
 
-/**
- * Picks the newest finished run of a stage that was not started by a pull
- * request reaction, from runs in any order.
- */
+/** Picks the newest finished run of a stage that was not started by a pull request reaction, from runs in any order. */
 export function lastStageRunOf(
   runs: readonly RunResponse[],
   current: string,
@@ -373,11 +419,7 @@ export function lastStageRunOf(
     );
 }
 
-/**
- * Reads a finished issue's place in the chain its last stage run stood on,
- * from one issue's runs served newest first. It returns `null` when the issue
- * has no stage run, or that run's chain is absent or does not hold its rule.
- */
+/** Runs are served newest first; `null` when the issue has no stage run, or that run's chain is absent or does not hold its rule. */
 export function lastStagePositionOf(runs: readonly RunResponse[]): StagePosition | null {
   const run = runs.find((candidate) => !candidate.reaction_kind && candidate.rule_name);
   return run === undefined
@@ -385,18 +427,15 @@ export function lastStagePositionOf(runs: readonly RunResponse[]): StagePosition
     : positionFrom({ chain: run.stage_chain, current: run.rule_name ?? "" });
 }
 
-/** Words a finished run's place in its chain, or its rule, as an Active row words a running one. */
 export function runRouteText(run: RunResponse, config: ConfigResponse | undefined): string | null {
   const position = lastStagePositionOf([run]);
   return routeText({ stage_position: position, rule_name: run.rule_name }, config);
 }
 
-/** What the stage summary and the meter single out. */
 export type StageFocus =
   | { kind: "current"; mark: Mark | null }
   | { kind: "hop_not_made"; target: string; result: string };
 
-/** Counts for the stage summary and the stage meter. */
 export interface StageProgress {
   /** The 1-based place of the current stage. */
   k: number;
@@ -418,12 +457,7 @@ function hopNotMade(run: RunResponse | undefined): StageFocus | null {
   };
 }
 
-/**
- * Counts the stages done and ahead and picks the focus of the summary.
- * `lastStageRun` is the newest finished non-reaction run of the current stage;
- * a `failed` or `ceiling` result on it means the hop to the next stage was
- * not made.
- */
+/** `lastStageRun` is the newest finished non-reaction run of the current stage; a `failed` or `ceiling` result on it means the hop to the next stage was not made. */
 export function stageProgressOf(
   position: StagePosition,
   live: boolean,

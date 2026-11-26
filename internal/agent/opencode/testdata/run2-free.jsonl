@@ -1,0 +1,1 @@
+{"type":"error","timestamp":1793148100867,"sessionID":"ses_abc123","error":{"type":"provider.free-limit","message":"Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.","status":429,"retryAfterMs":3600000}}

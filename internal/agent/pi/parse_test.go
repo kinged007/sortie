@@ -115,7 +115,9 @@ func TestCompletedMessage(t *testing.T) {
 		{name: "wrong event type", event: rawRunEvent{Type: "agent_end"}, wantErr: "carries no completed message"},
 		{name: "no payload", event: rawRunEvent{Type: "turn_end"}, wantErr: "missing payload"},
 		{name: "payload is a string", event: rawRunEvent{Type: "message_end", Message: []byte(`"nope"`)}, wantErr: "message"},
-		{name: "content is not a list", event: rawRunEvent{Type: "message_end", Message: []byte(`{"role":"assistant","content":"hi"}`)}, wantErr: "message"},
+		{name: "pi 1.6.1 system message has string content and extra sections", event: rawRunEvent{Type: "message_end", Message: []byte(`{"role":"system","content":"","sections":{"preamble":"You are a coding assistant."},"timestamp":1795698038023}`)}, wantRole: "system"},
+		{name: "string content is a single text part", event: rawRunEvent{Type: "message_end", Message: []byte(`{"role":"assistant","content":"hi"}`)}, wantRole: "assistant", wantText: "hi"},
+		{name: "content is neither a string nor a list", event: rawRunEvent{Type: "message_end", Message: []byte(`{"role":"assistant","content":7}`)}, wantErr: "message"},
 		{name: "no role", event: rawRunEvent{Type: "turn_end", Message: []byte(`{"content":[]}`)}, wantErr: "carries no role"},
 	}
 

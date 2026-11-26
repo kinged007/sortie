@@ -23,11 +23,6 @@ function subscribe(onChange: () => void): () => void {
   return () => observer.disconnect();
 }
 
-/**
- * Renders the rail-foot button that names the current theme and opens a menu of
- * the three choices, the current one checked. It opens upward and follows the
- * page theme, not the rail's.
- */
 export function ThemeMenu() {
   const choice = useSyncExternalStore(subscribe, getTheme);
   const current = CHOICES.find((entry) => entry.value === choice) ?? CHOICES[0];
@@ -35,14 +30,13 @@ export function ThemeMenu() {
   return (
     <Menu>
       <MenuTrigger
-        className={buttonStyles("ghost", "w-full justify-start font-regular")}
+        className={buttonStyles("ghost", "w-(--size-control) px-0")}
         title="Theme (T)"
+        aria-label="Theme"
       >
         <current.Icon />
-        Theme
-        <span className="ml-auto text-ink-body">{current.label}</span>
       </MenuTrigger>
-      <MenuPopup side="top" align="start">
+      <MenuPopup side="bottom" align="end">
         <MenuRadioGroup value={choice} onValueChange={setTheme}>
           {CHOICES.map(({ value, label, Icon }) => (
             <MenuRadioItem key={value} value={value}>

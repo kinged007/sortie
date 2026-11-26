@@ -28,7 +28,7 @@ The two gaps had to be settled in one decision. Any mechanism that sends aggrega
 - No outbound reporting, with operators aggregating the JSON output of the local reporting command using their own tooling
 - An opt-in export of Sortie's own aggregates to an operator-chosen endpoint, with no default destination and no project-operated receiver, so that the operator owns both ends
 - An opt-in report of aggregates to a project-operated endpoint, for aggregate insight across installations
-- External pull-based aggregation, in which a separate consumer polls each instance's existing HTTP surfaces and the orchestrator pushes nothing and is unchanged
+- External pull-based aggregation, in which a separate consumer polls each instance's HTTP surfaces and the orchestrator pushes nothing, adding at most read-only identifying data to those surfaces
 
 ## Decision Outcome
 
@@ -66,7 +66,7 @@ The first reading is that the Sortie binary is not a multi-tenant server. It hol
 
 The second reading is that cross-instance aggregation is therefore impossible. It is false, and the metric surface described above is the proof: the figures are already exposed, already labelled per instance by the scraper, and already aggregable. An external consumer that polls unmodified single-tenant instances does not make any of those instances multi-tenant. Each one continues to answer only for itself, on its own port, from its own database, with no knowledge that another instance exists.
 
-The direction is the load-bearing part, and it is recorded as a rule rather than a preference. The orchestrator does not push to any aggregator. Aggregation, if built, pulls. A push design would put a destination, a credential, a schedule, and a failure mode inside the orchestrator, and would make every instance aware of something outside itself. A pull design puts all four outside, leaves the orchestrator unchanged, and keeps the property that an instance exposing nothing is an instance nothing can collect from.
+The direction is the load-bearing part, and it is recorded as a rule rather than a preference. The orchestrator does not push to any aggregator. Aggregation, if built, pulls. A push design would put a destination, a credential, a schedule, and a failure mode inside the orchestrator, and would make every instance aware of something outside itself. A pull design puts all four outside, asks of the orchestrator at most read-only identifying data on its existing surfaces, and keeps the property that an instance exposing nothing is an instance nothing can collect from.
 
 ### Why the destination decides, and not the payload
 
@@ -108,14 +108,14 @@ These bind any later proposal to transmit anything, and are recorded so they are
 
 **An opt-in report to a project-operated endpoint.** This is the only option that answers a question the others cannot: how Sortie behaves across deployments that have no relationship with each other. That question is real, and no amount of operator-owned tooling answers it. It is rejected on the evidence set out above. A scheme that cannot prompt cannot reach a participation rate at which the responding population resembles the whole, and the resulting sample would be selected precisely on the axis that any conclusion drawn from it would concern. The obligation created by crossing an organizational boundary would be taken on in full, in exchange for data that does not support the inference it exists to support. Both premises are named above, and both are revisitable.
 
-**External pull-based aggregation.** This is not rejected. It is named as the shape any future cross-instance aggregation takes, and it is recorded here rather than adopted because it requires nothing of the orchestrator: the metric families, the scrape labels, and the JSON API it would read are already in place and unchanged by this decision. The reason it belongs in this record is that its existence is what narrows the first two options. Once it is clear that a pull-based consumer can already produce a cross-deployment view from unmodified instances, an outbound push mechanism is no longer the only way to answer the cross-instance question, and it has to justify itself on other grounds. Nothing is said here about what such a consumer would be or who would build one.
+**External pull-based aggregation.** This is not rejected. It is named as the shape any future cross-instance aggregation takes, and it is recorded here rather than adopted because it requires nothing of the orchestrator beyond read-only identifying data on surfaces it already has: the metric families, the scrape labels, and the JSON API it would read are already in place, and the JSON API names the tracked project so a consumer can tell instances apart. The reason it belongs in this record is that its existence is what narrows the first two options. Once it is clear that a pull-based consumer can already produce a cross-deployment view from instances that push nothing, an outbound push mechanism is no longer the only way to answer the cross-instance question, and it has to justify itself on other grounds. Nothing is said here about what such a consumer would be or who would build one.
 
 ## Consequences
 
 ### Positive
 
 - The outbound posture is a single stated fact rather than an inference: Sortie transmits no usage data, and an operator can assert that in an audited environment without reading the source.
-- The cross-instance question has an answer that requires no new mechanism, no new credential, and no change to the orchestrator.
+- The cross-instance question has an answer that requires no new mechanism, no new credential, and no change to the orchestrator beyond read-only identifying data on its existing surfaces.
 - The multi-tenant non-goal is stated in a form that no longer blocks work it was never meant to block, while continuing to exclude what it was written to exclude.
 - Any export, whether an operator's pipe today or a built-in feature later, has one figures document to match, so a second and divergent set of figures cannot appear by default.
 - The constraints binding a future outbound feature are settled, so a later proposal argues its own merits rather than re-opening consent, disablement, disclosure, and redaction from the start.

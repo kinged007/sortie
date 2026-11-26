@@ -4,11 +4,16 @@ import { NavLink, useNavigate } from "react-router";
 import { useStateQuery } from "@/api/queries";
 import { BrandMark } from "@/app/BrandMark";
 import { keyTip } from "@/app/key-tips";
-import { modifierLabel } from "@/app/keys";
 import { StatusCard } from "@/app/StatusCard";
-import { CircleHelpIcon, SearchIcon, XIcon } from "@/components/icons";
-import { ThemeMenu } from "@/components/ThemeMenu";
-import { Button } from "@/components/ui/button";
+import {
+  BookOpenIcon,
+  CircleHelpIcon,
+  ExternalLinkIcon,
+  GithubIcon,
+  SearchIcon,
+  XIcon,
+} from "@/components/icons";
+import { Button, buttonStyles } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import { fmtVersion, pluralVerb } from "@/lib/format";
 
@@ -16,12 +21,7 @@ import type { StateResponse } from "@/api/types.gen";
 import type { IconProps } from "@/components/icons";
 import type { KeyboardEvent, ReactNode } from "react";
 
-/**
- * One screen the shell can open. `key` is the letter pressed after `G`, `path`
- * is relative to the application's base path, and screens with the same `group`
- * sit together, with a divider between groups in ascending order. The screen at
- * path `/` is Overview, which carries the attention badge.
- */
+/** `key` is the letter pressed after `G`, `path` is relative to the application's base path, and screens with the same `group` sit together; the screen at `/` is Overview, which carries the attention badge. */
 export interface ScreenEntry {
   key: string;
   label: string;
@@ -31,6 +31,11 @@ export interface ScreenEntry {
 }
 
 const OVERVIEW_PATH = "/";
+
+const EXTERNAL_LINKS: { label: string; href: string; Icon: (props: IconProps) => ReactNode }[] = [
+  { label: "Documentation", href: "https://docs.sortie-ai.com", Icon: BookOpenIcon },
+  { label: "GitHub", href: "https://github.com/sortie-ai/sortie", Icon: GithubIcon },
+];
 
 function hasCriticalItem(state: StateResponse): boolean {
   return (state.attention ?? []).some(
@@ -54,8 +59,8 @@ function AttentionBadge({ state }: AttentionBadgeProps) {
   }
   const attentionPhrase = pluralVerb(count, ["item", "items"], ["needs", "need"]);
   const tone = hasCriticalItem(state)
-    ? "bg-error-fill text-on-warning-fill"
-    : "bg-warning-fill text-on-warning-fill";
+    ? "border border-error-border bg-error-container text-error"
+    : "border border-warning-border bg-warning-container text-warning";
   return (
     <span
       title={`${attentionPhrase.subject} ${attentionPhrase.verb} attention`}
@@ -82,7 +87,6 @@ interface NavFilterProps {
   onQueryChange: (query: string) => void;
 }
 
-// Enter opens the first match, so typing a few letters is enough to move.
 function NavFilter({ query, firstMatch, onQueryChange }: NavFilterProps) {
   const navigate = useNavigate();
 
@@ -111,7 +115,7 @@ function NavFilter({ query, firstMatch, onQueryChange }: NavFilterProps) {
         value={query}
         onChange={(event) => onQueryChange(event.target.value)}
         onKeyDown={handleKeyDown}
-        className="h-(--size-control) w-full rounded-lg border border-line bg-canvas pr-xl pl-[calc(var(--spacing-sm)+var(--size-icon)+var(--spacing-xs))] text-body-md text-ink outline-none transition-colors duration-(--duration-feedback) placeholder:text-ink-muted hover:border-line-medium focus-visible:border-line-medium focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring"
+        className="h-(--size-control) w-full rounded-lg border border-line bg-field pr-xl pl-[calc(var(--spacing-sm)+var(--size-icon)+var(--spacing-xs))] text-body-md text-ink outline-none transition-colors duration-(--duration-feedback) placeholder:text-ink-muted hover:border-line-medium focus-visible:border-line-medium focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring"
       />
       {query === "" ? undefined : (
         <button
@@ -127,19 +131,17 @@ function NavFilter({ query, firstMatch, onQueryChange }: NavFilterProps) {
   );
 }
 
-/** Props of {@link Rail}. */
 export interface RailProps {
   screens: ScreenEntry[];
-  onOpenPalette: () => void;
   onOpenShortcuts: () => void;
 }
 
-/** Renders the dark navigation rail: brand, screen filter, one entry per matching screen, the status card, and the foot controls. */
-export function Rail({ screens, onOpenPalette, onOpenShortcuts }: RailProps) {
+export function Rail({ screens, onOpenShortcuts }: RailProps) {
   const { data } = useStateQuery();
   const [query, setQuery] = useState("");
   const shown = matching(screens, query);
   const groups = groupsOf(shown);
+  const project = data?.config?.tracker.project;
 
   return (
     <aside
@@ -147,15 +149,23 @@ export function Rail({ screens, onOpenPalette, onOpenShortcuts }: RailProps) {
       aria-label="Sortie navigation"
       className="sticky top-0 hidden h-screen flex-col bg-surface px-sm py-lg text-ink [--ghost-hover:var(--color-item-hover-panel)] [--ghost-pressed:var(--color-item-selected-panel)] md:flex"
     >
-      <div className="flex items-center gap-sm px-sm pb-md">
+      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-sm px-sm pb-md">
         <BrandMark />
         <span className="font-heading text-h7 font-semibold">Sortie</span>
         {data === undefined ? undefined : (
           <span
             title={data.version}
-            className="ml-auto whitespace-nowrap text-body-sm text-ink-muted"
+            className="justify-self-end whitespace-nowrap text-body-sm text-ink-muted"
           >
             {fmtVersion(data.version)}
+          </span>
+        )}
+        {project === undefined || project === "" ? undefined : (
+          <span
+            title={project}
+            className="col-span-2 col-start-2 truncate text-body-sm text-ink-muted"
+          >
+            {project}
           </span>
         )}
       </div>
@@ -190,15 +200,20 @@ export function Rail({ screens, onOpenPalette, onOpenShortcuts }: RailProps) {
         <div className="mb-sm">
           <StatusCard />
         </div>
-        <Button
-          variant="ghost"
-          className="w-full justify-start font-regular"
-          onClick={onOpenPalette}
-          title={keyTip("Commands", modifierLabel(), "K")}
-        >
-          <SearchIcon />
-          Commands
-        </Button>
+        {EXTERNAL_LINKS.map(({ label, href, Icon }) => (
+          <a
+            key={href}
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`${label}, opens in a new tab`}
+            className={buttonStyles("ghost", "w-full justify-start font-regular")}
+          >
+            <Icon />
+            {label}
+            <ExternalLinkIcon className="ml-auto text-ink-muted" />
+          </a>
+        ))}
         <Button
           variant="ghost"
           className="w-full justify-start font-regular"
@@ -208,7 +223,6 @@ export function Rail({ screens, onOpenPalette, onOpenShortcuts }: RailProps) {
           <CircleHelpIcon />
           Shortcuts
         </Button>
-        <ThemeMenu />
       </div>
     </aside>
   );

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -53,6 +54,25 @@ func LiveDescendants(root int) []int {
 		queue = append(queue, children[queue[0]]...)
 	}
 	return descendants
+}
+
+// KillEscaped sends SIGKILL to the process pidFile names and to each of its
+// live descendants; a pidFile that is missing, does not parse, or names a
+// number not above 1 kills nothing. The descendants are listed before anything
+// is sent because a killed leader's children leave its tree.
+func KillEscaped(pidFile string) {
+	raw, err := os.ReadFile(pidFile) //nolint:gosec // the caller names its own fixture file
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		return
+	}
+	victims := append([]int{pid}, LiveDescendants(pid)...)
+	for _, victim := range victims {
+		_ = syscall.Kill(victim, syscall.SIGKILL)
+	}
 }
 
 // processChildren maps each parent id to its live children, in table order.

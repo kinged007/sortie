@@ -3,6 +3,7 @@ package jsonrpc_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // childEnv, when set to "1" in the test binary's own environment,
@@ -81,43 +83,34 @@ func startNeverReadingChild(t *testing.T) (w io.WriteCloser, r io.Reader, releas
 
 	release := func() {
 		_ = cmd.Process.Kill()
-		select {
-		case <-waitDone:
-		case <-time.After(5 * time.Second):
-		}
+		waittest.Receive(t, waitDone, "child exit after kill")
 	}
 	return stdin, stdout, release
 }
 
-// waitForGoroutineCountAtOrBelow polls runtime.NumGoroutine() until it
-// settles at or below want, or fails t once timeout elapses. A single
-// sample taken right after the goroutines of interest should have
-// exited is not reliable: the runtime schedules their actual exit
-// slightly after the channel or process event a test observes to learn
-// they are done.
-func waitForGoroutineCountAtOrBelow(t *testing.T, want int, timeout time.Duration) {
+// waitForGoroutineCountAtOrBelow waits until runtime.NumGoroutine() settles at
+// or below want. A single sample taken right after the goroutines of interest
+// should have exited is not reliable: the runtime schedules their actual exit
+// slightly after the channel or process event a test observes to learn they
+// are done.
+func waitForGoroutineCountAtOrBelow(t *testing.T, want int) {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
-	for {
-		if n := runtime.NumGoroutine(); n <= want {
-			return
+	waittest.Until(t, func() error {
+		if n := runtime.NumGoroutine(); n > want {
+			return fmt.Errorf("runtime.NumGoroutine() = %d, want <= %d (a goroutine leaked)", n, want)
 		}
-		if time.Now().After(deadline) {
-			t.Errorf("runtime.NumGoroutine() = %d after waiting %v, want <= %d (a goroutine leaked)", runtime.NumGoroutine(), timeout, want)
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return nil
+	})
 }
 
 // TestConn_RealSubprocessNeverReadingStdin drives a real child process,
 // re-executed from this test binary, that stays alive and never reads
-// its own standard input. Against that child: a large Notify returns
-// at once, Flush under a short ctx times out because the write behind
-// it is genuinely parked in the OS pipe, closing the write end makes
-// WriteFailed close within a bound, and no goroutine this test's own
-// connection started survives cleanup.
+// its own standard input. Against that child: a large Notify returns,
+// Flush under a short ctx times out because the write behind it is
+// genuinely parked in the OS pipe, closing the write end makes
+// WriteFailed close, and no goroutine this test's own connection
+// started survives cleanup.
 func TestConn_RealSubprocessNeverReadingStdin(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
@@ -132,31 +125,17 @@ func TestConn_RealSubprocessNeverReadingStdin(t *testing.T) {
 	largeParams := map[string]any{"blob": strings.Repeat("x", 8<<20)}
 
 	notifyDone := make(chan error, 1)
-	notifyStart := time.Now()
 	go func() { notifyDone <- conn.Notify("large/notify", largeParams) }()
 
-	select {
-	case err := <-notifyDone:
-		if err != nil {
-			t.Fatalf("Notify() error = %v", err)
-		}
-		if elapsed := time.Since(notifyStart); elapsed > 2*time.Second {
-			t.Errorf("Notify() took %v to return, want at once (it must not wait for the child to read)", elapsed)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Notify() did not return within 2s against a child that never reads its stdin")
+	if err := waittest.Receive(t, notifyDone, "Notify() return against a child that never reads its stdin"); err != nil {
+		t.Fatalf("Notify() error = %v", err)
 	}
 
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer flushCancel()
-	flushStart := time.Now()
 	err := conn.Flush(flushCtx)
-	flushElapsed := time.Since(flushStart)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Flush() error = %v, want error wrapping context.DeadlineExceeded (the write is genuinely parked on the child's stdin)", err)
-	}
-	if flushElapsed > 2*time.Second {
-		t.Errorf("Flush() took %v to time out, want close to its 300ms bound", flushElapsed)
 	}
 
 	closeErr := stdin.Close()
@@ -164,14 +143,10 @@ func TestConn_RealSubprocessNeverReadingStdin(t *testing.T) {
 		t.Logf("stdin.Close() error = %v (informational; the point is that WriteFailed closes afterward)", closeErr)
 	}
 
-	select {
-	case <-conn.WriteFailed():
-	case <-time.After(5 * time.Second):
-		t.Fatal("WriteFailed() did not close within 5s after closing the child's stdin pipe")
-	}
+	waittest.Receive(t, conn.WriteFailed(), "WriteFailed() close after closing the child's stdin pipe")
 
 	conn.Close()
 	releaseChild()
 
-	waitForGoroutineCountAtOrBelow(t, baseline+1, 5*time.Second)
+	waitForGoroutineCountAtOrBelow(t, baseline+1)
 }

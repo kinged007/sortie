@@ -585,14 +585,30 @@ func (a *GitHubAdapter) fetchClosedIssuesByLabel(ctx context.Context, label stri
 func (a *GitHubAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []string) (map[string]string, error) {
 	var states map[string]string
 	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
-		fetchedStates, err := a.fetchStatesByNumbers(ctx, issueIDs)
+		reads, err := a.fetchStatesByNumbers(ctx, issueIDs)
 		if err != nil {
 			return err
 		}
-		states = fetchedStates
+		states = issuekit.StatesOf(reads)
 		return nil
 	})
 	return states, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the current state and labels for
+// each requested issue ID. A conditional-request hit reports the labels the
+// cache holds for the issue. The query filter is not applied.
+func (a *GitHubAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		fetched, err := a.fetchStatesByNumbers(ctx, issueIDs)
+		if err != nil {
+			return err
+		}
+		reads = fetched
+		return nil
+	})
+	return reads, err
 }
 
 // FetchIssueStatesByIdentifiers returns the current state for each
@@ -601,67 +617,69 @@ func (a *GitHubAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []st
 func (a *GitHubAdapter) FetchIssueStatesByIdentifiers(ctx context.Context, identifiers []string) (map[string]string, error) {
 	var states map[string]string
 	err := trackermetrics.Track(a.metrics, "fetch_states_by_identifiers", func() error {
-		fetchedStates, err := a.fetchStatesByNumbers(ctx, identifiers)
+		reads, err := a.fetchStatesByNumbers(ctx, identifiers)
 		if err != nil {
 			return err
 		}
-		states = fetchedStates
+		states = issuekit.StatesOf(reads)
 		return nil
 	})
 	return states, err
 }
 
-func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []string) (map[string]string, error) {
+func (a *GitHubAdapter) fetchStatesByNumbers(ctx context.Context, numbers []string) (map[string]domain.IssueStateAndLabels, error) {
 	if len(numbers) == 0 {
-		return map[string]string{}, nil
+		return map[string]domain.IssueStateAndLabels{}, nil
 	}
 
 	snapshot := a.model.Snapshot()
-	states := make(map[string]string, len(numbers))
-	for _, num := range numbers {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	return issuekit.ReadStates(ctx, numbers, func(ctx context.Context, num string) (domain.IssueStateAndLabels, bool, error) {
+		return a.readState(ctx, snapshot, num)
+	})
+}
 
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(num)
-		etag, cachedLabels, cachedClosed, cacheHit := a.etagCache.lookup(path)
+// readState reads one issue's state and labels, reporting false for an
+// issue that does not exist or is a pull request.
+func (a *GitHubAdapter) readState(ctx context.Context, snapshot issuekit.LabelStates, num string) (domain.IssueStateAndLabels, bool, error) {
+	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(num)
+	etag, cachedLabels, cachedClosed, cacheHit := a.etagCache.lookup(path)
 
-		body, responseETag, notModified, err := a.client.GetConditional(ctx, path, etag, nil)
-		if err != nil {
-			if domain.IsNotFound(err) {
-				continue
-			}
-			return nil, err
+	body, responseETag, notModified, err := a.client.GetConditional(ctx, path, etag, nil)
+	if err != nil {
+		if domain.IsNotFound(err) {
+			return domain.IssueStateAndLabels{}, false, nil
 		}
-
-		if notModified && cacheHit {
-			a.etagCache.touch(path)
-			states[num] = a.model.Derive(snapshot, num, cachedLabels, cachedClosed)
-			continue
-		}
-
-		var gi githubIssue
-		if err := json.Unmarshal(body, &gi); err != nil {
-			return nil, &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to parse issue response",
-				Err:     err,
-			}
-		}
-		if isPullRequest(gi) {
-			continue
-		}
-		labels := githubLabelNames(gi.Labels)
-		closed := isClosed(gi)
-
-		if responseETag != "" {
-			a.etagCache.put(path, responseETag, labels, closed)
-		}
-
-		states[num] = a.model.Derive(snapshot, num, labels, closed)
+		return domain.IssueStateAndLabels{}, false, err
 	}
 
-	return states, nil
+	if notModified && cacheHit {
+		a.etagCache.touch(path)
+		return domain.IssueStateAndLabels{
+			State:  a.model.Derive(snapshot, num, cachedLabels, cachedClosed),
+			Labels: issuekit.NormalizeLabels(cachedLabels),
+		}, true, nil
+	}
+
+	var gi githubIssue
+	if err := json.Unmarshal(body, &gi); err != nil {
+		return domain.IssueStateAndLabels{}, false, &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to parse issue response",
+			Err:     err,
+		}
+	}
+	if isPullRequest(gi) {
+		return domain.IssueStateAndLabels{}, false, nil
+	}
+	labels := githubLabelNames(gi.Labels)
+	closed := isClosed(gi)
+	if responseETag != "" {
+		a.etagCache.put(path, responseETag, labels, closed)
+	}
+	return domain.IssueStateAndLabels{
+		State:  a.model.Derive(snapshot, num, labels, closed),
+		Labels: issuekit.NormalizeLabels(labels),
+	}, true, nil
 }
 
 // FetchIssueComments returns comments for the specified issue.
@@ -765,14 +783,6 @@ func (a *GitHubAdapter) setIssueClosed(ctx context.Context, issuePath string, cl
 func (a *GitHubAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(ctx, issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GitHubAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

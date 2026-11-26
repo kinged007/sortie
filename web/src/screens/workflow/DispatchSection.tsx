@@ -1,5 +1,6 @@
 import { Fragment } from "react";
 
+import { Code } from "@/components/Code";
 import { ArrowRightIcon } from "@/components/icons";
 import { fmtCount } from "@/lib/format";
 import { Panel } from "@/components/Panel";
@@ -13,7 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-import { Code, Note, selectionText } from "./workflow-text";
+import { Note, selectionText } from "./workflow-text";
 
 import type { ShapeAgent, ShapeDispatch, ShapeRule } from "@/api/types.gen";
 import type { ReactNode } from "react";
@@ -37,10 +38,8 @@ function Fallback({ dispatch, agent }: FallbackProps) {
 
 interface StepProps {
   marker: ReactNode;
-  /** Whether a connector runs down from this step's marker to the next step. */
   hasNext: boolean;
   title: ReactNode;
-  /** A muted fact beside the title, such as the agent the stage runs. */
   aside?: ReactNode;
   detail: ReactNode;
 }
@@ -197,7 +196,6 @@ function hopNote(dispatch: ShapeDispatch): ReactNode {
   );
 }
 
-/** Props of {@link DispatchSection}. */
 export interface DispatchSectionProps {
   dispatch: ShapeDispatch;
   agent: ShapeAgent;
@@ -205,7 +203,6 @@ export interface DispatchSectionProps {
   hasReactions: boolean;
 }
 
-/** Renders Dispatch: the rules outside any chain as one table, then each stage chain as a numbered list ending on the handoff state. */
 export function DispatchSection({
   dispatch,
   agent,

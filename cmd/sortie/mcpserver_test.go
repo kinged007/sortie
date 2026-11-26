@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -17,29 +18,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/tool/mcpserver"
 	"github.com/sortie-ai/sortie/internal/tool/notify"
 	"github.com/sortie-ai/sortie/internal/tool/status"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workspacekit"
 )
 
 var agentMessageEvents = []domain.EventType{domain.EventAgentMessage}
-
-func TestRunMCPServer_Help_ReturnsZero(t *testing.T) {
-	t.Parallel()
-
-	var stdout, stderr bytes.Buffer
-	code := runMCPServer(context.Background(), []string{"--help"}, &stdout, &stderr)
-	if code != 0 {
-		t.Errorf("runMCPServer(--help) = %d, want 0", code)
-	}
-	if !strings.Contains(stdout.String(), "--workflow PATH") {
-		t.Errorf("stdout = %q, want to contain %q", stdout.String(), "--workflow PATH")
-	}
-}
 
 func TestRunMCPServer_MissingWorkflow_ReturnsOne(t *testing.T) {
 	t.Parallel()
@@ -63,6 +54,36 @@ func TestRunMCPServer_InvalidWorkflowPath_ReturnsOne(t *testing.T) {
 	}
 }
 
+func TestRunMCPServer_HTTPWithoutBearer_ReturnsOne(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		unset bool
+	}{
+		{"bearer unset", true},
+		{"bearer empty", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(mcpconfig.BearerEnv, "")
+			if tt.unset {
+				os.Unsetenv(mcpconfig.BearerEnv) //nolint:errcheck // t.Setenv restores the original value on cleanup
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := runMCPServer(context.Background(), []string{"--http", "--workflow", filepath.Join(t.TempDir(), "WORKFLOW.md")}, &stdout, &stderr)
+
+			if code != 1 {
+				t.Errorf("runMCPServer(--http, %s) = %d, want 1", tt.name, code)
+			}
+			if !strings.Contains(stderr.String(), mcpconfig.BearerEnv) {
+				t.Errorf("runMCPServer(--http, %s) stderr = %q, want to contain %q", tt.name, stderr.String(), mcpconfig.BearerEnv)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("runMCPServer(--http, %s) stdout = %q, want empty", tt.name, stdout.String())
+			}
+		})
+	}
+}
+
 // writeMCPStateFile writes a state.json file to <dir>/.sortie/ for use in
 // MCP server smoke tests.
 func writeMCPStateFile(t *testing.T, dir string, data map[string]any) {
@@ -81,38 +102,58 @@ func writeMCPStateFile(t *testing.T, dir string, data map[string]any) {
 	}
 }
 
-// buildMCPRequest constructs a newline-terminated JSON-RPC 2.0 request string.
-func buildMCPRequest(t *testing.T, method string, id any, params any) string {
+func serveMCP(t *testing.T, reg *domain.ToolRegistry, method string, params any) map[string]any {
 	t.Helper()
-	type req struct {
-		JSONRPC string `json:"jsonrpc"`
-		ID      any    `json:"id"`
-		Method  string `json:"method"`
-		Params  any    `json:"params,omitempty"`
-	}
-	b, err := json.Marshal(req{JSONRPC: "2.0", ID: id, Method: method, Params: params})
-	if err != nil {
-		t.Fatalf("buildMCPRequest(%q): %v", method, err)
-	}
-	return string(b) + "\n"
-}
 
-// parseMCPResponses splits newline-delimited JSON into a slice of maps.
-func parseMCPResponses(t *testing.T, data []byte) []map[string]any {
-	t.Helper()
-	var results []map[string]any
-	for line := range bytes.SplitSeq(data, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	lines := make(chan []byte, 2)
+	go func() {
+		done <- mcpserver.NewServer(reg, slog.New(slog.DiscardHandler), "test").Serve(waittest.Context(t), inR, outW)
+		_ = outW.Close()
+	}()
+	go func() {
+		for scanner := bufio.NewScanner(outR); scanner.Scan(); {
+			lines <- bytes.Clone(scanner.Bytes())
 		}
-		var m map[string]any
-		if err := json.Unmarshal(line, &m); err != nil {
-			t.Fatalf("parseMCPResponses: unmarshal %q: %v", line, err)
+	}()
+	t.Cleanup(func() {
+		_ = inW.Close()
+		if err := waittest.Receive(t, done, "Serve to return"); err != nil {
+			t.Errorf("Serve() = %v, want nil on end of input", err)
 		}
-		results = append(results, m)
+	})
+
+	write := func(request map[string]any) {
+		t.Helper()
+		b, err := json.Marshal(request)
+		if err != nil {
+			t.Fatalf("marshal %v: %v", request, err)
+		}
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatalf("write %v: %v", request, err)
+		}
 	}
-	return results
+	write(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test", "version": "1"},
+	}})
+	waittest.Receive(t, lines, "initialize response")
+	write(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	write(map[string]any{"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
+
+	var resp struct {
+		Result map[string]any
+		Error  json.RawMessage
+	}
+	line := waittest.Receive(t, lines, method+" response")
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("decode %q: %v", line, err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("%s error = %s, want a result", method, resp.Error)
+	}
+	return resp.Result
 }
 
 func TestMCPServer_StatusTool_Dispatch(t *testing.T) {
@@ -136,32 +177,11 @@ func TestMCPServer_StatusTool_Dispatch(t *testing.T) {
 		return workspacekit.ReadSortieFile(dir, name, maxBytes)
 	}))
 
-	input := buildMCPRequest(t, "tools/call", 1, map[string]any{
+	result := serveMCP(t, reg, "tools/call", map[string]any{
 		"name":      "sortie_status",
 		"arguments": map[string]any{},
 	})
 
-	var outBuf bytes.Buffer
-	logger := slog.New(slog.DiscardHandler)
-	srv := mcpserver.NewServer(reg, strings.NewReader(input), &outBuf, logger, "test")
-	if err := srv.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
-
-	resps := parseMCPResponses(t, outBuf.Bytes())
-	if len(resps) != 1 {
-		t.Fatalf("response count = %d, want 1", len(resps))
-	}
-	resp := resps[0]
-
-	if resp["error"] != nil {
-		t.Fatalf("JSON-RPC error: %v", resp["error"])
-	}
-
-	result, ok := resp["result"].(map[string]any)
-	if !ok {
-		t.Fatalf("result is not an object: %v", resp["result"])
-	}
 	content, ok := result["content"].([]any)
 	if !ok || len(content) == 0 {
 		t.Fatalf("content = %v, want non-empty array", result["content"])
@@ -302,14 +322,14 @@ func TestBuildBudgetQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
-		if usage.CompletedTotalTokens != 600 {
-			t.Errorf("CompletedTotalTokens = %d, want 600", usage.CompletedTotalTokens)
+		if usage.CompletedUncachedTokens != 600 {
+			t.Errorf("CompletedUncachedTokens = %d, want 600", usage.CompletedUncachedTokens)
 		}
 		if usage.CompletedSessions != 2 {
 			t.Errorf("CompletedSessions = %d, want 2", usage.CompletedSessions)
 		}
-		if usage.RunningTotalTokens != 150 {
-			t.Errorf("RunningTotalTokens = %d, want 150 (dispatch_id matches)", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 150 {
+			t.Errorf("RunningUncachedTokens = %d, want 150 (dispatch_id matches)", usage.RunningUncachedTokens)
 		}
 		if usage.UnaccountedTurns != 2 {
 			t.Errorf("UnaccountedTurns = %d, want 2 (running row's count after the conflict update)", usage.UnaccountedTurns)
@@ -327,11 +347,11 @@ func TestBuildBudgetQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
-		if usage.CompletedTotalTokens != 600 {
-			t.Errorf("CompletedTotalTokens = %d, want 600", usage.CompletedTotalTokens)
+		if usage.CompletedUncachedTokens != 600 {
+			t.Errorf("CompletedUncachedTokens = %d, want 600", usage.CompletedUncachedTokens)
 		}
-		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0 (stale dispatch row)", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 0 {
+			t.Errorf("RunningUncachedTokens = %d, want 0 (stale dispatch row)", usage.RunningUncachedTokens)
 		}
 		if usage.UnaccountedTurns != 0 {
 			t.Errorf("UnaccountedTurns = %d, want 0 (stale dispatch row)", usage.UnaccountedTurns)
@@ -350,8 +370,8 @@ func TestBuildBudgetQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
-		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0 (dispatch_id cleared, not a session_id match)", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 0 {
+			t.Errorf("RunningUncachedTokens = %d, want 0 (dispatch_id cleared, not a session_id match)", usage.RunningUncachedTokens)
 		}
 		if usage.RunningMeasured {
 			t.Error("RunningMeasured = true, want false")
@@ -367,8 +387,8 @@ func TestBuildBudgetQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
-		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0 (no running dispatch id)", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 0 {
+			t.Errorf("RunningUncachedTokens = %d, want 0 (no running dispatch id)", usage.RunningUncachedTokens)
 		}
 	})
 
@@ -381,17 +401,12 @@ func TestBuildBudgetQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildBudgetQuery query: %v", err)
 		}
-		if usage.CompletedTotalTokens != 0 || usage.CompletedSessions != 0 || usage.RunningTotalTokens != 0 {
+		if usage.CompletedUncachedTokens != 0 || usage.CompletedSessions != 0 || usage.RunningUncachedTokens != 0 {
 			t.Errorf("usage = %+v, want all-zero", usage)
 		}
 	})
 }
 
-// seedBudgetMeasurementStore builds a store with run_history and
-// session_metadata rows exercising the three running-session measurement
-// cases: a mismatched running session id (unmeasured), a matching row
-// reporting a genuine spend, and a matching row reporting a measurement
-// of zero.
 func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 	t.Helper()
 	ctx := context.Background()
@@ -421,6 +436,21 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 			Workspace: "/tmp/ws/PROJ-ZERO", StartedAt: "2026-03-19T10:00:00Z", CompletedAt: "2026-03-19T10:00:30Z",
 			Status: "succeeded", TotalTokens: 500, TokensMeasured: true,
 		},
+		{
+			IssueID: "iss-priced", Identifier: "PROJ-PRICED", Attempt: 1, AgentAdapter: "mock",
+			Workspace: "/tmp/ws/PROJ-PRICED", StartedAt: "2026-03-19T10:00:00Z", CompletedAt: "2026-03-19T10:00:30Z",
+			Status: "succeeded", TotalTokens: 300, TokensMeasured: true, EstimatedCostUSD: new(0.5), CostStatus: "estimated",
+		},
+		{
+			IssueID: "iss-priced-gap", Identifier: "PROJ-GAP", Attempt: 1, AgentAdapter: "mock",
+			Workspace: "/tmp/ws/PROJ-GAP", StartedAt: "2026-03-19T10:00:00Z", CompletedAt: "2026-03-19T10:00:30Z",
+			Status: "succeeded", TotalTokens: 300, TokensMeasured: true, EstimatedCostUSD: new(0.5), CostStatus: "estimated",
+		},
+		{
+			IssueID: "iss-priced-gap", Identifier: "PROJ-GAP", Attempt: 2, AgentAdapter: "mock",
+			Workspace: "/tmp/ws/PROJ-GAP", StartedAt: "2026-03-19T10:01:00Z", CompletedAt: "2026-03-19T10:01:30Z",
+			Status: "succeeded", TotalTokens: 200, TokensMeasured: true,
+		},
 	}
 	for i, run := range runs {
 		if _, err := rw.AppendRunHistory(ctx, run); err != nil {
@@ -431,6 +461,8 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 	metas := []persistence.SessionMetadata{
 		{IssueID: "iss-mixed", SessionID: "sess-mixed-live", DispatchID: "dispatch-mixed-live", TotalTokens: 50, UpdatedAt: "2026-03-19T10:02:00Z"},
 		{IssueID: "iss-zero", SessionID: "sess-zero-live", DispatchID: "dispatch-zero-live", TotalTokens: 0, UpdatedAt: "2026-03-19T10:02:00Z"},
+		{IssueID: "iss-priced", SessionID: "sess-priced-live", DispatchID: "dispatch-priced-live", TotalTokens: 100, EstimatedCostUSD: new(0.125), CostStatus: "estimated", UpdatedAt: "2026-03-19T10:02:00Z"},
+		{IssueID: "iss-priced-gap", SessionID: "sess-gap-live", DispatchID: "dispatch-gap-live", TotalTokens: 100, EstimatedCostUSD: new(0.125), CostStatus: "estimated", UpdatedAt: "2026-03-19T10:02:00Z"},
 	}
 	for _, meta := range metas {
 		if err := rw.UpsertSessionMetadata(ctx, meta); err != nil {
@@ -454,10 +486,6 @@ func seedBudgetMeasurementStore(t *testing.T) *persistence.Store {
 	return ro
 }
 
-// TestBuildBudgetQuery_Measurement covers the wiring layer's
-// UnmeasuredSessions and RunningMeasured population, at the three
-// running-session cases the budget tool's own test suite exercises at
-// the result-shape layer.
 func TestBuildBudgetQuery_Measurement(t *testing.T) {
 	t.Parallel()
 
@@ -473,14 +501,14 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 		if usage.UnmeasuredSessions != 1 {
 			t.Errorf("UnmeasuredSessions = %d, want 1", usage.UnmeasuredSessions)
 		}
-		if usage.CompletedTotalTokens != 400 {
-			t.Errorf("CompletedTotalTokens = %d, want 400 (the unmeasured row contributes zero)", usage.CompletedTotalTokens)
+		if usage.CompletedUncachedTokens != 400 {
+			t.Errorf("CompletedUncachedTokens = %d, want 400 (the unmeasured row contributes zero)", usage.CompletedUncachedTokens)
 		}
 		if !usage.RunningMeasured {
 			t.Error("RunningMeasured = false, want true (session_metadata row matches the running dispatch id)")
 		}
-		if usage.RunningTotalTokens != 50 {
-			t.Errorf("RunningTotalTokens = %d, want 50", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 50 {
+			t.Errorf("RunningUncachedTokens = %d, want 50", usage.RunningUncachedTokens)
 		}
 	})
 
@@ -496,8 +524,8 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 		if usage.RunningMeasured {
 			t.Error("RunningMeasured = true, want false (no matching session_metadata row)")
 		}
-		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 0 {
+			t.Errorf("RunningUncachedTokens = %d, want 0", usage.RunningUncachedTokens)
 		}
 	})
 
@@ -516,13 +544,68 @@ func TestBuildBudgetQuery_Measurement(t *testing.T) {
 		if !usage.RunningMeasured {
 			t.Error("RunningMeasured = false, want true (the session_metadata row exists, reporting zero)")
 		}
-		if usage.RunningTotalTokens != 0 {
-			t.Errorf("RunningTotalTokens = %d, want 0", usage.RunningTotalTokens)
+		if usage.RunningUncachedTokens != 0 {
+			t.Errorf("RunningUncachedTokens = %d, want 0", usage.RunningUncachedTokens)
 		}
-		if usage.CompletedTotalTokens != 500 {
-			t.Errorf("CompletedTotalTokens = %d, want 500", usage.CompletedTotalTokens)
+		if usage.CompletedUncachedTokens != 500 {
+			t.Errorf("CompletedUncachedTokens = %d, want 500", usage.CompletedUncachedTokens)
 		}
 	})
+}
+
+func TestBuildBudgetQuery_UsedUSD(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		issueID    string
+		dispatchID string
+		recorded   pricing.RecordedCost
+		session    pricing.SessionCost
+		complete   bool
+	}{
+		{
+			name:       "recorded run plus the running dispatch's estimate",
+			issueID:    "iss-priced",
+			dispatchID: "dispatch-priced-live",
+			recorded:   pricing.RecordedCost{USD: 0.5, Priced: 1},
+			session:    pricing.SessionCost{USD: new(0.125), Status: pricing.CostEstimated, Spent: true},
+			complete:   true,
+		},
+		{
+			name:       "another dispatch's row adds nothing",
+			issueID:    "iss-priced",
+			dispatchID: "dispatch-other",
+			recorded:   pricing.RecordedCost{USD: 0.5, Priced: 1},
+		},
+		{
+			name:       "an unpriced recorded run keeps the figure incomplete",
+			issueID:    "iss-priced-gap",
+			dispatchID: "dispatch-gap-live",
+			recorded:   pricing.RecordedCost{USD: 0.5, Priced: 1, Unpriced: 1},
+			session:    pricing.SessionCost{USD: new(0.125), Status: pricing.CostEstimated, Spent: true},
+			complete:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			query := buildBudgetQuery(seedBudgetMeasurementStore(t))
+			wantUSD, wantStatus := pricing.IssueCost(tt.recorded, tt.session, tt.complete)
+
+			usage, err := query(context.Background(), tt.issueID, tt.dispatchID)
+			if err != nil {
+				t.Fatalf("buildBudgetQuery query: %v", err)
+			}
+
+			if usage.UsedUSD != wantUSD || usage.UsedUSDComplete != (wantStatus == pricing.CostEstimated) {
+				t.Errorf("query(%q, %q) = UsedUSD %v, UsedUSDComplete %v, want %v, %v",
+					tt.issueID, tt.dispatchID, usage.UsedUSD, usage.UsedUSDComplete, wantUSD, wantStatus == pricing.CostEstimated)
+			}
+		})
+	}
 }
 
 // TestSessionToolParamsFromEnv covers env-to-SessionToolParams mapping:
@@ -931,6 +1014,22 @@ func mcpServerWorkflow(notificationsYAML string) []byte {
 	return []byte(base)
 }
 
+// emptyStdin gives Serve its own handle, as it closes stdin. Not for parallel
+// tests: it swaps the process-wide os.Stdin.
+func emptyStdin(t *testing.T) {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	orig := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = orig
+		_ = f.Close()
+	})
+}
+
 // TestRunMCPServer_SuccessPath exercises the section of runMCPServer
 // starting at line 106: SORTIE_ATTEMPT parsing, env-to-SessionToolParams
 // mapping, BuildSessionToolRegistry call, and the final Serve invocation.
@@ -955,6 +1054,8 @@ func TestRunMCPServer_SuccessPath_ReturnsZero(t *testing.T) {
 	t.Setenv("SORTIE_ISSUE_ID", "issue-99")
 	t.Setenv("SORTIE_ISSUE_IDENTIFIER", "PROJ-99")
 	t.Setenv("SORTIE_SESSION_AGENT_KIND", "mock")
+
+	emptyStdin(t)
 
 	var stdout, stderr bytes.Buffer
 	code := runMCPServer(context.Background(), []string{"--workflow", wfPath}, &stdout, &stderr)
@@ -1004,6 +1105,8 @@ func TestRunMCPServer_InvalidAttemptIgnored_ReturnsZero(t *testing.T) {
 	}
 
 	t.Setenv("SORTIE_ATTEMPT", "not-a-number")
+
+	emptyStdin(t)
 
 	var stdout, stderr bytes.Buffer
 	code := runMCPServer(context.Background(), []string{"--workflow", wfPath}, &stdout, &stderr)

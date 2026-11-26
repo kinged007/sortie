@@ -18,7 +18,6 @@ import (
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
-	"github.com/sortie-ai/sortie/internal/server"
 	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
@@ -45,15 +44,13 @@ var workflowValidate workflow.ValidateFunc = func(cfg config.ServiceConfig) erro
 // the program constructs wires through [workflow.WithAdvisoryFunc], so a
 // workflow reaching a deprecated agent kind, an effort setting on a kind
 // that forwards none, a rule that changes the model but keeps an inherited
-// effort level, an invalid token_rates entry, or a stage chain needing more
-// runs than agent.max_sessions allows draws the same advisory on every
-// load path. It also reports each deprecated
-// notification setting the workflow relies on.
+// effort level, or a stage chain needing more runs than agent.max_sessions
+// allows draws the same advisory on every load path. It also reports each
+// deprecated notification setting the workflow relies on.
 var workflowAdvisories workflow.AdvisoryFunc = func(cfg config.ServiceConfig) []config.Advisory {
 	advisories := orchestrator.AgentKindDeprecations(cfg, registry.Agents.Meta)
 	advisories = append(advisories, orchestrator.AgentKindEffortAdvisories(cfg, registry.Agents.Meta)...)
 	advisories = append(advisories, orchestrator.DispatchRuleEffortAdvisories(cfg)...)
-	advisories = append(advisories, server.TokenRateAdvisories(cfg)...)
 	advisories = append(advisories, orchestrator.StageChainAdvisories(cfg)...)
 	return append(advisories, route.Advisories(cfg)...)
 }
@@ -77,6 +74,8 @@ type bootResult struct {
 	serverEnabled   bool
 	portIsImplicit  bool
 	dryRun          bool
+	once            bool
+	onceResultPath  string
 	effectiveLevel  slog.Level
 	effectiveFormat logging.Format
 }
@@ -107,6 +106,8 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 	logFormat := fs.String("log-format", "", `Log output format: "text", "json" (default "text")`)
 	logLevel := fs.String("log-level", "", `Log verbosity: "debug", "info", "warn", "error" (default "info")`)
 	dryRun := fs.Bool("dry-run", false, "Run one poll cycle without spawning agents or writing to the database, then exit")
+	once := fs.Bool("once", false, "Poll once, finish the issues found, then exit")
+	onceResult := fs.String("once-result", "", "With --once, write each issue's latest outcome to this JSON file")
 	port := fs.Int("port", defaultServerPort, "HTTP server port (0 to disable)")
 	host := fs.String("host", defaultServerHost, "HTTP server bind address (IP address)")
 	envFile := fs.String("env-file", "", "Path to .env file for config overrides")
@@ -129,6 +130,16 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 	if *showVersion {
 		fmt.Fprint(p.stdout, versionBanner()) //nolint:errcheck // stdout write failure is unrecoverable
 		return bootResult{}, 0
+	}
+
+	if *once && *dryRun {
+		fmt.Fprintln(p.stderr, "sortie: --once and --dry-run cannot be used together") //nolint:errcheck // stderr write failure is unrecoverable
+		return bootResult{}, 1
+	}
+
+	if *onceResult != "" && !*once {
+		fmt.Fprintln(p.stderr, "sortie: --once-result requires --once") //nolint:errcheck // stderr write failure is unrecoverable
+		return bootResult{}, 1
 	}
 
 	path, err := resolveWorkflowPath(fs.Args())
@@ -207,6 +218,7 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 		ConfigFunc:      mgr.Config,
 		TrackerRegistry: registry.Trackers,
 		AgentRegistry:   registry.Agents,
+		RatesFunc:       mgr.Rates,
 	}
 	validation := orchestrator.ValidateDispatchConfig(preflightParams)
 	if !validation.OK() {
@@ -307,6 +319,8 @@ func boot(ctx context.Context, p bootParams) (bootResult, int) {
 		serverEnabled:   serverEnabled,
 		portIsImplicit:  !portFlagSet && !hasServerPortExtension(cfg.ExtensionSection("server")),
 		dryRun:          *dryRun,
+		once:            *once,
+		onceResultPath:  *onceResult,
 		effectiveLevel:  effectiveLevel,
 		effectiveFormat: effectiveFormat,
 	}, 0

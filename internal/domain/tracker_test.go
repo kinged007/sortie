@@ -30,6 +30,10 @@ func (m *mockTrackerAdapter) FetchIssueStatesByIDs(_ context.Context, _ []string
 	return nil, nil
 }
 
+func (m *mockTrackerAdapter) FetchIssueStatesAndLabelsByIDs(context.Context, []string) (map[string]IssueStateAndLabels, error) {
+	return nil, nil
+}
+
 func (m *mockTrackerAdapter) FetchIssueStatesByIdentifiers(_ context.Context, _ []string) (map[string]string, error) {
 	return nil, nil
 }
@@ -43,9 +47,6 @@ func (m *mockTrackerAdapter) TransitionIssue(_ context.Context, _ string, _ stri
 }
 
 func (m *mockTrackerAdapter) CommentIssue(_ context.Context, _ string, _ string) error {
-	return nil
-}
-func (m *mockTrackerAdapter) CommentIssueWithLiteral(_ context.Context, _, _, _ string) error {
 	return nil
 }
 

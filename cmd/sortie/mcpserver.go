@@ -2,20 +2,24 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 
+	"github.com/sortie-ai/sortie/internal/agent/mcpconfig"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/tool/budget"
@@ -39,6 +43,7 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 	fs := flag.NewFlagSet("sortie mcp-server", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	workflowFlag := fs.String("workflow", "", "Absolute path to the WORKFLOW.md file (required)")
+	httpFlag := fs.Bool("http", false, "Serve MCP over streamable HTTP on a loopback port instead of stdio")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -59,8 +64,28 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		return 1
 	}
 
+	bearer := os.Getenv(mcpconfig.BearerEnv)
+	if *httpFlag && bearer == "" {
+		fmt.Fprintf(stderr, "sortie mcp-server: --http requires the %s environment variable to be non-empty\n", mcpconfig.BearerEnv) //nolint:errcheck // stderr write failure is unrecoverable
+		return 1
+	}
+
+	var ln net.Listener
+	if *httpFlag {
+		var listenErr error
+		ln, listenErr = listenMCPHTTP(ctx, stdout)
+		if listenErr != nil {
+			fmt.Fprintf(stderr, "sortie mcp-server: %s\n", listenErr) //nolint:errcheck // stderr write failure is unrecoverable
+			return 1
+		}
+		defer ln.Close() //nolint:errcheck // ServeStreamableHTTP closes it first; this covers the early exits
+	}
+
 	logger := logging.Setup(stderr, slog.LevelInfo, logging.FormatText)
 	redact.AddEnviron(os.Environ())
+	if bearer != "" {
+		redact.Add("tool server bearer", bearer)
+	}
 
 	wf, err := workflow.Load(*workflowFlag)
 	if err != nil {
@@ -111,13 +136,61 @@ func runMCPServer(ctx context.Context, args []string, stdout io.Writer, stderr i
 		defer sessionTools.Store.Close() //nolint:errcheck // best-effort cleanup at shutdown
 	}
 
-	srv := mcpserver.NewServer(sessionTools.Registry, os.Stdin, stdout, logger, Version)
-	if err := srv.Serve(ctx); err != nil {
+	srv := mcpserver.NewServer(sessionTools.Registry, logger, Version)
+	if ln != nil {
+		if err := serveMCPHTTP(ctx, srv, ln, bearer, os.Stdin, stdout); err != nil {
+			logger.Error("MCP server error", slog.Any("error", err))
+			return 1
+		}
+		return 0
+	}
+	if err := srv.Serve(ctx, os.Stdin, writerOnly{stdout}); err != nil {
 		logger.Error("MCP server error", slog.Any("error", err))
 		return 1
 	}
 
 	return 0
+}
+
+// writerOnly keeps the transport from closing the caller's writer.
+type writerOnly struct{ io.Writer }
+
+func (writerOnly) Close() error { return nil }
+
+// listenMCPHTTP announces the port before the workflow loads, so the spawning
+// process need not wait for startup work.
+func listenMCPHTTP(ctx context.Context, stdout io.Writer) (net.Listener, error) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen on loopback: %w", err)
+	}
+	line, err := json.Marshal(mcpserver.HTTPEvent{Listening: ln.Addr().String()})
+	if err != nil {
+		ln.Close() //nolint:errcheck,gosec // best-effort; the marshal error is what the caller needs
+		return nil, fmt.Errorf("encode listening event: %w", err)
+	}
+	if _, err := stdout.Write(append(line, '\n')); err != nil {
+		ln.Close() //nolint:errcheck,gosec // best-effort; the write error is what the caller needs
+		return nil, fmt.Errorf("write listening event: %w", err)
+	}
+	return ln, nil
+}
+
+// serveMCPHTTP serves until ctx ends or stdin closes, which is how the
+// spawning process ends the server's life.
+func serveMCPHTTP(ctx context.Context, srv *mcpserver.Server, ln net.Listener, bearer string, stdin io.Reader, stdout io.Writer) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The copy may stay blocked in a read nothing can interrupt; the process
+	// exits right after.
+	go func() {
+		io.Copy(io.Discard, stdin) //nolint:errcheck,gosec // any read error ends the server the same way as end of file
+		cancel()
+	}()
+
+	return srv.ServeStreamableHTTP(ctx, ln, mcpserver.HTTPOptions{Bearer: bearer, Events: stdout})
 }
 
 // sessionToolParamsFromEnv builds the per-session tool registry inputs
@@ -141,6 +214,7 @@ func sessionToolParamsFromEnv(getenv func(string) string, cfg config.ServiceConf
 		Attempt:               attempt,
 		AgentKind:             getenv("SORTIE_SESSION_AGENT_KIND"),
 		MaxTokens:             cfg.Agent.MaxTokens,
+		MaxCostUSD:            cfg.Agent.MaxCostUSD,
 		MaxSessions:           cfg.Agent.MaxSessions,
 		TokenWarningThreshold: cfg.Agent.TokenWarningThreshold(),
 		Notifications:         cfg.Notifications.Backends,
@@ -200,28 +274,61 @@ func buildBudgetQuery(store *persistence.Store) budget.BudgetQueryFunc {
 		}
 
 		usage := budget.BudgetUsage{
-			CompletedTotalTokens: completed.TotalTokens,
-			CompletedSessions:    completed.Sessions,
-			UnmeasuredSessions:   completed.UnmeasuredSessions,
-			UnaccountedTurns:     completed.UnaccountedTurns,
+			CompletedUncachedTokens: completed.UncachedTokens,
+			CompletedSessions:       completed.Sessions,
+			UnmeasuredSessions:      completed.UnmeasuredSessions,
+			UnaccountedTurns:        completed.UnaccountedTurns,
 		}
 
 		// Add the running session's spend only when its stored dispatch ID
 		// matches the live one, so neither a stale dispatch's row nor a
 		// session-exit cleared row is double counted.
-		if runningDispatchID == "" {
-			return usage, nil
+		var session pricing.SessionCost
+		if runningDispatchID != "" {
+			meta, found, err := store.LoadSessionMetadata(ctx, issueID)
+			if err != nil {
+				return budget.BudgetUsage{}, err
+			}
+			if found && meta.DispatchID == runningDispatchID {
+				usage.RunningUncachedTokens = domain.TokenUsage{TotalTokens: meta.TotalTokens, CacheReadTokens: meta.CacheReadTokens}.Uncached()
+				usage.RunningMeasured = true
+				usage.UnaccountedTurns += meta.UnaccountedTurns
+				session = sessionCostOf(meta)
+			}
 		}
-		meta, found, err := store.LoadSessionMetadata(ctx, issueID)
-		if err != nil {
-			return budget.BudgetUsage{}, err
-		}
-		if found && meta.DispatchID == runningDispatchID {
-			usage.RunningTotalTokens = meta.TotalTokens
-			usage.RunningMeasured = true
-			usage.UnaccountedTurns += meta.UnaccountedTurns
-		}
+
+		spendComplete := usage.UnmeasuredSessions == 0 && usage.UnaccountedTurns == 0 &&
+			runningDispatchID != "" && usage.RunningMeasured
+		var status pricing.CostStatus
+		usage.UsedUSD, status = pricing.IssueCost(recordedOf(completed), session, spendComplete)
+		usage.UsedUSDComplete = status == pricing.CostEstimated
 		return usage, nil
+	}
+}
+
+// recordedOf maps the cost aggregates of an issue's usage read onto the input
+// of [pricing.IssueCost].
+func recordedOf(usage persistence.IssueTokenUsage) pricing.RecordedCost {
+	return pricing.RecordedCost{
+		USD:      usage.RecordedCostUSD,
+		Priced:   usage.PricedSessions,
+		Partial:  usage.PartialSessions,
+		Unpriced: usage.UnpricedSessions,
+	}
+}
+
+// sessionCostOf reads the running session's stored estimate; a row recorded
+// without a status reads as unmeasured.
+func sessionCostOf(meta persistence.SessionMetadata) pricing.SessionCost {
+	status := pricing.CostStatus(meta.CostStatus)
+	if status == "" {
+		status = pricing.CostUnmeasured
+	}
+	return pricing.SessionCost{
+		USD:    meta.EstimatedCostUSD,
+		Status: status,
+		Spent: meta.InputTokens != 0 || meta.OutputTokens != 0 || meta.TotalTokens != 0 ||
+			meta.CacheReadTokens != 0 || meta.CacheWriteTokens != 0,
 	}
 }
 

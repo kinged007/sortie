@@ -1,6 +1,7 @@
 import { activeRowOf, decidingRowOf } from "@/lib/active-rows";
-import { buildEnded } from "@/lib/ended";
+import { buildEnded, endingWord } from "@/lib/ended";
 import { parseInstant } from "@/lib/format";
+import { stateWord } from "@/lib/run-status";
 import {
   laneOf,
   lastStagePositionOf,
@@ -16,10 +17,8 @@ import type { Deciding, Filterable } from "@/lib/active-rows";
 import type { EndedIssue } from "@/lib/ended";
 import type { LaneMarker, LaneStation, StagePosition, StageProgress, Station } from "@/lib/lane";
 
-/** The lane count above which the Pipeline compresses its lanes by station. */
 export const PIPELINE_COMPRESS_AFTER = 24;
 
-/** One issue on the Pipeline: its identity, the standing every lane variant draws, and what the filters read. */
 export interface PipelineLane extends Filterable {
   issueId: string;
   identifier: string;
@@ -28,14 +27,10 @@ export interface PipelineLane extends Filterable {
   /** The rule the lane names when it draws no stage meter, or `null`. */
   route: string | null;
   agentKind: string | null;
-  statusText: string;
+  word: string;
   statusTextFull: string;
-  stallText: string | null;
-  stallTextFull: string | null;
   marker: LaneMarker;
-  acknowledgedAt: string | null;
   stations: LaneStation[];
-  /** The key of the station the issue stands at. */
   station: string;
   position: StagePosition | null;
   progress: StageProgress | null;
@@ -44,10 +39,7 @@ export interface PipelineLane extends Filterable {
   live: boolean;
 }
 
-/**
- * Counts the lanes per station key. A station is `hot` while a lane at it is
- * marked as needing attention. A station no lane stands at has no entry.
- */
+/** A station is `hot` while a lane at it is marked as needing attention; a station no lane stands at has no entry. */
 export function stationTally(
   lanes: readonly PipelineLane[],
 ): Map<string, { count: number; hot: boolean }> {
@@ -74,6 +66,10 @@ function ownPullRequestOf(deciding: Deciding): PullRequestResponse | undefined {
     default:
       return undefined;
   }
+}
+
+function laneWord(marker: LaneMarker): string {
+  return marker === "ended" ? "Ended" : stateWord(marker);
 }
 
 function activeLanes(state: StateResponse, stations: readonly Station[], now: number) {
@@ -105,12 +101,9 @@ function activeLanes(state: StateResponse, stations: readonly Station[], now: nu
       rule: row.rule,
       route: position === null ? row.route : null,
       agentKind: row.agentKind,
-      statusText: row.statusText,
+      word: laneWord(standing.mark ?? row.mark),
       statusTextFull: row.statusTextFull,
-      stallText: row.stallText,
-      stallTextFull: row.stallTextFull,
       marker: standing.mark ?? row.mark,
-      acknowledgedAt: row.acknowledgedAt,
       stations: laneOf(stations, standing, pending, entry.pr_loop),
       station: standing.station,
       position,
@@ -166,13 +159,10 @@ function endedLanes(
       rule: position?.current ?? issue.rule,
       route: position === null && hasRules ? issue.rule : null,
       agentKind: issue.agentKind,
-      statusText: issue.outcome.status_text,
+      word: endingWord(issue.outcome),
       statusTextFull: issue.outcome.status_text_full,
-      stallText: null,
-      stallTextFull: null,
       marker: "ended",
-      acknowledgedAt: null,
-      stations: laneOf(stations, { ...standing, mark: "ended" }, [], issue.prLoop),
+      stations: laneOf(stations, standing, [], issue.prLoop),
       station: standing.station,
       position,
       progress:
@@ -191,12 +181,7 @@ function endedLanes(
   return lanes;
 }
 
-/**
- * Builds the Pipeline lanes: one per active issue in the served order, then
- * one per issue that ended today by ending time. `pages` undefined means
- * today's endings are not loaded, and only active lanes come back. A state
- * without `config` has no stations and so no lanes.
- */
+/** `pages` undefined means today's endings are not loaded, and only active lanes come back; a state without `config` has no stations and so no lanes. */
 export function pipelineLanes(
   state: StateResponse,
   pages: readonly RunsResponse[] | undefined,
@@ -210,7 +195,6 @@ export function pipelineLanes(
   return pages === undefined ? active : [...active, ...endedLanes(state, pages, stations, now)];
 }
 
-/** Gives the keyboard-selection key of a Pipeline lane. */
 export function laneNavKey(issueId: string): string {
   return `lane:${issueId}`;
 }

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router";
 
-import { XIcon } from "@/components/icons";
+import { SearchIcon, XIcon } from "@/components/icons";
 import { ruleLabel } from "@/lib/labels";
 import { RUN_STATUS_NAMES, runStatus } from "@/lib/run-status";
 
@@ -43,7 +43,7 @@ export function filterFromParams(params: URLSearchParams): HistoryFilter {
 }
 
 const FIELD =
-  "h-(--size-control) w-56 max-w-full rounded border border-line-strong bg-field pr-xl pl-sm text-body-md text-ink outline-none placeholder:text-ink-muted focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring";
+  "h-(--size-control) w-56 max-w-full rounded-lg border border-line bg-field pr-xl pl-[calc(var(--spacing-sm)+var(--size-icon)+var(--spacing-xs))] text-body-md text-ink outline-none transition-colors duration-(--duration-feedback) placeholder:text-ink-muted hover:border-line-medium focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-focus-ring";
 
 interface IssueKeyFieldProps {
   applied: string;
@@ -73,6 +73,7 @@ function IssueKeyField({ applied, onApply }: IssueKeyFieldProps) {
 
   return (
     <span className="relative inline-flex items-center">
+      <SearchIcon className="pointer-events-none absolute left-sm text-ink-muted" />
       <input
         type="text"
         aria-label="Issue key"
@@ -143,12 +144,10 @@ function valueTextOf(value: string, options: readonly FilterOption[], anyText: s
   return value.startsWith(RULE_PREFIX) ? value.slice(RULE_PREFIX.length) : value;
 }
 
-/** Props of {@link HistoryFilters}. */
 export interface HistoryFiltersProps {
   config: ConfigResponse | undefined;
 }
 
-/** Renders the History filter row: issue key, rule, run status, and stage hop. Each control writes its URL parameter with a replace navigation. */
 export function HistoryFilters({ config }: HistoryFiltersProps) {
   const [params, setParams] = useSearchParams();
   const rule = params.get(RULE_PARAM) ?? "";

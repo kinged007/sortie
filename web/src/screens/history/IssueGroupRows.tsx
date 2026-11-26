@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import { useHistoryRunsQuery } from "@/api/queries";
+import { NotedFigure } from "@/components/NotedFigure";
 import { ServedText } from "@/components/ServedText";
+import { StandingMark } from "@/components/Lane";
 import { StatusMark } from "@/components/StatusMark";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,27 +15,36 @@ import {
   TableRow,
   TableSpanCell,
 } from "@/components/ui/table";
+import { hasRateSource } from "@/lib/budget";
 import { cn } from "@/lib/cn";
 import {
-  NOT_MEASURED,
-  UNPRICED,
-  runCacheReadsText,
-  runCostText,
-  runTokensText,
+  runCostFigure,
+  runTokensFigure,
   totalsCacheReadsText,
-  totalsCostText,
-  totalsTokensText,
+  totalsCostFigure,
+  totalsTokensFigure,
+  vendorAmountFigure,
 } from "@/lib/figures";
-import { fmtCount, fmtDuration, fmtStamp, parseInstant, plural } from "@/lib/format";
+import { fmtCount, fmtDuration, fmtStamp, parseInstant, plural, upperFirst } from "@/lib/format";
 import { issueLinkOf } from "@/lib/issue-link";
-import { ruleLabel } from "@/lib/labels";
-import { outcomeMark, runStatus } from "@/lib/run-status";
+import { hopLabel, ruleLabel } from "@/lib/labels";
+import { issueAwaitsApproval } from "@/lib/active-rows";
+import { issueStanding } from "@/lib/lane";
+import { agentStatement, runOutcome } from "@/lib/run-status";
 
 import type { HistoryFilter } from "@/api/client";
-import type { ConfigResponse, IssueGroupResponse, RunResponse } from "@/api/types.gen";
-import type { Mark } from "@/lib/run-status";
+import type {
+  HistoryTotalsResponse,
+  IssueGroupResponse,
+  RunResponse,
+  SkillCall,
+  StateResponse,
+} from "@/api/types.gen";
+import type { ReactNode } from "react";
 
 const READ_FAILED = "Run history could not be read.";
+
+const SKILLS_WIDTH = "w-full min-w-40";
 
 interface Columns {
   hasRule: boolean;
@@ -41,25 +52,24 @@ interface Columns {
   span: number;
 }
 
-function columnsOf(config: ConfigResponse | undefined): Columns {
-  const hasRule = (config?.dispatch.rules ?? []).length > 0;
-  const hasCost = config?.token_rates != null;
-  return { hasRule, hasCost, span: 6 + (hasRule ? 1 : 0) + (hasCost ? 1 : 0) };
+function columnsOf(state: StateResponse | undefined): Columns {
+  const hasRule = (state?.config?.dispatch.rules ?? []).length > 0;
+  const hasCost = hasRateSource(state);
+  return { hasRule, hasCost, span: 7 + (hasRule ? 1 : 0) + (hasCost ? 1 : 0) };
 }
 
-/** Props of {@link HistoryTableHead}. */
 export interface HistoryTableHeadProps {
-  config: ConfigResponse | undefined;
+  state: StateResponse | undefined;
 }
 
-/** Renders the header row of the run table; its columns follow the workflow. */
-export function HistoryTableHead({ config }: HistoryTableHeadProps) {
-  const { hasRule, hasCost } = columnsOf(config);
+export function HistoryTableHead({ state }: HistoryTableHeadProps) {
+  const { hasRule, hasCost } = columnsOf(state);
   return (
     <TableHeader>
       <TableHead>Status</TableHead>
       {hasRule ? <TableHead>Rule</TableHead> : undefined}
       <TableHead>Agent</TableHead>
+      <TableHead className={SKILLS_WIDTH}>Skills</TableHead>
       <TableHead>Duration</TableHead>
       <TableHead>Turns</TableHead>
       <TableHead title="Cache reads not included">Tokens</TableHead>
@@ -67,25 +77,6 @@ export function HistoryTableHead({ config }: HistoryTableHeadProps) {
       <TableHead>Finished</TableHead>
     </TableHeader>
   );
-}
-
-function groupMark(group: IssueGroupResponse): Mark | null {
-  switch (group.status) {
-    case "running":
-      return "running";
-    case "retrying":
-      return "retry";
-    case "budget_exhausted":
-    case "parked":
-    case "pending_reactions":
-    case "between_stages":
-      return "waiting";
-    case "history":
-      // Green marks only a success, and "terminal" covers a person's close too.
-      return outcomeMark(group.issue_outcome?.kind);
-    default:
-      return null;
-  }
 }
 
 function runSeconds(run: RunResponse): number | null {
@@ -100,24 +91,62 @@ function hopText(run: RunResponse): string | undefined {
   if (!run.stage_target) {
     return undefined;
   }
-  return run.stage_result
-    ? `Hop to ${run.stage_target}: ${run.stage_result}`
-    : `Hop to ${run.stage_target}`;
+  return upperFirst(hopLabel(run.stage_target, run.stage_result));
 }
 
-function tokensPart(text: string): string {
-  return text === NOT_MEASURED ? "tokens not measured" : `${text} tokens`;
+function tokensPart(totals: HistoryTotalsResponse): ReactNode {
+  const figure = <NotedFigure figure={totalsTokensFigure(totals)} />;
+  return totals.uncached_tokens === null ? <>tokens {figure}</> : <>{figure} tokens</>;
 }
 
-function cacheReadsTitle(text: string | null): string | undefined {
-  return text === null ? undefined : `${text} cache reads`;
+function costPart(totals: HistoryTotalsResponse): ReactNode {
+  const figure = <NotedFigure figure={totalsCostFigure(totals)} />;
+  return totals.cost_status === "unpriced" || totals.cost_status === "unmeasured" ? (
+    <>cost {figure}</>
+  ) : (
+    <>{figure} estimated</>
+  );
 }
 
-function costPart(text: string): string {
-  if (text === UNPRICED) {
-    return "cost unpriced";
-  }
-  return text === NOT_MEASURED ? "cost not measured" : `${text} estimated`;
+function skillsTitle(skills: readonly SkillCall[]): string {
+  return skills
+    .map((call) => (call.tool_error === true ? `${call.skill} (failed)` : call.skill))
+    .join(", ");
+}
+
+interface SkillsCellProps {
+  skills: readonly SkillCall[] | undefined;
+}
+
+function SkillsCell({ skills }: SkillsCellProps) {
+  const calls = skills ?? [];
+
+  return (
+    <TableCell className={cn(SKILLS_WIDTH, "max-w-0")}>
+      {calls.length === 0 ? undefined : (
+        <span title={skillsTitle(calls)} className="block truncate">
+          {calls.map((call, index) => (
+            <Fragment key={index}>
+              {index === 0 ? undefined : ", "}
+              {call.tool_error === true ? (
+                <StatusMark
+                  mark="failed"
+                  label={
+                    <>
+                      {call.skill}
+                      <span className="sr-only"> (failed)</span>
+                    </>
+                  }
+                />
+              ) : (
+                call.skill
+              )}
+            </Fragment>
+          ))}
+        </span>
+      )}
+    </TableCell>
+  );
 }
 
 interface RunRowProps {
@@ -129,7 +158,8 @@ function RunRow({ run, columns }: RunRowProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const link = issueLinkOf(run.issue_identifier, location);
-  const status = runStatus(run.status);
+  const status = runOutcome(run);
+  const statement = agentStatement(run);
   const model = run.model_name || run.configured_model;
   const agent = [run.agent_kind, model].filter((part) => part !== undefined && part !== "");
   const isModelDiverged =
@@ -140,7 +170,7 @@ function RunRow({ run, columns }: RunRowProps) {
 
   return (
     <TableRow look="link" onClick={() => void navigate(link.to, { state: link.state })}>
-      <TableCell>
+      <TableCell title={statement === null ? run.error || undefined : `\u201C${statement}\u201D`}>
         <Link
           to={link.to}
           state={link.state}
@@ -167,51 +197,61 @@ function RunRow({ run, columns }: RunRowProps) {
       >
         {agent[0] === undefined ? undefined : <ServedText text={agent[0]} />}
       </TableCell>
+      <SkillsCell skills={run.skills} />
       <TableCell>{fmtDuration(runSeconds(run))}</TableCell>
       <TableCell>{fmtCount(run.turns_completed)}</TableCell>
-      <TableCell title={cacheReadsTitle(runCacheReadsText(run))}>{runTokensText(run)}</TableCell>
-      {columns.hasCost ? <TableCell>{runCostText(run)}</TableCell> : undefined}
+      <TableCell>
+        <NotedFigure figure={runTokensFigure(run)} />
+      </TableCell>
+      {columns.hasCost ? (
+        <TableCell>
+          <NotedFigure figure={runCostFigure(run)} />
+        </TableCell>
+      ) : undefined}
       <TableCell>{fmtStamp(run.completed_at)}</TableCell>
     </TableRow>
   );
 }
 
-/** Props of {@link IssueGroupRows}. */
 export interface IssueGroupRowsProps {
   group: IssueGroupResponse;
   filter: HistoryFilter;
-  config: ConfigResponse | undefined;
+  state: StateResponse | undefined;
 }
 
-/**
- * Renders one issue of History as a row group: a header row for the issue, its
- * newest runs, and a "Show more runs" row that swaps the served runs for pages
- * read from the run list. Mount it with a key that changes with the filter so
- * an expansion resets then.
- */
-export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
+/** Mount it with a key that changes with the filter so an expansion resets then. */
+export function IssueGroupRows({ group, filter, state }: IssueGroupRowsProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const link = issueLinkOf(group.issue_identifier, location);
-  const columns = columnsOf(config);
+  const columns = columnsOf(state);
   const [isExpanded, setIsExpanded] = useState(false);
   const expansion = useHistoryRunsQuery(group.issue_id, filter, isExpanded);
 
   const key = group.display_identifier || group.issue_identifier;
   const title = group.issue_title || key;
-  const mark = groupMark(group);
+  const standing = issueStanding(
+    group.issue_id,
+    group.status,
+    group.issue_outcome,
+    state?.attention ?? [],
+    issueAwaitsApproval(state, group.issue_id),
+  );
   const ending = group.status === "history" ? group.issue_outcome : null;
   const cacheReads = totalsCacheReadsText(group.totals);
-  const secondLine = (
-    [
-      ["key", group.issue_title ? key : undefined],
-      ["status", group.status_text],
-      ["runs", plural(group.totals.run_count, "run", "runs")],
-      ["tokens", tokensPart(totalsTokensText(group.totals))],
-      ["cache-reads", cacheReads === null ? undefined : `${cacheReads} cache reads`],
-      ["cost", columns.hasCost ? costPart(totalsCostText(group.totals)) : undefined],
-    ] as const
-  ).filter(([, part]) => part !== undefined);
+  const parts: [string, ReactNode][] = [
+    ["key", group.issue_title ? key : undefined],
+    ["status", standing.word || undefined],
+    ["runs", plural(group.totals.run_count, "run", "runs")],
+    ["tokens", tokensPart(group.totals)],
+    ["cache-reads", cacheReads === null ? undefined : `${cacheReads} cache reads`],
+    ["cost", columns.hasCost ? costPart(group.totals) : undefined],
+    ...(group.totals.vendor_amounts ?? []).map((amount): [string, ReactNode] => [
+      `vendor-${amount.unit}`,
+      <NotedFigure key={amount.unit} figure={vendorAmountFigure(amount, "full")} />,
+    ]),
+  ];
+  const secondLine = parts.filter(([, part]) => part !== undefined);
 
   const expandedRuns = expansion.data?.pages.flatMap((page) => page.runs ?? []);
   const runs = expandedRuns ?? group.runs ?? [];
@@ -236,8 +276,8 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
       <TableRow look="group" onClick={() => void navigate(link.to, { state: link.state })}>
         <TableSpanCell colSpan={columns.span}>
           <div className="flex items-start gap-sm">
-            <span className="flex h-6 w-(--size-icon) shrink-0 items-center">
-              {mark === null ? undefined : <StatusMark mark={mark} />}
+            <span className="flex w-(--size-icon) shrink-0 items-center justify-center self-center">
+              {standing.marker === null ? undefined : <StandingMark marker={standing.marker} />}
             </span>
             <div className="min-w-0 flex-1">
               <p className="text-body-md font-medium text-ink wrap-anywhere">
@@ -252,7 +292,7 @@ export function IssueGroupRows({ group, filter, config }: IssueGroupRowsProps) {
               </p>
               <p className="flex flex-wrap gap-x-md text-body-sm text-ink-muted wrap-anywhere">
                 {secondLine.map(([id, part]) => (
-                  <span key={id}>{id === "status" ? <ServedText text={part} /> : part}</span>
+                  <span key={id}>{part}</span>
                 ))}
               </p>
             </div>

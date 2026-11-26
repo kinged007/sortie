@@ -18,6 +18,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // mustTriageWorkspace creates a workspace root containing a directory for
@@ -179,26 +180,6 @@ func writeHookScript(t *testing.T, body string) string {
 func probeTriageConfig(t *testing.T) config.ReactionTriageConfig {
 	t.Helper()
 	return config.ReactionTriageConfig{Script: writeHookScript(t, handledScript), TimeoutMS: 5000}
-}
-
-// triageTestRunTimeout bounds how long a test waits for a real triage
-// subprocess to finish.
-const triageTestRunTimeout = 5 * time.Second
-
-// waitTriageRunDone blocks until run's Done channel closes or
-// triageTestRunTimeout elapses, failing the test on timeout. Tests use
-// this instead of a fixed sleep because the real subprocess's
-// completion time is not otherwise observable.
-func waitTriageRunDone(t *testing.T, run *ReactionTriageRun) {
-	t.Helper()
-	if run == nil {
-		t.Fatal("waitTriageRunDone: run is nil")
-	}
-	select {
-	case <-run.Done:
-	case <-time.After(triageTestRunTimeout):
-		t.Fatalf("triage run did not finish within %v", triageTestRunTimeout)
-	}
 }
 
 // triageCancelSpy records how many times Cancel was invoked, for tests
@@ -749,7 +730,7 @@ func TestReactionTriageGate(t *testing.T) {
 			t.Errorf("pending.Triage.Fingerprint = %q, want %q", pending.Triage.Fingerprint, "fp-3")
 		}
 
-		waitTriageRunDone(t, pending.Triage)
+		waittest.Receive(t, pending.Triage.Done, "triage run to finish")
 	})
 
 	t.Run("not done same fingerprint waits without acting", func(t *testing.T) {
@@ -802,7 +783,7 @@ func TestReactionTriageGate(t *testing.T) {
 			t.Errorf("pending.Triage = %+v, want a run for fp-new", pending.Triage)
 		}
 
-		waitTriageRunDone(t, pending.Triage)
+		waittest.Receive(t, pending.Triage.Done, "triage run to finish")
 	})
 
 	t.Run("done different fingerprint discards and starts a new run", func(t *testing.T) {
@@ -828,7 +809,7 @@ func TestReactionTriageGate(t *testing.T) {
 			t.Errorf("pending.Triage = %+v, want a run for fp-new-2", pending.Triage)
 		}
 
-		waitTriageRunDone(t, pending.Triage)
+		waittest.Receive(t, pending.Triage.Done, "triage run to finish")
 	})
 
 	t.Run("done same fingerprint unapplied dispatch-agent proceeds", func(t *testing.T) {
@@ -1032,22 +1013,13 @@ func TestReactionTriageGate(t *testing.T) {
 		if run3.Cancel != nil {
 			run3.Cancel()
 		}
-		waitStateTriageWg(t, state, 5*time.Second)
+		drained := make(chan struct{})
+		go func() {
+			state.TriageWg.Wait()
+			close(drained)
+		}()
+		waittest.Receive(t, drained, "state.TriageWg to drain")
 	})
-}
-
-func waitStateTriageWg(t *testing.T, state *State, bound time.Duration) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		state.TriageWg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(bound):
-		t.Log("state.TriageWg did not drain within the bound; background goroutines may still be running")
-	}
 }
 
 // TestStartReactionTriage_UnconsumedRun_StillLogsCompletion verifies
@@ -1074,7 +1046,7 @@ func TestStartReactionTriage_UnconsumedRun_StillLogsCompletion(t *testing.T) {
 	if run == nil {
 		t.Fatal("startReactionTriage() = nil, want a started run")
 	}
-	waitTriageRunDone(t, run)
+	waittest.Receive(t, run.Done, "triage run to finish")
 
 	mu.Lock()
 	output := buf.String()

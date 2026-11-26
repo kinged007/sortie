@@ -12,17 +12,17 @@ func TestNoopMetricsSatisfiesInterface(t *testing.T) {
 	m.SetAvailableSlots(2)
 	m.SetActiveSessionsElapsed(123.45)
 
-	m.AddTokens("input", 1000)
-	m.AddTokens("output", 500)
+	m.AddTokens("input", "model-a", 1000)
+	m.AddTokens("output", "model-a", 500)
 
-	m.AddAgentRuntime(60.5)
+	m.AddAgentRuntime("model-a", 60.5)
 
 	m.IncDispatches("success")
 	m.IncDispatches("error")
 
-	m.IncWorkerExits("normal")
-	m.IncWorkerExits("error")
-	m.IncWorkerExits("cancelled")
+	m.IncWorkerExits("normal", "model-a")
+	m.IncWorkerExits("error", "model-a")
+	m.IncWorkerExits("cancelled", "model-a")
 
 	m.IncRetries("error")
 	m.IncRetries("continuation")

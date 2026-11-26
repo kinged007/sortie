@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 )
@@ -526,10 +528,10 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 	// GitHub's mergeability computation is asynchronous; the PR may
 	// initially return mergeable_state=unknown and needs a few ticks.
 	const maxTicks = 5
-	for range maxTicks {
+	_ = waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, func() error {
 		// Re-enqueue the pending reaction if it was deferred.
 		if _, present := state.PendingReactions[rkey]; !present {
-			break
+			return nil
 		}
 
 		reconcileAutoMerge(state, params, discardLogger(), ctx, metrics)
@@ -540,7 +542,7 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 		// Break early once merged.
 		if metrics.mergedCount() > 0 {
 			t.Logf("merge detected after tick; exiting early")
-			break
+			return nil
 		}
 
 		// Re-add the pending entry if it was deferred with a retry-at in
@@ -549,9 +551,8 @@ func TestReconcileAutoMerge_LiveAPI_E2E(t *testing.T) {
 			pending.PendingRetryAt = time.Time{}
 			state.PendingReactions[rkey] = pending
 		}
-
-		time.Sleep(2 * time.Second)
-	}
+		return errors.New("PR not merged yet")
+	})
 
 	pr := ghClient.fetchPRState(t, owner, repo, prNumber)
 	if !pr.Merged {

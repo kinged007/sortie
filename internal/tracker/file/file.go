@@ -2,9 +2,10 @@
 // fixture file. Issues are read from disk on each operation call,
 // normalized to domain types with labels lowercased, integer-only
 // priority (non-integers become nil), and nil-vs-empty comments
-// semantics. Intended for development and testing where a live
-// tracker API is unavailable. Registered under kind "file" via
-// an init function.
+// semantics. The adapter needs no tracker API, so it is also how a
+// caller hands work to a one-shot run: write the issue to the file,
+// then start Sortie with --once. Registered under kind "file" via an
+// init function.
 package file
 
 import (
@@ -35,11 +36,11 @@ var _ domain.TrackerAdapter = (*FileAdapter)(nil)
 
 // FileAdapter reads issues from a JSON file and implements all seven
 // [domain.TrackerAdapter] operations. The file is re-read on each
-// call to support test scenarios that modify the fixture between
-// operations. State mutations via [FileAdapter.TransitionIssue] are
-// stored in an in-memory override map layered on top of disk reads.
-// Overrides are not persisted to disk; they exist only for the
-// lifetime of the adapter instance. Safe for concurrent use.
+// call, so a caller can add or change issues while Sortie runs. State
+// mutations via [FileAdapter.TransitionIssue] are stored in an
+// in-memory override map layered on top of disk reads. Overrides are
+// not persisted to disk; they exist only for the lifetime of the
+// adapter instance. Safe for concurrent use.
 type FileAdapter struct {
 	*issuekit.StateSource
 	path string
@@ -208,30 +209,57 @@ func (a *FileAdapter) FetchIssueStatesByIDs(_ context.Context, issueIDs []string
 		return map[string]string{}, nil
 	}
 
-	states := make(map[string]string, len(issueIDs))
+	var states map[string]string
 	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
-		raws, err := loadIssues(a.path)
+		reads, err := a.readStatesAndLabels(issueIDs)
 		if err != nil {
 			return err
 		}
-
-		a.mu.RLock()
-		defer a.mu.RUnlock()
-
-		wanted := make(map[string]bool, len(issueIDs))
-		for _, id := range issueIDs {
-			wanted[id] = true
-		}
-
-		for _, raw := range raws {
-			if wanted[raw.ID] {
-				raw = a.applyOverride(raw)
-				states[raw.ID] = raw.State
-			}
-		}
+		states = issuekit.StatesOf(reads)
 		return nil
 	})
 	return states, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the current state and labels for
+// each requested issue ID, with the in-memory state and label overlays
+// applied. Issues not found in the file are omitted from the map.
+func (a *FileAdapter) FetchIssueStatesAndLabelsByIDs(_ context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	if len(issueIDs) == 0 {
+		return map[string]domain.IssueStateAndLabels{}, nil
+	}
+
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		var err error
+		reads, err = a.readStatesAndLabels(issueIDs)
+		return err
+	})
+	return reads, err
+}
+
+func (a *FileAdapter) readStatesAndLabels(issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	raws, err := loadIssues(a.path)
+	if err != nil {
+		return nil, err
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	wanted := make(map[string]bool, len(issueIDs))
+	for _, id := range issueIDs {
+		wanted[id] = true
+	}
+
+	reads := make(map[string]domain.IssueStateAndLabels, len(issueIDs))
+	for _, raw := range raws {
+		if wanted[raw.ID] {
+			raw = a.applyOverride(raw)
+			reads[raw.ID] = domain.IssueStateAndLabels{State: raw.State, Labels: issuekit.NormalizeLabels(raw.Labels)}
+		}
+	}
+	return reads, nil
 }
 
 // FetchIssueStatesByIdentifiers returns the current state for each
@@ -348,15 +376,6 @@ func (a *FileAdapter) TransitionIssue(_ context.Context, issueID string, targetS
 func (a *FileAdapter) CommentIssue(_ context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral records a comment whose body is text followed by
-// literal in a fenced Markdown code block, otherwise as
-// [FileAdapter.CommentIssue] does.
-func (a *FileAdapter) CommentIssueWithLiteral(_ context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

@@ -13,7 +13,11 @@ permissions:
 
 jobs:
   dependabot:
-    if: ${{ github.actor == 'dependabot[bot]' || github.actor == 'dependabot-preview[bot]' }}
-    uses: sortie-ai/shared-workflows/.github/workflows/dependabot-merge.yml@12099056fde09c3b1ef701128316e9fb883eba90 # v1.1.0
+    # cicdbot pushes the rebuilt dashboard bundle onto Dependabot PRs, which
+    # starts the CI run that decides the merge.
+    if: ${{ github.repository == 'sortie-ai/sortie' && (github.actor == 'dependabot[bot]' || github.actor == 'dependabot-preview[bot]' || github.actor == 'cicdbot') }}
+    uses: sortie-ai/shared-workflows/.github/workflows/dependabot-merge.yml@6d471deb70b0fee52d42366fb84f76b95d8f957a # v1.2.0
+    with:
+      trusted-pushers: cicdbot
     secrets:
       bot-token: ${{ secrets.CICDBOT_TOKEN }}

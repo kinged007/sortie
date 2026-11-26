@@ -3,9 +3,8 @@
 // Required environment variables:
 //
 //	SORTIE_CODEX_TEST=1     enable this suite
-//	CODEX_API_KEY           Codex API key for authentication; the live cases
-//	                        need it, the scripted-model case reads no
-//	                        credential and needs only the gate
+//	CODEX_API_KEY           Codex API key; the live cases need it, the
+//	                        scripted-model case needs only the gate
 //
 // Optional environment variables:
 //
@@ -29,6 +28,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -68,6 +68,11 @@ func integrationCommand() string {
 	return "codex app-server"
 }
 
+func runtimeCommand() string {
+	command, _, _ := strings.Cut(integrationCommand(), " app-server")
+	return command
+}
+
 func integrationAgentConfig() domain.AgentConfig {
 	return domain.AgentConfig{
 		Command:       integrationCommand(),
@@ -76,9 +81,9 @@ func integrationAgentConfig() domain.AgentConfig {
 	}
 }
 
-// The Codex app-server requires a git repository by default.
 func gitInitWorkspace(t *testing.T) string {
 	t.Helper()
+	// The Codex app-server requires a git repository by default.
 	dir := t.TempDir()
 	cmd := exec.CommandContext(context.Background(), "git", "-C", dir, "init")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -190,10 +195,10 @@ func TestIntegration_StartSession_InvalidCommand(t *testing.T) {
 	requireAgentErrorKind(t, err, domain.ErrAgentNotFound)
 }
 
-// The redirect rides in -c overrides because the runtime ignores
-// OPENAI_BASE_URL and a project-local config file; zero retry counts make a
-// refused request end the turn instead of being replayed.
-func scriptedProviderCommand(url string) string {
+func scriptedProviderCommand(command, url string) string {
+	// The redirect rides in -c overrides because the runtime ignores
+	// OPENAI_BASE_URL and a project-local config file; zero retry counts make a
+	// refused request end the turn instead of being replayed.
 	pairs := []string{
 		"model_provider=\"scripted\"",
 		"model_providers.scripted.name=\"scripted\"",
@@ -204,7 +209,7 @@ func scriptedProviderCommand(url string) string {
 		"model_providers.scripted.stream_max_retries=0",
 		"model_providers.scripted.supports_websockets=false",
 	}
-	args := []string{integrationCommand()}
+	args := []string{command}
 	for _, pair := range pairs {
 		args = append(args, "-c", pair)
 	}
@@ -236,10 +241,22 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 		},
 		CredentialEnv: []string{"CODEX_API_KEY"},
 		Read:          fakemodel.CatFile,
+		Spend: &fakemodel.SpendSources{
+			Live:    domain.UsageProvenance{Source: usage.SourceOutput, Strategy: usage.StrategyLive},
+			Records: domain.UsageProvenance{Source: usage.SourceJournal, Strategy: usage.StrategyRecords},
+		},
+		SSH: &fakemodel.SSHVariant{
+			Package: "@openai/codex",
+			// app-server rejects --version; the top-level command reports it.
+			HostCommand: runtimeCommand(),
+			RemoteCommand: func(env fakemodel.Environment) string {
+				return scriptedProviderCommand("codex app-server", env.URL)
+			},
+		},
 		Launch: func(t *testing.T, env fakemodel.Environment) fakemodel.Launch {
 			return fakemodel.Launch{
 				Config: domain.AgentConfig{
-					Command:       scriptedProviderCommand(env.URL),
+					Command:       scriptedProviderCommand(integrationCommand(), env.URL),
 					TurnTimeoutMS: 300000,
 					ReadTimeoutMS: 30000,
 				},

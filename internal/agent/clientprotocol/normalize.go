@@ -72,7 +72,7 @@ func applySessionUpdate(tracker *agentcore.ToolTracker, ev sessionUpdateEvent) n
 		return normalizedUpdate{}
 
 	case updateToolCall:
-		tracker.Begin(string(ev.toolCallBegin.ToolCallID), normalizeToolKind(ev.toolCallBegin.Kind))
+		tracker.Begin(string(ev.toolCallBegin.ToolCallID), toolCallOf(ev.toolCallBegin))
 		return normalizedUpdate{}
 
 	case updateToolCallUpdate:
@@ -81,7 +81,7 @@ func applySessionUpdate(tracker *agentcore.ToolTracker, ev sessionUpdateEvent) n
 		}
 		switch *ev.toolCallUpdate.Status {
 		case toolCallStatusCompleted, toolCallStatusFailed:
-			name, durationMS, ok := tracker.End(string(ev.toolCallUpdate.ToolCallID))
+			call, durationMS, ok := tracker.End(string(ev.toolCallUpdate.ToolCallID))
 			if !ok {
 				return normalizedUpdate{}
 			}
@@ -93,7 +93,9 @@ func applySessionUpdate(tracker *agentcore.ToolTracker, ev sessionUpdateEvent) n
 				event: domain.AgentEvent{
 					Type:           domain.EventToolResult,
 					Timestamp:      now,
-					ToolName:       name,
+					ToolName:       call.Name,
+					ToolKind:       call.Kind,
+					ToolArgument:   call.Argument,
 					ToolDurationMS: durationMS,
 					ToolError:      *ev.toolCallUpdate.Status == toolCallStatusFailed,
 					Message:        redact.Truncate(title, messageTruncateLimit),
@@ -140,9 +142,8 @@ func chunkText(chunk contentChunk) string {
 	return text.Text
 }
 
-// normalizeToolKind maps a tool call's declared kind to the ten-value
-// closed set the orchestrator's tool-call metric uses as a label,
-// substituting "other" for an absent or unrecognized value.
+// normalizeToolKind maps a tool call's declared kind to the closed set of
+// ACP kinds, substituting "other" for an absent or unrecognized value.
 func normalizeToolKind(kind *toolKind) string {
 	if kind == nil {
 		return string(toolKindOther)
@@ -154,6 +155,36 @@ func normalizeToolKind(kind *toolKind) string {
 	default:
 		return string(toolKindOther)
 	}
+}
+
+// toolCallOf maps a tool_call begin payload to a tool call. The call is named
+// by its normalized ACP kind, except other and switch_mode, which name none.
+// The main argument is the first location's path for a file kind and the
+// title for execute, because the protocol defines no command member.
+func toolCallOf(begin toolCall) agentcore.ToolCall {
+	kind := normalizeToolKind(begin.Kind)
+	call := agentcore.ToolCall{Name: kind}
+	switch toolKind(kind) {
+	case toolKindOther, toolKindSwitchMode:
+		call.Name = ""
+	case toolKindRead:
+		call.Kind = domain.ToolKindRead
+		call.Argument = firstLocationPath(begin.Locations)
+	case toolKindEdit, toolKindDelete, toolKindMove:
+		call.Kind = domain.ToolKindEdit
+		call.Argument = firstLocationPath(begin.Locations)
+	case toolKindExecute:
+		call.Kind = domain.ToolKindShell
+		call.Argument = begin.Title
+	}
+	return call
+}
+
+func firstLocationPath(locations *[]toolCallLocation) string {
+	if locations == nil || len(*locations) == 0 {
+		return ""
+	}
+	return (*locations)[0].Path
 }
 
 // stopReasonEvidence maps promptResponse.StopReason to the shared turn

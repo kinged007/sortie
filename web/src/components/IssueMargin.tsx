@@ -2,6 +2,8 @@ import { useId } from "react";
 
 import { useNow } from "@/app/live";
 import { ExternalLinkIcon } from "@/components/icons";
+import { BudgetMeter } from "@/components/BudgetMeter";
+import { NotedFigure } from "@/components/NotedFigure";
 import { Pair, Pairs, Panel } from "@/components/Panel";
 import { ServedText } from "@/components/ServedText";
 import { StateBadge } from "@/components/StateBadge";
@@ -12,14 +14,15 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "@/components/ui/tooltip";
 import { linkActionOf, useAttentionActions } from "@/components/use-attention-actions";
 import { useIssueActions } from "@/components/use-issue-actions";
 import { rowMark } from "@/lib/active-rows";
-import { budgetOf } from "@/lib/budget";
+import { budgetOf, moneyBudgetFigure } from "@/lib/budget";
 import { cn } from "@/lib/cn";
-import { costText, NOT_MEASURED } from "@/lib/figures";
+import { issueCostFigure, liveCostFigure, liveTokensFigure } from "@/lib/figures";
 import {
   fmtAgo,
   fmtClock,
   fmtCount,
   fmtDue,
+  fmtMoney,
   fmtStamp,
   fmtTokens,
   parseInstant,
@@ -30,7 +33,6 @@ import { safeHttpUrl } from "@/lib/links";
 
 import type {
   AttentionItemResponse,
-  ConfigResponse,
   IssueDetailResponse,
   NextOutcomeResponse,
   PendingReactionResponse,
@@ -165,14 +167,21 @@ function RetryPanel({ detail, now }: RetryPanelProps) {
     return undefined;
   }
   const isDue = (parseInstant(retry.due_at) ?? 0) <= now;
+  const isUsageLimit = retry.trigger === "usage_limit";
   return (
     <Panel title={`Retry ${retry.attempt}`}>
       <Pairs>
         <Pair label="Due">{dueText(retry.due_at, now)}</Pair>
-        {retry.trigger ? (
-          <Pair label="Started by">{startLabel(retry.trigger, "trigger")}</Pair>
-        ) : undefined}
-        {retry.error === "" ? undefined : <Pair label="Error">{retry.error}</Pair>}
+        {isUsageLimit ? (
+          <Pair label="Waiting for">the usage limit to reset</Pair>
+        ) : (
+          <>
+            {retry.trigger ? (
+              <Pair label="Started by">{startLabel(retry.trigger, "trigger")}</Pair>
+            ) : undefined}
+            {retry.error === "" ? undefined : <Pair label="Error">{retry.error}</Pair>}
+          </>
+        )}
       </Pairs>
       <EffectButton
         label="Retry now"
@@ -193,7 +202,6 @@ function triesText(row: PendingReactionResponse): string | undefined {
     : `${row.used_attempts} of ${row.max_attempts} fixes used`;
 }
 
-/** Words where a watch stands, from its last check, and the mark that word carries. */
 function watchState(
   row: PendingReactionResponse,
   detail: IssueDetailResponse,
@@ -210,9 +218,10 @@ function watchState(
     case "review":
     case "bot-review":
       if (row.wait === "debounce") return { word: "comments arriving", mark: "waiting" };
-      if ((check?.actionable_comments ?? 0) > 0) {
-        return { word: "comments to answer", mark: "waiting" };
-      }
+      if (check?.handled === true) return { word: "handled", mark: "succeeded" };
+      if ((check?.new_comments ?? 0) > 0) return { word: "comments to answer", mark: "waiting" };
+      if (check?.awaiting_approval === true)
+        return { word: "waiting on approval", mark: "waiting" };
       break;
     case "merge-conflict":
       if (check?.mergeable === false) return { word: "conflict", mark: "failed" };
@@ -238,7 +247,7 @@ function ReactionLine({ row, detail, state }: ReactionLineProps) {
       ? watchState(row, detail)
       : {
           word: "escalated",
-          mark: rowMark("pending_reactions", detail.issue_id, state?.attention ?? []).mark,
+          mark: rowMark("pending_reactions", detail.issue_id, state?.attention ?? []),
         };
 
   return (
@@ -327,7 +336,6 @@ interface NextOutcomesProps {
   outcomes: readonly NextOutcomeResponse[];
 }
 
-/** Lists the served next outcomes as condition and sentence pairs. */
 export function NextOutcomes({ outcomes }: NextOutcomesProps) {
   return (
     <ul className="flex flex-col gap-xs">
@@ -343,50 +351,36 @@ export function NextOutcomes({ outcomes }: NextOutcomesProps) {
   );
 }
 
-interface BudgetMeterProps {
-  name: string;
-  line: BudgetLine;
-  format: (n: number) => string;
-}
-
-function BudgetMeter({ name, line, format }: BudgetMeterProps) {
-  const { used, limit } = line;
-  if (used === null || limit === null || limit <= 0) {
-    return undefined;
-  }
-  const isFull = used >= limit;
-  return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-sm gap-y-xxs text-body-md">
-      <span className="text-ink">{name}</span>
-      <span className="text-ink-body tabular-nums">{`${format(used)} of ${format(limit)}`}</span>
-      <span
-        aria-hidden="true"
-        className={cn(
-          "col-span-2 h-1 overflow-hidden rounded-full",
-          isFull ? "bg-warning-container" : "bg-viz-1-track",
-        )}
-      >
-        <span
-          className={cn("block h-full rounded-full", isFull ? "bg-warning-fill" : "bg-viz-1")}
-          style={{ width: `${Math.min(100, (used / limit) * 100)}%` }}
-        />
-      </span>
-    </div>
-  );
-}
-
 function noTokenBudgetText(tokens: BudgetLine & { complete: boolean }): string | undefined {
-  if (tokens.used !== null && tokens.limit !== null && tokens.limit > 0) {
-    return undefined;
-  }
   if (!tokens.limitKnown) {
     return undefined;
   }
-  return tokens.used === null ? "No token budget: tokens not reported." : "No token budget.";
+  const hasBudget = tokens.limit !== null && tokens.limit > 0;
+  if (tokens.used === null) {
+    return hasBudget ? "Tokens not reported." : "No token budget: tokens not reported.";
+  }
+  return hasBudget ? undefined : "No token budget.";
 }
 
-function costShares(runs: readonly RunResponse[], chained: boolean): [string, number | null][] {
-  const shares = new Map<string, number | null>();
+interface CostShare {
+  name: string;
+  usd: number;
+  hasPriced: boolean;
+  hasUnpriced: boolean;
+  /** True when a run of the share is a lower bound or reported no usage. */
+  isIncomplete: boolean;
+}
+
+/** Folds the runs of a share as the issue's own cost folds them. */
+function shareStatus(share: CostShare): string {
+  if (share.hasPriced) {
+    return share.hasUnpriced || share.isIncomplete ? "partial" : "estimated";
+  }
+  return share.hasUnpriced ? "unpriced" : "unmeasured";
+}
+
+function costShares(runs: readonly RunResponse[], chained: boolean): CostShare[] {
+  const shares = new Map<string, CostShare>();
   const stageRuns = runs.filter((run) => !run.reaction_kind).length;
   for (const run of runs) {
     const name = run.reaction_kind
@@ -396,23 +390,48 @@ function costShares(runs: readonly RunResponse[], chained: boolean): [string, nu
         : run.rule_name
           ? ruleLabel(run.rule_name)
           : "Work";
-    const before = shares.has(name) ? (shares.get(name) ?? null) : 0;
+    const before = shares.get(name) ?? {
+      name,
+      usd: 0,
+      hasPriced: false,
+      hasUnpriced: false,
+      isIncomplete: false,
+    };
     const usd = run.estimated_cost_usd;
-    shares.set(name, before === null || usd === null ? null : before + usd);
+    shares.set(name, {
+      name,
+      usd: before.usd + (usd ?? 0),
+      hasPriced: before.hasPriced || usd !== null,
+      hasUnpriced: before.hasUnpriced || run.cost_status === "unpriced",
+      isIncomplete:
+        before.isIncomplete ||
+        run.cost_status === "partial" ||
+        run.cost_status === "unmeasured" ||
+        run.usage_completeness === "lower_bound",
+    });
   }
-  return [...shares];
+  return [...shares.values()];
 }
 
 interface BudgetPanelProps {
   detail: IssueDetailResponse;
-  config: ConfigResponse | undefined;
+  state: StateResponse | undefined;
   chained: boolean;
 }
 
-function BudgetPanel({ detail, config, chained }: BudgetPanelProps) {
-  const { sessions, tokens, cost } = budgetOf(detail, config);
+function BudgetPanel({ detail, state, chained }: BudgetPanelProps) {
+  const figures = budgetOf(detail, state);
+  const { sessions, tokens, money, cost } = figures;
   const note = noTokenBudgetText(tokens);
+  const moneyFigure = moneyBudgetFigure(figures);
+  const moneyText =
+    moneyFigure === undefined || money.limit === null ? undefined : (
+      <>
+        <NotedFigure figure={moneyFigure} /> of {fmtMoney(money.limit)}
+      </>
+    );
   const shares = cost === null ? [] : costShares(detail.history?.runs ?? [], chained);
+  const hasPairs = cost !== null && (moneyText === undefined || shares.length > 0);
 
   return (
     <Panel title={cost === null ? "Budget" : "Budget and cost"}>
@@ -424,17 +443,42 @@ function BudgetPanel({ detail, config, chained }: BudgetPanelProps) {
         ) : (
           <BudgetMeter name="Sessions" line={sessions} format={fmtCount} />
         )}
-        <BudgetMeter name="Tokens and cache reads" line={tokens} format={fmtTokens} />
+        <BudgetMeter
+          name="Tokens"
+          line={tokens}
+          format={fmtTokens}
+          text={
+            tokens.used === null || tokens.limit === null || tokens.complete ? undefined : (
+              <>
+                <NotedFigure figure={liveTokensFigure(tokens.used, false)} /> of{" "}
+                {fmtTokens(tokens.limit)}
+              </>
+            )
+          }
+        />
         {note === undefined ? undefined : <p className="text-body-sm text-ink-muted">{note}</p>}
+        {moneyText === undefined ? undefined : (
+          <BudgetMeter name="Cost" line={money} format={fmtMoney} text={moneyText} />
+        )}
       </div>
-      {cost === null ? undefined : (
+      {cost === null || !hasPairs ? undefined : (
         <Pairs>
-          <Pair label="Estimated cost">
-            <strong className="font-bold">{costText(cost.status, cost.usd)}</strong>
-          </Pair>
-          {shares.map(([name, usd]) => (
-            <Pair key={name} label={name}>
-              {usd === null ? NOT_MEASURED : costText("estimated", usd)}
+          {moneyText === undefined ? (
+            <Pair label="Estimated cost">
+              <strong className="font-bold">
+                <NotedFigure figure={issueCostFigure(detail, cost)} />
+              </strong>
+            </Pair>
+          ) : undefined}
+          {shares.map((share) => (
+            <Pair key={share.name} label={share.name}>
+              <NotedFigure
+                figure={liveCostFigure(
+                  shareStatus(share),
+                  share.hasPriced ? share.usd : null,
+                  "runs",
+                )}
+              />
             </Pair>
           ))}
         </Pairs>
@@ -444,15 +488,16 @@ function BudgetPanel({ detail, config, chained }: BudgetPanelProps) {
 }
 
 function agentOf(detail: IssueDetailResponse): string | undefined {
+  const kind = detail.running?.agent_kind ?? detail.history?.runs?.[0]?.agent_kind;
+  return kind ? agentLabel(kind) : undefined;
+}
+
+function modelOf(detail: IssueDetailResponse): string {
   const { running } = detail;
   const last = detail.history?.runs?.[0];
-  const kind = running?.agent_kind ?? last?.agent_kind;
   const model =
     running?.model_name || running?.configured_model || last?.model_name || last?.configured_model;
-  if (!kind) {
-    return undefined;
-  }
-  return model ? `${agentLabel(kind)} · ${modelLabel(model)}` : agentLabel(kind);
+  return model ? modelLabel(model) : "agent default";
 }
 
 function ruleOf(detail: IssueDetailResponse): string | undefined {
@@ -491,6 +536,7 @@ function RoutePanel({ detail, position }: RoutePanelProps) {
           </>
         )}
         {agent === undefined ? undefined : <Pair label="Agent">{agent}</Pair>}
+        {agent === undefined ? undefined : <Pair label="Model">{modelOf(detail)}</Pair>}
       </Pairs>
     </Panel>
   );
@@ -530,18 +576,12 @@ function IssuePanel({ detail }: IssuePanelProps) {
   );
 }
 
-/** Props of {@link IssueMargin}. */
 export interface IssueMarginProps {
   detail: IssueDetailResponse;
   state: StateResponse | undefined;
   position: StagePosition | null;
 }
 
-/**
- * Renders the column beside an issue's story: its attention items with their
- * actions, a scheduled retry with Retry now, what happens next, the pull
- * requests with Check now, the budget and cost, the route, and the issue.
- */
 export function IssueMargin({ detail, state, position }: IssueMarginProps) {
   const now = useNow();
   const attention = (state?.attention ?? []).filter((item) => item.issue_id === detail.issue_id);
@@ -571,7 +611,7 @@ export function IssueMargin({ detail, state, position }: IssueMarginProps) {
           state={state}
         />
       ))}
-      <BudgetPanel detail={detail} config={state?.config} chained={position !== null} />
+      <BudgetPanel detail={detail} state={state} chained={position !== null} />
       <RoutePanel detail={detail} position={position} />
       <IssuePanel detail={detail} />
     </>

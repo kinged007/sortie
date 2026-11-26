@@ -51,10 +51,10 @@ func livePass(rule, previous string, budget bool) LivePass {
 
 func funnelsOf(t *testing.T, stages Stages, until *time.Time, rows ...persistence.RunStatsRow) Report {
 	t.Helper()
-	agg := New(withTriggerBreakdown(fullCaps), nil)
+	agg := New(withTriggerBreakdown(fullCaps))
 	agg.SetStages(stages)
 	addRows(t, agg, rows...)
-	return agg.Report(fixedNow, "/wf", "/db", nil, until, nil)
+	return agg.Report(fixedNow, "/wf", "/db", nil, until)
 }
 
 func stageOf(t *testing.T, report Report, rule string) FunnelStage {

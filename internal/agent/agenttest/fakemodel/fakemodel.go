@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // Usage is the token accounting one answer reports.
@@ -35,12 +37,20 @@ type Usage struct {
 
 // Response is one scripted turn answer: Text when Call is nil and Hold is
 // false, a function call when Call is set, and a held request when Hold is
-// true.
+// true. A non-zero Status makes it a refusal instead.
 type Response struct {
-	Text  string
-	Call  ToolChoice
-	Hold  bool // keeps the request open and answers nothing until the client disconnects
-	Usage Usage
+	Text   string
+	Call   ToolChoice
+	Hold   bool // keeps the request open and answers nothing until the client disconnects
+	Usage  Usage
+	Header http.Header // headers the answer carries beside the wire's own; nil adds none
+
+	// Status is the HTTP status of a refusal answer; zero answers 200
+	// with Text or Call.
+	Status int
+	// Body is the refusal body served verbatim; nil serves the wire's
+	// own error body for Status and Text.
+	Body []byte
 }
 
 // Tool is one function tool a model request declares.
@@ -65,9 +75,10 @@ type ToolChoice func(declared []Tool) (FunctionCall, error)
 type Wire string
 
 const (
-	WireGenerateContent Wire = "generateContent"
-	WireMessages        Wire = "messages"
-	WireResponses       Wire = "responses"
+	WireGenerateContent           Wire = "generateContent"
+	WireMessages                  Wire = "messages"
+	WireResponses                 Wire = "responses"
+	WireGenerateAssistantResponse Wire = "generateAssistantResponse"
 )
 
 // ExchangeKind classifies how the server answered one request.
@@ -75,7 +86,7 @@ type ExchangeKind string
 
 const (
 	ExchangeTurn        ExchangeKind = "turn"        // answered from the script
-	ExchangeAuxiliary   ExchangeKind = "auxiliary"   // answered outside the script
+	ExchangeAuxiliary   ExchangeKind = "auxiliary"   // answered outside the script: a request with no tool, or one a Background classifier claims
 	ExchangeExhausted   ExchangeKind = "exhausted"   // a turn request after the last script entry
 	ExchangeUnmatched   ExchangeKind = "unmatched"   // the entry's ToolChoice matched no declared tool
 	ExchangeUnrouted    ExchangeKind = "unrouted"    // no wire routes the method and path
@@ -154,6 +165,7 @@ var auxiliaryUsage = Usage{Prompt: 7, Candidates: 3, Thoughts: 2}
 type route struct {
 	model     string
 	streaming bool
+	operation string // the operation a wire carries in a header rather than the path
 }
 
 // responseSchema is the top-level object schema a request asks its answer to
@@ -165,6 +177,7 @@ type responseSchema struct {
 type decoded struct {
 	model       string
 	streaming   bool
+	operation   string
 	tools       []Tool
 	toolResults []ToolResult
 	schema      *responseSchema
@@ -173,6 +186,7 @@ type decoded struct {
 
 type reply struct {
 	seq       int
+	operation string
 	model     string
 	streaming bool
 	text      string
@@ -191,7 +205,7 @@ type rendered struct {
 // answers and errors are written.
 type codec interface {
 	wire() Wire
-	route(method, path string) (route, bool)
+	route(method, path string, header http.Header) (route, bool)
 	decode(rt route, body []byte) (decoded, error)
 	render(r reply) rendered
 	errorBody(status int, message string) []byte
@@ -199,7 +213,7 @@ type codec interface {
 }
 
 // wireCodecs lists the codecs the server routes to, in routing order.
-var wireCodecs = []codec{generateContentCodec{}, messagesCodec{}, responsesCodec{}}
+var wireCodecs = []codec{generateContentCodec{}, messagesCodec{}, responsesCodec{}, generateAssistantCodec{}}
 
 // unroutedCredentialHeaders are the credential headers read from a request no
 // wire routes: the union of every wire's own.
@@ -207,20 +221,37 @@ var unroutedCredentialHeaders = []string{"x-goog-api-key", "x-api-key", "Authori
 
 // Server is a running scripted model endpoint.
 type Server struct {
-	t      testing.TB
-	script []Response
-	http   *httptest.Server
+	t       testing.TB
+	script  []Response
+	options serverOptions
+	http    *httptest.Server
 
 	holdingOnce sync.Once
 	holdingCh   chan struct{} // closed when the first held request is held
 	releaseOnce sync.Once
 	released    chan struct{}
 
-	mu         sync.Mutex
-	served     []bool        // guarded by mu
-	log        []Exchange    // guarded by mu
-	open       map[int]bool  // guarded by mu; Seq of every held request still open
-	holdsMoved chan struct{} // guarded by mu; closed and replaced whenever open changes
+	mu     sync.Mutex
+	served []bool       // guarded by mu
+	log    []Exchange   // guarded by mu
+	open   map[int]bool // guarded by mu; Seq of every held request still open
+}
+
+// Option configures a [Server] at [Start].
+type Option func(*serverOptions)
+
+type serverOptions struct {
+	background []func(Exchange) bool
+}
+
+// Background returns an [Option] that answers outside the script every
+// tool-declaring request classify reports true for, with the auxiliary
+// answer and usage and without claiming a script entry. classify receives
+// the request as decoded so far, once per tool-declaring request, on the
+// handler goroutine, before a step is claimed, so it must be safe for
+// concurrent calls.
+func Background(classify func(Exchange) bool) Option {
+	return func(o *serverOptions) { o.background = append(o.background, classify) }
 }
 
 // Start serves script on 127.0.0.1 with an OS-assigned port and closes the
@@ -229,10 +260,13 @@ type Server struct {
 // Start fails t with Fatalf, naming the first invalid index, unless each
 // entry has exactly one of a non-empty Text, a non-nil Call and a true Hold,
 // no negative count, and CachedContent plus CacheWrite no greater than Prompt.
-// A held entry reports no usage. At cleanup it ends every held request and
-// reports every entry no request was served from. It must be called on the
-// test goroutine.
-func Start(t testing.TB, script []Response) *Server {
+// A held entry reports no usage and carries no Header. An entry with a
+// non-zero Status is a refusal: it carries no Call, no Hold and no Usage, and
+// the exactly-one rule does not apply to it. A request that
+// declares no tool is answered outside the script, as is one a [Background]
+// option claims. At cleanup it ends every held request and reports every entry
+// no request was served from. It must be called on the test goroutine.
+func Start(t testing.TB, script []Response, opts ...Option) *Server {
 	t.Helper()
 
 	for i, entry := range script {
@@ -240,20 +274,24 @@ func Start(t testing.TB, script []Response) *Server {
 			t.Fatalf("scripted model: script response %d %s", i, rule)
 		}
 	}
+	var options serverOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("scripted model: listen on 127.0.0.1: %v", err)
 	}
 
 	s := &Server{
-		t:      t,
-		script: slices.Clone(script),
-		served: make([]bool, len(script)),
+		t:       t,
+		script:  slices.Clone(script),
+		options: options,
+		served:  make([]bool, len(script)),
 
-		holdingCh:  make(chan struct{}),
-		released:   make(chan struct{}),
-		open:       make(map[int]bool),
-		holdsMoved: make(chan struct{}),
+		holdingCh: make(chan struct{}),
+		released:  make(chan struct{}),
+		open:      make(map[int]bool),
 	}
 	s.http = &httptest.Server{
 		Listener: listener,
@@ -267,10 +305,14 @@ func Start(t testing.TB, script []Response) *Server {
 func invalidScriptRule(r Response) string {
 	u := r.Usage
 	switch {
+	case r.Status != 0 && (r.Call != nil || r.Hold || u != (Usage{})):
+		return "refuses with a Status but holds a Call, a Hold or usage"
+	case r.Status != 0:
+		return ""
 	case !exactlyOne(r.Text != "", r.Call != nil, r.Hold):
 		return "must hold exactly one of Text, Call and Hold"
-	case r.Hold && u != (Usage{}):
-		return "holds a request but reports usage"
+	case r.Hold && (u != (Usage{}) || r.Header != nil):
+		return "holds a request but reports usage or a header"
 	case min(u.Prompt, u.Candidates, u.Thoughts, u.CachedContent, u.CacheWrite) < 0:
 		return "reports a negative usage count"
 	case u.CachedContent+u.CacheWrite > u.Prompt:
@@ -324,22 +366,18 @@ func (s *Server) release() {
 // awaitHolds returns the held requests still open once all have ended or
 // bound has elapsed.
 func (s *Server) awaitHolds(bound time.Duration) []Exchange {
-	timer := time.NewTimer(bound)
-	defer timer.Stop()
-	for {
+	err := waittest.UntilWithin(bound, livenessPoll, func() error {
 		s.mu.Lock()
-		moved := s.holdsMoved
-		pending := len(s.open)
-		s.mu.Unlock()
-		if pending == 0 {
-			return nil
+		defer s.mu.Unlock()
+		if len(s.open) > 0 {
+			return fmt.Errorf("%d held request(s) still open", len(s.open))
 		}
-		select {
-		case <-moved:
-		case <-timer.C:
-			return s.openHolds()
-		}
+		return nil
+	})
+	if err != nil {
+		return s.openHolds()
 	}
+	return nil
 }
 
 func (s *Server) openHolds() []Exchange {
@@ -362,8 +400,6 @@ func (s *Server) setHold(seq int, open bool) {
 	} else {
 		delete(s.open, seq)
 	}
-	close(s.holdsMoved)
-	s.holdsMoved = make(chan struct{})
 }
 
 func (s *Server) close() {
@@ -405,6 +441,15 @@ func (s *Server) record(ex Exchange) {
 	s.log[ex.Seq-1] = ex.clone()
 }
 
+func (s *Server) isBackground(ex Exchange) bool {
+	for _, classify := range s.options.background {
+		if classify(ex.clone()) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) claimStep() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -432,7 +477,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.t.Errorf("%s", failure)
 	}
 
-	w.Header().Set("Content-Type", contentType)
+	s.writeHeader(w, ex, contentType)
 	w.WriteHeader(ex.Answer.Status)
 	_, _ = w.Write(ex.Answer.Body)
 }
@@ -449,7 +494,7 @@ func (s *Server) respond(ex *Exchange, r *http.Request) (contentType, failure st
 			label+" is encoded as "+encoding+", which this server does not decode")
 	}
 
-	c, rt, routed := findRoute(r.Method, r.URL.Path)
+	c, rt, routed := findRoute(r.Method, r.URL.Path, r.Header)
 	if !routed {
 		return failGeneric(ex, http.StatusNotFound, ExchangeUnrouted, label+" matches no route")
 	}
@@ -471,9 +516,9 @@ func (s *Server) respond(ex *Exchange, r *http.Request) (contentType, failure st
 		return failWire(ex, c, ExchangeUnsupported,
 			label+" asks for a "+dec.unsupported+" this server does not answer", "")
 	}
-	if len(dec.tools) == 0 {
+	if len(dec.tools) == 0 || s.isBackground(*ex) {
 		text := auxiliaryText(dec.schema)
-		return answerWire(ex, c, ExchangeAuxiliary, reply{seq: ex.Seq, model: dec.model, streaming: dec.streaming, text: text, usage: auxiliaryUsage})
+		return answerWire(ex, c, ExchangeAuxiliary, reply{seq: ex.Seq, model: dec.model, streaming: dec.streaming, operation: dec.operation, text: text, usage: auxiliaryUsage})
 	}
 
 	step := s.claimStep()
@@ -488,7 +533,10 @@ func (s *Server) respond(ex *Exchange, r *http.Request) (contentType, failure st
 		ex.Kind = ExchangeHeld
 		return "", ""
 	}
-	turn := reply{seq: ex.Seq, model: dec.model, streaming: dec.streaming, text: entry.Text, usage: entry.Usage}
+	if entry.Status != 0 {
+		return refuse(ex, c, entry)
+	}
+	turn := reply{seq: ex.Seq, model: dec.model, streaming: dec.streaming, operation: dec.operation, text: entry.Text, usage: entry.Usage}
 	if entry.Call != nil {
 		call, err := entry.Call(dec.tools)
 		if err == nil && !isJSONObject(call.Arguments) {
@@ -508,6 +556,19 @@ const jsonContentType = "application/json"
 
 func failureLabel(ex Exchange) string {
 	return fmt.Sprintf("scripted model: request %d (%s %s)", ex.Seq, ex.Method, ex.Path)
+}
+
+// writeHeader sets the headers of an answer: those its script entry carries,
+// then the wire's own Content-Type, which replaces a scripted one.
+func (s *Server) writeHeader(w http.ResponseWriter, ex Exchange, contentType string) {
+	if ex.Kind == ExchangeTurn {
+		for name, values := range s.script[ex.Step].Header {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", contentType)
 }
 
 // hold keeps a claimed held request open without writing, so the runtime
@@ -530,7 +591,7 @@ func (s *Server) hold(w http.ResponseWriter, r *http.Request, ex Exchange) {
 		return
 	}
 
-	c, _, _ := findRoute(r.Method, r.URL.Path)
+	c, _, _ := findRoute(r.Method, r.URL.Path, r.Header)
 	text := failureLabel(ex) + " was still held when the server released it"
 	ex.Answer = Answer{Status: http.StatusBadRequest, Text: text, Body: c.errorBody(http.StatusBadRequest, text)}
 	s.record(ex)
@@ -562,6 +623,16 @@ func fail(ex *Exchange, status int, kind ExchangeKind, message string, body []by
 	return jsonContentType, message + suffix
 }
 
+func refuse(ex *Exchange, c codec, entry Response) (contentType, failure string) {
+	body := entry.Body
+	if body == nil {
+		body = c.errorBody(entry.Status, entry.Text)
+	}
+	ex.Kind = ExchangeTurn
+	ex.Answer = Answer{Status: entry.Status, Text: entry.Text, Body: slices.Clone(body)}
+	return jsonContentType, ""
+}
+
 func answerWire(ex *Exchange, c codec, kind ExchangeKind, r reply) (contentType, failure string) {
 	out := c.render(r)
 	ex.Kind = kind
@@ -569,9 +640,9 @@ func answerWire(ex *Exchange, c codec, kind ExchangeKind, r reply) (contentType,
 	return out.contentType, ""
 }
 
-func findRoute(method, path string) (codec, route, bool) {
+func findRoute(method, path string, header http.Header) (codec, route, bool) {
 	for _, c := range wireCodecs {
-		if rt, ok := c.route(method, path); ok {
+		if rt, ok := c.route(method, path, header); ok {
 			return c, rt, true
 		}
 	}

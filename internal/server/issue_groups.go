@@ -218,15 +218,15 @@ func (s *Server) buildIssueGroup(ctx context.Context, key IssueGroupKey, q Issue
 		DisplayIdentifier: newest.DisplayID,
 		IssueTitle:        redact.Mask(newest.IssueTitle),
 		IssueURL:          redact.Mask(newest.IssueURL),
-		Runs:              toRunResponses(page, s.tokenRates, chains),
+		Runs:              toRunResponses(page, chains),
 		NextCursor:        runsNext,
-		Totals:            historyTotalsOf(totals, s.tokenRates),
+		Totals:            historyTotalsOf(totals),
 	}
 	attachIssueOutcomes(group.Runs, outcomes)
 	if hasOutcome {
 		group.IssueOutcome = toIssueOutcomeResponse(outcome, newest.Identifier, newest.DisplayID)
 	}
-	if live := buildIssueDetail("", key.IssueID, snap, s.tokenRates, words); live != nil {
+	if live := buildIssueDetail("", key.IssueID, snap, words); live != nil {
 		group.Status, group.StatusText, group.StatusTextFull = live.Status, live.StatusText, live.StatusTextFull
 	} else {
 		group.Status = "history"

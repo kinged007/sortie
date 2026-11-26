@@ -4,7 +4,7 @@
 {"type":"turn_end","message":"not-a-message-object","toolResults":[]}
 {"type":"turn_end","message":{"content":[]},"toolResults":[]}
 {"type":"turn_end","toolResults":[]}
-{"type":"message_end","message":{"role":"assistant","content":"not-a-list"},"toolResults":[]}
+{"type":"message_end","message":{"role":"assistant","content":7},"toolResults":[]}
 {"type":"message_update","assistantMessageEvent":"not-an-object"}
 {"type":"message_update","assistantMessageEvent":{"type":"teleport_delta","contentIndex":0,"delta":"x"}}
 {"type":"message_update"}

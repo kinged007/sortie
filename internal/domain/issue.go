@@ -4,6 +4,8 @@
 // contract.
 package domain
 
+import "time"
+
 // Issue is the normalized issue record used by orchestration, prompt
 // rendering, and observability output. Tracker adapters produce Issue
 // values by normalizing their native API responses.
@@ -127,8 +129,54 @@ type Comment struct {
 	// Body is the comment text content.
 	Body string
 
-	// CreatedAt is an ISO-8601 timestamp.
+	// CreatedAt is the tracker's timestamp text, passed through unchanged.
+	// It is RFC 3339 with fractional seconds optional and a "Z" or "±hh:mm"
+	// offset, or the same with a "±hhmm" offset. [Comment.CreatedTime]
+	// parses exactly these forms.
 	CreatedAt string
+}
+
+// commentTimeLayouts are the forms [Comment.CreatedTime] accepts. Parsing
+// with a fractional-seconds-free layout also accepts fractional input.
+var commentTimeLayouts = []string{
+	time.RFC3339,
+	"2006-01-02T15:04:05Z0700",
+}
+
+// CreatedTime reports the instant CreatedAt names. It parses RFC 3339
+// (fractional seconds optional) and the same form with a ±hhmm offset, and
+// returns an error for anything else, the empty string included.
+func (c Comment) CreatedTime() (time.Time, error) {
+	var firstErr error
+	for _, layout := range commentTimeLayouts {
+		t, err := time.Parse(layout, c.CreatedAt)
+		if err == nil {
+			return t, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return time.Time{}, firstErr
+}
+
+// CommentTemplateMaps converts comments to template form, one map per
+// comment with keys id, author, body, created_at. A nil input yields nil;
+// any other input yields a non-nil slice of equal length.
+func CommentTemplateMaps(comments []Comment) []map[string]any {
+	if comments == nil {
+		return nil
+	}
+	maps := make([]map[string]any, len(comments))
+	for i, c := range comments {
+		maps[i] = map[string]any{
+			"id":         c.ID,
+			"author":     c.Author,
+			"body":       c.Body,
+			"created_at": c.CreatedAt,
+		}
+	}
+	return maps
 }
 
 // ToTemplateMap converts the Issue to a map[string]any with snake_case
@@ -149,16 +197,7 @@ func (iss *Issue) ToTemplateMap() map[string]any {
 
 	var comments any
 	if iss.Comments != nil {
-		cm := make([]map[string]any, len(iss.Comments))
-		for i, c := range iss.Comments {
-			cm[i] = map[string]any{
-				"id":         c.ID,
-				"author":     c.Author,
-				"body":       c.Body,
-				"created_at": c.CreatedAt,
-			}
-		}
-		comments = cm
+		comments = CommentTemplateMaps(iss.Comments)
 	}
 
 	var blockedBy any

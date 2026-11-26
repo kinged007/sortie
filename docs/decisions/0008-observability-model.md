@@ -42,7 +42,7 @@ Sortie's deployment model is distinctive: a single binary with zero infrastructu
 
 ## Decision Outcome
 
-Chosen option: **Embedded JSON API + HTML dashboard as the primary observability surface, combined with a Prometheus `/metrics` endpoint as an opt-in integration point**, because this layered model preserves zero-infrastructure operation (drivers 1, 3) while enabling standard production monitoring integration (driver 2) without over-engineering (driver 4). Structured logs are retained as the always-on baseline. Unix socket and OpenTelemetry SDK are deferred.
+Chosen option: **Embedded JSON API + HTML dashboard as the primary observability surface, combined with a Prometheus `/metrics` endpoint as an opt-in integration point**, because this layered model preserves zero-infrastructure operation and seconds-to-answer debugging while enabling standard production monitoring integration at a low implementation and maintenance cost. Structured logs are retained as the always-on baseline. Unix socket and OpenTelemetry SDK are deferred.
 
 This is a **layered observability model** with three tiers:
 

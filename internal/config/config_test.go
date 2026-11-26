@@ -1150,54 +1150,81 @@ func TestNewServiceConfig(t *testing.T) {
 		assertStringEqual(t, "ConfigError.Message", "invalid integer value: not-a-number", ce.Message)
 	})
 
-	t.Run("MaxTokens/DefaultIsZero", func(t *testing.T) {
+	t.Run("MaxTokens", func(t *testing.T) {
 		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+
+		tests := []struct {
+			name    string
+			agent   map[string]any
+			want    int
+			wantErr bool
+		}{
+			{name: "default is zero", agent: map[string]any{}, want: 0},
+			{name: "explicit zero", agent: map[string]any{"max_tokens": 0}, want: 0},
+			{name: "positive integer", agent: map[string]any{"max_tokens": 500000}, want: 500000},
+			{name: "string coercion", agent: map[string]any{"max_tokens": "500000"}, want: 500000},
+			{name: "negative rejected", agent: map[string]any{"max_tokens": -1}, wantErr: true},
 		}
-		assertIntEqual(t, "Agent.MaxTokens", 0, cfg.Agent.MaxTokens)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				cfg, err := NewServiceConfig(map[string]any{"agent": tt.agent})
+
+				if tt.wantErr {
+					assertConfigErrorField(t, err, "agent.max_tokens")
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewServiceConfig(agent: %v) unexpected error: %v", tt.agent, err)
+				}
+				assertIntEqual(t, "Agent.MaxTokens", tt.want, cfg.Agent.MaxTokens)
+			})
+		}
 	})
 
-	t.Run("MaxTokens/ExplicitZero", func(t *testing.T) {
+	t.Run("MaxCostUSD", func(t *testing.T) {
 		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{
-			"agent": map[string]any{"max_tokens": 0},
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		assertIntEqual(t, "Agent.MaxTokens", 0, cfg.Agent.MaxTokens)
-	})
 
-	t.Run("MaxTokens/PositiveInteger", func(t *testing.T) {
-		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{
-			"agent": map[string]any{"max_tokens": 500000},
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		tests := []struct {
+			name    string
+			value   any
+			want    float64
+			wantMsg string
+		}{
+			{name: "zero", value: 0, want: 0},
+			{name: "integer", value: 5, want: 5},
+			{name: "float", value: 2.5, want: 2.5},
+			{name: "string trimmed", value: " 2.5 ", want: 2.5},
+			{name: "negative", value: -1, wantMsg: "must be non-negative"},
+			{name: "NaN", value: math.NaN(), wantMsg: "must be a finite number"},
+			{name: "infinity", value: math.Inf(1), wantMsg: "must be a finite number"},
+			{name: "non-numeric string", value: "abc", wantMsg: "invalid number value: abc"},
 		}
-		assertIntEqual(t, "Agent.MaxTokens", 500000, cfg.Agent.MaxTokens)
-	})
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
 
-	t.Run("MaxTokens/StringCoercion", func(t *testing.T) {
-		t.Parallel()
-		cfg, err := NewServiceConfig(map[string]any{
-			"agent": map[string]any{"max_tokens": "500000"},
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+				cfg, err := NewServiceConfig(map[string]any{
+					"agent": map[string]any{"max_cost_usd": tt.value},
+				})
+
+				if tt.wantMsg != "" {
+					assertConfigErrorField(t, err, "agent.max_cost_usd")
+					var ce *ConfigError
+					if errors.As(err, &ce) && ce.Message != tt.wantMsg {
+						t.Errorf("NewServiceConfig(max_cost_usd: %v) ConfigError.Message = %q, want %q", tt.value, ce.Message, tt.wantMsg)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewServiceConfig(max_cost_usd: %v) unexpected error: %v", tt.value, err)
+				}
+				if cfg.Agent.MaxCostUSD != tt.want {
+					t.Errorf("NewServiceConfig(max_cost_usd: %v).Agent.MaxCostUSD = %v, want %v", tt.value, cfg.Agent.MaxCostUSD, tt.want)
+				}
+			})
 		}
-		assertIntEqual(t, "Agent.MaxTokens", 500000, cfg.Agent.MaxTokens)
-	})
-
-	t.Run("MaxTokens/NegativeRejected", func(t *testing.T) {
-		t.Parallel()
-		_, err := NewServiceConfig(map[string]any{
-			"agent": map[string]any{"max_tokens": -1},
-		})
-		assertConfigErrorField(t, err, "agent.max_tokens")
 	})
 
 	t.Run("TokenWarningPercent/DefaultIsZero", func(t *testing.T) {

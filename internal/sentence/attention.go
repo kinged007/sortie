@@ -10,8 +10,8 @@ import (
 )
 
 // AttentionItem is one thing that needs a person, worded and ready to serve.
-// Kind is parked, budget_held, reaction_escalated, workflow_reload_failed, or
-// preflight_failed; Severity is critical or warning. Since is nil only for a
+// Kind is parked, budget_held, reaction_escalated, workflow_reload_failed,
+// preflight_failed, or spend_ceiling_reached; Severity is critical or warning. Since is nil only for a
 // park whose stored time did not parse. AcknowledgedAt is nil while no person
 // has acknowledged the item. The issue fields are empty on a process-wide item.
 type AttentionItem struct {
@@ -50,6 +50,9 @@ type AttentionEvidence struct {
 	UsedTokens         *int64
 	UsedTokensComplete *bool
 	BudgetTokens       *int64
+	UsedUSD            *float64
+	UsedUSDComplete    *bool
+	BudgetUSD          *float64
 	ReactionKind       string
 	ConfigKey          string
 	PullRequest        *orchestrator.SnapshotPullRequest
@@ -59,6 +62,7 @@ type AttentionEvidence struct {
 	LastCheck          *orchestrator.ReactionCheck
 	File               string
 	Error              string
+	ResetsAt           *time.Time
 }
 
 const (
@@ -75,6 +79,7 @@ const (
 const (
 	parkReasonHandoffAbsence = "handoff_absence"
 	budgetReasonTokens       = "token_budget"
+	budgetReasonMoney        = "money_budget"
 	checkVerdictFailing      = "failing"
 	checkVerdictPending      = "pending"
 )
@@ -123,6 +128,8 @@ func attentionItem(cause orchestrator.AttentionCause, c Context) AttentionItem {
 		return workflowReloadItem(cause)
 	case orchestrator.AttentionKindPreflightFailed:
 		return preflightItem(cause)
+	case orchestrator.AttentionKindSpendCeilingReached:
+		return spendCeilingItem(cause)
 	}
 	return AttentionItem{ID: cause.ID, Kind: cause.Kind, Since: cause.Since}
 }
@@ -161,12 +168,13 @@ func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 	evidence := AttentionEvidence{Reason: e.Reason}
 	var template string
 	var data map[string]any
-	if e.Reason == budgetReasonTokens {
+	stopped := 0
+	if e.StoppedInFlight != nil {
+		stopped = *e.StoppedInFlight
+	}
+	switch e.Reason {
+	case budgetReasonTokens:
 		used, atLeast := heldTokenSpend(e)
-		stopped := 0
-		if e.StoppedInFlight != nil {
-			stopped = *e.StoppedInFlight
-		}
 		template = "attn_budget_tokens"
 		data = map[string]any{
 			"Used":    used,
@@ -177,7 +185,23 @@ func budgetItem(cause orchestrator.AttentionCause) AttentionItem {
 		evidence.UsedTokens = e.UsedTokens
 		evidence.UsedTokensComplete = new(!atLeast)
 		evidence.BudgetTokens = new(e.BudgetTokens)
-	} else {
+	case budgetReasonMoney:
+		var used float64
+		if e.UsedUSD != nil {
+			used = *e.UsedUSD
+		}
+		complete := e.UsedUSDComplete != nil && *e.UsedUSDComplete
+		template = "attn_budget_money"
+		data = map[string]any{
+			"Used":    used,
+			"AtLeast": !complete,
+			"Budget":  e.BudgetUSD,
+			"Stopped": stopped,
+		}
+		evidence.UsedUSD = e.UsedUSD
+		evidence.UsedUSDComplete = e.UsedUSDComplete
+		evidence.BudgetUSD = new(e.BudgetUSD)
+	default:
 		template = "attn_budget_sessions"
 		data = map[string]any{
 			"UsedSessions":   e.UsedSessions,
@@ -276,6 +300,20 @@ func preflightItem(cause orchestrator.AttentionCause) AttentionItem {
 	return failingCheckItem(cause, "attn_preflight",
 		map[string]any{"Error": leadless},
 		AttentionEvidence{Error: check.Error})
+}
+
+func spendCeilingItem(cause orchestrator.AttentionCause) AttentionItem {
+	status := cause.Spend
+	return failingCheckItem(cause, "attn_spend_"+string(status.Window),
+		map[string]any{"Used": status.UsedUSD, "AtLeast": !status.UsedComplete, "Budget": status.BudgetUSD},
+		AttentionEvidence{
+			Reason:          string(status.Window.SkipReason()),
+			ConfigKey:       status.Window.Setting(),
+			UsedUSD:         new(status.UsedUSD),
+			UsedUSDComplete: new(status.UsedComplete),
+			BudgetUSD:       new(status.BudgetUSD),
+			ResetsAt:        new(status.ResetsAt.UTC()),
+		})
 }
 
 // failingCheckItem builds a process-wide item, which no issue owns and only an

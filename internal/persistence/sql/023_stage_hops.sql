@@ -1,5 +1,3 @@
--- Migration 23: automatic stage hops and the stage a dispatch followed
-
 CREATE TABLE stage_hops (
     issue_id           TEXT    PRIMARY KEY,
     identifier         TEXT    NOT NULL,

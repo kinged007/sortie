@@ -14,8 +14,8 @@ These pages are for working on Sortie itself. To install, configure, and run Sor
     - [Claude Code](claude-code-adapter-notes.md) - model mismatches and known traps
     - [Codex](codex-adapter-notes.md) - process model and trust and approval collisions
     - [Copilot CLI](copilot-adapter-notes.md) - session and cost model and hard-to-diagnose failures
-    - [OpenCode](opencode-adapter-notes.md) - why it skips the shared subprocess skeleton
-    - [Pi](pi-adapter-notes.md) - the JSON event stream, a zero exit on a failed response, and the absent tool channel
+    - [OpenCode](opencode-adapter-notes.md) - launch contract, usage export, and session identity
+    - [Pi](pi-adapter-notes.md) - the JSON event stream, a zero exit on a failed response, and why pi receives no Sortie tools
     - [Agent Client Protocol](agent-client-protocol-adapter-notes.md) - the generic ACP adapter: pinned schema artifact and runtime selection
     - [Kiro CLI](kiro-adapter-notes.md) - Kiro through the generic ACP adapter
     - [Gemini CLI](gemini-adapter-notes.md) - Gemini through the generic ACP adapter and its token accounting
@@ -91,91 +91,15 @@ These pages are for working on Sortie itself. To install, configure, and run Sor
     - [Keep both kinds registered and retire a hand-written one only at parity](decisions/0030-keep-both-kinds-registered-and-retire-only-at-parity.md)
     - [Let a dispatch rule carry the settings of the agent kind it selects](decisions/0031-let-a-dispatch-rule-carry-its-agent-kinds-settings.md)
     - [Route Outbound Messages Through Per-Destination Event Subscriptions](decisions/0032-route-outbound-messages-through-per-destination-event-subscriptions.md)
-- **Reference**
-  - [Workflow file](workflow-reference.md) - `WORKFLOW.md` syntax for workflow authors: every field, its default, and its validation
-  - [Agent-to-orchestrator protocol](agent-to-orchestrator-protocol.md) - out-of-band signaling from the agent to the orchestrator through sentinel files
-  - [File-based tasks](file-based-tasks-spec.md) - informational RFC for tasks kept as files instead of tracker issues
-  - [JSON API schema](api.schema.json) - the JSON Schema of every response the JSON API serves, generated from the server's response types
-- **Adapters**
-  - **Agent adapters**
-    - [Concepts](agent-adapter-concepts.md) - kinds, package boundaries, and the ACP qualification
-    - [Add or refresh an agent adapter](agent-adapter-howto.md) - the ordered procedure for a new kind or a refresh of an existing one
-    - [Claude Code](claude-code-adapter-notes.md) - model mismatches and known traps
-    - [Codex](codex-adapter-notes.md) - process model and trust and approval collisions
-    - [Copilot CLI](copilot-adapter-notes.md) - session and cost model and hard-to-diagnose failures
-    - [OpenCode](opencode-adapter-notes.md) - why it skips the shared subprocess skeleton
-    - [Agent Client Protocol](agent-client-protocol-adapter-notes.md) - the generic ACP adapter: pinned schema artifact and runtime selection
-    - [Kiro CLI](kiro-adapter-notes.md) - Kiro through the generic ACP adapter
-    - [Gemini CLI](gemini-adapter-notes.md) - Gemini through the generic ACP adapter and its token accounting
-  - **Tracker and SCM adapters**
-    - [Jira](jira-adapter-notes.md) - tracker decisions and failure modes
-    - [Linear](linear-adapter-notes.md) - GraphQL costs and model mismatches
-    - [GitHub](github-adapter-notes.md) - SCM design decisions and traps
-    - [GitLab](gitlab-adapter-notes.md) - SCM design decisions and traps
-    - [Gitea](gitea-adapter-notes.md) - SCM design decisions and traps
-- **Architecture and design**
-  - **Architecture**
-    - [Architecture index](architecture.md) - the system at a glance and a routing table from task to section; the section files below are the source of truth
-    - [Problem statement](architecture/01-problem-statement.md) - what Sortie automates and how work splits between the orchestrator and the agent
-    - [Goals and non-goals](architecture/02-goals-and-non-goals.md) - what the system commits to and what it excludes
-    - [System overview](architecture/03-system-overview.md) - main components, the six abstraction layers, and their dependency rule
-    - [Core domain model](architecture/04-core-domain-model.md) - domain entities, their fields, and identifier normalization
-    - [Workflow specification](architecture/05-workflow-specification.md) - `WORKFLOW.md` discovery, the front-matter schema, and the prompt-template contract
-    - [Configuration specification](architecture/06-configuration-specification.md) - source precedence, dynamic reload, preflight validation, and the cheat sheet
-    - [Orchestration state machine](architecture/07-orchestration-state-machine.md) - issue states, the run-attempt lifecycle, and recovery rules
-    - [Polling, scheduling, and reconciliation](architecture/08-polling-scheduling-and-reconciliation.md) - the poll loop, candidate selection, concurrency caps, retries, and reconciliation
-    - [Workspace management and safety](architecture/09-workspace-management-and-safety.md) - workspace layout, retention, hooks, `.sortie` artifacts, and safety invariants
-    - [Agent adapter contract](architecture/10-agent-adapter-contract.md) - the adapter interface, session lifecycle, event types, and error mapping
-    - [Issue tracker integration contract](architecture/11-issue-tracker-integration-contract.md) - required tracker operations, normalization, the error contract, and the write boundary
-    - [CI feedback contract](architecture/12-ci-feedback-contract.md) - the CI status provider interface and CI feedback in the reconcile loop
-    - [PR review comment feedback contract](architecture/13-pr-review-comment-feedback-contract.md) - reading human review comments, fingerprinting, and debounce
-    - [Auto-merge reaction contract](architecture/14-auto-merge-reaction-contract.md) - the SCM write surface, merge preconditions, and the token-scope preflight
-    - [Bot review comment feedback contract](architecture/15-bot-review-comment-feedback-contract.md) - bot-author classification and non-debounced bot review dispatch
-    - [Merge conflict reaction contract](architecture/16-merge-conflict-reaction-contract.md) - conflict detection, episodic retry, and escalation
-    - [Prompt construction and context assembly](architecture/17-prompt-construction-and-context-assembly.md) - template inputs, rendering rules, and retry and continuation semantics
-    - [Logging, status, and observability](architecture/18-logging-status-and-observability.md) - logging conventions, the runtime snapshot, metrics, and the HTTP status surface
-    - [Failure model and recovery strategy](architecture/19-failure-model-and-recovery-strategy.md) - failure classes, restart recovery, and operator intervention points
-    - [Security and operational safety](architecture/20-security-and-operational-safety.md) - trust boundaries, filesystem safety, and secret handling
-    - [Reference algorithms](architecture/21-reference-algorithms.md) - pseudocode for startup, the poll tick, dispatch, and worker retry handling
-    - [Test and validation matrix](architecture/22-test-and-validation-matrix.md) - expected test coverage per area and the integration profile
-    - [Implementation checklist](architecture/23-implementation-checklist.md) - the definition of done: conformance requirements and operational validation
-    - [Persistence schema](architecture/24-persistence-schema.md) - the SQLite schema, table definitions, and migration strategy
-    - [Webhook support](architecture/25-webhook-support.md) - the webhook-ingress design held as a future extension
-    - [Agent-authored workspace files](architecture/26-agent-authored-workspace-files.md) - the `.sortie/status` and `.sortie/review_verdict.json` files the agent leaves
-    - [SSH worker extension](architecture/27-appendix-a-ssh-worker-extension.md) - the optional remote-execution model for workers over SSH
-    - [Label command and read-only review contract](architecture/28-label-command-and-read-only-review-contract.md) - PR label-command detection and the read-only review and read-write fix dispatches
-    - [Merge completion reaction contract](architecture/29-merge-completion-reaction-contract.md) - the post-merge continuation trigger, the review wait, and terminal-target selection
-  - **Decisions**
-    - [Decision index](decisions/README.md) - every record with its status, in MADR format
-    - [Use Go as the core runtime](decisions/0001-use-go-as-core-runtime.md)
-    - [Use SQLite for persistence](decisions/0002-use-sqlite-for-persistence.md)
-    - [Use adapter interfaces for integration extensibility](decisions/0003-adapter-based-integration.md)
-    - [Use YAML front matter for workflow files](decisions/0004-workflow-file-format.md)
-    - [Use Go `text/template` for prompt rendering](decisions/0005-prompt-template-engine.md)
-    - [Use `fsnotify` for filesystem event watching](decisions/0006-use-fsnotify-for-file-watching.md)
-    - [Use handoff state transitions to signal agent completion](decisions/0007-handoff-state-and-tracker-writes.md)
-    - [Use an embedded dashboard with Prometheus metrics for observability](decisions/0008-observability-model.md)
-    - [Use an MCP stdio sidecar for agent tool execution](decisions/0009-mcp-stdio-sidecar-for-tool-execution.md)
-    - [Keep `TrackerAdapter` as a unified interface](decisions/0010-keep-tracker-adapter-unified.md)
-    - [Use first-match-wins dispatch rules in `WORKFLOW.md` front matter](decisions/0011-dispatch-rule-configuration.md) - superseded by the decision to let a dispatch rule carry its agent kind's settings
-    - [Extend `SCMAdapter` with write methods for auto-merge reactions](decisions/0012-auto-merge-reaction.md)
-    - [Use cumulative per-issue token counts for the agent cost budget](decisions/0013-agent-cost-budget.md)
-    - [Use an adapter family for operator notifications](decisions/0014-operator-notifications.md)
-    - [Detect PR label commands by polling the label-event journal](decisions/0015-pr-label-command-detection.md)
-    - [Place forge integrations in one package per forge](decisions/0016-place-forge-integrations-in-one-package-per-forge.md)
-    - [Close the tracker issue when a managed pull request merges](decisions/0017-close-tracker-issue-on-managed-pr-merge.md)
-    - [Bound workspace retention by age independently of tracker state](decisions/0018-bound-workspace-retention-by-age.md)
-    - [Keep usage data on the host and aggregate across instances by pull](decisions/0019-keep-usage-data-on-the-host.md)
-    - [Withhold the handoff transition only when absence of work is observed](decisions/0020-withhold-handoff-on-observed-absence-of-work.md)
-    - [Run self-review before ending the run on the completion signal](decisions/0021-run-self-review-before-ending-on-the-completion-signal.md)
-    - [Release a parked issue on a human gesture in the tracker](decisions/0022-release-a-parked-issue-on-a-human-gesture.md)
-    - [Scope the CI verdict to the pull request's current head](decisions/0023-scope-the-ci-verdict-to-the-current-head.md)
-    - [Start a new feedback epoch when the pull request head moves](decisions/0024-start-a-new-feedback-epoch-when-the-head-moves.md)
-    - [Refuse agent requests that only a human could answer](decisions/0025-refuse-agent-requests-only-a-human-could-answer.md)
-    - [Re-read the issue state before recording an absence failure](decisions/0026-re-read-issue-state-before-recording-absence-failure.md)
-    - [Give the consecutive-absence ceiling its own setting](decisions/0027-give-the-consecutive-absence-ceiling-its-own-setting.md)
-    - [Let the agent declare that nothing needed changing](decisions/0028-let-the-agent-declare-that-nothing-needed-changing.md)
-    - [Adopt the Agent Client Protocol as a single generic agent transport](decisions/0029-adopt-agent-client-protocol-as-a-generic-agent-transport.md)
-    - [Keep both kinds registered and retire a hand-written one only at parity](decisions/0030-keep-both-kinds-registered-and-retire-only-at-parity.md)
-    - [Let a dispatch rule carry the settings of the agent kind it selects](decisions/0031-let-a-dispatch-rule-carry-its-agent-kinds-settings.md)
-    - [Route Outbound Messages Through Per-Destination Event Subscriptions](decisions/0032-route-outbound-messages-through-per-destination-event-subscriptions.md)
+    - [Advance an issue to the next stage by swapping a stage label](decisions/0033-advance-an-issue-to-the-next-stage-by-swapping-a-stage-label.md)
+    - [Build the dashboard as a React application committed and embedded in the binary](decisions/0034-build-the-dashboard-as-an-embedded-react-application.md)
+    - [Retain agent events per run and stream them on the change stream](decisions/0035-retain-agent-events-per-run-and-stream-them-on-the-change-stream.md)
+    - [Label usage, runtime and exit counters by model](decisions/0036-label-usage-runtime-and-exit-counters-by-model.md)
+    - [Supply a built-in prompt for every reaction run](decisions/0037-supply-a-built-in-prompt-for-every-reaction-run.md)
+    - [Price runs from a layered rate table and record the price when the run is written](decisions/0038-price-runs-from-a-layered-rate-table-and-record-the-price-at-write.md)
+    - [Account for agent spend in one usage component fed by each runtime's own reports](decisions/0039-account-for-agent-spend-in-one-usage-component.md)
+    - [Keep the Codex and Claude Code kinds as the routes to their CLIs](decisions/0040-keep-the-codex-and-claude-code-kinds-as-the-routes-to-their-clis.md)
+    - [Reset a usage-limit refusal at the latest reset of its gating windows](decisions/0041-reset-a-usage-limit-refusal-at-the-latest-reset-of-its-gating-windows.md)
+- **Process**
+  - [Contributing](../CONTRIBUTING.md) - setup, making a change, code and testing conventions, commits and PRs
+  - [Releasing](../RELEASING.md) - the ordered checklist for cutting a release

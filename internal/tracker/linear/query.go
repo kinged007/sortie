@@ -96,6 +96,15 @@ const queryIssueStatesByIDs = `query IssueStatesByIDs($ids: [ID!]!, $first: Int!
   issues(filter: { id: { in: $ids } }, first: $first) { nodes { id state { name } } }
 }`
 
+// queryIssueStatesAndLabelsByIDs is queryIssueStatesByIDs plus the first page
+// of each issue's labels. Its operation name shares no prefix with
+// IssueStatesByIDs so the two stay distinguishable by name.
+const queryIssueStatesAndLabelsByIDs = `query IssueStatesAndLabelsByIDs($ids: [ID!]!, $first: Int!) {
+  issues(filter: { id: { in: $ids } }, first: $first) {
+    nodes { id state { name } labels(first: 25) { nodes { name } pageInfo { hasNextPage endCursor } } }
+  }
+}`
+
 // queryIssueStatesByNumbers fetches issue states for a batch of issue numbers
 // scoped to the configured team, using a connection filter.
 const queryIssueStatesByNumbers = `query IssueStatesByNumbers($teamKey: String!, $numbers: [Float!]!, $first: Int!) {

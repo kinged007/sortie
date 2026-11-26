@@ -7,8 +7,10 @@ import { StatusMark } from "@/components/StatusMark";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import { fmtClockSec, fmtCount, fmtDuration, fmtTokens, parseInstant, plural } from "@/lib/format";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 import { now } from "@/lib/server-clock";
+
+import { foldPhraseOf, ToolLine } from "./ToolLine";
 
 import type { RunEventResponse } from "@/api/types.gen";
 import type { Timeline, TimelineLine } from "./timeline";
@@ -21,10 +23,6 @@ const RELEASE_EVENTS = ["pointerup", "pointercancel", "touchend", "touchcancel"]
 function isFreshAt(at: string, isLive: boolean): boolean {
   const instant = parseInstant(at);
   return isLive && instant !== null && now() - instant <= FRESH_EVENT_MS;
-}
-
-function toolNameOf(call: RunEventResponse): string {
-  return call.tool_name || "unnamed";
 }
 
 function newestSeqOf(timeline: Timeline): number {
@@ -107,28 +105,6 @@ function TurnItems({ turn, tokens, seconds, className }: TurnItemsProps) {
   );
 }
 
-function toolDurationTextOf(call: RunEventResponse): string | undefined {
-  return call.duration_ms === undefined ? undefined : fmtDuration(call.duration_ms / 1000);
-}
-
-function ToolCall({ event }: { event: RunEventResponse }) {
-  const duration = toolDurationTextOf(event);
-  return (
-    <span className="flex flex-wrap items-baseline gap-x-sm gap-y-xxs text-ink">
-      <span className="wrap-anywhere">{toolNameOf(event)}</span>
-      {duration === undefined ? undefined : <span className="whitespace-nowrap">{duration}</span>}
-    </span>
-  );
-}
-
-function ToolResultText({ event }: { event: RunEventResponse }) {
-  return event.tool_error === true ? (
-    <StatusMark mark="failed" label={<ServedText text={event.text} />} />
-  ) : (
-    <ServedText text={event.text} />
-  );
-}
-
 interface EventLineProps {
   event: RunEventResponse;
   isFresh: boolean;
@@ -146,14 +122,7 @@ function EventLine({ event, isFresh }: EventLineProps) {
       );
       break;
     case "tool_result":
-      content =
-        event.tool_error === true ? (
-          <span className="text-ink-body">
-            <ToolResultText event={event} />
-          </span>
-        ) : (
-          <ToolCall event={event} />
-        );
+      content = <ToolLine call={event} />;
       break;
     case "startup_failed":
       content = <StatusMark mark="failed" label={<ServedText text={event.text} />} />;
@@ -173,19 +142,35 @@ function EventLine({ event, isFresh }: EventLineProps) {
   );
 }
 
+interface FailedLeadProps {
+  event: RunEventResponse;
+  end: PaneEnd | undefined;
+}
+
+/** Marks a failed turn end as failed, except the one that closes a finished session, which carries the run's own outcome. */
+function FailedLead({ event, end }: FailedLeadProps) {
+  if (end === undefined) {
+    return <StatusMark mark="failed" label={<ServedText text={event.text} />} />;
+  }
+  const { word, mark } = runOutcome(end);
+  return mark === null ? <span>{word}</span> : <StatusMark mark={mark} label={word} />;
+}
+
 interface TurnLineProps {
   line: Extract<TimelineLine, { kind: "turn" }>;
+  /** How the run ended, given for the line that closes a finished session. */
+  end?: PaneEnd;
   isFresh: boolean;
 }
 
-function TurnLine({ line, isFresh }: TurnLineProps) {
+function TurnLine({ line, end, isFresh }: TurnLineProps) {
   const { event, turn, tokens, seconds } = line;
   const isFailed = event.event === "turn_failed" || event.event === "turn_ended_with_error";
   const isAsk = event.event === "turn_input_required";
   const isNumbered = event.event === "turn_completed" && turn !== null;
   let lead: ReactNode;
   if (isFailed) {
-    lead = <StatusMark mark="failed" label={<ServedText text={event.text} />} />;
+    lead = <FailedLead event={event} end={end} />;
   } else if (isNumbered) {
     lead = <span>{`Turn ${turn} completed`}</span>;
   } else {
@@ -221,16 +206,6 @@ function TurnLine({ line, isFresh }: TurnLineProps) {
   );
 }
 
-function toolSummaryOf(calls: readonly RunEventResponse[]): string {
-  const counts = new Map<string, number>();
-  for (const call of calls) {
-    const name = toolNameOf(call);
-    counts.set(name, (counts.get(name) ?? 0) + 1);
-  }
-  const parts = [...counts].map(([name, count]) => (count === 1 ? name : `${count} ${name}`));
-  return `${calls.length} tool calls: ${parts.join(", ")}`;
-}
-
 function toolDurationOf(calls: readonly RunEventResponse[]): string | undefined {
   const measured = calls.filter((call) => call.duration_ms !== undefined);
   if (measured.length === 0) {
@@ -250,7 +225,6 @@ interface ToolsLineProps {
 function ToolsLine({ line, isOpen, onOpenChange, isFresh }: ToolsLineProps) {
   const { calls } = line;
   const failed = calls.filter((call) => call.tool_error === true);
-  const failedNames = [...new Set(failed.map(toolNameOf))].join(", ");
   const duration = toolDurationOf(calls);
 
   return (
@@ -264,29 +238,17 @@ function ToolsLine({ line, isOpen, onOpenChange, isFresh }: ToolsLineProps) {
             )}
           />
           <span className="flex min-w-0 flex-wrap items-baseline gap-x-sm gap-y-xxs">
-            <span>{toolSummaryOf(calls)}</span>
+            <span>{foldPhraseOf(calls)}</span>
             {duration === undefined ? undefined : <span>{duration}</span>}
             {failed.length === 0 ? undefined : (
-              <StatusMark mark="failed" label={`${failed.length} failed: ${failedNames}`} />
+              <StatusMark mark="failed" label={`${failed.length} failed`} />
             )}
           </span>
         </Collapsible.Trigger>
         <Collapsible.Panel>
           <div className="grid gap-xxs pt-xs text-body-sm">
             {calls.map((call) => (
-              <div
-                key={call.seq}
-                className="grid grid-cols-[100px_minmax(0,1fr)] gap-sm text-ink-body"
-              >
-                <span className="wrap-anywhere">{toolNameOf(call)}</span>
-                <span>
-                  {call.tool_error === true ? (
-                    <ToolResultText event={call} />
-                  ) : (
-                    toolDurationTextOf(call)
-                  )}
-                </span>
-              </div>
+              <ToolLine key={call.seq} call={call} />
             ))}
           </div>
         </Collapsible.Panel>
@@ -303,25 +265,9 @@ function GapLine({ missing }: { missing: number }) {
   );
 }
 
-/** How a finished session ended. */
 export interface PaneEnd {
-  /** The run's `completed_at`. */
-  at: string;
-  /** The run's persisted status. */
   status: string;
-}
-
-function EndLine({ end }: { end: PaneEnd }) {
-  const { word, mark } = runStatus(end.status);
-  return (
-    <Row title="run history" time={end.at}>
-      {mark === null ? (
-        <span className="text-ink-body">{word}</span>
-      ) : (
-        <StatusMark mark={mark} label={word} />
-      )}
-    </Row>
-  );
+  declared_outcome: string | null;
 }
 
 interface FootProps {
@@ -373,7 +319,6 @@ interface FollowState {
   newestSeq: number;
 }
 
-/** Props of {@link EventPane}. */
 export interface EventPaneProps {
   timeline: Timeline;
   /** How a finished session ended; `null` while the session is live. */
@@ -381,16 +326,10 @@ export interface EventPaneProps {
   /** Whether the stream answered that the run's events are not retained. */
   isNotRetained: boolean;
   isPaused: boolean;
-  /** The running row's `last_event_at`. */
   lastEventAt: string | null;
 }
 
-/**
- * Renders the event lines of one session in a scrolling pane, with the jump
- * control and the foot line. A live session follows its newest event until the
- * reader scrolls up; a finished one opens at the top. Holds follow and
- * expansion state for one session, so key it by the session.
- */
+/** Holds follow and expansion state for one session, so key it by the session. */
 export function EventPane({ timeline, end, isNotRetained, isPaused, lastEventAt }: EventPaneProps) {
   const isLive = end === null;
   const paneRef = useRef<HTMLDivElement>(null);
@@ -510,7 +449,7 @@ export function EventPane({ timeline, end, isNotRetained, isPaused, lastEventAt 
             <span className="text-ink-muted">No events retained</span>
           </Row>
         ) : undefined}
-        {timeline.lines.map((line) => {
+        {timeline.lines.map((line, index) => {
           switch (line.kind) {
             case "event":
               return (
@@ -522,7 +461,12 @@ export function EventPane({ timeline, end, isNotRetained, isPaused, lastEventAt 
               );
             case "turn":
               return (
-                <TurnLine key={line.key} line={line} isFresh={isFreshAt(line.event.at, isLive)} />
+                <TurnLine
+                  key={line.key}
+                  line={line}
+                  end={index === timeline.lines.length - 1 ? (end ?? undefined) : undefined}
+                  isFresh={isFreshAt(line.event.at, isLive)}
+                />
               );
             case "tools":
               return (
@@ -538,7 +482,6 @@ export function EventPane({ timeline, end, isNotRetained, isPaused, lastEventAt 
               return <GapLine key={line.key} missing={line.missing} />;
           }
         })}
-        {end === null ? undefined : <EndLine end={end} />}
         {isJumpShown ? (
           <div className="sticky bottom-xs ml-auto w-max transition-[opacity,translate] duration-(--duration-enter-small) ease-enter starting:translate-y-(--offset-anchored) starting:opacity-0">
             <Button variant="primary" onClick={handleJump}>

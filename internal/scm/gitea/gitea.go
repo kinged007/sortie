@@ -698,10 +698,26 @@ func (a *GiteaAdapter) FetchIssueStatesByIDs(ctx context.Context, ids []string) 
 		if fetchErr != nil {
 			return fetchErr
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the derived state and labels for
+// each requested issue index, keyed by the requested value. The query filter
+// is not applied.
+func (a *GiteaAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		fetched, fetchErr := a.fetchStatesByIndexes(ctx, ids)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		reads = fetched
+		return nil
+	})
+	return reads, err
 }
 
 // FetchIssueStatesByIdentifiers returns the derived state for each requested
@@ -714,56 +730,59 @@ func (a *GiteaAdapter) FetchIssueStatesByIdentifiers(ctx context.Context, ids []
 		if fetchErr != nil {
 			return fetchErr
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
 }
 
-// fetchStatesByIndexes fetches each issue by index and derives its state,
-// keying the result by the requested value. It returns an empty map with no
+// fetchStatesByIndexes fetches each issue by index and derives its state and
+// labels, keying the result by the requested value. It returns an empty map with no
 // request when indexes is empty.
 //
 // A 404 or a pull-request entry omits that index from the result rather than
 // failing. Cancellation is checked before each request. No conditional-request
 // cache is used because Gitea sends no ETag.
-func (a *GiteaAdapter) fetchStatesByIndexes(ctx context.Context, indexes []string) (map[string]string, error) {
+func (a *GiteaAdapter) fetchStatesByIndexes(ctx context.Context, indexes []string) (map[string]domain.IssueStateAndLabels, error) {
 	if len(indexes) == 0 {
-		return map[string]string{}, nil
+		return map[string]domain.IssueStateAndLabels{}, nil
 	}
 
 	snapshot := a.model.Snapshot()
-	states := make(map[string]string, len(indexes))
-	for _, index := range indexes {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	return issuekit.ReadStates(ctx, indexes, func(ctx context.Context, index string) (domain.IssueStateAndLabels, bool, error) {
+		return a.readState(ctx, snapshot, index)
+	})
+}
 
-		path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(index)
-		body, _, err := a.client.Get(ctx, path, nil)
-		if err != nil {
-			if domain.IsNotFound(err) {
-				continue
-			}
-			return nil, err
+// readState reads one issue's state and labels, reporting false for an
+// issue that does not exist or is a pull request.
+func (a *GiteaAdapter) readState(ctx context.Context, snapshot issuekit.LabelStates, index string) (domain.IssueStateAndLabels, bool, error) {
+	path := "/repos/" + a.owner + "/" + a.repo + "/issues/" + url.PathEscape(index)
+	body, _, err := a.client.Get(ctx, path, nil)
+	if err != nil {
+		if domain.IsNotFound(err) {
+			return domain.IssueStateAndLabels{}, false, nil
 		}
-
-		var gi giteaIssue
-		if err := json.Unmarshal(body, &gi); err != nil {
-			return nil, &domain.TrackerError{
-				Kind:    domain.ErrTrackerPayload,
-				Message: "failed to parse issue response",
-				Err:     err,
-			}
-		}
-		if isPullRequest(gi) {
-			continue
-		}
-
-		states[index] = a.model.Derive(snapshot, index, giteaLabelNames(gi.Labels), gi.State == "closed")
+		return domain.IssueStateAndLabels{}, false, err
 	}
 
-	return states, nil
+	var gi giteaIssue
+	if err := json.Unmarshal(body, &gi); err != nil {
+		return domain.IssueStateAndLabels{}, false, &domain.TrackerError{
+			Kind:    domain.ErrTrackerPayload,
+			Message: "failed to parse issue response",
+			Err:     err,
+		}
+	}
+	if isPullRequest(gi) {
+		return domain.IssueStateAndLabels{}, false, nil
+	}
+
+	labels := giteaLabelNames(gi.Labels)
+	return domain.IssueStateAndLabels{
+		State:  a.model.Derive(snapshot, index, labels, gi.State == "closed"),
+		Labels: issuekit.NormalizeLabels(labels),
+	}, true, nil
 }
 
 // resolveLabelIndex pages the repository label catalog to exhaustion and returns
@@ -906,14 +925,6 @@ func (a *GiteaAdapter) setIssueClosed(ctx context.Context, issuePath string, clo
 func (a *GiteaAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(ctx, issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GiteaAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

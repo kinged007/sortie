@@ -5,74 +5,30 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func newPumpForCapabilityTests(t *testing.T) (*sessionState, *pumpState) {
 	t.Helper()
-	state := &sessionState{caps: newCapabilityRecord(false, false), logger: discardLogger()}
+	state := &sessionState{caps: newCapabilityRecord(), logger: discardLogger()}
 	return state, &pumpState{state: state}
 }
 
-func TestNewCapabilityRecordToolServersStageOne(t *testing.T) {
+func TestNewCapabilityRecordStageOne(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name      string
-		remote    bool
-		wantState capabilityState
-	}{
-		{name: "a local launch starts toolServers at protocol", remote: false, wantState: capabilityProtocol},
-		{name: "a remote launch starts toolServers at gap", remote: true, wantState: capabilityGap},
+	record := newCapabilityRecord()
+
+	want := capabilityRecord{
+		toolServers:         capabilityProtocol,
+		tokenCounts:         capabilityGap,
+		sessionContinuation: capabilityProtocol,
+		agentVersion:        capabilityProtocol,
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			record := newCapabilityRecord(tt.remote, false)
-
-			if record.toolServers != tt.wantState {
-				t.Errorf("newCapabilityRecord(%v).toolServers = %q, want %q", tt.remote, record.toolServers, tt.wantState)
-			}
-		})
-	}
-}
-
-func TestNewCapabilityRecordStageOneEntries(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		remote bool
-	}{
-		{name: "local launch", remote: false},
-		{name: "remote launch", remote: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			record := newCapabilityRecord(tt.remote, false)
-
-			wantToolServers := capabilityProtocol
-			if tt.remote {
-				wantToolServers = capabilityGap
-			}
-			if record.toolServers != wantToolServers {
-				t.Errorf("newCapabilityRecord(%v).toolServers = %q, want %q", tt.remote, record.toolServers, wantToolServers)
-			}
-			if record.tokenCounts != capabilityGap {
-				t.Errorf("newCapabilityRecord(%v).tokenCounts = %q, want %q", tt.remote, record.tokenCounts, capabilityGap)
-			}
-			if record.sessionContinuation != capabilityProtocol {
-				t.Errorf("newCapabilityRecord(%v).sessionContinuation = %q, want %q", tt.remote, record.sessionContinuation, capabilityProtocol)
-			}
-			if record.agentVersion != capabilityProtocol {
-				t.Errorf("newCapabilityRecord(%v).agentVersion = %q, want %q", tt.remote, record.agentVersion, capabilityProtocol)
-			}
-		})
+	if *record != want {
+		t.Errorf("newCapabilityRecord() = %+v, want %+v", *record, want)
 	}
 }
 
@@ -81,20 +37,14 @@ func TestCapabilityLoweringNeverRises(t *testing.T) {
 
 	state, p := newPumpForCapabilityTests(t)
 
-	p.applyHandshakeCapabilityLowering(&handshakeFacts{agentInfoPresent: false, toolServersWithheld: true})
+	p.applyHandshakeCapabilityLowering(&handshakeFacts{agentInfoPresent: false})
 	if state.caps.agentVersion != capabilityGap {
 		t.Fatalf("agentVersion after the first lowering = %q, want %q", state.caps.agentVersion, capabilityGap)
 	}
-	if state.caps.toolServers != capabilityGap {
-		t.Fatalf("toolServers after the first lowering = %q, want %q", state.caps.toolServers, capabilityGap)
-	}
 
-	p.applyHandshakeCapabilityLowering(&handshakeFacts{agentInfoPresent: true, toolServersWithheld: false})
+	p.applyHandshakeCapabilityLowering(&handshakeFacts{agentInfoPresent: true})
 	if state.caps.agentVersion != capabilityGap {
 		t.Errorf("agentVersion after a later report of presence = %q, want %q: an entry must never rise once lowered", state.caps.agentVersion, capabilityGap)
-	}
-	if state.caps.toolServers != capabilityGap {
-		t.Errorf("toolServers after a later report of delivery = %q, want %q: an entry must never rise once lowered", state.caps.toolServers, capabilityGap)
 	}
 }
 
@@ -111,7 +61,7 @@ func TestHandshakeLoweringPersistsAcrossTurns(t *testing.T) {
 	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&firstTurnEvents)})
 	promptID := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("first RunTurn() error = %v, want nil", outcome.err)
 	}
@@ -125,7 +75,7 @@ func TestHandshakeLoweringPersistsAcrossTurns(t *testing.T) {
 	outcomeCh2 := runTurnAsync(state, domain.RunTurnParams{Prompt: "go again", OnEvent: collectEvents(&secondTurnEvents)})
 	promptID2 := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID2, promptResponse{StopReason: stopReasonEndTurn})
-	outcome2 := awaitOutcome(t, outcomeCh2)
+	outcome2 := waittest.Receive(t, outcomeCh2, "turn outcome")
 	if outcome2.err != nil {
 		t.Fatalf("second RunTurn() error = %v, want nil", outcome2.err)
 	}
@@ -147,60 +97,38 @@ func firstNotification(t *testing.T, events []domain.AgentEvent) domain.AgentEve
 	return domain.AgentEvent{}
 }
 
-func TestTurnSnapshotIsolatesMidTurnLowering(t *testing.T) {
+func TestOpeningNotice(t *testing.T) {
 	t.Parallel()
-
-	state, p := newPumpForCapabilityTests(t)
-	turn := &activeTurn{capsSnapshot: *state.caps}
-
-	if turn.capsSnapshot.agentVersion != capabilityProtocol {
-		t.Fatalf("turn snapshot agentVersion at turn start = %q, want %q", turn.capsSnapshot.agentVersion, capabilityProtocol)
-	}
-
-	p.lowerCapability(&state.caps.agentVersion, capabilityLabelAgentVersion)
-
-	if state.caps.agentVersion != capabilityGap {
-		t.Fatalf("live record agentVersion after the lowering = %q, want %q", state.caps.agentVersion, capabilityGap)
-	}
-	if turn.capsSnapshot.agentVersion != capabilityProtocol {
-		t.Errorf("turn snapshot agentVersion after a mid-turn lowering = %q, want %q: a lowering observed mid-turn must not change decisions the turn already made", turn.capsSnapshot.agentVersion, capabilityProtocol)
-	}
-
-	nextTurn := &activeTurn{capsSnapshot: *state.caps}
-	if nextTurn.capsSnapshot.agentVersion != capabilityGap {
-		t.Errorf("next turn's snapshot agentVersion = %q, want %q: the lowering takes effect from the following turn", nextTurn.capsSnapshot.agentVersion, capabilityGap)
-	}
-}
-
-func TestEmitCapabilityGapNoticeOnceReadsTurnSnapshot(t *testing.T) {
-	t.Parallel()
-
-	allProtocol := capabilityRecord{
-		toolServers:         capabilityProtocol,
-		tokenCounts:         capabilityProtocol,
-		sessionContinuation: capabilityProtocol,
-		agentVersion:        capabilityProtocol,
-	}
-	withTokenCountsGap := allProtocol
-	withTokenCountsGap.tokenCounts = capabilityGap
 
 	tests := []struct {
-		name         string
-		liveCaps     capabilityRecord
-		capsSnapshot capabilityRecord
-		wantNotice   bool
+		name           string
+		measured       bool
+		toolServersGap bool
+		want           string
+		wantToolState  capabilityState
 	}{
 		{
-			name:         "snapshot has a gap the live record does not",
-			liveCaps:     allProtocol,
-			capsSnapshot: withTokenCountsGap,
-			wantNotice:   true,
+			name:          "no tool-server gap lists only the record's own gaps",
+			want:          toolrelay.GapNoticeStem + capabilityLabelTokenCounts,
+			wantToolState: capabilityProtocol,
 		},
 		{
-			name:         "live record has a gap the snapshot does not",
-			liveCaps:     withTokenCountsGap,
-			capsSnapshot: allProtocol,
-			wantNotice:   false,
+			name:           "a tool-server gap joins the record's own gaps",
+			toolServersGap: true,
+			want:           toolrelay.GapNoticeStem + toolrelay.ToolServersLabel + capabilityGapNoticeSeparator + capabilityLabelTokenCounts,
+			wantToolState:  capabilityGap,
+		},
+		{
+			name:           "a tool-server gap alone is the shared tool-server notice",
+			measured:       true,
+			toolServersGap: true,
+			want:           toolrelay.GapNotice,
+			wantToolState:  capabilityGap,
+		},
+		{
+			name:          "a record without gaps emits nothing",
+			measured:      true,
+			wantToolState: capabilityProtocol,
 		},
 	}
 
@@ -208,28 +136,26 @@ func TestEmitCapabilityGapNoticeOnceReadsTurnSnapshot(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			state := &sessionState{caps: &tt.liveCaps, logger: discardLogger()}
-			p := &pumpState{state: state}
-			turn := &activeTurn{
-				sink:         make(chan domain.AgentEvent, 1),
-				done:         make(chan struct{}),
-				capsSnapshot: tt.capsSnapshot,
+			state := &sessionState{caps: newCapabilityRecord(), logger: discardLogger()}
+			if tt.measured {
+				state.caps.tokenCounts = capabilityOurs
 			}
+			p := &pumpState{state: state}
+			var events []domain.AgentEvent
 
-			p.emitCapabilityGapNoticeOnce(turn)
+			p.openingNotice(collectEvents(&events), tt.toolServersGap)
 
-			select {
-			case ev := <-turn.sink:
-				if !tt.wantNotice {
-					t.Fatalf("emitCapabilityGapNoticeOnce() published %+v, want no event: the turn's own snapshot carried no gap entry", ev)
+			if state.caps.toolServers != tt.wantToolState {
+				t.Errorf("toolServers after openingNotice(toolServersGap=%v) = %q, want %q", tt.toolServersGap, state.caps.toolServers, tt.wantToolState)
+			}
+			if tt.want == "" {
+				if len(events) != 0 {
+					t.Fatalf("openingNotice(toolServersGap=%v) emitted %+v, want nothing", tt.toolServersGap, events)
 				}
-				if ev.Type != domain.EventNotification {
-					t.Fatalf("emitCapabilityGapNoticeOnce() published event type = %q, want %q", ev.Type, domain.EventNotification)
-				}
-			default:
-				if tt.wantNotice {
-					t.Fatal("emitCapabilityGapNoticeOnce() published no event, want the gap notice for the turn's own snapshot")
-				}
+				return
+			}
+			if len(events) != 1 || events[0].Type != domain.EventNotification || events[0].Message != tt.want {
+				t.Errorf("openingNotice(toolServersGap=%v) emitted %+v, want one notification %q", tt.toolServersGap, events, tt.want)
 			}
 		})
 	}
@@ -277,32 +203,6 @@ func TestAgentVersionLoweredByPresenceBoolean(t *testing.T) {
 			gotGap := state.caps.agentVersion == capabilityGap
 			if gotGap != tt.wantGap {
 				t.Errorf("applyHandshakeCapabilityLowering(agentInfoPresent=%v) agentVersion gap = %v, want %v", tt.agentInfoPresent, gotGap, tt.wantGap)
-			}
-		})
-	}
-}
-
-func TestToolServersLoweredWhenWithheld(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		withheld  bool
-		wantState capabilityState
-	}{
-		{name: "an HTTP server withheld by the handshake lowers toolServers", withheld: true, wantState: capabilityGap},
-		{name: "nothing withheld leaves toolServers at its stage-one state", withheld: false, wantState: capabilityProtocol},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			state, p := newPumpForCapabilityTests(t)
-			p.applyHandshakeCapabilityLowering(&handshakeFacts{agentInfoPresent: true, toolServersWithheld: tt.withheld})
-
-			if state.caps.toolServers != tt.wantState {
-				t.Errorf("toolServers after applyHandshakeCapabilityLowering(toolServersWithheld=%v) = %q, want %q", tt.withheld, state.caps.toolServers, tt.wantState)
 			}
 		})
 	}
@@ -497,7 +397,7 @@ func TestCapabilityRecordGapNotice(t *testing.T) {
 				toolServers: capabilityProtocol, tokenCounts: capabilityGap,
 				sessionContinuation: capabilityProtocol, agentVersion: capabilityProtocol,
 			},
-			want:   capabilityGapNoticeStem + capabilityLabelTokenCounts,
+			want:   toolrelay.GapNoticeStem + capabilityLabelTokenCounts,
 			wantOK: true,
 		},
 		{
@@ -506,8 +406,8 @@ func TestCapabilityRecordGapNotice(t *testing.T) {
 				toolServers: capabilityGap, tokenCounts: capabilityProtocol,
 				sessionContinuation: capabilityProtocol, agentVersion: capabilityGap,
 			},
-			want: capabilityGapNoticeStem + strings.Join([]string{
-				capabilityLabelToolServers, capabilityLabelAgentVersion,
+			want: toolrelay.GapNoticeStem + strings.Join([]string{
+				toolrelay.ToolServersLabel, capabilityLabelAgentVersion,
 			}, capabilityGapNoticeSeparator),
 			wantOK: true,
 		},
@@ -517,8 +417,8 @@ func TestCapabilityRecordGapNotice(t *testing.T) {
 				toolServers: capabilityGap, tokenCounts: capabilityGap,
 				sessionContinuation: capabilityGap, agentVersion: capabilityGap,
 			},
-			want: capabilityGapNoticeStem + strings.Join([]string{
-				capabilityLabelToolServers, capabilityLabelTokenCounts,
+			want: toolrelay.GapNoticeStem + strings.Join([]string{
+				toolrelay.ToolServersLabel, capabilityLabelTokenCounts,
 				capabilityLabelSessionContinuation, capabilityLabelAgentVersion,
 			}, capabilityGapNoticeSeparator),
 			wantOK: true,
@@ -546,17 +446,14 @@ func TestCapabilityGapNoticeOncePerSession(t *testing.T) {
 	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
 	out := newOutboundReader(outPr)
 
-	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{
-		agentInfoPresent:    false,
-		toolServersWithheld: true,
-	}}})
+	state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{agentInfoPresent: false}}})
 	markSessionKnown(state)
 
 	var firstTurnEvents []domain.AgentEvent
 	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&firstTurnEvents)})
 	promptID := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("first RunTurn() error = %v, want nil", outcome.err)
 	}
@@ -572,9 +469,8 @@ func TestCapabilityGapNoticeOncePerSession(t *testing.T) {
 		t.Fatalf("second event type = %q, want %q (the once-per-session gap notice)", notice.Type, domain.EventNotification)
 	}
 
-	wantMessage := capabilityGapNoticeStem + strings.Join([]string{
-		capabilityLabelToolServers, capabilityLabelTokenCounts,
-		capabilityLabelSessionContinuation, capabilityLabelAgentVersion,
+	wantMessage := toolrelay.GapNoticeStem + strings.Join([]string{
+		capabilityLabelTokenCounts, capabilityLabelSessionContinuation, capabilityLabelAgentVersion,
 	}, capabilityGapNoticeSeparator)
 	if notice.Message != wantMessage {
 		t.Errorf("gap notice = %q, want %q", notice.Message, wantMessage)
@@ -590,7 +486,7 @@ func TestCapabilityGapNoticeOncePerSession(t *testing.T) {
 	outcomeCh2 := runTurnAsync(state, domain.RunTurnParams{Prompt: "go again", OnEvent: collectEvents(&secondTurnEvents)})
 	promptID2 := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID2, promptResponse{StopReason: stopReasonEndTurn})
-	outcome2 := awaitOutcome(t, outcomeCh2)
+	outcome2 := waittest.Receive(t, outcomeCh2, "turn outcome")
 	if outcome2.err != nil {
 		t.Fatalf("second RunTurn() error = %v, want nil", outcome2.err)
 	}
@@ -614,7 +510,7 @@ func runOneTurnAndCaptureNotice(t *testing.T, sessionID string, facts *handshake
 	outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&events)})
 	promptID := out.awaitMethod(t, methodSessionPrompt)
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 	}

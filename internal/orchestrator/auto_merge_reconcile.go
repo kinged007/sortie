@@ -402,8 +402,13 @@ func postAutoMergeSuccess(state *State, params ReconcileParams, pending *Pending
 		})
 	}
 
-	commentText := buildAutoMergeComment(autoMergeData, mergeResult, params.AutoMergeConfig.Strategy)
-	delivery := params.Router.Route(reactionNotification(domain.EventAutoMergeMerged, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventAutoMergeMerged, pending, domain.AutoMergedFacts{
+		Owner:    autoMergeData.Owner,
+		Repo:     autoMergeData.Repo,
+		PRNumber: autoMergeData.PRNumber,
+		Strategy: params.AutoMergeConfig.Strategy,
+		SHA:      mergeResult.SHA,
+	}))
 	commentLog := log
 	deliverDetached(ctx, &state.TrackerOpsWg, delivery, log, func(received bool, err error) {
 		if received && err != nil {
@@ -418,16 +423,6 @@ func postAutoMergeSuccess(state *State, params ReconcileParams, pending *Pending
 			slog.Any("error", err),
 		)
 	}
-}
-
-// buildAutoMergeComment returns the fixed three-line tracker comment
-// template used on a successful auto-merge.
-func buildAutoMergeComment(autoMergeData *AutoMergeReactionData, mergeResult domain.MergeResult, strategy domain.MergeStrategy) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Sortie auto-merged PR #%d (%s/%s).\n", autoMergeData.PRNumber, autoMergeData.Owner, autoMergeData.Repo)
-	fmt.Fprintf(&b, "Strategy: %s.\n", string(strategy))
-	fmt.Fprintf(&b, "Merge commit: %s.", mergeResult.SHA)
-	return b.String()
 }
 
 // handleMergeError routes a failing MergePR call to the disposition
@@ -462,12 +457,7 @@ func handleMergeError(state *State, params ReconcileParams, key string, pending 
 					slog.Any("error", markErr),
 				)
 			}
-			delete(state.PendingReactions, key)
-			if delErr := params.Store.DeleteReactionFingerprint(ctx, pending.IssueID, ReactionKindAutoMerge); delErr != nil {
-				log.Warn("auto_merge fingerprint delete failed on duplicate merge",
-					slog.Any("error", delErr),
-				)
-			}
+			postAutoMergeSuccess(state, params, pending, autoMergeData, domain.MergeResult{}, log, ctx)
 			return
 		}
 		pending.PendingRetryAt = now.Add(pollInterval)
@@ -570,8 +560,10 @@ func applyAutoMergeEscalation(
 		slog.Int("pr_number", autoMergeData.PRNumber),
 	)
 
-	commentText := buildAutoMergeEscalationComment(autoMergeData, turnCount)
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationAutoMerge, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationAutoMerge, pending, domain.AutoMergeEscalationFacts{
+		PRNumber: autoMergeData.PRNumber,
+		Turns:    turnCount,
+	}))
 
 	if params.AutoMergeConfig.Escalation == "label" {
 		label := params.AutoMergeConfig.EscalationLabel
@@ -601,14 +593,4 @@ func applyAutoMergeEscalation(
 	})
 
 	metrics.IncAutoMergeReactions("escalated")
-}
-
-// buildAutoMergeEscalationComment returns the escalation comment used
-// when MaxRetries is exhausted.
-func buildAutoMergeEscalationComment(autoMergeData *AutoMergeReactionData, turnCount int) string {
-	return fmt.Sprintf(
-		"Sortie auto_merge attempted %d time(s) and could not complete the merge for PR #%d. Manual merge required.",
-		turnCount,
-		autoMergeData.PRNumber,
-	)
 }

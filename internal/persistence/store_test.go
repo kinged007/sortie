@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func closeStore(t *testing.T, s *Store) {
@@ -115,6 +117,8 @@ func TestSaveAndLoadRetryEntry(t *testing.T) {
 	withLabels := func(labels []string) RetryEntry { e := base; e.IssueLabels = labels; return e }
 	withSession := base
 	withSession.SessionID = &sessionID
+	withNotified := base
+	withNotified.UsageLimitNotified = true
 	stale := RetryEntry{
 		IssueID: "ISS-1", Identifier: "stale", ConfiguredModel: "stale", IssueType: "stale",
 		IssueLabels: []string{"stale"}, IssueState: "stale", DispatchedAt: "stale",
@@ -128,6 +132,7 @@ func TestSaveAndLoadRetryEntry(t *testing.T) {
 		{"empty labels", withLabels([]string{})},
 		{"two labels", withLabels([]string{"backend", "needs-review"})},
 		{"session id", withSession},
+		{"usage limit notified", withNotified},
 	}
 
 	for _, tt := range tests {
@@ -869,8 +874,7 @@ func TestQueryIssueGroups(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
+			ctx := waittest.Context(t)
 			s := openTestStore(t)
 			migrateOrFatal(t, s)
 			var ids []int64
@@ -1868,6 +1872,24 @@ func TestCountRunHistoryByIssue(t *testing.T) {
 		}
 		if count != 5 {
 			t.Errorf("CountRunHistoryByIssue(ISS-COUNT) = %d, want 5", count)
+		}
+	})
+
+	t.Run("usage_limited row is not counted", func(t *testing.T) {
+		t.Parallel()
+		s := openTestStore(t)
+		migrateOrFatal(t, s)
+
+		for i, status := range []string{"failed", "usage_limited"} {
+			run := newTestRun(i + 1)
+			run.IssueID = "ISS-REFUSED"
+			run.Status = status
+			appendOrFatal(t, s, run)
+		}
+
+		count, err := s.CountRunHistoryByIssue(context.Background(), "ISS-REFUSED")
+		if err != nil || count != 1 {
+			t.Errorf("CountRunHistoryByIssue(ISS-REFUSED) = %d, %v, want 1, nil", count, err)
 		}
 	})
 

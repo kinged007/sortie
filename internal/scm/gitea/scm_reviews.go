@@ -17,8 +17,10 @@ import (
 
 // giteaReview is one entry from the pull request reviews route. Dismissed marks
 // a review an operator nullified, which the fold and the comment collection both
-// skip; official and stale are decoded for parity with the wire shape but not
-// gated on. The state enum uses Gitea's REQUEST_CHANGES spelling, not GitHub's
+// skip. Official marks a review from a user the branch protection counts toward
+// its required approvals; stale is decoded for parity with the wire shape but not
+// gated on, because Gitea counts a stale approval unless the rule ignores them.
+// The state enum uses Gitea's REQUEST_CHANGES spelling, not GitHub's
 // CHANGES_REQUESTED.
 type giteaReview struct {
 	ID          int64     `json:"id"`
@@ -29,6 +31,12 @@ type giteaReview struct {
 	Official    bool      `json:"official"`
 	Stale       bool      `json:"stale"`
 	SubmittedAt string    `json:"submitted_at"`
+}
+
+// giteaBranch is the branch route response, decoding only the approvals the
+// branch protection requires. The field reads zero for an unprotected branch.
+type giteaBranch struct {
+	RequiredApprovals int `json:"required_approvals"`
 }
 
 // giteaReviewComment is one inline comment from a review. Position is the
@@ -95,9 +103,12 @@ func (a *GiteaSCMAdapter) FetchBotReviewComments(ctx context.Context, prNumber i
 
 // GetReviewDecision returns the aggregated review decision for the given PR.
 //
-// Gitea exposes no aggregate decision, so the adapter folds the per-review list
-// together with the PR object's requested-reviewers signal. Dismissed reviews do
-// not contribute. A failure on either read returns a [*domain.SCMError].
+// Gitea exposes no aggregate decision, so the adapter folds the per-review list,
+// the PR object's requested-reviewers signal, and the approvals the base
+// branch's protection requires through [scmcore.FoldReviewDecision]. Dismissed
+// reviews do not contribute, and only official approvals count toward the
+// required number. A base branch without a readable protection (HTTP 404)
+// requires none. A failure on any read returns a [*domain.SCMError].
 func (a *GiteaSCMAdapter) GetReviewDecision(ctx context.Context, prNumber int, owner, repo string) (domain.ReviewDecision, error) {
 	reviews, err := a.fetchAllReviews(ctx, prNumber, owner, repo)
 	if err != nil {
@@ -109,11 +120,40 @@ func (a *GiteaSCMAdapter) GetReviewDecision(ctx context.Context, prNumber int, o
 		return "", err
 	}
 
-	decision, err := foldReviewDecision(reviews, len(pr.RequestedReviewers) > 0)
+	required, err := a.fetchRequiredApprovals(ctx, owner, repo, pr.Base.Ref)
 	if err != nil {
 		return "", err
 	}
-	return decision, nil
+
+	facts, err := reviewFacts(reviews, required, len(pr.RequestedReviewers) > 0)
+	if err != nil {
+		return "", err
+	}
+	return scmcore.FoldReviewDecision(facts), nil
+}
+
+// fetchRequiredApprovals returns the approvals the protection of branch
+// requires; a 404 means no protection is readable and requires none. A
+// non-integer required_approvals fails with [domain.ErrSCMPayload].
+func (a *GiteaSCMAdapter) fetchRequiredApprovals(ctx context.Context, owner, repo, branch string) (int, error) {
+	body, _, err := a.client.Get(ctx, branchPath(owner, repo, branch), nil)
+	if err != nil {
+		scmErr := scmcore.ToSCMError(err)
+		if scmErr.Kind == domain.ErrSCMNotFound {
+			return 0, nil
+		}
+		return 0, scmErr
+	}
+
+	var protected giteaBranch
+	if jsonErr := json.Unmarshal(body, &protected); jsonErr != nil {
+		return 0, &domain.SCMError{
+			Kind:    domain.ErrSCMPayload,
+			Message: "failed to parse branch response",
+			Err:     jsonErr,
+		}
+	}
+	return protected.RequiredApprovals, nil
 }
 
 // collectReviewComments fetches every review, retains those passing keepReview
@@ -215,8 +255,8 @@ type giteaContributingReview struct {
 	at     time.Time
 }
 
-// foldReviewDecision aggregates the per-review states with the PR's
-// requested-reviewers signal into one [domain.ReviewDecision].
+// reviewFacts reduces the per-review states, the approvals the base branch
+// requires, and the PR's requested-reviewers signal to [scmcore.ReviewFacts].
 //
 // Dismissed reviews, and any review whose state is not APPROVED or
 // REQUEST_CHANGES, are filtered out before the parse; only a review that can
@@ -225,10 +265,9 @@ type giteaContributingReview struct {
 // submitted_at is ordered then id so the latest per reviewer supersedes
 // their earlier ones. A retained review whose submitted_at does not parse
 // as RFC 3339 fails with a [*domain.SCMError] of Kind
-// [domain.ErrSCMPayload]. Any standing REQUEST_CHANGES yields
-// changes-requested; otherwise any APPROVED yields approved; otherwise
-// reviewRequested yields review-required; otherwise not-required.
-func foldReviewDecision(reviews []giteaReview, reviewRequested bool) (domain.ReviewDecision, error) {
+// [domain.ErrSCMPayload]. The approval rule is unmet when fewer reviewers
+// than required have an official approval as their latest review.
+func reviewFacts(reviews []giteaReview, requiredApprovals int, reviewerRequested bool) (scmcore.ReviewFacts, error) {
 	contributing := make([]giteaContributingReview, 0, len(reviews))
 	for _, r := range reviews {
 		if r.Dismissed {
@@ -240,7 +279,7 @@ func foldReviewDecision(reviews []giteaReview, reviewRequested bool) (domain.Rev
 
 		at, err := scmcore.ParseTimestamp("review submitted_at", r.SubmittedAt)
 		if err != nil {
-			return "", err
+			return scmcore.ReviewFacts{}, err
 		}
 		contributing = append(contributing, giteaContributingReview{review: r, at: at})
 	}
@@ -252,32 +291,26 @@ func foldReviewDecision(reviews []giteaReview, reviewRequested bool) (domain.Rev
 		return cmp.Compare(a.review.ID, b.review.ID)
 	})
 
-	latestDecision := make(map[string]string)
+	latestReview := make(map[string]giteaReview)
 	for _, pair := range contributing {
-		latestDecision[pair.review.User.Login] = pair.review.State
+		latestReview[pair.review.User.Login] = pair.review
 	}
 
-	anyChangesRequested := false
-	anyApproved := false
-	for _, decision := range latestDecision {
-		switch decision {
+	facts := scmcore.ReviewFacts{ReviewerRequested: reviewerRequested}
+	officialApprovals := 0
+	for _, r := range latestReview {
+		switch r.State {
 		case "REQUEST_CHANGES":
-			anyChangesRequested = true
+			facts.ChangesRequested = true
 		case "APPROVED":
-			anyApproved = true
+			facts.Approved = true
+			if r.Official {
+				officialApprovals++
+			}
 		}
 	}
-
-	if anyChangesRequested {
-		return domain.ReviewDecisionChangesRequested, nil
-	}
-	if anyApproved {
-		return domain.ReviewDecisionApproved, nil
-	}
-	if reviewRequested {
-		return domain.ReviewDecisionReviewRequired, nil
-	}
-	return domain.ReviewDecisionNotRequired, nil
+	facts.ApprovalRuleUnmet = requiredApprovals > officialApprovals
+	return facts, nil
 }
 
 // fetchAllReviews returns every review on the given PR, following page-number

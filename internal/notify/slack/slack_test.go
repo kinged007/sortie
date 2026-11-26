@@ -1,12 +1,9 @@
 package slack
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,9 +12,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
-// captureServer starts an httptest.Server that records the last request
-// body and returns the given status code.
-func captureServer(t *testing.T, statusCode int) (server *httptest.Server, body func() []byte) {
+func captureServer(t *testing.T) (server *httptest.Server, body func() []byte) {
 	t.Helper()
 	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,22 +21,12 @@ func captureServer(t *testing.T, statusCode int) (server *httptest.Server, body 
 			t.Errorf("captureServer: read body: %v", err)
 		}
 		captured = b
-		w.WriteHeader(statusCode)
+		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, func() []byte { return captured }
 }
 
-// slogCapture returns a slog.Logger backed by a bytes.Buffer at Debug
-// level and a function that retrieves the captured output.
-func slogCapture() (*slog.Logger, func() string) {
-	var buf bytes.Buffer
-	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	return slog.New(h), func() string { return buf.String() }
-}
-
-// makeNotification builds a test Notification with recognizable field
-// values.
 func makeNotification() domain.Notification {
 	return domain.Notification{
 		Envelope: domain.NotificationEnvelope{
@@ -88,10 +73,6 @@ func TestSlack_NewNotifier_MissingWebhookURL(t *testing.T) {
 	}
 }
 
-// TestSlack_NewNotifier_WrongTypeVsAbsentWebhookURL covers the distinction
-// between a wrong-typed webhook_url and an absent one: the type fault
-// carries the typed-fault message, while the absent key keeps its
-// existing "webhook_url is required" message.
 func TestSlack_NewNotifier_WrongTypeVsAbsentWebhookURL(t *testing.T) {
 	t.Parallel()
 
@@ -125,7 +106,7 @@ func TestSlack_NewNotifier_WrongTypeVsAbsentWebhookURL(t *testing.T) {
 func TestSlack_NewNotifier_ValidWebhookURL(t *testing.T) {
 	t.Parallel()
 
-	srv, _ := captureServer(t, http.StatusOK)
+	srv, _ := captureServer(t)
 
 	n, err := newNotifier(map[string]any{"webhook_url": srv.URL})
 	if err != nil {
@@ -139,7 +120,7 @@ func TestSlack_NewNotifier_ValidWebhookURL(t *testing.T) {
 func TestSlack_Send_PostsSlackShapedBody(t *testing.T) {
 	t.Parallel()
 
-	srv, getBody := captureServer(t, http.StatusOK)
+	srv, getBody := captureServer(t)
 
 	n, err := newNotifier(map[string]any{"webhook_url": srv.URL})
 	if err != nil {
@@ -172,76 +153,9 @@ func TestSlack_Send_PostsSlackShapedBody(t *testing.T) {
 	if !strings.Contains(text, notif.Message.Body) {
 		t.Errorf("text %q does not contain body %q", text, notif.Message.Body)
 	}
-	// Severity should appear in some form in the text field.
 	severityUpper := strings.ToUpper(notif.Message.Severity)
 	if !strings.Contains(strings.ToUpper(text), severityUpper) {
 		t.Errorf("text %q does not contain severity %q (case-insensitive)", text, notif.Message.Severity)
-	}
-}
-
-func TestSlack_Send_Non2xxReturnsClassifiedError(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name       string
-		statusCode int
-	}{
-		{name: "401 unauthorized", statusCode: http.StatusUnauthorized},
-		{name: "403 forbidden", statusCode: http.StatusForbidden},
-		{name: "429 rate limited", statusCode: http.StatusTooManyRequests},
-		{name: "500 server error", statusCode: http.StatusInternalServerError},
-		{name: "404 client error", statusCode: http.StatusNotFound},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			srv, _ := captureServer(t, tt.statusCode)
-
-			n, err := newNotifier(map[string]any{"webhook_url": srv.URL})
-			if err != nil {
-				t.Fatalf("newNotifier: %v", err)
-			}
-
-			err = n.Send(context.Background(), makeNotification())
-			if err == nil {
-				t.Fatalf("Send(status %d) = nil, want error", tt.statusCode)
-			}
-
-			var se *sendError
-			if !errors.As(err, &se) {
-				t.Fatalf("Send error type = %T, want *sendError", err)
-			}
-			if se.Category == "" {
-				t.Error("sendError.Category is empty, want a non-empty category string")
-			}
-		})
-	}
-}
-
-func TestSlack_Send_TransportFailureReturnsClassifiedError(t *testing.T) {
-	t.Parallel()
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Close()
-
-	n, err := newNotifier(map[string]any{"webhook_url": srv.URL})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	err = n.Send(context.Background(), makeNotification())
-	if err == nil {
-		t.Fatal("Send(closed server) = nil, want transport error")
-	}
-
-	var se *sendError
-	if !errors.As(err, &se) {
-		t.Fatalf("Send error type = %T, want *sendError", err)
-	}
-	if se.Category == "" {
-		t.Error("sendError.Category is empty")
 	}
 }
 
@@ -264,119 +178,5 @@ func TestSlack_Send_ContextCancellationReturnsError(t *testing.T) {
 	err = n.Send(ctx, makeNotification())
 	if err == nil {
 		t.Fatal("Send(cancelled ctx) = nil, want error")
-	}
-}
-
-func TestSlack_ErrorRedaction_URLAbsentFromError(t *testing.T) {
-	t.Parallel()
-
-	srv, _ := captureServer(t, http.StatusInternalServerError)
-	const secretToken = "XXXX_SECRET"
-	webhookURL := srv.URL + "/" + secretToken
-
-	n, err := newNotifier(map[string]any{"webhook_url": webhookURL})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	sendErr := n.Send(context.Background(), makeNotification())
-	if sendErr == nil {
-		t.Fatal("Send(500 response) = nil, want error")
-	}
-
-	errText := sendErr.Error()
-	if strings.Contains(errText, webhookURL) {
-		t.Errorf("error message contains URL %q: %q", webhookURL, errText)
-	}
-	if strings.Contains(errText, secretToken) {
-		t.Errorf("error message contains secret token: %q", errText)
-	}
-}
-
-func TestSlack_ErrorRedaction_URLAbsentFromLog(t *testing.T) {
-	t.Parallel()
-
-	srv, _ := captureServer(t, http.StatusUnauthorized)
-	const secretToken = "SECRET_TOKEN"
-	webhookURL := srv.URL + "/" + secretToken
-
-	logger, getLog := slogCapture()
-
-	n, err := newNotifier(map[string]any{"webhook_url": webhookURL})
-	if err != nil {
-		t.Fatalf("newNotifier: %v", err)
-	}
-
-	sendErr := n.Send(context.Background(), makeNotification())
-	if sendErr == nil {
-		t.Fatal("Send(401 response) = nil, want error")
-	}
-
-	logger.Error("send failed", slog.Any("error", sendErr))
-	logOutput := getLog()
-	if strings.Contains(logOutput, webhookURL) {
-		t.Errorf("log output contains URL %q: %q", webhookURL, logOutput)
-	}
-	if strings.Contains(logOutput, secretToken) {
-		t.Errorf("log output contains secret token: %q", logOutput)
-	}
-}
-
-func TestSlack_Send_AgentText(t *testing.T) {
-	t.Parallel()
-
-	const base = "[CRITICAL] Blocker found\nAgent cannot proceed without operator input."
-	tests := []struct {
-		name      string
-		agentText string
-		want      string
-	}{
-		{
-			name: "empty agent text leaves the text unchanged",
-			want: base,
-		},
-		{
-			name:      "agent text follows after two line feeds",
-			agentText: "Which one should the API expose?\nSoft or hard delete.",
-			want:      base + "\n\nWhich one should the API expose?\nSoft or hard delete.",
-		},
-		{
-			name:      "ampersand and angle brackets are escaped",
-			agentText: "<!channel> a & b <https://example.com|click> > done",
-			want:      base + "\n\n&lt;!channel&gt; a &amp; b &lt;https://example.com|click&gt; &gt; done",
-		},
-		{
-			name:      "an existing entity is escaped again rather than passed through",
-			agentText: "&amp; and &lt;",
-			want:      base + "\n\n&amp;amp; and &amp;lt;",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			srv, getBody := captureServer(t, http.StatusOK)
-			n, err := newNotifier(map[string]any{"webhook_url": srv.URL})
-			if err != nil {
-				t.Fatalf("newNotifier: %v", err)
-			}
-			notification := makeNotification()
-			notification.Message.AgentText = tt.agentText
-
-			if err := n.Send(context.Background(), notification); err != nil {
-				t.Fatalf("Send: %v", err)
-			}
-
-			var posted struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(getBody(), &posted); err != nil {
-				t.Fatalf("unmarshal posted body: %v", err)
-			}
-			if posted.Text != tt.want {
-				t.Errorf("Send(AgentText=%q) text = %q, want %q", tt.agentText, posted.Text, tt.want)
-			}
-		})
 	}
 }

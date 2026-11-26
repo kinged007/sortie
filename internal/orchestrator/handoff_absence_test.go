@@ -927,8 +927,8 @@ func TestUnparkIssueAgentBlockedResetsAbsenceSequence(t *testing.T) {
 	if len(store.absenceResetOf) != 1 || store.absenceResetOf[0] != issueID {
 		t.Errorf("ResetHandoffAbsenceSequence calls = %v, want [%s] for an agent_blocked park", store.absenceResetOf, issueID)
 	}
-	if len(store.deletedParkedIDs) != 1 || store.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", store.deletedParkedIDs, issueID)
+	if len(store.parkedIssues) != 1 || store.parkedIssues[0].ReleaseGesture != unparkTriggerStateChanged || len(store.deletedParkedIDs) != 0 {
+		t.Errorf("upserted rows = %+v, DeleteParkedIssue calls = %v, want one release row with gesture %q and no delete", store.parkedIssues, store.deletedParkedIDs, unparkTriggerStateChanged)
 	}
 }
 
@@ -1097,7 +1097,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 			return func(context.Context, domain.Issue, *int) {}
 		},
 		AgentAdapterByKind: func(string) (domain.AgentAdapter, error) { return &mockAgentAdapter{}, nil },
-		ResolveAttemptSettings: func(_ DispatchResolution, _ string) AttemptSettings {
+		ResolveAttemptSettings: func(_ DispatchResolution) AttemptSettings {
 			return AttemptSettings{}
 		},
 		OnRetryFire: noopRetryFire,
@@ -1148,9 +1148,7 @@ func TestParkRetryLaneBackfillAndRelease(t *testing.T) {
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change observed after the backfill did not release the park")
 	}
-	if len(store.deletedParkedIDs) != 1 || store.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", store.deletedParkedIDs, issueID)
-	}
+	assertReleaseKept(t, store, unparkTriggerStateChanged)
 }
 
 // TestParkSingleLogRecordPerTrigger verifies that one park emits exactly
@@ -1301,7 +1299,5 @@ func TestHandleWorkerExitAbsenceParkRecordsObservedStateAndReleasesWithoutBackfi
 	if _, ok := state.Parked[issueID]; ok {
 		t.Error("a state change did not release the worker-exit absence park")
 	}
-	if len(tickStore.deletedParkedIDs) != 1 || tickStore.deletedParkedIDs[0] != issueID {
-		t.Errorf("DeleteParkedIssue calls = %v, want [%s]", tickStore.deletedParkedIDs, issueID)
-	}
+	assertReleaseKept(t, tickStore, unparkTriggerStateChanged)
 }

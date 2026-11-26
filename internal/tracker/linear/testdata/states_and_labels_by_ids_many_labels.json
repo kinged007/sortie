@@ -1,0 +1,20 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "a7c4f8e2-1b9d-4e3a-8f2c-6d5e4a3b2c1f",
+          "state": { "name": "Todo" },
+          "labels": {
+            "nodes": [
+              { "name": "Label-01" },
+              { "name": "Label-02" },
+              { "name": "Label-03" }
+            ],
+            "pageInfo": { "hasNextPage": true, "endCursor": "labels-cursor-03" }
+          }
+        }
+      ]
+    }
+  }
+}

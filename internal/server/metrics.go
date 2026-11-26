@@ -21,7 +21,7 @@ type PromMetrics struct {
 	activeSessionsElapsed prometheus.Gauge
 
 	tokensTotal                   *prometheus.CounterVec
-	agentRuntimeTotal             prometheus.Counter
+	agentRuntimeTotal             *prometheus.CounterVec
 	dispatchesTotal               *prometheus.CounterVec
 	workerExitsTotal              *prometheus.CounterVec
 	retriesTotal                  *prometheus.CounterVec
@@ -101,13 +101,13 @@ func NewPromMetrics(version, goVersion string) *PromMetrics {
 		Namespace: "sortie",
 		Name:      "tokens_total",
 		Help:      "Cumulative LLM tokens consumed.",
-	}, []string{"type"})
+	}, []string{"type", "model"})
 
-	agentRuntimeTotal := prometheus.NewCounter(prometheus.CounterOpts{
+	agentRuntimeTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "sortie",
 		Name:      "agent_runtime_seconds_total",
 		Help:      "Cumulative agent runtime in seconds.",
-	})
+	}, []string{"model"})
 
 	dispatchesTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "sortie",
@@ -119,7 +119,7 @@ func NewPromMetrics(version, goVersion string) *PromMetrics {
 		Namespace: "sortie",
 		Name:      "worker_exits_total",
 		Help:      "Worker exit events by type.",
-	}, []string{"exit_type"})
+	}, []string{"exit_type", "model"})
 
 	retriesTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "sortie",
@@ -426,20 +426,51 @@ func (p *PromMetrics) SetActiveSessionsElapsed(seconds float64) {
 
 // AddTokens increments the cumulative token counter by count. Negative
 // values are silently clamped to zero to prevent Prometheus counter panics.
-func (p *PromMetrics) AddTokens(tokenType string, count int64) {
+func (p *PromMetrics) AddTokens(tokenType, model string, count int64) {
 	if count <= 0 {
 		return
 	}
-	p.tokensTotal.WithLabelValues(tokenType).Add(float64(count))
+	p.tokensTotal.WithLabelValues(tokenType, modelLabel(model)).Add(float64(count))
 }
 
 // AddAgentRuntime increments the cumulative agent runtime counter. Negative
 // values are silently clamped to zero to prevent Prometheus counter panics.
-func (p *PromMetrics) AddAgentRuntime(seconds float64) {
+func (p *PromMetrics) AddAgentRuntime(model string, seconds float64) {
 	if seconds <= 0 {
 		return
 	}
-	p.agentRuntimeTotal.Add(seconds)
+	p.agentRuntimeTotal.WithLabelValues(modelLabel(model)).Add(seconds)
+}
+
+// modelLabel returns model verbatim, or "<none>" when it is empty, because
+// Prometheus treats an empty label value as an absent label.
+func modelLabel(model string) string {
+	if model == "" {
+		return "<none>"
+	}
+	return model
+}
+
+// The value lists match the types and exit types the AddTokens and
+// IncWorkerExits contracts name; PrepareModel cannot discover them from
+// the vectors, which create children lazily.
+var (
+	preparedTokenTypes = []string{"input", "output", "cache_read", "cache_write"}
+	preparedExitTypes  = []string{"normal", "error", "cancelled", "soft_stop"}
+)
+
+// PrepareModel exports a zero-valued series under model for every token
+// type, every exit type, and the agent runtime counter. Existing series
+// keep their values: WithLabelValues returns an existing child unchanged.
+func (p *PromMetrics) PrepareModel(model string) {
+	label := modelLabel(model)
+	for _, tokenType := range preparedTokenTypes {
+		p.tokensTotal.WithLabelValues(tokenType, label)
+	}
+	for _, exitType := range preparedExitTypes {
+		p.workerExitsTotal.WithLabelValues(exitType, label)
+	}
+	p.agentRuntimeTotal.WithLabelValues(label)
 }
 
 // IncDispatches increments the dispatch attempt counter.
@@ -448,8 +479,8 @@ func (p *PromMetrics) IncDispatches(outcome string) {
 }
 
 // IncWorkerExits increments the worker exit counter.
-func (p *PromMetrics) IncWorkerExits(exitType string) {
-	p.workerExitsTotal.WithLabelValues(exitType).Inc()
+func (p *PromMetrics) IncWorkerExits(exitType, model string) {
+	p.workerExitsTotal.WithLabelValues(exitType, modelLabel(model)).Inc()
 }
 
 // IncRetries increments the retry scheduling counter.
@@ -573,8 +604,7 @@ func (p *PromMetrics) IncDispatchRuleMatch(layer, rule string) {
 }
 
 // IncCandidateHolds increments the counter of candidates the dispatch
-// loop held. reason is "blocked_by", "blockers_unresolved",
-// "blockers_not_read", or "blockers_incomplete".
+// loop held.
 func (p *PromMetrics) IncCandidateHolds(reason string) {
 	p.candidateHoldsTotal.WithLabelValues(reason).Inc()
 }

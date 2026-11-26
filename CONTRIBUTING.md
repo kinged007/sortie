@@ -57,6 +57,14 @@ A change under `web/` passes `make ui-check`, which `make check` also runs. `int
 
 If `make ui-install` or `make ui-build` reports a missing native binding, run `make ui-install` again: it replaces `web/node_modules` with a clean install from the committed `web/package-lock.json`. If the binding is still missing, the lockfile lacks your platform: run `npm install` in `web/`, then review the lockfile change and commit it with the rebuilt output.
 
+### Price table
+
+The embedded price snapshot is generated: the upstream price file, `REVISION` and `REVISION_TIME` under `internal/pricing/snapshot`. The snapshot files are committed together and never edited by hand.
+
+`make price-table` refreshes them to the latest upstream revision that changed the price file. It needs Go and access to `api.github.com`, and an optional `GITHUB_TOKEN` raises the rate limit. The command changes nothing when it fails. `make build` then embeds the new prices.
+
+A weekly workflow opens a pull request with the refresh and posts to the CI Discord channel when the refresh fails. A conflict in the snapshot is resolved by rerunning the refresh.
+
 ### Integration tests
 
 Integration tests are gated by environment variables and skip cleanly without them:
@@ -73,6 +81,16 @@ SORTIE_CLAUDE_TEST=1 ANTHROPIC_API_KEY="sk-..." \
 ```
 
 GitHub integration tests also accept an optional `SORTIE_GITHUB_ISSUE_ID` variable (a valid issue number in the configured repo) to enable `FetchIssueByID` and `FetchIssueStatesByIDs` test cases.
+
+The agent adapters' scripted-model suites also run an SSH variant against a throwaway sshd container. It needs `docker`, `ssh`, and `ssh-keygen` on `PATH` and skips with a reason naming the missing tool otherwise.
+
+To probe a runtime over SSH by hand, start a lab and keep it running until you interrupt it:
+
+```bash
+make ssh-lab INSTALL='npm install -g <package>@<version>'
+```
+
+Omit `INSTALL` for a base image with no runtime. The command prints the `ssh` command that connects and the name of the container. Each distinct install command builds and keeps its own image, so every runtime version leaves one behind; `make ssh-lab-clean` removes every lab container and image from the local Docker cache.
 
 You do not need access to Jira, GitHub, or Claude to contribute. The unit test suite covers the vast majority of the codebase.
 
@@ -92,7 +110,7 @@ The linter config in [.golangci.yml](.golangci.yml) catches most issues. Beyond 
 - **Errors:** wrap with context (`fmt.Errorf("operation: %w", err)`), no capitals, no trailing punctuation. Use the error categories in `internal/domain/errors.go`.
 - **Logging:** `log/slog` with typed `slog.Attr` constructors. Derive loggers via `logging.WithIssue` and `logging.WithSession`.
 - **Templates:** `Option("missingkey=error")` on every `text/template` - strict mode is mandatory.
-- **Shared adapter helpers:** don't re-implement a helper already extracted to a shared package (`internal/httpkit`, `internal/typeutil`, `internal/issuekit`, or an adapter-family package like `internal/scm/scmcore`). A contract test in `internal/adaptertest` fails `make test` if a tracker, SCM, agent, or notifier package re-declares one of these under a local name.
+- **Shared adapter helpers:** don't re-implement a helper already extracted to a shared package (`internal/httpkit`, `internal/typeutil`, `internal/issuekit`, or an adapter-family package like `internal/scm/scmcore` or the agent family's `internal/agent/agentcore` and `internal/agent/procutil`). A contract test in `internal/adaptertest` fails `make test` if a tracker, SCM, agent, or notifier package re-declares one of the listed names under a local name. For agent packages it also fails a private per-turn subprocess lifecycle (rule `LIFECYCLE`), a direct read of `ReadTimeoutMS` (rule `READTIMEOUT`), and token counters added by hand (rule `USAGESUM`). A kind that runs one process per turn builds on `agentcore.NewForkPerTurnSession` and adds what it lacks as a hook.
 
 ## Testing conventions
 

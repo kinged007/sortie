@@ -28,7 +28,7 @@ func (responsesCodec) credentialHeaders() []string {
 	return []string{"Authorization"}
 }
 
-func (responsesCodec) route(method, path string) (route, bool) {
+func (responsesCodec) route(method, path string, _ http.Header) (route, bool) {
 	return route{}, method == http.MethodPost && path == "/v1/responses"
 }
 
@@ -164,7 +164,8 @@ type responsesPart struct {
 type responsesUsage struct {
 	InputTokens        int64 `json:"input_tokens"`
 	InputTokensDetails struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
 	} `json:"input_tokens_details"`
 	OutputTokens        int64 `json:"output_tokens"`
 	OutputTokensDetails struct {
@@ -181,6 +182,7 @@ func (responsesCodec) render(r reply) rendered {
 		TotalTokens:  r.usage.Prompt + output,
 	}
 	usage.InputTokensDetails.CachedTokens = r.usage.CachedContent
+	usage.InputTokensDetails.CacheWriteTokens = r.usage.CacheWrite
 	usage.OutputTokensDetails.ReasoningTokens = r.usage.Thoughts
 
 	responseID := fmt.Sprintf("resp_scripted_%d", r.seq)
@@ -233,9 +235,7 @@ func (responsesCodec) render(r reply) rendered {
 		fmt.Fprintf(&stream, "event: %s\ndata: %s\n\n", event.Type, encodeJSON(event))
 	}
 
-	reported := r.usage
-	reported.CacheWrite = 0
-	return rendered{contentType: "text/event-stream", body: []byte(stream.String()), callID: callID, usage: reported}
+	return rendered{contentType: "text/event-stream", body: []byte(stream.String()), callID: callID, usage: r.usage}
 }
 
 type responsesError struct {

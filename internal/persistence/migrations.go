@@ -125,6 +125,42 @@ var migration037SQL string
 //go:embed sql/038_reaction_activity.sql
 var migration038SQL string
 
+//go:embed sql/039_run_history_resume_usage.sql
+var migration039SQL string
+
+//go:embed sql/040_run_model_usage.sql
+var migration040SQL string
+
+//go:embed sql/041_run_cost.sql
+var migration041SQL string
+
+//go:embed sql/042_run_history_completed_at_index.sql
+var migration042SQL string
+
+//go:embed sql/043_run_model_unrated_classes.sql
+var migration043SQL string
+
+//go:embed sql/044_reaction_triage_outcomes.sql
+var migration044SQL string
+
+//go:embed sql/045_run_declared_outcome.sql
+var migration045SQL string
+
+//go:embed sql/046_run_history_skills.sql
+var migration046SQL string
+
+//go:embed sql/047_parked_issue_release_hand_over.sql
+var migration047SQL string
+
+//go:embed sql/048_usage_limit_holds.sql
+var migration048SQL string
+
+//go:embed sql/049_drop_run_history_resume_columns.sql
+var migration049SQL string
+
+//go:embed sql/050_run_usage_provenance_and_reported_amounts.sql
+var migration050SQL string
+
 // reactionActivityMigration is the version of the migration that creates the
 // reaction_activity table.
 const reactionActivityMigration = 38
@@ -168,4 +204,16 @@ var migrations = []Migration{
 	{Version: 36, Description: "dispatch ID on run history and retained run events", SQL: migration036SQL},
 	{Version: 37, Description: "blocked runs on run history and live passes", SQL: migration037SQL},
 	{Version: reactionActivityMigration, Description: "reaction activity records per stage pass", SQL: migration038SQL},
+	{Version: 39, Description: "resume usage on run history", SQL: migration039SQL},
+	{Version: 40, Description: "per-model token usage of a run", SQL: migration040SQL},
+	{Version: 41, Description: "recorded run cost and live session estimate", SQL: migration041SQL},
+	{Version: 42, Description: "completed_at index on run_history", SQL: migration042SQL},
+	{Version: 43, Description: "unrated token classes of a run's per-model cost", SQL: migration043SQL},
+	{Version: 44, Description: "reaction triage answers per comment set", SQL: migration044SQL},
+	{Version: 45, Description: "declared outcome and statement of a run", SQL: migration045SQL},
+	{Version: 46, Description: "skill calls of a run on run history", SQL: migration046SQL},
+	{Version: 47, Description: "release hand-over columns on parked issues", SQL: migration047SQL},
+	{Version: 48, Description: "usage-limit holds and the usage-limit notice flag on retry entries", SQL: migration048SQL},
+	{Version: 49, Description: "drop the resume columns from run history", SQL: migration049SQL},
+	{Version: 50, Description: "usage provenance and completeness on run history and the amounts a run reported", SQL: migration050SQL},
 }

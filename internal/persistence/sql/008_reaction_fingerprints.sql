@@ -1,5 +1,3 @@
--- Migration 8: Cross-restart reaction deduplication
-
 CREATE TABLE reaction_fingerprints (
     issue_id    TEXT    NOT NULL,
     kind        TEXT    NOT NULL,

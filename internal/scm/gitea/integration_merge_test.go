@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // giteaMergeFixture is a minimal Gitea REST client used only to create and clean
@@ -278,19 +279,17 @@ func TestIntegration_SCMMergeFlow(t *testing.T) {
 		// asynchronously; poll until it leaves unknown before capturing the head.
 		const maxAttempts = 5
 		var headSHA string
-		for attempt := range maxAttempts {
+		_ = waittest.UntilWithin(maxAttempts*2*time.Second, 2*time.Second, func() error {
 			status, err := adapter.GetMergeability(ctx, prNumber, owner, repo)
 			if err != nil {
 				t.Fatalf("GetMergeability(PR #%d): %v", prNumber, err)
 			}
 			headSHA = status.HeadSHA
-			if status.Mergeability != domain.MergeabilityUnknown {
-				break
+			if status.Mergeability == domain.MergeabilityUnknown {
+				return errors.New("mergeability is still unknown")
 			}
-			if attempt < maxAttempts-1 {
-				time.Sleep(2 * time.Second)
-			}
-		}
+			return nil
+		})
 		if headSHA == "" {
 			t.Fatalf("GetMergeability(PR #%d).HeadSHA is empty after the readiness poll", prNumber)
 		}

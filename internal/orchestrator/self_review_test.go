@@ -1408,7 +1408,7 @@ func TestSelfReviewLoop_CancelledDuringTurnFailureLogging(t *testing.T) {
 	logger := slog.New(&cancelOnMessageHandler{
 		message: "self-review turn failed",
 		cancel:  cancel,
-		cause:   errTokenCeilingStop,
+		cause:   errCeilingStop,
 	})
 
 	adapter := &failOnFirstAdapter{wsPath: wsPath}

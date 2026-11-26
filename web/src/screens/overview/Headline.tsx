@@ -4,7 +4,6 @@ import type { Headline as HeadlineText, Segment } from "./headline";
 
 const EMPHASIS_CLASS = {
   strong: "font-medium text-ink",
-  attention: "text-warning",
   critical: "text-error",
 } as const;
 
@@ -20,12 +19,10 @@ function renderSegments(segments: readonly Segment[]) {
   ));
 }
 
-/** Props of {@link Headline}. */
 export interface HeadlineProps {
   headline: HeadlineText;
 }
 
-/** Renders the page's only `h1` and the lede sentence under it. */
 export function Headline({ headline }: HeadlineProps) {
   return (
     <header>

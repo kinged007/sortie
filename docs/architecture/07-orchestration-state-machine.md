@@ -57,8 +57,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Validate config, which forces a defensive reload, then apply the result to runtime state.
   - Reconcile active runs.
   - Run the periodic workspace sweep when due (Section 8.7).
+  - Evaluate the instance spend ceiling (Section 8.4), whether or not validation succeeded.
   - Fetch candidate issues.
-  - Dispatch until slots are exhausted. Dispatch is the only step gated on validation success.
+  - Dispatch until slots are exhausted, unless a spend window holds dispatch (Section 8.4). Dispatch is the only step gated on validation success.
   - Dispatched workers perform the optional dispatch-time in-progress transition (via `tracker.in_progress_state`) as their first step, before workspace preparation.
 
 - `Worker Exit (normal)`
@@ -103,11 +104,12 @@ A verdict that withholds the write is, immediately before any of its effects, ch
   - Schedule an exponential-backoff retry when the retry slot (Section 7.5) is free; defer to the incumbent already occupying it otherwise, keeping the claim.
 
 - `Agent Update Event`
-  - Update live session fields, token counters, and rate limits.
-  - Every agent update and self-review progress message a worker delivered before its exit is applied before that exit is handled, so no message from one run is applied after its exit or to a later run of the same issue. A usage figure applied this way for a run whose exit is being handled or already waiting is evaluated against neither the in-flight token ceiling nor the token warning threshold, because that run has already ended; the run's recorded total carries the figure to the next dispatch decision.
+  - Update live session fields, token counters, and the agent kind's usage windows.
+  - Every agent update and self-review progress message a worker delivered before its exit is applied before that exit is handled, so no message from one run is applied after its exit or to a later run of the same issue. A usage figure applied this way for a run whose exit is being handled or already waiting is evaluated against neither an in-flight ceiling (token or money) nor the token warning threshold, because that run has already ended; the run's recorded total carries the figure to the next dispatch decision.
 
 - `Retry Timer Fired`
-  - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
+  - While an instance spend window holds dispatch, re-arm the retry one `polling.interval_ms` ahead and start nothing, leaving its attempt count, claim, and persisted entry unchanged (Section 8.4).
+  - Otherwise re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
 
 - `Reconciliation State Refresh`
   - Stop runs whose issue states are terminal or no longer active.
@@ -144,7 +146,7 @@ A verdict that withholds the write is, immediately before any of its effects, ch
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are required before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery uses persisted state from SQLite for retry queues, session metadata, parked issues, budget-hold notice records (the durable record that a `budget.held` notice reached at least one destination; a hold with no destination records nothing and is routed again on a later pass), and attention acknowledgements (the durable record that a person has seen an attention item), supplemented by tracker polling for current issue states and filesystem inspection for workspace existence.
+- Restart recovery uses persisted state from SQLite for retry queues, session metadata, parked issues (including a park a person released that the issue's next primary dispatch has not yet consumed), budget-hold notice records (the durable record that a `budget.held` notice reached at least one destination; a hold with no destination records nothing and is routed again on a later pass), and attention acknowledgements (the durable record that a person has seen an attention item), supplemented by tracker polling for current issue states and filesystem inspection for workspace existence.
 - Startup pending reaction recovery uses `run_history`, tracker state, and `.sortie/scm.json` to reconstruct runtime `pending_reactions` for recent handoff-stage runs before the first poll tick. The scan is bounded by `PendingReactionRecoveryLookback` and a fixed candidate cap.
 - Startup terminal cleanup maps existing workspace directories to issue identifiers, queries the tracker for the states of those specific issues, and removes the ones in terminal states. An issue that reaches a terminal state through the merge-completion transition (§11G) becomes eligible for this same cleanup without a human relabeling it first.
 
@@ -153,14 +155,15 @@ A verdict that withholds the write is, immediately before any of its effects, ch
 1. Open or create the SQLite database and run schema migrations.
 2. Load persisted retry entries from SQLite.
 3. Reconstruct retry timers from persisted `due_at` timestamps.
-4. Load persisted park records from SQLite and reconstruct the runtime park set before the event loop starts, so a parked issue stays out of dispatch across the restart.
+4. Load persisted park records from SQLite and reconstruct the runtime park set before the event loop starts, so a parked issue stays out of dispatch across the restart. A record a person already released loads as a pending release instead, so the issue stays dispatchable and its next primary dispatch carries the hand-over (Section 14.2).
    Then load persisted stage hop records and reconstruct each issue's hop count, latest hop, and hold flag, so the count and the hold survive the restart. A record with an empty issue ID is skipped with a warning, and a failed load starts with none.
 5. Load persisted budget-hold notice records from SQLite and reconstruct the runtime notice memory before the event loop starts, so a hold already announced to its destinations before the restart is not announced again after it. A record exists only for a notice that had at least one destination.
 6. Load persisted attention acknowledgements from SQLite before the event loop starts, so an attention item whose `id` survives the restart keeps its acknowledgement (§13.7.2). A record that does not parse is skipped with a warning, and a failed load starts with none.
-7. Map existing workspace directories to issue identifiers, query the tracker for the states of those specific issues, and clean the ones in terminal states.
-8. Construct reaction providers and call `RecoverPendingReactions` to restore eligible CI and review pending entries for handoff-stage issues.
-9. Query tracker for active issues and reconcile with persisted state.
-10. Begin normal polling loop.
+7. Load persisted usage-limit holds from SQLite before the first tick, so a hold a provider usage limit began before the restart still stops new sessions of its agent kind, or of that kind on one model, until its reset. A hold whose reset has passed loads and has no effect, and a failed load starts with none. The restored retry entries keep the reset as their due time and their `usage_limit` origin trigger, so a refused issue's retry is still the first dispatch the hold admits.
+8. Map existing workspace directories to issue identifiers, query the tracker for the states of those specific issues, and clean the ones in terminal states.
+9. Construct reaction providers and call `RecoverPendingReactions` to restore eligible CI and review pending entries for handoff-stage issues.
+10. Query tracker for active issues and reconcile with persisted state.
+11. Begin normal polling loop.
 
 ### 7.5 Retry-Slot Arbitration
 
@@ -168,7 +171,7 @@ Retry staleness is measured from a monotonic timestamp captured before arming th
 
 `retry_attempts` holds at most one entry per issue: the retry slot. The entry's reaction kind records the owner, with the empty string meaning the orchestrator's own continuation lane. Every code path that wants to schedule a retry for an issue (a challenger) checks whether the slot is occupied before writing. A non-nil occupant (the incumbent) means another unit of work already owns the issue's next dispatch; the challenger defers instead of overwriting it, leaving the incumbent untouched and making no other state mutation. The rule keys on occupancy alone: it does not compare owners, rank reaction kinds, or preempt.
 
-Only two writers are exempt from checking first, because each frees the slot itself immediately before writing back into it: the retry-timer handler's inner reschedule, which pops and deletes the entry it is replacing before rescheduling it, and the overdue-retry re-arm pass (below), which cancels the same entry before re-arming it with a zero delay. Every other writer is admitted only into a free slot.
+Only two writers are exempt from checking first, because each frees the slot itself immediately before writing back into it: the retry-timer handler's inner reschedule and its re-arm under a spend hold (Section 8.4), which pop and delete the entry they are replacing before rescheduling it, and the overdue-retry re-arm pass (below), which cancels the same entry before re-arming it with a zero delay. Every other writer is admitted only into a free slot.
 
 Two liveness bounds keep an arbitrated slot from being held for the process lifetime:
 

@@ -121,13 +121,25 @@ func workflowCheck(status workflow.LoadStatus) SnapshotHealthCheck {
 // text to its base name, so the unauthenticated API does not disclose the
 // directory layout, as every other workflow file it serves already does.
 func (o *Orchestrator) withoutWorkflowDir(c SnapshotHealthCheck) SnapshotHealthCheck {
+	c.Error = o.cutWorkflowDir(c.Error)
+	return c
+}
+
+func (o *Orchestrator) cutWorkflowDir(text string) string {
 	if o.workflowManager == nil {
-		return c
+		return text
 	}
 	if path := o.workflowManager.WorkflowAbsPath(); path != "" {
-		c.Error = strings.ReplaceAll(c.Error, path, filepath.Base(path))
+		return strings.ReplaceAll(text, path, filepath.Base(path))
 	}
-	return c
+	return text
+}
+
+// MaskError returns text as Health serves the workflow check's error: the
+// workflow file's absolute path cut to its base name, then secrets masked.
+// Safe for concurrent use; it performs no I/O.
+func (o *Orchestrator) MaskError(text string) string {
+	return redact.Mask(o.cutWorkflowDir(text))
 }
 
 // recordPreflight records a tick's dispatch preflight; warnings neither

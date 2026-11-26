@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // mustSelfReviewGit runs git args in dir, failing t on error.
@@ -66,21 +66,12 @@ func TestGenerateWorkspaceDiff_HeldDescendantHoldingOutput(t *testing.T) {
 		err  error
 	}
 	done := make(chan outcome, 1)
-	start := time.Now()
 	go func() {
 		diff, _, _, diffErr := generateWorkspaceDiff(context.Background(), dir, 0)
 		done <- outcome{diff, diffErr}
 	}()
 
-	var oc outcome
-	select {
-	case oc = <-done:
-	case <-time.After(20 * time.Second):
-		t.Fatal("generateWorkspaceDiff() did not return within 20s, want a bounded return despite the held descendant")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("generateWorkspaceDiff() took %v, want within 5s", elapsed)
-	}
+	oc := waittest.Receive(t, done, "generateWorkspaceDiff() return")
 	if oc.err != nil {
 		t.Fatalf("generateWorkspaceDiff() error = %v", oc.err)
 	}
@@ -135,24 +126,12 @@ exec "%s" "$@"
 		done <- diffErr
 	}()
 
-	select {
-	case diffErr := <-done:
-		if diffErr != nil {
-			t.Fatalf("generateWorkspaceDiff() error = %v", diffErr)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("generateWorkspaceDiff() did not return within 20s")
+	diffErr := waittest.Receive(t, done, "generateWorkspaceDiff() return")
+	if diffErr != nil {
+		t.Fatalf("generateWorkspaceDiff() error = %v", diffErr)
 	}
 
-	pid := pollVerificationPID(t, pidPath, 5*time.Second)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if killErr := syscall.Kill(pid, 0); killErr != nil {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("intent-to-add descendant %d still answers signal 0, want it gone", pid)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidPath))
 }
 
 // TestRunSingleVerification_HeldDescendantSucceedsAndLogsLeftoverRecord
@@ -171,8 +150,8 @@ func TestRunSingleVerification_HeldDescendantSucceedsAndLogsLeftoverRecord(t *te
 
 	start := time.Now()
 	result := runSingleVerification(context.Background(), command, wsPath, 5000, logger, &domain.NoopMetrics{})
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("runSingleVerification() took %v, want within 2s", elapsed)
+	if elapsed := time.Since(start); elapsed >= procutil.DefaultDrainGrace {
+		t.Errorf("runSingleVerification() took %v, want under the %v drain grace", elapsed, procutil.DefaultDrainGrace)
 	}
 
 	if result.ExitCode != 0 {
@@ -196,22 +175,7 @@ func TestRunSingleVerification_HeldDescendantSucceedsAndLogsLeftoverRecord(t *te
 		t.Errorf("log missing a command attribute; log = %q", out)
 	}
 
-	pidData, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read descendant pid: %v", err)
-	}
-	pid, convErr := strconv.Atoi(strings.TrimSpace(string(pidData)))
-	if convErr != nil || pid <= 0 {
-		t.Fatalf("parse descendant pid from %q: %v", pidData, convErr)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if killErr := syscall.Kill(pid, 0); killErr != nil {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("descendant %d still answers signal 0, want it gone", pid)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidFile))
 }
 
 func TestRunSingleVerification_SelfSignalledCommandReportsItsExitAndLeftovers(t *testing.T) {
@@ -275,51 +239,16 @@ func TestRunVerification_TimeoutSignalsDescendantGroup(t *testing.T) {
 		done <- runSingleVerification(context.Background(), command, wsPath, 1000, discardLogger(), &domain.NoopMetrics{})
 	}()
 
-	descendantPID := pollVerificationPID(t, pidFile, 5*time.Second)
+	descendantPID := waittest.PIDFile(t, pidFile)
 	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
 
-	var result domain.VerificationResult
-	select {
-	case result = <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("runSingleVerification did not return within 30s, want a timed-out result")
-	}
+	result := waittest.Receive(t, done, "runSingleVerification return")
 
 	if !result.TimedOut {
 		t.Errorf("runSingleVerification().TimedOut = false, want true")
 	}
-	if !pollVerificationFile(marker, 5*time.Second) {
-		t.Errorf("runSingleVerification() left %q absent, want the descendant to have caught a graceful signal", marker)
-	}
+	waittest.File(t, marker)
 	if err := syscall.Kill(descendantPID, 0); err == nil {
 		t.Errorf("runSingleVerification() left descendant %d alive, want gone", descendantPID)
 	}
-}
-
-// pollVerificationPID polls path until it holds a positive integer.
-func pollVerificationPID(t *testing.T, path string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("pollVerificationPID(%q) = no PID after %v, want a PID", path, timeout)
-	return 0
-}
-
-// pollVerificationFile reports whether path appears before the timeout.
-func pollVerificationFile(path string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return false
 }

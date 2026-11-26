@@ -98,6 +98,13 @@ func matchLabels(pairs []*dto.LabelPair, want map[string]string) bool {
 	return true
 }
 
+func assertCounter(t *testing.T, m *PromMetrics, name string, labels map[string]string, want float64) {
+	t.Helper()
+	if got := counterValue(t, gatherFamilies(t, m), name, labels); got != want {
+		t.Errorf("%s%v = %v, want %v", name, labels, got, want)
+	}
+}
+
 func TestNewPromMetrics(t *testing.T) {
 	t.Parallel()
 
@@ -112,9 +119,10 @@ func TestNewPromMetrics(t *testing.T) {
 	// Exercise every labeled metric once so they appear in Gather().
 	// Prometheus CounterVec/HistogramVec are lazily initialized per
 	// label combination and won't appear until first observation.
-	m.AddTokens("input", 1)
+	m.AddTokens("input", "m", 1)
+	m.AddAgentRuntime("m", 1)
 	m.IncDispatches("success")
-	m.IncWorkerExits("normal")
+	m.IncWorkerExits("normal", "m")
 	m.IncRetries("error")
 	m.IncReconciliationActions("keep")
 	m.IncPollCycles("success")
@@ -150,11 +158,12 @@ func TestNewPromMetrics(t *testing.T) {
 		}
 	}
 
+	modelLabelled := map[string]bool{"sortie_tokens_total": true, "sortie_agent_runtime_seconds_total": true, "sortie_worker_exits_total": true}
 	for name, family := range families {
 		for _, metric := range family.GetMetric() {
 			for _, label := range metric.GetLabel() {
-				if strings.Contains(label.GetName(), "model") || strings.Contains(label.GetName(), "effort") {
-					t.Errorf("metric %q carries label %q, want no model or effort label on any series", name, label.GetName())
+				if strings.Contains(label.GetName(), "effort") || (strings.Contains(label.GetName(), "model") && !modelLabelled[name]) {
+					t.Errorf("metric %q carries label %q, want model only on token, runtime, and exit counters and no effort label", name, label.GetName())
 				}
 			}
 		}
@@ -281,15 +290,15 @@ func TestPromMetricsCounters(t *testing.T) {
 		t.Parallel()
 
 		m := newTestMetrics(t)
-		m.IncWorkerExits("normal")
-		m.IncWorkerExits("error")
-		m.IncWorkerExits("cancelled")
-		m.IncWorkerExits("soft_stop")
+		m.IncWorkerExits("normal", "m")
+		m.IncWorkerExits("error", "m")
+		m.IncWorkerExits("cancelled", "m")
+		m.IncWorkerExits("soft_stop", "m")
 
 		families := gatherFamilies(t, m)
 		for _, exitType := range []string{"normal", "error", "cancelled", "soft_stop"} {
-			if got := counterValue(t, families, "sortie_worker_exits_total", map[string]string{"exit_type": exitType}); got != 1 {
-				t.Errorf("sortie_worker_exits_total{exit_type=%s} = %v, want 1", exitType, got)
+			if got := counterValue(t, families, "sortie_worker_exits_total", map[string]string{"exit_type": exitType, "model": "m"}); got != 1 {
+				t.Errorf("sortie_worker_exits_total{exit_type=%s,model=m} = %v, want 1", exitType, got)
 			}
 		}
 	})
@@ -423,43 +432,27 @@ func TestPromMetricsCounters(t *testing.T) {
 		t.Parallel()
 
 		m := newTestMetrics(t)
-		m.AddTokens("input", 100)
+		m.AddTokens("input", "m", 100)
+		m.AddTokens("output", "m", 50)
+		m.AddTokens("input", "m", -10)
+		m.AddTokens("input", "m", 0)
+		m.AddTokens("input", "", 7)
 
-		families := gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_tokens_total", map[string]string{"type": "input"}); got != 100 {
-			t.Errorf("sortie_tokens_total{type=input} = %v, want 100", got)
+		tests := []struct {
+			tokenType string
+			model     string
+			want      float64
+		}{
+			{"input", "m", 100},
+			{"output", "m", 50},
+			{"input", "<none>", 7},
 		}
-
-		m.AddTokens("output", 50)
-		families = gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_tokens_total", map[string]string{"type": "output"}); got != 50 {
-			t.Errorf("sortie_tokens_total{type=output} = %v, want 50", got)
-		}
-		// input unchanged
-		if got := counterValue(t, families, "sortie_tokens_total", map[string]string{"type": "input"}); got != 100 {
-			t.Errorf("sortie_tokens_total{type=input} after output add = %v, want 100", got)
-		}
-
-		// Negative values clamped; no panic.
-		m.AddTokens("input", -10)
-		families = gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_tokens_total", map[string]string{"type": "input"}); got != 100 {
-			t.Errorf("sortie_tokens_total{type=input} after negative add = %v, want 100", got)
-		}
-
-		// Zero is a no-op.
-		m.AddTokens("input", 0)
-		families = gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_tokens_total", map[string]string{"type": "input"}); got != 100 {
-			t.Errorf("sortie_tokens_total{type=input} after zero add = %v, want 100", got)
+		for _, tt := range tests {
+			assertCounter(t, m, "sortie_tokens_total", map[string]string{"type": tt.tokenType, "model": tt.model}, tt.want)
 		}
 	})
 
-	// Regression coverage: a session that reported no measurement never
-	// reaches AddTokens on the orchestrator's token-delta path (gated on
-	// a non-zero usage component), so a scrape must expose no
-	// sortie_tokens_total series at all, not a series holding zero.
-	t.Run("no AddTokens call exposes no sortie_tokens_total series", func(t *testing.T) {
+	t.Run("no AddTokens call exposes no sortie_tokens_total series without PrepareModel", func(t *testing.T) {
 		t.Parallel()
 
 		m := newTestMetrics(t)
@@ -474,8 +467,8 @@ func TestPromMetricsCounters(t *testing.T) {
 		t.Parallel()
 
 		m := newTestMetrics(t)
-		m.AddTokens("input", 0)
-		m.AddTokens("output", -5)
+		m.AddTokens("input", "m", 0)
+		m.AddTokens("output", "m", -5)
 
 		families := gatherFamilies(t, m)
 		if _, ok := families["sortie_tokens_total"]; ok {
@@ -487,26 +480,34 @@ func TestPromMetricsCounters(t *testing.T) {
 		t.Parallel()
 
 		m := newTestMetrics(t)
-		m.AddAgentRuntime(60.5)
+		m.AddAgentRuntime("m", 60.5)
+		m.AddAgentRuntime("m", -1.0)
+		m.AddAgentRuntime("m", 0)
 
-		families := gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_agent_runtime_seconds_total", nil); got != 60.5 {
-			t.Errorf("sortie_agent_runtime_seconds_total = %v, want 60.5", got)
+		assertCounter(t, m, "sortie_agent_runtime_seconds_total", map[string]string{"model": "m"}, 60.5)
+	})
+
+	t.Run("PrepareModel exports zero series and keeps existing values", func(t *testing.T) {
+		t.Parallel()
+
+		m := newTestMetrics(t)
+		m.PrepareModel("m")
+		m.PrepareModel("")
+
+		for _, model := range []string{"m", "<none>"} {
+			for _, tokenType := range []string{"input", "output", "cache_read", "cache_write"} {
+				assertCounter(t, m, "sortie_tokens_total", map[string]string{"type": tokenType, "model": model}, 0)
+			}
+			for _, exitType := range []string{"normal", "error", "cancelled", "soft_stop"} {
+				assertCounter(t, m, "sortie_worker_exits_total", map[string]string{"exit_type": exitType, "model": model}, 0)
+			}
+			assertCounter(t, m, "sortie_agent_runtime_seconds_total", map[string]string{"model": model}, 0)
 		}
 
-		// Negative clamped; no panic.
-		m.AddAgentRuntime(-1.0)
-		families = gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_agent_runtime_seconds_total", nil); got != 60.5 {
-			t.Errorf("sortie_agent_runtime_seconds_total after negative = %v, want 60.5", got)
-		}
+		m.AddTokens("input", "m", 5)
+		m.PrepareModel("m")
 
-		// Zero is a no-op.
-		m.AddAgentRuntime(0)
-		families = gatherFamilies(t, m)
-		if got := counterValue(t, families, "sortie_agent_runtime_seconds_total", nil); got != 60.5 {
-			t.Errorf("sortie_agent_runtime_seconds_total after zero = %v, want 60.5", got)
-		}
+		assertCounter(t, m, "sortie_tokens_total", map[string]string{"type": "input", "model": "m"}, 5)
 	})
 }
 

@@ -3,13 +3,17 @@
 package sshutil
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrConnectionFailed marks an ssh client that failed to connect, as
@@ -108,33 +112,69 @@ type SSHOptions struct {
 	// Unset lists variable names the remote shell unsets before it runs
 	// the agent command.
 	Unset []string
+
+	// Forward, when non-nil, asks the launch for a reverse forward. The agent
+	// command runs only after the outcome resolves; see
+	// [SSHLaunch.WatchStderr].
+	Forward *ReverseForward
+
+	// StopGrace is how long the remote agent has between SIGTERM and SIGKILL
+	// once its SSH connection is gone, rounded up to whole seconds.
+	StopGrace time.Duration
+
+	// ExitBarrier, when non-empty, is a name from [NewExitBarrier] that the
+	// remote agent tree holds until it has exited, so [AwaitExitCommand] can
+	// wait for that exit from a second connection after this one is gone.
+	// Empty leaves the launch without a barrier.
+	ExitBarrier string
 }
 
-// Format implements [fmt.Formatter], rendering StrictHostKeyChecking
-// and Env for every verb. Env renders through [EnvVar.Format], so a
-// carried value never reaches a formatted log line or error.
+func (o SSHOptions) forwardHostPort() (int, bool) {
+	if o.Forward == nil {
+		return 0, false
+	}
+	return o.Forward.HostPort, true
+}
+
+// Format implements [fmt.Formatter], rendering StrictHostKeyChecking, Env
+// and the Forward host port for every verb. Env renders through
+// [EnvVar.Format], so a carried value never reaches a formatted log line or
+// error.
 func (o SSHOptions) Format(f fmt.State, _ rune) {
-	_, _ = fmt.Fprintf(f, "sshutil.SSHOptions{StrictHostKeyChecking:%q, Env:%v}", o.StrictHostKeyChecking, o.Env) //nolint:errcheck // best-effort formatting
+	forward := ""
+	if port, ok := o.forwardHostPort(); ok {
+		forward = fmt.Sprintf(", Forward:{HostPort:%d}", port)
+	}
+	_, _ = fmt.Fprintf(f, "sshutil.SSHOptions{StrictHostKeyChecking:%q, Env:%v%s}", o.StrictHostKeyChecking, o.Env, forward) //nolint:errcheck // a fmt.Formatter has no way to report a write error
 }
 
 // LogValue implements [slog.LogValuer]. Env renders through
 // [EnvVar.LogValue] and [EnvVar.MarshalJSON], so a carried value never
 // reaches a structured log record.
 func (o SSHOptions) LogValue() slog.Value {
-	return slog.GroupValue(
+	attrs := []slog.Attr{
 		slog.String("strict_host_key_checking", o.StrictHostKeyChecking),
 		slog.Any("env", o.Env),
-	)
+	}
+	if port, ok := o.forwardHostPort(); ok {
+		attrs = append(attrs, slog.Int("forward_host_port", port))
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // MarshalJSON implements [json.Marshaler]. Env marshals through
 // [EnvVar.MarshalJSON], so a carried value never reaches a
 // JSON-encoded log record.
 func (o SSHOptions) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
+	view := struct {
 		StrictHostKeyChecking string   `json:"strict_host_key_checking"`
 		Env                   []EnvVar `json:"env"`
-	}{StrictHostKeyChecking: o.StrictHostKeyChecking, Env: o.Env})
+		ForwardHostPort       *int     `json:"forward_host_port,omitempty"`
+	}{StrictHostKeyChecking: o.StrictHostKeyChecking, Env: o.Env}
+	if port, ok := o.forwardHostPort(); ok {
+		view.ForwardHostPort = &port
+	}
+	return json.Marshal(view)
 }
 
 // ddMissingMessage is the line the remote guard writes to standard
@@ -166,6 +206,10 @@ type SSHLaunch struct {
 	// standard input; use [SSHLaunch.StdinReader] or
 	// [SSHLaunch.PrefixStdin].
 	preamble []byte
+
+	// forward is non-nil on a launch built with [SSHOptions.Forward]; its
+	// preamble exists only once the outcome resolves, so preamble stays empty.
+	forward *forwardState
 }
 
 // buildSSHOpts builds the SSH client options and destination arguments
@@ -176,14 +220,37 @@ func buildSSHOpts(host string, opts SSHOptions) []string {
 		strictHostKey = "accept-new"
 	}
 
-	return []string{
+	args := []string{
 		"-o", "StrictHostKeyChecking=" + strictHostKey,
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=30",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
-		"--",
-		strings.TrimSpace(host),
+		// A shared connection outlives this client, so the remote supervisor
+		// would never see it end, and its master would own a forward's
+		// allocation line.
+		"-o", "ControlPath=none",
+	}
+	if opts.Forward != nil {
+		args = append(args, forwardOptions(opts.Forward.HostPort)...)
+	}
+	return append(args, "--", strings.TrimSpace(host))
+}
+
+// forwardOptions returns the ssh options a forwarded launch adds. A refused
+// forward must not end the launch; LogLevel=INFO keeps the allocation line
+// visible whatever the operator's ssh_config sets. Remote port 0 lets sshd
+// allocate one, since a fixed port collides across sessions on one host.
+//
+// It panics when hostPort is outside 1..65535.
+func forwardOptions(hostPort int) []string {
+	if hostPort < 1 || hostPort > 65535 {
+		panic("sshutil: BuildSSHLaunch: forward host port out of range")
+	}
+	return []string{
+		"-o", "ExitOnForwardFailure=no",
+		"-o", "LogLevel=INFO",
+		"-R", "127.0.0.1:0:127.0.0.1:" + strconv.Itoa(hostPort),
 	}
 }
 
@@ -195,18 +262,41 @@ func buildSSHOpts(host string, opts SSHOptions) []string {
 // newline closes the group rather than a semicolon: the fragment is
 // the operator's own command and may itself end in &, which a
 // semicolon after it turns into a syntax error the remote shell
-// rejects before the agent runs.
-func agentGroup(remoteCommand string, agentArgs []string) string {
+// rejects before the agent runs. With positional set, "$@" follows the
+// arguments so the preamble's late arguments reach the command.
+func agentGroup(remoteCommand string, agentArgs []string, positional bool) string {
 	command, terminator := splitCommandTerminator(remoteCommand)
-	parts := make([]string, 0, len(agentArgs)+2)
+	parts := make([]string, 0, len(agentArgs)+3)
 	parts = append(parts, command)
 	for _, arg := range agentArgs {
 		parts = append(parts, shellQuote(arg))
+	}
+	if positional {
+		parts = append(parts, `"$@"`)
 	}
 	if terminator != "" {
 		parts = append(parts, terminator)
 	}
 	return "{ " + strings.Join(parts, " ") + "\n}"
+}
+
+//go:embed supervise.sh
+var supervisor string
+
+// supervisedAgent runs agent under supervisor, which ends the session's
+// process group once the SSH connection is gone, granting the agent grace
+// rounded up to whole seconds between SIGTERM and SIGKILL. A non-empty
+// barrier names the exit barrier the agent tree holds.
+func supervisedAgent(agent string, grace time.Duration, barrier string) string {
+	hold := ""
+	if barrier != "" {
+		hold = "sortie_hold_barrier " + shellQuote(exitBarrierPath(barrier)) + "\n"
+	}
+	return "{\n" + supervisor +
+		"sortie_agent() {\n" + agent + "\n}\n" +
+		hold +
+		`sortie_start_agent sortie_agent "$@"` + "\n" +
+		"sortie_supervise " + strconv.Itoa(wholeSeconds(grace)) + "\n}"
 }
 
 // shellBlanks holds the trailing characters a POSIX shell either
@@ -284,15 +374,24 @@ func endsInEscape(s string) bool {
 // import step requires the completion marker the preamble sets last.
 // BuildSSHLaunch neither reorders nor deduplicates opts.Env.
 //
+// With a non-nil opts.Forward, the launch adds the forward's ssh options and
+// always carries a preamble, whose length is reserved from
+// opts.Forward.Render(WidestOutcome); [SSHLaunch.StdinReader] and
+// [SSHLaunch.PrefixStdin] pad the real rendering to it.
+//
+// With a non-empty opts.ExitBarrier, the agent tree holds that barrier from
+// its start until it has exited; see [AwaitExitCommand].
+//
 // With a non-empty opts.Unset, the remote shell also unsets each named
 // variable after the import step, when there is one, and before the
 // agent command runs, so the agent does not inherit a variable the
 // remote host's login environment sets.
 //
-// BuildSSHLaunch panics when an opts.Env entry's Name or an opts.Unset
-// name fails [IsEnvName] or is one [IsReservedEnvName] reports; the
-// panic message names the entry's index and carries neither its Name
-// nor its Value.
+// BuildSSHLaunch panics when an opts.Env entry's Name, a late entry's Name or
+// an opts.Unset name fails [IsEnvName] or is reserved, when
+// opts.Forward.HostPort is outside 1..65535, and when opts.ExitBarrier is not
+// a name [NewExitBarrier] returns; the message names the entry's index and
+// carries neither its Name nor its Value.
 func BuildSSHLaunch(host, workspacePath, remoteCommand string, agentArgs []string, opts SSHOptions) SSHLaunch {
 	sshOpts := buildSSHOpts(host, opts)
 
@@ -304,9 +403,17 @@ func BuildSSHLaunch(host, workspacePath, remoteCommand string, agentArgs []strin
 			panic(fmt.Sprintf("sshutil: BuildSSHLaunch: reserved environment variable name at Unset[%d]", i))
 		}
 	}
-	agent := agentGroup(remoteCommand, agentArgs)
+	agent := agentGroup(remoteCommand, agentArgs, opts.Forward != nil)
 	if len(opts.Unset) > 0 {
 		agent = "unset " + strings.Join(opts.Unset, " ") + " && " + agent
+	}
+	if opts.ExitBarrier != "" && !isExitBarrierName(opts.ExitBarrier) {
+		panic("sshutil: BuildSSHLaunch: invalid exit barrier name")
+	}
+	agent = supervisedAgent(agent, opts.StopGrace, opts.ExitBarrier)
+
+	if opts.Forward != nil {
+		return buildForwardedLaunch(sshOpts, workspacePath, agent, opts)
 	}
 
 	if len(opts.Env) == 0 {
@@ -316,26 +423,12 @@ func BuildSSHLaunch(host, workspacePath, remoteCommand string, agentArgs []strin
 		return SSHLaunch{Args: append(sshOpts, remoteCmd)}
 	}
 
-	for i, entry := range opts.Env {
-		switch {
-		case !IsEnvName(entry.Name):
-			panic(fmt.Sprintf("sshutil: BuildSSHLaunch: invalid environment variable name at Env[%d]", i))
-		case IsReservedEnvName(entry.Name):
-			panic(fmt.Sprintf("sshutil: BuildSSHLaunch: reserved environment variable name at Env[%d]", i))
-		}
-	}
+	panicOnBadEnvName(opts.Env, "Env")
 
-	assignments := make([]string, len(opts.Env))
-	for i, entry := range opts.Env {
-		assignments[i] = entry.Name + "=" + shellQuote(entry.Value)
-	}
-	preamble := "unset _sortie_env && export " + strings.Join(assignments, " ") + " && " + completionMarkerName + "=1"
-
-	guard := "{ command -v dd >/dev/null 2>&1 || { echo '" + ddMissingMessage + "' >&2; exit 1; }; }"
-	importStep := fmt.Sprintf(`unset %[1]s && _sortie_env=$(dd bs=1 count=%[2]d 2>/dev/null) && eval "$_sortie_env" && [ "${%[1]s-}" = 1 ]`, completionMarkerName, len(preamble))
+	preamble := "unset _sortie_env && export " + strings.Join(envAssignments(opts.Env), " ") + " && " + completionMarkerName + "=1"
 
 	remoteCmd := strings.Join([]string{
-		"cd", "--", shellQuote(workspacePath), "&&", guard, "&&", importStep, "&&", agent,
+		"cd", "--", shellQuote(workspacePath), "&&", ddGuard, "&&", importStep(len(preamble)), "&&", agent,
 	}, " ")
 
 	return SSHLaunch{
@@ -344,11 +437,84 @@ func BuildSSHLaunch(host, workspacePath, remoteCommand string, agentArgs []strin
 	}
 }
 
+func buildForwardedLaunch(sshOpts []string, workspacePath, agent string, opts SSHOptions) SSHLaunch {
+	panicOnBadEnvName(opts.Env, "Env")
+	widest := opts.Forward.Render(WidestOutcome)
+	panicOnBadEnvName(widest.Env, "LatePreamble.Env")
+
+	state := newForwardState(opts.Forward)
+	state.static = slices.Clone(opts.Env)
+	state.reserved = len(forwardPreamble(state.static, widest))
+
+	remoteCmd := strings.Join([]string{
+		"cd", "--", shellQuote(workspacePath), "&&", ddGuard, "&&", readyStep, "&&", importStep(state.reserved), "&&", agent,
+	}, " ")
+	return SSHLaunch{Args: append(sshOpts, remoteCmd), forward: state}
+}
+
+// forwardPreamble always runs set -- so the agent command never inherits the
+// remote shell's own positional parameters.
+func forwardPreamble(static []EnvVar, late LatePreamble) string {
+	var b strings.Builder
+	b.WriteString("unset _sortie_env")
+	if len(static)+len(late.Env) > 0 {
+		b.WriteString(" && export ")
+		b.WriteString(strings.Join(envAssignments(append(slices.Clone(static), late.Env...)), " "))
+	}
+	b.WriteString(" && set --")
+	for _, arg := range late.Args {
+		b.WriteString(" ")
+		b.WriteString(shellQuote(arg))
+	}
+	b.WriteString(" && " + completionMarkerName + "=1")
+	return b.String()
+}
+
+func envAssignments(entries []EnvVar) []string {
+	assignments := make([]string, len(entries))
+	for i, entry := range entries {
+		assignments[i] = entry.Name + "=" + shellQuote(entry.Value)
+	}
+	return assignments
+}
+
+// badEnvName returns the index of the first entry the preamble cannot carry
+// and why, or -1.
+func badEnvName(entries []EnvVar) (index int, reason string) {
+	for i, entry := range entries {
+		switch {
+		case !IsEnvName(entry.Name):
+			return i, "invalid"
+		case IsReservedEnvName(entry.Name):
+			return i, "reserved"
+		}
+	}
+	return -1, ""
+}
+
+func panicOnBadEnvName(entries []EnvVar, where string) {
+	if i, reason := badEnvName(entries); i >= 0 {
+		panic(fmt.Sprintf("sshutil: BuildSSHLaunch: %s environment variable name at %s[%d]", reason, where, i))
+	}
+}
+
+const ddGuard = "{ command -v dd >/dev/null 2>&1 || { echo '" + ddMissingMessage + "' >&2; exit 1; }; }"
+
+// readyMarker tells [SSHLaunch.WatchStderr] that ssh has said everything it
+// will about the forward.
+const readyMarker = "sortie: remote shell ready"
+
+const readyStep = "printf '%s\\n' '" + readyMarker + "' >&2"
+
+func importStep(count int) string {
+	return fmt.Sprintf(`unset %[1]s && _sortie_env=$(dd bs=1 count=%[2]d 2>/dev/null) && eval "$_sortie_env" && [ "${%[1]s-}" = 1 ]`, completionMarkerName, count)
+}
+
 // Format implements [fmt.Formatter], redacting the unexported
 // preamble for every verb so a carried value baked into it never
 // reaches a formatted log line or error.
 func (l SSHLaunch) Format(f fmt.State, _ rune) {
-	_, _ = fmt.Fprintf(f, "sshutil.SSHLaunch{Args:%q}", l.Args) //nolint:errcheck // best-effort formatting
+	_, _ = fmt.Fprintf(f, "sshutil.SSHLaunch{Args:%q}", l.Args) //nolint:errcheck // a fmt.Formatter has no way to report a write error
 }
 
 // LogValue implements [slog.LogValuer], redacting the unexported
@@ -372,18 +538,31 @@ func (l SSHLaunch) MarshalJSON() ([]byte, error) {
 // default reflection-based formatting would render the preamble
 // verbatim; Format, LogValue, and MarshalJSON render none of it.
 type preambleReader struct {
-	r *strings.Reader
+	fetch func(cancel <-chan struct{}) ([]byte, error)
+	once  sync.Once
+	r     *strings.Reader
+	err   error
 }
 
-// Read implements [io.Reader].
 func (r *preambleReader) Read(p []byte) (int, error) {
+	r.once.Do(func() {
+		preamble, err := r.fetch(nil)
+		if err != nil {
+			r.err = err
+			return
+		}
+		r.r = strings.NewReader(string(preamble))
+	})
+	if r.err != nil {
+		return 0, r.err
+	}
 	return r.r.Read(p)
 }
 
 // Format implements [fmt.Formatter], rendering no preamble bytes for
 // any verb.
 func (r *preambleReader) Format(f fmt.State, _ rune) {
-	_, _ = fmt.Fprint(f, "sshutil.preambleReader{}") //nolint:errcheck // best-effort formatting
+	_, _ = fmt.Fprint(f, "sshutil.preambleReader{}") //nolint:errcheck // a fmt.Formatter has no way to report a write error
 }
 
 // LogValue implements [slog.LogValuer], rendering no preamble bytes.
@@ -400,11 +579,26 @@ func (r *preambleReader) MarshalJSON() ([]byte, error) {
 // StdinReader returns a reader yielding the launch's standard input
 // preamble, or a nil [io.Reader] interface value when the launch
 // carries no preamble. Each call returns a fresh reader.
+//
+// On a forwarded launch the first Read blocks until the outcome resolves,
+// which needs a reader of [SSHLaunch.WatchStderr], and fails with
+// [ErrPreambleOverflow] when the rendering exceeds the reserved length.
 func (l SSHLaunch) StdinReader() io.Reader {
-	if len(l.preamble) == 0 {
+	if !l.hasPreamble() {
 		return nil
 	}
-	return &preambleReader{r: strings.NewReader(string(l.preamble))}
+	return &preambleReader{fetch: l.preambleBytes}
+}
+
+func (l SSHLaunch) hasPreamble() bool {
+	return l.forward != nil || len(l.preamble) > 0
+}
+
+func (l SSHLaunch) preambleBytes(cancel <-chan struct{}) ([]byte, error) {
+	if l.forward == nil {
+		return l.preamble, nil
+	}
+	return l.forward.await(cancel)
 }
 
 // PrefixStdin returns w unchanged when the launch carries no
@@ -414,11 +608,16 @@ func (l SSHLaunch) StdinReader() io.Reader {
 // only part of it, and none of the caller's bytes on failure; every
 // later Write passes straight through to w; and Close closes w
 // without waiting for a Write in progress.
+//
+// On a forwarded launch the first Write blocks until the outcome resolves,
+// which needs a reader of [SSHLaunch.WatchStderr], and fails with
+// [ErrPreambleOverflow] when the rendering exceeds the reserved length or
+// with [io.ErrClosedPipe] when Close arrives first.
 func (l SSHLaunch) PrefixStdin(w io.WriteCloser) io.WriteCloser {
-	if len(l.preamble) == 0 {
+	if !l.hasPreamble() {
 		return w
 	}
-	return &preambleWriter{w: w, preamble: l.preamble}
+	return &preambleWriter{w: w, fetch: l.preambleBytes, closed: make(chan struct{})}
 }
 
 // preambleWriter prepends a preamble to the first Write it receives.
@@ -426,7 +625,9 @@ func (l SSHLaunch) PrefixStdin(w io.WriteCloser) io.WriteCloser {
 // concurrent Write calls to the same extent the wrapped writer w is.
 type preambleWriter struct {
 	w           io.WriteCloser
-	preamble    []byte
+	fetch       func(cancel <-chan struct{}) ([]byte, error)
+	closed      chan struct{}
+	closeOnce   sync.Once
 	once        sync.Once
 	preambleErr error
 }
@@ -437,9 +638,13 @@ type preambleWriter struct {
 // short count and no error cannot pass for a delivered preamble.
 func (p *preambleWriter) Write(b []byte) (int, error) {
 	p.once.Do(func() {
-		n, err := p.w.Write(p.preamble)
-		if err == nil && n != len(p.preamble) {
-			err = io.ErrShortWrite
+		preamble, err := p.fetch(p.closed)
+		if err == nil {
+			var n int
+			n, err = p.w.Write(preamble)
+			if err == nil && n != len(preamble) {
+				err = io.ErrShortWrite
+			}
 		}
 		p.preambleErr = err
 	})
@@ -454,13 +659,14 @@ func (p *preambleWriter) Write(b []byte) (int, error) {
 // racing with a Write blocked on a peer that stopped reading unblocks
 // that Write rather than waiting for it.
 func (p *preambleWriter) Close() error {
+	p.closeOnce.Do(func() { close(p.closed) })
 	return p.w.Close()
 }
 
 // Format implements [fmt.Formatter], rendering no preamble bytes for
 // any verb.
 func (p *preambleWriter) Format(f fmt.State, _ rune) {
-	_, _ = fmt.Fprint(f, "sshutil.preambleWriter{}") //nolint:errcheck // best-effort formatting
+	_, _ = fmt.Fprint(f, "sshutil.preambleWriter{}") //nolint:errcheck // a fmt.Formatter has no way to report a write error
 }
 
 // LogValue implements [slog.LogValuer], rendering no preamble bytes.

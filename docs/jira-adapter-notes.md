@@ -32,7 +32,7 @@ Every interpolated project key, state name, and issue key passes through a quote
 
 ## The reconciliation queries ignore query_filter on purpose
 
-`tracker.query_filter` is a raw JQL fragment the adapter neither parses nor validates. It is ANDed into the candidate and by-states queries and deliberately left out of the two batch state lookups: those issues already passed filtering at dispatch time, and re-applying the filter would make a running session invisible the moment an operator narrowed the fragment.
+`tracker.query_filter` is a raw JQL fragment the adapter neither parses nor validates. It is ANDed into the candidate and by-states queries and deliberately left out of the batch state lookups: those issues already passed filtering at dispatch time, and re-applying the filter would make a running session invisible the moment an operator narrowed the fragment.
 
 The fragment is wrapped in parentheses when it is appended, and that is load-bearing rather than tidy. Without them a fragment containing a top-level `OR` binds loosely enough to widen the query past the project and state constraints the adapter just built, and an operator would be selecting issues Sortie was never configured to touch. Parenthesization is the only containment there is, since nothing parses the fragment.
 
@@ -61,12 +61,6 @@ The flattener emits only `text` nodes and appends a newline after block-level on
 On Server the same fields are plain strings carrying wiki markup, passed through verbatim with no translation, so agents see the raw markup tokens rather than clean prose. That is deliberate: translating a markup dialect is not the adapter's job, and the rendered-HTML expansion is not requested.
 
 Comment creation mirrors the split. On Cloud the text is split on newlines into one paragraph node per line, because a single node with embedded newlines does not render as line breaks.
-
-A comment that carries agent text keeps the split and ends in a literal block. On Cloud the paragraph nodes for Sortie's text are followed by one `codeBlock` node holding one text node with the whole literal, newlines included.
-
-On Server the body is the text, two line feeds, `{noformat}`, a line feed, the literal, a line feed, and `{noformat}`. The closing marker is matched without regard to letter case, so the adapter inserts U+200B after every `{` that starts the word `noformat` in the literal; otherwise the literal could end the block early. Server also parses `[~user]` mentions inside a `{noformat}` block, so the adapter inserts U+200B after every `[` followed by `~`. The text stays as written but notifies nobody.
-
-Server rendering is covered by a request-body test only. Whether the renderer closes on a case-insensitive match is unchecked, and the integration suite cannot post a version 2 comment because it refuses a Cloud host.
 
 ## Label writes
 

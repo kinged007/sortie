@@ -25,8 +25,9 @@ check() {
 	file=$1
 	case "$file" in
 	*"$self") return 0 ;;
-	*.go) marker='//' ;;
+	*.go | *.ts | *.tsx | *.mjs) marker='//' ;;
 	*.sh | *.py | *.mk | Makefile | */Makefile) marker='#' ;;
+	*.sql) marker='--' ;;
 	*) return 0 ;;
 	esac
 	[ -f "$file" ] || return 0
@@ -47,6 +48,7 @@ BEGIN {
   FENCE_SINGLE = SQ SQ SQ
   QUOTES = "\"" SQ
   if (marker == "//") QUOTES = QUOTES "`"
+  BLOCK_COMMENTS = (marker == "//" || marker == "--")
 
   SEQ_LABEL = "(^|[^[:alnum:]])(step|phase|check|rule|section|part|case|pass|stage|round|scenario)[[:space:]]+[0-9]"
   SPEC_NOUN = "(^|[^[:alnum:]])(Table|Tables|Appendix|Figure|Diagram|Criterion|Criteria|Requirement|Spec)[-[:space:]]+[0-9]"
@@ -66,6 +68,13 @@ BEGIN {
   PLAN_LABEL = "(^|[^[:alnum:]_])([Pp]ropert(y|ies)|[Ii]nvariants?|[Rr]ules?|[Ss]teps?|[Pp]hases?|[Ss]tages?)[[:space:]]+[(]?" PLAN_ID "([^[:alnum:]_]|$)"
   PLAN_LABEL = PLAN_LABEL "|(^|[^[:alnum:]_])" PLAN_ID "[[:space:]]+(step|phase|stage|reconciliation|probe|property|invariant|rule)s?([^[:alnum:]_]|$)"
   PLAN_RANGE = "(^|[^[:alnum:]_])" PLAN_ID "[[:space:]]+(to|through)[[:space:]]+" PLAN_ID "([^[:alnum:]_]|$)"
+
+  # A spec may name a rule by letters alone (rule LS, rule LS-DOCUMENT). Four
+  # letters or more is a keyword or a target (MUST, ACCEPT), and the words
+  # below follow "rule" in prose without naming one.
+  LETTER_RULE = "(^|[^[:alnum:]_])[Rr]ules?[[:space:]]+[(]?[A-Z][A-Z][A-Z]?([^[:alnum:]_]|$)"
+  split("ID API MAY NOT", words, " ")
+  for (i in words) NOT_A_RULE_NAME[words[i]] = 1
 
   VERIFICATION_PROPERTY = "(verification[[:space:]]+property[[:space:]]+[0-9]|property[[:space:]]+[0-9][[:space:]]+of[[:space:]]+the[[:space:]]+verification)"
 
@@ -133,7 +142,7 @@ function scan(s,   i, n, ch, three) {
     } else if (substr(s, i, length(marker)) == marker) {
       add_comment(substr(s, i + length(marker)))
       i = n + 1
-    } else if (marker == "//" && substr(s, i, 2) == "/*") {
+    } else if (BLOCK_COMMENTS && substr(s, i, 2) == "/*") {
       open_span = "*/"
       span_kind = "comment"
       i += 2
@@ -205,6 +214,16 @@ function cites_plan_family(c,   id) {
   return 0
 }
 
+function names_letter_rule(c,   name) {
+  while (match(c, LETTER_RULE)) {
+    name = substr(c, RSTART, RLENGTH)
+    c = substr(c, RSTART + RLENGTH)
+    match(name, /[A-Z][A-Z][A-Z]?/)
+    if (!(substr(name, RSTART, RLENGTH) in NOT_A_RULE_NAME)) return 1
+  }
+  return 0
+}
+
 function classify(c) {
   if (c ~ RFC_CITATION) return ""
   if (tolower(c) ~ SEQ_LABEL) return "sequence/section label"
@@ -212,6 +231,7 @@ function classify(c) {
   if (c ~ SPEC_PREFIX) return "spec-criteria reference"
   if (c ~ ATTESTED_ID) return "spec-criteria reference"
   if (c ~ PLAN_LABEL || c ~ PLAN_RANGE || cites_plan_family(c)) return "spec-criteria reference"
+  if (names_letter_rule(c)) return "spec-criteria reference"
   if (tolower(c) ~ VERIFICATION_PROPERTY) return "spec-criteria reference"
   if (c ~ TEST_TYPE) return "test-type reference"
   if (c ~ DOC_REF) return "internal doc/ADR reference"
@@ -228,7 +248,8 @@ function classify(c) {
 
 explain() {
 	log "Comments must not carry what rots or points outside the tree:"
-	log "  - labels: Step 2, Phase 1, AC-7, FR-1, I-1, property P5, D1 to D3, Table 3"
+	log "  - labels: Step 2, Phase 1, AC-7, FR-1, I-1, property P5, D1 to D3, Table 3,"
+	log "    rule LS"
 	log "  - references: docs/architecture, docs/decisions, ADR-3, .specs/, .plans/,"
 	log "    a section sign with a number, #811, AGENTS.md or CLAUDE.md"
 	log "  - decorations: banner lines, em-dashes, unicode arrows (write ->)"

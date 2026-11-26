@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 
 	_ "github.com/sortie-ai/sortie/internal/agent/mock"
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
@@ -329,32 +331,25 @@ func TestGitHubIntegration_FullDispatchCycle(t *testing.T) {
 		}
 		return false
 	}
-	deadline := time.After(60 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			orchCancel()
-			<-done
-			labels := make([]string, len(issue.Labels))
-			for i, l := range issue.Labels {
-				labels[i] = l.Name
-			}
-			t.Fatalf("timed out waiting for issue #%s to swap 'backlog' for 'review'; last labels = %v", issueNumber, labels)
-		default:
-		}
-
+	if err := waittest.UntilWithin(60*time.Second, 2*time.Second, func() error {
 		issue = ghClient.fetchIssue(t, issueNumber)
-		if hasLabel("review") && !hasLabel("backlog") {
-			t.Logf("issue #%s transitioned: state=%q, 'backlog' swapped for 'review'", issueNumber, issue.State)
-			break
+		if !hasLabel("review") || hasLabel("backlog") {
+			return errors.New("'backlog' is not yet swapped for 'review'")
 		}
-		time.Sleep(2 * time.Second)
+		return nil
+	}); err != nil {
+		orchCancel()
+		<-done
+		labels := make([]string, len(issue.Labels))
+		for i, l := range issue.Labels {
+			labels[i] = l.Name
+		}
+		t.Fatalf("timed out waiting for issue #%s to swap 'backlog' for 'review'; last labels = %v", issueNumber, labels)
 	}
+	t.Logf("issue #%s transitioned: state=%q, 'backlog' swapped for 'review'", issueNumber, issue.State)
 
 	orchCancel()
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
+	if _, ok := waittest.ReceiveWithin(done, 15*time.Second); !ok {
 		t.Fatal("orchestrator did not shut down within 15 seconds")
 	}
 

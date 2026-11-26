@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestStartWithOwnedPipes_Success(t *testing.T) {
@@ -23,17 +24,8 @@ func TestStartWithOwnedPipes_Success(t *testing.T) {
 	go func() { b, _ := io.ReadAll(pipes.Stdout); outCh <- b }()
 	go func() { b, _ := io.ReadAll(pipes.Stderr); errCh <- b }()
 
-	var stdout, stderr []byte
-	select {
-	case stdout = <-outCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reading Stdout did not reach EOF within 5s")
-	}
-	select {
-	case stderr = <-errCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reading Stderr did not reach EOF within 5s")
-	}
+	stdout := waittest.Receive(t, outCh, "Stdout read to EOF")
+	stderr := waittest.Receive(t, errCh, "Stderr read to EOF")
 
 	if got := string(stdout); got != "out-line\n" {
 		t.Errorf("Stdout content = %q, want %q", got, "out-line\n")
@@ -93,7 +85,7 @@ func TestStartWithOwnedPipes_ReturnsRecord(t *testing.T) {
 	}
 
 	r := StartReaper(cmd, nil)
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	if got := lookupGroup(cmd); got != nil {
 		t.Errorf("lookupGroup(cmd) after Done = %p, want nil (the reaper unregisters the launch)", got)
@@ -160,20 +152,12 @@ func TestOwnedPipes_CloseIdempotent(t *testing.T) {
 		buf := make([]byte, 1)
 		stderrR.Read(buf) //nolint:errcheck // only used to detect return
 	}()
-	select {
-	case <-readDone:
-		t.Fatal("read on Stderr returned after CloseStdout, want the standard-error end left open")
-	case <-time.After(100 * time.Millisecond):
-	}
+	waittest.Never(t, readDone, 100*time.Millisecond, "a read on Stderr after CloseStdout, want the standard-error end left open")
 
 	if err := pipes.Close(); err != nil {
 		t.Errorf("Close() after CloseStdout = %v, want nil", err)
 	}
-	select {
-	case <-readDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("read on Stderr did not return after Close(), want the standard-error end released")
-	}
+	waittest.Receive(t, readDone, "the read on Stderr after Close()")
 
 	if err := pipes.Close(); err != nil {
 		t.Errorf("Close() second call = %v, want nil (idempotent)", err)
@@ -209,20 +193,12 @@ func TestStartWithOwnedPipes_ParentWriteEndCloseIsLoadBearing(t *testing.T) {
 			stdoutRead.Read(buf) //nolint:errcheck // only used to detect return
 		}()
 
-		select {
-		case <-readDone:
-			t.Fatal("read on Stdout returned before the parent's write end was closed, want it still parked (the negative control failed to reproduce the hang)")
-		case <-time.After(300 * time.Millisecond):
-		}
+		waittest.Never(t, readDone, 300*time.Millisecond, "a read on Stdout before the parent's write end was closed, want it still parked (the negative control failed to reproduce the hang)")
 
 		if err := stdoutWrite.Close(); err != nil {
 			t.Fatalf("stdoutWrite.Close() = %v", err)
 		}
-		select {
-		case <-readDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("read on Stdout did not return after closing the parent's write end")
-		}
+		waittest.Receive(t, readDone, "the read on Stdout after closing the parent's write end")
 	})
 
 	t.Run("with the real StartWithOwnedPipes, the read reaches EOF promptly", func(t *testing.T) {
@@ -243,11 +219,7 @@ func TestStartWithOwnedPipes_ParentWriteEndCloseIsLoadBearing(t *testing.T) {
 			}
 		}()
 
-		select {
-		case <-readDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("read on Stdout did not reach EOF within 2s of an exited child, want the parent write-end close to release it")
-		}
+		waittest.Receive(t, readDone, "Stdout EOF after an exited child, want the parent write-end close to release it")
 
 		if err := cmd.Wait(); err != nil {
 			t.Errorf("cmd.Wait() = %v, want nil", err)
@@ -301,9 +273,7 @@ func TestOwnedPipes_DeferredCloseAfterStderrBoundIsLoadBearing(t *testing.T) {
 		stderrWrite.Close() //nolint:errcheck // best-effort
 
 		collector := NewStderrCollector(stderrRead, nil)
-		if !collector.WaitDone(2 * time.Second) {
-			t.Fatal("WaitDone() = false, want the drain to finish once the write end is closed")
-		}
+		waittest.Receive(t, collector.Done(), "the drain finishing once the write end is closed")
 		if err := pipes.closeStderr(); err != nil {
 			t.Errorf("closeStderr() after the drain = %v, want nil", err)
 		}

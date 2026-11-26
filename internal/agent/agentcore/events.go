@@ -27,53 +27,59 @@ func EmitSessionStarted(emit func(domain.AgentEvent), agentPID string, sessionID
 // API response wait time in milliseconds for this turn; use 0 when
 // unavailable. usage is the session's run-cumulative token usage snapshot;
 // the zero value means the caller reports no usage for this event.
-func EmitTurnCompleted(emit func(domain.AgentEvent), message string, apiDurationMS int64, usage domain.TokenUsage) {
+// byModel is usage's per-model split, or nil.
+func EmitTurnCompleted(emit func(domain.AgentEvent), message string, apiDurationMS int64, usage domain.TokenUsage, byModel map[string]domain.TokenUsage) {
 	emit(domain.AgentEvent{
 		Type:          domain.EventTurnCompleted,
 		Timestamp:     time.Now().UTC(),
 		Message:       message,
 		APIDurationMS: apiDurationMS,
 		Usage:         usage,
+		UsageByModel:  byModel,
 	})
 }
 
 // EmitTurnFailed emits an EventTurnFailed event. message describes the
 // failure. apiDurationMS is attached to the event; use 0 when unavailable.
 // usage is the session's run-cumulative token usage snapshot; the zero
-// value means the caller reports no usage for this event.
-func EmitTurnFailed(emit func(domain.AgentEvent), message string, apiDurationMS int64, usage domain.TokenUsage) {
+// value means the caller reports no usage for this event. byModel is
+// usage's per-model split, or nil.
+func EmitTurnFailed(emit func(domain.AgentEvent), message string, apiDurationMS int64, usage domain.TokenUsage, byModel map[string]domain.TokenUsage) {
 	emit(domain.AgentEvent{
 		Type:          domain.EventTurnFailed,
 		Timestamp:     time.Now().UTC(),
 		Message:       message,
 		APIDurationMS: apiDurationMS,
 		Usage:         usage,
+		UsageByModel:  byModel,
 	})
 }
 
 // EmitTurnCancelled emits an EventTurnCancelled event with the given
 // human-readable message. usage is the session's run-cumulative token
 // usage snapshot; the zero value means the caller reports no usage for
-// this event.
-func EmitTurnCancelled(emit func(domain.AgentEvent), message string, usage domain.TokenUsage) {
+// this event. byModel is usage's per-model split, or nil.
+func EmitTurnCancelled(emit func(domain.AgentEvent), message string, usage domain.TokenUsage, byModel map[string]domain.TokenUsage) {
 	emit(domain.AgentEvent{
-		Type:      domain.EventTurnCancelled,
-		Timestamp: time.Now().UTC(),
-		Message:   message,
-		Usage:     usage,
+		Type:         domain.EventTurnCancelled,
+		Timestamp:    time.Now().UTC(),
+		Message:      message,
+		Usage:        usage,
+		UsageByModel: byModel,
 	})
 }
 
 // EmitTurnInputRequired emits an EventTurnInputRequired event with the
 // given human-readable message. usage is the session's run-cumulative
 // token usage snapshot; the zero value means the caller reports no usage
-// for this event.
-func EmitTurnInputRequired(emit func(domain.AgentEvent), message string, usage domain.TokenUsage) {
+// for this event. byModel is usage's per-model split, or nil.
+func EmitTurnInputRequired(emit func(domain.AgentEvent), message string, usage domain.TokenUsage, byModel map[string]domain.TokenUsage) {
 	emit(domain.AgentEvent{
-		Type:      domain.EventTurnInputRequired,
-		Timestamp: time.Now().UTC(),
-		Message:   message,
-		Usage:     usage,
+		Type:         domain.EventTurnInputRequired,
+		Timestamp:    time.Now().UTC(),
+		Message:      message,
+		Usage:        usage,
+		UsageByModel: byModel,
 	})
 }
 
@@ -96,5 +102,15 @@ func EmitNotification(emit func(domain.AgentEvent), message string) {
 		Type:      domain.EventNotification,
 		Timestamp: time.Now().UTC(),
 		Message:   message,
+	})
+}
+
+// EmitUsageWindows emits an EventNotification event with an empty message
+// that carries the given usage windows, observed at the given instant.
+func EmitUsageWindows(emit func(domain.AgentEvent), at time.Time, windows []domain.UsageWindow) {
+	emit(domain.AgentEvent{
+		Type:         domain.EventNotification,
+		Timestamp:    at,
+		UsageWindows: windows,
 	})
 }

@@ -137,6 +137,10 @@ type NotificationEnvelope struct {
 	// Identifier is the human-readable issue key.
 	Identifier string
 
+	// DisplayID is the qualified display form of Identifier; empty when
+	// Identifier is display-ready.
+	DisplayID string
+
 	// DispatchID fences session identity to a single worker attempt.
 	DispatchID string
 
@@ -159,8 +163,9 @@ type NotificationEnvelope struct {
 	Stage StageTransition
 }
 
-// NotificationMessage carries the content of a notification: agent-supplied
-// for [EventAgentMessage], built by the orchestrator for every other event.
+// NotificationMessage carries the content of a notification: the agent's
+// title and body for [EventAgentMessage], the event's typed facts for every
+// other event.
 // Severity is constrained to info, warning, or critical, and Category to
 // decision_needed, progress, blocked, completed, or other. The
 // constraints are documented here but enforced by the producing tool,
@@ -169,10 +174,12 @@ type NotificationMessage struct {
 	// Severity is one of info, warning, or critical.
 	Severity string
 
-	// Title is a non-empty short summary.
+	// Title is the agent-supplied short summary of agent.message. It is
+	// empty on every other event.
 	Title string
 
-	// Body is the non-empty notification detail.
+	// Body is the agent-supplied detail of agent.message. It is empty on
+	// every other event.
 	Body string
 
 	// Category is optional and, when set, is one of decision_needed,
@@ -180,7 +187,11 @@ type NotificationMessage struct {
 	Category string
 
 	// AgentText is agent-authored text carried by an orchestrator event.
-	// Every destination renders it apart from Body; it is empty on
-	// agent.message.
+	// The renderer places it after the body, and the webhook payload
+	// carries it under its own key; it is empty on agent.message.
 	AgentText string
+
+	// Facts is the content of an orchestrator event. It is nil on
+	// agent.message.
+	Facts MessageFacts
 }

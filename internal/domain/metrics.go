@@ -27,13 +27,15 @@ type Metrics interface {
 	SetActiveSessionsElapsed(seconds float64)
 
 	// AddTokens increments the cumulative token counter by count.
-	// tokenType is "input", "output", "cache_read", or "cache_write"
-	// (sortie_tokens_total{type} counter).
-	AddTokens(tokenType string, count int64)
+	// tokenType is "input", "output", "cache_read", or "cache_write";
+	// model names the run's model, and an empty model reports as
+	// "<none>" (sortie_tokens_total{type,model} counter).
+	AddTokens(tokenType string, model string, count int64)
 
-	// AddAgentRuntime increments the cumulative agent runtime counter
-	// (sortie_agent_runtime_seconds_total counter).
-	AddAgentRuntime(seconds float64)
+	// AddAgentRuntime increments the cumulative agent runtime counter.
+	// model names the run's model, and an empty model reports as
+	// "<none>" (sortie_agent_runtime_seconds_total{model} counter).
+	AddAgentRuntime(model string, seconds float64)
 
 	// IncDispatches increments the dispatch attempt counter.
 	// outcome is "success" or "error"
@@ -41,13 +43,14 @@ type Metrics interface {
 	IncDispatches(outcome string)
 
 	// IncWorkerExits increments the worker exit counter.
-	// exitType is "normal", "error", "cancelled", or "soft_stop"
-	// (sortie_worker_exits_total{exit_type} counter).
-	IncWorkerExits(exitType string)
+	// exitType is "normal", "error", "cancelled", or "soft_stop";
+	// model names the run's model, and an empty model reports as
+	// "<none>" (sortie_worker_exits_total{exit_type,model} counter).
+	IncWorkerExits(exitType string, model string)
 
 	// IncRetries increments the retry scheduling counter.
-	// trigger is "error", "continuation", "timer", "stall", or
-	// "ci_fix" (sortie_retries_total{trigger} counter).
+	// trigger is "error", "usage_limit", "continuation", "timer",
+	// "stall", or "ci_fix" (sortie_retries_total{trigger} counter).
 	IncRetries(trigger string)
 
 	// IncReconciliationActions increments the reconciliation outcome
@@ -187,32 +190,43 @@ type Metrics interface {
 
 	// IncCandidateHolds increments the counter of candidates the
 	// dispatch loop held. reason is "blocked_by",
-	// "blockers_unresolved", "blockers_not_read", or
-	// "blockers_incomplete"
+	// "blockers_unresolved", "blockers_not_read",
+	// "blockers_incomplete", "daily_spend_ceiling",
+	// "weekly_spend_ceiling", or "monthly_spend_ceiling"
 	// (sortie_candidate_holds_total{reason} counter).
 	IncCandidateHolds(reason string)
 
 	// IncBudgetExhaustions increments the counter of issues that entered
 	// the per-issue budget exhausted set. reason is one of the
-	// dispatch-gate reason values, and the vocabulary may gain a third
-	// value later. Called once per entry from whichever lane discovered
+	// dispatch-gate reason values: "session_budget", "token_budget", or
+	// "money_budget". Called once per entry from whichever lane discovered
 	// it (sortie_budget_exhaustions_total{reason} counter).
 	IncBudgetExhaustions(reason string)
 
 	// IncRunsStoppedByBudget increments the counter of runs the
 	// orchestrator stopped in flight because a budget ceiling was
-	// reached. reason is "token_budget"
+	// reached. reason is "token_budget" or "money_budget"
 	// (sortie_runs_stopped_by_budget_total{reason} counter).
 	IncRunsStoppedByBudget(reason string)
 
 	// SetBudgetExhaustedIssues records how many issues are currently
 	// held out of dispatch under the given reason, one of the
-	// dispatch-gate reason values whose vocabulary may gain a third
-	// value later. Called for every known reason value on every
+	// dispatch-gate reason values listed on [Metrics.IncBudgetExhaustions].
+	// Called for every known reason value on every
 	// recompute, so a reason that no longer holds any issue reports
 	// zero rather than keeping its last value
 	// (sortie_budget_exhausted_issues{reason} gauge).
 	SetBudgetExhaustedIssues(reason string, count int)
+
+	// PrepareModel exports a zero-valued series under model for every
+	// type of sortie_tokens_total, every exit_type of
+	// sortie_worker_exits_total, and sortie_agent_runtime_seconds_total,
+	// so rate() and increase() count the first sample recorded under
+	// model once a scrape has read the zero. A model prepared in the
+	// same call path as its first sample gives no scrape that chance. A
+	// series that already exists keeps its value, and an empty model
+	// prepares "<none>".
+	PrepareModel(model string)
 }
 
 // NoopMetrics is a [Metrics] implementation where every method is a no-op.
@@ -227,10 +241,10 @@ func (*NoopMetrics) SetRunningSessions(int)                                {}
 func (*NoopMetrics) SetRetryingSessions(int)                               {}
 func (*NoopMetrics) SetAvailableSlots(int)                                 {}
 func (*NoopMetrics) SetActiveSessionsElapsed(float64)                      {}
-func (*NoopMetrics) AddTokens(string, int64)                               {}
-func (*NoopMetrics) AddAgentRuntime(float64)                               {}
+func (*NoopMetrics) AddTokens(string, string, int64)                       {}
+func (*NoopMetrics) AddAgentRuntime(string, float64)                       {}
 func (*NoopMetrics) IncDispatches(string)                                  {}
-func (*NoopMetrics) IncWorkerExits(string)                                 {}
+func (*NoopMetrics) IncWorkerExits(string, string)                         {}
 func (*NoopMetrics) IncRetries(string)                                     {}
 func (*NoopMetrics) IncReconciliationActions(string)                       {}
 func (*NoopMetrics) IncPollCycles(string)                                  {}
@@ -261,6 +275,7 @@ func (*NoopMetrics) IncCandidateHolds(string)                              {}
 func (*NoopMetrics) IncBudgetExhaustions(string)                           {}
 func (*NoopMetrics) IncRunsStoppedByBudget(string)                         {}
 func (*NoopMetrics) SetBudgetExhaustedIssues(string, int)                  {}
+func (*NoopMetrics) PrepareModel(string)                                   {}
 
 // MetricsSetter is implemented by adapters that accept a [Metrics]
 // recorder for self-instrumentation.

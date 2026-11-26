@@ -221,7 +221,7 @@ func TestIntegration_GetReviewDecision(t *testing.T) {
 		want domain.ReviewDecision
 	}{
 		{"forge_approved", forgeIID, domain.ReviewDecisionApproved},
-		{"draft_review_required", draftIID, domain.ReviewDecisionReviewRequired},
+		{"draft_review_requested", draftIID, domain.ReviewDecisionReviewRequested},
 		{"conflict_not_required", conflictIID, domain.ReviewDecisionNotRequired},
 	}
 	for _, tt := range tests {

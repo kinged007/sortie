@@ -4,6 +4,7 @@
 package typeutil
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -94,6 +95,23 @@ func StringField(config map[string]any, key string) (string, *TypeFault) {
 	s, ok := v.(string)
 	if !ok {
 		return "", &TypeFault{Key: key, Want: "string", Got: DescribeYAMLType(v)}
+	}
+	return s, nil
+}
+
+// RequiredString returns the trimmed string value for key in config.
+//
+// It returns the [StringField] fault unchanged for a value of the wrong
+// type, and the error "<key> is required" for an absent key, a nil value,
+// or a value that is blank after trimming.
+func RequiredString(config map[string]any, key string) (string, error) {
+	s, fault := StringField(config, key)
+	if fault != nil {
+		return "", fault
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("%s is required", key)
 	}
 	return s, nil
 }

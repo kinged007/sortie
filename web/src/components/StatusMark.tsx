@@ -29,10 +29,15 @@ const STATUS: Record<Mark, StatusEntry> = {
   running: { Glyph: LoaderCircleIcon, word: "Running", tone: "neutral" },
   current: { Glyph: CircleDotIcon, word: "Current", tone: "neutral" },
   waiting: { Glyph: ClockIcon, word: "Waiting", tone: "neutral" },
+  approval: { Glyph: ClockIcon, word: "Waiting on approval", tone: "neutral" },
   retry: { Glyph: RotateCwIcon, word: "Retry scheduled", tone: "neutral" },
   held: { Glyph: CirclePauseIcon, word: "Held, acknowledged", tone: "neutral" },
   needs: { Glyph: CircleAlertFilledIcon, word: "Needs attention", tone: "attention" },
-  stopped: { Glyph: CirclePauseIcon, word: "Stopped for a person or budget", tone: "attention" },
+  stopped: {
+    Glyph: CirclePauseIcon,
+    word: "Stopped",
+    tone: "attention",
+  },
   handed: { Glyph: ArrowRightIcon, word: "Handed off", tone: "neutral" },
   succeeded: { Glyph: CheckIcon, word: "Succeeded", tone: "success" },
   failed: { Glyph: XIcon, word: "Failed", tone: "error" },
@@ -56,12 +61,10 @@ const LABEL_TONE: Record<Tone, string> = {
   error: "text-error",
 };
 
-/** Returns the word a status mark stands for. */
 export function markWord(mark: Mark): string {
   return STATUS[mark].word;
 }
 
-/** Props of {@link StatusMark}. */
 export interface StatusMarkProps {
   mark: Mark;
   /** Visible text beside the glyph; without it the mark names itself to screen readers and a tooltip. */
@@ -71,7 +74,6 @@ export interface StatusMarkProps {
   className?: string;
 }
 
-/** Draws the glyph of a status, with a visible label or a screen-reader word. The running glyph turns unless the reader prefers reduced motion. */
 export function StatusMark({ mark, label, title, className }: StatusMarkProps) {
   const { Glyph, word, tone } = STATUS[mark];
   const isSpinning = mark === "running";

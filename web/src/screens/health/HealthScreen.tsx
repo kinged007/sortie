@@ -49,7 +49,6 @@ interface CheckRowProps {
   check: HealthCheckResponse;
   /** The line once the check has run; the check's error, when it has one, follows it. */
   line: ReactNode;
-  /** The line before the check's first run. */
   unrunLine?: ReactNode;
 }
 
@@ -58,7 +57,7 @@ function CheckRow({ name, check, line, unrunLine = "Not run yet." }: CheckRowPro
   const hasError = hasRun && check.error !== undefined && check.error !== "";
   return (
     <li className="grid grid-cols-[var(--size-icon)_minmax(0,1fr)] items-baseline gap-x-md gap-y-xxs border-t border-line py-sm text-body-md first:border-t-0 sm:grid-cols-[var(--size-icon)_168px_minmax(0,1fr)]">
-      <StatusMark mark={markOf(check)} className="self-start pt-[3px]" />
+      <StatusMark mark={markOf(check)} className="self-start pt-0.75" />
       <span className="font-medium text-ink">{name}</span>
       <div className="col-start-2 flex min-w-0 flex-col gap-xs text-ink-body sm:col-start-3">
         <span>{hasRun ? line : unrunLine}</span>
@@ -142,7 +141,7 @@ function Checks({ health }: ChecksProps) {
 }
 
 function stampOrDash(at: string | null, format: (at: string) => string): string {
-  return at === null ? "—" : format(at);
+  return at === null ? "–" : format(at);
 }
 
 function nextPollText(nextPollAt: string | null, generatedAt: string): string {
@@ -194,7 +193,6 @@ function ProcessPanel({ state, health }: AsideProps) {
   );
 }
 
-/** Renders Health: one row per check of Sortie itself, then the poll loop and the process beside them. */
 export function HealthScreen(): ReactNode {
   const { data } = useStateQuery();
   if (data === undefined) {

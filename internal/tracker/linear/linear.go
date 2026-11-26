@@ -475,6 +475,55 @@ func (a *LinearAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []st
 	return states, err
 }
 
+// FetchIssueStatesAndLabelsByIDs returns the current state and every label for
+// each requested UUID, keyed by id. It returns an empty map with no API call
+// when issueIDs is empty. Issues absent from the response are omitted. Labels
+// beyond the first page cost further requests; a label page reported without
+// an end cursor fails the call with [domain.ErrTrackerMissingCursor].
+func (a *LinearAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	if len(issueIDs) == 0 {
+		return map[string]domain.IssueStateAndLabels{}, nil
+	}
+
+	reads := map[string]domain.IssueStateAndLabels{}
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		for start := 0; start < len(issueIDs); start += stateBatchChunkSize {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			end := min(start+stateBatchChunkSize, len(issueIDs))
+			chunk := issueIDs[start:end]
+
+			nodes, fetchErr := a.fetchStateAndLabelBatch(ctx, map[string]any{
+				"ids":   chunk,
+				"first": len(chunk),
+			})
+			if fetchErr != nil {
+				return fetchErr
+			}
+			for i := range nodes {
+				if labelErr := a.completeLabels(ctx, &nodes[i]); labelErr != nil {
+					return labelErr
+				}
+				labels := make([]string, 0, len(nodes[i].Labels.Nodes))
+				for _, label := range nodes[i].Labels.Nodes {
+					labels = append(labels, label.Name)
+				}
+				reads[nodes[i].ID] = domain.IssueStateAndLabels{
+					State:  nodes[i].State.Name,
+					Labels: issuekit.NormalizeLabels(labels),
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return reads, nil
+}
+
 // FetchIssueStatesByIdentifiers returns the current state for each requested
 // human identifier, keyed by identifier. It returns an empty map with no API
 // call when identifiers is empty. Each identifier is split into its team key
@@ -526,6 +575,25 @@ func (a *LinearAdapter) fetchStateBatch(ctx context.Context, query string, varia
 	recordRateLimit(headers, a.log)
 
 	var resp graphQLResponse[stateBatchData]
+	if err := unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	if classified := classifyGraphQLErrors(resp.Errors); classified != nil {
+		return nil, classified
+	}
+	return resp.Data.Issues.Nodes, nil
+}
+
+// fetchStateAndLabelBatch runs a single state-and-label batch query and returns
+// its nodes with only the first page of labels.
+func (a *LinearAdapter) fetchStateAndLabelBatch(ctx context.Context, variables map[string]any) ([]linearIssue, error) {
+	body, headers, err := a.client.Execute(ctx, queryIssueStatesAndLabelsByIDs, variables)
+	if err != nil {
+		return nil, err
+	}
+	recordRateLimit(headers, a.log)
+
+	var resp graphQLResponse[issuesData]
 	if err := unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
@@ -632,14 +700,6 @@ func (a *LinearAdapter) TransitionIssue(ctx context.Context, issueID, targetStat
 func (a *LinearAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(ctx, issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *LinearAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

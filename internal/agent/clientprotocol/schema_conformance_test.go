@@ -17,6 +17,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // This file validates the generated wire types, the messages the
@@ -28,7 +29,7 @@ import (
 
 // schemaAssetsDir is the directory holding the pinned schema artifact
 // and its provenance file, relative to this package's own directory.
-const schemaAssetsDir = "testdata/schema-v1.25.0"
+const schemaAssetsDir = "testdata/schema-v1.28.0"
 
 // assertProvenance asserts that every asset line PROVENANCE.txt records
 // (the form "<path> <byte-count> sha256:<hex>") matches the file it
@@ -927,16 +928,12 @@ func TestSchemaConformance(t *testing.T) {
 		respondLine(t, inPw, initID, initializeResponse{ProtocolVersion: protocolVersion(pinnedProtocolVersion)})
 		<-initDone
 
-		parsed, agentErr := parseMCPServers("", false)
-		if agentErr != nil {
-			t.Fatalf("parseMCPServers: %v", agentErr)
-		}
-		servers, _ := parsed.wireServers(false)
+		servers := []mcpServer{}
 
 		newSessDone := make(chan struct{})
 		go func() {
 			defer close(newSessDone)
-			_, _ = doNewSession(context.Background(), state, t.TempDir(), servers)
+			_, _, _ = doNewSession(context.Background(), state, t.TempDir(), servers)
 		}()
 		newSessRaw, newSessID := nextRequestLine(t, out, methodSessionNew)
 		respondLine(t, inPw, newSessID, newSessionResponse{SessionID: sessionId("sess-conformance")})
@@ -956,7 +953,7 @@ func TestSchemaConformance(t *testing.T) {
 		assertRawID(t, cancelledPermissionRaw, `"cancelled"`)
 
 		respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-		awaitOutcome(t, outcomeCh)
+		waittest.Receive(t, outcomeCh, "turn outcome")
 
 		loadState, loadOutPr, loadInPw := newTestSession(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes)
 		loadOut := newOutboundReader(loadOutPr)
@@ -964,7 +961,7 @@ func TestSchemaConformance(t *testing.T) {
 		t.Cleanup(cancelLoad)
 		loadOutcomeCh := make(chan resolveSessionOutcome, 1)
 		go func() {
-			sessionID, err := resolveSession(loadCtx, loadState, "prior-session", capsAdvertisingLoad(), "", servers)
+			sessionID, _, _, err := resolveSession(loadCtx, loadState, "prior-session", capsAdvertisingLoad(), "", servers)
 			loadOutcomeCh <- resolveSessionOutcome{sessionID: sessionID, err: err}
 		}()
 		loadProbeID := loadOut.awaitMethod(t, negativeControlMethod)
@@ -972,7 +969,7 @@ func TestSchemaConformance(t *testing.T) {
 		loadRaw, loadReqID := nextRequestLine(t, loadOut, methodSessionLoad)
 		sendLine(t, loadInPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prior-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}}`)
 		respondLine(t, loadInPw, loadReqID, loadSessionResponse{})
-		awaitResolveSessionOutcome(t, loadOutcomeCh)
+		waittest.Receive(t, loadOutcomeCh, "resolveSession() outcome")
 
 		resumeState, resumeOutPr, resumeInPw := newTestSession(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes)
 		resumeOut := newOutboundReader(resumeOutPr)
@@ -980,14 +977,14 @@ func TestSchemaConformance(t *testing.T) {
 		t.Cleanup(cancelResume)
 		resumeOutcomeCh := make(chan resolveSessionOutcome, 1)
 		go func() {
-			sessionID, err := resolveSession(resumeCtx, resumeState, "prior-session", capsAdvertisingResume(), "", servers)
+			sessionID, _, _, err := resolveSession(resumeCtx, resumeState, "prior-session", capsAdvertisingResume(), "", servers)
 			resumeOutcomeCh <- resolveSessionOutcome{sessionID: sessionID, err: err}
 		}()
 		resumeProbeID := resumeOut.awaitMethod(t, negativeControlMethod)
 		respondErrorLine(t, resumeInPw, resumeProbeID, jsonrpc.MethodNotFoundCode, "method not found")
 		resumeRaw, resumeReqID := nextRequestLine(t, resumeOut, methodSessionResume)
 		respondLine(t, resumeInPw, resumeReqID, resumeSessionResponse{})
-		awaitResolveSessionOutcome(t, resumeOutcomeCh)
+		waittest.Receive(t, resumeOutcomeCh, "resolveSession() outcome")
 
 		closeState, closeOutPr, closeInPw := newTestSession(t, domain.AgentConfig{ReadTimeoutMS: 2000}, clientProtocolMaxLineBytes)
 		closeOut := newOutboundReader(closeOutPr)

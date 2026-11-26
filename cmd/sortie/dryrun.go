@@ -42,6 +42,7 @@ func runDryRun(ctx context.Context, cfg config.ServiceConfig, logger *slog.Logge
 		cfg.Agent.MaxConcurrentByState,
 		orchestrator.AgentTotals{},
 	)
+	state.MaxCostUSD = cfg.Agent.MaxCostUSD
 
 	activeSet := dryRunStateSet(cfg.Tracker.ActiveStates)
 	terminalSet := dryRunStateSet(cfg.Tracker.TerminalStates)

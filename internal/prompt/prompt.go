@@ -57,6 +57,35 @@ func stageContextToMap(sc StageContext) map[string]any {
 	}
 }
 
+// ParkContext carries the hand-over of a released park, passed to the
+// prompt template as the "park" variable. Comments holds the template form
+// of the comments in the window; nil renders as an empty list.
+type ParkContext struct {
+	Reason     string
+	Statement  string
+	ParkedAt   string
+	ReleasedAt string
+	Gesture    string
+	Comments   []map[string]any
+}
+
+// parkContextToMap converts a [ParkContext] to the map representation used
+// as the "park" template variable, with snake_case keys.
+func parkContextToMap(pc ParkContext) map[string]any {
+	comments := pc.Comments
+	if comments == nil {
+		comments = []map[string]any{}
+	}
+	return map[string]any{
+		"reason":      pc.Reason,
+		"statement":   pc.Statement,
+		"parked_at":   pc.ParkedAt,
+		"released_at": pc.ReleasedAt,
+		"gesture":     pc.Gesture,
+		"comments":    comments,
+	}
+}
+
 // promptFuncMap is the minimal, prompt-essential FuncMap shipped with
 // every template. Each entry is permanent API surface.
 var promptFuncMap = template.FuncMap{
@@ -95,7 +124,6 @@ type Template struct {
 	tmpl             *template.Template
 	frontMatterLines int
 	source           string
-	body             string
 	partials         *Partials
 	reached          map[string]struct{}
 }
@@ -108,24 +136,6 @@ func (t *Template) Tree() *parse.Tree {
 		return nil
 	}
 	return t.tmpl.Tree
-}
-
-// Mentions reports whether s occurs in the body text the template was
-// parsed from, or in the Body of a partial that defines a block the
-// template reaches. A nil receiver mentions nothing.
-func (t *Template) Mentions(s string) bool {
-	if t == nil {
-		return false
-	}
-	if strings.Contains(t.body, s) {
-		return true
-	}
-	for name := range t.reached {
-		if owner, ok := t.partials.owner(name); ok && strings.Contains(owner.body, s) {
-			return true
-		}
-	}
-	return false
 }
 
 // Parse compiles a prompt template body with strict mode
@@ -173,7 +183,6 @@ func ParseWithPartials(body, source string, frontMatterLines int, partials *Part
 		tmpl:             set,
 		frontMatterLines: frontMatterLines,
 		source:           source,
-		body:             body,
 		partials:         partials,
 	}
 	if err := t.checkCalls(); err != nil {
@@ -190,19 +199,14 @@ func newSet(name string) *template.Template {
 
 // RenderOption applies optional overrides to the template data map
 // before execution. Use [WithContinuationContext] to inject reaction
-// continuation data and [WithStage] to supply the stage chain position.
+// continuation data, [WithStage] to supply the stage chain position, and
+// [WithPark] to supply the hand-over of a released park.
 type RenderOption func(m map[string]any)
-
-// continuationKeys lists all template variable names reserved for
-// reaction continuation context. Each key receives a nil default in
-// [Template.Render] so templates using missingkey=error do not reject
-// references to absent reaction types.
-var continuationKeys = []string{"ci_failure", "review_comments", "bot_review_comments", "merge_conflict", "label_review", "label_fix"}
 
 // isContinuationKey reports whether key is a registered continuation
 // template variable name.
 func isContinuationKey(key string) bool {
-	return slices.Contains(continuationKeys, key)
+	return slices.ContainsFunc(continuationKeys, func(k continuationKey) bool { return k.name == key })
 }
 
 // WithContinuationContext returns a [RenderOption] that merges each
@@ -229,14 +233,22 @@ func WithStage(sc StageContext) RenderOption {
 	}
 }
 
+// WithPark returns a [RenderOption] that sets the "park" template variable
+// from pc.
+func WithPark(pc ParkContext) RenderOption {
+	return func(m map[string]any) {
+		m["park"] = parkContextToMap(pc)
+	}
+}
+
 // Render executes the template with the given inputs and returns the
 // rendered prompt string. The data map contains the top-level keys
-// "issue", "attempt", "run", and "stage", plus every key in [continuationKeys]
+// "issue", "attempt", "run", "stage", and "park", plus every key in [continuationKeys]
 // (currently "ci_failure", "review_comments", "bot_review_comments",
 // "merge_conflict", "label_review", "label_fix").
-// Continuation keys default to nil when no [RenderOption] overrides them,
-// ensuring missingkey=error does not reject templates that reference these
-// fields.
+// Continuation keys and "park" default to nil when no [RenderOption]
+// overrides them ([WithPark] sets "park"), ensuring missingkey=error does
+// not reject templates that reference these fields.
 // Returns a [*TemplateError] with Kind [ErrTemplateRender] on failure,
 // located in the file that holds the fault: a partial's path with its own
 // line numbers, or the prompt template's source with line numbers adjusted
@@ -247,9 +259,10 @@ func (t *Template) Render(issue map[string]any, attempt any, run RunContext, opt
 		"attempt": attempt,
 		"run":     runContextToMap(run),
 		"stage":   stageContextToMap(StageContext{}),
+		"park":    nil,
 	}
 	for _, k := range continuationKeys {
-		templateVars[k] = nil
+		templateVars[k.name] = nil
 	}
 
 	for _, opt := range opts {

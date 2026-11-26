@@ -510,6 +510,40 @@ func TestApplyEnvOverrides(t *testing.T) {
 		assertEnvOverrideError(t, err, "agent.max_turns", wantMsg)
 	})
 
+	t.Run("SORTIE_AGENT_MAX_COST_USD", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			env     string
+			want    float64
+			wantMsg string
+		}{
+			{name: "override beats front matter", env: " 2.5 ", want: 2.5},
+			{name: "NaN", env: "NaN", wantMsg: "must be a finite number"},
+			{name: "negative", env: "-0.5", wantMsg: "must be non-negative"},
+			{name: "non-numeric", env: "x", wantMsg: "invalid number value: x"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Setenv("SORTIE_AGENT_MAX_COST_USD", tt.env)
+
+				cfg, err := NewServiceConfig(map[string]any{
+					"agent": map[string]any{"max_cost_usd": 9},
+				})
+
+				if tt.wantMsg != "" {
+					assertEnvOverrideError(t, err, "agent.max_cost_usd", tt.wantMsg)
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewServiceConfig with SORTIE_AGENT_MAX_COST_USD=%q unexpected error: %v", tt.env, err)
+				}
+				if cfg.Agent.MaxCostUSD != tt.want {
+					t.Errorf("NewServiceConfig with SORTIE_AGENT_MAX_COST_USD=%q Agent.MaxCostUSD = %v, want %v", tt.env, cfg.Agent.MaxCostUSD, tt.want)
+				}
+			})
+		}
+	})
+
 	t.Run("workspace retention days override reaches RetentionDays with no YAML key", func(t *testing.T) {
 		t.Setenv("SORTIE_WORKSPACE_RETENTION_DAYS", "45")
 

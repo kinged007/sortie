@@ -114,13 +114,13 @@ func (a *alwaysSucceedsAdapter) RunTurn(context.Context, domain.Session, domain.
 func (a *alwaysSucceedsAdapter) StopSession(context.Context, domain.Session) error { return nil }
 
 type forkPerTurnFixtureAdapter struct {
-	parseLine func([]byte, func(domain.AgentEvent), string) (any, error)
+	parseLine func([]byte, func(domain.AgentEvent), string, *agentcore.TurnSpend) (any, error)
 	session   *agentcore.ForkPerTurnSession
 }
 
 var _ domain.AgentAdapter = (*forkPerTurnFixtureAdapter)(nil)
 
-func jsonDecodingParseLine(line []byte, _ func(domain.AgentEvent), _ string) (any, error) {
+func jsonDecodingParseLine(line []byte, _ func(domain.AgentEvent), _ string, _ *agentcore.TurnSpend) (any, error) {
 	var v any
 	if err := json.Unmarshal(line, &v); err != nil {
 		return nil, err
@@ -135,19 +135,19 @@ func (a *forkPerTurnFixtureAdapter) StartSession(_ context.Context, params domai
 	}
 	parseLine := a.parseLine
 	if parseLine == nil {
-		parseLine = func([]byte, func(domain.AgentEvent), string) (any, error) { return nil, nil }
+		parseLine = func([]byte, func(domain.AgentEvent), string, *agentcore.TurnSpend) (any, error) { return nil, nil }
 	}
 	a.session = agentcore.NewForkPerTurnSession(&target, agentcore.ForkPerTurnHooks{
 		BuildArgs:    func(int, string) []string { return nil },
 		ParseLine:    parseLine,
-		GetUsage:     func() (domain.TokenUsage, bool) { return domain.TokenUsage{}, false },
+		GetUsage:     func() (domain.TokenUsage, map[string]domain.TokenUsage, bool) { return domain.TokenUsage{}, nil, false },
 		GetSessionID: func() string { return "" },
-		OnFinalize: func(emit func(domain.AgentEvent), _ any, exitCode int, _ error, _ []string, earlyExit *domain.AgentError) (domain.TurnResult, *domain.AgentError) {
+		OnFinalize: func(emit func(domain.AgentEvent), _ any, exitCode int, _ error, _ []string, earlyExit *domain.AgentError, _ *agentcore.TurnSpend) (domain.TurnResult, *domain.AgentError) {
 			return agentcore.FinalizeTurn(emit, slog.Default(), agentcore.TurnEvidence{
 				ExitObserved: true,
 				ExitCode:     exitCode,
 				EarlyExit:    earlyExit,
-			}, agentcore.TurnMeta{})
+			}, agentcore.TurnMeta{}, agentcore.TurnSpend{})
 		},
 	}, slog.Default(), 0)
 	return domain.Session{}, nil

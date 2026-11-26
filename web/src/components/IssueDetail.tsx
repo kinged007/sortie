@@ -8,18 +8,27 @@ import { ExternalLinkIcon } from "@/components/icons";
 import { IssueMargin, NextOutcomes } from "@/components/IssueMargin";
 import { IssueStory, storyRunsOf } from "@/components/IssueStory";
 import { Lane } from "@/components/Lane";
+import { NotedFigure } from "@/components/NotedFigure";
+import { Parts } from "@/components/Parts";
 import { ServedText } from "@/components/ServedText";
 import { StallNotice } from "@/components/StallNotice";
 import { StateBadge } from "@/components/StateBadge";
 import { Button, buttonStyles } from "@/components/ui/button";
 import { DrawerClose, DrawerTitle } from "@/components/ui/drawer";
 import { useAttentionActions } from "@/components/use-attention-actions";
-import { budgetOf } from "@/lib/budget";
+import { budgetOf, moneyBudgetFigure } from "@/lib/budget";
 import { cn } from "@/lib/cn";
-import { costText, NOT_MEASURED, runningTokensText } from "@/lib/figures";
-import { fmtClock, fmtTokens, plural } from "@/lib/format";
+import {
+  NOT_MEASURED,
+  issueCostFigure,
+  liveCostFigure,
+  liveTokensFigure,
+  runningTokensText,
+} from "@/lib/figures";
+import { closingClock } from "@/lib/ended";
+import { fmtClock, fmtMoney, lowerFirst, plural, upperFirst } from "@/lib/format";
 import { issueLinkOf, latestSessionOf, sessionLinkOf } from "@/lib/issue-link";
-import { agentLabel, modelLabel, ruleLabel } from "@/lib/labels";
+import { agentLabel, hopLabel, modelLabel, ruleLabel } from "@/lib/labels";
 import {
   decidingOf,
   laneOf,
@@ -31,7 +40,7 @@ import {
 } from "@/lib/lane";
 import { safeHttpUrl } from "@/lib/links";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 
 import type { ReactNode } from "react";
 
@@ -44,7 +53,6 @@ import type {
 } from "@/api/types.gen";
 import type { LaneStation, StagePosition, StageProgress } from "@/lib/lane";
 
-const SEP = " · ";
 const PEEK_RUNS = 4;
 
 /** What a list already knows of an issue; shown until the issue's own response arrives. */
@@ -54,9 +62,7 @@ export interface IssueDetailRow {
   statusTextFull: string;
 }
 
-/** Props of {@link IssueDetail}. */
 export interface IssueDetailProps {
-  /** The `issue_identifier` that addresses the issue. */
   identifier: string;
   row?: IssueDetailRow;
   /** Renders the drawer layout with "Open page" and "Close" instead of the page. */
@@ -214,16 +220,16 @@ function Kicker({ detail }: KickerProps) {
   );
 }
 
-function agentText(detail: IssueDetailResponse): string | undefined {
+function agentParts(detail: IssueDetailResponse): string[] {
   const { running } = detail;
   const last = detail.history?.runs?.[0];
   const kind = running?.agent_kind ?? last?.agent_kind;
   const model =
     running?.model_name || running?.configured_model || last?.model_name || last?.configured_model;
   if (!kind) {
-    return undefined;
+    return [];
   }
-  return model ? `${agentLabel(kind)}${SEP}${modelLabel(model)}` : agentLabel(kind);
+  return model ? [agentLabel(kind), modelLabel(model)] : [agentLabel(kind)];
 }
 
 interface PeekFactsProps {
@@ -234,29 +240,51 @@ interface PeekFactsProps {
 
 function PeekFacts({ detail, state, position }: PeekFactsProps) {
   const config = state?.config;
-  const { sessions, uncachedTokens, cost } = budgetOf(detail, config);
+  const figures = budgetOf(detail, state);
+  const { sessions, tokens, money, uncachedTokens, cost } = figures;
+  const moneyFigure = moneyBudgetFigure(figures);
   const { running } = detail;
   const pullRequest = pullRequestOf(detail);
-  const agent = agentText(detail);
+  const agent = agentParts(detail);
   const facts: [string, ReactNode][] = [];
   if (position !== null) {
     const k = position.chain.indexOf(position.current) + 1;
-    facts.push(["Route", `${ruleLabel(position.current)}${SEP}${k} of ${position.chain.length}`]);
+    facts.push([
+      "Route",
+      <Parts
+        key="route"
+        parts={[ruleLabel(position.current), `${k} of ${position.chain.length}`]}
+      />,
+    ]);
   }
-  if (agent !== undefined) {
-    facts.push(["Agent", agent]);
+  if (agent.length > 0) {
+    facts.push(["Agent", <Parts key="agent" parts={agent} />]);
   }
   if (running !== null) {
     const tokensText = runningTokensText(running);
-    const sessionCost = costText(running.cost_status, running.estimated_cost_usd);
+    const sessionCost = liveCostFigure(running.cost_status, running.estimated_cost_usd, "session");
     const parts = [
       config === undefined
         ? `turn ${running.turn_count}`
         : `turn ${running.turn_count} of ${config.agent.max_turns}`,
       tokensText === NOT_MEASURED ? "tokens not measured" : `${tokensText} tokens`,
-      cost === null || sessionCost === NOT_MEASURED ? undefined : `${sessionCost} est.`,
-    ].filter((part) => part !== undefined);
-    facts.push(["This session", parts.join(SEP)]);
+    ];
+    facts.push([
+      "This session",
+      <Parts
+        key="session"
+        parts={[
+          ...parts,
+          ...(cost === null || sessionCost.text === NOT_MEASURED
+            ? []
+            : [
+                <span key="cost">
+                  <NotedFigure figure={sessionCost} /> est.
+                </span>,
+              ]),
+        ]}
+      />,
+    ]);
   }
   facts.push([
     "Sessions",
@@ -274,20 +302,35 @@ function PeekFacts({ detail, state, position }: PeekFactsProps) {
   } else if (cost !== null) {
     facts.push([
       "Spent",
-      `${costText(cost.status, cost.usd)} estimated, ${fmtTokens(uncachedTokens)} tokens`,
+      <>
+        <NotedFigure figure={issueCostFigure(detail, cost)} />
+        {moneyFigure === undefined || money.limit === null
+          ? undefined
+          : ` of ${fmtMoney(money.limit)}`}
+        {" estimated, "}
+        <NotedFigure figure={liveTokensFigure(uncachedTokens, tokens.complete)} />
+        {" tokens"}
+      </>,
     ]);
   } else {
-    facts.push(["Tokens", fmtTokens(uncachedTokens)]);
+    facts.push([
+      "Tokens",
+      <NotedFigure key="tokens" figure={liveTokensFigure(uncachedTokens, tokens.complete)} />,
+    ]);
   }
   if (pullRequest !== undefined) {
     facts.push([
       "Pull request",
       pullRequest.branch ? (
-        <>
-          #{pullRequest.number}
-          {SEP}
-          <span className="font-mono">{pullRequest.branch}</span>
-        </>
+        <Parts
+          key="pull-request"
+          parts={[
+            `#${pullRequest.number}`,
+            <span key="branch" className="font-mono">
+              {pullRequest.branch}
+            </span>,
+          ]}
+        />
       ) : (
         `#${pullRequest.number}`
       ),
@@ -335,10 +378,16 @@ function PeekRuns({ detail, now }: PeekRunsProps) {
           </span>
           <span aria-hidden="true" className={cn(node, "border-ink-body bg-ink-body")} />
           <span className="text-ink-body">
-            {`Run ${number}${run.rule_name ? `${SEP}${ruleLabel(run.rule_name)}` : ""}${SEP}${runStatus(run.status).word.toLowerCase()} at ${fmtClock(run.completed_at)}`}
-            {run.stage_result ? (
+            <Parts
+              parts={[
+                `Run ${number}`,
+                ...(run.rule_name ? [ruleLabel(run.rule_name)] : []),
+                `${lowerFirst(runOutcome(run).word)} at ${fmtClock(run.completed_at)}`,
+              ]}
+            />
+            {run.stage_target && run.stage_result ? (
               <span className="block text-body-sm text-ink-muted">
-                stage result: {run.stage_result}
+                {upperFirst(hopLabel(run.stage_target, run.stage_result))}
               </span>
             ) : undefined}
           </span>
@@ -346,7 +395,7 @@ function PeekRuns({ detail, now }: PeekRunsProps) {
       ))}
       <li className="grid grid-cols-[48px_20px_minmax(0,1fr)] gap-x-sm py-xs text-body-md">
         <span className="pt-xxs text-right text-body-sm text-ink-muted tabular-nums">
-          {fmtClock(new Date(now))}
+          {closingClock(detail, now)}
         </span>
         <span
           aria-hidden="true"
@@ -367,12 +416,6 @@ function SubHeading({ children }: { children: ReactNode }) {
   return <h3 className="mt-lg mb-sm text-body-sm font-medium text-ink-muted">{children}</h3>;
 }
 
-/**
- * Renders one issue. The page shows the state and type over the title,
- * the served sentence, the external links, the lane, then the story beside a
- * margin from 1280 px. The peek shows the same head over the facts, what
- * happens next, and the last runs.
- */
 export function IssueDetail({ identifier, row, peek = false }: IssueDetailProps) {
   const { data, error } = useIssueQuery(identifier);
   const { data: state } = useStateQuery();

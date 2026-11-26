@@ -1,6 +1,6 @@
 import { Meter } from "@base-ui/react/meter";
 
-import { CheckIcon, CircleAlertFilledIcon, MinusIcon, XIcon } from "@/components/icons";
+import { CircleAlertFilledIcon } from "@/components/icons";
 import { markWord } from "@/components/StatusMark";
 import { cn } from "@/lib/cn";
 import { reactionCountLabel, ruleLabel } from "@/lib/labels";
@@ -13,42 +13,39 @@ import type {
   StationState,
 } from "@/lib/lane";
 
-/** The longest chain the meter draws one segment per stage for; a longer chain draws one bar. */
 const SEGMENT_LIMIT = 12;
 
 const MARKER: Record<LaneMarker, string> = {
-  running: "size-3.5 bg-track-done",
-  current: "size-3.5 bg-track-done",
-  waiting: "size-3.5 border-3 border-track-done bg-canvas",
+  running: "size-3.5 bg-ink-body",
+  current: "size-3.5 bg-ink-body",
+  waiting: "size-2.75 border-[1.5px] border-dashed border-ink-body bg-canvas",
+  approval: "size-2.75 border-[1.5px] border-dashed border-ink-body bg-canvas",
   retry: "size-3.5 border-2 border-ink-muted bg-canvas",
   held: "size-3.5 border-[1.5px] border-dashed border-ink-muted bg-canvas",
   stopped: "size-3.5 border-[1.5px] border-dashed border-ink-muted bg-canvas",
   needs: "size-4 text-warning-fill",
-  handed: "size-3.5 bg-track-done",
-  succeeded: "size-3.5 bg-track-done",
+  handed: "size-2.75 border-[1.5px] border-dashed border-ink-body bg-canvas",
+  succeeded: "size-3.5 bg-ink-body",
   failed: "size-3.5 border-2 border-error-fill bg-canvas",
   degraded: "size-3.5 border-2 border-error-fill bg-canvas",
-  clear: "size-3.5 bg-track-done",
+  clear: "size-3.5 bg-ink-body",
   ended:
-    "size-3.5 border-2 border-track-done bg-[radial-gradient(circle,var(--color-track-done)_0_3px,var(--color-canvas)_3px)]",
+    "size-3.5 border-2 border-ink-body bg-[radial-gradient(circle,var(--color-ink-body)_0_3px,var(--color-canvas)_3px)]",
 };
 
-const GLYPH = {
-  escalated: { Icon: XIcon, tone: "text-ink-body" },
-  acted: { Icon: CheckIcon, tone: "text-ink-body" },
-  quiet: { Icon: MinusIcon, tone: "text-ink-muted" },
-};
-
-function isGlyphState(state: StationState): state is keyof typeof GLYPH {
-  return Object.hasOwn(GLYPH, state);
-}
-
-const DOT: Record<Exclude<StationState, keyof typeof GLYPH>, string> = {
-  passed: "border-track-done bg-track-done",
-  current: "border-track-done bg-track-done",
-  waiting: "border-dashed border-track-done bg-canvas",
-  ahead: "border-track-todo bg-canvas",
-  idle: "border-track-todo bg-canvas",
+// A reaction station reads the same filled dot whatever Sortie did there; only a standing
+// escalation, which needs a person, takes the attention fill.
+const DOT: Record<StationState, string> = {
+  passed: "border-ink-body bg-ink-body",
+  acted: "border-ink-body bg-ink-body",
+  quiet: "border-ink-body bg-ink-body",
+  escalated: "border-ink-body bg-ink-body",
+  needs: "border-warning-fill bg-warning-fill",
+  current: "border-ink-body bg-ink-body",
+  waiting: "border-dashed border-ink-body bg-canvas",
+  approval: "border-dashed border-ink-body bg-canvas",
+  ahead: "border-ink-faint bg-canvas",
+  idle: "border-ink-faint bg-canvas",
 };
 
 /** Gives the share of the track width, in percent, where the station at `index` of `count` stands. */
@@ -63,7 +60,21 @@ function laneMarkerWord(mark: LaneMarker): string {
 const STATE_WORD: Partial<Record<StationState, string>> = {
   acted: "Sortie acted",
   quiet: "nothing to act on",
+  needs: "needs attention",
+  approval: "waiting on approval",
 };
+
+// Sortie keeps working an issue after its handoff, so the track runs on through every
+// reaction station it watched in the pass, not only to where the issue stands.
+function isWorkedReaction(station: LaneStation): boolean {
+  return (
+    station.kind === "reaction" &&
+    (station.state === "acted" ||
+      station.state === "quiet" ||
+      station.state === "escalated" ||
+      station.state === "needs")
+  );
+}
 
 function stateWord(state: StationState): string {
   return STATE_WORD[state] ?? state;
@@ -76,11 +87,9 @@ function countLineOf(station: LaneStation, variant: LaneVariant): string {
   return reactionCountLabel(station.key, station.continuations);
 }
 
-/** Props of {@link StageMeter}. */
 export interface StageMeterProps {
   position: StagePosition;
   progress: StageProgress;
-  /** Draws the current stage in the attention color. */
   needs: boolean;
   /** Whether the issue stands at the agent station; elsewhere the meter shows only the stages done. */
   atAgent: boolean;
@@ -88,11 +97,6 @@ export interface StageMeterProps {
   caption: boolean;
 }
 
-/**
- * Draws the stages of a chain as segments, or as one bar past twelve stages.
- * At the agent station the caption names the stage and its place; elsewhere it
- * counts the stages done.
- */
 export function StageMeter({ position, progress, needs, atAgent, caption }: StageMeterProps) {
   const { k, n, done } = progress;
   const focus = atAgent ? progress.focus : null;
@@ -112,17 +116,17 @@ export function StageMeter({ position, progress, needs, atAgent, caption }: Stag
                 className={cn(
                   "min-w-0 flex-1 rounded-[1px]",
                   stage <= done
-                    ? "bg-track-done"
+                    ? "bg-ink-body"
                     : focus?.kind === "current" && stage === k
                       ? currentTone
-                      : "bg-track-todo",
+                      : "bg-ink-faint",
                 )}
               />
             ))}
           </div>
         ) : (
-          <Meter.Track className="relative block h-1 overflow-hidden rounded-full bg-track-todo">
-            <Meter.Indicator className="block h-full bg-track-done" />
+          <Meter.Track className="relative block h-1 overflow-hidden rounded-full bg-ink-faint">
+            <Meter.Indicator className="block h-full bg-ink-body" />
             {focus?.kind === "current" ? (
               <span
                 aria-hidden="true"
@@ -149,7 +153,6 @@ export function StageMeter({ position, progress, needs, atAgent, caption }: Stag
 /** How much of the lane a {@link Lane} draws: the issue page card, the peek track, a Pipeline lane, or a compressed Pipeline lane. */
 export type LaneVariant = "page" | "peek" | "lane" | "dense";
 
-/** Props of {@link Lane}. */
 export interface LaneProps {
   stations: LaneStation[];
   position: StagePosition | null;
@@ -176,12 +179,7 @@ const METER_MARGIN: Record<LaneVariant, string | undefined> = {
   dense: undefined,
 };
 
-/**
- * Draws the stations an issue can stand at as one track, the current station
- * marked with its time above it. The stage meter sits under the agent station,
- * which holds all agent work whatever stage the issue is on. Positions are
- * shares of the width, so the track never scrolls sideways.
- */
+/** The stage meter sits under the agent station, which holds all agent work whatever stage the issue is on; positions are shares of the width, so the track never scrolls sideways. */
 export function Lane({
   stations,
   position,
@@ -199,7 +197,11 @@ export function Lane({
   const hasCount = stations.some((station) => countLineOf(station, variant) !== "");
   const hasPullRequest =
     variant === "lane" && pullRequestNumber !== null && handoff >= 0 && current >= handoff;
-  const reached = current < 0 ? 0 : stationX(current, count) - stationX(0, count);
+  const furthest = stations.reduce(
+    (last, station, index) => (isWorkedReaction(station) && index > last ? index : last),
+    current,
+  );
+  const reached = furthest < 0 ? 0 : stationX(furthest, count) - stationX(0, count);
   const headWord =
     standing === undefined
       ? undefined
@@ -220,14 +222,14 @@ export function Lane({
       )}
     >
       <div
-        className="absolute top-1/2 h-px bg-track-todo"
+        className="absolute top-1/2 h-px bg-ink-faint"
         style={{
           left: `${stationX(0, count)}%`,
           right: `${100 - stationX(count - 1, count)}%`,
         }}
       />
       <div
-        className="absolute top-[calc(50%-1px)] h-0.75 rounded-full bg-track-done"
+        className="absolute top-[calc(50%-1px)] h-0.75 rounded-full bg-ink-body"
         style={{ left: `${stationX(0, count)}%`, width: `${reached}%` }}
       />
       {stations.map((station, index) => {
@@ -250,7 +252,8 @@ export function Lane({
               <span
                 className={cn(
                   "absolute top-[calc(50%+12px)] -translate-x-1/2 whitespace-nowrap text-body-sm",
-                  isCurrent ? "font-semibold text-ink" : "text-ink-body max-md:hidden",
+                  index === count - 1 && "max-md:-translate-x-full",
+                  isCurrent ? "text-ink-body" : "text-ink-body max-md:hidden",
                 )}
                 style={{ left }}
               >
@@ -339,13 +342,35 @@ export function Lane({
   );
 }
 
+export interface StandingMarkProps {
+  marker: LaneMarker;
+  className?: string;
+}
+
+/** Draws where an issue stands in the shape its lane draws there, so every list marks an issue alike. */
+export function StandingMark({ marker, className }: StandingMarkProps) {
+  return (
+    <span
+      role="img"
+      aria-label={laneMarkerWord(marker)}
+      title={laneMarkerWord(marker)}
+      className={cn(
+        "inline-grid shrink-0 place-items-center rounded-full",
+        MARKER[marker],
+        className,
+      )}
+    >
+      {marker === "needs" ? <CircleAlertFilledIcon className="size-4" /> : undefined}
+    </span>
+  );
+}
+
 interface StationMarkProps {
   station: LaneStation;
   left: string;
 }
 
 interface StationDotProps extends StationMarkProps {
-  /** The count line the station shows, or an empty string; the tooltip repeats it. */
   countLine: string;
 }
 
@@ -386,19 +411,9 @@ function CurrentMarker({ station, left, variant, edge }: CurrentMarkerProps) {
 }
 
 function StationDot({ station, left, countLine }: StationDotProps) {
-  if (isGlyphState(station.state)) {
-    const { Icon, tone } = GLYPH[station.state];
-    const word = [stateWord(station.state), countLine].filter((part) => part !== "").join(", ");
-    return (
-      <span
-        className={cn("absolute top-1/2 -translate-1/2", tone)}
-        style={{ left }}
-        title={`${station.label}: ${word}`}
-      >
-        <Icon className="size-3.5" />
-      </span>
-    );
-  }
+  const word = [station.state === "idle" ? "" : stateWord(station.state), countLine]
+    .filter((part) => part !== "")
+    .join(", ");
   return (
     <span
       className={cn(
@@ -406,7 +421,7 @@ function StationDot({ station, left, countLine }: StationDotProps) {
         DOT[station.state],
       )}
       style={{ left }}
-      title={station.state === "waiting" ? `${station.label}: waiting` : station.label}
+      title={station.kind === "reaction" && word !== "" ? `${station.label}: ${word}` : undefined}
     />
   );
 }

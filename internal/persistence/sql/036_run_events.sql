@@ -1,12 +1,4 @@
--- Migration 36: dispatch ID on run history and retained run events
---
--- run_history.dispatch_id stays nullable and unfilled: NULL marks a row
--- written before the column existed, which '' would misstate as a run that
--- had no dispatch. The index on run_events covers the pruning walk, so it
--- reads no payload. run_events_total.bytes is the sum of run_events.size,
--- kept by every write so pruning never sums the table, and it starts exact
--- because the table starts empty.
-
+-- Nullable: '' would misstate a pre-column row as a run with no dispatch.
 ALTER TABLE run_history ADD COLUMN dispatch_id TEXT;
 
 CREATE TABLE run_events (

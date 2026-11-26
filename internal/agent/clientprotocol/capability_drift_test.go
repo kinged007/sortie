@@ -16,37 +16,26 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/toolrelay"
 	"github.com/sortie-ai/sortie/internal/domain"
 
 	"gopkg.in/yaml.v3"
 )
 
-// capabilityDriftProfileEnv is the coordinate the nightly conformance
-// job's own environment names the tracked runtime profile through. It
-// is owned by this package alongside SORTIE_CLIENTPROTOCOL_TEST and
-// SORTIE_CLIENTPROTOCOL_COMMAND, behind the same one gate, so the
-// one-gate-per-package rule stays unaffected.
 const capabilityDriftProfileEnv = "SORTIE_CLIENTPROTOCOL_PROFILE"
 
 const capabilityDriftCommandEnv = "SORTIE_CLIENTPROTOCOL_COMMAND"
 
-// capabilityGapLabelSet is the four labels a session's capability-gap
-// notice may report, in the record's own field order.
 var capabilityGapLabelSet = []string{
-	capabilityLabelToolServers, capabilityLabelTokenCounts,
+	toolrelay.ToolServersLabel, capabilityLabelTokenCounts,
 	capabilityLabelSessionContinuation, capabilityLabelAgentVersion,
 }
 
-// liveCapabilityGapLabels reads the label set out of events' own
-// notification stream: every domain.EventNotification message, joined
-// in arrival order and separated, searched once per label. The
-// separator is what keeps the reading honest: concatenating the
-// messages directly lets one message's suffix and the next one's
-// prefix spell a label no notification ever reported. A turn whose
-// result reports no measured usage also counts as a live token-counts
-// gap, since a capability lowered after the once-per-session notice
-// leaves no notification of its own for the notice-derived reading to
-// find.
+// The messages are joined with a separator because one message's suffix and
+// the next one's prefix could otherwise spell a label no notification
+// reported. An unmeasured result counts as a token-counts gap because a
+// capability lowered after the once-per-session notice leaves no
+// notification of its own.
 func liveCapabilityGapLabels(events []domain.AgentEvent, result domain.TurnResult) []string {
 	var joined strings.Builder
 	for _, event := range events {
@@ -84,35 +73,59 @@ func resolveDriftProfilePath(t *testing.T, path string) string {
 	return filepath.Join(root, path)
 }
 
-type capabilityGapLabelsDocument struct {
-	CapabilityGapLabels []string `json:"capability_gap_labels"`
+type profileDeclaration struct {
+	Capability string `json:"capability"`
+	Case       string `json:"case"`
+	Reason     string `json:"reason"`
+	Surface    string `json:"surface"`
 }
 
-// assertCapabilityGapLabelsMatchProfile reads the runtime profile named
-// by SORTIE_CLIENTPROTOCOL_PROFILE and compares the live capability-gap
-// label set, derived from events' notification stream and result's own
-// UsageMeasured verdict, against the profile's own capability_gap_labels,
-// failing on a difference in either direction. It skips cleanly when the
-// coordinate is absent, so an operator running the conformance suite as
-// today is unaffected; a value naming a file it cannot read fails rather
-// than skips, so a typo cannot pass green. It carries no Test prefix of
-// its own by design: it is called from the event stream and turn result
-// an existing conformance turn already collects, spending no turn of its
-// own.
-func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEvent, result domain.TurnResult) {
+type capabilityGapLabelsDocument struct {
+	CapabilityGapLabels []string             `json:"capability_gap_labels"`
+	Declarations        []profileDeclaration `json:"declarations"`
+}
+
+func readNamedProfile(t *testing.T) (data []byte, profilePath string, named bool) {
 	t.Helper()
 
 	profilePath, present := os.LookupEnv(capabilityDriftProfileEnv)
 	if !present || strings.TrimSpace(profilePath) == "" {
-		// Returning rather than skipping: this runs inside a caller whose
-		// own assertions follow, and skipping would abort them too.
-		t.Logf("capability-gap drift comparison not run: %s is unset", capabilityDriftProfileEnv)
-		return
+		return nil, "", false
 	}
-	resolvedPath := resolveDriftProfilePath(t, profilePath)
-	data, err := os.ReadFile(resolvedPath) //nolint:gosec // the coordinate names a repository-tracked or operator-supplied profile
+	data, err := os.ReadFile(resolveDriftProfilePath(t, profilePath)) //nolint:gosec // the coordinate names a repository-tracked or operator-supplied profile
 	if err != nil {
 		t.Fatalf("load the profile %s names, %q: %v", capabilityDriftProfileEnv, profilePath, err)
+	}
+	return data, profilePath, true
+}
+
+func namedProfileFoldsRuntimeFailure(t *testing.T) bool {
+	t.Helper()
+
+	data, profilePath, named := readNamedProfile(t)
+	if !named {
+		return false
+	}
+	var doc capabilityGapLabelsDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("decode the profile %s names, %q: %v", capabilityDriftProfileEnv, profilePath, err)
+	}
+	return slices.ContainsFunc(doc.Declarations, func(d profileDeclaration) bool {
+		return d.Capability == "turn_disposition" && d.Case == "runtime_failure" && d.Reason == "outcome_folded_into_another" &&
+			(d.Surface == "" || d.Surface == "protocol")
+	})
+}
+
+// A profile path naming an unreadable file fails rather than skips, so a typo
+// cannot pass green.
+func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEvent, result domain.TurnResult) {
+	t.Helper()
+
+	data, profilePath, named := readNamedProfile(t)
+	if !named {
+		// Returning rather than skipping: the caller's own assertions follow.
+		t.Logf("capability-gap drift comparison not run: %s is unset", capabilityDriftProfileEnv)
+		return
 	}
 	var doc capabilityGapLabelsDocument
 	if err := json.Unmarshal(data, &doc); err != nil {
@@ -129,16 +142,12 @@ func assertCapabilityGapLabelsMatchProfile(t *testing.T, events []domain.AgentEv
 	}
 }
 
-// nightlyWorkflowStep is the subset of one workflow step's shape the
-// reachability guard reads.
 type nightlyWorkflowStep struct {
 	Name string            `yaml:"name"`
 	Env  map[string]string `yaml:"env"`
 	Run  string            `yaml:"run"`
 }
 
-// nightlyWorkflowJob is the subset of one workflow job's shape the
-// reachability guard reads.
 type nightlyWorkflowJob struct {
 	Env      map[string]string `yaml:"env"`
 	Strategy struct {
@@ -149,18 +158,12 @@ type nightlyWorkflowJob struct {
 	Steps []nightlyWorkflowStep `yaml:"steps"`
 }
 
-// nightlyWorkflowDocument is the subset of .github/workflows/nightly.yml
-// the reachability guard reads.
 type nightlyWorkflowDocument struct {
 	Jobs map[string]nightlyWorkflowJob `yaml:"jobs"`
 }
 
-// nightlyWorkflowRelPath locates the nightly workflow file relative to
-// this package directory, the shape a package-relative constant
-// already establishes for a package-relative reader in this family.
 const nightlyWorkflowRelPath = "../../../.github/workflows/nightly.yml"
 
-// readNightlyWorkflow reads and decodes the nightly workflow document.
 func readNightlyWorkflow() (nightlyWorkflowDocument, error) {
 	raw, err := os.ReadFile(nightlyWorkflowRelPath) //nolint:gosec // the tracked workflow's own path, resolved from a package-relative constant
 	if err != nil {
@@ -173,8 +176,6 @@ func readNightlyWorkflow() (nightlyWorkflowDocument, error) {
 	return doc, nil
 }
 
-// nightlyMatrixRowsNamingThisPackage returns every matrix include entry,
-// across every job, whose test_path names this package.
 func nightlyMatrixRowsNamingThisPackage(doc nightlyWorkflowDocument) []struct {
 	jobName string
 	job     nightlyWorkflowJob
@@ -199,8 +200,6 @@ func nightlyMatrixRowsNamingThisPackage(doc nightlyWorkflowDocument) []struct {
 	return rows
 }
 
-// nightlyGoTestStep returns the one step in steps whose run script
-// invokes go test, or false when none does.
 func nightlyGoTestStep(steps []nightlyWorkflowStep) (nightlyWorkflowStep, bool) {
 	for _, step := range steps {
 		if strings.Contains(step.Run, "go test") {
@@ -210,8 +209,6 @@ func nightlyGoTestStep(steps []nightlyWorkflowStep) (nightlyWorkflowStep, bool) 
 	return nightlyWorkflowStep{}, false
 }
 
-// nightlyRepositoryRoot serves both readNightlyWorkflow's caller and
-// resolveDriftProfilePath, so no root-module package exists for either alone.
 func nightlyRepositoryRoot() (string, error) {
 	abs, err := filepath.Abs(filepath.Join(".", nightlyWorkflowRelPath, "..", "..", ".."))
 	if err != nil {
@@ -220,9 +217,6 @@ func nightlyRepositoryRoot() (string, error) {
 	return filepath.Clean(abs), nil
 }
 
-// callersOfAssertCapabilityGapLabels returns the name of every
-// top-level Test function in this package directory whose body calls
-// assertCapabilityGapLabelsMatchProfile.
 func callersOfAssertCapabilityGapLabels(t *testing.T) []string {
 	t.Helper()
 
@@ -266,12 +260,8 @@ func callersOfAssertCapabilityGapLabels(t *testing.T) []string {
 	return callers
 }
 
-// nightlyMatrixValue resolves value against row when it is a single
-// "${{ matrix.<key> }}" expression, and returns it unchanged
-// otherwise. A workflow that varies a coordinate per shard writes the
-// expression rather than a literal, and a guard that could not read
-// through it would pass vacuously on exactly the rows it exists to
-// check.
+// A guard that could not read through a matrix expression would pass
+// vacuously on exactly the rows it exists to check.
 func nightlyMatrixValue(row map[string]string, value string) string {
 	trimmed := strings.TrimSpace(value)
 	match := nightlyMatrixExpression.FindStringSubmatch(trimmed)
@@ -302,21 +292,21 @@ func TestLiveCapabilityGapLabelsAddsTokenCountsOnlyWhenUnmeasured(t *testing.T) 
 	}{
 		{
 			name:   "an unmeasured result adds token counts to a notice naming a different gap",
-			events: notify(capabilityGapNoticeStem + capabilityLabelAgentVersion),
+			events: notify(toolrelay.GapNoticeStem + capabilityLabelAgentVersion),
 			result: domain.TurnResult{UsageMeasured: false},
 			want:   []string{capabilityLabelAgentVersion, capabilityLabelTokenCounts},
 		},
 		{
 			name:   "an unmeasured result whose notice already names token counts adds nothing more",
-			events: notify(capabilityGapNoticeStem + capabilityLabelTokenCounts),
+			events: notify(toolrelay.GapNoticeStem + capabilityLabelTokenCounts),
 			result: domain.TurnResult{UsageMeasured: false},
 			want:   []string{capabilityLabelTokenCounts},
 		},
 		{
 			name:   "a measured result leaves notice-derived labels unchanged",
-			events: notify(capabilityGapNoticeStem + capabilityLabelToolServers),
+			events: notify(toolrelay.GapNoticeStem + toolrelay.ToolServersLabel),
 			result: domain.TurnResult{UsageMeasured: true},
-			want:   []string{capabilityLabelToolServers},
+			want:   []string{toolrelay.ToolServersLabel},
 		},
 	}
 
@@ -344,8 +334,8 @@ func TestNightlyReachability(t *testing.T) {
 	}
 
 	callers := callersOfAssertCapabilityGapLabels(t)
-	if len(callers) != 1 {
-		t.Fatalf("%d top-level Test functions in this package call assertCapabilityGapLabelsMatchProfile, want exactly 1: %v", len(callers), callers)
+	if len(callers) == 0 {
+		t.Fatal("no top-level Test function in this package calls assertCapabilityGapLabelsMatchProfile, want at least one")
 	}
 
 	root, err := nightlyRepositoryRoot()
@@ -354,8 +344,9 @@ func TestNightlyReachability(t *testing.T) {
 	}
 
 	type shard struct {
-		command string
-		reaches bool
+		command     string
+		spendSource string
+		reaches     bool
 	}
 	shards := map[shard]string{}
 	commandReached := map[string]bool{}
@@ -387,14 +378,19 @@ func TestNightlyReachability(t *testing.T) {
 			t.Errorf("row %q: compile run_filter %q and skip_filter %q as Go regexps: %v", name, runFilter, skipFilter, compileErr)
 			continue
 		}
-		reaches := runPattern.MatchString(callers[0]) && (skipPattern == nil || !skipPattern.MatchString(callers[0]))
+		reaches := slices.ContainsFunc(callers, func(caller string) bool {
+			return runPattern.MatchString(caller) && (skipPattern == nil || !skipPattern.MatchString(caller))
+		})
 
-		key := shard{command: command, reaches: reaches}
+		spendSource := nightlyMatrixValue(row.row, env[spendDeclarationEnv])
+		key := shard{command: command, spendSource: spendSource, reaches: reaches}
 		if previous, duplicate := shards[key]; duplicate {
-			t.Errorf("rows %q and %q both drive this package with %s %q and reaches=%v, want one row per runtime and tier", previous, name, capabilityDriftCommandEnv, command, reaches)
+			t.Errorf("rows %q and %q both drive this package with %s %q, %s %q and reaches=%v, want one row per runtime, spend declaration and tier", previous, name, capabilityDriftCommandEnv, command, spendDeclarationEnv, spendSource, reaches)
 		}
 		shards[key] = name
-		commandReached[command] = commandReached[command] || reaches
+		if !rowRunsOnlyContextScenario(row.row) {
+			commandReached[command] = commandReached[command] || reaches
+		}
 
 		if !reaches {
 			continue
@@ -407,7 +403,7 @@ func TestNightlyReachability(t *testing.T) {
 
 	for command, reached := range commandReached {
 		if !reached {
-			t.Errorf("no row that reaches %s drives %s %q", callers[0], capabilityDriftCommandEnv, command)
+			t.Errorf("no row that reaches any of %v drives %s %q", callers, capabilityDriftCommandEnv, command)
 		}
 	}
 }

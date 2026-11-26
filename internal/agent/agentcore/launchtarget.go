@@ -10,8 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
@@ -66,6 +66,11 @@ type LaunchTarget struct {
 	// target carries: a local launch runs without them, and a remote launch
 	// neither carries them nor lets the remote shell pass them to the agent.
 	WithheldEnv []string
+
+	// StopGrace is the session's resolved agent.stop_grace_ms, which a remote
+	// launch also grants its runtime once the SSH connection is gone. Zero in
+	// local mode.
+	StopGrace time.Duration
 }
 
 // ResolveLaunchTarget resolves the workspace path and agent binary for a
@@ -145,6 +150,7 @@ func resolveSSHLaunch(params domain.StartSessionParams, absPath, sshHost, remote
 		SSHHost:                  sshHost,
 		SSHStrictHostKeyChecking: params.SSHStrictHostKeyChecking,
 		SSHEnvNames:              params.SSHEnvNames,
+		StopGrace:                procutil.StopGrace(params.AgentConfig.StopGraceMS),
 	}, nil
 }
 
@@ -163,31 +169,15 @@ func resolveArgvLaunch(params domain.StartSessionParams, absPath, sshHost string
 	}, nil
 }
 
-// AppendCommandArgs returns command, which names an executable,
-// followed by args, in the form that launches exactly that argv. A list
-// stays a list in both launch modes. A string launched locally stays a
-// string only when every argument is non-empty and holds no space rune,
-// since the local launch splits it on whitespace; otherwise it becomes
-// the list of its whitespace-separated words followed by args. A string
-// launched remotely stays a string with args quoted for the remote
-// shell and placed where the launch places its own arguments.
-func AppendCommandArgs(command domain.AgentCommand, remote bool, args ...string) domain.AgentCommand {
-	switch {
-	case len(command.Argv) > 0:
-		return domain.AgentCommand{Argv: append(slices.Clone(command.Argv), args...)}
-	case remote:
-		return domain.AgentCommand{Line: sshutil.AppendArgs(command.Line, args...)}
-	case slices.ContainsFunc(args, breaksWhitespaceSplit):
-		return domain.AgentCommand{Argv: append(strings.Fields(command.Line), args...)}
+// CommandWords returns the words of the configured agent command: Command
+// then Args for a local launch, the whitespace-separated words of
+// RemoteCommand for a remote one. The SSH executable is never among them.
+// The slice is the caller's to modify.
+func (t LaunchTarget) CommandWords() []string {
+	if t.RemoteCommand != "" {
+		return strings.Fields(t.RemoteCommand)
 	}
-	words := append([]string{strings.TrimRightFunc(command.Line, unicode.IsSpace)}, args...)
-	return domain.AgentCommand{Line: strings.Join(words, " ")}
-}
-
-// breaksWhitespaceSplit reports whether a whitespace split would not
-// yield arg as one word: it is empty or holds a space rune.
-func breaksWhitespaceSplit(arg string) bool {
-	return arg == "" || strings.ContainsFunc(arg, unicode.IsSpace)
+	return append([]string{t.Command}, t.Args...)
 }
 
 // SSHOptions resolves t's SSH transport options for one remote
@@ -245,7 +235,42 @@ func (t LaunchTarget) SSHOptions(settings ...sshutil.EnvVar) sshutil.SSHOptions 
 		StrictHostKeyChecking: t.SSHStrictHostKeyChecking,
 		Env:                   carried,
 		Unset:                 slices.Clone(t.WithheldEnv),
+		StopGrace:             t.StopGrace,
 	}
+}
+
+// RuntimeEnv returns name's value as the runtime receives it from
+// Sortie: from env, or [os.Environ] when env is nil, for a local
+// launch; for a remote launch, only a variable the launch forwards
+// over SSH, which is a name in t.SSHEnvNames whose value in env holds a
+// non-whitespace character, the rule [LaunchTarget.SSHOptions] carries
+// by. A value the remote host sets for itself is invisible. A name in
+// t.WithheldEnv is never visible. When env holds a name more than once
+// the last entry wins, as it does for a launched process.
+func (t LaunchTarget) RuntimeEnv(env []string, name string) (string, bool) {
+	if slices.Contains(t.WithheldEnv, name) {
+		return "", false
+	}
+	remote := t.RemoteCommand != ""
+	if remote && !slices.Contains(t.SSHEnvNames, name) {
+		return "", false
+	}
+	if env == nil {
+		env = os.Environ()
+	}
+	var value string
+	var found bool
+	for _, entry := range env {
+		if !isEnvEntryNamed(entry, name) {
+			continue
+		}
+		_, value, _ = strings.Cut(entry, "=")
+		found = true
+	}
+	if remote && strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	return value, found
 }
 
 // BindWorkspace re-verifies t.WorkspacePath and, on success, sets

@@ -141,9 +141,10 @@ run_report() {
 		GITHUB_STEP_SUMMARY="$summary" \
 		DISCORD_WEBHOOK=https://discord.example/webhook \
 		"$@" \
-		"$SCRIPT" report || _status=$?
+		"$SCRIPT" report 2>"$tmp/stderr" || _status=$?
 
-	[ "$_status" -eq "$_expect_exit" ] || fail "scripts/protocol-pin.sh report exited ${_status}, want ${_expect_exit}"
+	[ "$_status" -eq "$_expect_exit" ] ||
+		fail "scripts/protocol-pin.sh report exited ${_status}, want ${_expect_exit}; stderr: $(cat "$tmp/stderr")"
 }
 
 FIXTURE_TAG="schema-v1.21.0"
@@ -191,3 +192,4 @@ echo "$fault_embed" | jq -e '.embeds[0].title | startswith("protocol-pin:")' >/d
 echo "$fault_embed" | jq -e '.embeds[0].url == "https://github.com/sortie-ai/sortie/actions/runs/42"' >/dev/null ||
 	fail "fault: Discord embed url = $(echo "$fault_embed" | jq '.embeds[0].url'), want the run URL"
 grep -q '^protocol-pin: protocolpin locate failed$' "$tmp/summary" || fail "fault: summary does not record the fault reason: $(cat "$tmp/summary")"
+grep -q '^::error::protocol-pin: protocolpin locate failed$' "$tmp/stderr" || fail "fault: stderr carries no error annotation: $(cat "$tmp/stderr")"

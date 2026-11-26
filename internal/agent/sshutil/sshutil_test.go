@@ -1,18 +1,22 @@
 package sshutil
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestConnectionFailed(t *testing.T) {
@@ -247,8 +251,6 @@ func TestQuoteArgv_ShellNeverReadsElementZeroSpecially(t *testing.T) {
 	}
 }
 
-// mustReadAllBytes drains r into a byte slice, or returns nil for a nil
-// reader.
 func mustReadAllBytes(t *testing.T, r io.Reader) []byte {
 	t.Helper()
 	if r == nil {
@@ -261,9 +263,6 @@ func mustReadAllBytes(t *testing.T, r io.Reader) []byte {
 	return data
 }
 
-// TestBuildSSHLaunch_ZeroEnv asserts that a nil or empty opts.Env
-// produces Args byte-identical between the two, with the exact option
-// prefix and final-element text, and carries no preamble.
 func TestBuildSSHLaunch_ZeroEnv(t *testing.T) {
 	t.Parallel()
 
@@ -315,7 +314,7 @@ func TestBuildSSHLaunch_ZeroEnv(t *testing.T) {
 				if len(launch.Args) == 0 {
 					t.Fatalf("%s: BuildSSHLaunch(...).Args is empty", label)
 				}
-				gotFinal := launch.Args[len(launch.Args)-1]
+				gotFinal := withoutSupervisor(t, launch.Args[len(launch.Args)-1])
 				if gotFinal != tt.wantFinal {
 					t.Errorf("%s: Args final element = %q, want %q", label, gotFinal, tt.wantFinal)
 				}
@@ -330,6 +329,7 @@ func TestBuildSSHLaunch_ZeroEnv(t *testing.T) {
 					"-o", "ConnectTimeout=30",
 					"-o", "ServerAliveInterval=15",
 					"-o", "ServerAliveCountMax=3",
+					"-o", "ControlPath=none",
 					"--",
 					strings.TrimSpace(tt.host),
 				}
@@ -354,9 +354,6 @@ func TestBuildSSHLaunch_ZeroEnv(t *testing.T) {
 	}
 }
 
-// TestSSHLaunch_ZeroValue asserts that the zero SSHLaunch behaves the
-// same as a zero-Env BuildSSHLaunch result: no preamble, and
-// PrefixStdin returns its argument unchanged.
 func TestSSHLaunch_ZeroValue(t *testing.T) {
 	t.Parallel()
 
@@ -373,8 +370,6 @@ func TestSSHLaunch_ZeroValue(t *testing.T) {
 	}
 }
 
-// TestBuildSSHLaunch_NonEmptyEnv_ExactLiterals pins the exact preamble
-// and final-element text for a two-entry Env.
 func TestBuildSSHLaunch_NonEmptyEnv_ExactLiterals(t *testing.T) {
 	t.Parallel()
 
@@ -393,21 +388,15 @@ func TestBuildSSHLaunch_NonEmptyEnv_ExactLiterals(t *testing.T) {
 	}
 
 	const wantFinal = `cd -- '/w' && { command -v dd >/dev/null 2>&1 || { echo 'sortie: dd is required on the remote host to receive environment variables' >&2; exit 1; }; } && unset _sortie_complete && _sortie_env=$(dd bs=1 count=63 2>/dev/null) && eval "$_sortie_env" && [ "${_sortie_complete-}" = 1 ] && { run --acp 'a'` + "\n}"
-	gotFinal := launch.Args[len(launch.Args)-1]
+	gotFinal := withoutSupervisor(t, launch.Args[len(launch.Args)-1])
 	if gotFinal != wantFinal {
 		t.Errorf("final element = %q, want %q", gotFinal, wantFinal)
 	}
 }
 
-// TestBuildSSHLaunch_AgentArgsAndCommandTerminator pins where agent
-// arguments land when the operator's own command ends in a top-level
-// ; or &. They go in front of that terminator, which ends the command
-// and would otherwise make them a command of their own. A trailing
-// newline, which a multi-line block in the workflow leaves on the
-// fragment, ends the command the same way and is dropped. A
-// terminator the fragment escapes, and a doubled one, are not
-// terminators of the operator's command, so the arguments follow them
-// as they follow any other fragment.
+// Arguments go in front of a top-level ; or &, which would otherwise make
+// them a command of their own. An escaped or doubled terminator is not
+// one, so the arguments follow it.
 func TestBuildSSHLaunch_AgentArgsAndCommandTerminator(t *testing.T) {
 	t.Parallel()
 
@@ -501,7 +490,7 @@ func TestBuildSSHLaunch_AgentArgsAndCommandTerminator(t *testing.T) {
 			t.Parallel()
 
 			launch := BuildSSHLaunch("h", "/w", tt.remoteCommand, tt.agentArgs, SSHOptions{})
-			gotFinal := launch.Args[len(launch.Args)-1]
+			gotFinal := withoutSupervisor(t, launch.Args[len(launch.Args)-1])
 			if gotFinal != tt.wantFinal {
 				t.Errorf("final element = %q, want %q", gotFinal, tt.wantFinal)
 			}
@@ -509,8 +498,6 @@ func TestBuildSSHLaunch_AgentArgsAndCommandTerminator(t *testing.T) {
 	}
 }
 
-// TestBuildSSHLaunch_ArgsNeverContainEnvValues asserts that no element
-// of Args contains a carried value as a substring.
 func TestBuildSSHLaunch_ArgsNeverContainEnvValues(t *testing.T) {
 	t.Parallel()
 
@@ -530,9 +517,6 @@ func TestBuildSSHLaunch_ArgsNeverContainEnvValues(t *testing.T) {
 	}
 }
 
-// TestBuildSSHLaunch_PanicsOnInvalidEnvName asserts that an invalid
-// Env name panics with a message naming the entry's index and neither
-// its name nor its value.
 func TestBuildSSHLaunch_PanicsOnInvalidEnvName(t *testing.T) {
 	t.Parallel()
 
@@ -564,13 +548,10 @@ func TestBuildSSHLaunch_PanicsOnInvalidEnvName(t *testing.T) {
 	})
 }
 
-// TestBuildSSHLaunch_PanicsOnReservedEnvName asserts that an Env entry
-// naming the completion marker panics with a message naming the
-// entry's index and neither its name nor its value. Carrying that name
-// would break the marker both ways: the preamble's own trailing
-// assignment overwrites the carried value, and a preamble truncated
-// just after the carried assignment satisfies the completeness test
-// with none of the later variables exported.
+// Carrying the marker's name would break it both ways: the preamble's own
+// trailing assignment overwrites the carried value, and a preamble
+// truncated just after the carried assignment satisfies the completeness
+// test with none of the later variables exported.
 func TestBuildSSHLaunch_PanicsOnReservedEnvName(t *testing.T) {
 	t.Parallel()
 
@@ -648,7 +629,7 @@ func TestBuildSSHLaunch_Unset(t *testing.T) {
 
 			launch := BuildSSHLaunch("h", "/w", "run --acp", []string{"a"}, tt.opts)
 
-			gotFinal := launch.Args[len(launch.Args)-1]
+			gotFinal := withoutSupervisor(t, launch.Args[len(launch.Args)-1])
 			if gotFinal != tt.wantFinal {
 				t.Errorf("BuildSSHLaunch(...).Args final element = %q, want %q", gotFinal, tt.wantFinal)
 			}
@@ -735,9 +716,6 @@ func recoverFrom(f func()) (recovered any) {
 	return nil
 }
 
-// recordingWriteCloser is a test double for io.WriteCloser that
-// records every Write call's bytes, optionally fails every Write with
-// a fixed error, and records whether Close was called.
 type recordingWriteCloser struct {
 	mu       sync.Mutex
 	writes   [][]byte
@@ -768,9 +746,6 @@ func (r *recordingWriteCloser) recordedWrites() [][]byte {
 	return append([][]byte(nil), r.writes...)
 }
 
-// blockingWriteCloser is a test double for io.WriteCloser whose first
-// Write blocks until Close is called, then reports an error, so a test
-// can observe Close unblocking a Write in progress.
 type blockingWriteCloser struct {
 	mu      sync.Mutex
 	closed  bool
@@ -804,9 +779,6 @@ func (b *blockingWriteCloser) Close() error {
 	return nil
 }
 
-// TestPrefixStdin_Ordering asserts that the first Write sends the
-// preamble then the caller's own bytes, in order, and every later
-// Write passes straight through.
 func TestPrefixStdin_Ordering(t *testing.T) {
 	t.Parallel()
 
@@ -838,9 +810,6 @@ func TestPrefixStdin_Ordering(t *testing.T) {
 	}
 }
 
-// TestPrefixStdin_FailingPreambleWrite asserts that a failing preamble
-// write returns that error and the caller's own bytes are never
-// forwarded to the underlying writer.
 func TestPrefixStdin_FailingPreambleWrite(t *testing.T) {
 	t.Parallel()
 
@@ -863,9 +832,6 @@ func TestPrefixStdin_FailingPreambleWrite(t *testing.T) {
 	}
 }
 
-// shortWriteCloser is a test double for io.WriteCloser that reports a
-// short count with a nil error on its first Write, the contract
-// violation a preamble write must not accept as a delivered preamble.
 type shortWriteCloser struct {
 	writes [][]byte
 }
@@ -880,9 +846,6 @@ func (s *shortWriteCloser) Write(p []byte) (int, error) {
 
 func (s *shortWriteCloser) Close() error { return nil }
 
-// TestPrefixStdin_ShortPreambleWrite asserts that a preamble write
-// reporting fewer bytes than the preamble holds, with a nil error,
-// fails with io.ErrShortWrite and forwards none of the caller's bytes.
 func TestPrefixStdin_ShortPreambleWrite(t *testing.T) {
 	t.Parallel()
 
@@ -904,8 +867,6 @@ func TestPrefixStdin_ShortPreambleWrite(t *testing.T) {
 	}
 }
 
-// TestPrefixStdin_CloseBeforeWrite asserts that Close before any Write
-// closes the underlying writer and forwards no bytes.
 func TestPrefixStdin_CloseBeforeWrite(t *testing.T) {
 	t.Parallel()
 
@@ -925,9 +886,6 @@ func TestPrefixStdin_CloseBeforeWrite(t *testing.T) {
 	}
 }
 
-// TestPrefixStdin_CloseUnblocksInFlightWrite asserts that Close
-// returns while a Write is blocked on a peer that never reads, and
-// that blocked Write then returns an error.
 func TestPrefixStdin_CloseUnblocksInFlightWrite(t *testing.T) {
 	t.Parallel()
 
@@ -941,11 +899,7 @@ func TestPrefixStdin_CloseUnblocksInFlightWrite(t *testing.T) {
 		writeErrCh <- err
 	}()
 
-	select {
-	case <-bw.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Write did not start within 2s")
-	}
+	waittest.Receive(t, bw.started, "Write start")
 
 	closeDone := make(chan struct{})
 	go func() {
@@ -953,18 +907,105 @@ func TestPrefixStdin_CloseUnblocksInFlightWrite(t *testing.T) {
 		close(closeDone)
 	}()
 
-	select {
-	case <-closeDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return while a Write was blocked")
+	waittest.Receive(t, closeDone, "Close return while a Write is blocked")
+
+	if err := waittest.Receive(t, writeErrCh, "blocked Write return after Close"); err == nil {
+		t.Error("blocked Write returned nil error after Close, want an error")
+	}
+}
+
+func toolsURLRender(o ForwardOutcome) LatePreamble {
+	if o.Status != ForwardAllocated {
+		return LatePreamble{}
+	}
+	url := "http://127.0.0.1:" + strconv.Itoa(o.RemotePort) + "/mcp"
+	return LatePreamble{
+		Env:  []EnvVar{{Name: "TOOLS_URL", Value: url}},
+		Args: []string{"--url", url, "it's $HOME"},
+	}
+}
+
+func TestBuildSSHLaunch_ForwardAddsOptionsBeforeTheSeparator(t *testing.T) {
+	t.Parallel()
+
+	launch := BuildSSHLaunch("h", "/ws", "agent", nil, SSHOptions{
+		Forward: &ReverseForward{HostPort: 4242, Render: toolsURLRender},
+	})
+
+	sep := slices.Index(launch.Args, "--")
+	if sep < 0 {
+		t.Fatalf("Args = %q, want a %q separator", launch.Args, "--")
+	}
+	got := strings.Join(launch.Args[:sep], " ")
+	want := "-o ExitOnForwardFailure=no -o LogLevel=INFO -R 127.0.0.1:0:127.0.0.1:4242"
+	if !strings.Contains(got, want) {
+		t.Errorf("options before %q = %q, want them to contain %q", "--", got, want)
+	}
+}
+
+func TestBuildSSHLaunch_ForwardRendersLateArgsOnlyForTheOutcome(t *testing.T) {
+	t.Parallel()
+	sh := requirePOSIXShell(t)
+
+	const tail = "agent stdin\n"
+	url := func(port int) string { return "http://127.0.0.1:" + strconv.Itoa(port) + "/mcp" }
+	allocated := func(port int) string {
+		return fmt.Sprintf("Allocated port %d for remote forward to 127.0.0.1:4242\nsortie: remote shell ready\n", port)
+	}
+	tests := []struct {
+		name   string
+		stderr string
+		want   []string
+	}{
+		{"allocated one-digit port", allocated(7), []string{url(7), "--url", url(7), "it's $HOME", tail}},
+		{"allocated five-digit port", allocated(54321), []string{url(54321), "--url", url(54321), "it's $HOME", tail}},
+		{"refused", "Warning: remote port forwarding failed for listen port 0\nsortie: remote shell ready\n", []string{"unset", tail}},
+		{"unconfirmed", "sortie: remote shell ready\n", []string{"unset", tail}},
 	}
 
-	select {
-	case err := <-writeErrCh:
-		if err == nil {
-			t.Error("blocked Write returned nil error after Close, want an error")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("blocked Write did not return after Close")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			agent := filepath.Join(dir, "agent")
+			if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf '%s\\0' \"${TOOLS_URL-unset}\" \"$@\"\ncat\n"), 0o755); err != nil { //nolint:gosec // fixture script under t.TempDir()
+				t.Fatalf("WriteFile(agent): %v", err)
+			}
+			launch := BuildSSHLaunch("h", dir, agent, nil, SSHOptions{
+				Forward: &ReverseForward{HostPort: 4242, Render: toolsURLRender},
+			})
+			if _, err := io.Copy(io.Discard, launch.WatchStderr(strings.NewReader(tt.stderr))); err != nil {
+				t.Fatalf("draining WatchStderr: %v", err)
+			}
+			preamble := mustReadAllBytes(t, launch.StdinReader())
+			final := launch.Args[len(launch.Args)-1]
+
+			count := regexp.MustCompile(`count=(\d+)`).FindStringSubmatch(final)
+			if count == nil || count[1] != strconv.Itoa(len(preamble)) {
+				t.Fatalf("import count in %q, want %d, the preamble's length", final, len(preamble))
+			}
+			cmd := exec.Command(sh, "-c", final) //nolint:gosec // sh from exec.LookPath, final built from t.TempDir() paths
+			cmd.Stdin = bytes.NewReader(append(preamble, tail...))
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("sh -c <final element>: %v", err)
+			}
+
+			if got := strings.Split(string(out), "\x00"); !slices.Equal(got, tt.want) {
+				t.Errorf("words the agent received = %q, want %q", got, tt.want)
+			}
+		})
 	}
+}
+
+func withoutSupervisor(t *testing.T, final string) string {
+	t.Helper()
+
+	head, rest, _ := strings.Cut(final, "{\n"+supervisor+"sortie_agent() {\n")
+	agent, _, _ := strings.Cut(rest, "\n}\nsortie_start_agent")
+	if head+supervisedAgent(agent, 0, "") != final {
+		t.Fatalf("final element = %q, want the agent command inside the supervisor", final)
+	}
+	return head + agent
 }

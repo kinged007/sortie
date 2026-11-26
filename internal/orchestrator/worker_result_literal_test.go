@@ -128,7 +128,7 @@ func checkWorkerResultExitKind(fset *token.FileSet, files []*ast.File) (violatio
 	return violations, literalCount
 }
 
-func checkWorkerResultNoStoppedByTokenCeilingLiteral(fset *token.FileSet, files []*ast.File) (violations []workerResultLiteralViolation) {
+func checkWorkerResultNoStoppedByCeilingLiteral(fset *token.FileSet, files []*ast.File) (violations []workerResultLiteralViolation) {
 	for _, file := range files {
 		ast.Inspect(file, func(n ast.Node) bool {
 			lit, ok := n.(*ast.CompositeLit)
@@ -139,8 +139,8 @@ func checkWorkerResultNoStoppedByTokenCeilingLiteral(fset *token.FileSet, files 
 			if !ok || ident.Name != "WorkerResult" {
 				return true
 			}
-			if value := workerResultKeyValue(lit, "StoppedByTokenCeiling"); value != nil {
-				violations = append(violations, workerResultLiteralViolation{pos: fset.Position(value.Pos()), detail: "StoppedByTokenCeiling is set in a WorkerResult literal"})
+			if value := workerResultKeyValue(lit, "StoppedByCeiling"); value != nil {
+				violations = append(violations, workerResultLiteralViolation{pos: fset.Position(value.Pos()), detail: "StoppedByCeiling is set in a WorkerResult literal"})
 			}
 			return true
 		})
@@ -311,8 +311,8 @@ func TestWorkerResultLiteral_RealPackage(t *testing.T) {
 		t.Errorf("checkWorkerResultExitKind() found %d violations in the real package, want 0: %+v", len(violations), violations)
 	}
 
-	if violations := checkWorkerResultNoStoppedByTokenCeilingLiteral(fset, files); len(violations) != 0 {
-		t.Errorf("checkWorkerResultNoStoppedByTokenCeilingLiteral() found %d violations in the real package, want 0: %+v", len(violations), violations)
+	if violations := checkWorkerResultNoStoppedByCeilingLiteral(fset, files); len(violations) != 0 {
+		t.Errorf("checkWorkerResultNoStoppedByCeilingLiteral() found %d violations in the real package, want 0: %+v", len(violations), violations)
 	}
 
 	if violations := checkWorkerResultNoSessionIDLiteral(fset, files); len(violations) != 0 {
@@ -425,7 +425,7 @@ func TestWorkerResultLiteralRules_ScratchMutationDetected(t *testing.T) {
 		check func(*token.FileSet, []*ast.File) []workerResultLiteralViolation
 	}{
 		{"ExitKind", exitKindCheck},
-		{"StoppedByTokenCeilingLiteral", checkWorkerResultNoStoppedByTokenCeilingLiteral},
+		{"StoppedByCeilingLiteral", checkWorkerResultNoStoppedByCeilingLiteral},
 		{"SessionIDLiteral", checkWorkerResultNoSessionIDLiteral},
 		{"OnExitCallSites", onExitCheck},
 	}
@@ -444,11 +444,11 @@ func TestWorkerResultLiteralRules_ScratchMutationDetected(t *testing.T) {
 			},
 		},
 		{
-			name: "StoppedByTokenCeiling set in a literal",
-			own:  "StoppedByTokenCeilingLiteral",
+			name: "StoppedByCeiling set in a literal",
+			own:  "StoppedByCeilingLiteral",
 			replacements: []string{
 				"report(WorkerResult{\n\t\t\tIssueID:          issue.ID,\n\t\t\tIdentifier:       issue.Identifier,\n\t\t\tExitKind:         WorkerExitError,",
-				"report(WorkerResult{\n\t\t\tIssueID:          issue.ID,\n\t\t\tIdentifier:       issue.Identifier,\n\t\t\tExitKind:         WorkerExitError,\n\t\t\tStoppedByTokenCeiling: true,",
+				"report(WorkerResult{\n\t\t\tIssueID:          issue.ID,\n\t\t\tIdentifier:       issue.Identifier,\n\t\t\tExitKind:         WorkerExitError,\n\t\t\tStoppedByCeiling: true,",
 			},
 		},
 		{

@@ -14,21 +14,20 @@ Sortie follows [Semantic Versioning](https://semver.org/). Security fixes are ap
 
 | Version | Supported |
 |---------|-----------|
-| 1.28.x | Yes (1.28.1 recommended) |
-| 1.27.x | Security patches until 16 Jan 2027 |
-| < 1.27 | No |
+| 1.31.x | Yes (1.31.0 recommended) |
+| 1.30.x | Security patches until 31 Jan 2027 |
+| < 1.30 | No |
 
-When a new minor version ships (e.g., 1.28.0), the immediately preceding minor (e.g., 1.27.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
+When a new minor version ships (e.g., 1.31.0), the immediately preceding minor (e.g., 1.30.x) enters a 3-month security-maintenance window. During that window, only critical and high severity patches are backported; all other fixes ship only on the current minor. After the window ends, only the current minor release of the latest major version is supported; all older versions are unsupported.
 
 ## Reporting a Vulnerability
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Report vulnerabilities privately through
-[GitHub Security Advisories](https://github.com/sortie-ai/sortie/security/advisories/new).
+Report vulnerabilities privately through:
 
-If you are unable to use GitHub Security Advisories, email **security@sortie-ai.com**
-with the subject line `[VULNERABILITY] <short description>`.
+- [GitHub Security Advisories](https://github.com/sortie-ai/sortie/security/advisories/new): "Report a vulnerability" button (preferred)
+- If you are unable to use GitHub Security Advisories, email **security@sortie-ai.com** with the subject line `[VULNERABILITY] <short description>`.
 
 ### What to Include
 
@@ -41,8 +40,7 @@ A good report helps us triage quickly. Please include:
 - **Impact assessment:** what an attacker can achieve (path traversal, secret leak, arbitrary execution, etc.).
 - **Proof of concept:** code, logs, or a patch demonstrating the issue. If you have a fix, include it.
 
-You do not need to encrypt your report. If you require encrypted communication,
-note this in your initial report and we will establish a secure channel.
+You do not need to encrypt your report. If you require encrypted communication, note this in your initial report and we will establish a secure channel.
 
 ## Response Process
 
@@ -53,8 +51,7 @@ note this in your initial report and we will establish a secure channel.
 | Fix development and review | Depends on severity and complexity |
 | Coordinated release | Negotiated with reporter |
 
-We will keep you informed at each stage. If you have not received an acknowledgment
-within the stated window, follow up on the same channel.
+We will keep you informed at each stage. If you have not received an acknowledgment within the stated window, follow up on the same channel.
 
 ### Severity Classification
 
@@ -71,10 +68,8 @@ We use a four-level severity model to prioritize response:
 
 We follow **coordinated disclosure**:
 
-1. The reporter and maintainers agree on a disclosure date, defaulting to **90 days**
-   from the initial report or sooner once a fix is available.
-2. We publish a [GitHub Security Advisory](https://github.com/sortie-ai/sortie/security/advisories)
-   with full details, affected versions, and remediation steps.
+1. The reporter and maintainers agree on a disclosure date, defaulting to **90 days** from the initial report or sooner once a fix is available.
+2. We publish a [GitHub Security Advisory](https://github.com/sortie-ai/sortie/security/advisories) with full details, affected versions, and remediation steps.
 3. A new release containing the fix is published simultaneously with the advisory.
 4. The reporter is credited in the advisory unless they request anonymity.
 
@@ -82,8 +77,7 @@ We may shorten the disclosure window if:
 - The vulnerability is already being actively exploited.
 - The vulnerability has been independently disclosed elsewhere.
 
-We may request an extension beyond 90 days for issues requiring coordinated fixes
-across multiple projects. Extensions require reporter agreement.
+We may request an extension beyond 90 days for issues requiring coordinated fixes across multiple projects. Extensions require reporter agreement.
 
 ## Scope
 
@@ -99,21 +93,16 @@ across multiple projects. Extensions require reporter agreement.
 - Configuration injection via environment variable handling or YAML parsing.
 - Denial of service against the orchestrator (crash, resource exhaustion, deadlock).
 - Cross-site request forgery against the HTTP API.
-- Vulnerabilities in direct dependencies of code that ships in the binary: Go
-  modules (see [go.mod](go.mod)) and any third-party code bundled into the
-  embedded dashboard.
+- Vulnerabilities in direct dependencies of code that ships in the binary: Go modules (see [go.mod](go.mod)) and any third-party code bundled into the embedded dashboard.
 
 ### Out of Scope
 
-The following are **not** security vulnerabilities in Sortie. Please report
-them as regular GitHub issues instead:
+The following are **not** security vulnerabilities in Sortie. Please report them as regular GitHub issues instead:
 
 - Bugs in third-party coding agents (Claude Code, etc.) launched by Sortie.
 - Vulnerabilities in the underlying OS, container runtime, or hosting environment.
-- Issues that require the attacker to already have write access to WORKFLOW.md
-  (workflow configuration is a trusted input &mdash; see [architecture Section 15.4](docs/architecture/20-security-and-operational-safety.md#154-hook-script-safety)).
-- Misconfiguration of deployment-specific hardening (sandbox settings, network
-  policies, credential scoping).
+- Issues that require the attacker to already have write access to `WORKFLOW.md` (workflow configuration is a trusted input - see [architecture Section 15.4](docs/architecture/20-security-and-operational-safety.md#154-hook-script-safety)).
+- Misconfiguration of deployment-specific hardening (sandbox settings, network policies, credential scoping).
 - Automated scanner output without analysis demonstrating actual exploitability.
 - Issues in pre-release branches or unreleased code not present in any tagged version.
 
@@ -122,44 +111,26 @@ triage a borderline report than miss a real vulnerability.
 
 ## Security Architecture
 
-Sortie's security model is documented in the
-[architecture specification](docs/architecture/20-security-and-operational-safety.md) (Section 15). Key invariants:
+Sortie's security model is documented in the [architecture specification](docs/architecture/20-security-and-operational-safety.md) (Section 15). Key invariants:
 
-- **Path containment**: all workspace paths are validated to remain under the
-  configured workspace root using symlink resolution and relative-path checks.
-- **Input sanitization**: workspace directory names are restricted to
-  `[A-Za-z0-9._-]`; all other characters are replaced. Filesystem special
-  names (`.`, `..`) are explicitly rejected.
-- **Cross-origin requests**: the HTTP server refuses a state-changing request
-  that a page served from another origin sends. DNS rebinding is outside this
-  protection.
-- **Agent execution boundary**: the coding agent subprocess `cwd` is validated
-  to equal the workspace path before every launch.
-- **Secret handling**: API tokens and secret values support `$VAR` indirection
-  and are never logged or expanded beyond a single level.
-- **Minimal dependency surface**: the binary is statically linked with zero
-  runtime dependencies. No CGo. The Go code uses a small set of direct
-  dependencies, with Prometheus metrics support remaining optional. Tooling
-  used only to develop or build Sortie never ships in the binary.
+- **Path containment**: all workspace paths are validated to remain under the configured workspace root using symlink resolution and relative-path checks.
+- **Input sanitization**: workspace directory names are restricted to `[A-Za-z0-9._-]`; all other characters are replaced. Filesystem special names (`.`, `..`) are explicitly rejected.
+- **Cross-origin requests**: the HTTP server refuses a state-changing request that a page served from another origin sends. DNS rebinding is outside this protection.
+- **Agent execution boundary**: the coding agent subprocess `cwd` is validated to equal the workspace path before every launch.
+- **Secret handling**: API tokens and secret values support `$VAR` indirection and are never logged or expanded beyond a single level.
+- **Minimal dependency surface**: the binary is statically linked with zero runtime dependencies. No CGo. The Go code uses a small set of direct dependencies, with Prometheus metrics support remaining optional. Tooling used only to develop or build Sortie never ships in the binary.
 
 ## Security Announcements
 
-Security advisories are published through
-[GitHub Security Advisories](https://github.com/sortie-ai/sortie/security/advisories)
-and noted in the [CHANGELOG](CHANGELOG.md).
+Security advisories are published through [GitHub Security Advisories](https://github.com/sortie-ai/sortie/security/advisories) and noted in the [CHANGELOG](CHANGELOG.md).
 
-Watch this repository's **Security** tab or subscribe to release notifications
-to receive security updates.
+Watch this repository's **Security** tab or subscribe to release notifications to receive security updates.
 
 ## Acknowledgments
 
-We value the work of security researchers. Contributors who report valid
-vulnerabilities will be:
+We value the work of security researchers. Contributors who report valid vulnerabilities will be:
 
-- Credited by name (or handle) in the security advisory, unless anonymity
-  is requested.
-- Listed in a `SECURITY_ACKNOWLEDGMENTS.md` file in the repository after
-  disclosure.
+- Credited by name (or handle) in the security advisory, unless anonymity is requested.
+- Listed in a [Security Acknowledgments](SECURITY_ACKNOWLEDGMENTS.md) file in the repository after disclosure.
 
-We do not currently operate a paid bug bounty program. If this changes, it
-will be announced here.
+We do not currently operate a paid bug bounty program. If this changes, it will be announced here.

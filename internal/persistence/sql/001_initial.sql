@@ -1,5 +1,3 @@
--- Migration 1: Core persistence tables
-
 CREATE TABLE retry_entries (
     issue_id   TEXT    PRIMARY KEY,
     identifier TEXT    NOT NULL,

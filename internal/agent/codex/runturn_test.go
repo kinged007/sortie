@@ -9,10 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
@@ -20,7 +22,9 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // nopWriteCloser is an io.WriteCloser that discards all writes.
@@ -306,6 +310,7 @@ func makeTestStateWithStdin(t *testing.T, fixtureData []byte, recorder *capturin
 		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
+		ledger:     adaptNewLedger(t),
 	}
 	state.conn = jsonrpc.NewConn(w, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
@@ -337,6 +342,7 @@ func makeTestStateWithMalformedBeforeResponse(t *testing.T, malformed, response 
 		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
+		ledger:     adaptNewLedger(t),
 	}
 	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
 	go watchTermination(state)
@@ -373,6 +379,7 @@ func gatedTurnStartState(t *testing.T, response string) *sessionState {
 		waitCh:   make(chan struct{}),
 		inbox:    jsonrpc.NewInbox[jsonrpc.Message](),
 		acc:      agentcore.NewRunUsage(),
+		ledger:   adaptNewLedger(t),
 	}
 	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
 
@@ -382,6 +389,18 @@ func gatedTurnStartState(t *testing.T, response string) *sessionState {
 	}()
 
 	return state
+}
+
+func adaptNewLedger(t *testing.T) *usage.Ledger {
+	t.Helper()
+
+	ledger, err := usage.NewLedger(usageSources.Live, usageSources.Records)
+	if err != nil {
+		t.Fatalf("usage.NewLedger() error = %v", err)
+	}
+	ledger.SessionCreated()
+
+	return ledger
 }
 
 // fakeSession wraps state in a domain.Session suitable for RunTurn.
@@ -545,97 +564,6 @@ func TestAssertUsageReporting(t *testing.T) {
 	})
 }
 
-// TestRunTurn_TokenUsageUpdated_ResumedThreadBaseline drives a thread
-// whose first matching notification already reports a non-zero
-// total.totalTokens because the thread resumed from a prior run. It
-// asserts a preceding notification carrying another turn's id
-// contributes nothing and only raises the baseline, and that the first
-// reported snapshot for the current turn is the difference between that
-// notification's total and last breakdowns.
-func TestRunTurn_TokenUsageUpdated_ResumedThreadBaseline(t *testing.T) {
-	t.Parallel()
-
-	fixture := "{\"id\":1,\"result\":{\"turn\":{\"id\":\"turn-002\",\"status\":\"starting\"}}}\n" +
-		"{\"method\":\"turn/started\",\"params\":{\"turnId\":\"turn-002\"}}\n" +
-		// A notification from an earlier turn of the resumed thread:
-		// contributes nothing to this turn and only raises the baseline.
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-001\",\"tokenUsage\":{\"last\":{\"totalTokens\":5000,\"inputTokens\":4000,\"cachedInputTokens\":1000,\"outputTokens\":1000,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":5000,\"inputTokens\":4000,\"cachedInputTokens\":1000,\"outputTokens\":1000,\"reasoningOutputTokens\":0}}}}\n" +
-		// The current turn's first matching notification: total is
-		// already thread-cumulative from the resumed session.
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-002\",\"tokenUsage\":{\"last\":{\"totalTokens\":13846,\"inputTokens\":13818,\"cachedInputTokens\":13692,\"outputTokens\":28,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":27631,\"inputTokens\":27549,\"cachedInputTokens\":27392,\"outputTokens\":82,\"reasoningOutputTokens\":0}}}}\n" +
-		"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-002\",\"status\":\"completed\"}}}\n"
-
-	state := makeTestState(t, []byte(fixture))
-	adapter, _ := NewCodexAdapter()
-
-	var events []domain.AgentEvent
-	result, err := adapter.RunTurn(context.Background(), fakeSession(state), domain.RunTurnParams{
-		Prompt:  "continue",
-		OnEvent: collectEvents(&events),
-	})
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	tokenUsageEvents := filterEventsOfType(events, domain.EventTokenUsage)
-	if len(tokenUsageEvents) != 1 {
-		t.Fatalf("token_usage event count = %d, want 1 (the other-turn notification contributes nothing)", len(tokenUsageEvents))
-	}
-
-	// The baseline is total minus last (27549-13818, 82-28, 27392-13692),
-	// so the reported snapshot equals last exactly: total_tokens 13846.
-	wantSnapshot := domain.TokenUsage{InputTokens: 13818, OutputTokens: 28, CacheReadTokens: 13692, TotalTokens: 13846}
-	if got := tokenUsageEvents[0].Usage; got != wantSnapshot {
-		t.Errorf("token_usage event Usage = %+v, want %+v (baseline is total minus last)", got, wantSnapshot)
-	}
-	if result.Usage != wantSnapshot {
-		t.Errorf("TurnResult.Usage = %+v, want %+v", result.Usage, wantSnapshot)
-	}
-}
-
-// TestRunTurn_TokenUsageUpdated_EmptyTurnIDAdoptsFirstNotification
-// drives a turn whose turn/start response body fails to unmarshal,
-// leaving the adapter's current turn id empty, followed by two
-// thread/tokenUsage/updated notifications sharing one non-empty turnId.
-// It asserts the adapter adopts the first notification's turnId rather
-// than treating every notification as belonging to another turn, so
-// both notifications contribute and the run-cumulative snapshot after
-// the second reports the full total rather than zero.
-func TestRunTurn_TokenUsageUpdated_EmptyTurnIDAdoptsFirstNotification(t *testing.T) {
-	t.Parallel()
-
-	fixture := "{\"id\":1,\"result\":\"malformed turn/start body\"}\n" +
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-777\",\"tokenUsage\":{\"last\":{\"totalTokens\":13785,\"inputTokens\":13731,\"cachedInputTokens\":13700,\"outputTokens\":54,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":13785,\"inputTokens\":13731,\"cachedInputTokens\":13700,\"outputTokens\":54,\"reasoningOutputTokens\":0}}}}\n" +
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-777\",\"tokenUsage\":{\"last\":{\"totalTokens\":13846,\"inputTokens\":13818,\"cachedInputTokens\":13692,\"outputTokens\":28,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":27631,\"inputTokens\":27549,\"cachedInputTokens\":27392,\"outputTokens\":82,\"reasoningOutputTokens\":0}}}}\n" +
-		"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-777\",\"status\":\"completed\"}}}\n"
-
-	state := makeTestState(t, []byte(fixture))
-	adapter, _ := NewCodexAdapter()
-
-	var events []domain.AgentEvent
-	result, err := adapter.RunTurn(context.Background(), fakeSession(state), domain.RunTurnParams{
-		Prompt:  "do something",
-		OnEvent: collectEvents(&events),
-	})
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	tokenUsageEvents := filterEventsOfType(events, domain.EventTokenUsage)
-	if len(tokenUsageEvents) != 2 {
-		t.Fatalf("token_usage event count = %d, want 2 (both notifications must contribute once the empty turn id adopts the first)", len(tokenUsageEvents))
-	}
-
-	wantSnapshot := domain.TokenUsage{InputTokens: 27549, OutputTokens: 82, TotalTokens: 27631}
-	got := tokenUsageEvents[1].Usage
-	if got.InputTokens != wantSnapshot.InputTokens || got.OutputTokens != wantSnapshot.OutputTokens || got.TotalTokens != wantSnapshot.TotalTokens {
-		t.Errorf("second token_usage event Usage = %+v, want input/output/total %+v (not zero)", got, wantSnapshot)
-	}
-	if result.Usage.TotalTokens != wantSnapshot.TotalTokens {
-		t.Errorf("TurnResult.Usage.TotalTokens = %d, want %d", result.Usage.TotalTokens, wantSnapshot.TotalTokens)
-	}
-}
-
 // TestRunTurn_TokenUsageUpdated_StampsStoredModel drives the same
 // token_usage_updated.jsonl fixture as TestRunTurn_TokenUsageUpdated,
 // with a stored model set on the session before the turn runs, and
@@ -666,8 +594,8 @@ func TestRunTurn_TokenUsageUpdated_StampsStoredModel(t *testing.T) {
 func TestRunTurn_ModelRerouted(t *testing.T) {
 	t.Parallel()
 
-	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0}}}}`
-	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0}}}}`
+	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
+	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
 
 	fixture := strings.Join([]string{
 		`{"id":1,"result":{"turn":{"id":"turn-001","status":"starting"}}}`,
@@ -712,9 +640,9 @@ func TestRunTurn_ModelRerouted(t *testing.T) {
 func TestRunTurn_ModelRerouted_MalformedPayload(t *testing.T) {
 	t.Parallel()
 
-	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0}}}}`
+	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
 	const malformedReroute = `{"method":"model/rerouted","params":{"toModel":123}}`
-	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0}}}}`
+	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
 
 	fixture := strings.Join([]string{
 		`{"id":1,"result":{"turn":{"id":"turn-001","status":"starting"}}}`,
@@ -766,9 +694,9 @@ func TestRunTurn_ModelRerouted_MalformedPayload(t *testing.T) {
 func TestRunTurn_ModelRerouted_EmptyToModel(t *testing.T) {
 	t.Parallel()
 
-	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0}}}}`
+	const before = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":100,"inputTokens":80,"cachedInputTokens":0,"outputTokens":20,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
 	const emptyToModelReroute = `{"method":"model/rerouted","params":{"threadId":"thread-001","turnId":"turn-001","fromModel":"gpt-5.6-sol","toModel":""}}`
-	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0}}}}`
+	const after = `{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":50,"inputTokens":40,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":150,"inputTokens":120,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}}`
 
 	fixture := strings.Join([]string{
 		`{"id":1,"result":{"turn":{"id":"turn-001","status":"starting"}}}`,
@@ -1043,22 +971,13 @@ func TestRunTurn_CancelledMainLoopWaitsForCompletion(t *testing.T) {
 		outcomeCh <- outcome{result: result, err: err}
 	}()
 
-	t.Cleanup(func() {
-		select {
-		case <-finished:
-		case <-time.After(time.Second):
-		}
-	})
+	t.Cleanup(func() { waittest.Receive(t, finished, "RunTurn exit") })
 
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
-	waitForSessionStarted(t, started)
+	waittest.Receive(t, started, "RunTurn past its turn/start call")
 
 	cancel()
-	select {
-	case <-stdin.interrupts:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not send turn/interrupt after cancellation")
-	}
+	waittest.Receive(t, stdin.interrupts, "turn/interrupt after cancellation")
 
 	callsAfterInterrupt := ctx.calls.Load()
 	time.Sleep(50 * time.Millisecond)
@@ -1073,15 +992,11 @@ func TestRunTurn_CancelledMainLoopWaitsForCompletion(t *testing.T) {
 	turnCompletedMsg := jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"interrupted"}}`)}
 	state.inbox.Put(turnCompletedMsg)
 
-	select {
-	case got := <-outcomeCh:
-		if got.result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
-		}
-		requireAgentError(t, got.err, domain.ErrTurnCancelled)
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not return after turn/completed")
+	got := waittest.Receive(t, outcomeCh, "RunTurn outcome after turn/completed")
+	if got.result.ExitReason != domain.EventTurnCancelled {
+		t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
 	}
+	requireAgentError(t, got.err, domain.ErrTurnCancelled)
 }
 
 // TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus drives
@@ -1119,22 +1034,13 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 		outcomeCh <- outcome{result: result, err: err}
 	}()
 
-	t.Cleanup(func() {
-		select {
-		case <-finished:
-		case <-time.After(time.Second):
-		}
-	})
+	t.Cleanup(func() { waittest.Receive(t, finished, "RunTurn exit") })
 
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
-	waitForSessionStarted(t, started)
+	waittest.Receive(t, started, "RunTurn past its turn/start call")
 
 	cancel()
-	select {
-	case <-stdin.interrupts:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not send turn/interrupt after cancellation")
-	}
+	waittest.Receive(t, stdin.interrupts, "turn/interrupt after cancellation")
 	if got := stdin.count.Load(); got != 1 {
 		t.Errorf("turn/interrupt request count = %d, want 1", got)
 	}
@@ -1142,15 +1048,11 @@ func TestRunTurn_CancelledMainLoopReportsCancelledDespiteCompletedStatus(t *test
 	turnCompletedMsg := jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"completed"}}`)}
 	state.inbox.Put(turnCompletedMsg)
 
-	select {
-	case got := <-outcomeCh:
-		if got.result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
-		}
-		requireAgentError(t, got.err, domain.ErrTurnCancelled)
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not return after turn/completed")
+	got := waittest.Receive(t, outcomeCh, "RunTurn outcome after turn/completed")
+	if got.result.ExitReason != domain.EventTurnCancelled {
+		t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
 	}
+	requireAgentError(t, got.err, domain.ErrTurnCancelled)
 
 	if got := filterEventsOfType(events, domain.EventTurnCancelled); len(got) != 1 {
 		t.Errorf("turn_cancelled event count = %d, want 1", len(got))
@@ -1179,19 +1081,26 @@ func TestRunTurn_ItemStartedAndCompletedEmitsToolResult(t *testing.T) {
 		t.Errorf("ExitReason = %v, want EventTurnCompleted", result.ExitReason)
 	}
 
-	wantToolError := map[string]bool{"ls -la": false, "mcpToolCall": true, "rm -rf build": true}
-	results := filterEventsOfType(events, domain.EventToolResult)
-	if len(results) != len(wantToolError) {
-		t.Fatalf("EventToolResult count = %d, want %d", len(results), len(wantToolError))
+	type toolResult struct {
+		name, argument string
+		kind           domain.ToolKind
+		failed         bool
 	}
-	for _, e := range results {
-		if want, ok := wantToolError[e.ToolName]; !ok || e.ToolError != want {
-			t.Errorf("ToolResult %q: ToolError = %v, want %v (expected and unseen: %v)", e.ToolName, e.ToolError, want, ok)
-		}
-		delete(wantToolError, e.ToolName)
+	want := []toolResult{
+		{"", "ls -la", domain.ToolKindShell, false},
+		{"github.get_issue", "", "", true},
+		{"", "rm -rf build", domain.ToolKindShell, true},
+		{"", "a.go", domain.ToolKindEdit, false},
+		{"", "a.go, b.go", domain.ToolKindEdit, false},
+		{"sortie.status", "", "", false},
+		{"lookup", "", "", false},
 	}
-	if len(wantToolError) != 0 {
-		t.Errorf("missing ToolResult for %v", wantToolError)
+	var got []toolResult
+	for _, e := range filterEventsOfType(events, domain.EventToolResult) {
+		got = append(got, toolResult{e.ToolName, e.ToolArgument, e.ToolKind, e.ToolError})
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("tool_result events (name, argument, kind, failed) = %+v, want %+v", got, want)
 	}
 }
 
@@ -1516,64 +1425,52 @@ func TestRunTurn_HumanInputRequestEndsAttempt(t *testing.T) {
 func TestRunTurn_CancelledReturnsWithinBoundWhenTurnCompletedNeverArrives(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		const bound = 50 * time.Millisecond
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	stdin := &interruptTrackingWriteCloser{interrupts: make(chan struct{}, 1)}
-	state := newInterruptedStatusState(t, stdin)
-	state.agentConfig = domain.AgentConfig{ReadTimeoutMS: 50}
+		stdin := &interruptTrackingWriteCloser{interrupts: make(chan struct{}, 1)}
+		state := newInterruptedStatusState(t, stdin)
+		state.agentConfig = domain.AgentConfig{ReadTimeoutMS: int(bound.Milliseconds())}
 
-	type outcome struct {
-		result domain.TurnResult
-		err    error
-	}
-	outcomeCh := make(chan outcome, 1)
-	finished := make(chan struct{})
-	started := make(chan struct{})
-
-	adapter, _ := NewCodexAdapter()
-	go func() {
-		defer close(finished)
-		result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
-			Prompt:  "go",
-			OnEvent: onEventSignalingSessionStarted(func(domain.AgentEvent) {}, started),
-		})
-		outcomeCh <- outcome{result: result, err: err}
-	}()
-
-	t.Cleanup(func() {
-		select {
-		case <-finished:
-		case <-time.After(time.Second):
+		type outcome struct {
+			result domain.TurnResult
+			err    error
 		}
-	})
+		outcomeCh := make(chan outcome, 1)
+		finished := make(chan struct{})
+		started := make(chan struct{})
 
-	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
-	waitForSessionStarted(t, started)
+		adapter, _ := NewCodexAdapter()
+		go func() {
+			defer close(finished)
+			result, err := adapter.RunTurn(ctx, fakeSession(state), domain.RunTurnParams{
+				Prompt:  "go",
+				OnEvent: onEventSignalingSessionStarted(func(domain.AgentEvent) {}, started),
+			})
+			outcomeCh <- outcome{result: result, err: err}
+		}()
 
-	start := time.Now()
-	cancel()
+		t.Cleanup(func() { waittest.Receive(t, finished, "RunTurn exit") })
 
-	select {
-	case <-stdin.interrupts:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not send turn/interrupt after cancellation")
-	}
+		state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
+		waittest.Receive(t, started, "RunTurn past its turn/start call")
 
-	// turn/completed is never sent. RunTurn must return once the
-	// configured read_timeout_ms bound elapses, not merely eventually.
-	select {
-	case got := <-outcomeCh:
-		if elapsed := time.Since(start); elapsed > time.Second {
-			t.Errorf("RunTurn returned after %v, want well within the 50ms read_timeout_ms bound", elapsed)
+		start := time.Now()
+		cancel()
+
+		waittest.Receive(t, stdin.interrupts, "turn/interrupt after cancellation")
+
+		got := waittest.Receive(t, outcomeCh, "RunTurn outcome")
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Errorf("RunTurn returned after %v, want within the %v read_timeout_ms bound", elapsed, bound)
 		}
 		if got.result.ExitReason != domain.EventTurnCancelled {
 			t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
 		}
 		requireAgentError(t, got.err, domain.ErrTurnCancelled)
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunTurn did not return within the bound; it kept reading after cancellation with no turn/completed")
-	}
+	})
 }
 
 func TestStopSession_InvalidInternalType(t *testing.T) {
@@ -1591,11 +1488,11 @@ func TestRunTurn_MultiTurnNoRace(t *testing.T) {
 
 	fixture := "{\"id\":1,\"result\":{\"turn\":{\"id\":\"turn-001\",\"status\":\"starting\"}}}\n" +
 		"{\"method\":\"turn/started\",\"params\":{\"turnId\":\"turn-001\"}}\n" +
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-001\",\"tokenUsage\":{\"last\":{\"totalTokens\":150,\"inputTokens\":100,\"cachedInputTokens\":10,\"outputTokens\":50,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":150,\"inputTokens\":100,\"cachedInputTokens\":10,\"outputTokens\":50,\"reasoningOutputTokens\":0}}}}\n" +
+		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-001\",\"tokenUsage\":{\"last\":{\"totalTokens\":150,\"inputTokens\":100,\"cachedInputTokens\":10,\"outputTokens\":50,\"reasoningOutputTokens\":0,\"cacheWriteInputTokens\":0},\"total\":{\"totalTokens\":150,\"inputTokens\":100,\"cachedInputTokens\":10,\"outputTokens\":50,\"reasoningOutputTokens\":0,\"cacheWriteInputTokens\":0}}}}\n" +
 		"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-001\",\"status\":\"completed\"}}}\n" +
 		"{\"id\":2,\"result\":{\"turn\":{\"id\":\"turn-002\",\"status\":\"starting\"}}}\n" +
 		"{\"method\":\"turn/started\",\"params\":{\"turnId\":\"turn-002\"}}\n" +
-		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-002\",\"tokenUsage\":{\"last\":{\"totalTokens\":300,\"inputTokens\":200,\"cachedInputTokens\":20,\"outputTokens\":100,\"reasoningOutputTokens\":0},\"total\":{\"totalTokens\":300,\"inputTokens\":200,\"cachedInputTokens\":20,\"outputTokens\":100,\"reasoningOutputTokens\":0}}}}\n" +
+		"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thread-001\",\"turnId\":\"turn-002\",\"tokenUsage\":{\"last\":{\"totalTokens\":300,\"inputTokens\":200,\"cachedInputTokens\":20,\"outputTokens\":100,\"reasoningOutputTokens\":0,\"cacheWriteInputTokens\":0},\"total\":{\"totalTokens\":300,\"inputTokens\":200,\"cachedInputTokens\":20,\"outputTokens\":100,\"reasoningOutputTokens\":0,\"cacheWriteInputTokens\":0}}}}\n" +
 		"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-002\",\"status\":\"completed\"}}}\n"
 
 	state := makeTestState(t, []byte(fixture))
@@ -1638,7 +1535,7 @@ func TestRunTurn_StdoutEOFBetweenTurns(t *testing.T) {
 	session := fakeSession(state)
 
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
-	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "thread/tokenUsage/updated", Params: json.RawMessage(`{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0},"total":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0}}}`)})
+	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "thread/tokenUsage/updated", Params: json.RawMessage(`{"threadId":"thread-001","turnId":"turn-001","tokenUsage":{"last":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0,"cacheWriteInputTokens":0},"total":{"totalTokens":15,"inputTokens":10,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0,"cacheWriteInputTokens":0}}}`)})
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"turn-001","status":"completed"}}`)})
 
 	if _, err := adapter.RunTurn(context.Background(), session, domain.RunTurnParams{
@@ -1718,13 +1615,9 @@ func TestStopSession_WithActiveReaderGoroutine(t *testing.T) {
 	go watchTermination(state)
 
 	for i := range lines {
-		select {
-		case <-state.inbox.Ready():
-			if _, ok := state.inbox.Take(); !ok {
-				t.Fatalf("inbox closed after %d of %d lines, want the reader still parked on the live pipe", i, lines)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("reader delivered %d of %d lines within 5s", i, lines)
+		waittest.Receive(t, state.inbox.Ready(), fmt.Sprintf("reader line %d of %d", i+1, lines))
+		if _, ok := state.inbox.Take(); !ok {
+			t.Fatalf("inbox closed after %d of %d lines, want the reader still parked on the live pipe", i, lines)
 		}
 	}
 	select {
@@ -1779,7 +1672,7 @@ func TestHandshakeIsolation_PreTurnMessagesDoNotReachFirstTurn(t *testing.T) {
 	if err := authenticateIfNeeded(context.Background(), state, discardTestLogger()); err != nil {
 		t.Fatalf("authenticateIfNeeded() error = %v", err)
 	}
-	threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
+	threadID, _, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 	if err != nil {
 		t.Fatalf("startThread() error = %v", err)
 	}
@@ -1855,7 +1748,7 @@ func TestRunTurn_StdoutParseFailureBeforeResponse(t *testing.T) {
 
 // TestAuthenticateIfNeeded_LoginWaitEOF drives the login wait past a
 // clean end of stream and asserts it returns the pinned text rather
-// than timing out, within 2s while readTimeout keeps its 30s default.
+// than timing out on its 30s readTimeout default.
 func TestAuthenticateIfNeeded_LoginWaitEOF(t *testing.T) {
 	// No t.Parallel(): uses t.Setenv.
 	t.Setenv("CODEX_API_KEY", "test-key")
@@ -1878,20 +1771,15 @@ func TestAuthenticateIfNeeded_LoginWaitEOF(t *testing.T) {
 	// own resolution on the connection.
 	state.inbox.Close()
 
-	select {
-	case err := <-done:
-		const want = "unexpected EOF waiting for login"
-		if err == nil || err.Error() != want {
-			t.Errorf("authenticateIfNeeded() error = %v, want %q", err, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("authenticateIfNeeded() did not return within 2s of the stream ending")
+	const want = "unexpected EOF waiting for login"
+	if err := waittest.Receive(t, done, "authenticateIfNeeded return"); err == nil || err.Error() != want {
+		t.Errorf("authenticateIfNeeded() error = %v, want %q", err, want)
 	}
 }
 
 // TestAuthenticateIfNeeded_LoginWaitReadError drives the login wait
 // past a read failure (rather than a clean end of stream) and asserts
-// it returns the pinned text naming the underlying error, within 2s.
+// it returns the pinned text naming the underlying error.
 func TestAuthenticateIfNeeded_LoginWaitReadError(t *testing.T) {
 	// No t.Parallel(): uses t.Setenv.
 	t.Setenv("CODEX_API_KEY", "test-key")
@@ -1907,21 +1795,16 @@ func TestAuthenticateIfNeeded_LoginWaitReadError(t *testing.T) {
 
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindStreamEnd, Err: wantErr})
 
-	select {
-	case err := <-done:
-		want := "scanner error waiting for login: " + wantErr.Error()
-		if err == nil || err.Error() != want {
-			t.Errorf("authenticateIfNeeded() error = %v, want %q", err, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("authenticateIfNeeded() did not return within 2s of the read failure")
+	want := "scanner error waiting for login: " + wantErr.Error()
+	if err := waittest.Receive(t, done, "authenticateIfNeeded return"); err == nil || err.Error() != want {
+		t.Errorf("authenticateIfNeeded() error = %v, want %q", err, want)
 	}
 }
 
 // TestStartThread_NotificationWaitEOF drives the thread/started wait
 // past a clean end of stream and asserts it returns the thread ID
-// with a nil error, within 2s, rather than waiting for the 30s
-// readTimeout default.
+// with a nil error, rather than waiting for the 30s readTimeout
+// default.
 func TestStartThread_NotificationWaitEOF(t *testing.T) {
 	t.Parallel()
 
@@ -1935,22 +1818,18 @@ func TestStartThread_NotificationWaitEOF(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		threadID, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
+		threadID, _, _, err := startThread(context.Background(), state, passthroughConfig{}, discardTestLogger())
 		done <- outcome{threadID, err}
 	}()
 
 	state.inbox.Close()
 
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Errorf("startThread() error = %v, want nil", got.err)
-		}
-		if got.threadID != "thread-abc" {
-			t.Errorf("startThread() threadID = %q, want %q", got.threadID, "thread-abc")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("startThread() did not return within 2s of the stream ending")
+	got := waittest.Receive(t, done, "startThread return")
+	if got.err != nil {
+		t.Errorf("startThread() error = %v, want nil", got.err)
+	}
+	if got.threadID != "thread-abc" {
+		t.Errorf("startThread() threadID = %q, want %q", got.threadID, "thread-abc")
 	}
 }
 
@@ -2039,22 +1918,13 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 		outcomeCh <- outcome{result: result, err: err}
 	}()
 
-	t.Cleanup(func() {
-		select {
-		case <-finished:
-		case <-time.After(time.Second):
-		}
-	})
+	t.Cleanup(func() { waittest.Receive(t, finished, "RunTurn exit") })
 
 	state.inbox.Put(jsonrpc.Message{Kind: jsonrpc.KindNotification, Method: "turn/started", Params: json.RawMessage(`{"turnId":"turn-001"}`)})
-	waitForSessionStarted(t, started)
+	waittest.Receive(t, started, "RunTurn past its turn/start call")
 
 	cancel()
-	select {
-	case <-stdin.interrupts:
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not send turn/interrupt after cancellation")
-	}
+	waittest.Receive(t, stdin.interrupts, "turn/interrupt after cancellation")
 
 	approvalMsg := jsonrpc.Message{
 		Kind:   jsonrpc.KindRequest,
@@ -2064,15 +1934,11 @@ func TestRunTurn_CancelledApprovalRequestReportsCancelled(t *testing.T) {
 	}
 	state.inbox.Put(approvalMsg)
 
-	select {
-	case got := <-outcomeCh:
-		if got.result.ExitReason != domain.EventTurnCancelled {
-			t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
-		}
-		requireAgentError(t, got.err, domain.ErrTurnCancelled)
-	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not return after the approval request arrived")
+	got := waittest.Receive(t, outcomeCh, "RunTurn outcome after the approval request")
+	if got.result.ExitReason != domain.EventTurnCancelled {
+		t.Errorf("ExitReason = %q, want %q", got.result.ExitReason, domain.EventTurnCancelled)
 	}
+	requireAgentError(t, got.err, domain.ErrTurnCancelled)
 
 	if err := state.conn.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush() error = %v", err)

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // Compile-time assertion: Server satisfies orchestrator.Observer.
@@ -78,10 +78,7 @@ func TestServerLifecycle(t *testing.T) {
 	}()
 
 	// Gracefully shut down.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(waittest.Context(t)); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
@@ -154,9 +151,7 @@ func TestServeMethod(t *testing.T) {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(waittest.Context(t)); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
@@ -324,10 +319,7 @@ func TestSetDrainingThenShutdown(t *testing.T) {
 	}
 
 	// Shutdown should succeed even after draining.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(waittest.Context(t)); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 

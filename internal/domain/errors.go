@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // TrackerErrorKind enumerates the normalized error categories that
@@ -157,10 +158,27 @@ const (
 	// exhausted.
 	ErrTurnRequestLimit AgentErrorKind = "turn_request_limit"
 
-	// ErrCredentialUnverified indicates the runtime did not complete a
-	// request with its credential before the first turn.
+	// ErrCredentialUnverified indicates the runtime refused its
+	// credential on any turn, or did not complete a
+	// credential-verification request.
 	ErrCredentialUnverified AgentErrorKind = "credential_unverified" //nolint:gosec // G101: an error-kind label, not a credential
+
+	// ErrUsageLimit indicates the agent provider refused the turn
+	// because an allowance of the account is exhausted. The error
+	// carries a [UsageLimit].
+	ErrUsageLimit AgentErrorKind = "usage_limit"
 )
+
+// UsageLimit is a provider usage-limit refusal in runtime-neutral form.
+type UsageLimit struct {
+	// ResetsAt is the UTC instant the runtime reported the exhausted
+	// allowance reopens; zero when it reported none.
+	ResetsAt time.Time
+
+	// ModelOnly reports that the exhausted allowance covers only the
+	// model the run used, not the account.
+	ModelOnly bool
+}
 
 // AgentError is a structured error returned by [AgentAdapter]
 // implementations. The Kind field enables the orchestrator to make
@@ -175,6 +193,9 @@ type AgentError struct {
 
 	// Err is the underlying error, if any.
 	Err error
+
+	// UsageLimit is non-nil exactly when Kind is [ErrUsageLimit].
+	UsageLimit *UsageLimit
 }
 
 // Error returns a human-readable diagnostic including the error
@@ -257,7 +278,7 @@ func (k AgentErrorKind) RetryClassification() RetryClassification {
 		return RetryClassification{Backoff: BackoffNone}
 	case ErrTurnTokenLimit:
 		return RetryClassification{Backoff: BackoffNone}
-	case ErrResponseTimeout, ErrTurnTimeout, ErrPortExit, ErrResponseError, ErrTurnFailed, ErrTurnIncomplete, ErrTurnRequestLimit, ErrCredentialUnverified:
+	case ErrResponseTimeout, ErrTurnTimeout, ErrPortExit, ErrResponseError, ErrTurnFailed, ErrTurnIncomplete, ErrTurnRequestLimit, ErrCredentialUnverified, ErrUsageLimit:
 		return RetryClassification{Retryable: true, Backoff: BackoffExponential}
 	default:
 		return RetryClassification{Retryable: true, Backoff: BackoffExponential}

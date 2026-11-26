@@ -71,7 +71,7 @@ func TestEmitTurnCompleted(t *testing.T) {
 
 	wantUsage := domain.TokenUsage{InputTokens: 42, OutputTokens: 7, TotalTokens: 49}
 	got := captureOne(t, func(emit func(domain.AgentEvent)) {
-		EmitTurnCompleted(emit, "done", 250, wantUsage)
+		EmitTurnCompleted(emit, "done", 250, wantUsage, nil)
 	})
 
 	if got.Type != domain.EventTurnCompleted {
@@ -96,7 +96,7 @@ func TestEmitTurnFailed(t *testing.T) {
 	t.Parallel()
 
 	got := captureOne(t, func(emit func(domain.AgentEvent)) {
-		EmitTurnFailed(emit, "oops", 100, domain.TokenUsage{})
+		EmitTurnFailed(emit, "oops", 100, domain.TokenUsage{}, nil)
 	})
 
 	if got.Type != domain.EventTurnFailed {
@@ -115,7 +115,7 @@ func TestEmitTurnCancelled(t *testing.T) {
 	t.Parallel()
 
 	got := captureOne(t, func(emit func(domain.AgentEvent)) {
-		EmitTurnCancelled(emit, "cancelled by user", domain.TokenUsage{})
+		EmitTurnCancelled(emit, "cancelled by user", domain.TokenUsage{}, nil)
 	})
 
 	if got.Type != domain.EventTurnCancelled {
@@ -132,7 +132,7 @@ func TestEmitTurnInputRequired(t *testing.T) {
 
 	wantUsage := domain.TokenUsage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15}
 	got := captureOne(t, func(emit func(domain.AgentEvent)) {
-		EmitTurnInputRequired(emit, "agent asked for a decision only a person can make", wantUsage)
+		EmitTurnInputRequired(emit, "agent asked for a decision only a person can make", wantUsage, nil)
 	})
 
 	if got.Type != domain.EventTurnInputRequired {

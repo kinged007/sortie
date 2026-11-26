@@ -20,6 +20,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func requireHookError(t *testing.T, err error) *HookError {
@@ -212,25 +213,21 @@ func latestWindowsHookTeardownRecord(spy *windowsHookLogSpy, from int, dir strin
 
 // TestRunHook_HeldBackgroundProcessSucceedsWithSettledTeardown pins
 // that a script that echoes a line and starts a background process
-// holding the output, then exits 0, makes RunHook return within 3s with
-// the line and no error, logs no CaptureAbandonedWarning record, and
-// the teardown record takes the Debug arm.
+// holding the output, then exits 0, makes RunHook return with the line
+// and no error, logs no CaptureAbandonedWarning record, and the teardown
+// record takes the Debug arm.
 func TestRunHook_HeldBackgroundProcessSucceedsWithSettledTeardown(t *testing.T) {
 	spy := installWindowsHookLogSpy(t)
 
 	dir := t.TempDir()
 	before := len(spy.snapshot())
 
-	start := time.Now()
 	result, err := RunHook(context.Background(), HookParams{
 		Script:    "echo hello & start /b ping -n 30 127.0.0.1",
 		Dir:       dir,
 		Env:       map[string]string{},
 		TimeoutMS: 5000,
 	})
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("RunHook() took %v, want within 3s", elapsed)
-	}
 	if err != nil {
 		t.Fatalf("RunHook() error: %v", err)
 	}
@@ -327,7 +324,7 @@ func init() {
 // from a helper process with no console of its own (DETACHED_PROCESS),
 // a script that leaves a background process running makes RunHook
 // report TerminatedLeftovers true; a script that exits cleanly reports
-// it false. The helper answers within 20s or the test fails.
+// it false.
 func TestRunHook_DetachedHelperReportsTerminatedLeftovers(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -368,21 +365,8 @@ func TestRunHook_DetachedHelperReportsTerminatedLeftovers(t *testing.T) {
 				_ = cmd.Wait()
 			})
 
-			deadline := time.Now().Add(20 * time.Second)
-			var data []byte
-			for time.Now().Before(deadline) {
-				if b, readErr := os.ReadFile(resultPath); readErr == nil {
-					data = b
-					break
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			if data == nil {
-				t.Fatal("no answer from the detached helper within 20s")
-			}
-
 			var out runHookHelperResult
-			if err := json.Unmarshal(data, &out); err != nil {
+			if err := json.Unmarshal(waittest.File(t, resultPath), &out); err != nil {
 				t.Fatalf("unmarshal helper result: %v", err)
 			}
 			if (out.Err != "") != (tt.wantOp != "") {
@@ -394,8 +378,8 @@ func TestRunHook_DetachedHelperReportsTerminatedLeftovers(t *testing.T) {
 			if out.TerminatedLeftovers != tt.wantLeftover {
 				t.Errorf("TerminatedLeftovers = %v, want %v", out.TerminatedLeftovers, tt.wantLeftover)
 			}
-			if out.RunHookMS > 3000 {
-				t.Errorf("helper's RunHook() took %dms, want within 3000ms", out.RunHookMS)
+			if took := time.Duration(out.RunHookMS) * time.Millisecond; took >= procutil.DefaultDrainGrace {
+				t.Errorf("helper's RunHook() took %v, want less than the %v drain grace: it waited the drain out on the leftover's output", took, procutil.DefaultDrainGrace)
 			}
 		})
 	}

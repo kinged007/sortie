@@ -4,8 +4,11 @@
 # Go/npm dependency files - cicdbot can approve Dependabot PRs
 /go.mod @cicdbot
 /go.sum @cicdbot
-/web/package.json
-/web/package-lock.json
+/web/package.json @cicdbot
+/web/package-lock.json @cicdbot
+
+# Dashboard bundle - cicdbot rebuilds it on Dependabot npm PRs
+/internal/server/ui/dist/ @cicdbot @sergeyklay @serghei-dev
 
 # GitHub Actions workflows - bot + human
 /.github/workflows/ @cicdbot @sergeyklay @serghei-dev

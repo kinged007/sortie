@@ -23,6 +23,7 @@ const (
 	FieldShellScript                       // multiline string (shell script)
 	FieldSequence                          // []any (YAML sequence of maps or scalars)
 	FieldStringOrList                      // string scalar or []any (YAML sequence)
+	FieldNumber                            // integer, float, or string-encoded number
 )
 
 // FieldDef describes a single known configuration field within a section.
@@ -97,6 +98,10 @@ var knownFieldsRegistry = map[string]SectionSchema{
 			{Name: "max_concurrent_agents_by_state", Type: FieldMap},
 			{Name: "max_sessions", Type: FieldInt},
 			{Name: "max_tokens", Type: FieldInt},
+			{Name: "max_cost_usd", Type: FieldNumber},
+			{Name: "max_daily_cost_usd", Type: FieldNumber},
+			{Name: "max_weekly_cost_usd", Type: FieldNumber},
+			{Name: "max_monthly_cost_usd", Type: FieldNumber},
 			{Name: "token_warning_percent", Type: FieldInt},
 			{Name: "max_consecutive_absences", Type: FieldInt},
 			{Name: "stop_grace_ms", Type: FieldInt},
@@ -138,6 +143,7 @@ var staticKnownExtensionKeys = map[string]bool{
 	"logging":     true,
 	"worker":      true,
 	"token_rates": true,
+	"price_table": true,
 }
 
 // FrontMatterWarning represents a single advisory diagnostic from
@@ -695,6 +701,9 @@ func typeMatches(v any, ft FieldType) bool {
 	case FieldInt:
 		_, err := coerceInt(v)
 		return err == nil || errors.Is(err, ErrIntegerOutOfRange)
+	case FieldNumber:
+		_, err := coerceFloat(v)
+		return err == nil
 	default:
 		return false
 	}
@@ -707,6 +716,8 @@ func typeName(ft FieldType) string {
 		return "string"
 	case FieldInt:
 		return "integer"
+	case FieldNumber:
+		return "number"
 	case FieldBool:
 		return "bool"
 	case FieldStringList:

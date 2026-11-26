@@ -4,20 +4,35 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
 )
 
+var (
+	tokenLive = usage.Source{
+		Category: usage.SourceOutput,
+		Strategy: usage.StrategyLive,
+		Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative, DuringTurn: true, ServedModel: true},
+	}
+	vendorOnlyLive = usage.Source{
+		Category: usage.SourceOutput,
+		Strategy: usage.StrategyLive,
+		Spend:    usage.SpendDeclaration{Amounts: []usage.AmountDeclaration{{Unit: "credits", Shape: usage.AmountSessionCumulative}}},
+	}
+	journalRecords = usage.Source{
+		Category: usage.SourceJournal,
+		Strategy: usage.StrategyRecords,
+		Spend:    usage.SpendDeclaration{Shape: usage.SpendPerRequest, ServedModel: true},
+	}
+
+	vendorOnlyJournalSources = usage.Sources{Live: vendorOnlyLive, Records: journalRecords}
+)
+
 func settingsMeta() registry.AgentMeta {
 	return registry.AgentMeta{
-		UsageArrival:     registry.UsageArrivalIncremental,
-		UsageAttribution: registry.UsageAttributionPerModel,
-		UsageSessionRules: []registry.UsageSessionRule{{
-			When:        func(passthrough map[string]any, remote bool) bool { return remote || passthrough["quiet"] == true },
-			Arrival:     registry.UsageArrivalNone,
-			Attribution: registry.UsageAttributionNone,
-		}},
+		UsageSources: usage.Sources{Live: tokenLive},
 		SessionResumeBlockedBy: func(passthrough map[string]any) string {
 			if persist, ok := passthrough["session_persistence"].(bool); ok && !persist {
 				return "session_persistence"
@@ -64,18 +79,16 @@ func settingsConfig(topLevel map[string]any, rules ...config.DispatchRule) confi
 func TestResolveAttemptSettings_UsagePair(t *testing.T) {
 	t.Parallel()
 
-	quiet := config.DispatchRule{Name: "quiet-rule", SettingsKind: "kind-a", Settings: map[string]any{"quiet": true}}
 	tests := []struct {
 		name        string
 		kind        string
-		sshHost     string
-		ruleName    string
 		wantArrival registry.UsageArrival
 		wantAttrib  registry.UsageAttribution
+		wantCarries bool
+		wantShape   string
 	}{
-		{name: "declared pair for a local launch", kind: "kind-a", wantArrival: registry.UsageArrivalIncremental, wantAttrib: registry.UsageAttributionPerModel},
-		{name: "session rule applies to a remote launch", kind: "kind-a", sshHost: "host-1", wantArrival: registry.UsageArrivalNone, wantAttrib: registry.UsageAttributionNone},
-		{name: "session rule reads the selected rule's block", kind: "kind-a", ruleName: "quiet-rule", wantArrival: registry.UsageArrivalNone, wantAttrib: registry.UsageAttributionNone},
+		{name: "token live source on a local launch", kind: "kind-a", wantArrival: registry.UsageArrivalIncremental, wantAttrib: registry.UsageAttributionPerModel, wantCarries: true, wantShape: "incremental"},
+		{name: "vendor-only live source with records on a local launch", kind: "kind-v", wantArrival: registry.UsageArrivalTurnEnd, wantAttrib: registry.UsageAttributionPerModel, wantCarries: true, wantShape: "turn_end"},
 		{name: "unregistered kind resolves the undeclared pair", kind: "ghost", wantArrival: registry.UsageArrivalUndeclared, wantAttrib: registry.UsageAttributionUndeclared},
 	}
 
@@ -83,13 +96,19 @@ func TestResolveAttemptSettings_UsagePair(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg := settingsConfig(nil, quiet)
-			o := attemptSettingsOrchestrator(cfg, map[string]registry.AgentMeta{"kind-a": settingsMeta()})
+			cfg := settingsConfig(nil)
+			o := attemptSettingsOrchestrator(cfg, map[string]registry.AgentMeta{
+				"kind-a": settingsMeta(),
+				"kind-v": {UsageSources: vendorOnlyJournalSources},
+			})
 
-			got := o.resolveAttemptSettings(cfg, DispatchResolution{AgentKind: tt.kind, RuleName: tt.ruleName}, tt.sshHost)
+			got := o.resolveAttemptSettings(cfg, DispatchResolution{AgentKind: tt.kind})
 
-			if got.UsageArrival != tt.wantArrival || got.UsageAttribution != tt.wantAttrib {
-				t.Errorf("resolveAttemptSettings(%q, rule %q, host %q) usage = %q, %q, want %q, %q", tt.kind, tt.ruleName, tt.sshHost, got.UsageArrival, got.UsageAttribution, tt.wantArrival, tt.wantAttrib)
+			if got.UsageArrival != tt.wantArrival || got.UsageAttribution != tt.wantAttrib || got.CarriesTokenFigure != tt.wantCarries {
+				t.Errorf("resolveAttemptSettings(%q) = (%q, %q, carries %t), want (%q, %q, carries %t)", tt.kind, got.UsageArrival, got.UsageAttribution, got.CarriesTokenFigure, tt.wantArrival, tt.wantAttrib, tt.wantCarries)
+			}
+			if shape := o.usageArrival(tt.kind); tt.wantShape != "" && shape != tt.wantShape {
+				t.Errorf("usageArrival(%q) = %q, want %q", tt.kind, shape, tt.wantShape)
 			}
 		})
 	}
@@ -130,7 +149,7 @@ func TestResolveAttemptSettings_Refusals(t *testing.T) {
 			cfg := settingsConfig(tt.topLevel, rules...)
 			o := attemptSettingsOrchestrator(cfg, map[string]registry.AgentMeta{"kind-a": settingsMeta()})
 
-			got := o.resolveAttemptSettings(cfg, selection, "")
+			got := o.resolveAttemptSettings(cfg, selection)
 
 			var checks []string
 			for _, refusal := range got.Refusals {
@@ -149,8 +168,8 @@ func TestSettingsDiagnostics_SplitsSeveritiesAndSkipsUnregisteredKinds(t *testin
 	cfg := settingsConfig(map[string]any{"permission_mode": "default", "noisy": true})
 	settings := config.ResolveAgentSettings(cfg, config.SettingsSelection{Kind: "kind-a"}, "")
 
-	errs, warns := settingsDiagnostics(cfg, settingsMeta(), true, settings, false)
-	skippedErrs, skippedWarns := settingsDiagnostics(cfg, settingsMeta(), false, settings, false)
+	errs, warns := settingsDiagnostics(cfg, settingsMeta(), true, settings)
+	skippedErrs, skippedWarns := settingsDiagnostics(cfg, settingsMeta(), false, settings)
 
 	if len(errs) != 1 || errs[0].Check != "kind-a.permission_mode.interactive" || len(warns) != 1 || warns[0].Check != "kind-a.noisy" {
 		t.Errorf("settingsDiagnostics errors, warnings = %+v, %+v, want the permission_mode check and the noisy check", errs, warns)

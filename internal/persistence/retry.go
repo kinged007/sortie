@@ -48,6 +48,10 @@ type RetryEntry struct {
 	// put-back; empty when the retry never stored it, and for legacy rows.
 	OriginTrigger string
 
+	// UsageLimitNotified reports that the retried run ended in a provider
+	// usage-limit refusal; stored as 0 or 1, false for legacy rows.
+	UsageLimitNotified bool
+
 	// ConfiguredModel is the model the retried dispatch was configured
 	// with; empty when unset and for legacy rows.
 	ConfiguredModel string
@@ -88,8 +92,8 @@ func (s *Store) SaveRetryEntry(ctx context.Context, entry RetryEntry) error {
 	}
 
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO retry_entries (issue_id, identifier, attempt, due_at_ms, error, session_id, rule_name, template_id, agent_kind, stage_previous, stage_previous_outcome, chain_id, display_identifier, issue_title, issue_url, trigger, configured_model, issue_type, issue_labels, issue_state, dispatched_at, origin_trigger)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO retry_entries (issue_id, identifier, attempt, due_at_ms, error, session_id, rule_name, template_id, agent_kind, stage_previous, stage_previous_outcome, chain_id, display_identifier, issue_title, issue_url, trigger, configured_model, issue_type, issue_labels, issue_state, dispatched_at, origin_trigger, usage_limit_notified)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (issue_id) DO UPDATE SET
 			identifier             = excluded.identifier,
 			attempt                = excluded.attempt,
@@ -111,13 +115,14 @@ func (s *Store) SaveRetryEntry(ctx context.Context, entry RetryEntry) error {
 			issue_labels           = excluded.issue_labels,
 			issue_state            = excluded.issue_state,
 			dispatched_at          = excluded.dispatched_at,
-			origin_trigger         = excluded.origin_trigger`,
+			origin_trigger         = excluded.origin_trigger,
+			usage_limit_notified   = excluded.usage_limit_notified`,
 		entry.IssueID, entry.Identifier, entry.Attempt, entry.DueAtMs, errVal, ssnVal,
 		entry.RuleName, entry.TemplateID, entry.AgentKind,
 		entry.StagePrevious, entry.StagePreviousOutcome, entry.ChainID,
 		entry.DisplayID, entry.IssueTitle, entry.IssueURL, entry.Trigger,
 		entry.ConfiguredModel, entry.IssueType, encodeIssueLabels(entry.IssueLabels), entry.IssueState, entry.DispatchedAt,
-		entry.OriginTrigger,
+		entry.OriginTrigger, entry.UsageLimitNotified,
 	)
 	if err != nil {
 		return fmt.Errorf("save retry entry %q: %w", entry.IssueID, err)
@@ -132,7 +137,7 @@ func (s *Store) LoadRetryEntries(ctx context.Context) ([]RetryEntry, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT issue_id, identifier, attempt, due_at_ms, error, session_id, rule_name, template_id, agent_kind,
 			stage_previous, stage_previous_outcome, chain_id, display_identifier, issue_title, issue_url, trigger,
-			configured_model, issue_type, issue_labels, issue_state, dispatched_at, origin_trigger
+			configured_model, issue_type, issue_labels, issue_state, dispatched_at, origin_trigger, usage_limit_notified
 		FROM retry_entries
 		ORDER BY due_at_ms ASC, issue_id ASC`)
 	if err != nil {
@@ -149,7 +154,7 @@ func (s *Store) LoadRetryEntries(ctx context.Context) ([]RetryEntry, error) {
 		if err := rows.Scan(&e.IssueID, &e.Identifier, &e.Attempt, &e.DueAtMs, &errVal, &ssnVal,
 			&e.RuleName, &e.TemplateID, &e.AgentKind, &e.StagePrevious, &e.StagePreviousOutcome, &e.ChainID,
 			&e.DisplayID, &e.IssueTitle, &e.IssueURL, &e.Trigger,
-			&e.ConfiguredModel, &e.IssueType, &labelsVal, &e.IssueState, &e.DispatchedAt, &e.OriginTrigger); err != nil {
+			&e.ConfiguredModel, &e.IssueType, &labelsVal, &e.IssueState, &e.DispatchedAt, &e.OriginTrigger, &e.UsageLimitNotified); err != nil {
 			return nil, fmt.Errorf("scan retry entry: %w", err)
 		}
 		e.IssueLabels = decodeIssueLabels(labelsVal)

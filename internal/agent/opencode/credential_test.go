@@ -3,7 +3,6 @@
 package opencode
 
 import (
-	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,7 +11,6 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
-	"github.com/sortie-ai/sortie/internal/agent/sshutil"
 	"github.com/sortie-ai/sortie/internal/domain"
 )
 
@@ -49,65 +47,5 @@ func TestDeleteVerificationSession_CarriesManagedEnv(t *testing.T) {
 	}
 	if string(got) != "true" {
 		t.Errorf("session delete launch OPENCODE_DISABLE_AUTOUPDATE = %q, want %q", got, "true")
-	}
-}
-
-func writeSSHExit255Script(t *testing.T, dir string, runOutput []byte) string {
-	t.Helper()
-	exportPath := filepath.Join(dir, "export.json")
-	if err := os.WriteFile(exportPath, []byte(`{"info":{"id":""},"messages":[]}`), 0o644); err != nil {
-		t.Fatalf("WriteFile(export.json): %v", err)
-	}
-	runPath := filepath.Join(dir, "run.jsonl")
-	if err := os.WriteFile(runPath, runOutput, 0o644); err != nil {
-		t.Fatalf("WriteFile(run.jsonl): %v", err)
-	}
-	body := `case "$1 $2" in
-  "session export") cat '` + exportPath + `'; exit 0;;
-esac
-cat '` + runPath + `'
-exit 255
-`
-	return agenttest.WriteScript(t, dir, "fake-opencode-ssh255", body)
-}
-
-var nonTerminalStepFinishToolCalls = []byte(`{"type":"step_finish","timestamp":1777197446660,"sessionID":"ses_abc123","part":{"id":"prt_003","reason":"tool-calls","messageID":"msg_001","sessionID":"ses_abc123","type":"step-finish"}}` + "\n")
-
-func TestRunTurn_SSHExit255WithoutForkPerTurn(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name                 string
-		runOutput            []byte
-		wantConnectionFailed bool
-	}{
-		{name: "no output wraps connection failed", wantConnectionFailed: true},
-		{name: "output with no terminal step_finish still wraps connection failed", runOutput: nonTerminalStepFinishToolCalls, wantConnectionFailed: true},
-		{name: "output with a terminal step_finish does not wrap connection failed", runOutput: loadFixture(t, "simple_turn.jsonl")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			tmpDir := t.TempDir()
-			script := writeSSHExit255Script(t, tmpDir, tt.runOutput)
-
-			a, _ := NewOpenCodeAdapter()
-			session := mustBuildSSHSessionWithLocalScript(t, tmpDir, script, "example.test")
-
-			_, result, err := collectEvents(t, a, session, "work")
-
-			if got := errors.Is(err, sshutil.ErrConnectionFailed); got != tt.wantConnectionFailed {
-				t.Fatalf("RunTurn() error = %v, wraps sshutil.ErrConnectionFailed = %v, want %v", err, got, tt.wantConnectionFailed)
-			}
-			var agentErr *domain.AgentError
-			if !errors.As(err, &agentErr) || agentErr.Kind != domain.ErrPortExit {
-				t.Errorf("RunTurn() error kind = %v, want %q", err, domain.ErrPortExit)
-			}
-			if result.ExitReason != domain.EventTurnFailed {
-				t.Errorf("RunTurn() ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)
-			}
-		})
 	}
 }

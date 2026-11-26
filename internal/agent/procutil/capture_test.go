@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func init() {
@@ -174,17 +175,8 @@ func TestCapture_AbandonedStreamClosesThroughAsyncSeam(t *testing.T) {
 		drainGrace: 50 * time.Millisecond,
 	}
 
-	type outcome struct{ result CaptureResult }
-	done := make(chan outcome, 1)
-	go func() { done <- outcome{c.Wait()} }()
-
-	select {
-	case oc := <-done:
-		if oc.result.OutputComplete {
-			t.Error("OutputComplete = true, want false (the pipe was never written to or closed)")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Wait() did not return within 2s despite the close seam returning at once, want it not to block on the close ever completing")
+	if result := awaitCapture(t, c); result.OutputComplete {
+		t.Error("OutputComplete = true, want false (the pipe was never written to or closed)")
 	}
 
 	select {
@@ -239,24 +231,15 @@ func newCancelProbe(t *testing.T, install func(*exec.Cmd), name string, args ...
 
 func (p *cancelProbe) fire() {
 	p.cancel()
-	select {
-	case <-p.ran:
-		p.observed.Store(true)
-	case <-time.After(5 * time.Second):
-	}
+	_, ran := waittest.ReceiveWithin(p.ran, waittest.HangGuard)
+	p.observed.Store(ran)
 }
 
-func awaitCaptureResult(t *testing.T, c *Capture, within time.Duration) CaptureResult {
+func awaitCapture(t *testing.T, c *Capture) CaptureResult {
 	t.Helper()
 	done := make(chan CaptureResult, 1)
 	go func() { done <- c.Wait() }()
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(within):
-		t.Fatalf("Wait() did not return within %v", within)
-		return CaptureResult{}
-	}
+	return waittest.Receive(t, done, "Capture.Wait() result")
 }
 
 func TestCapture_StopWhileRunningIsRecorded(t *testing.T) {
@@ -301,7 +284,7 @@ func TestCapture_StopWhileRunningIsRecorded(t *testing.T) {
 			}
 
 			tt.stop(t, cmd, p)
-			result := awaitCaptureResult(t, c, 10*time.Second)
+			result := awaitCapture(t, c)
 
 			if !result.Stopped {
 				t.Errorf("Wait().Stopped = false after %s while the child ran, want true", tt.name)

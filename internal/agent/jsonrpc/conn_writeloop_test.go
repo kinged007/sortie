@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // neverReadPipe returns an io.Writer whose reader end is never read,
@@ -68,13 +69,9 @@ func TestConn_CallReturnsOnCtxCancelWhilePeerNeverReads(t *testing.T) {
 
 	cancel()
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, context.Canceled) {
-			t.Errorf("Call() error = %v, want error wrapping context.Canceled", outcome.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Call() did not return within 2s after ctx cancel while the peer never read the request")
+	outcome := waittest.Receive(t, done, "Call() return after ctx cancel while the peer never read the request")
+	if !errors.Is(outcome.err, context.Canceled) {
+		t.Errorf("Call() error = %v, want error wrapping context.Canceled", outcome.err)
 	}
 }
 
@@ -107,13 +104,8 @@ func TestConn_EnqueueingMethodsReturnAtOnceWhilePeerNeverReads(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- tt.do(conn) }()
 
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Errorf("%s() error = %v, want nil", tt.name, err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatalf("%s() did not return within 2s while the peer never read the pipe", tt.name)
+			if err := waittest.Receive(t, done, tt.name+"() return while the peer never read the pipe"); err != nil {
+				t.Errorf("%s() error = %v, want nil", tt.name, err)
 			}
 		})
 	}
@@ -192,20 +184,12 @@ func TestConn_WriteFailureIsTerminal(t *testing.T) {
 		done <- callOutcome{resp: resp, err: err}
 	}()
 
-	select {
-	case outcome := <-done:
-		if !errors.Is(outcome.err, writeErr) {
-			t.Errorf("Call() error = %v, want error wrapping %v", outcome.err, writeErr)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Call() did not fail after the write behind it failed")
+	outcome := waittest.Receive(t, done, "Call() failure after the write behind it failed")
+	if !errors.Is(outcome.err, writeErr) {
+		t.Errorf("Call() error = %v, want error wrapping %v", outcome.err, writeErr)
 	}
 
-	select {
-	case <-conn.WriteFailed():
-	case <-time.After(2 * time.Second):
-		t.Fatal("WriteFailed() did not close after a write failure")
-	}
+	waittest.Receive(t, conn.WriteFailed(), "WriteFailed() close after a write failure")
 
 	if got := w.calls.Load(); got != 1 {
 		t.Fatalf("writer was called %d times before later sends were attempted, want 1", got)
@@ -269,30 +253,17 @@ func TestConn_Flush(t *testing.T) {
 			t.Fatalf("Notify() error = %v", err)
 		}
 
-		select {
-		case <-w.entered:
-		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for the write to start")
-		}
+		waittest.Receive(t, w.entered, "the write to start")
 
 		flushDone := make(chan error, 1)
 		go func() { flushDone <- conn.Flush(context.Background()) }()
 
-		select {
-		case err := <-flushDone:
-			t.Fatalf("Flush() returned (err=%v) before the in-progress write finished", err)
-		case <-time.After(200 * time.Millisecond):
-		}
+		waittest.Never(t, flushDone, 200*time.Millisecond, "Flush() return before the in-progress write finished")
 
 		close(w.release)
 
-		select {
-		case err := <-flushDone:
-			if err != nil {
-				t.Errorf("Flush() error = %v, want nil", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("Flush() did not return after the write finished")
+		if err := waittest.Receive(t, flushDone, "Flush() return after the write finished"); err != nil {
+			t.Errorf("Flush() error = %v, want nil", err)
 		}
 	})
 
@@ -314,13 +285,8 @@ func TestConn_Flush(t *testing.T) {
 
 		cancel()
 
-		select {
-		case err := <-flushDone:
-			if !errors.Is(err, context.Canceled) {
-				t.Errorf("Flush() error = %v, want error wrapping context.Canceled", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("Flush() did not return after ctx cancel while the peer never read the pipe")
+		if err := waittest.Receive(t, flushDone, "Flush() return after ctx cancel while the peer never read the pipe"); !errors.Is(err, context.Canceled) {
+			t.Errorf("Flush() error = %v, want error wrapping context.Canceled", err)
 		}
 	})
 

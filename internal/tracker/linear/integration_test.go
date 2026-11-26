@@ -315,24 +315,6 @@ func TestIntegration_AddLabel(t *testing.T) {
 	}
 }
 
-func TestIntegration_CommentIssueWithLiteral(t *testing.T) {
-	skipUnlessIntegration(t)
-
-	adapter := newIntegrationAdapter(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	issue := firstCandidate(t, adapter, ctx)
-
-	text := "sortie literal round trip " + time.Now().UTC().Format(time.RFC3339Nano)
-	statement := "/close\n@sortie-literal-probe please look\n[~jdoe] see https://example.com/probe?x=1\n" +
-		"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat}\ntoken=[redacted]"
-	if err := adapter.CommentIssueWithLiteral(ctx, issue.ID, text, statement); err != nil {
-		t.Fatalf("CommentIssueWithLiteral(%s): %v", issue.Identifier, err)
-	}
-}
-
 func TestIntegration_LabelRoundTrip(t *testing.T) {
 	skipUnlessIntegration(t)
 

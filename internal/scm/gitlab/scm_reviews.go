@@ -19,10 +19,13 @@ type gitlabReviewer struct {
 	State string     `json:"state"`
 }
 
-// gitlabApprovals is the merge-request approvals response, decoding
-// only the Community Edition field the review-decision fold reads.
+// gitlabApprovals is the merge-request approvals response, decoding only
+// the fields the review-decision fold reads. ApprovalsLeft is the approvals
+// the merge gate still requires; Community Edition omits it, which decodes
+// as 0, so an instance without approval rules never reports an unmet rule.
 type gitlabApprovals struct {
-	Approved bool `json:"approved"`
+	Approved      bool `json:"approved"`
+	ApprovalsLeft int  `json:"approvals_left"`
 }
 
 // gitlabUserDetail is the GET /users/:id response, decoding only the
@@ -274,7 +277,12 @@ func (a *GitLabSCMAdapter) FetchBotReviewComments(ctx context.Context, prNumber 
 
 // GetReviewDecision returns the aggregated review decision for the
 // given merge request, folding the reviewer states and the approvals
-// payload.
+// payload through [scmcore.FoldReviewDecision].
+//
+// Enterprise Edition reports an unmet approval rule as approvals_left above
+// zero, which yields [domain.ReviewDecisionReviewRequired] with or without a
+// reviewer. Community Edition has no approval rules, so an assigned reviewer
+// who has not approved yields [domain.ReviewDecisionReviewRequested].
 //
 // A requested_changes reviewer short-circuits to
 // [domain.ReviewDecisionChangesRequested] before the approvals read,
@@ -308,11 +316,9 @@ func (a *GitLabSCMAdapter) GetReviewDecision(ctx context.Context, prNumber int, 
 		}
 	}
 
-	if approvals.Approved {
-		return domain.ReviewDecisionApproved, nil
-	}
-	if len(reviewers) > 0 {
-		return domain.ReviewDecisionReviewRequired, nil
-	}
-	return domain.ReviewDecisionNotRequired, nil
+	return scmcore.FoldReviewDecision(scmcore.ReviewFacts{
+		ApprovalRuleUnmet: approvals.ApprovalsLeft > 0,
+		Approved:          approvals.Approved,
+		ReviewerRequested: len(reviewers) > 0,
+	}), nil
 }

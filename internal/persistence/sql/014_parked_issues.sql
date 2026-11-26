@@ -1,5 +1,3 @@
--- Migration 14: issues held out of primary dispatch until a human acts
-
 CREATE TABLE parked_issues (
     issue_id      TEXT    PRIMARY KEY,
     identifier    TEXT    NOT NULL,

@@ -17,6 +17,7 @@ const (
 	mcpEchoServerScenario = "mcp-echo-server"
 	relayedEnvName        = "RELAY_TEST_DISPATCH_ID"
 	relayedEnvValue       = "dispatch-7f3a91c2"
+	bothMedia             = "application/json, text/event-stream"
 )
 
 type mcpEchoParams struct {
@@ -85,13 +86,25 @@ func TestRecordingMCPRelay_AssertToolCallSucceeded(t *testing.T) {
 	)
 
 	identity := map[string]string{"SORTIE_DISPATCH_ID": "abc"}
+	pairedByRequest := []string{
+		`{"pid":10,"dir":"to_server","req":1,"msg":{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sortie_status"}}}`,
+		`{"pid":10,"dir":"to_server","req":2,"msg":{"jsonrpc":"2.0","id":5,"method":"tools/list"}}`,
+		`{"pid":10,"dir":"to_client","req":2,"msg":{"jsonrpc":"2.0","id":5,"result":{"tools":[]}}}`,
+		`{"pid":10,"dir":"to_client","req":1,"msg":{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"boom"}}}`,
+	}
 
 	tests := []struct {
 		name     string
 		lines    []string
+		missing  bool
 		env      map[string]string
 		wantFail bool
 	}{
+		{name: "legacy era over stdio", lines: eraTraffic("legacy", false)},
+		{name: "modern era over stdio", lines: eraTraffic("modern", false)},
+		{name: "modern era over http", lines: eraTraffic("modern", true)},
+		{name: "http error response pairs with its own request", lines: pairedByRequest, wantFail: true},
+		{name: "record file missing", missing: true, wantFail: true},
 		{name: "call answered without error", lines: []string{statusCall, statusOK}},
 		{name: "call answered after an unrelated message", lines: []string{statusCall, otherID, statusOK}},
 		{name: "call answered with an error", lines: []string{statusCall, statusErr}, wantFail: true},
@@ -110,7 +123,10 @@ func TestRecordingMCPRelay_AssertToolCallSucceeded(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			relay := writeMCPRecord(t, tt.lines...)
+			relay := agenttest.RecordingMCPRelay{RecordPath: filepath.Join(t.TempDir(), "absent.jsonl")}
+			if !tt.missing {
+				relay = writeMCPRecord(t, tt.lines...)
+			}
 			rec := &recordingTB{TB: t}
 
 			relay.AssertToolCallSucceeded(rec, "sortie_status", tt.env)
@@ -122,16 +138,64 @@ func TestRecordingMCPRelay_AssertToolCallSucceeded(t *testing.T) {
 	}
 }
 
-func TestRecordingMCPRelay_MissingRecordFails(t *testing.T) {
+func eraTraffic(era string, overHTTP bool) []string {
+	meta := ""
+	if era == "modern" {
+		meta = `,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}`
+	}
+	record := func(dir string, req int, msg string) string {
+		if !overHTTP {
+			return fmt.Sprintf(`{"pid":10,"dir":%q,"msg":%s}`, dir, msg)
+		}
+		return fmt.Sprintf(`{"pid":10,"dir":%q,"req":%d,"accept":%q,"msg":%s}`, dir, req, bothMedia, msg)
+	}
+	open := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`
+	if era == "modern" {
+		open = `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+	}
+	return []string{
+		record("to_server", 1, open),
+		record("to_client", 1, `{"jsonrpc":"2.0","id":1,"result":{}}`),
+		record("to_server", 2, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{`+strings.TrimPrefix(meta, ",")+`}}`),
+		record("to_client", 2, `{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}`),
+		record("to_server", 3, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sortie_status"`+meta+`}}`),
+		record("to_client", 3, `{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{}"}]}}`),
+	}
+}
+
+func TestRecordingMCPRelay_AssertAcceptNamesBothMedia(t *testing.T) {
 	t.Parallel()
 
-	relay := agenttest.RecordingMCPRelay{RecordPath: filepath.Join(t.TempDir(), "absent.jsonl")}
-	rec := &recordingTB{TB: t}
+	postRecord := func(accept string) string {
+		return fmt.Sprintf(`{"pid":10,"dir":"to_server","req":1,"accept":%q,"msg":{"jsonrpc":"2.0","id":1,"method":"initialize"}}`, accept)
+	}
+	postWithoutAccept := `{"pid":10,"dir":"to_server","req":1,"accept":"","msg":{"jsonrpc":"2.0","id":1,"method":"initialize"}}`
+	stdioRequest := `{"pid":10,"dir":"to_server","msg":{"jsonrpc":"2.0","id":1,"method":"initialize"}}`
 
-	relay.AssertToolCallSucceeded(rec, "sortie_status", nil)
+	tests := []struct {
+		name     string
+		lines    []string
+		wantFail bool
+	}{
+		{name: "both named", lines: []string{postRecord("application/json, text/event-stream")}},
+		{name: "json only", lines: []string{postRecord("application/json")}, wantFail: true},
+		{name: "header absent", lines: []string{postWithoutAccept}, wantFail: true},
+		{name: "stdio traffic only", lines: []string{stdioRequest}, wantFail: true},
+	}
 
-	if rec.errors == 0 {
-		t.Error("AssertToolCallSucceeded(\"sortie_status\") passed on a missing record, want failure")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			relay := writeMCPRecord(t, tt.lines...)
+			rec := &recordingTB{TB: t}
+
+			relay.AssertAcceptNamesBothMedia(rec, "claude-code")
+
+			if failed := rec.errors > 0; failed != tt.wantFail {
+				t.Errorf("AssertAcceptNamesBothMedia(%q) failed = %v, want %v", tt.name, failed, tt.wantFail)
+			}
+		})
 	}
 }
 

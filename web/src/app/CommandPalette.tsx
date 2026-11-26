@@ -4,7 +4,6 @@ import { useLocation, useNavigate } from "react-router";
 import { useIssueLookupQuery, useStateQuery } from "@/api/queries";
 import { Kbd } from "@/app/Kbd";
 import { useLive } from "@/app/live";
-import { ServedText } from "@/components/ServedText";
 import {
   Autocomplete,
   AutocompleteCollection,
@@ -17,17 +16,18 @@ import {
   useAutocompleteFilter,
 } from "@/components/ui/autocomplete";
 import { Dialog, DialogPopup } from "@/components/ui/dialog";
-import { routeText } from "@/lib/active-rows";
+import { issueAwaitsApproval, routeText } from "@/lib/active-rows";
 import { fmtStamp, parseInstant } from "@/lib/format";
 import { issueLinkOf, sessionLinkOf } from "@/lib/issue-link";
-import { runRouteText } from "@/lib/lane";
+import { issueStanding, runRouteText } from "@/lib/lane";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 import { setTheme } from "@/lib/theme";
 
 import type { ScreenEntry } from "@/app/Rail";
 import type {
   ActiveIssueResponse,
+  AttentionItemResponse,
   ConfigResponse,
   IssueGroupResponse,
   RunningEntryResponse,
@@ -46,7 +46,7 @@ interface IssueEntry {
   value: string;
   label: string;
   identifier: string;
-  statusText: string;
+  word: string;
 }
 
 interface SessionEntry {
@@ -70,20 +70,25 @@ const LOOKUP_DEBOUNCE_MS = 250;
 const LOOKUP_FAILED = "Run history could not be read.";
 
 function isIssueEntry(item: PaletteItem): item is IssueEntry {
-  return "statusText" in item;
+  return "word" in item;
 }
 
 function isSessionEntry(item: PaletteItem): item is SessionEntry {
   return "dispatchId" in item;
 }
 
-function issueEntryOf(issue: ActiveIssueResponse | IssueGroupResponse): IssueEntry {
+function issueEntryOf(
+  issue: ActiveIssueResponse | IssueGroupResponse,
+  attention: readonly AttentionItemResponse[],
+  awaitingApproval: boolean,
+): IssueEntry {
   const key = issue.display_identifier || issue.issue_identifier;
+  const outcome = "issue_outcome" in issue ? issue.issue_outcome : null;
   return {
     value: `issue:${issue.issue_id}`,
     label: issue.issue_title ? `${key} ${issue.issue_title}` : key,
     identifier: issue.issue_identifier,
-    statusText: issue.status_text,
+    word: issueStanding(issue.issue_id, issue.status, outcome, attention, awaitingApproval).word,
   };
 }
 
@@ -131,7 +136,7 @@ function finishedSessionEntriesOf(
       identifier: group.issue_identifier,
       dispatchId,
       route: runRouteText(run, config),
-      status: runStatus(run.status).word,
+      status: runOutcome(run).word,
       startedAt: run.started_at,
     }));
 }
@@ -151,7 +156,6 @@ const THEME_COMMANDS: { choice: ThemeChoice; label: string }[] = [
   { choice: "dark", label: "Theme: Dark" },
 ];
 
-/** Props of {@link CommandPalette}. */
 export interface CommandPaletteProps {
   screens: ScreenEntry[];
   open: boolean;
@@ -162,7 +166,6 @@ export interface CommandPaletteProps {
   onOpenShortcuts: () => void;
 }
 
-/** Renders the command palette: a dialog with a search field over "Go to" entries for the registered screens and the global commands. */
 export function CommandPalette({
   screens,
   open,
@@ -218,7 +221,9 @@ export function CommandPalette({
       : (lookup.data ?? [])
           .filter((group) => !activeIds.has(group.issue_id))
           .slice(0, FINISHED_ENTRY_CAP);
-  const issueEntries = [...activeIssues, ...finishedIssues].map(issueEntryOf);
+  const issueEntries = [...activeIssues, ...finishedIssues].map((issue) =>
+    issueEntryOf(issue, state?.attention ?? [], issueAwaitsApproval(state, issue.issue_id)),
+  );
   const sessionEntries =
     issueQuery === ""
       ? []
@@ -298,7 +303,7 @@ export function CommandPalette({
                         <span className="flex min-w-0 flex-col">
                           <span className="wrap-anywhere">{item.label}</span>
                           <span className="text-body-sm text-ink-muted wrap-anywhere">
-                            <ServedText text={item.statusText} />
+                            {item.word}
                           </span>
                         </span>
                       </AutocompleteItem>

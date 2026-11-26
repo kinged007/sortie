@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/launchtest"
 	"github.com/sortie-ai/sortie/internal/agent/clientprotocol"
 	"github.com/sortie-ai/sortie/internal/domain"
 
@@ -47,7 +49,7 @@ func induceProtocolContinuation(t *testing.T, coords Coordinates, fixture *share
 		return seed, unmetRecall
 	}
 
-	fullCommand := append([]string{coords.CommandPath}, argv...)
+	fullCommand := slices.Concat(modelEnvironPrefix(coords.Profile, coords.Model), []string{coords.CommandPath}, argv)
 	launchConfig := domain.AgentConfig{
 		Kind:           "agent-client-protocol",
 		Command:        strings.Join(fullCommand, " "),
@@ -65,6 +67,7 @@ func induceProtocolContinuation(t *testing.T, coords Coordinates, fixture *share
 		seed := transportGraded(evidence.Observation{Grade: evidence.GradeNotObserved, Outcome: evidence.OutcomePrerequisiteFailed, Detail: "the seed session failed to start"})
 		return seed, unmetRecall
 	}
+	firstGroup, bindErr := launchtest.Held(firstSession.AgentPID)
 	createdAt := time.Now().UTC()
 
 	seedPrompt := strings.ReplaceAll(coords.Profile.ProbePrompts[promptKeyContinuationSeed], "{nonce}", fixture.nonce)
@@ -76,7 +79,10 @@ func induceProtocolContinuation(t *testing.T, coords Coordinates, fixture *share
 	if stopErr := adapter.StopSession(context.Background(), firstSession); stopErr != nil {
 		t.Errorf("stop the continuation induction's seed session: %v", stopErr)
 	}
-	assertSessionGroupAbsent(t, firstSession)
+	if bindErr != nil {
+		t.Fatalf("account for the continuation induction's seed session: %v", bindErr)
+	}
+	requireTornDown(t, firstGroup)
 
 	seedOutcome := evidence.LaunchOutcomeCompleted
 	if seedErr != nil {
@@ -109,7 +115,8 @@ func induceProtocolContinuation(t *testing.T, coords Coordinates, fixture *share
 	// Registered with the run rather than stopped here, so the
 	// process-cleanup reading stops and measures this session while the
 	// run is still being graded.
-	if err := fixture.registerSession(adapter, secondSession); err != nil {
+	secondGroup, err := fixture.registerSession(adapter, secondSession)
+	if err != nil {
 		_ = adapter.StopSession(context.Background(), secondSession)
 		t.Fatalf("account for the continuation induction's recall session: %v", err)
 	}
@@ -117,7 +124,7 @@ func induceProtocolContinuation(t *testing.T, coords Coordinates, fixture *share
 		if _, err := fixture.stopOpenSessions(context.Background()); err != nil {
 			t.Errorf("stop the continuation induction's recall session: %v", err)
 		}
-		assertSessionGroupAbsent(t, secondSession)
+		requireTornDown(t, secondGroup)
 	})
 
 	// A load replays the prior conversation into this turn's events, so
@@ -170,7 +177,7 @@ func induceNativeContinuation(t *testing.T, coords Coordinates, fixture *sharedF
 	}
 	seedArgv = append(seedArgv, substituteSessionID(entry.SeedArgs, correlationID)...)
 
-	seedOutput, seedLaunchErr := launchNativeProbe(t, coords.CommandPath, seedArgv, workspace, fixture.env, fixture.ownership())
+	seedOutput, seedLaunchErr := launchNativeProbe(t, coords.CommandPath, seedArgv, workspace, withModelEnviron(fixture.env, coords.Profile, coords.Model), fixture.ownership())
 	fixture.recordNativeOutput(surface, seedOutput)
 
 	seedLaunch := newNativeLaunchRecord(seedArgv, coords, promptKeyContinuationSeed, correlationID, seedLaunchErr)
@@ -204,7 +211,7 @@ func induceNativeContinuation(t *testing.T, coords Coordinates, fixture *sharedF
 	}
 	recallArgv = append(recallArgv, substituteSessionID(entry.ResumeArgs, resumeSessionID)...)
 
-	recallOutput, recallLaunchErr := launchNativeProbe(t, coords.CommandPath, recallArgv, workspace, fixture.env, fixture.ownership())
+	recallOutput, recallLaunchErr := launchNativeProbe(t, coords.CommandPath, recallArgv, workspace, withModelEnviron(fixture.env, coords.Profile, coords.Model), fixture.ownership())
 	fixture.recordNativeOutput(surface, recallOutput)
 
 	recallLaunch := newNativeLaunchRecord(recallArgv, coords, promptKeyContinuationRecall, "", recallLaunchErr)

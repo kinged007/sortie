@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+
+	"github.com/sortie-ai/sortie/internal/pricing"
 )
 
 // funcs is the FuncMap every template in the table is parsed with.
@@ -13,6 +15,7 @@ var funcs = template.FuncMap{
 	"elapsed":  elapsed,
 	"due":      due,
 	"tokens":   tokens,
+	"usd":      pricing.FormatUSD,
 	"count":    count,
 	"plural":   plural,
 	"list":     list,

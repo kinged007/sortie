@@ -491,11 +491,11 @@ func applyMergeConflictEscalation(
 		)
 	}
 
-	commentText := buildMergeConflictEscalationComment(data, attempts)
+	var facts domain.MessageFacts = domain.MergeConflictFacts{PRNumber: data.PRNumber, Attempts: attempts}
 	if trigger == EscalationTriggerTriage {
-		commentText = buildTriageEscalationComment("merge-conflict", fmt.Sprintf("PR #%d", data.PRNumber))
+		facts = domain.TriageEscalationFacts{PRNumber: data.PRNumber}
 	}
-	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeConflicts, pending, commentText))
+	delivery := params.Router.Route(reactionNotification(domain.EventEscalationMergeConflicts, pending, facts))
 
 	if params.MergeConflictConfig.Escalation == "label" {
 		label := params.MergeConflictConfig.EscalationLabel
@@ -533,20 +533,4 @@ func applyMergeConflictEscalation(
 	publishEscalation(ctx, &state.TrackerOpsWg, delivery, log, record, func(err error) {
 		log.Warn("merge conflict escalation comment failed", slog.Any("error", err))
 	})
-}
-
-// buildMergeConflictEscalationComment returns the plain-text escalation
-// comment used when the per-episode retry budget is exhausted. Plain text
-// is used so the comment renders consistently across all tracker adapters.
-func buildMergeConflictEscalationComment(data *MergeConflictReactionData, attempts int) string {
-	// The observation that trips the retry cap dispatches no continuation, so
-	// the number of resolution turns actually dispatched is attempts-1. At
-	// max_retries 0 this is 0: the reaction escalates on first detection
-	// without attempting a rebase.
-	dispatched := attempts - 1
-	return fmt.Sprintf(
-		"Sortie attempted %d merge-conflict resolution turn(s) and could not clear the conflicts for PR #%d. Manual rebase required.",
-		dispatched,
-		data.PRNumber,
-	)
 }

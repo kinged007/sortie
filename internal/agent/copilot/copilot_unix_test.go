@@ -9,13 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const versionHeldDescendantScenario = "copilot.version-held-descendant"
@@ -51,37 +51,6 @@ func init() {
 	fakeScenarios[versionHeldDescendantScenario] = agenttest.Typed(runVersionHeldDescendant)
 }
 
-// pollCopilotPIDAndAssertGone polls path for a positive PID, then
-// polls until kill(pid, 0) reports an error (process gone), failing t
-// if either bound is exceeded.
-func pollCopilotPIDAndAssertGone(t *testing.T, path string) {
-	t.Helper()
-
-	deadline := time.Now().Add(5 * time.Second)
-	var pid int
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil {
-			if v, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && v > 0 {
-				pid = v
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if pid == 0 {
-		t.Fatalf("pid file %q never populated", path)
-	}
-
-	goneDeadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(goneDeadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Errorf("descendant %d still answers signal 0, want it gone", pid)
-}
-
 func TestStartSession_VersionCanaryHeldDescendantHoldingOutput(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token-for-unit-test")
 
@@ -103,12 +72,12 @@ func TestStartSession_VersionCanaryHeldDescendantHoldingOutput(t *testing.T) {
 		WorkspacePath: t.TempDir(),
 		AgentConfig:   domain.AgentConfig{Command: binPath},
 	})
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("StartSession() took %v, want within 3s", elapsed)
+	if elapsed := time.Since(start); elapsed > procutil.DefaultDrainGrace {
+		t.Errorf("StartSession() took %v, want under the default drain grace %v", elapsed, procutil.DefaultDrainGrace)
 	}
 	if err != nil {
 		t.Fatalf("StartSession() error = %v, want nil", err)
 	}
 
-	pollCopilotPIDAndAssertGone(t, pidPath)
+	waittest.ProcessGone(t, waittest.PIDFile(t, pidPath))
 }

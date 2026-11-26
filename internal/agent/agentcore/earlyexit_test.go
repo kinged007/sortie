@@ -3,10 +3,11 @@ package agentcore
 import (
 	"context"
 	"errors"
-	"os"
+	"io"
 	"os/exec"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
@@ -309,27 +310,27 @@ func TestEarlyExit_Report_IncompleteAppendsAbandonedMarker(t *testing.T) {
 func TestEarlyExit_Report_SecondFinishAndCollectDoesNotWait(t *testing.T) {
 	t.Parallel()
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() = %v", err)
-	}
-	stderr := procutil.NewStderrCollector(r, nil)
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			drainDelay = 150 * time.Millisecond
+			grace      = 5 * time.Second
+		)
+		r, w := io.Pipe()
+		stderr := procutil.NewStderrCollector(r, nil)
+		time.AfterFunc(drainDelay, func() { _ = w.Close() })
 
-	const drainDelay = 150 * time.Millisecond
-	time.AfterFunc(drainDelay, func() { _ = w.Close() })
+		// The first call actually waits out the drain, so there is a real
+		// wait for a bug to double.
+		stderr.FinishAndCollect(grace)
 
-	// The first call actually waits out the drain, so there is a real
-	// wait for a bug to double.
-	stderr.FinishAndCollect(5 * time.Second)
+		e := EarlyExit{observed: true, grace: grace}
+		start := time.Now()
+		_ = e.Report(stderr)
 
-	e := EarlyExit{observed: true, grace: 5 * time.Second}
-	start := time.Now()
-	_ = e.Report(stderr)
-	elapsed := time.Since(start)
-
-	if elapsed > drainDelay {
-		t.Errorf("Report() took %v after FinishAndCollect already resolved, want well under the drain delay %v, want no additional wait toward the 5s grace", elapsed, drainDelay)
-	}
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("Report() took %v after FinishAndCollect already resolved, want no additional wait toward the %v grace", elapsed, grace)
+		}
+	})
 }
 
 func TestEarlyExit_Report_RepeatedCallsProduceEqualErrors(t *testing.T) {

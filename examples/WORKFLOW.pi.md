@@ -71,7 +71,7 @@ server:
      turns, so continuation uses the existing session instead of
      starting over.
 
-     pi has no MCP transport, so the `pi` block takes no mcp_config
+     The pi adapter delivers no tool server, so the `pi` block takes no mcp_config
      and Sortie's own tools are neither advertised nor callable here.
      The tool set the agent works with is narrowed by allowed_tools
      and denied_tools instead.

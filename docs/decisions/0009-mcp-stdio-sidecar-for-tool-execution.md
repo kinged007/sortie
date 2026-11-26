@@ -144,7 +144,7 @@ Both channels draw from the same `ToolRegistry`, so the tool set is always consi
 
 ### Graceful degradation: MCP server crash
 
-If `sortie mcp-server` crashes or exits unexpectedly mid-session, the agent runtime detects the broken stdio pipe and returns a JSON-RPC error for any subsequent `tools/call` request. The worker does not detect or handle this event directly — it has no visibility into the MCP server process, which is the agent runtime's child (per decision driver #4).
+If `sortie mcp-server` crashes or exits unexpectedly mid-session, the agent runtime detects the broken stdio pipe and returns a JSON-RPC error for any subsequent `tools/call` request. The worker does not detect or handle this event directly — it has no visibility into the MCP server process, which is the agent runtime's child.
 
 This is by design, for three reasons:
 
@@ -154,13 +154,13 @@ This is by design, for three reasons:
 
 3. **Defense in depth provides resilience.** Per Section 10.4.6, the tool channel and file channel are independent. If the MCP execution channel becomes unavailable, the agent still has prompt-time tool documentation and the `.sortie/status` advisory file channel. Neither channel is a single point of failure for the other.
 
-Adding MCP-server-specific crash detection to the worker would violate the agent-agnostic principle (decision driver #1): the worker would need knowledge of the MCP server's process identity and failure semantics, coupling it to the sidecar transport choice.
+Adding MCP-server-specific crash detection to the worker would violate the agent-agnostic principle: the worker would need knowledge of the MCP server's process identity and failure semantics, coupling it to the sidecar transport choice.
 
 ### Considered Options in Detail
 
 **HTTP-based tool server.** The worker starts an HTTP server on localhost and passes the URL to the agent for tool calls. Common objections to this approach — port collisions, firewall restrictions, network latency — are individually solvable: binding to port 0 yields an OS-assigned port, localhost traffic bypasses firewall rules, and local TCP round-trip times are comparable to stdio pipe latency. The decisive disadvantages are structural:
 
-1. **Lifecycle inversion.** With the stdio sidecar, the agent runtime spawns the MCP server as its child — when the agent exits, the pipe closes and the server terminates automatically. With HTTP, the worker owns the server: it must start the server before the agent, keep it running for the session, and shut it down after the agent exits or crashes. This violates decision driver #4 (lifecycle simplicity) and requires explicit teardown on every exit path — normal completion, agent crash, orchestrator shutdown — to avoid orphaned servers.
+1. **Lifecycle inversion.** With the stdio sidecar, the agent runtime spawns the MCP server as its child — when the agent exits, the pipe closes and the server terminates automatically. With HTTP, the worker owns the server: it must start the server before the agent, keep it running for the session, and shut it down after the agent exits or crashes. This breaks lifecycle simplicity and requires explicit teardown on every exit path — normal completion, agent crash, orchestrator shutdown — to avoid orphaned servers.
 2. **Transport compatibility.** MCP defines stdio and Streamable HTTP transports. Stdio is universally supported by MCP-compatible agent runtimes: Claude Code and Copilot CLI both accept standard MCP config files with stdio server entries. HTTP-based MCP transport (SSE, Streamable HTTP) has narrower and less consistent runtime support. Choosing HTTP would limit the set of compatible agents without compensating benefit.
 3. **Session isolation overhead.** Stdio achieves session isolation structurally — each agent session gets its own pipe to its own MCP server instance. With HTTP, the worker must allocate a distinct port per concurrent session and prevent cross-session tool calls via port-to-session mapping. Solvable, but adds coordination that stdio eliminates entirely.
 
@@ -173,7 +173,7 @@ This approach bypasses MCP entirely. The standard MCP config mechanism requires 
 - Format tool results in whatever syntax the agent expects to receive.
 - Manage control flow: pause reading agent output, execute the tool, inject the result, resume reading.
 
-Each adapter becomes a bespoke tool-call interceptor, breaking the agent-agnostic goal (driver #1). The `ToolRegistry` dispatch is shared, but detection, parsing, and response framing are entirely adapter-specific.
+Each adapter becomes a bespoke tool-call interceptor, breaking the agent-agnostic goal. The `ToolRegistry` dispatch is shared, but detection, parsing, and response framing are entirely adapter-specific.
 
 Beyond the agent-agnostic violation, two further problems apply:
 
@@ -194,12 +194,6 @@ Beyond the agent-agnostic violation, two further problems apply:
 - One additional process per active agent session. The worker does not spawn or manage the MCP server process directly — the agent runtime does — but the host runs N MCP server processes alongside N agent processes during concurrent sessions.
 - Session context passing via config file environment variables limits the information available to the MCP server at startup. Complex session metadata requires serialization to a file or database query rather than direct in-memory access.
 
-### Scope limitation: SSH remote execution
+### SSH remote execution
 
-This ADR covers local execution only — the agent and MCP server run on the same host as the orchestrator. The SSH worker extension (Appendix A) introduces three requirements that this design does not address:
-
-1. **Binary availability.** The `sortie` binary must be installed on each remote host so the agent runtime can spawn `sortie mcp-server`. Appendix A already requires "coding-agent executable" on the remote host; the MCP server extends this to include the `sortie` binary.
-2. **Config file delivery.** The worker generates `.sortie/mcp.json` locally, but in SSH mode `workspace.root` is interpreted on the remote host. The config file must be written to the remote workspace before the agent launches.
-3. **Environment variable forwarding.** The current SSH transport (`sshutil.BuildSSHArgs`) constructs a remote shell command without `SendEnv` or explicit variable forwarding. Per-session context is delivered via the config file `env` field (handled by config file delivery above), but tracker credentials in the orchestrator's process environment do not automatically reach the remote agent or its MCP server child.
-
-These are solvable (e.g., write config via SSH before agent launch, prepend `env VAR=val` to the remote command), but the design belongs in a follow-up specific to SSH tool execution — not in this ADR.
+The stdio sidecar applies where the agent and the MCP server run on the same host as the orchestrator. A stdio declaration is never sent to a remote host, because the server needs inputs that exist only on the orchestrator host (the workflow file, the read-only database and the tracker credentials in the `SORTIE_*` env block), and the credentials must not leave that host. On an SSH launch the tool server stays on the orchestrator host and serves Streamable HTTP on a loopback port. The SSH connection carries an `ssh -R` reverse forward, and the remote runtime reaches the server at a loopback URL on the remote side of that forward. Each session has its own bearer token, and the server rejects any request that lacks it. The token reaches the remote runtime only through the SSH environment carrier, and the runtime's declaration references it by name. Tracker credentials stay in the environment of the server process on the orchestrator host. One shared mechanism serves every process-launching agent kind. Stdio delivery to a remote host remains a declared gap: a session whose runtime does not reach the server opens without the tools, and its prompt advertises none. A local protocol runtime that accepts only HTTP tool servers reaches the same HTTP server directly on loopback, with its own per-session bearer and no forward.

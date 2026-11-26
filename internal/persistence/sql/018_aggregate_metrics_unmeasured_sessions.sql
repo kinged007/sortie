@@ -1,5 +1,3 @@
--- Migration 18: unmeasured-session count on aggregate_metrics
-
 ALTER TABLE aggregate_metrics ADD COLUMN unmeasured_sessions INTEGER NOT NULL DEFAULT 0;
 
 UPDATE aggregate_metrics

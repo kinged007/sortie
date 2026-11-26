@@ -37,7 +37,7 @@ func executeOK(t *testing.T, tool *BudgetTool) costBudgetResponse {
 func TestBudgetTool_Name(t *testing.T) {
 	t.Parallel()
 
-	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0)
+	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0, 0)
 
 	if got := tool.Name(); got != "cost_budget" {
 		t.Errorf("Name() = %q, want %q", got, "cost_budget")
@@ -47,7 +47,7 @@ func TestBudgetTool_Name(t *testing.T) {
 func TestBudgetTool_Description(t *testing.T) {
 	t.Parallel()
 
-	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0)
+	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0, 0)
 
 	got := tool.Description()
 	if got == "" {
@@ -66,8 +66,8 @@ func TestBudgetTool_Description_WarningThreshold(t *testing.T) {
 		"warning_reached is true, wrap up or hand off the work in progress before the " +
 		"ceiling stops this run."
 
-	withThreshold := New(noopQuery, "10042", "sess-1", 0, 0, 100)
-	withoutThreshold := New(noopQuery, "10042", "sess-1", 0, 0, 0)
+	withThreshold := New(noopQuery, "10042", "sess-1", 0, 0, 100, 0)
+	withoutThreshold := New(noopQuery, "10042", "sess-1", 0, 0, 0, 0)
 
 	if strings.Contains(withoutThreshold.Description(), "warning_tokens") {
 		t.Errorf("Description() = %q, want no mention of warning_tokens when warningTokens is 0", withoutThreshold.Description())
@@ -89,26 +89,26 @@ func TestBudgetTool_Execute_WarningThreshold(t *testing.T) {
 	}{
 		{
 			name:          "warningTokens zero omits both fields",
-			usage:         BudgetUsage{CompletedTotalTokens: 900},
+			usage:         BudgetUsage{CompletedUncachedTokens: 900},
 			warningTokens: 0,
 		},
 		{
 			name:               "used_tokens below the threshold",
-			usage:              BudgetUsage{CompletedTotalTokens: 799},
+			usage:              BudgetUsage{CompletedUncachedTokens: 799},
 			warningTokens:      800,
 			wantWarningTokens:  new(int64(800)),
 			wantWarningReached: new(false),
 		},
 		{
 			name:               "used_tokens exactly at the threshold",
-			usage:              BudgetUsage{CompletedTotalTokens: 800},
+			usage:              BudgetUsage{CompletedUncachedTokens: 800},
 			warningTokens:      800,
 			wantWarningTokens:  new(int64(800)),
 			wantWarningReached: new(true),
 		},
 		{
 			name:               "used_tokens above the threshold",
-			usage:              BudgetUsage{CompletedTotalTokens: 950},
+			usage:              BudgetUsage{CompletedUncachedTokens: 950},
 			warningTokens:      800,
 			wantWarningTokens:  new(int64(800)),
 			wantWarningReached: new(true),
@@ -122,7 +122,7 @@ func TestBudgetTool_Execute_WarningThreshold(t *testing.T) {
 			query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 				return tt.usage, nil
 			}
-			tool := New(query, "10042", "sess-1", 0, 0, tt.warningTokens)
+			tool := New(query, "10042", "sess-1", 0, 0, tt.warningTokens, 0)
 
 			resp := executeOK(t, tool)
 
@@ -149,7 +149,7 @@ func TestBudgetTool_Execute_WarningThreshold(t *testing.T) {
 func TestBudgetTool_InputSchema_ValidJSON(t *testing.T) {
 	t.Parallel()
 
-	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0)
+	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0, 0)
 
 	schema := tool.InputSchema()
 
@@ -173,7 +173,7 @@ func TestBudgetTool_InputSchema_ValidJSON(t *testing.T) {
 func TestBudgetTool_InputSchema_DefensiveCopy(t *testing.T) {
 	t.Parallel()
 
-	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0)
+	tool := New(noopQuery, "10042", "sess-1", 0, 0, 0, 0)
 
 	schema1 := tool.InputSchema()
 
@@ -205,7 +205,7 @@ func TestBudgetTool_Execute(t *testing.T) {
 	}{
 		{
 			name:               "used tokens sums completed and running, used sessions counts completed only",
-			usage:              BudgetUsage{CompletedTotalTokens: 600, CompletedSessions: 3, RunningTotalTokens: 150},
+			usage:              BudgetUsage{CompletedUncachedTokens: 600, CompletedSessions: 3, RunningUncachedTokens: 150},
 			budgetTokens:       1000,
 			budgetSessions:     5,
 			wantUsedTokens:     750,
@@ -216,7 +216,7 @@ func TestBudgetTool_Execute(t *testing.T) {
 		},
 		{
 			name:               "remaining floored at zero when over budget",
-			usage:              BudgetUsage{CompletedTotalTokens: 900, CompletedSessions: 2, RunningTotalTokens: 200},
+			usage:              BudgetUsage{CompletedUncachedTokens: 900, CompletedSessions: 2, RunningUncachedTokens: 200},
 			budgetTokens:       1000,
 			budgetSessions:     0,
 			wantUsedTokens:     1100,
@@ -227,7 +227,7 @@ func TestBudgetTool_Execute(t *testing.T) {
 		},
 		{
 			name:               "remaining zero at exact budget consumption",
-			usage:              BudgetUsage{CompletedTotalTokens: 1000, CompletedSessions: 4},
+			usage:              BudgetUsage{CompletedUncachedTokens: 1000, CompletedSessions: 4},
 			budgetTokens:       1000,
 			budgetSessions:     4,
 			wantUsedTokens:     1000,
@@ -238,7 +238,7 @@ func TestBudgetTool_Execute(t *testing.T) {
 		},
 		{
 			name:               "unlimited token budget reports null remaining",
-			usage:              BudgetUsage{CompletedTotalTokens: 600, CompletedSessions: 3, RunningTotalTokens: 150},
+			usage:              BudgetUsage{CompletedUncachedTokens: 600, CompletedSessions: 3, RunningUncachedTokens: 150},
 			budgetTokens:       0,
 			budgetSessions:     5,
 			wantUsedTokens:     750,
@@ -267,7 +267,7 @@ func TestBudgetTool_Execute(t *testing.T) {
 			query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 				return tt.usage, nil
 			}
-			tool := New(query, "10042", "sess-1", tt.budgetTokens, tt.budgetSessions, 0)
+			tool := New(query, "10042", "sess-1", tt.budgetTokens, tt.budgetSessions, 0, 0)
 
 			resp := executeOK(t, tool)
 
@@ -295,6 +295,56 @@ func TestBudgetTool_Execute(t *testing.T) {
 	}
 }
 
+func TestBudgetTool_Execute_MoneyFields(t *testing.T) {
+	t.Parallel()
+
+	// A variable sum: the constant expression 0.7 + 0.1 folds exactly to 0.8
+	// and never exercises the float error the clamp exists for.
+	sum := func(a, b float64) float64 { return a + b }
+
+	tests := []struct {
+		name          string
+		budgetUSD     float64
+		usedUSD       float64
+		wantRemaining float64
+		wantPresent   bool
+	}{
+		{name: "ceiling zero omits every money field", budgetUSD: 0, usedUSD: 3},
+		{name: "below the ceiling reports the difference", budgetUSD: 5, usedUSD: 3.5, wantRemaining: 1.5, wantPresent: true},
+		{name: "float sum equal to the ceiling clamps to zero", budgetUSD: 0.8, usedUSD: sum(0.7, 0.1), wantRemaining: 0, wantPresent: true},
+		{name: "past the ceiling clamps to zero", budgetUSD: 5, usedUSD: 7, wantRemaining: 0, wantPresent: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
+				return BudgetUsage{UsedUSD: tt.usedUSD, UsedUSDComplete: true}, nil
+			}
+			tool := New(query, "10042", "sess-1", 0, 0, 0, tt.budgetUSD)
+
+			resp := executeOK(t, tool)
+
+			if !tt.wantPresent {
+				if resp.UsedUSD != nil || resp.BudgetUSD != nil || resp.RemainingUSD != nil || resp.UsedUSDComplete != nil {
+					t.Errorf("Execute() money fields with budgetUSD=%v = %+v, want all absent", tt.budgetUSD, resp)
+				}
+				return
+			}
+			if resp.RemainingUSD == nil || resp.UsedUSD == nil || resp.BudgetUSD == nil || resp.UsedUSDComplete == nil {
+				t.Fatalf("Execute() money fields with budgetUSD=%v = %+v, want all present", tt.budgetUSD, resp)
+			}
+			if *resp.RemainingUSD != tt.wantRemaining {
+				t.Errorf("data.remaining_usd (used=%v, budget=%v) = %v, want %v", tt.usedUSD, tt.budgetUSD, *resp.RemainingUSD, tt.wantRemaining)
+			}
+			if *resp.BudgetUSD != tt.budgetUSD {
+				t.Errorf("data.budget_usd = %v, want %v", *resp.BudgetUSD, tt.budgetUSD)
+			}
+		})
+	}
+}
+
 func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 	t.Parallel()
 
@@ -303,14 +353,14 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				RunningTotalTokens:   40,
-				RunningMeasured:      true,
-				UnaccountedTurns:     1,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				RunningUncachedTokens:   40,
+				RunningMeasured:         true,
+				UnaccountedTurns:        1,
 			}, nil
 		}
-		tool := New(query, "10042", "dispatch-1", 1000, 5, 0)
+		tool := New(query, "10042", "dispatch-1", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -331,12 +381,12 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				UnmeasuredSessions:   1,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				UnmeasuredSessions:      1,
 			}, nil
 		}
-		tool := New(query, "10042", "", 1000, 5, 0)
+		tool := New(query, "10042", "", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -368,14 +418,14 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				UnmeasuredSessions:   0,
-				RunningTotalTokens:   50,
-				RunningMeasured:      true,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				UnmeasuredSessions:      0,
+				RunningUncachedTokens:   50,
+				RunningMeasured:         true,
 			}, nil
 		}
-		tool := New(query, "10042", "sess-running", 1000, 5, 0)
+		tool := New(query, "10042", "sess-running", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -395,14 +445,14 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				UnmeasuredSessions:   0,
-				RunningTotalTokens:   0,
-				RunningMeasured:      true,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				UnmeasuredSessions:      0,
+				RunningUncachedTokens:   0,
+				RunningMeasured:         true,
 			}, nil
 		}
-		tool := New(query, "10042", "sess-running", 1000, 5, 0)
+		tool := New(query, "10042", "sess-running", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -419,14 +469,14 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				UnmeasuredSessions:   0,
-				RunningTotalTokens:   0,
-				RunningMeasured:      true,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				UnmeasuredSessions:      0,
+				RunningUncachedTokens:   0,
+				RunningMeasured:         true,
 			}, nil
 		}
-		tool := New(query, "10042", "", 1000, 5, 0)
+		tool := New(query, "10042", "", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -440,13 +490,13 @@ func TestBudgetTool_Execute_UsedTokensComplete(t *testing.T) {
 
 		query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 			return BudgetUsage{
-				CompletedTotalTokens: 500,
-				CompletedSessions:    2,
-				UnmeasuredSessions:   0,
-				RunningMeasured:      false,
+				CompletedUncachedTokens: 500,
+				CompletedSessions:       2,
+				UnmeasuredSessions:      0,
+				RunningMeasured:         false,
 			}, nil
 		}
-		tool := New(query, "10042", "sess-running", 1000, 5, 0)
+		tool := New(query, "10042", "sess-running", 1000, 5, 0, 0)
 
 		resp := executeOK(t, tool)
 
@@ -460,9 +510,9 @@ func TestBudgetTool_Execute_SuccessEnvelopeShape(t *testing.T) {
 	t.Parallel()
 
 	query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
-		return BudgetUsage{CompletedTotalTokens: 10, CompletedSessions: 1}, nil
+		return BudgetUsage{CompletedUncachedTokens: 10, CompletedSessions: 1}, nil
 	}
-	tool := New(query, "10042", "", 0, 0, 0)
+	tool := New(query, "10042", "", 0, 0, 0, 0)
 
 	out, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
@@ -516,7 +566,7 @@ func TestBudgetTool_Execute_QueryError(t *testing.T) {
 		return BudgetUsage{}, fmt.Errorf("database is locked")
 	}
 
-	tool := New(query, "10042", "sess-1", 1000, 5, 0)
+	tool := New(query, "10042", "sess-1", 1000, 5, 0, 0)
 
 	out, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
@@ -554,7 +604,7 @@ func TestBudgetTool_Execute_FailureEnvelopeShape(t *testing.T) {
 	query := func(_ context.Context, _ string, _ string) (BudgetUsage, error) {
 		return BudgetUsage{}, fmt.Errorf("disk full")
 	}
-	tool := New(query, "10042", "sess-1", 0, 0, 0)
+	tool := New(query, "10042", "sess-1", 0, 0, 0, 0)
 
 	out, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
@@ -591,7 +641,7 @@ func TestBudgetTool_Execute_PassesIdentity(t *testing.T) {
 		return BudgetUsage{}, nil
 	}
 
-	tool := New(query, "10042", "sess-live", 0, 0, 0)
+	tool := New(query, "10042", "sess-live", 0, 0, 0, 0)
 
 	executeOK(t, tool)
 
@@ -611,7 +661,7 @@ func TestNew_PanicsOnNilQuery(t *testing.T) {
 			t.Error(`New(nil, "10042", ...) did not panic`)
 		}
 	}()
-	New(nil, "10042", "sess-1", 0, 0, 0)
+	New(nil, "10042", "sess-1", 0, 0, 0, 0)
 
 }
 
@@ -623,6 +673,6 @@ func TestNew_PanicsOnEmptyIssueID(t *testing.T) {
 			t.Error(`New(noopQuery, "", ...) did not panic`)
 		}
 	}()
-	New(noopQuery, "", "sess-1", 0, 0, 0)
+	New(noopQuery, "", "sess-1", 0, 0, 0, 0)
 
 }

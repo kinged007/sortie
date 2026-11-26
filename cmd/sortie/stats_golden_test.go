@@ -15,22 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/server"
-	"github.com/sortie-ai/sortie/internal/workflow"
 )
 
 const goldenStatsDir = "testdata/golden_stats"
-
-const goldenStatsTokenRates = `token_rates:
-  claude-code:
-    input_per_mtok: 3
-    output_per_mtok: 15
-    cache_read_per_mtok: 0.3
-    cache_write_per_mtok: 3.75
-`
 
 func goldenStatsRuns() []persistence.RunHistory {
 	const (
@@ -43,6 +33,7 @@ func goldenStatsRuns() []persistence.RunHistory {
 			AgentAdapter: "claude-code", Status: "succeeded", TurnsCompleted: 3, CompletedAt: ranFor,
 			RuleName: "implement", TemplateID: "tpl-a", ConfiguredModel: "claude-sonnet",
 			InputTokens: 1_000_000, OutputTokens: 200_000, TotalTokens: 1_200_000, CacheReadTokens: 50_000, CacheWriteTokens: 10_000, TokensMeasured: true,
+			EstimatedCostUSD: new(5.8725), CostStatus: "estimated",
 			ChainID: "chain-1", StageTarget: "review", StageResult: "advanced",
 			ReviewMetadata: new(`{"enabled":true,"total_iterations":2,"final_verdict":"pass","cap_reached":false}`),
 		},
@@ -50,6 +41,7 @@ func goldenStatsRuns() []persistence.RunHistory {
 			AgentAdapter: "claude-code", Status: "succeeded", TurnsCompleted: 5, CompletedAt: ranLong,
 			RuleName: "review", TemplateID: "tpl-b", ConfiguredModel: "claude-opus", Trigger: new("ci_fix"),
 			InputTokens: 2_000_000, OutputTokens: 400_000, TotalTokens: 2_400_000, TokensMeasured: true,
+			EstimatedCostUSD: new(12.0), CostStatus: "estimated",
 			ChainID: "chain-1", StagePrevious: "implement", StagePreviousOutcome: "advanced",
 			ReviewMetadata: new(`{"enabled":true,"total_iterations":3,"final_verdict":"iterate","cap_reached":true}`),
 		},
@@ -57,6 +49,7 @@ func goldenStatsRuns() []persistence.RunHistory {
 			AgentAdapter: "claude-code", Status: "failed", TurnsCompleted: 2, CompletedAt: "2026-01-10T10:05:00Z",
 			RuleName: "implement", TemplateID: "tpl-a", ConfiguredModel: "claude-sonnet",
 			InputTokens: 300_000, OutputTokens: 50_000, TotalTokens: 350_000, TokensMeasured: true,
+			EstimatedCostUSD: new(1.65), CostStatus: "estimated",
 			ChainID: "chain-2", StageResult: "failed",
 		},
 		{
@@ -66,11 +59,38 @@ func goldenStatsRuns() []persistence.RunHistory {
 		{
 			AgentAdapter: "codex", Status: "succeeded", TurnsCompleted: 4, CompletedAt: "2026-01-10T10:20:00Z",
 			RuleName: "implement", ConfiguredModel: "gpt-5",
-			InputTokens: 500_000, OutputTokens: 100_000, TotalTokens: 600_000, TokensMeasured: true,
+			InputTokens: 500_000, OutputTokens: 100_000, TotalTokens: 600_000, TokensMeasured: true, CostStatus: "unpriced",
 			ReviewMetadata: new(`not json`),
 		},
 		{
 			Status: "failed", TurnsCompleted: 1, StartedAt: "yesterday", CompletedAt: ranFor,
+		},
+		{
+			AgentAdapter: "claude-code", Status: "succeeded", TurnsCompleted: 2, CompletedAt: "2026-01-10T10:15:00Z",
+			RuleName: "implement", TemplateID: "tpl-a", ConfiguredModel: "claude-sonnet",
+			InputTokens: 400_000, OutputTokens: 80_000, TotalTokens: 480_000, TokensMeasured: true, UnaccountedTurns: 1,
+			EstimatedCostUSD: new(2.015), CostStatus: "partial",
+			UsageCompleteness: persistence.UsageLowerBound, UsageProvenance: "journal:records,output:live",
+		},
+		{
+			AgentAdapter: "copilot", Status: "succeeded", TurnsCompleted: 1, CompletedAt: "2026-01-10T10:05:00Z",
+			RuleName: "implement", CostStatus: "unmeasured",
+			UsageCompleteness: persistence.UsageUnmeasured,
+			ReportedAmounts:   []persistence.ReportedAmount{{Unit: "credits", Amount: 12.5}},
+		},
+		{
+			AgentAdapter: "copilot", Status: "failed", TurnsCompleted: 1, CompletedAt: "2026-01-10T10:02:00Z",
+			RuleName: "implement", CostStatus: "unmeasured",
+			UsageCompleteness: persistence.UsageUnmeasured,
+		},
+		{
+			AgentAdapter: "gemini", Status: "succeeded", TurnsCompleted: 3, CompletedAt: "2026-01-10T10:12:00Z",
+			RuleName: "review", TemplateID: "tpl-b", ConfiguredModel: "gemini-x",
+			InputTokens: 600_000, OutputTokens: 100_000, TotalTokens: 700_000, TokensMeasured: true,
+			EstimatedCostUSD: new(0.4), CostStatus: "estimated",
+			UsageCompleteness: persistence.UsageComplete, UsageProvenance: "protocol:live",
+			ModelUsage: map[string]persistence.ModelTokens{"gemini-x": {InputTokens: 600_000, OutputTokens: 100_000}},
+			ModelCosts: map[string]persistence.ModelCost{"gemini-x": {EstimatedCostUSD: new(0.4), CostStatus: "estimated", PriceSource: "agent"}},
 		},
 	}
 	for i := range runs {
@@ -123,7 +143,7 @@ func TestRunStatsMatchesGolden(t *testing.T) {
 	pinStatsNow(t, time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC))
 
 	dir := t.TempDir()
-	wfPath := writeCustomWorkflowFile(t, dir, statsWorkflow(goldenStatsTokenRates))
+	wfPath := writeCustomWorkflowFile(t, dir, statsWorkflow(""))
 	dbPath := filepath.Join(dir, ".sortie.db")
 	createStatsDB(t, dbPath, goldenStatsRuns()...)
 
@@ -156,22 +176,6 @@ func TestRunStatsMatchesGolden(t *testing.T) {
 	}
 }
 
-func statsSourceFromWorkflow(t *testing.T, wfPath, dbPath string) statsSource {
-	t.Helper()
-
-	wf, err := workflow.Load(wfPath)
-	if err != nil {
-		t.Fatalf("workflow.Load(%q): %v", wfPath, err)
-	}
-	cfg, err := config.NewServiceConfig(wf.Config)
-	if err != nil {
-		t.Fatalf("NewServiceConfig: %v", err)
-	}
-	rawRates, present := cfg.ExtensionValue("token_rates")
-	rates, rateWarnings := server.ParseTokenRates(rawRates, present)
-	return statsSource{dbPath: dbPath, workflowPath: wfPath, rates: rates, rateWarnings: rateWarnings}
-}
-
 func decodeReportWithoutClock(t *testing.T, body []byte) map[string]any {
 	t.Helper()
 
@@ -200,13 +204,13 @@ func TestStatsRouteEqualsCLIReport(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			wfPath := writeCustomWorkflowFile(t, dir, statsWorkflow(goldenStatsTokenRates))
+			wfPath := writeCustomWorkflowFile(t, dir, statsWorkflow(""))
 			dbPath := filepath.Join(dir, ".sortie.db")
 			createStatsDB(t, dbPath, tt.runs...)
 			srv := server.New(server.Params{
 				SnapshotFn: func() (orchestrator.RuntimeSnapshotResult, error) { return orchestrator.RuntimeSnapshotResult{}, nil },
 				RefreshFn:  func() bool { return true },
-				Stats:      statsSourceFromWorkflow(t, wfPath, dbPath).report,
+				Stats:      statsSource{dbPath: dbPath, workflowPath: wfPath}.report,
 			})
 			ts := httptest.NewServer(srv.Mux())
 			t.Cleanup(ts.Close)

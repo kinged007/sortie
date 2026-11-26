@@ -1,123 +1,108 @@
+import { NotedFigure } from "@/components/NotedFigure";
+import { Hint } from "@/components/ui/hint";
 import {
+  COST_PER_RUN_TILE_CAPTION,
+  TOKENS_TILE_CAPTION,
   statsCacheReadsText,
-  statsCostText,
-  statsShortfall,
-  statsTokensShortfall,
-  statsTokensText,
+  statsCostFigure,
+  statsCostPerSucceededFigure,
+  statsTokensFigure,
 } from "@/lib/figures";
 import { fmtCount, fmtDuration, fmtMean, fmtPercent, plural } from "@/lib/format";
 
-import type { ConfigResponse, Report } from "@/api/types.gen";
+import type { Report } from "@/api/types.gen";
+import type { Figure } from "@/lib/figures";
 import type { ReactNode } from "react";
 
 interface TileProps {
   label: string;
-  value: string;
-  detail?: ReactNode;
+  value: Figure;
+  hint?: string | null;
 }
 
-// Spans three rows of the shared figure grid so labels, figures and detail lines
-// of one visual row stay level when a label wraps. The grid sets no row gap
-// because a subgrid inherits it between its own rows; the label margin spaces
-// the visual rows instead.
-function Tile({ label, value, detail }: TileProps) {
+// Spans two rows of the shared figure grid so the labels and the figures of one
+// visual row stay level when a label wraps. The grid sets no row gap because a
+// subgrid inherits it between its own rows; the label margin spaces the visual
+// rows instead.
+function Tile({ label, value, hint }: TileProps) {
   return (
-    <div className="row-span-3 grid min-w-0 grid-rows-subgrid">
-      <span className="mt-lg text-body-sm text-ink-muted">{label}</span>
-      <span className="mt-xxs font-heading text-h5 font-semibold text-ink tabular-nums">
-        {value}
+    <div className="row-span-2 grid min-w-0 grid-rows-subgrid">
+      <span className="mt-lg text-body-sm text-ink-muted">
+        {hint === undefined || hint === null ? label : <Hint hint={hint}>{label}</Hint>}
       </span>
-      {detail === undefined || detail === null ? undefined : (
-        <span className="mt-xxs text-body-sm text-ink-muted">{detail}</span>
-      )}
+      <span className="mt-xxs font-heading text-h5 font-semibold text-ink tabular-nums">
+        <NotedFigure figure={value} />
+      </span>
     </div>
   );
 }
 
-function runsDetail(summary: Report["summary"]): ReactNode {
-  const parts = [
-    summary.failed > 0 ? `${fmtCount(summary.failed)} failed` : undefined,
-    summary.stopped > 0 ? `${fmtCount(summary.stopped)} stopped` : undefined,
-    summary.cancelled > 0 ? `${fmtCount(summary.cancelled)} cancelled` : undefined,
-  ].filter((part) => part !== undefined);
-  return parts.length === 0 ? undefined : (
-    <span className="flex flex-wrap gap-x-md">
-      {parts.map((part) => (
-        <span key={part} className="whitespace-nowrap">
-          {part}
-        </span>
-      ))}
-    </span>
-  );
-}
-
-function durationDetail(duration: Report["summary"]["duration_seconds"]): string | undefined {
-  if (duration.samples === 0) {
-    return undefined;
-  }
-  const p95 = fmtDuration(duration.p95);
-  return p95 === fmtDuration(duration.p50) ? "p50 and p95" : `p50, p95 ${p95}`;
-}
-
-/** Props of {@link SummaryTiles}. */
 export interface SummaryTilesProps {
   report: Report;
-  config: ConfigResponse | undefined;
+  /** Whether a rate source is available, which adds the cost tile. */
+  hasCost: boolean;
 }
 
-/** Renders the success-rate hero beside a borderless row of summary figures. */
-export function SummaryTiles({ report, config }: SummaryTilesProps) {
+export function SummaryTiles({ report, hasCost }: SummaryTilesProps) {
   const { summary, schema_tier: tier } = report;
   const hasSucceeded = summary.succeeded > 0;
   const tiles: ReactNode[] = [
-    <Tile key="runs" label="Runs" value={fmtCount(summary.runs)} detail={runsDetail(summary)} />,
-    <Tile key="issues" label="Issues" value={fmtCount(summary.issues)} />,
+    <Tile key="runs" label="Runs" value={{ text: fmtCount(summary.runs) }} />,
+    <Tile key="issues" label="Issues" value={{ text: fmtCount(summary.issues) }} />,
   ];
   if (hasSucceeded) {
     tiles.push(
       <Tile
         key="duration"
-        label="Duration, succeeded runs"
-        value={fmtDuration(summary.duration_seconds.p50)}
-        detail={durationDetail(summary.duration_seconds)}
+        label="Duration"
+        value={{ text: fmtDuration(summary.duration_seconds.p50) }}
+        hint="Median time of a succeeded run."
       />,
       <Tile
         key="turns"
-        label="Turns per succeeded run"
-        value={
-          summary.mean_turns_succeeded === null
-            ? "not recorded"
-            : fmtMean(summary.mean_turns_succeeded)
-        }
-        detail={summary.mean_turns_succeeded === null ? undefined : "mean"}
+        label="Turns"
+        value={{
+          text:
+            summary.mean_turns_succeeded === null
+              ? "not recorded"
+              : fmtMean(summary.mean_turns_succeeded),
+        }}
+        hint={summary.mean_turns_succeeded === null ? undefined : "mean per succeeded run"}
       />,
     );
   }
+  const isEveryRunMeasured =
+    tier === "full" &&
+    summary.tokens_unmeasured_runs === 0 &&
+    summary.tokens_lower_bound_runs === 0;
   tiles.push(
     <Tile
       key="tokens"
       label="Tokens"
-      value={statsTokensText(summary, tier)}
-      detail={statsTokensShortfall(summary) ?? (tier === "full" ? "every run measured" : null)}
+      value={statsTokensFigure(summary, tier)}
+      hint={isEveryRunMeasured ? TOKENS_TILE_CAPTION : null}
     />,
   );
   const cacheReads = statsCacheReadsText(summary, tier);
   tiles.push(
     cacheReads === null ? (
-      <div key="cache-reads" className="row-span-3" />
+      <div key="cache-reads" className="row-span-2" />
     ) : (
-      <Tile key="cache-reads" label="Cache reads" value={cacheReads} />
+      <Tile key="cache-reads" label="Cache reads" value={{ text: cacheReads }} />
     ),
   );
-  if (config?.token_rates != null) {
-    tiles.push(
-      <Tile
-        key="cost"
-        label="Estimated cost"
-        value={statsCostText(summary, tier)}
-        detail={statsShortfall(summary)}
-      />,
-    );
+  if (hasCost) {
+    tiles.push(<Tile key="cost" label="Estimated cost" value={statsCostFigure(summary, tier)} />);
+    if (hasSucceeded) {
+      tiles.push(
+        <Tile
+          key="cost-per-succeeded"
+          label="Cost per run"
+          hint={COST_PER_RUN_TILE_CAPTION}
+          value={statsCostPerSucceededFigure(summary, tier)}
+        />,
+      );
+    }
   }
 
   return (
@@ -130,7 +115,7 @@ export function SummaryTiles({ report, config }: SummaryTilesProps) {
           {fmtCount(summary.succeeded)} of {plural(summary.runs, "run", "runs")} succeeded
         </span>
       </div>
-      <div className="-mt-lg grid grid-cols-2 gap-x-lg md:grid-cols-3 xl:auto-cols-fr xl:grid-flow-col xl:grid-cols-none xl:grid-rows-[repeat(3,auto)]">
+      <div className="-mt-lg grid grid-cols-2 gap-x-lg md:grid-cols-3 xl:auto-cols-fr xl:grid-flow-col xl:grid-cols-none xl:grid-rows-[repeat(2,auto)]">
         {tiles}
       </div>
     </div>

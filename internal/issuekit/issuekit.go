@@ -30,6 +30,16 @@ func NormalizeLabels(in []string) []string {
 	return out
 }
 
+// StatesOf returns the state of each entry of reads, keyed as reads is, as a
+// non-nil map.
+func StatesOf(reads map[string]domain.IssueStateAndLabels) map[string]string {
+	states := make(map[string]string, len(reads))
+	for id, read := range reads {
+		states[id] = read.State
+	}
+	return states
+}
+
 // ParsePriorityIntStrict parses a JSON integer literal and returns nil for all other JSON values.
 func ParsePriorityIntStrict(raw json.RawMessage) *int {
 	text := strings.TrimSpace(string(raw))
@@ -49,6 +59,10 @@ func ParsePriorityIntFromString(s string) *int {
 }
 
 // NormalizeComments maps adapter-local comment values to [domain.Comment] values.
+//
+// CreatedAt passes through unchanged, so every source comment must carry a
+// form the [domain.Comment] CreatedAt documentation lists; the
+// orchestrator parses it with [domain.Comment.CreatedTime].
 func NormalizeComments(in []SourceComment) []domain.Comment {
 	if in == nil {
 		return []domain.Comment{}
@@ -64,27 +78,6 @@ func NormalizeComments(in []SourceComment) []domain.Comment {
 		}
 	}
 	return out
-}
-
-// MarkdownLiteralComment returns text followed by literal in a fenced code
-// block. The fence is one backtick longer than the longest backtick run in
-// literal, and at least three, so nothing inside literal can close it.
-func MarkdownLiteralComment(text, literal string) string {
-	fence := strings.Repeat("`", max(3, 1+longestBacktickRun(literal)))
-	return text + "\n\n" + fence + "\n" + literal + "\n" + fence
-}
-
-func longestBacktickRun(s string) int {
-	longest, run := 0, 0
-	for i := 0; i < len(s); i++ {
-		if s[i] != '`' {
-			run = 0
-			continue
-		}
-		run++
-		longest = max(longest, run)
-	}
-	return longest
 }
 
 func isJSONIntLiteral(s string) bool {

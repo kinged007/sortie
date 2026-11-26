@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
+name: Price table refresh
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: price-table
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Refresh price table
+    if: github.repository == 'sortie-ai/sortie'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Refresh snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make price-table
+
+      # Pushes and pull requests made with the workflow token start no
+      # pull_request workflows, so the required checks would never run.
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ secrets.CICDBOT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          snapshot=internal/pricing/snapshot
+          branch=chore/price-table-refresh
+
+          if git diff --quiet HEAD -- "${snapshot}"; then
+            echo "Price table is up to date"
+            exit 0
+          fi
+
+          revision=$(cat "${snapshot}/REVISION")
+          revision_time=$(cat "${snapshot}/REVISION_TIME")
+          subject="chore(pricing): refresh the embedded price table to ${revision:0:12}"
+          body="Upstream revision ${revision}, committed ${revision_time}."
+
+          # The account's public email can be null, so use the noreply form.
+          bot_id=$(gh api user --jq .id)
+          bot_login=$(gh api user --jq .login)
+
+          git checkout -B "${branch}"
+          git add -- "${snapshot}/model_prices_and_context_window.json" "${snapshot}/REVISION" "${snapshot}/REVISION_TIME"
+          git -c "user.name=${bot_login}" -c "user.email=${bot_id}+${bot_login}@users.noreply.github.com" \
+            commit -m "${subject}" -m "${body}"
+
+          gh auth setup-git
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          number=$(gh pr list --head "${branch}" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "${number}" ]; then
+            gh pr edit "${number}" --title "${subject}" --body "${body}"
+          else
+            gh pr create --head "${branch}" --base main --title "${subject}" --body "${body}"
+          fi
+
+      - name: Post failure notice
+        if: failure()
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_CI }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK}" ]; then
+            echo "::warning::Discord webhook is not configured; skipping"
+            exit 0
+          fi
+
+          printf 'Price table refresh failed. %s\n' "${RUN_URL}" >message.txt
+          scripts/discord-notify.sh <message.txt

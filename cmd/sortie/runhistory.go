@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
@@ -37,11 +38,45 @@ func (r runHistoryReader) QueryRuns(ctx context.Context, q server.RunHistoryQuer
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]int64, len(runs))
+	for i, run := range runs {
+		ids[i] = run.ID
+	}
+	parts, err := r.store.QueryRunModelUsage(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	amounts, err := r.store.QueryRunReportedAmounts(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]server.RunHistoryEntry, len(runs))
 	for i, run := range runs {
-		out[i] = runHistoryEntry(run)
+		out[i] = runHistoryEntry(run, parts[run.ID], amounts[run.ID])
 	}
 	return out, nil
+}
+
+func runModelUsage(parts []persistence.RunModelPart) []server.RunModelUsage {
+	out := make([]server.RunModelUsage, len(parts))
+	for i, p := range parts {
+		out[i] = server.RunModelUsage{
+			Model: p.Model,
+			Tokens: domain.TokenUsage{
+				InputTokens:      p.Tokens.InputTokens,
+				OutputTokens:     p.Tokens.OutputTokens,
+				TotalTokens:      p.Tokens.InputTokens + p.Tokens.OutputTokens,
+				CacheReadTokens:  p.Tokens.CacheReadTokens,
+				CacheWriteTokens: p.Tokens.CacheWriteTokens,
+			},
+			EstimatedCostUSD: p.EstimatedCostUSD,
+			CostStatus:       p.CostStatus,
+			UnratedClasses:   p.UnratedClasses,
+			UnratedRecorded:  p.UnratedRecorded,
+			PriceSource:      p.PriceSource,
+		}
+	}
+	return out
 }
 
 // QueryIssueGroups returns the issues whose runs match q, newest first.
@@ -72,6 +107,10 @@ func (r runHistoryReader) IssueTotals(ctx context.Context, issueID string) (serv
 	if err != nil {
 		return server.IssueRunTotals{}, fmt.Errorf("issue run totals: %w", err)
 	}
+	provenance, err := r.store.IssueSpendProvenance(ctx, issueID)
+	if err != nil {
+		return server.IssueRunTotals{}, fmt.Errorf("issue spend provenance: %w", err)
+	}
 	return server.IssueRunTotals{
 		Usage: *orchestrator.SnapshotIssueUsageOf(&usage),
 		Tokens: domain.TokenUsage{
@@ -80,7 +119,24 @@ func (r runHistoryReader) IssueTotals(ctx context.Context, issueID string) (serv
 			CacheReadTokens:  usage.CacheReadTokens,
 			CacheWriteTokens: usage.CacheWriteTokens,
 		},
+		Provenance: issueProvenance(provenance),
 	}, nil
+}
+
+// issueProvenance maps what an issue's recorded runs say about the origin of
+// their figures to the server reader type.
+func issueProvenance(p persistence.IssueSpendProvenance) server.IssueProvenance {
+	amounts := make([]server.UnitAmount, len(p.VendorAmounts))
+	for i, a := range p.VendorAmounts {
+		amounts[i] = server.UnitAmount{Unit: a.Unit, Amount: a.Amount, LowerBound: a.LowerBound}
+	}
+	return server.IssueProvenance{
+		UnmeasuredCause:   string(p.UnmeasuredCause),
+		UnmeasuredUnits:   p.UnmeasuredUnits,
+		VendorAmounts:     amounts,
+		AgentPricedUSD:    p.AgentPricedUSD,
+		AgentPricedModels: p.AgentPricedModels,
+	}
 }
 
 // RunEvents returns one run's stored events, decoded, ascending by seq: all
@@ -139,8 +195,8 @@ func (r runHistoryReader) PassActivities(ctx context.Context, passes []server.Pa
 	return out, nil
 }
 
-func runHistoryEntry(r persistence.RunHistory) server.RunHistoryEntry {
-	return server.RunHistoryEntry{
+func runHistoryEntry(r persistence.RunHistory, parts []persistence.RunModelPart, amounts []persistence.ReportedAmount) server.RunHistoryEntry {
+	entry := server.RunHistoryEntry{
 		Identifier:       r.Identifier,
 		DisplayID:        r.DisplayID,
 		Attempt:          r.Attempt,
@@ -172,14 +228,70 @@ func runHistoryEntry(r persistence.RunHistory) server.RunHistoryEntry {
 			CacheWriteTokens: r.CacheWriteTokens,
 		},
 		TokensMeasured:       r.TokensMeasured,
-		UnaccountedTurns:     r.UnaccountedTurns,
+		EstimatedCostUSD:     r.EstimatedCostUSD,
+		CostStatus:           r.CostStatus,
 		StagePreviousOutcome: r.StagePreviousOutcome,
 		ReviewMetadata:       r.ReviewMetadata,
+		Skills:               r.Skills,
 		OriginRecorded:       r.OriginRecorded,
 		Trigger:              r.Trigger,
 		ReactionKind:         r.ReactionKind,
 		SessionID:            r.SessionID,
 		SSHHost:              r.SSHHost,
 		DispatchID:           r.DispatchID,
+		DeclaredOutcome:      r.DeclaredOutcome,
+		AgentText:            r.AgentText,
+		UsageCompleteness:    r.Completeness(),
+		ModelUsage:           runModelUsage(parts),
 	}
+	// A row recorded before provenance was kept has no sources or amounts to
+	// serve; an empty answer there would claim the run had none.
+	if r.UsageCompleteness != "" {
+		entry.UsageProvenance = usagePairs(r.UsageProvenance)
+		entry.VendorAmounts = vendorAmounts(amounts)
+	}
+	if entry.UsageCompleteness == persistence.UsageUnmeasured {
+		units := reportedUnits(amounts)
+		cause := persistence.UnmeasuredCauseOf(r.Status, r.UsageCompleteness, units)
+		entry.UnmeasuredCause = string(cause)
+		entry.UnmeasuredUnits = []string{}
+		if cause == persistence.UnmeasuredAmountsOnly {
+			entry.UnmeasuredUnits = units
+		}
+	}
+	return entry
+}
+
+func usagePairs(text string) []server.UsagePair {
+	parsed := persistence.ParseUsageProvenance(text)
+	pairs := make([]server.UsagePair, len(parsed))
+	for i, p := range parsed {
+		pairs[i] = server.UsagePair{Source: p.Source, Strategy: p.Strategy}
+	}
+	return pairs
+}
+
+// vendorAmounts keeps the amounts in a unit other than US dollars, in the
+// order the store returned them. US dollars are already priced into the
+// run's cost.
+func vendorAmounts(amounts []persistence.ReportedAmount) []server.VendorAmount {
+	out := make([]server.VendorAmount, 0, len(amounts))
+	for _, a := range amounts {
+		if a.Unit == domain.UnitUSD {
+			continue
+		}
+		out = append(out, server.VendorAmount{Unit: a.Unit, Model: a.Model, Amount: a.Amount, LowerBound: a.LowerBound})
+	}
+	return out
+}
+
+// reportedUnits lists the distinct units of amounts in ascending order, US
+// dollars included.
+func reportedUnits(amounts []persistence.ReportedAmount) []string {
+	units := make([]string, len(amounts))
+	for i, a := range amounts {
+		units[i] = a.Unit
+	}
+	slices.Sort(units)
+	return slices.Compact(units)
 }

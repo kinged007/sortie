@@ -11,7 +11,7 @@ import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import { fmtDuration, lowerFirst, parseInstant } from "@/lib/format";
 import { sessionLinkOf } from "@/lib/issue-link";
 import { numberedRunsOf } from "@/lib/run-number";
-import { runStatus } from "@/lib/run-status";
+import { runOutcome } from "@/lib/run-status";
 
 import type { IssueDetailResponse, RunsResponse } from "@/api/types.gen";
 import type { Mark } from "@/lib/run-status";
@@ -40,7 +40,7 @@ function rowsOf(detail: IssueDetailResponse, pages: readonly RunsResponse[]): Se
   const finished = numberedRunsOf(storyRunsOf(history?.runs ?? [], pages), total)
     .reverse()
     .map(({ run, number }): SessionRow => {
-      const { word, mark } = runStatus(run.status);
+      const { word, mark } = runOutcome(run);
       return {
         key: String(run.run_id),
         number,
@@ -95,7 +95,7 @@ function SessionRowView({ row, identifier, isCurrent }: SessionRowViewProps) {
           </Link>
         )}
       </TableCell>
-      <TableCell className="whitespace-normal">
+      <TableCell isWrapping>
         {row.mark === null ? row.word : <StatusMark mark={row.mark} label={row.word} />}
       </TableCell>
       <TableCell look="number">
@@ -109,18 +109,12 @@ function SessionRowView({ row, identifier, isCurrent }: SessionRowViewProps) {
   );
 }
 
-/** Props of {@link SessionsPanel}. */
 export interface SessionsPanelProps {
   identifier: string;
   /** The dispatch ID of the session on screen, whose row is not a link. */
   dispatchId: string;
 }
 
-/**
- * Renders every session of the issue, newest first, each named by the run
- * number the issue page gives it. It draws nothing while the issue has a
- * single session. Older runs load on request.
- */
 export function SessionsPanel({ identifier, dispatchId }: SessionsPanelProps) {
   const { data: detail } = useIssueQuery(identifier);
   const [wanted, setWanted] = useState(0);
@@ -162,7 +156,7 @@ export function SessionsPanel({ identifier, dispatchId }: SessionsPanelProps) {
 
   return (
     <Panel title="Sessions">
-      <Table aria-label="Sessions">
+      <Table aria-label="Sessions" isCompact>
         <TableBody>
           {rows.map((row) => (
             <SessionRowView

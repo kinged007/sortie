@@ -28,18 +28,17 @@ function floorOf(query: Query): number | undefined {
   return typeof floor === "number" ? floor : undefined;
 }
 
+function skipsChangeSignal(query: Query): boolean {
+  return query.meta?.skipsChangeSignal === true;
+}
+
 interface FloorGate {
-  /** Refetches a floored query now, after its floor, or after its running fetch ends. */
   request: (query: Query) => void;
   /** Starts watching the cache; the returned function stops it and clears every timer and mark. */
   watch: () => () => void;
 }
 
-/**
- * Spaces the refetches of queries that carry `meta.refetchFloorMs`. A running
- * fetch is never canceled: a signal during it is remembered and the query is
- * checked again once the fetch ends, because its result can predate the signal.
- */
+/** A running fetch is never canceled: a signal during it is remembered and the query is checked again once the fetch ends, because its result can predate the signal. */
 function createFloorGate(
   client: QueryClient,
   isPaused: () => boolean,
@@ -146,10 +145,7 @@ function handleStreamMessage(message: StreamMessage): void {
   }
 }
 
-/**
- * Connects the tab to the change stream; later calls do nothing. Call it
- * before React renders so the first change signal is not missed.
- */
+/** Later calls do nothing; call it before React renders so the first change signal is not missed. */
 export function startLiveStream(): void {
   if (streamStarted) {
     return;
@@ -161,16 +157,12 @@ export function startLiveStream(): void {
   }
 }
 
-/** Subscribes to the items of the run this tab shows; the returned function unsubscribes. */
 export function subscribeRunMessages(listener: (m: RunMessage) => void): () => void {
   runListeners.add(listener);
   return () => runListeners.delete(listener);
 }
 
-/**
- * Names the run whose events this tab receives, or null for none. A call made
- * before `startLiveStream` applies when the stream starts.
- */
+/** A call made before `startLiveStream` applies when the stream starts. */
 export function showRun(dispatchId: string | null): void {
   shownRun = dispatchId;
   connection?.show(dispatchId);
@@ -189,7 +181,6 @@ function quietKeyOf(row: RunningEntryResponse): string {
   return `${row.dispatch_id}|${row.quiet_at}`;
 }
 
-/** What the shell and the screens read about live updates. */
 export interface LiveValue {
   paused: boolean;
   /** Flips the pause and returns the new value; resuming replays a change signal that arrived while paused. */
@@ -202,7 +193,6 @@ export interface LiveValue {
 
 const LiveContext = createContext<LiveValue | undefined>(undefined);
 
-/** Provides the pause, the stream status, and the version notice, and refetches queries on every change signal. */
 export function LiveProvider({ children }: LiveProviderProps) {
   const client = useQueryClient();
   const { data } = useStateQuery();
@@ -229,7 +219,10 @@ export function LiveProvider({ children }: LiveProviderProps) {
     const others = { type: "active", stale: true } as const;
     void client.refetchQueries({
       ...others,
-      predicate: (query) => query.queryKey[0] !== STATE_KEY_ROOT && floorOf(query) === undefined,
+      predicate: (query) =>
+        query.queryKey[0] !== STATE_KEY_ROOT &&
+        floorOf(query) === undefined &&
+        !skipsChangeSignal(query),
     });
     for (const query of client.getQueryCache().findAll({
       ...others,
@@ -340,11 +333,7 @@ interface LiveProviderProps {
   children: ReactNode;
 }
 
-/**
- * Reads the live-update value.
- *
- * @throws When used outside `LiveProvider`.
- */
+/** @throws When used outside `LiveProvider`. */
 export function useLive(): LiveValue {
   const value = use(LiveContext);
   if (value === undefined) {
@@ -353,11 +342,7 @@ export function useLive(): LiveValue {
   return value;
 }
 
-/**
- * Returns the value as it was when `held` turned true for as long as `held`
- * stays true, else the live value. Pass one object bundling everything a view
- * renders so the whole view holds still together.
- */
+/** Returns the value as it was when `held` turned true for as long as `held` stays true, else the live value; pass one object bundling everything a view renders so the whole view holds still together. */
 export function useHold<T>(value: T, held: boolean): T {
   const [snapshot, setSnapshot] = useState<{ value: T } | null>(null);
   if (held && snapshot === null) {

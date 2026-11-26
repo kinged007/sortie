@@ -168,17 +168,7 @@ func (t *TrackerAPITool) fetchComments(ctx context.Context, issueID string) (jso
 		return mapTrackerError(err)
 	}
 
-	commentMaps := make([]map[string]any, len(comments))
-	for i, c := range comments {
-		commentMaps[i] = map[string]any{
-			"id":         c.ID,
-			"author":     c.Author,
-			"body":       c.Body,
-			"created_at": c.CreatedAt,
-		}
-	}
-
-	return toolresult.Success(commentMaps)
+	return toolresult.Success(domain.CommentTemplateMaps(comments))
 }
 
 func (t *TrackerAPITool) searchIssues(ctx context.Context) (json.RawMessage, error) {

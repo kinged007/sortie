@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
-	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/tools/qualify/evidence"
 )
 
@@ -169,16 +169,12 @@ func TestBoundedLaunchEndsWhileADescendantHoldsTheStreams(t *testing.T) {
 		done <- launchResult{output: output, err: err}
 	}()
 
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Errorf("launchNativeProbe(...) error = %v, want nil: the direct child exited cleanly", got.err)
-		}
-		if !strings.Contains(got.output, "parent-done") {
-			t.Errorf("launchNativeProbe(...) output = %q, want it to carry the direct child's own line", got.output)
-		}
-	case <-time.After(2 * nativeDrainBound):
-		t.Fatal("launchNativeProbe(...) did not return while a descendant held the inherited output streams")
+	got := waittest.Receive(t, done, "launchNativeProbe to return while a descendant held the inherited output streams")
+	if got.err != nil {
+		t.Errorf("launchNativeProbe(...) error = %v, want nil: the direct child exited cleanly", got.err)
+	}
+	if !strings.Contains(got.output, "parent-done") {
+		t.Errorf("launchNativeProbe(...) output = %q, want it to carry the direct child's own line", got.output)
 	}
 }
 
@@ -243,17 +239,11 @@ func TestAwaitProbeExecution(t *testing.T) {
 
 		cmd := exec.Command(probe) //nolint:gosec // probe is this test's own fixture
 		cmd.Dir = t.TempDir()
-		procutil.SetProcessGroup(cmd)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("cmd.Start() error = %v, want nil", err)
-		}
-		pgid := cmd.Process.Pid
-		t.Cleanup(func() {
-			_ = signalProcessGroup(pgid, syscall.SIGKILL)
-			_, _ = cmd.Process.Wait()
-		})
+		group := startHeldLaunch(t, cmd).Group()
+		tracker := &groupTracker{}
+		tracker.register(group)
 
-		if !awaitProbeExecution(newOwnedDescendants(&groupTracker{}), probe, pgid, time.Now().Add(30*time.Second)) {
+		if !awaitProbeExecution(newOwnedDescendants(tracker), probe, group.PID(), time.Now().Add(30*time.Second)) {
 			t.Error("awaitProbeExecution(...) = false, want true for a probe this launch is running")
 		}
 	})

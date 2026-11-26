@@ -1,26 +1,12 @@
 import { Fragment } from "react";
 
+import { Code } from "@/components/Code";
 import { TrackerLabel } from "@/components/TrackerLabel";
 import { fmtDuration } from "@/lib/format";
 
 import type { ShapeMatch, ShapePriority, ShapeRule } from "@/api/types.gen";
 import type { ReactNode } from "react";
 
-/** Props of {@link Code}. */
-export interface CodeProps {
-  children: ReactNode;
-}
-
-/** Renders a configured name or pattern in the monospace face. */
-export function Code({ children }: CodeProps) {
-  return (
-    <code className="rounded bg-surface-raised px-xxs font-mono text-[0.9em] wrap-anywhere">
-      {children}
-    </code>
-  );
-}
-
-/** Renders each tracker label as a {@link TrackerLabel}, joined by a separator text. */
 export function joinLabels(labels: readonly string[], separator: string): ReactNode {
   return joinNodes(
     labels.map((label) => <TrackerLabel key={label}>{label}</TrackerLabel>),
@@ -38,7 +24,6 @@ export function joinNodes(nodes: readonly ReactNode[], separator: string): React
   ));
 }
 
-/** Renders each value in the monospace face, joined by a separator text. */
 export function joinCode(values: readonly string[], separator: string): ReactNode {
   return values.map((value, index) => (
     <Fragment key={index}>
@@ -123,7 +108,6 @@ export function usageText(arrival: string): string {
   }
 }
 
-/** Words a configured span in milliseconds. */
 export function msText(ms: number): string {
   return fmtDuration(ms / 1000);
 }
@@ -134,18 +118,16 @@ export function escalationText(escalation: string, label: string | undefined): R
     case "label":
       return label === undefined ? "label" : <TrackerLabel>{label}</TrackerLabel>;
     case "none":
-      return "—";
+      return "–";
     default:
       return escalation;
   }
 }
 
-/** Props of {@link Note}. */
 export interface NoteProps {
   children: ReactNode;
 }
 
-/** Renders a line of body text under a panel's content. */
 export function Note({ children }: NoteProps) {
   return <p className="text-body-md text-ink-body">{children}</p>;
 }

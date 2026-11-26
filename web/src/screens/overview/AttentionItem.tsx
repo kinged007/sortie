@@ -11,36 +11,24 @@ import type { MouseEvent } from "react";
 
 import type { AttentionItemResponse } from "@/api/types.gen";
 
-/** Props of {@link AttentionItem}. */
 export interface AttentionItemProps {
   item: AttentionItemResponse;
-  /** Key of the item in the keyboard selection. */
   navKey: string;
   /** Server-clock time in epoch milliseconds that the item's age measures against. */
   now: number;
-  isUnread: boolean;
-  /** Whether this is the selected item; its action takes the primary style. */
   isSelected: boolean;
   /** Whether the selected-row look shows, which it does from the first navigation key on. */
   showSelection: boolean;
-  /** Whether the item's acknowledge request is running. */
   isPending: boolean;
   onOpen: (item: AttentionItemResponse) => void;
   onAcknowledge: (item: AttentionItemResponse) => void;
-  /** Called when the reader follows the link of the item's action. */
   onAction: (item: AttentionItemResponse) => void;
 }
 
-/**
- * Renders one attention item: its reason, title and key on one line, why it
- * exists, what clears it, and its age above its actions at the right.
- * A click outside its buttons opens the peek of its issue.
- */
 export function AttentionItem({
   item,
   navKey,
   now,
-  isUnread,
   isSelected,
   showSelection,
   isPending,
@@ -77,13 +65,10 @@ export function AttentionItem({
       data-nav-key={navKey}
       onClick={handleClick}
       className={cn(
-        "grid grid-cols-[var(--size-icon)_minmax(0,1fr)_auto] gap-x-md gap-y-xxs p-md max-md:grid-cols-[var(--size-icon)_minmax(0,1fr)]",
+        "grid grid-cols-[minmax(0,1fr)_auto] gap-x-md gap-y-xxs p-md max-md:grid-cols-[minmax(0,1fr)]",
         rowStyles(isLook, isOpenable),
       )}
     >
-      <span className="row-span-3 flex justify-center pt-xs">
-        <span aria-hidden="true" className={cn("size-xs rounded-full", isUnread && "bg-primary")} />
-      </span>
       <p className="flex min-w-0 flex-wrap items-baseline gap-x-sm gap-y-xxs">
         <strong
           className={cn(
@@ -104,13 +89,13 @@ export function AttentionItem({
           </span>
         ) : undefined}
       </p>
-      <p className="col-start-2 text-body-md text-ink-body">
+      <p className="text-body-md text-ink-body">
         <ServedText text={item.why_text} />
       </p>
-      <p className={cn("col-start-2 text-body-sm", secondLineColor(isLook))}>
+      <p className={cn("text-body-sm", secondLineColor(isLook))}>
         <ServedText text={item.clears_text} />
       </p>
-      <div className="col-start-3 row-span-3 row-start-1 flex flex-col items-end justify-between gap-xs max-md:col-start-2 max-md:row-span-1 max-md:row-start-auto max-md:flex-row-reverse max-md:items-center max-md:justify-end">
+      <div className="col-start-2 row-span-3 row-start-1 flex flex-col items-end justify-between gap-xs max-md:col-start-1 max-md:row-span-1 max-md:row-start-auto max-md:flex-row-reverse max-md:items-center max-md:justify-end">
         <span
           className={cn("text-body-sm whitespace-nowrap tabular-nums", secondLineColor(isLook))}
         >
@@ -118,7 +103,7 @@ export function AttentionItem({
         </span>
         <span className="flex flex-wrap gap-xs">
           <Button
-            variant={isSelected && link === null ? "primary" : "secondary"}
+            variant="primary"
             disabled={isPending}
             title={keyTip("Acknowledge", "E")}
             onClick={() => onAcknowledge(item)}
@@ -134,7 +119,7 @@ export function AttentionItem({
               aria-disabled={isPending}
               data-disabled={isPending ? "" : undefined}
               onClick={handleLinkClick}
-              className={buttonStyles(isSelected ? "primary" : "secondary")}
+              className={buttonStyles("secondary")}
             >
               <ExternalLinkIcon />
               {link.label}

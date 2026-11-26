@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const (
@@ -116,9 +117,8 @@ func streamFrames(t *testing.T, srv *Server, lastEventID string, paced bool, run
 	if rest, ok := strings.CutPrefix(lastEventID, "current"); ok {
 		lastEventID = strconv.FormatUint(srv.changes.current(), 10) + rest
 	}
-	ctx, cancel := context.WithCancel(t.Context())
 	target := "http://" + srv.httpServer.Addr + "/api/v1/events?" + url.Values{"run": runs}.Encode()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	req, _ := http.NewRequestWithContext(waittest.Context(t), http.MethodGet, target, nil)
 	req.Header.Set("Last-Event-ID", lastEventID)
 	resp, err := (&http.Client{Transport: &http.Transport{DialContext: dialSmallBuffer}}).Do(req)
 	if err != nil {
@@ -131,7 +131,6 @@ func streamFrames(t *testing.T, srv *Server, lastEventID string, paced bool, run
 	}
 	lines := bufio.NewScanner(body)
 	return func() (event, id, data string) {
-		defer time.AfterFunc(5*time.Second, cancel).Stop()
 		for _, line := range []*string{&id, &event, &data, new(string)} {
 			if !lines.Scan() {
 				if err := lines.Err(); err != nil {
@@ -297,32 +296,23 @@ func TestEvents_NeverReadingClientDoesNotDelayEventLoop(t *testing.T) {
 	t.Parallel()
 	src := &runSource{}
 	src.add(runA, bulkEvents(1, 1)...)
-	srv, closed := serveStreams(t, Params{RunEventsAfterFn: src.after}, runStreamTiming)
-	streamFrames(t, srv, "", false, runA)
+	looping, _ := serveStreams(t, Params{RunEventsAfterFn: src.after}, streamTiming{heartbeat: time.Hour, signalInterval: 10 * time.Millisecond, frameDeadline: time.Hour})
+	streamFrames(t, looping, "", false, runA)
+	expiring, closed := serveStreams(t, Params{RunEventsAfterFn: src.after}, runStreamTiming)
+	streamFrames(t, expiring, "", false, runA)
 
-	loopTime := make(chan time.Duration, 1)
+	looped := make(chan struct{})
 	go func() {
-		start := time.Now()
+		defer close(looped)
 		for seq := int64(2); seq <= 10_000; seq++ {
 			src.add(runA, bulkEvents(seq, seq)...)
-			srv.OnStateChange()
+			looping.OnStateChange()
+			expiring.OnStateChange()
 		}
-		loopTime <- time.Since(start)
 	}()
 
-	select {
-	case took := <-loopTime:
-		if took >= runStreamTiming.frameDeadline {
-			t.Errorf("10000 appends with OnStateChange took %v, want under the %v frame deadline", took, runStreamTiming.frameDeadline)
-		}
-	case <-time.After(5 * runStreamTiming.frameDeadline):
-		t.Fatal("10000 appends with OnStateChange did not finish while a stream write was stalled")
-	}
-	select {
-	case <-closed:
-	case <-time.After(runStreamTiming.frameDeadline + 2*time.Second):
-		t.Fatal("stream of a client that never reads still open after the frame deadline")
-	}
+	waittest.Receive(t, looped, "10000 appends with OnStateChange while a stream write is stalled")
+	waittest.Receive(t, closed, "close of the stream of a client that never reads")
 }
 
 func TestEvents_ChangeSignalDuringCatchUp(t *testing.T) {
@@ -375,18 +365,14 @@ func TestEvents_ShutdownWithConnectedClient(t *testing.T) {
 	srv, next := openCatchUp(t, "", 1000, runA, runB)
 	readThrough(t, next, 64<<10)
 
-	start := time.Now()
+	ctx := waittest.Context(t)
 	shutdownErr := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		shutdownErr <- srv.Shutdown(ctx)
-	}()
+	go func() { shutdownErr <- srv.Shutdown(ctx) }()
 	for event, _, _ := next(); event != ""; event, _, _ = next() {
 	}
 
-	if err, took := <-shutdownErr, time.Since(start); err != nil || took >= 2*runStreamTiming.frameDeadline {
-		t.Errorf("Shutdown() = %v after %v, want nil within %v", err, took, 2*runStreamTiming.frameDeadline)
+	if err := waittest.Receive(t, shutdownErr, "Shutdown() result"); err != nil {
+		t.Errorf("Shutdown() = %v, want nil", err)
 	}
 }
 

@@ -19,8 +19,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/tools/qualify/evidence"
-	"github.com/sortie-ai/sortie/tools/qualify/procgroup"
 	"github.com/sortie-ai/sortie/tools/qualify/profile"
 )
 
@@ -85,20 +85,6 @@ func TestMembersDescendFromLaunch(t *testing.T) {
 	}
 }
 
-func TestMembersOfGroup(t *testing.T) {
-	t.Parallel()
-
-	members := []processMember{
-		{pid: 1, pgid: 10, basename: "a"},
-		{pid: 2, pgid: 20, basename: "b"},
-		{pid: 3, pgid: 10, basename: "c"},
-	}
-	got := membersOfGroup(members, 10)
-	if len(got) != 2 || got[0].basename != "a" || got[1].basename != "c" {
-		t.Errorf("membersOfGroup(members, 10) = %+v, want the two pgid=10 members in order", got)
-	}
-}
-
 func TestInduceWorkspaceSecurity(t *testing.T) {
 	t.Parallel()
 
@@ -135,9 +121,9 @@ func TestInduceWorkspaceSecurity(t *testing.T) {
 	t.Run("a live group of the launched command grades usable with pass", func(t *testing.T) {
 		t.Parallel()
 
-		pgid, commandPath := startTrackedLiveGroup(t)
+		group, commandPath := startTrackedLiveGroup(t)
 		tracker := &groupTracker{}
-		tracker.register(pgid)
+		tracker.register(group)
 		coords := Coordinates{CommandPath: commandPath, Profile: profile.RuntimeProfile{ProjectConfigPaths: []string{".mcp.json"}}}
 		fixture := &sharedFixture{workspaceRoot: t.TempDir(), tracker: tracker}
 
@@ -152,29 +138,28 @@ func TestInduceWorkspaceSecurity(t *testing.T) {
 	})
 }
 
-func startTrackedLiveGroup(t *testing.T) (pgid int, commandPath string) {
+func startHeldLaunch(t *testing.T, cmd *exec.Cmd) *procutil.Capture {
+	t.Helper()
+
+	capture, err := procutil.StartCapture(context.Background(), cmd, procutil.CaptureParams{})
+	if err != nil {
+		t.Fatalf("start the launch: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = capture.Group().Kill()
+		capture.Wait()
+	})
+	return capture
+}
+
+func startTrackedLiveGroup(t *testing.T) (group *procutil.Group, commandPath string) {
 	t.Helper()
 
 	hangPath := agenttest.FakeRuntime(t, t.TempDir(), "runtime", agenttest.OutputScenario, agenttest.Output{Hang: true})
 	cmd := exec.Command(hangPath) //nolint:gosec // hangPath is a fake runtime this test built under its own temp directory
-	procutil.SetProcessGroup(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start tracked process group: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	t.Cleanup(func() {
-		_ = signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
-		<-done
-	})
-	return cmd.Process.Pid, hangPath
+	return startHeldLaunch(t, cmd).Group(), hangPath
 }
 
-// stubAdapter's StopSession does only what stop does, isolating what the
-// shutdown path achieved from what the drain after it did.
 type stubAdapter struct {
 	mu    sync.Mutex
 	stops int
@@ -209,18 +194,16 @@ func (a *stubAdapter) stopCount() int {
 func TestInduceProcessCleanupReportsALiveGroupAsALeak(t *testing.T) {
 	t.Parallel()
 
-	pgid, _ := startTrackedLiveGroup(t)
+	group, _ := startTrackedLiveGroup(t)
 	tracker := &groupTracker{}
-	tracker.register(pgid)
+	tracker.register(group)
 
 	obs := induceProcessCleanup(&sharedFixture{tracker: tracker})
 
 	if obs.Grade == evidence.GradeUsable {
 		t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a group that was alive when the run was graded", obs)
 	}
-	if present, err := procgroup.Present(pgid); err != nil || present {
-		t.Errorf("procgroup.Present(%d) = %v, %v, want false, nil: a failing observation must still leave no child behind", pgid, present, err)
-	}
+	requireTornDown(t, group)
 }
 
 func TestInduceProcessCleanupWithoutASubjectIsNotAPass(t *testing.T) {
@@ -239,10 +222,10 @@ func TestInduceProcessCleanupStopsRegisteredSessionsBeforeReading(t *testing.T) 
 	t.Run("a session whose group survives its own stop is a leak the drain still clears", func(t *testing.T) {
 		t.Parallel()
 
-		pgid, _ := startTrackedLiveGroup(t)
+		group, _ := startTrackedLiveGroup(t)
 		adapter := &stubAdapter{}
 		fixture := &sharedFixture{tracker: &groupTracker{}}
-		if err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(pgid)}); err != nil {
+		if _, err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(group.PID())}); err != nil {
 			t.Fatalf("registerSession(...) error = %v, want nil", err)
 		}
 
@@ -254,18 +237,16 @@ func TestInduceProcessCleanupStopsRegisteredSessionsBeforeReading(t *testing.T) 
 		if obs.Grade == evidence.GradeUsable {
 			t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a session the shutdown path left running", obs)
 		}
-		if present, err := procgroup.Present(pgid); err != nil || present {
-			t.Errorf("procgroup.Present(%d) = %v, %v, want false, nil after the drain", pgid, present, err)
-		}
+		requireTornDown(t, group)
 	})
 
 	t.Run("a session its own stop ended grades usable with pass", func(t *testing.T) {
 		t.Parallel()
 
-		pgid, _ := startTrackedLiveGroup(t)
-		adapter := &stubAdapter{stop: func() error { return signalProcessGroup(pgid, syscall.SIGKILL) }}
+		group, _ := startTrackedLiveGroup(t)
+		adapter := &stubAdapter{stop: func() error { return group.Signal(syscall.SIGKILL) }}
 		fixture := &sharedFixture{tracker: &groupTracker{}}
-		if err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(pgid)}); err != nil {
+		if _, err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(group.PID())}); err != nil {
 			t.Fatalf("registerSession(...) error = %v, want nil", err)
 		}
 
@@ -310,14 +291,6 @@ func TestConfigRoots(t *testing.T) {
 	}
 }
 
-func ownedOverGroups(pgids ...int) *ownedDescendants {
-	tracker := &groupTracker{}
-	for _, pgid := range pgids {
-		tracker.register(pgid)
-	}
-	return newOwnedDescendants(tracker)
-}
-
 func TestOwnedDescendantsObserve(t *testing.T) {
 	t.Parallel()
 
@@ -354,7 +327,7 @@ func TestOwnedDescendantsObserve(t *testing.T) {
 			t.Parallel()
 
 			var got []int
-			for _, m := range ownedOverGroups(tt.pgids...).observe(tt.members) {
+			for _, m := range newOwnedDescendants(&groupTracker{}).observe(tt.members, tt.pgids) {
 				got = append(got, m.pid)
 			}
 			if !slices.Equal(got, tt.want) {
@@ -367,13 +340,13 @@ func TestOwnedDescendantsObserve(t *testing.T) {
 func TestOwnedDescendantsKeepOwnershipOnceTheParentIsGone(t *testing.T) {
 	t.Parallel()
 
-	owned := ownedOverGroups(2)
+	owned := newOwnedDescendants(&groupTracker{})
 	owned.observe([]processMember{
 		{pid: 2, pgid: 2, ppid: 1},
 		{pid: 3, pgid: 3, ppid: 2},
-	})
+	}, []int{2})
 
-	survivors := owned.observe([]processMember{{pid: 3, pgid: 3, ppid: 1}})
+	survivors := owned.observe([]processMember{{pid: 3, pgid: 3, ppid: 1}}, []int{2})
 
 	if len(survivors) != 1 || survivors[0].pid != 3 {
 		t.Errorf("observe(...) after the launch exited = %+v, want the detached descendant still owned", survivors)
@@ -383,14 +356,14 @@ func TestOwnedDescendantsKeepOwnershipOnceTheParentIsGone(t *testing.T) {
 func TestOwnedDescendantsDropAProcessThatLeftTheTable(t *testing.T) {
 	t.Parallel()
 
-	owned := ownedOverGroups(2)
+	owned := newOwnedDescendants(&groupTracker{})
 	owned.observe([]processMember{
 		{pid: 2, pgid: 2, ppid: 1},
 		{pid: 3, pgid: 3, ppid: 2},
-	})
-	owned.observe(nil)
+	}, []int{2})
+	owned.observe(nil, []int{2})
 
-	survivors := owned.observe([]processMember{{pid: 3, pgid: 3, ppid: 1}})
+	survivors := owned.observe([]processMember{{pid: 3, pgid: 3, ppid: 1}}, []int{2})
 
 	if len(survivors) != 0 {
 		t.Errorf("observe(...) = %+v, want nothing owned: process 3 had left the process table, so the id is no longer this run's", survivors)
@@ -402,9 +375,9 @@ func TestOwnedDescendantsDropAProcessThatLeftTheTable(t *testing.T) {
 func TestInduceWorkspaceSecurityGradesAnInterpretedLaunch(t *testing.T) {
 	t.Parallel()
 
-	pgid, commandPath := startInterpretedLiveGroup(t)
+	group, commandPath := startInterpretedLiveGroup(t)
 	tracker := &groupTracker{}
-	tracker.register(pgid)
+	tracker.register(group)
 	coords := Coordinates{CommandPath: commandPath, Profile: profile.RuntimeProfile{ProjectConfigPaths: []string{".mcp.json"}}}
 	fixture := &sharedFixture{workspaceRoot: t.TempDir(), tracker: tracker}
 
@@ -417,7 +390,7 @@ func TestInduceWorkspaceSecurityGradesAnInterpretedLaunch(t *testing.T) {
 
 const interpreterLinkName = "node"
 
-func startInterpretedLiveGroup(t *testing.T) (pgid int, commandPath string) {
+func startInterpretedLiveGroup(t *testing.T) (group *procutil.Group, commandPath string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -438,61 +411,26 @@ func startInterpretedLiveGroup(t *testing.T) (pgid int, commandPath string) {
 	}
 
 	cmd := exec.Command(script) //nolint:gosec // script is a fixture this test built under its own temp directory
-	procutil.SetProcessGroup(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start the interpreted launch: %v", err)
+	group = startHeldLaunch(t, cmd).Group()
+	if member := awaitProcessMember(t, group.PID(), "appear in the process table", memberPresent); member.basename != interpreterLinkName {
+		t.Fatalf("the launched process reports basename %q, want %q: the control no longer reproduces an interpreted launch", member.basename, interpreterLinkName)
 	}
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	t.Cleanup(func() {
-		_ = signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
-		<-done
-	})
-	awaitInterpretedBasename(t, cmd.Process.Pid)
-	return cmd.Process.Pid, script
-}
-
-func awaitInterpretedBasename(t *testing.T, pid int) {
-	t.Helper()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		snapshot, err := psSnapshot()
-		if err != nil {
-			t.Fatalf("process-table query: %v", err)
-		}
-		for _, m := range snapshot {
-			if m.pid != pid {
-				continue
-			}
-			if m.basename == interpreterLinkName {
-				return
-			}
-			t.Fatalf("the launched process reports basename %q, want %q: the control no longer reproduces an interpreted launch", m.basename, interpreterLinkName)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the launched process never appeared in the process table")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	return group, script
 }
 
 func TestInduceProcessCleanupReportsADetachedReparentedDescendant(t *testing.T) {
 	t.Parallel()
 
-	launchPID, descendantPID := startDetachedDescendantLeak(t)
+	launch, descendantPID := startDetachedDescendantLeak(t)
 	adapter := &stubAdapter{stop: func() error {
-		if err := signalProcessGroup(launchPID, syscall.SIGKILL); err != nil {
+		if err := launch.Signal(syscall.SIGKILL); err != nil {
 			return err
 		}
-		awaitReparentedDescendant(t, descendantPID, launchPID)
+		awaitReparentedDescendant(t, descendantPID, launch.PID())
 		return nil
 	}}
 	fixture := &sharedFixture{tracker: &groupTracker{}}
-	if err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(launchPID)}); err != nil {
+	if _, err := fixture.registerSession(adapter, domain.Session{ID: "induction", AgentPID: strconv.Itoa(launch.PID())}); err != nil {
 		t.Fatalf("registerSession(...) error = %v, want nil", err)
 	}
 
@@ -501,7 +439,7 @@ func TestInduceProcessCleanupReportsADetachedReparentedDescendant(t *testing.T) 
 	if obs.Grade == evidence.GradeUsable {
 		t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a descendant this run left running outside every process group it registered", obs)
 	}
-	awaitProcessMember(t, descendantPID, "leave the process table under the drain", func(_ processMember, present bool) bool { return !present })
+	awaitProcessMember(t, descendantPID, "leave the process table under the drain", memberGone)
 }
 
 type detachedProbeLeakParams struct {
@@ -577,23 +515,23 @@ func TestInduceProcessCleanupReportsADescendantOrphanedBeforeTheReading(t *testi
 	// still frees the descendant.
 	t.Cleanup(func() { killReportedPID(receipt) })
 
-	if !awaitProbeExecution(fixture.ownership(), probe, launch.pgid, time.Now().Add(processTableBound)) {
+	if !awaitProbeExecution(fixture.ownership(), probe, launch.group.PID(), time.Now().Add(waittest.HangGuard)) {
 		t.Fatal("the probe was never observed running under this launch, so the control never reached the one reading that can prove ownership")
 	}
-	descendantPID := awaitReportedPID(t, receipt)
-	requireDetachedDescendant(t, launch.pgid, descendantPID)
+	descendantPID := waittest.PIDFile(t, receipt)
+	requireDetachedDescendant(t, launch.group.PID(), descendantPID)
 
 	if _, _, ended := launch.terminate(); !ended {
 		t.Fatal("the launch did not end within its own drain bound after its group was taken down")
 	}
-	awaitReparentedDescendant(t, descendantPID, launch.pgid)
+	awaitReparentedDescendant(t, descendantPID, launch.group.PID())
 
 	obs := induceProcessCleanup(fixture)
 
 	if obs.Grade == evidence.GradeUsable {
 		t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a descendant the run orphaned before the reading was taken", obs)
 	}
-	awaitProcessMember(t, descendantPID, "leave the process table under the drain", func(_ processMember, present bool) bool { return !present })
+	awaitProcessMember(t, descendantPID, "leave the process table under the drain", memberGone)
 }
 
 func TestInduceProcessCleanupReportsADescendantOfAPlainNativeLaunch(t *testing.T) {
@@ -612,21 +550,29 @@ func TestInduceProcessCleanupReportsADescendantOfAPlainNativeLaunch(t *testing.T
 	t.Cleanup(launch.cancel)
 	t.Cleanup(func() { killReportedPID(receipt) })
 
-	descendantPID := awaitReportedPID(t, receipt)
-	requireDetachedDescendant(t, launch.pgid, descendantPID)
-	awaitLedgerOwnership(t, fixture.ownership(), descendantPID)
+	descendantPID := waittest.PIDFile(t, receipt)
+	requireDetachedDescendant(t, launch.group.PID(), descendantPID)
+	owned := fixture.ownership()
+	waittest.Until(t, func() error {
+		owned.mu.Lock()
+		defer owned.mu.Unlock()
+		if !owned.owned[descendantPID] {
+			return fmt.Errorf("the ledger never recorded process %d while the launch that started it was running", descendantPID)
+		}
+		return nil
+	})
 
 	if _, _, ended := launch.terminate(); !ended {
 		t.Fatal("the launch did not end within its own drain bound after its group was taken down")
 	}
-	awaitReparentedDescendant(t, descendantPID, launch.pgid)
+	awaitReparentedDescendant(t, descendantPID, launch.group.PID())
 
 	obs := induceProcessCleanup(fixture)
 
 	if obs.Grade == evidence.GradeUsable {
 		t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a descendant of a launch no probe wait watched", obs)
 	}
-	awaitProcessMember(t, descendantPID, "leave the process table under the drain", func(_ processMember, present bool) bool { return !present })
+	awaitProcessMember(t, descendantPID, "leave the process table under the drain", memberGone)
 }
 
 // A process-table read is an observation, not a proof, so for a program this
@@ -650,19 +596,19 @@ func TestInduceProcessCleanupReportsAChildStartedAfterTheLastReading(t *testing.
 	}
 	t.Cleanup(launch.cancel)
 
-	if _, _, ended := launch.await(lateDetachedChildDelay + processTableBound); !ended {
+	if _, _, ended := launch.await(waittest.HangGuard); !ended {
 		t.Fatal("the runtime never exited, so the control never reached the reading a vanished parent is read under")
 	}
-	descendantPID := awaitReportedPID(t, receipt)
-	member := awaitProcessMember(t, descendantPID, "appear in the process table", func(_ processMember, present bool) bool { return present })
+	descendantPID := waittest.PIDFile(t, receipt)
+	member := awaitProcessMember(t, descendantPID, "appear in the process table", memberPresent)
 	if member.pgid != descendantPID {
 		t.Fatalf("the detached descendant runs in process group %d, want the group %d it leads itself", member.pgid, descendantPID)
 	}
-	if member.pgid == launch.pgid {
-		t.Fatalf("the detached descendant runs in the launch's own process group %d, want a group the run never registered", launch.pgid)
+	if member.pgid == launch.group.PID() {
+		t.Fatalf("the detached descendant runs in the launch's own process group %d, want a group the run never registered", launch.group.PID())
 	}
-	if member.ppid == launch.pgid {
-		t.Fatalf("the detached descendant's parent is still the launch %d, want it orphaned before the reading", launch.pgid)
+	if member.ppid == launch.group.PID() {
+		t.Fatalf("the detached descendant's parent is still the launch %d, want it orphaned before the reading", launch.group.PID())
 	}
 
 	obs := induceProcessCleanup(fixture)
@@ -670,25 +616,7 @@ func TestInduceProcessCleanupReportsAChildStartedAfterTheLastReading(t *testing.
 	if obs.Grade == evidence.GradeUsable {
 		t.Errorf("induceProcessCleanup(...) = %+v, want a negative observation for a descendant started after the last reading its launch took", obs)
 	}
-	awaitProcessMember(t, descendantPID, "leave the process table under the drain", func(_ processMember, present bool) bool { return !present })
-}
-
-func awaitLedgerOwnership(t *testing.T, owned *ownedDescendants, pid int) {
-	t.Helper()
-
-	deadline := time.Now().Add(processTableBound)
-	for {
-		owned.mu.Lock()
-		held := owned.owned[pid]
-		owned.mu.Unlock()
-		if held {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the ledger never recorded process %d while the launch that started it was running, within %s", pid, processTableBound)
-		}
-		time.Sleep(processTablePollInterval)
-	}
+	awaitProcessMember(t, descendantPID, "leave the process table under the drain", memberGone)
 }
 
 // killReportedPID frees the reported pid, addressed by id alone so nothing
@@ -733,7 +661,7 @@ func TestDetachedLeakHelperProcess(t *testing.T) {
 	time.Sleep(detachedLeakLifetime)
 }
 
-func startDetachedDescendantLeak(t *testing.T) (launchPID, descendantPID int) {
+func startDetachedDescendantLeak(t *testing.T) (launch *procutil.Group, descendantPID int) {
 	t.Helper()
 
 	sleeper, err := exec.LookPath("sleep")
@@ -750,55 +678,18 @@ func startDetachedDescendantLeak(t *testing.T) (launchPID, descendantPID int) {
 		detachedLeakReportEnv+"="+filepath.Join(dir, "descendant.pid"),
 		detachedLeakSleeperEnv+"="+sleeper,
 	)
-	procutil.SetProcessGroup(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start the launch: %v", err)
-	}
-	launchPID = cmd.Process.Pid
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	t.Cleanup(func() {
-		_ = signalProcessGroup(launchPID, syscall.SIGKILL)
-		<-done
-	})
+	launch = startHeldLaunch(t, cmd).Group()
 
-	descendantPID = awaitReportedPID(t, filepath.Join(dir, "descendant.pid"))
+	descendantPID = waittest.PIDFile(t, filepath.Join(dir, "descendant.pid"))
 	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
-	requireDetachedDescendant(t, launchPID, descendantPID)
-	return launchPID, descendantPID
+	requireDetachedDescendant(t, launch.PID(), descendantPID)
+	return launch, descendantPID
 }
 
-// awaitReportedPID reads the pid the launch half wrote to path. The trailing
-// newline distinguishes a short read from a complete one.
-func awaitReportedPID(t *testing.T, path string) int {
-	t.Helper()
-
-	deadline := time.Now().Add(processTableBound)
-	for {
-		reported, err := os.ReadFile(path)
-		if err == nil && strings.HasSuffix(string(reported), "\n") {
-			pid, convErr := strconv.Atoi(strings.TrimSpace(string(reported)))
-			if convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the launch never reported a detached descendant within %s", processTableBound)
-		}
-		time.Sleep(processTablePollInterval)
-	}
-}
-
-// requireDetachedDescendant asserts the descendant leads its own group and is
-// a child of the launch while it lives, so the control is not grading an
-// ordinary group member.
 func requireDetachedDescendant(t *testing.T, launchPID, descendantPID int) {
 	t.Helper()
 
-	member := awaitProcessMember(t, descendantPID, "appear in the process table", func(_ processMember, present bool) bool { return present })
+	member := awaitProcessMember(t, descendantPID, "appear in the process table", memberPresent)
 	if member.pgid != descendantPID {
 		t.Fatalf("the detached descendant runs in process group %d, want the group %d it leads itself", member.pgid, descendantPID)
 	}
@@ -823,36 +714,31 @@ func awaitReparentedDescendant(t *testing.T, descendantPID, launchPID int) {
 	})
 }
 
-const processTableBound = 10 * time.Second
+func memberPresent(_ processMember, present bool) bool { return present }
 
-const processTablePollInterval = 10 * time.Millisecond
+func memberGone(_ processMember, present bool) bool { return !present }
 
-// awaitProcessMember polls until cond holds for pid's row and returns it. cond
-// receives the zero row and false when no row belongs to pid; what names the
-// condition in the timeout message.
 func awaitProcessMember(t *testing.T, pid int, what string, cond func(member processMember, present bool) bool) processMember {
 	t.Helper()
 
-	deadline := time.Now().Add(processTableBound)
-	for {
+	var member processMember
+	waittest.Until(t, func() error {
 		snapshot, err := psSnapshot()
 		if err != nil {
 			t.Fatalf("process-table query: %v", err)
 		}
-		var member processMember
 		var present bool
+		member = processMember{}
 		for _, candidate := range snapshot {
 			if candidate.pid == pid {
 				member, present = candidate, true
 				break
 			}
 		}
-		if cond(member, present) {
-			return member
+		if !cond(member, present) {
+			return fmt.Errorf("process %d did not %s", pid, what)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("process %d did not %s within %s", pid, what, processTableBound)
-		}
-		time.Sleep(processTablePollInterval)
-	}
+		return nil
+	})
+	return member
 }

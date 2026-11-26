@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 )
@@ -335,21 +337,19 @@ func TestReconcileLabelFix_LiveAPI_E2E(t *testing.T) {
 	ghClient.addLabel(t, owner, repo, prNumber, fixLabel)
 
 	const maxTicks = 8
-	dispatched := false
-	for range maxTicks {
+	dispatchTick := func() error {
 		reconcileLabelFixCommands(state, params, discardLogger(), ctx, &domain.NoopMetrics{})
 
 		if _, retryQueued := state.RetryAttempts[issueID]; retryQueued {
-			dispatched = true
-			break
+			return nil
 		}
 		if pending, present := state.PendingReactions[rkey]; present {
 			pending.PendingRetryAt = time.Time{}
 			state.PendingReactions[rkey] = pending
 		}
-		time.Sleep(2 * time.Second)
+		return errors.New("no label-fix dispatch queued")
 	}
-	if !dispatched {
+	if err := waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, dispatchTick); err != nil {
 		t.Fatal("label-fix dispatch did not fire within the tick budget")
 	}
 
@@ -402,21 +402,7 @@ func TestReconcileLabelFix_LiveAPI_E2E(t *testing.T) {
 
 	ghClient.addLabel(t, owner, repo, prNumber, fixLabel)
 
-	dispatchedAgain := false
-	for range maxTicks {
-		reconcileLabelFixCommands(state, params, discardLogger(), ctx, &domain.NoopMetrics{})
-
-		if _, retryQueued := state.RetryAttempts[issueID]; retryQueued {
-			dispatchedAgain = true
-			break
-		}
-		if pending, present := state.PendingReactions[rkey]; present {
-			pending.PendingRetryAt = time.Time{}
-			state.PendingReactions[rkey] = pending
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if !dispatchedAgain {
+	if err := waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, dispatchTick); err != nil {
 		t.Fatal("second label-fix dispatch did not fire within the tick budget after re-applying the label")
 	}
 }

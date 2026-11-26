@@ -729,14 +729,14 @@
                         "uid": "${DS_PROMETHEUS}"
                     },
                     "editorMode": "code",
-                    "expr": "rate(sortie_agent_runtime_seconds_total[5m])",
-                    "legendFormat": "Agent runtime rate",
+                    "expr": "sum(rate(sortie_agent_runtime_seconds_total[5m])) by (model)",
+                    "legendFormat": "{{model}}",
                     "range": true,
                     "refId": "A"
                 }
             ],
             "title": "Agent Runtime",
-            "description": "Rate of cumulative agent runtime accumulation (seconds/second). Represents effective agent concurrency.",
+            "description": "Rate at which completed sessions add agent runtime, per model (seconds/second). A session adds its runtime when it ends, so a session still running is not shown.",
             "type": "timeseries"
         },
         {

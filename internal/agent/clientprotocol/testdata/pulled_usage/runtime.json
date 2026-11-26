@@ -1,0 +1,1 @@
+{"launch":{"Command":"/usr/local/bin/kiro-cli","Args":["acp"]},"remoteLaunches":["kiro-cli acp","/home/dev/.local/bin/kiro-cli acp"],"otherRemoteLaunch":"/usr/local/bin/gemini --acp","execute":"_kiro.dev/commands/execute","getUsage":"_kiro/account/getUsage"}

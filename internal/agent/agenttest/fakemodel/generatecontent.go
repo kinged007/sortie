@@ -28,7 +28,7 @@ func (generateContentCodec) credentialHeaders() []string {
 	return []string{"x-goog-api-key", "Authorization"}
 }
 
-func (generateContentCodec) route(method, path string) (route, bool) {
+func (generateContentCodec) route(method, path string, _ http.Header) (route, bool) {
 	if method != http.MethodPost {
 		return route{}, false
 	}

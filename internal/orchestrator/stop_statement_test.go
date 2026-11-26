@@ -12,6 +12,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/render"
 	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/redact"
@@ -168,6 +169,7 @@ func TestStopStatement_PublicStatementLeavesNoSecretPrefixAtAnyCut(t *testing.T)
 type stopExit struct {
 	tracker *mockTrackerAdapter
 	slack   *notifierSpy
+	store   *mockExitStore
 }
 
 func exitWithStatement(t *testing.T, result WorkerResult, withheld bool) stopExit {
@@ -176,12 +178,13 @@ func exitWithStatement(t *testing.T, result WorkerResult, withheld bool) stopExi
 	const issueID = "STOP-1"
 	tracker := &mockTrackerAdapter{}
 	slack := &notifierSpy{}
+	store := &mockExitStore{}
 	router := mustRouter(t, tracker, spyLookup(slack), route.Inputs{Entries: []config.NotificationBackend{
 		subscribe(domain.TrackerCommentKind, domain.EventSessionStopped, domain.EventSessionFailed),
 		subscribe("slack", domain.EventSessionStopped, domain.EventSessionFailed),
 	}})
 	state := exitStateWithIssue(t, issueID, "In Progress")
-	params := handoffEvidenceExitParams(t, &mockExitStore{}, tracker, &domain.NoopMetrics{})
+	params := handoffEvidenceExitParams(t, store, tracker, &domain.NoopMetrics{})
 	params.Router = router
 	result.IssueID = issueID
 	result.Identifier = issueID + "-ident"
@@ -197,7 +200,7 @@ func exitWithStatement(t *testing.T, result WorkerResult, withheld bool) stopExi
 	state.TrackerOpsWg.Wait()
 	t.Cleanup(func() { CancelRetry(state, issueID) })
 
-	return stopExit{tracker: tracker, slack: slack}
+	return stopExit{tracker: tracker, slack: slack, store: store}
 }
 
 func (e stopExit) comments(t *testing.T) []commentIssueCall {
@@ -218,6 +221,17 @@ func (e stopExit) singleComment(t *testing.T) commentIssueCall {
 	return comments[0]
 }
 
+func (e stopExit) assertRun(t *testing.T, wantOutcome, wantText string) {
+	t.Helper()
+
+	if len(e.store.runHistories) != 1 {
+		t.Fatalf("appended runs = %+v, want exactly one", e.store.runHistories)
+	}
+	if run := e.store.runHistories[0]; run.DeclaredOutcome != wantOutcome || run.AgentText != wantText {
+		t.Errorf("run row declared_outcome, agent_text = %q, %q, want %q, %q", run.DeclaredOutcome, run.AgentText, wantOutcome, wantText)
+	}
+}
+
 func (e stopExit) singleNotification(t *testing.T) domain.Notification {
 	t.Helper()
 
@@ -228,7 +242,7 @@ func (e stopExit) singleNotification(t *testing.T) domain.Notification {
 	return sent[0]
 }
 
-func TestStopStatement_ExitCommentCarriesTheReasonAsLiteral(t *testing.T) {
+func TestStopStatement_ExitCommentCarriesTheReasonAfterTheBody(t *testing.T) {
 	t.Parallel()
 
 	secret := registeredSecret(t)
@@ -289,19 +303,20 @@ func TestStopStatement_ExitCommentCarriesTheReasonAsLiteral(t *testing.T) {
 			}, false)
 
 			comment := exit.singleComment(t)
-			if comment.Text != tt.wantBody || comment.Literal != tt.wantLiteral {
-				t.Errorf("tracker comment = {Text:%q Literal:%q}, want {Text:%q Literal:%q}", comment.Text, comment.Literal, tt.wantBody, tt.wantLiteral)
+			if wantText := tt.wantBody + "\n\n" + tt.wantLiteral; comment.Text != wantText {
+				t.Errorf("tracker comment Text = %q, want %q", comment.Text, wantText)
 			}
 			notification := exit.singleNotification(t)
 			if notification.Message.AgentText != tt.wantLiteral {
 				t.Errorf("slack AgentText = %q, want %q", notification.Message.AgentText, tt.wantLiteral)
 			}
-			if notification.Message.Body != tt.wantBody {
-				t.Errorf("slack Body = %q, want %q (the statement travels apart from the body)", notification.Message.Body, tt.wantBody)
+			if body := render.Notification(notification).Body; body != tt.wantBody {
+				t.Errorf("slack Body = %q, want %q (the statement travels apart from the body)", body, tt.wantBody)
 			}
 			if notification.Envelope.EventType != domain.EventSessionStopped {
 				t.Errorf("slack EventType = %q, want %q", notification.Envelope.EventType, domain.EventSessionStopped)
 			}
+			exit.assertRun(t, tt.reason, tt.wantLiteral)
 		})
 	}
 }
@@ -341,6 +356,7 @@ func TestStopStatement_ExitWithoutAReasonCommentsAsBefore(t *testing.T) {
 			if got := exit.singleNotification(t).Message.AgentText; got != "" {
 				t.Errorf("slack AgentText = %q, want empty", got)
 			}
+			exit.assertRun(t, "blocked", "")
 		})
 	}
 }
@@ -364,9 +380,10 @@ func TestStopStatement_FailedSessionCarriesNoReason(t *testing.T) {
 		t.Errorf("session.failed AgentText = %q, want empty", notification.Message.AgentText)
 	}
 	comment := exit.singleComment(t)
-	if comment.Literal != "" || !strings.HasPrefix(comment.Text, "Sortie session failed.") {
-		t.Errorf("tracker comment = %+v, want the failure comment with no literal block", comment)
+	if !strings.HasPrefix(comment.Text, "Sortie session failed.") || strings.Contains(comment.Text, "Check the retry path.") {
+		t.Errorf("tracker comment = %+v, want the failure comment with no statement", comment)
 	}
+	exit.assertRun(t, "needs-human-review", "Check the retry path.")
 }
 
 func TestStopStatement_ErrorExitCarriesNoReason(t *testing.T) {
@@ -381,9 +398,10 @@ func TestStopStatement_ErrorExitCarriesNoReason(t *testing.T) {
 	if got := exit.singleNotification(t).Message.AgentText; got != "" {
 		t.Errorf("session.failed AgentText = %q, want empty", got)
 	}
-	if comment := exit.singleComment(t); comment.Literal != "" {
-		t.Errorf("tracker comment literal = %q, want empty", comment.Literal)
+	if comment := exit.singleComment(t); strings.Contains(comment.Text, "left over") {
+		t.Errorf("tracker comment = %q, want no statement", comment.Text)
 	}
+	exit.assertRun(t, "", "")
 }
 
 type statusScenario struct {

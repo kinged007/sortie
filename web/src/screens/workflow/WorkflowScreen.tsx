@@ -1,11 +1,15 @@
 import { useStateQuery } from "@/api/queries";
-import { fmtCount, fmtRate, fmtStamp, fmtTokens } from "@/lib/format";
+import { usageByKind } from "@/lib/agent-kinds";
+import { hasRateSource } from "@/lib/budget";
+import { fmtCount, fmtMoney, fmtStamp, fmtTokens } from "@/lib/format";
+import { rateText, UNSET_RATE, UNSET_RATE_FROM_INPUT } from "@/lib/rates";
+import { Code } from "@/components/Code";
 import { Pair, Pairs, Panel } from "@/components/Panel";
 import { StateBadge } from "@/components/StateBadge";
 
 import { DispatchSection } from "./DispatchSection";
 import { ReactionsSection } from "./ReactionsSection";
-import { Code, joinCode, msText, Note, usageText } from "./workflow-text";
+import { joinCode, msText, Note, usageText } from "./workflow-text";
 
 import type { ConfigResponse, TokenRateResponse, WorkflowHealthResponse } from "@/api/types.gen";
 import type { ReactNode } from "react";
@@ -60,6 +64,7 @@ function TrackerPanel({ config }: ConfigProps) {
     <Panel title="Tracker">
       <Pairs>
         <Pair label="Kind">{tracker.kind}</Pair>
+        {tracker.project ? <Pair label="Project">{tracker.project}</Pair> : undefined}
         <Pair label="Active">
           <StateList states={tracker.active_states} />
         </Pair>
@@ -85,18 +90,6 @@ function TrackerPanel({ config }: ConfigProps) {
       </Pairs>
     </Panel>
   );
-}
-
-function usageByKind(config: ConfigResponse): [string, string][] {
-  const byKind = new Map<string, string>([[config.agent.kind, config.agent.usage_arrival]]);
-  const { dispatch } = config;
-  if (dispatch.default !== null) {
-    byKind.set(dispatch.default.agent_kind, dispatch.default.usage_arrival);
-  }
-  for (const rule of dispatch.rules ?? []) {
-    byKind.set(rule.agent_kind, rule.usage_arrival);
-  }
-  return [...byKind].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function AgentPanel({ config }: ConfigProps) {
@@ -126,6 +119,9 @@ function AgentPanel({ config }: ConfigProps) {
         <Pair label="Token budget">
           {agent.max_tokens === null ? NONE : `${fmtTokens(agent.max_tokens)} per issue`}
         </Pair>
+        <Pair label="Money budget">
+          {agent.max_cost_usd === null ? NONE : `${fmtMoney(agent.max_cost_usd)} per issue`}
+        </Pair>
         <Pair label="Session budget">
           {agent.max_sessions === null ? NONE : `${fmtCount(agent.max_sessions)} per issue`}
         </Pair>
@@ -149,27 +145,24 @@ function AgentPanel({ config }: ConfigProps) {
   );
 }
 
-function rateText(rate: number | null, unset: string): string {
-  return rate === null ? unset : `${fmtRate(rate)} per 1M`;
-}
-
 interface RateListProps {
-  kind: string;
+  name: string;
   rate: TokenRateResponse;
 }
 
-function RateList({ kind, rate }: RateListProps) {
-  const unsetCache = rate.input_per_mtok === null ? "not set" : "input rate (not set)";
+function RateList({ name, rate }: RateListProps) {
+  const unsetCache =
+    rate.per_kind && rate.input_per_mtok !== null ? UNSET_RATE_FROM_INPUT : UNSET_RATE;
   return (
     <div className="flex flex-col gap-xs">
-      <p className="font-mono text-body-sm text-ink">{kind}</p>
+      <p className="font-mono text-body-sm text-ink">{name}</p>
       <Pairs>
-        <Pair label="Input">{rateText(rate.input_per_mtok, "not set")}</Pair>
-        <Pair label="Output">{rateText(rate.output_per_mtok, "not set")}</Pair>
+        <Pair label="Input">{rateText(rate.input_per_mtok, UNSET_RATE)}</Pair>
+        <Pair label="Output">{rateText(rate.output_per_mtok, UNSET_RATE)}</Pair>
         <Pair label="Cache read">{rateText(rate.cache_read_per_mtok, unsetCache)}</Pair>
         <Pair label="Cache write">{rateText(rate.cache_write_per_mtok, unsetCache)}</Pair>
       </Pairs>
-      {rate.complete ? undefined : (
+      {rate.complete || !rate.per_kind ? undefined : (
         <Note>
           Not priced without <Code>input_per_mtok</Code> and <Code>output_per_mtok</Code>.
         </Note>
@@ -178,16 +171,22 @@ function RateList({ kind, rate }: RateListProps) {
   );
 }
 
-function TokenRatesPanel({ config }: ConfigProps) {
+interface TokenRatesPanelProps extends ConfigProps {
+  hasSource: boolean;
+}
+
+function TokenRatesPanel({ config, hasSource }: TokenRatesPanelProps) {
   const rates = config.token_rates;
   return (
     <Panel title="Token rates">
       {rates === null ? (
-        <p className="text-body-md text-ink-body">Not set: no cost is shown.</p>
+        <p className="text-body-md text-ink-body">
+          {hasSource ? "Not set: costs come from the price table." : "Not set: no cost is shown."}
+        </p>
       ) : (
         Object.keys(rates)
           .sort()
-          .map((kind) => <RateList key={kind} kind={kind} rate={rates[kind]} />)
+          .map((name) => <RateList key={name} name={name} rate={rates[name]} />)
       )}
     </Panel>
   );
@@ -197,7 +196,6 @@ function hasReactions(config: ConfigResponse): boolean {
   return Object.values(config.reactions).some((reaction) => reaction !== undefined);
 }
 
-/** Renders Workflow: the configuration in effect as the state route serves it, under a standfirst that names a failed load of the file. */
 export function WorkflowScreen(): ReactNode {
   const { data } = useStateQuery();
   if (data === undefined) {
@@ -235,7 +233,7 @@ export function WorkflowScreen(): ReactNode {
         <div className="flex min-w-0 flex-col gap-xl">
           <TrackerPanel config={config} />
           <AgentPanel config={config} />
-          <TokenRatesPanel config={config} />
+          <TokenRatesPanel config={config} hasSource={hasRateSource(data)} />
         </div>
       </div>
     </div>

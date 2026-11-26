@@ -840,7 +840,7 @@ func (a *GitLabAdapter) FetchIssueComments(ctx context.Context, issueID string) 
 	return comments, err
 }
 
-// fetchStatesByIIDs returns the derived state for each requested iid
+// fetchStatesByIIDs returns the derived state and labels for each requested iid
 // string, keyed by the requested value. It returns an empty non-nil map
 // with no request when requested is empty or when every value is empty or
 // unparseable.
@@ -849,9 +849,9 @@ func (a *GitLabAdapter) FetchIssueComments(ctx context.Context, issueID string) 
 // through the iids[] filter. A 404 on this route signals a lost project
 // and is returned rather than swallowed; an absent iid simply omits its
 // key from the result.
-func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []string) (map[string]string, error) {
+func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []string) (map[string]domain.IssueStateAndLabels, error) {
 	if len(requested) == 0 {
-		return map[string]string{}, nil
+		return map[string]domain.IssueStateAndLabels{}, nil
 	}
 
 	order := make([]int, 0, len(requested))
@@ -867,11 +867,11 @@ func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []strin
 		wanted[n] = append(wanted[n], value)
 	}
 	if len(order) == 0 {
-		return map[string]string{}, nil
+		return map[string]domain.IssueStateAndLabels{}, nil
 	}
 
 	snapshot := a.model.Snapshot()
-	states := make(map[string]string, len(requested))
+	reads := make(map[string]domain.IssueStateAndLabels, len(requested))
 	for chunkStart := 0; chunkStart < len(order); chunkStart += stateBatchSize {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -901,14 +901,17 @@ func (a *GitLabAdapter) fetchStatesByIIDs(ctx context.Context, requested []strin
 			if !ok {
 				continue
 			}
-			derived := a.model.Derive(snapshot, strconv.Itoa(gi.IID), gi.Labels, gi.isClosed())
+			read := domain.IssueStateAndLabels{
+				State:  a.model.Derive(snapshot, strconv.Itoa(gi.IID), gi.Labels, gi.isClosed()),
+				Labels: issuekit.NormalizeLabels(gi.Labels),
+			}
 			for _, key := range keys {
-				states[key] = derived
+				reads[key] = read
 			}
 		}
 	}
 
-	return states, nil
+	return reads, nil
 }
 
 // FetchIssueStatesByIDs returns the derived state for each requested iid,
@@ -921,10 +924,26 @@ func (a *GitLabAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []st
 		if fetchErr != nil {
 			return fetchErr
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the derived state and labels for
+// each requested iid, keyed by the requested string. The query filter is
+// not applied.
+func (a *GitLabAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		fetched, fetchErr := a.fetchStatesByIIDs(ctx, issueIDs)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		reads = fetched
+		return nil
+	})
+	return reads, err
 }
 
 // FetchIssueStatesByIdentifiers returns the derived state for each
@@ -937,7 +956,7 @@ func (a *GitLabAdapter) FetchIssueStatesByIdentifiers(ctx context.Context, ident
 		if fetchErr != nil {
 			return fetchErr
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
@@ -1121,14 +1140,6 @@ func (a *GitLabAdapter) setClosed(path string) func(ctx context.Context, closed 
 func (a *GitLabAdapter) CommentIssue(ctx context.Context, issueID, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(ctx, issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GitLabAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

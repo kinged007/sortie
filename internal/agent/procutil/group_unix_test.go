@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func stubGroupKill(t *testing.T, fn func(pid int, sig syscall.Signal) error) {
@@ -118,7 +119,7 @@ func startLeaderWithLiveMember(t *testing.T) *exec.Cmd {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 	})
-	pollForPID(t, pidFile, 5*time.Second)
+	waittest.PIDFile(t, pidFile)
 	return cmd
 }
 
@@ -154,7 +155,7 @@ func runReapToDone(t *testing.T, cmd *exec.Cmd, logger *slog.Logger) *Reaper {
 	t.Helper()
 	startOwned(t, cmd)
 	r := StartReaper(cmd, logger)
-	awaitDone(t, r, 10*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 	return r
 }
 
@@ -267,11 +268,7 @@ func TestGroupReleasedRecordSparesReusedIdentifier(t *testing.T) {
 	if got := calls.Load(); got != 0 {
 		t.Errorf("operations on a released record sharing identifier %d made %d group sends, want 0", proc.Pid, got)
 	}
-	select {
-	case <-victimReaper.Done():
-		t.Errorf("the launch holding group %d ended during operations on a released record that shares its identifier", proc.Pid)
-	case <-time.After(100 * time.Millisecond):
-	}
+	waittest.Never(t, victimReaper.Done(), 100*time.Millisecond, "the launch holding the group ending during operations on a released record that shares its identifier")
 }
 
 func TestReapOutcomeForRealLaunch(t *testing.T) {
@@ -302,7 +299,7 @@ func TestReapOutcomeForRealLaunch(t *testing.T) {
 				})
 				cmd = exec.Command(leaderPath) //nolint:gosec // fake runtime path under t.TempDir()
 				startOwned(t, cmd)
-				descendantPID = pollCapturePIDFile(t, pidPath)
+				descendantPID = waittest.PIDFile(t, pidPath)
 			} else {
 				cmd = fakeRuntimeCmd(t, agenttest.Output{})
 				startOwned(t, cmd)
@@ -316,7 +313,7 @@ func TestReapOutcomeForRealLaunch(t *testing.T) {
 			}
 
 			r := StartReaper(cmd, slog.New(slog.DiscardHandler))
-			awaitDone(t, r, 10*time.Second)
+			waittest.Receive(t, r.Done(), "reaper Done()")
 
 			if got := r.Leftover(); got != tt.wantLeftover {
 				t.Errorf("Leftover() = %t, want %t", got, tt.wantLeftover)
@@ -393,7 +390,7 @@ func TestReapSeamCallsPrecedeRelease(t *testing.T) {
 	})
 
 	r := StartReaper(cmd, slog.New(slog.DiscardHandler))
-	awaitDone(t, r, 10*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	for _, v := range violations {
 		t.Error(v)
@@ -602,7 +599,7 @@ func TestCancellationAfterOwnExitIsNotAStop(t *testing.T) {
 				startOwned(t, cmd)
 
 				r := StartReaper(cmd, slog.New(slog.DiscardHandler))
-				awaitDone(t, r, 10*time.Second)
+				waittest.Receive(t, r.Done(), "reaper Done()")
 
 				if !p.observed.Load() {
 					t.Fatal("the cancellation did not run before the wait, want it to have run")

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/tool/toolresult"
 )
 
@@ -19,32 +20,40 @@ var inputSchema = json.RawMessage(`{
   "additionalProperties": false
 }`)
 
-// BudgetQueryFunc returns per-issue token accounting. The running-session
-// total is taken from session_metadata only when its stored dispatch ID
-// matches runningDispatchID; otherwise it is 0. Implementations make no
+// BudgetQueryFunc returns per-issue token accounting in uncached tokens, the
+// figure the token ceiling compares. The running-session figure is taken from
+// session_metadata only when its stored dispatch ID matches
+// runningDispatchID; otherwise it is 0. Implementations make no
 // external calls.
 type BudgetQueryFunc func(ctx context.Context, issueID string, runningDispatchID string) (BudgetUsage, error)
 
 // BudgetUsage is the per-issue token accounting returned by a
 // [BudgetQueryFunc].
 type BudgetUsage struct {
-	CompletedTotalTokens int64
-	CompletedSessions    int
-	RunningTotalTokens   int64 // session_metadata.total_tokens when dispatch_id matches; else 0.
+	CompletedUncachedTokens int64
+	CompletedSessions       int
+	RunningUncachedTokens   int64 // session_metadata total less cache reads when dispatch_id matches; else 0.
 
 	UnmeasuredSessions int
 
 	// UnaccountedTurns is the summed count of turns that spent tokens no
 	// figure was proven to cover, across the completed sessions and the
 	// matched running session, so a non-zero value makes the sum of
-	// CompletedTotalTokens and RunningTotalTokens a lower bound even when
-	// every session was measured.
+	// CompletedUncachedTokens and RunningUncachedTokens a lower bound even
+	// when every session was measured.
 	UnaccountedTurns int
 
 	// RunningMeasured is true when a session_metadata row matched the
 	// running dispatch ID, the same condition that gates
-	// RunningTotalTokens.
+	// RunningUncachedTokens.
 	RunningMeasured bool
+
+	// UsedUSD is the issue's estimated cost in USD, folded by
+	// [pricing.IssueCost] over the completed runs and the matched running
+	// session. UsedUSDComplete is true when every part of the spend was
+	// priced, so false makes UsedUSD a lower bound.
+	UsedUSD         float64
+	UsedUSDComplete bool
 }
 
 // BudgetTool implements [domain.AgentTool] for the cost_budget tool.
@@ -56,6 +65,7 @@ type BudgetTool struct {
 	budgetTokens      int
 	budgetSessions    int
 	warningTokens     int
+	budgetUSD         float64
 }
 
 // costBudgetResponse is the JSON result of the cost_budget tool. The field
@@ -74,16 +84,24 @@ type costBudgetResponse struct {
 	// byte-identical results to before the threshold existed.
 	WarningTokens  *int64 `json:"warning_tokens,omitempty"`
 	WarningReached *bool  `json:"warning_reached,omitempty"`
+
+	// The money fields are present only while a money ceiling is in force,
+	// for the same byte-identical reason.
+	UsedUSD         *float64 `json:"used_usd,omitempty"`
+	BudgetUSD       *float64 `json:"budget_usd,omitempty"`
+	RemainingUSD    *float64 `json:"remaining_usd,omitempty"`
+	UsedUSDComplete *bool    `json:"used_usd_complete,omitempty"`
 }
 
 // New returns a [BudgetTool] for the given issue and running dispatch.
 // budgetTokens and budgetSessions are the configured ceilings, where 0
 // means unlimited. warningTokens is the configured warning threshold,
 // where 0 omits the warning fields from the result and the description.
-// An empty runningDispatchID contributes no running-session spend and
+// budgetUSD is the configured money ceiling, where 0 omits the money
+// fields from the result and the description. An empty runningDispatchID contributes no running-session spend and
 // makes used_tokens_complete false. New panics if query is nil or
 // issueID is empty.
-func New(query BudgetQueryFunc, issueID string, runningDispatchID string, budgetTokens int, budgetSessions int, warningTokens int) *BudgetTool {
+func New(query BudgetQueryFunc, issueID string, runningDispatchID string, budgetTokens int, budgetSessions int, warningTokens int, budgetUSD float64) *BudgetTool {
 	if query == nil {
 		panic("budget.New: query must not be nil")
 	}
@@ -97,6 +115,7 @@ func New(query BudgetQueryFunc, issueID string, runningDispatchID string, budget
 		budgetTokens:      budgetTokens,
 		budgetSessions:    budgetSessions,
 		warningTokens:     warningTokens,
+		budgetUSD:         budgetUSD,
 	}
 }
 
@@ -108,14 +127,24 @@ func (t *BudgetTool) Description() string {
 		"or hand off before the token ceiling stops this run in flight or blocks a further " +
 		"session. A false used_tokens_complete means some sessions could not be measured, a " +
 		"turn spent an amount that was never fully reported, or the running session's spend " +
-		"is not included yet, so used_tokens is a lower bound."
-	if t.warningTokens == 0 {
-		return desc
+		"is not included yet, so used_tokens is a lower bound. Prompt-cache reads are not " +
+		"counted in used_tokens or remaining_tokens, so used_tokens is lower than a token " +
+		"total your runtime may report; do not compare the two."
+	if t.warningTokens > 0 {
+		desc += " A warning threshold is set below the token ceiling: warning_tokens is " +
+			"that threshold, and warning_reached is true once used_tokens has reached it. When " +
+			"warning_reached is true, wrap up or hand off the work in progress before the " +
+			"ceiling stops this run."
 	}
-	return desc + " A warning threshold is set below the token ceiling: warning_tokens is " +
-		"that threshold, and warning_reached is true once used_tokens has reached it. When " +
-		"warning_reached is true, wrap up or hand off the work in progress before the " +
-		"ceiling stops this run."
+	if t.budgetUSD > 0 {
+		desc += " A money ceiling is set: used_usd is this issue's estimated cost in USD, " +
+			"budget_usd is the ceiling, and remaining_usd is what is left before the ceiling " +
+			"stops this run or blocks a further session. A false used_usd_complete means some " +
+			"spend could not be priced or was not fully reported, so used_usd is a lower bound. " +
+			"The figure is Sortie's estimate from its price rates, not your provider's bill, " +
+			"and can differ from a cost your runtime reports; do not compare the two."
+	}
+	return desc
 }
 
 // InputSchema returns the JSON Schema for cost_budget input; the tool
@@ -135,7 +164,7 @@ func (t *BudgetTool) Execute(ctx context.Context, _ json.RawMessage) (json.RawMe
 		return toolresult.Failure("query_failed", err.Error())
 	}
 
-	usedTokens := usage.CompletedTotalTokens + usage.RunningTotalTokens
+	usedTokens := usage.CompletedUncachedTokens + usage.RunningUncachedTokens
 
 	var remaining *int64
 	if t.budgetTokens > 0 {
@@ -159,6 +188,16 @@ func (t *BudgetTool) Execute(ctx context.Context, _ json.RawMessage) (json.RawMe
 		warningReached := usedTokens >= warningTokens
 		response.WarningTokens = &warningTokens
 		response.WarningReached = &warningReached
+	}
+	if t.budgetUSD > 0 {
+		budgetUSD, remainingUSD := t.budgetUSD, 0.0
+		if !pricing.CeilingReached(usage.UsedUSD, budgetUSD) {
+			remainingUSD = budgetUSD - usage.UsedUSD
+		}
+		response.UsedUSD = &usage.UsedUSD
+		response.BudgetUSD = &budgetUSD
+		response.RemainingUSD = &remainingUSD
+		response.UsedUSDComplete = &usage.UsedUSDComplete
 	}
 
 	return toolresult.Success(response)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
@@ -912,6 +913,41 @@ func TestFetchIssueStatesByIDs(t *testing.T) {
 	})
 }
 
+type labelPageGatedClient struct {
+	*fakeGraphQLClient
+	wantAfter string
+}
+
+func (c labelPageGatedClient) Execute(ctx context.Context, query string, variables map[string]any) ([]byte, http.Header, error) {
+	if strings.Contains(query, "query IssueLabels") && variables["after"] != c.wantAfter {
+		return nil, nil, errors.New("label page requested for an unknown cursor")
+	}
+	return c.fakeGraphQLClient.Execute(ctx, query, variables)
+}
+
+func TestFetchIssueStatesAndLabelsByIDsCompletesSecondLabelPage(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeClient()
+	seedPreflight(f, t)
+	f.queueBody("query IssueStatesAndLabelsByIDs", loadFixture(t, "states_and_labels_by_ids_many_labels.json"))
+	f.queueBody("query IssueLabels", loadFixture(t, "issue_labels_rest.json"))
+	a, err := newAdapter(labelPageGatedClient{f, "labels-cursor-03"}, "SOR", testStates(testActiveStates, "In Review"), nil, nil)
+	if err != nil {
+		t.Fatalf("newAdapter: %v", err)
+	}
+
+	got, err := a.FetchIssueStatesAndLabelsByIDs(context.Background(), []string{"a7c4f8e2-1b9d-4e3a-8f2c-6d5e4a3b2c1f"})
+	if err != nil {
+		t.Fatalf("FetchIssueStatesAndLabelsByIDs: %v", err)
+	}
+
+	want := []string{"label-01", "label-02", "label-03", "label-04", "label-05"}
+	if labels := got["a7c4f8e2-1b9d-4e3a-8f2c-6d5e4a3b2c1f"].Labels; !slices.Equal(labels, want) {
+		t.Errorf("FetchIssueStatesAndLabelsByIDs labels = %v, want %v", labels, want)
+	}
+}
+
 func TestFetchIssueStatesByIdentifiers(t *testing.T) {
 	t.Parallel()
 
@@ -1311,53 +1347,6 @@ func TestCommentIssue(t *testing.T) {
 
 		assertTrackerErrorKind(t, err, domain.ErrTrackerAuth)
 	})
-}
-
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			f := newFakeClient()
-			seedPreflight(f, t)
-			f.queueBody("CommentCreate", loadFixture(t, "comment_create_success.json"))
-			adapter := newTestAdapter(t, f)
-
-			if err := adapter.CommentIssueWithLiteral(context.Background(), "SOR-5", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			calls := f.callsFor("CommentCreate")
-			if len(calls) != 1 {
-				t.Fatalf("CommentCreate call count = %d, want 1", len(calls))
-			}
-			if got := calls[0].variables["body"]; got != tt.want {
-				t.Errorf("CommentCreate body = %q, want %q", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestAddLabel(t *testing.T) {

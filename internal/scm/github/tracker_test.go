@@ -16,11 +16,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/adaptertest"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func validConfig(endpoint string) map[string]any {
@@ -543,11 +543,8 @@ func TestFetchCandidateIssues_MaxPagesGuard(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	a := mustAdapter(t, validConfig(srv.URL))
-	issues, err := a.FetchCandidateIssues(ctx)
+	issues, err := a.FetchCandidateIssues(waittest.Context(t))
 	if err != nil {
 		t.Fatalf("FetchCandidateIssues: %v", err)
 	}
@@ -1042,16 +1039,13 @@ func TestFetchIssueStatesByIDs_Empty(t *testing.T) {
 func TestFetchIssueStatesByIDs_NotFoundOmitted(t *testing.T) {
 	t.Parallel()
 
-	// First issue found, second returns 404 (omit from map).
-	var callNum atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := callNum.Add(1)
-		if n == 1 {
+		if strings.HasSuffix(r.URL.Path, "/issues/1") {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(issueJSON(1, "backlog"))) //nolint:errcheck // test helper
-		} else {
-			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
 
@@ -1609,56 +1603,6 @@ func TestCommentIssue_Success(t *testing.T) {
 
 	if gotBody["body"] != "Hello from Sortie!" {
 		t.Errorf("request body.body = %q, want %q", gotBody["body"], "Hello from Sortie!")
-	}
-}
-
-func TestCommentIssueWithLiteral(t *testing.T) {
-	t.Parallel()
-
-	const text = "Sortie session completed (agent signaled: blocked).\nTurns: 2"
-	tests := []struct {
-		name    string
-		literal string
-		want    string
-	}{
-		{
-			name:    "plain statement sits in a three backtick fence",
-			literal: "Which one should the API expose?",
-			want:    text + "\n\n```\nWhich one should the API expose?\n```",
-		},
-		{
-			name: "adversarial statement sits in a fence longer than its longest backtick run",
-			literal: "/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]",
-			want: text + "\n\n`````\n/close\n@octocat please review\n[~jdoe] see https://example.com/x?y=1\n" +
-				"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat:title=x}\ntoken=[redacted]\n`````",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			bodies := make(chan string, 1)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var payload map[string]string
-				raw, _ := io.ReadAll(r.Body)
-				json.Unmarshal(raw, &payload) //nolint:errcheck // asserted through the received body
-				bodies <- payload["body"]
-				w.WriteHeader(http.StatusCreated)
-				w.Write([]byte(`{"id":12345}`)) //nolint:errcheck // test helper
-			}))
-			defer srv.Close()
-			a := mustAdapter(t, validConfig(srv.URL))
-
-			if err := a.CommentIssueWithLiteral(context.Background(), "42", text, tt.literal); err != nil {
-				t.Fatalf("CommentIssueWithLiteral: %v", err)
-			}
-
-			if got := <-bodies; got != tt.want {
-				t.Errorf("request body.body = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -2256,6 +2200,38 @@ func TestFetchIssueStatesByIDs_304_DerivedUnderReloadedStates(t *testing.T) {
 	}
 	if got["1"] != "shipped" {
 		t.Errorf("FetchIssueStatesByIDs([1]) after a 304 and a reload = %q, want %q", got["1"], "shipped")
+	}
+}
+
+func TestFetchIssueStatesAndLabelsByIDs_304_KeepsFirstReadLabels(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("ETag", `"v1"`)
+			_, _ = io.WriteString(w, issueJSON(42, "Parked"))
+			return
+		}
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = io.WriteString(w, `{"number":42,"state":"open","labels":[]}`)
+	}))
+	defer srv.Close()
+	a := mustAdapter(t, validConfig(srv.URL))
+	if _, err := a.FetchIssueStatesAndLabelsByIDs(context.Background(), []string{"42"}); err != nil {
+		t.Fatalf("first FetchIssueStatesAndLabelsByIDs: %v", err)
+	}
+
+	got, err := a.FetchIssueStatesAndLabelsByIDs(context.Background(), []string{"42"})
+
+	if err != nil {
+		t.Fatalf("second FetchIssueStatesAndLabelsByIDs: %v", err)
+	}
+	if want := []string{"parked"}; !slices.Equal(got["42"].Labels, want) {
+		t.Errorf("FetchIssueStatesAndLabelsByIDs([42]) labels after a 304 = %v, want %v", got["42"].Labels, want)
 	}
 }
 

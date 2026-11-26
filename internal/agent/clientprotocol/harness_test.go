@@ -9,14 +9,13 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
-
-const awaitTimeout = 5 * time.Second
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
@@ -27,28 +26,22 @@ func newTestSession(t *testing.T, agentConfig domain.AgentConfig, maxLineBytes i
 	return newTestSessionWithLogger(t, agentConfig, maxLineBytes, discardLogger())
 }
 
-// withUsageReader must be applied before the pump starts. It queues a
-// handshake control message carrying reader alone, so a test that never
-// calls publishHandshake still delivers reader to the pump through the
-// same path production does. A test that also calls publishHandshake must
-// pass reader there too: a later handshake control message overwrites
-// every field the first one set, reader included.
-func withUsageReader(reader usageReader) func(*sessionState) {
-	return func(state *sessionState) {
-		state.inbox.Put(pumpItem{control: &pumpControl{handshake: &handshakeFacts{reader: reader}}})
-		state.caps = newCapabilityRecord(false, true)
-	}
-}
-
 func newTestSessionWithLogger(t *testing.T, agentConfig domain.AgentConfig, maxLineBytes int, logger *slog.Logger) (*sessionState, *io.PipeReader, *io.PipeWriter) {
 	t.Helper()
+
+	tools, agentErr := agentcore.ResolveToolDelivery(t.Context(), domain.StartSessionParams{}, agentcore.LaunchTarget{}, registry.MCPDialectACPSession, logger)
+	if agentErr != nil {
+		t.Fatalf("ResolveToolDelivery() = %v, want nil", agentErr)
+	}
+	t.Cleanup(func() { _ = tools.Close() })
 
 	outPr, outPw := io.Pipe()
 	inPr, inPw := io.Pipe()
 
 	state := &sessionState{
+		tools:       tools,
 		agentConfig: agentConfig,
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 		usage:       agentcore.NewTurnEndUsage(),
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
@@ -65,6 +58,7 @@ func newTestSessionWithLogger(t *testing.T, agentConfig domain.AgentConfig, maxL
 		_ = inPw.Close()
 		state.stopOnce.Do(func() { close(state.stopCh) })
 		<-state.pumpDone
+		state.conn.Close()
 		_ = outPr.Close()
 		_ = outPw.Close()
 		_ = inPr.Close()
@@ -108,17 +102,6 @@ func runTurnAsyncCtx(ctx context.Context, state *sessionState, params domain.Run
 	return ch
 }
 
-func awaitOutcome(t *testing.T, ch <-chan turnOutcome) turnOutcome {
-	t.Helper()
-	select {
-	case outcome := <-ch:
-		return outcome
-	case <-time.After(awaitTimeout):
-		t.Fatal("timed out waiting for the turn to finish")
-		return turnOutcome{}
-	}
-}
-
 type wireHeader struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
@@ -140,7 +123,6 @@ type outboundReader struct {
 	err error
 }
 
-// newOutboundReader starts scanning r in the background.
 func newOutboundReader(r io.Reader) *outboundReader {
 	rec := &outboundReader{ch: make(chan []byte, 64)}
 	go func() {
@@ -167,15 +149,15 @@ func (r *outboundReader) next(t *testing.T) []byte {
 			t.Fatal("outbound stream ended with no more lines")
 		}
 		return line
-	case <-time.After(awaitTimeout):
-		t.Fatal("timed out waiting for the pump to write a line")
+	case <-waittest.Context(t).Done():
+		t.Fatalf("the pump wrote no line within %v", waittest.HangGuard)
 		return nil
 	}
 }
 
 func (r *outboundReader) awaitMethod(t *testing.T, method string) (id json.RawMessage) {
 	t.Helper()
-	deadline := time.After(awaitTimeout)
+	ctx := waittest.Context(t)
 	for {
 		select {
 		case line, ok := <-r.ch:
@@ -192,8 +174,8 @@ func (r *outboundReader) awaitMethod(t *testing.T, method string) (id json.RawMe
 			if h.Method == method {
 				return h.ID
 			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for method %q", method)
+		case <-ctx.Done():
+			t.Fatalf("method %q not written within %v", method, waittest.HangGuard)
 			return nil
 		}
 	}

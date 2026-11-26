@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,24 +14,26 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/agenttest/launchtest"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/tracker/file"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workflow"
 	"github.com/sortie-ai/sortie/internal/workspace"
 
 	"github.com/sortie-ai/sortie/tools/qualify/evidence"
 	"github.com/sortie-ai/sortie/tools/qualify/evidencetest"
-	"github.com/sortie-ai/sortie/tools/qualify/procgroup"
 )
 
 // fixtureAgentKind is the agent kind the deterministic harness configures;
@@ -40,7 +43,14 @@ const fixtureAgentKind = "qualification-e2e-fixture"
 func init() {
 	registry.Agents.RegisterWithMeta(fixtureAgentKind, func() (domain.AgentAdapter, error) {
 		return nil, fmt.Errorf("%s is resolved through AgentAdapterByKind, never constructed from the registry", fixtureAgentKind)
-	}, registry.AgentMeta{RequiresCommand: true})
+	}, registry.AgentMeta{
+		RequiresCommand: true,
+		UsageSources: usage.Sources{Live: usage.Source{
+			Category: usage.SourceOutput,
+			Strategy: usage.StrategyLive,
+			Spend:    usage.SpendDeclaration{Shape: usage.SpendProcessCumulative},
+		}},
+	})
 }
 
 // The fixture's active and non-active handoff states, and its single issue's
@@ -131,6 +141,8 @@ func (m *workflowManager) Config() config.ServiceConfig {
 	return m.config
 }
 
+func (m *workflowManager) Rates() *pricing.Rates { return nil }
+
 func (m *workflowManager) PromptTemplate() *prompt.Template {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -172,17 +184,22 @@ func newFakeAgent() *fakeAgent {
 
 type fakeAgentSession struct {
 	cmd                    *exec.Cmd
+	capture                *procutil.Capture
+	cancel                 context.CancelFunc
 	credentialVerification bool
 }
 
 // StartSession launches a bounded fake runtime process in its own process
-// group, so the run's teardown and the exact PGID postcondition have an
-// attributable group.
+// group, held by the capture's launch record rather than by its number, so
+// the run's teardown and the group postcondition have an attributable group.
 func (a *fakeAgent) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
-	cmd := exec.CommandContext(context.Background(), "sleep", "120") //nolint:gosec // a bounded fake local process the fake agent's own teardown kills
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sleep", "120") //nolint:gosec // a bounded fake local process the fake agent's own teardown kills
 	cmd.Dir = params.WorkspacePath
-	procutil.SetProcessGroup(cmd)
-	if err := cmd.Start(); err != nil {
+	procutil.SetGroupKill(cmd)
+	capture, err := procutil.StartCapture(ctx, cmd, procutil.CaptureParams{})
+	if err != nil {
+		cancel()
 		return domain.Session{}, &domain.AgentError{Kind: domain.ErrPortExit, Message: "fake agent start failed", Err: err}
 	}
 
@@ -192,8 +209,8 @@ func (a *fakeAgent) StartSession(_ context.Context, params domain.StartSessionPa
 
 	return domain.Session{
 		ID:       "sess-e2e-fake",
-		AgentPID: strconv.Itoa(cmd.Process.Pid),
-		Internal: &fakeAgentSession{cmd: cmd, credentialVerification: params.CredentialVerification},
+		AgentPID: strconv.Itoa(capture.Group().PID()),
+		Internal: &fakeAgentSession{cmd: cmd, capture: capture, cancel: cancel, credentialVerification: params.CredentialVerification},
 	}, nil
 }
 
@@ -226,15 +243,15 @@ func (a *fakeAgent) RunTurn(_ context.Context, session domain.Session, params do
 	}, nil
 }
 
-// StopSession terminates the fake runtime's process group and reaps it,
+// StopSession cancels the fake runtime's launch and waits for its reap,
 // recording that the session teardown completed.
 func (a *fakeAgent) StopSession(_ context.Context, session domain.Session) error {
 	fs, ok := session.Internal.(*fakeAgentSession)
 	if !ok {
 		return fmt.Errorf("unexpected session internal type %T", session.Internal)
 	}
-	_ = procgroup.Signal(fs.cmd.Process.Pid, syscall.SIGKILL)
-	_, _ = fs.cmd.Process.Wait()
+	fs.cancel()
+	fs.capture.Wait()
 
 	a.mu.Lock()
 	a.stopCalls++
@@ -272,21 +289,21 @@ func (h *Harness) Agent() *AdapterObserver {
 }
 
 // AdapterObserver wraps the harness's agent adapter and records the lifecycle
-// facts the terminal condition and PGID postcondition need: each session's
-// captured process group and each completed StopSession call.
+// facts the terminal condition and group postcondition need: each session's
+// launch record and each completed StopSession call.
 type AdapterObserver struct {
 	inner domain.AgentAdapter
 
 	mu         sync.Mutex
-	pgids      []int
+	groups     []*procutil.Group
 	sessionIDs []string
 	stops      int
 	turnCalls  int
 	figureTurn int
 }
 
-// StartSession delegates and captures the session's process-group leader PID
-// (its PGID) and the actual protocol session identifier.
+// StartSession delegates and captures the held launch record of the session's
+// direct child and the actual protocol session identifier.
 func (o *AdapterObserver) StartSession(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	session, err := o.inner.StartSession(ctx, params)
 	if err != nil {
@@ -297,10 +314,10 @@ func (o *AdapterObserver) StartSession(ctx context.Context, params domain.StartS
 		o.sessionIDs = append(o.sessionIDs, session.ID)
 	}
 	o.mu.Unlock()
-	if pid, parseErr := strconv.Atoi(session.AgentPID); parseErr == nil && pid > 0 {
+	if g, heldErr := launchtest.Held(session.AgentPID); heldErr == nil && g != nil {
 		o.mu.Lock()
-		if !slices.Contains(o.pgids, pid) {
-			o.pgids = append(o.pgids, pid)
+		if !slices.Contains(o.groups, g) {
+			o.groups = append(o.groups, g)
 		}
 		o.mu.Unlock()
 	}
@@ -347,11 +364,11 @@ func (o *AdapterObserver) StopObserved() bool {
 	return o.stops > 0
 }
 
-// PGIDs returns every captured process group.
-func (o *AdapterObserver) PGIDs() []int {
+// Groups returns the launch record of every captured session.
+func (o *AdapterObserver) Groups() []*procutil.Group {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return append([]int(nil), o.pgids...)
+	return append([]*procutil.Group(nil), o.groups...)
 }
 
 // SessionIDs returns every actual protocol session identifier the observed
@@ -428,7 +445,7 @@ type Budgets struct {
 	MaxTurns int
 
 	// Observation bounds the wait for a terminal condition. It is not a shutdown
-	// bound: procgroup.ShutdownDeadline governs that, and spending one on
+	// bound: ShutdownDeadline governs that, and spending one on
 	// the other gives a live run a shutdown's worth of time to do a turn's work.
 	Observation time.Duration
 }
@@ -446,7 +463,7 @@ func (b Budgets) withDefaults() Budgets {
 		b.StallTimeoutMS = 10000
 	}
 	if b.Observation == 0 {
-		b.Observation = procgroup.ShutdownDeadline
+		b.Observation = ShutdownDeadline
 	}
 	if b.MaxSessions == 0 {
 		b.MaxSessions = 1
@@ -748,21 +765,20 @@ func readCeilingSample(harness *Harness) (ceilingSample, error) {
 func ObserveCeilingStop(t *testing.T, harness *Harness) CeilingCondition {
 	t.Helper()
 
-	deadline := time.Now().Add(harness.Observation())
 	var rows []persistence.RunHistory
-	for {
+	err := waittest.UntilWithin(harness.Observation(), 20*time.Millisecond, func() error {
 		var err error
 		rows, err = harness.store.QueryRunHistoryByIssue(context.Background(), issueID)
 		if err != nil {
 			t.Fatalf("query run history: %v", err)
 		}
-		if len(rows) > 0 {
-			break
+		if len(rows) == 0 {
+			return errors.New("no run history row yet")
 		}
-		if !time.Now().Before(deadline) {
-			return CeilingCondition{}
-		}
-		time.Sleep(20 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		return CeilingCondition{}
 	}
 
 	row := rows[0]
@@ -786,20 +802,16 @@ func ObserveCeilingStop(t *testing.T, harness *Harness) CeilingCondition {
 	}
 
 	watch := &dispatchWatch{}
-	deadline = time.Now().Add(harness.Observation())
-	for {
+	_ = waittest.UntilWithin(harness.Observation(), 20*time.Millisecond, func() error {
 		sample, err := readCeilingSample(harness)
 		if err != nil {
 			t.Fatalf("read ceiling sample: %v", err)
 		}
-		if watch.add(sample) {
-			break
+		if !watch.add(sample) {
+			return errors.New("the quiet window has not passed")
 		}
-		if !time.Now().Before(deadline) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return nil
+	})
 	condition.HoldObserved, condition.Runs, condition.Running = watch.held, watch.runs, watch.running
 	return condition
 }
@@ -915,13 +927,11 @@ func StartWorkflow(t *testing.T, harness *Harness) (context.CancelFunc, <-chan s
 	}()
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-runDone:
-		case <-time.After(procgroup.ShutdownDeadline):
-			// A run still going after cancellation leaks its goroutine into the
-			// rest of the package's tests. Errorf, not Fatalf, so the remaining
-			// cleanups still run.
-			t.Errorf("orchestrator still running %s after cancellation; the harness leaked its run goroutine", procgroup.ShutdownDeadline)
+		// A run still going after cancellation leaks its goroutine into the
+		// rest of the package's tests. Errorf, not Fatalf, so the remaining
+		// cleanups still run.
+		if _, ok := waittest.ReceiveWithin(runDone, ShutdownDeadline); !ok {
+			t.Errorf("orchestrator still running %s after cancellation; the harness leaked its run goroutine", ShutdownDeadline)
 		}
 	})
 	return cancel, runDone

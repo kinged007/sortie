@@ -1,12 +1,43 @@
-import { parseInstant } from "@/lib/format";
+import { fmtClock, parseInstant, upperFirst } from "@/lib/format";
 
 import type {
+  IssueDetailResponse,
   IssueOutcomeResponse,
   PrLoopStationResponse,
   RunResponse,
   RunsResponse,
   StateResponse,
 } from "@/api/types.gen";
+
+/** The tracker state the issue reached, as the operator configured it with a capital first letter, or Merged. */
+export function endingWord(outcome: IssueOutcomeResponse): string {
+  switch (outcome.kind) {
+    case "merged":
+      return "Merged";
+    case "handed_off":
+    case "terminal":
+      return outcome.state === undefined || outcome.state === ""
+        ? "Ended"
+        : upperFirst(outcome.state);
+    default:
+      return "Ended";
+  }
+}
+
+export function hasSeveralTerminalStates(
+  terminalStates: readonly string[] | null | undefined,
+): boolean {
+  return (terminalStates ?? []).length >= 2;
+}
+
+/** Gives the clock time an issue's closing line carries: when its ending was observed once it ended, else now. */
+export function closingClock(
+  detail: Pick<IssueDetailResponse, "status" | "history">,
+  now: number,
+): string {
+  const ending = detail.status === "history" ? detail.history?.issue_outcome : null;
+  return fmtClock(ending ? ending.observed_at : new Date(now));
+}
 
 /** An issue whose newest run today ended with an outcome and which Sortie no longer holds. */
 export interface EndedIssue {
@@ -29,15 +60,12 @@ function activeIssueIds(state: StateResponse): Set<string> {
     state.parked,
     state.pending_reactions,
     state.between_stages,
+    state.held,
   ];
   return new Set(lists.flatMap((list) => (list ?? []).map((entry) => entry.issue_id)));
 }
 
-/**
- * Builds today's ended set from the run pages, which serve runs newest first:
- * the newest run of each issue that has an outcome and is in no row list of
- * the state, newest ending first.
- */
+/** Runs are served newest first; the newest run of each issue that has an outcome and is in no row list of the state, newest ending first. */
 export function buildEnded(pages: RunsResponse[], state: StateResponse): EndedIssue[] {
   const active = activeIssueIds(state);
   const newest = new Map<string, RunResponse>();

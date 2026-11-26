@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -40,15 +41,23 @@ func AssertIssueNormalized(t *testing.T, issue domain.Issue) {
 }
 
 // AssertCommentsAscending pins the ordering clause a fetched comment list
-// must satisfy: entries are sorted oldest first by CreatedAt.
+// must satisfy: every CreatedAt parses through [domain.Comment.CreatedTime]
+// and the instants are sorted oldest first.
 func AssertCommentsAscending(t *testing.T, comments []domain.Comment) {
 	t.Helper()
 
-	for i := 1; i < len(comments); i++ {
-		if comments[i-1].CreatedAt > comments[i].CreatedAt {
-			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q sorts after comment[%d].CreatedAt %q, want ascending order",
-				i-1, comments[i-1].CreatedAt, i, comments[i].CreatedAt)
+	var prev time.Time
+	for i, c := range comments {
+		created, err := c.CreatedTime()
+		if err != nil {
+			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q does not parse: %v", i, c.CreatedAt, err)
+			return
 		}
+		if i > 0 && created.Before(prev) {
+			t.Errorf("AssertCommentsAscending: comment[%d].CreatedAt %q is before comment[%d].CreatedAt %q, want oldest first",
+				i, c.CreatedAt, i-1, comments[i-1].CreatedAt)
+		}
+		prev = created
 	}
 }
 

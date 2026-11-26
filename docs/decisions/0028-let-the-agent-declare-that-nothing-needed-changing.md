@@ -60,7 +60,7 @@ A terminal state observed at exit keeps its meaning: a decision already made, wh
 
 ### Considered Options in Detail
 
-**Treat a terminal state observed at exit as the declaration.** Rejected on driver 4: an agent's conclusion, a hook's side effect and a person's action would license the same outcome, and the case the decision exists to serve cannot be told from the other two.
+**Treat a terminal state observed at exit as the declaration.** Rejected because an observed tracker state names no author: an agent's conclusion, a hook's side effect and a person's action would license the same outcome, and the case the decision exists to serve cannot be told from the other two.
 
 **A per-issue operator gesture in the tracker.** Rejected because it needs a human on every occurrence, arrives after the false failure is recorded, and answers a different question: an operator can call the conclusion acceptable; only the agent can say this run reached one.
 

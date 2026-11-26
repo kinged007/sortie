@@ -1,8 +1,4 @@
--- Migration 27: dispatch context on retry entries, run history, and stage hops
---
--- Timestamps are RFC 3339 text whose precision and offset vary, so they are
--- compared through unixepoch, never as strings.
-
+-- Timestamps vary in precision and offset, so they compare through unixepoch.
 ALTER TABLE retry_entries ADD COLUMN configured_model TEXT NOT NULL DEFAULT '';
 ALTER TABLE retry_entries ADD COLUMN issue_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE retry_entries ADD COLUMN issue_labels TEXT NOT NULL DEFAULT '';

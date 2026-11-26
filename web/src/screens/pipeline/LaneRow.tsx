@@ -2,42 +2,21 @@ import { Collapsible } from "@base-ui/react/collapsible";
 
 import { ChevronDownIcon } from "@/components/icons";
 import { Lane } from "@/components/Lane";
-import { ServedText } from "@/components/ServedText";
-import { markWord, StatusMark } from "@/components/StatusMark";
 import { cn } from "@/lib/cn";
-import { fmtClock, plural, pluralVerb } from "@/lib/format";
+import { plural, pluralVerb } from "@/lib/format";
 import { rowStyles, secondLineColor } from "@/lib/rows";
 
 import { laneNavKey } from "./lanes";
 
-import type { LaneMarker, Station } from "@/lib/lane";
+import type { Station } from "@/lib/lane";
 import type { PipelineLane } from "./lanes";
 
-/** How many issue keys a collapsed station group lists before it counts the rest. */
 const GROUP_KEY_LIMIT = 12;
 
 function laneGridStyles(): string {
   return "grid grid-cols-[minmax(0,1fr)_auto] [grid-template-areas:'ident_snt'_'trk_trk'] items-baseline gap-x-lg px-md py-xs max-md:grid-cols-[minmax(0,1fr)] max-md:[grid-template-areas:'ident'_'trk'_'snt']";
 }
 
-function stateWordOf(marker: LaneMarker): string {
-  switch (marker) {
-    case "running":
-      return "Agent running";
-    case "waiting":
-      return "Waiting";
-    case "retry":
-      return "Retry scheduled";
-    case "needs":
-      return "Needs attention";
-    case "ended":
-      return "Ended today";
-    default:
-      return markWord(marker);
-  }
-}
-
-/** Props of {@link LaneRow}. */
 export interface LaneRowProps {
   lane: PipelineLane;
   variant: "lane" | "dense";
@@ -47,21 +26,11 @@ export interface LaneRowProps {
   onOpen: (lane: PipelineLane) => void;
 }
 
-/**
- * Renders one issue as a row of two lines: its identity beside its served
- * sentence, then its lane across the stations. A click opens the peek of the
- * issue.
- */
 export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: LaneRowProps) {
   const isLook = isSelected && showSelection;
   const isNeeds = lane.marker === "needs";
   const hasTitle = lane.title !== null;
   const heading = hasTitle ? `${lane.displayKey}, ${lane.title}` : lane.displayKey;
-  const time = lane.stations.find((station) => station.state === "current")?.time ?? null;
-  const stateText =
-    lane.marker === "held" && lane.acknowledgedAt !== null
-      ? `Acknowledged at ${fmtClock(lane.acknowledgedAt)}`
-      : stateWordOf(lane.marker);
 
   return (
     <li
@@ -70,7 +39,7 @@ export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: La
       onClick={() => onOpen(lane)}
       className={cn(
         laneGridStyles(),
-        "scroll-mt-24! border-b border-line wrap-anywhere",
+        "scroll-mt-28! border-b border-line wrap-anywhere",
         rowStyles(isLook && !isNeeds, true),
         isNeeds && "shadow-[inset_2px_0_0_var(--color-warning-fill)]",
         isNeeds && isLook && "bg-item-selected",
@@ -92,28 +61,14 @@ export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: La
           <span className={cn("text-body-sm", secondLineColor(isLook))}>{lane.agentKind}</span>
         )}
       </div>
-      <div className="flex min-w-0 flex-wrap items-baseline justify-end gap-x-sm text-right [grid-area:snt] max-md:justify-start max-md:text-left">
-        <span className={cn("text-body-md font-medium", isNeeds ? "text-warning" : "text-ink")}>
-          <ServedText text={lane.statusText} />
-        </span>
-        {lane.stallText === null ? undefined : (
-          <span title={lane.stallTextFull?.replace(/`/g, "")} className="text-body-sm">
-            <StatusMark mark="stalled" label={<ServedText text={lane.stallText} />} />
-          </span>
+      <span
+        className={cn(
+          "w-32 truncate text-body-md font-medium [grid-area:snt]",
+          isNeeds ? "text-warning" : "text-ink",
         )}
-        <span className={cn("text-body-sm", secondLineColor(isLook))}>{stateText}</span>
-        {time === null ? undefined : (
-          <span
-            className={cn(
-              "text-body-sm tabular-nums",
-              secondLineColor(isLook),
-              variant === "lane" && "md:hidden",
-            )}
-          >
-            {time}
-          </span>
-        )}
-      </div>
+      >
+        {lane.word}
+      </span>
       <div className="min-w-0 [grid-area:trk]">
         <Lane
           stations={lane.stations}
@@ -128,10 +83,8 @@ export function LaneRow({ lane, variant, isSelected, showSelection, onOpen }: La
   );
 }
 
-/** Props of {@link StationGroup}. */
 export interface StationGroupProps {
   station: Station;
-  /** The lanes standing at the station, in served order. */
   lanes: readonly PipelineLane[];
   isOpen: boolean;
   onOpenChange: (isOpen: boolean) => void;
@@ -140,10 +93,6 @@ export interface StationGroupProps {
   onOpenLane: (lane: PipelineLane) => void;
 }
 
-/**
- * Renders the lanes of one station as a single line that lists their issue
- * keys and opens to the lanes themselves, dense, in served order.
- */
 export function StationGroup({
   station,
   lanes,

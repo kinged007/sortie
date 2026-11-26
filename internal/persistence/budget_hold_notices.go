@@ -9,7 +9,7 @@ import (
 // tracker notice already posted for the current budget hold on one issue.
 type BudgetHoldNotice struct {
 	IssueID   string
-	Reason    string // "session_budget" or "token_budget"
+	Reason    string // "session_budget", "token_budget", or "money_budget"
 	NoticedAt string // RFC 3339
 }
 

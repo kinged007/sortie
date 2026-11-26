@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
+	agentusage "github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 	"github.com/sortie-ai/sortie/internal/workspace"
 )
 
@@ -237,6 +239,9 @@ type mockTrackerAdapter struct {
 	transitionCalls   []transitionIssueCall
 	commentIssueFn    func(ctx context.Context, issueID, text string) error
 	fetchIssueByIDFn  func(ctx context.Context, id string) (domain.Issue, error)
+	fetchCommentsFn   func(ctx context.Context, id string) ([]domain.Comment, error)
+
+	fetchStatesAndLabelsFn func(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error)
 
 	// commentMu guards commentCalls: several detached budget-hold-notice
 	// goroutines can write it concurrently within a single tick.
@@ -285,12 +290,27 @@ func (m *mockTrackerAdapter) FetchIssueStatesByIDs(ctx context.Context, ids []st
 	return result, nil
 }
 
+func (m *mockTrackerAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+	if m.fetchStatesAndLabelsFn != nil {
+		return m.fetchStatesAndLabelsFn(ctx, ids)
+	}
+	states, err := m.FetchIssueStatesByIDs(ctx, ids)
+	reads := make(map[string]domain.IssueStateAndLabels, len(states))
+	for id, state := range states {
+		reads[id] = domain.IssueStateAndLabels{State: state}
+	}
+	return reads, err
+}
+
 func (m *mockTrackerAdapter) FetchIssueStatesByIdentifiers(_ context.Context, _ []string) (map[string]string, error) {
 	return nil, nil
 }
 
-func (m *mockTrackerAdapter) FetchIssueComments(_ context.Context, _ string) ([]domain.Comment, error) {
-	return nil, nil
+func (m *mockTrackerAdapter) FetchIssueComments(ctx context.Context, id string) ([]domain.Comment, error) {
+	if m.fetchCommentsFn != nil {
+		return m.fetchCommentsFn(ctx, id)
+	}
+	return []domain.Comment{}, nil
 }
 
 func (m *mockTrackerAdapter) TransitionIssue(ctx context.Context, issueID string, targetState string) error {
@@ -304,22 +324,11 @@ func (m *mockTrackerAdapter) TransitionIssue(ctx context.Context, issueID string
 type commentIssueCall struct {
 	IssueID string
 	Text    string
-	Literal string
 }
 
 func (m *mockTrackerAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	m.commentMu.Lock()
 	m.commentCalls = append(m.commentCalls, commentIssueCall{IssueID: issueID, Text: text})
-	m.commentMu.Unlock()
-	if m.commentIssueFn != nil {
-		return m.commentIssueFn(ctx, issueID, text)
-	}
-	return nil
-}
-
-func (m *mockTrackerAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	m.commentMu.Lock()
-	m.commentCalls = append(m.commentCalls, commentIssueCall{IssueID: issueID, Text: text, Literal: literal})
 	m.commentMu.Unlock()
 	if m.commentIssueFn != nil {
 		return m.commentIssueFn(ctx, issueID, text)
@@ -369,11 +378,7 @@ func (c *exitCapture) onExit(_ string, result WorkerResult) {
 
 func (c *exitCapture) waitResult(t *testing.T) WorkerResult {
 	t.Helper()
-	select {
-	case <-c.done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for OnExit")
-	}
+	waittest.Receive(t, c.done, "OnExit call")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.results) == 0 {
@@ -1327,11 +1332,7 @@ func TestRunWorkerAttempt(t *testing.T) {
 			t.Errorf("ExitKind = %q, want %q", result.ExitKind, WorkerExitCancelled)
 		}
 
-		select {
-		case <-stopCalled:
-		case <-time.After(3 * time.Second):
-			t.Fatal("StopSession was never called")
-		}
+		waittest.Receive(t, stopCalled, "StopSession call")
 
 		if stopCtxCancelled.Load() {
 			t.Error("StopSession received cancelled context, want detached (not cancelled)")
@@ -1767,66 +1768,6 @@ func TestRunWorkerAttempt(t *testing.T) {
 		}
 	})
 
-	t.Run("on_event_relay_copies_rate_limits", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(tmpDir)
-		cfg.Agent.MaxTurns = 1
-
-		adapterMap := map[string]any{"remaining": 42}
-
-		var relayedMap atomic.Value
-		ec := newExitCapture()
-
-		deps := WorkerDeps{
-			TrackerAdapter: &mockTrackerAdapter{},
-			AgentAdapter: &mockAgentAdapter{
-				runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-					if params.OnEvent != nil {
-						params.OnEvent(domain.AgentEvent{
-							Type:       domain.EventNotification,
-							Timestamp:  time.Now().UTC(),
-							RateLimits: adapterMap,
-						})
-					}
-					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
-				},
-			},
-			ConfigFunc:             func() config.ServiceConfig { return cfg },
-			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
-			OnEvent: func(_ string, event domain.AgentEvent) {
-				if event.RateLimits != nil {
-					relayedMap.Store(event.RateLimits)
-				}
-			},
-			OnExit: ec.onExit,
-			Logger: discardLogger(),
-		}
-
-		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-
-		result := ec.waitResult(t)
-		if result.ExitKind != WorkerExitNormal {
-			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-		}
-
-		got, ok := relayedMap.Load().(map[string]any)
-		if !ok {
-			t.Fatal("OnEvent never relayed an event with RateLimits")
-		}
-
-		if got["remaining"] != 42 {
-			t.Errorf("relayed RateLimits[\"remaining\"] = %v, want 42", got["remaining"])
-		}
-
-		// The relayed map must be a distinct object from the adapter's
-		// original, proving the OnEvent relay defensive-copied it.
-		if fmt.Sprintf("%p", got) == fmt.Sprintf("%p", adapterMap) {
-			t.Error("relayed RateLimits has same pointer as adapter map, want defensive copy")
-		}
-	})
-
 	t.Run("tool_advertisement_on_turn_1", func(t *testing.T) {
 		t.Parallel()
 
@@ -1858,7 +1799,7 @@ func TestRunWorkerAttempt(t *testing.T) {
 			OnExit:                 ec.onExit,
 			Logger:                 discardLogger(),
 			ToolRegistry:           reg,
-			AgentToolChannelFunc:   func(string, bool) bool { return true },
+			AgentToolChannelFunc:   func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -1914,7 +1855,7 @@ func TestRunWorkerAttempt(t *testing.T) {
 			OnExit:                 ec.onExit,
 			Logger:                 discardLogger(),
 			ToolRegistry:           reg,
-			AgentToolChannelFunc:   func(string, bool) bool { return true },
+			AgentToolChannelFunc:   func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -2130,165 +2071,71 @@ func TestRunWorkerAttempt(t *testing.T) {
 		}
 	})
 
-	t.Run("resolver reporting no channel withholds advertisement and logs info", func(t *testing.T) {
+	t.Run("a session without a tool channel withholds advertisement and logs info", func(t *testing.T) {
 		t.Parallel()
 
-		tmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(tmpDir)
-		cfg.Agent.MaxTurns = 1
-
-		ec := newExitCapture()
-		var capturedPrompt string
-		var mu sync.Mutex
-		var logs bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		reg := domain.NewToolRegistry()
-		reg.Register(&stubAgentTool{toolName: "tracker_api", desc: "Query issues"})
-
-		deps := WorkerDeps{
-			TrackerAdapter: &mockTrackerAdapter{},
-			AgentAdapter: &mockAgentAdapter{
-				runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-					mu.Lock()
-					capturedPrompt = params.Prompt
-					mu.Unlock()
-					return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
-				},
-			},
-			ConfigFunc:             func() config.ServiceConfig { return cfg },
-			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "do work on {{ .issue.title }}") },
-			OnEvent:                func(_ string, _ domain.AgentEvent) {},
-			OnExit:                 ec.onExit,
-			Logger:                 logger,
-			ToolRegistry:           reg,
-			AgentToolChannelFunc:   func(string, bool) bool { return false },
+		tests := []struct {
+			name             string
+			resolverChannel  bool
+			sessionNoChannel bool
+		}{
+			{"resolver reports no channel", false, false},
+			{"session reports no tool channel", true, true},
 		}
 
-		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
 
-		result := ec.waitResult(t)
-		if result.ExitKind != WorkerExitNormal {
-			t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-		}
+				tmpDir := t.TempDir()
+				cfg := defaultWorkerConfig(tmpDir)
+				cfg.Agent.MaxTurns = 1
 
-		mu.Lock()
-		p := capturedPrompt
-		mu.Unlock()
+				ec := newExitCapture()
+				var capturedPrompt string
+				var mu sync.Mutex
 
-		if strings.Contains(p, "Available Sortie tools") {
-			t.Errorf("prompt should not contain tool advertisement when resolver reports no channel:\n%s", p)
-		}
+				reg := domain.NewToolRegistry()
+				reg.Register(&stubAgentTool{toolName: "tracker_api", desc: "Query issues"})
 
-		logOutput := logs.String()
-		if !strings.Contains(logOutput, "level=INFO") || !strings.Contains(logOutput, "no tool execution channel for this session") {
-			t.Errorf("log output = %q, want an INFO log containing %q", logOutput, "no tool execution channel for this session")
-		}
-	})
-
-	t.Run("resolver withholds advertisement for a remote session and appends for a local one", func(t *testing.T) {
-		t.Parallel()
-
-		tmpDir := t.TempDir()
-		cfg := defaultWorkerConfig(tmpDir)
-		cfg.Agent.MaxTurns = 1
-		cfg.Tracker.Project = "TESTPROJ"
-
-		reg := domain.NewToolRegistry()
-		reg.Register(&stubAgentTool{toolName: "tracker_api", desc: "Query issues"})
-
-		newDeps := func(sshHost string, capturedPrompt *string, mu *sync.Mutex, ec *exitCapture) WorkerDeps {
-			return WorkerDeps{
-				TrackerAdapter: &mockTrackerAdapter{},
-				AgentAdapter: &mockAgentAdapter{
-					runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-						mu.Lock()
-						*capturedPrompt = params.Prompt
-						mu.Unlock()
-						return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+				deps := WorkerDeps{
+					TrackerAdapter: &mockTrackerAdapter{},
+					AgentAdapter: &mockAgentAdapter{
+						startSessionFn: func(_ context.Context, _ domain.StartSessionParams) (domain.Session, error) {
+							return domain.Session{ID: "sess-1", NoToolChannel: tt.sessionNoChannel}, nil
+						},
+						runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+							mu.Lock()
+							capturedPrompt = params.Prompt
+							mu.Unlock()
+							return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+						},
 					},
-				},
-				ConfigFunc:             func() config.ServiceConfig { return cfg },
-				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "do work on {{ .issue.title }}") },
-				OnEvent:                func(_ string, _ domain.AgentEvent) {},
-				OnExit:                 ec.onExit,
-				Logger:                 discardLogger(),
-				ToolRegistry:           reg,
-				AgentToolChannelFunc: func(_ string, remote bool) bool {
-					return !remote
-				},
-				SSHHost: sshHost,
-			}
+					ConfigFunc:             func() config.ServiceConfig { return cfg },
+					PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "do work on {{ .issue.title }}") },
+					OnEvent:                func(_ string, _ domain.AgentEvent) {},
+					OnExit:                 ec.onExit,
+					Logger:                 discardLogger(),
+					ToolRegistry:           reg,
+					AgentToolChannelFunc:   func(string) bool { return tt.resolverChannel },
+				}
+
+				RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+				result := ec.waitResult(t)
+				if result.ExitKind != WorkerExitNormal {
+					t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+				}
+
+				mu.Lock()
+				p := capturedPrompt
+				mu.Unlock()
+
+				if strings.Contains(p, "Available Sortie tools") {
+					t.Errorf("turn 1 prompt contains the tool advertisement, want none:\n%s", p)
+				}
+			})
 		}
-
-		t.Run("remote session withholds", func(t *testing.T) {
-			t.Parallel()
-
-			var capturedPrompt string
-			var mu sync.Mutex
-			ec := newExitCapture()
-
-			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, newDeps("example.invalid", &capturedPrompt, &mu, ec))
-
-			result := ec.waitResult(t)
-			if result.ExitKind != WorkerExitNormal {
-				t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-			}
-
-			mu.Lock()
-			p := capturedPrompt
-			mu.Unlock()
-
-			if strings.Contains(p, "Available Sortie tools") {
-				t.Errorf("remote session prompt should not contain tool advertisement:\n%s", p)
-			}
-		})
-
-		t.Run("local session appends", func(t *testing.T) {
-			t.Parallel()
-
-			var capturedPrompt string
-			var mu sync.Mutex
-			ec := newExitCapture()
-
-			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, newDeps("", &capturedPrompt, &mu, ec))
-
-			result := ec.waitResult(t)
-			if result.ExitKind != WorkerExitNormal {
-				t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-			}
-
-			mu.Lock()
-			p := capturedPrompt
-			mu.Unlock()
-
-			if !strings.Contains(p, "Available Sortie tools") {
-				t.Errorf("local session prompt should contain tool advertisement:\n%s", p)
-			}
-		})
-
-		t.Run("whitespace-only SSH host is still a local launch", func(t *testing.T) {
-			t.Parallel()
-
-			var capturedPrompt string
-			var mu sync.Mutex
-			ec := newExitCapture()
-
-			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, newDeps("   ", &capturedPrompt, &mu, ec))
-
-			result := ec.waitResult(t)
-			if result.ExitKind != WorkerExitNormal {
-				t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
-			}
-
-			mu.Lock()
-			p := capturedPrompt
-			mu.Unlock()
-
-			if !strings.Contains(p, "Available Sortie tools") {
-				t.Errorf("whitespace-only SSHHost session prompt should contain tool advertisement (still counts as local):\n%s", p)
-			}
-		})
 	})
 }
 
@@ -2402,7 +2249,7 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 		event   domain.AgentEvent
 	}
 
-	type buildRunTurnFn func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error)
+	type buildRunTurnFn func(t *testing.T, wsPath func() string, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error)
 
 	runVariant := func(t *testing.T, build buildRunTurnFn, maxIterations int) {
 		t.Helper()
@@ -2417,15 +2264,11 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 			VerificationTimeoutMS: 5000,
 		}
 
-		rateLimits := map[string]any{"limit": int64(5)}
 		startFn, wsPath := captureWorkspacePath()
 		var received []receivedEvent
 		var emitted []domain.AgentEvent
 		var codingTurnState, reviewTurnState workerState
 		record := func(event domain.AgentEvent) {
-			if event.RateLimits != nil {
-				event.RateLimits = maps.Clone(event.RateLimits)
-			}
 			emitted = append(emitted, event)
 		}
 		ec := newExitCapture()
@@ -2434,7 +2277,7 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 			TrackerAdapter: &mockTrackerAdapter{},
 			AgentAdapter: &mockAgentAdapter{
 				startSessionFn: startFn,
-				runTurnFn:      build(t, wsPath, rateLimits, record, &codingTurnState, &reviewTurnState),
+				runTurnFn:      build(t, wsPath, record, &codingTurnState, &reviewTurnState),
 			},
 			ConfigFunc:             func() config.ServiceConfig { return cfg },
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
@@ -2478,17 +2321,6 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 			}
 		}
 
-		// The event's RateLimits must reach deps.OnEvent as a copy: the
-		// mock's runTurnFn mutates the original map after emitting the
-		// event.
-		gotLimits := received[2].event.RateLimits
-		if gotLimits == nil {
-			t.Fatal("received[2].RateLimits = nil, want a non-nil copy")
-		}
-		if gotLimits["limit"] != int64(5) {
-			t.Errorf(`received[2].RateLimits["limit"] = %v, want 5 (unaffected by the later mutation)`, gotLimits["limit"])
-		}
-
 		assertTokenUsageMatches(t, reviewTurnState, reviewUsage)
 		assertNonTokenFieldsMatch(t, reviewTurnState, codingTurnState)
 
@@ -2502,16 +2334,15 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 	t.Run("event emitted during the review turn", func(t *testing.T) {
 		t.Parallel()
 
-		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
+		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
 			var codingTurnDone bool
 			return func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 				switch {
 				case isSelfReviewTurnPrompt(params.Prompt):
-					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes", RateLimits: rateLimits}
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes"}
 					params.OnEvent(event)
 					*reviewTurnState = readWorkerStateFile(t, wsPath())
 					record(event)
-					rateLimits["limit"] = int64(999)
 					writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "pass", Summary: "looks good"})
 				case !codingTurnDone:
 					codingTurnDone = true
@@ -2532,16 +2363,15 @@ func TestRunWorkerAttempt_SelfReviewFoldsWorkerMirror(t *testing.T) {
 	t.Run("event emitted during the fix turn", func(t *testing.T) {
 		t.Parallel()
 
-		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, rateLimits map[string]any, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
+		build := buildRunTurnFn(func(t *testing.T, wsPath func() string, record func(domain.AgentEvent), codingTurnState, reviewTurnState *workerState) func(context.Context, domain.Session, domain.RunTurnParams) (domain.TurnResult, error) {
 			var codingTurnDone bool
 			return func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 				switch {
 				case isSelfReviewFixPrompt(params.Prompt):
-					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes", RateLimits: rateLimits}
+					event := domain.AgentEvent{Type: domain.EventTokenUsage, Timestamp: time.Now().UTC(), Model: "r", Usage: reviewUsage, Message: "review notes"}
 					params.OnEvent(event)
 					*reviewTurnState = readWorkerStateFile(t, wsPath())
 					record(event)
-					rateLimits["limit"] = int64(999)
 				case isSelfReviewTurnPrompt(params.Prompt):
 					writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "iterate", Summary: "needs fix"})
 				case !codingTurnDone:
@@ -3065,7 +2895,7 @@ func TestExitKindAtEnding(t *testing.T) {
 	t.Parallel()
 
 	ceilingCtx, cancelCeiling := context.WithCancelCause(context.Background())
-	cancelCeiling(errTokenCeilingStop)
+	cancelCeiling(errCeilingStop)
 
 	tests := []struct {
 		name              string
@@ -3110,7 +2940,12 @@ func TestRunWorkerAttempt_DispatchTransition(t *testing.T) {
 		cfg.Tracker.InProgressState = "In Progress"
 
 		spy := &spyMetrics{}
-		tracker := &mockTrackerAdapter{}
+		var fetched []string
+		var reads []domain.IssueStateAndLabels
+		tracker := &mockTrackerAdapter{fetchStatesAndLabelsFn: func(_ context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+			fetched = append(fetched, ids...)
+			return map[string]domain.IssueStateAndLabels{ids[0]: {Labels: []string{"ai:in-progress"}}}, nil
+		}}
 		ec := newExitCapture()
 
 		deps := WorkerDeps{
@@ -3120,6 +2955,7 @@ func TestRunWorkerAttempt_DispatchTransition(t *testing.T) {
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
 			OnExit:                 ec.onExit,
+			OnIssueRead:            func(_ string, read domain.IssueStateAndLabels, _ time.Time) { reads = append(reads, read) },
 			Logger:                 discardLogger(),
 			Metrics:                spy,
 		}
@@ -3137,6 +2973,10 @@ func TestRunWorkerAttempt_DispatchTransition(t *testing.T) {
 		}
 		if got := tracker.transitionCalls[0].TargetState; got != "In Progress" {
 			t.Errorf("TransitionIssue TargetState = %q, want %q", got, "In Progress")
+		}
+
+		if !slices.Equal(fetched, []string{issue.ID}) || len(reads) != 1 || !slices.Equal(reads[0].Labels, []string{"ai:in-progress"}) {
+			t.Errorf("FetchIssueStatesAndLabelsByIDs ids, OnIssueRead reads = %v, %v, want [%q] and one read with the fake's labels", fetched, reads, issue.ID)
 		}
 
 		spy.mu.Lock()
@@ -3157,6 +2997,10 @@ func TestRunWorkerAttempt_DispatchTransition(t *testing.T) {
 
 		spy := &spyMetrics{}
 		tracker := &mockTrackerAdapter{
+			fetchStatesAndLabelsFn: func(context.Context, []string) (map[string]domain.IssueStateAndLabels, error) {
+				t.Error("FetchIssueStatesAndLabelsByIDs called after a failed transition, want none")
+				return nil, nil
+			},
 			transitionIssueFn: func(_ context.Context, _, _ string) error {
 				return errors.New("tracker forbidden")
 			},
@@ -3170,6 +3014,7 @@ func TestRunWorkerAttempt_DispatchTransition(t *testing.T) {
 			PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "work on {{ .issue.title }}") },
 			OnEvent:                func(_ string, _ domain.AgentEvent) {},
 			OnExit:                 ec.onExit,
+			OnIssueRead:            func(string, domain.IssueStateAndLabels, time.Time) {},
 			Logger:                 discardLogger(),
 			Metrics:                spy,
 		}
@@ -5058,7 +4903,7 @@ func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
 		}
 	}
 
-	const discardMessage = "token usage discarded: agent kind declares this session reports none"
+	const discardMessage = "token usage discarded: agent kind attaches no source that counts tokens"
 
 	t.Run("none arrival discards every figure and warns exactly once", func(t *testing.T) {
 		t.Parallel()
@@ -5219,19 +5064,7 @@ func TestRunWorkerAttempt_UsageArrivalNoneDiscardsFigures(t *testing.T) {
 	})
 }
 
-func TestDispatchComment_IsTheFixedHeadline(t *testing.T) {
-	t.Parallel()
-
-	const want = "Sortie session started."
-	if dispatchComment != want {
-		t.Errorf("dispatchComment = %q, want %q", dispatchComment, want)
-	}
-	for _, forbidden := range []string{"Session:", "Workspace:", "Attempt:", "Agent:"} {
-		if strings.Contains(dispatchComment, forbidden) {
-			t.Errorf("dispatchComment = %q, must not contain %q", dispatchComment, forbidden)
-		}
-	}
-}
+const sessionStartedText = "Sortie session started."
 
 func workerDotEnvSecret(t *testing.T) string {
 	t.Helper()
@@ -5325,8 +5158,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 		if got := tracker.commentCalls[0].IssueID; got != issue.ID {
 			t.Errorf("CommentIssue IssueID = %q, want %q", got, issue.ID)
 		}
-		if tracker.commentCalls[0].Text != dispatchComment {
-			t.Errorf("CommentIssue Text = %q, want %q", tracker.commentCalls[0].Text, dispatchComment)
+		if tracker.commentCalls[0].Text != sessionStartedText {
+			t.Errorf("CommentIssue Text = %q, want %q", tracker.commentCalls[0].Text, sessionStartedText)
 		}
 
 		spy.mu.Lock()
@@ -5381,8 +5214,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 				if len(tracker.commentCalls) != 1 {
 					t.Fatalf("CommentIssue call count = %d, want 1", len(tracker.commentCalls))
 				}
-				if got := tracker.commentCalls[0].Text; got != dispatchComment {
-					t.Errorf("agent kind %q: CommentIssue Text = %q, want %q (unchanged across agent kind)", kind, got, dispatchComment)
+				if got := tracker.commentCalls[0].Text; got != sessionStartedText {
+					t.Errorf("agent kind %q: CommentIssue Text = %q, want %q (unchanged across agent kind)", kind, got, sessionStartedText)
 				}
 			})
 		}
@@ -5512,8 +5345,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 		if len(tracker.commentCalls) != 1 {
 			t.Fatalf("CommentIssue call count = %d, want 1", len(tracker.commentCalls))
 		}
-		if got := tracker.commentCalls[0].Text; got != dispatchComment {
-			t.Errorf("CommentIssue Text = %q, want %q (unchanged on a retry dispatch)", got, dispatchComment)
+		if got := tracker.commentCalls[0].Text; got != sessionStartedText {
+			t.Errorf("CommentIssue Text = %q, want %q (unchanged on a retry dispatch)", got, sessionStartedText)
 		}
 	})
 
@@ -5545,8 +5378,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 		if tracker.commentIssueCalls != 1 {
 			t.Fatalf("CommentIssue call count = %d, want 1", tracker.commentIssueCalls)
 		}
-		if tracker.lastComment != dispatchComment {
-			t.Errorf("CommentIssue text = %q, want %q (unchanged across tracker adapter implementation)", tracker.lastComment, dispatchComment)
+		if tracker.lastComment != sessionStartedText {
+			t.Errorf("CommentIssue text = %q, want %q (unchanged across tracker adapter implementation)", tracker.lastComment, sessionStartedText)
 		}
 	})
 
@@ -5579,8 +5412,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 		if len(tracker.commentCalls) != 1 {
 			t.Fatalf("CommentIssue call count = %d, want 1", len(tracker.commentCalls))
 		}
-		if got := tracker.commentCalls[0].Text; got != dispatchComment {
-			t.Errorf("CommentIssue Text = %q, want %q (unchanged on a continuation dispatch)", got, dispatchComment)
+		if got := tracker.commentCalls[0].Text; got != sessionStartedText {
+			t.Errorf("CommentIssue Text = %q, want %q (unchanged on a continuation dispatch)", got, sessionStartedText)
 		}
 	})
 
@@ -5617,8 +5450,8 @@ func TestRunWorkerAttempt_DispatchComment(t *testing.T) {
 				if len(tracker.commentCalls) != 1 {
 					t.Fatalf("CommentIssue call count = %d, want 1", len(tracker.commentCalls))
 				}
-				if got := tracker.commentCalls[0].Text; got != dispatchComment {
-					t.Errorf("reaction kind %q: CommentIssue Text = %q, want %q", reactionKind, got, dispatchComment)
+				if got := tracker.commentCalls[0].Text; got != sessionStartedText {
+					t.Errorf("reaction kind %q: CommentIssue Text = %q, want %q", reactionKind, got, sessionStartedText)
 				}
 			})
 		}
@@ -5926,7 +5759,7 @@ func TestRuntimeStatusSuffixInjection(t *testing.T) {
 			OnExit:                 ec.onExit,
 			Logger:                 discardLogger(),
 			ToolRegistry:           reg,
-			AgentToolChannelFunc:   func(string, bool) bool { return true },
+			AgentToolChannelFunc:   func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -6049,6 +5882,42 @@ func TestRuntimeStatusSuffixInjection(t *testing.T) {
 			t.Errorf("first-turn prompt missing RuntimeStatusSuffix with empty template:\n%s", p)
 		}
 	})
+}
+
+func TestWorkerRendersParkOnFirstTurnOnly(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultWorkerConfig(t.TempDir())
+	cfg.Agent.MaxTurns = 2
+	tmpl := mustParseTemplate(t, "turn={{ .run.turn_number }} {{ if .park }}park={{ .park.reason }}{{ else }}park=nil{{ end }}")
+	ec := newExitCapture()
+	var mu sync.Mutex
+	var prompts []string
+	deps := WorkerDeps{
+		TrackerAdapter: &mockTrackerAdapter{},
+		AgentAdapter: &mockAgentAdapter{
+			runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+				mu.Lock()
+				prompts = append(prompts, params.Prompt)
+				mu.Unlock()
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			},
+		},
+		ConfigFunc:             func() config.ServiceConfig { return cfg },
+		PromptTemplateByIDFunc: func(string) *prompt.Template { return tmpl },
+		OnEvent:                func(string, domain.AgentEvent) {},
+		OnExit:                 ec.onExit,
+		Logger:                 discardLogger(),
+	}
+
+	RunWorkerAttempt(withParkRender(context.Background(), prompt.ParkContext{Reason: parkReasonAgentBlocked}), workerTestIssue(), nil, deps)
+
+	ec.waitResult(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(prompts) != 2 || !strings.Contains(prompts[0], "turn=1 park=agent_blocked") || !strings.Contains(prompts[1], "turn=2 park=nil") {
+		t.Errorf("turn prompts = %q, want turn 1 to render the park and turn 2 to render park nil", prompts)
+	}
 }
 
 func TestRunWorkerAttempt_PromptTemplateByIDFunc_ForwardsTemplateID(t *testing.T) {
@@ -6177,7 +6046,7 @@ func TestRunWorkerAttempt_SessionToolRegistryFunc(t *testing.T) {
 			SessionToolRegistryFunc: func(_ context.Context, _, _ string) (*domain.ToolRegistry, error) {
 				return fakeAllToolsRegistry(), nil
 			},
-			AgentToolChannelFunc: func(string, bool) bool { return true },
+			AgentToolChannelFunc: func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -6239,7 +6108,7 @@ func TestRunWorkerAttempt_SessionToolRegistryFunc(t *testing.T) {
 			SessionToolRegistryFunc: func(_ context.Context, _, _ string) (*domain.ToolRegistry, error) {
 				return fakeAllToolsRegistry(), nil
 			},
-			AgentToolChannelFunc: func(string, bool) bool { return true },
+			AgentToolChannelFunc: func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -6292,7 +6161,7 @@ func TestRunWorkerAttempt_SessionToolRegistryFunc(t *testing.T) {
 			SessionToolRegistryFunc: func(_ context.Context, _, _ string) (*domain.ToolRegistry, error) {
 				return fakeAllToolsRegistry(), nil
 			},
-			AgentToolChannelFunc: func(string, bool) bool { return true },
+			AgentToolChannelFunc: func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -6354,7 +6223,7 @@ func TestRunWorkerAttempt_SessionToolRegistryFunc(t *testing.T) {
 			SessionToolRegistryFunc: func(_ context.Context, _, _ string) (*domain.ToolRegistry, error) {
 				return nil, errors.New("simulated builder failure")
 			},
-			AgentToolChannelFunc: func(string, bool) bool { return true },
+			AgentToolChannelFunc: func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -6414,7 +6283,7 @@ func TestRunWorkerAttempt_SessionToolRegistryFunc(t *testing.T) {
 			Logger:                  discardLogger(),
 			ToolRegistry:            reg,
 			SessionToolRegistryFunc: nil,
-			AgentToolChannelFunc:    func(string, bool) bool { return true },
+			AgentToolChannelFunc:    func(string) bool { return true },
 		}
 
 		RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
@@ -7928,41 +7797,33 @@ func TestRunWorkerAttempt_StatusSignalLogLines(t *testing.T) {
 	})
 }
 
-// boundedTurnStub emits an event each tick until ctx is done or natural
-// elapses. natural must exceed the test's turn-timeout bound by a
-// measurable margin, so a missing deadline surfaces as a completed turn
-// rather than a hung test.
-type boundedTurnStub struct {
-	natural time.Duration
-}
-
-// boundedTurnStubEventInterval is the fixed tick at which boundedTurnStub
-// emits an event while its RunTurn call is still running.
+// boundedTurnStubEventInterval is the fixed tick at which the turn from
+// newBoundedTurnFn emits an event while it is still running.
 const boundedTurnStubEventInterval = 10 * time.Millisecond
 
-func (s *boundedTurnStub) runTurn(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-	ticker := time.NewTicker(boundedTurnStubEventInterval)
-	defer ticker.Stop()
-	timer := time.NewTimer(s.natural)
-	defer timer.Stop()
+// newBoundedTurnFn returns a turn that emits an event each tick until ctx is
+// done or waittest.HangGuard elapses. Only a turn deadline or a cancellation
+// ends it earlier, so a missing one surfaces as a completed turn.
+func newBoundedTurnFn() func(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+	return func(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+		ticker := time.NewTicker(boundedTurnStubEventInterval)
+		defer ticker.Stop()
+		timer := time.NewTimer(waittest.HangGuard)
+		defer timer.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return domain.TurnResult{}, ctx.Err()
-		case <-timer.C:
-			return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
-		case <-ticker.C:
-			if params.OnEvent != nil {
-				params.OnEvent(domain.AgentEvent{Type: domain.EventNotification, Timestamp: time.Now().UTC()})
+		for {
+			select {
+			case <-ctx.Done():
+				return domain.TurnResult{}, ctx.Err()
+			case <-timer.C:
+				return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+			case <-ticker.C:
+				if params.OnEvent != nil {
+					params.OnEvent(domain.AgentEvent{Type: domain.EventNotification, Timestamp: time.Now().UTC()})
+				}
 			}
 		}
 	}
-}
-
-func newBoundedTurnFn(natural time.Duration) func(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
-	stub := &boundedTurnStub{natural: natural}
-	return stub.runTurn
 }
 
 func linesWithAttr(logOutput, key string) []string {
@@ -7987,7 +7848,7 @@ func TestRunWorkerAttempt_TurnTimeoutExpires(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	runTurnFn := newBoundedTurnFn(2 * time.Second)
+	runTurnFn := newBoundedTurnFn()
 	ec := newExitCapture()
 
 	deps := WorkerDeps{
@@ -8000,9 +7861,7 @@ func TestRunWorkerAttempt_TurnTimeoutExpires(t *testing.T) {
 		Logger:                 logger,
 	}
 
-	start := time.Now()
 	RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
-	elapsed := time.Since(start)
 	result := ec.waitResult(t)
 
 	var agentErr *domain.AgentError
@@ -8011,9 +7870,6 @@ func TestRunWorkerAttempt_TurnTimeoutExpires(t *testing.T) {
 	}
 	if agentErr.Kind != domain.ErrTurnTimeout {
 		t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnTimeout)
-	}
-	if elapsed >= 1*time.Second {
-		t.Errorf("RunWorkerAttempt took %v, want well under the stub's 2s natural duration", elapsed)
 	}
 
 	lines := linesWithAttr(logBuf.String(), "turn_timeout_ms")
@@ -8040,7 +7896,7 @@ func TestRunWorkerAttempt_TurnTimeoutSchedulesRetry(t *testing.T) {
 	cfg.Agent.StallTimeoutMS = 0
 	cfg.Agent.MaxTurns = 1
 
-	runTurnFn := newBoundedTurnFn(2 * time.Second)
+	runTurnFn := newBoundedTurnFn()
 	ec := newExitCapture()
 
 	deps := WorkerDeps{
@@ -8081,15 +7937,20 @@ func TestRunWorkerAttempt_CancellationNotReportedAsTimeout(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfg := defaultWorkerConfig(tmpDir)
-	cfg.Agent.TurnTimeoutMS = 60_000 // far above the stub's natural duration
+	cfg.Agent.TurnTimeoutMS = 60_000
 	cfg.Agent.MaxTurns = 1
 
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	runTurnFn := newBoundedTurnFn(5 * time.Second)
+	boundedTurn := newBoundedTurnFn()
+	entered := make(chan struct{})
+	runTurnFn := func(ctx context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+		close(entered)
+		return boundedTurn(ctx, session, params)
+	}
 	ec := newExitCapture()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(waittest.Context(t))
 
 	deps := WorkerDeps{
 		TrackerAdapter:         &mockTrackerAdapter{},
@@ -8102,8 +7963,11 @@ func TestRunWorkerAttempt_CancellationNotReportedAsTimeout(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel()
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	RunWorkerAttempt(ctx, workerTestIssue(), nil, deps)
@@ -8183,7 +8047,7 @@ func TestRunWorkerAttempt_PostTurnRefreshUsesRunContext(t *testing.T) {
 	ctx := withRunContext(workerCtx, runCtx)
 
 	tracker := &mockTrackerAdapter{fetchStatesFn: func(refreshCtx context.Context, ids []string) (map[string]string, error) {
-		cancelWorker(errTokenCeilingStop)
+		cancelWorker(errCeilingStop)
 		if refreshCtx.Err() != nil {
 			return nil, refreshCtx.Err()
 		}
@@ -8195,8 +8059,8 @@ func TestRunWorkerAttempt_PostTurnRefreshUsesRunContext(t *testing.T) {
 	if result.ExitKind != WorkerExitNormal {
 		t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
 	}
-	if result.StoppedByTokenCeiling {
-		t.Error("StoppedByTokenCeiling = true, want false")
+	if result.StoppedByCeiling {
+		t.Error("StoppedByCeiling = true, want false")
 	}
 }
 
@@ -8213,7 +8077,7 @@ func TestRunWorkerAttempt_TurnFailureStaysFailureDespiteCeilingDuringTeardown(t 
 			return domain.TurnResult{}, turnErr
 		},
 		stopSessionFn: func(_ context.Context, _ domain.Session) error {
-			cancel(errTokenCeilingStop)
+			cancel(errCeilingStop)
 			return nil
 		},
 	}
@@ -8223,8 +8087,8 @@ func TestRunWorkerAttempt_TurnFailureStaysFailureDespiteCeilingDuringTeardown(t 
 	if result.ExitKind != WorkerExitError {
 		t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitError)
 	}
-	if result.StoppedByTokenCeiling {
-		t.Error("StoppedByTokenCeiling = true, want false: the turn failed on its own before the teardown's cancellation")
+	if result.StoppedByCeiling {
+		t.Error("StoppedByCeiling = true, want false: the turn failed on its own before the teardown's cancellation")
 	}
 	if !errors.Is(result.Error, turnErr) {
 		t.Errorf("Error = %v, want it to wrap %v", result.Error, turnErr)
@@ -8243,7 +8107,7 @@ func TestRunWorkerAttempt_CancellationCausePriority(t *testing.T) {
 
 	tracker := &mockTrackerAdapter{fetchStatesFn: func(_ context.Context, _ []string) (map[string]string, error) {
 		cancelRun()
-		cancelCeiling(errTokenCeilingStop)
+		cancelCeiling(errCeilingStop)
 		return nil, errors.New("refresh failed")
 	}}
 
@@ -8252,8 +8116,8 @@ func TestRunWorkerAttempt_CancellationCausePriority(t *testing.T) {
 	if result.ExitKind != WorkerExitCancelled {
 		t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitCancelled)
 	}
-	if result.StoppedByTokenCeiling {
-		t.Error("StoppedByTokenCeiling = true, want false: the run context was cancelled before the stop request")
+	if result.StoppedByCeiling {
+		t.Error("StoppedByCeiling = true, want false: the run context was cancelled before the stop request")
 	}
 }
 
@@ -8267,9 +8131,9 @@ func TestRunWorkerAttempt_SelfReviewCeilingAttribution(t *testing.T) {
 		wantExitKind       WorkerExitKind
 		wantAttributed     bool
 	}{
-		{name: "ceiling during the last coding turn keeps the phase from starting", cancelDuringCoding: true, cancelCause: errTokenCeilingStop, wantExitKind: WorkerExitCancelled, wantAttributed: true},
+		{name: "ceiling during the last coding turn keeps the phase from starting", cancelDuringCoding: true, cancelCause: errCeilingStop, wantExitKind: WorkerExitCancelled, wantAttributed: true},
 		{name: "a non-ceiling cancellation cuts the review turn short and exits normal", cancelCause: errors.New("shutdown"), wantExitKind: WorkerExitNormal},
-		{name: "the ceiling cancellation cuts the review turn short and records an attributed cancellation", cancelCause: errTokenCeilingStop, wantExitKind: WorkerExitCancelled, wantAttributed: true},
+		{name: "the ceiling cancellation cuts the review turn short and records an attributed cancellation", cancelCause: errCeilingStop, wantExitKind: WorkerExitCancelled, wantAttributed: true},
 	}
 
 	for _, tt := range tests {
@@ -8299,8 +8163,8 @@ func TestRunWorkerAttempt_SelfReviewCeilingAttribution(t *testing.T) {
 			if result.ExitKind != tt.wantExitKind {
 				t.Fatalf("ExitKind = %q, want %q", result.ExitKind, tt.wantExitKind)
 			}
-			if result.StoppedByTokenCeiling != tt.wantAttributed {
-				t.Errorf("StoppedByTokenCeiling = %v, want %v", result.StoppedByTokenCeiling, tt.wantAttributed)
+			if result.StoppedByCeiling != tt.wantAttributed {
+				t.Errorf("StoppedByCeiling = %v, want %v", result.StoppedByCeiling, tt.wantAttributed)
 			}
 			if tt.wantAttributed && !tt.cancelDuringCoding && result.ReviewMetadata == nil {
 				t.Error("ReviewMetadata = nil, want the phase's partial record to survive the ceiling exit")
@@ -8323,7 +8187,7 @@ func TestRunWorkerAttempt_SelfReviewPassVerdictThenCeilingStopExitsNormal(t *tes
 		runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
 			if isSelfReviewTurnPrompt(params.Prompt) {
 				writeVerdictFile(t, wsPath(), domain.ReviewVerdict{Verdict: "pass", Summary: "looks good"})
-				cancel(errTokenCeilingStop)
+				cancel(errCeilingStop)
 			}
 			return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
 		},
@@ -8334,8 +8198,8 @@ func TestRunWorkerAttempt_SelfReviewPassVerdictThenCeilingStopExitsNormal(t *tes
 	if result.ExitKind != WorkerExitNormal {
 		t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
 	}
-	if result.StoppedByTokenCeiling {
-		t.Error("StoppedByTokenCeiling = true, want false: the phase ended on its own before the stop request was read")
+	if result.StoppedByCeiling {
+		t.Error("StoppedByCeiling = true, want false: the phase ended on its own before the stop request was read")
 	}
 	if result.ReviewMetadata == nil || result.ReviewMetadata.FinalVerdict != "pass" {
 		t.Errorf("ReviewMetadata.FinalVerdict = %v, want %q", result.ReviewMetadata, "pass")
@@ -8361,7 +8225,7 @@ func TestRunWorkerAttempt_TurnTimeoutTeardownIgnoresReadTimeout(t *testing.T) {
 	cfg.Agent.MaxTurns = 1
 	cfg.Hooks.AfterRun = fmt.Sprintf("touch %s", markerPath)
 
-	runTurnFn := newBoundedTurnFn(2 * time.Second)
+	runTurnFn := newBoundedTurnFn()
 	ec := newExitCapture()
 
 	// The context itself must be inspected inside the StopSession call:
@@ -8494,7 +8358,7 @@ func TestRunWorkerAttempt_SelfReviewTurnTimeoutFailsAttempt(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	reviewTurnFn := newBoundedTurnFn(2 * time.Second)
+	reviewTurnFn := newBoundedTurnFn()
 	ec := newExitCapture()
 
 	deps := WorkerDeps{
@@ -9546,26 +9410,14 @@ func TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone(t *testing.T) 
 			close(workerDone)
 		}()
 
-		select {
-		case <-entered:
-			t.Fatal("RunTurn was entered while turnStartedCh was still full, want OnTurnStarted to block first")
-		case <-time.After(200 * time.Millisecond):
-		}
+		waittest.Never(t, entered, 200*time.Millisecond, "RunTurn entry while turnStartedCh is full, want OnTurnStarted to block first")
 
 		<-o.turnStartedCh
 
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("RunTurn was never entered after a slot freed")
-		}
+		waittest.Receive(t, entered, "RunTurn entry after a slot freed")
 		close(release)
 
-		select {
-		case <-workerDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("worker did not exit")
-		}
+		waittest.Receive(t, workerDone, "worker exit")
 		<-o.workerExitCh
 
 		select {
@@ -9601,25 +9453,13 @@ func TestMakeWorkerFn_OnTurnStartedBlocksThenEscapesOnContextDone(t *testing.T) 
 			close(workerDone)
 		}()
 
-		select {
-		case <-entered:
-			t.Fatal("RunTurn was entered while turnStartedCh was still full, want OnTurnStarted to block first")
-		case <-time.After(200 * time.Millisecond):
-		}
+		waittest.Never(t, entered, 200*time.Millisecond, "RunTurn entry while turnStartedCh is full, want OnTurnStarted to block first")
 
 		cancel()
 
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("RunTurn was never entered after cancelling the worker context")
-		}
+		waittest.Receive(t, entered, "RunTurn entry after cancelling the worker context")
 
-		select {
-		case <-workerDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("worker did not exit")
-		}
+		waittest.Receive(t, workerDone, "worker exit")
 		<-o.workerExitCh
 
 		if got := len(o.turnStartedCh); got != 1 {
@@ -9808,6 +9648,72 @@ func TestRunWorkerAttempt_SelfReviewTurnResultsCountUnaccountedSpend(t *testing.
 	})
 }
 
+func TestRunWorkerAttempt_CoverRuleSettlesCoverableMarks(t *testing.T) {
+	t.Parallel()
+
+	coverable := func(session string) domain.TurnResult {
+		return domain.TurnResult{SessionID: session, SpendUnaccounted: true, SpendCoverable: true}
+	}
+	marked := func(session string) domain.TurnResult {
+		return domain.TurnResult{SessionID: session, SpendUnaccounted: true}
+	}
+	covers := func(session string) domain.TurnResult {
+		return domain.TurnResult{SessionID: session, CoversSession: true}
+	}
+
+	tests := []struct {
+		name  string
+		turns []domain.TurnResult
+		want  int
+	}{
+		{"a coverable mark clears on a later cover of its session", []domain.TurnResult{coverable("s1"), covers("s1")}, 0},
+		{"a non-coverable mark stays", []domain.TurnResult{marked("s1"), covers("s1")}, 1},
+		{"a coverable mark followed by a non-coverable one stays", []domain.TurnResult{coverable("s1"), marked("s1"), covers("s1")}, 2},
+		{"a coverable last turn stays", []domain.TurnResult{covers("s1"), coverable("s1")}, 1},
+		{"another session's cover leaves the mark counted", []domain.TurnResult{coverable("s1"), covers("s2")}, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := defaultWorkerConfig(t.TempDir())
+			cfg.Agent.MaxTurns = len(tt.turns)
+			var next atomic.Int64
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter: &mockTrackerAdapter{},
+				AgentAdapter: &mockAgentAdapter{
+					runTurnFn: func(_ context.Context, _ domain.Session, _ domain.RunTurnParams) (domain.TurnResult, error) {
+						result := tt.turns[next.Add(1)-1]
+						result.ExitReason = domain.EventTurnCompleted
+						return result, nil
+					},
+				},
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				Logger:                 discardLogger(),
+				WorkflowPath:           "/fake/WORKFLOW.md",
+			}
+
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+			result := ec.waitResult(t)
+			if result.ExitKind != WorkerExitNormal {
+				t.Fatalf("ExitKind = %q, want %q (error: %v)", result.ExitKind, WorkerExitNormal, result.Error)
+			}
+			if got := next.Load(); got != int64(len(tt.turns)) {
+				t.Fatalf("RunTurn calls = %d, want %d", got, len(tt.turns))
+			}
+			if result.UnaccountedTurns != tt.want {
+				t.Errorf("WorkerResult.UnaccountedTurns = %d, want %d", result.UnaccountedTurns, tt.want)
+			}
+		})
+	}
+}
+
 func TestRenderFirstTurnPrompt(t *testing.T) {
 	t.Parallel()
 
@@ -9832,59 +9738,34 @@ func TestRenderFirstTurnPrompt(t *testing.T) {
 		body          string
 		attempt       int
 		continuation  map[string]any
-		freshRun      bool
 		wantPresented map[string][]string
 		wantRender    string
 		wantContains  string
 		wantErr       bool
 	}{
 		{
-			name:          "the added block presents review IDs on a continuation",
-			body:          referenceTemplate,
-			continuation:  reviewSeed,
-			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
-			wantContains:  "- a",
-		},
-		{
-			name:          "the added block presents bot-review IDs on a continuation",
-			body:          referenceTemplate,
-			continuation:  botSeed,
-			wantPresented: map[string][]string{ReactionKindBotReview: {"x"}},
-			wantContains:  "- x",
-		},
-		{
 			name:          "the added block presents both kinds on a fresh run",
 			body:          referenceTemplate,
 			continuation:  bothSeed,
-			freshRun:      true,
 			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}, ReactionKindBotReview: {"x"}},
 			wantContains:  "- x",
-		},
-		{
-			name:         "a template that never references the key presents nothing on a continuation",
-			body:         unreferenced,
-			continuation: reviewSeed,
-			wantRender:   "Resolve ISS-1.\n",
 		},
 		{
 			name:         "a template that never references the key presents nothing on a fresh run",
 			body:         unreferenced,
 			continuation: reviewSeed,
-			freshRun:     true,
 			wantRender:   "Resolve ISS-1.\n",
 		},
 		{
 			name:         "a reference only inside an attempt block presents nothing on a first attempt",
 			body:         attemptOnlyBlock,
 			continuation: reviewSeed,
-			freshRun:     true,
 			wantRender:   "task\n\n",
 		},
 		{
 			name:          "a reference behind the other kind's else-if presents only the shadowing kind",
 			body:          elseIfTemplate,
 			continuation:  bothSeed,
-			freshRun:      true,
 			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
 			wantRender:    "task\nR\n",
 		},
@@ -9892,47 +9773,29 @@ func TestRenderFirstTurnPrompt(t *testing.T) {
 			name:         "a fresh run whose seeded render drops a line gets the unseeded render",
 			body:         modeSwitch,
 			continuation: reviewSeed,
-			freshRun:     true,
 			wantRender:   "Do the task\n",
 		},
 		{
 			name:         "a fresh run whose seeded render fails gets the unseeded render",
 			body:         failsWhenSeeded,
 			continuation: reviewSeed,
-			freshRun:     true,
 			wantRender:   "task\n\n",
-		},
-		{
-			name:          "a continuation keeps a render that drops a line",
-			body:          modeSwitch,
-			continuation:  reviewSeed,
-			wantPresented: map[string][]string{ReactionKindReview: {"a", "b"}},
-			wantRender:    "Fix the comments\n",
-		},
-		{
-			name:         "a continuation whose render fails returns the error",
-			body:         failsWhenSeeded,
-			continuation: reviewSeed,
-			wantErr:      true,
 		},
 		{
 			name:         "a fresh run whose unseeded render fails returns the error",
 			body:         failsAlways,
 			continuation: reviewSeed,
-			freshRun:     true,
 			wantErr:      true,
 		},
 		{
 			name:         "no continuation renders the template alone",
 			body:         referenceTemplate,
-			freshRun:     true,
 			wantContains: "Resolve ISS-1.",
 		},
 		{
-			name:     "no continuation returns the render error",
-			body:     failsAlways,
-			freshRun: true,
-			wantErr:  true,
+			name:    "no continuation returns the render error",
+			body:    failsAlways,
+			wantErr: true,
 		},
 	}
 
@@ -9943,7 +9806,7 @@ func TestRenderFirstTurnPrompt(t *testing.T) {
 			tmpl := mustParseTemplate(t, tt.body)
 			issue := domain.Issue{ID: "1", Identifier: "ISS-1"}
 
-			rendered, presented, err := renderFirstTurnPrompt(tmpl, issue.ToTemplateMap(), tt.attempt, 3, tt.continuation, tt.freshRun)
+			rendered, presented, err := renderFirstTurnPrompt(tmpl, issue.ToTemplateMap(), tt.attempt, 3, tt.continuation)
 
 			if tt.wantErr {
 				var templateErr *prompt.TemplateError
@@ -9966,6 +9829,167 @@ func TestRenderFirstTurnPrompt(t *testing.T) {
 			}
 			if tt.wantContains != "" && !strings.Contains(rendered, tt.wantContains) {
 				t.Errorf("renderFirstTurnPrompt() rendered = %q, want it to contain %q", rendered, tt.wantContains)
+			}
+		})
+	}
+}
+
+func TestRunWorkerAttempt_ReactionRunNeverSendsWorkPrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		kind          string
+		template      string
+		turns         int
+		continuation  map[string]any
+		wantContains  string
+		wantHandedOff []string
+	}{
+		{
+			name:         "label-fix turn 2 keeps the fix branch",
+			kind:         ReactionKindLabelFix,
+			template:     "{{ if .label_fix }}FIX{{ else }}WORK{{ end }}",
+			turns:        2,
+			continuation: map[string]any{"label_fix": map[string]any{"branch": "feature/x"}},
+			wantContains: "FIX",
+		},
+		{
+			name:     "review turn 1 shows the comment instead of the work prompt",
+			kind:     ReactionKindReview,
+			template: "WORK",
+			turns:    1,
+			continuation: map[string]any{"review_comments": buildReviewTemplateMap([]domain.ReviewComment{
+				{ID: "c1", Reviewer: "alice", FilePath: "main.go", StartLine: 3, EndLine: 3, Body: "Rename the helper to buildWidget"},
+			})},
+			wantContains:  "buildWidget",
+			wantHandedOff: []string{"c1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := defaultWorkerConfig(t.TempDir())
+			cfg.Agent.MaxTurns = tt.turns
+
+			var mu sync.Mutex
+			var prompts []string
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter: &mockTrackerAdapter{},
+				AgentAdapter: &mockAgentAdapter{
+					runTurnFn: func(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+						mu.Lock()
+						prompts = append(prompts, params.Prompt)
+						mu.Unlock()
+						return domain.TurnResult{SessionID: session.ID, ExitReason: domain.EventTurnCompleted}, nil
+					},
+				},
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, tt.template) },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				Logger:                 discardLogger(),
+				Posture:                dispatchPostureForReactionKind(tt.kind),
+				ReactionKind:           tt.kind,
+				ContinuationContext:    tt.continuation,
+			}
+
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+			result := ec.waitResult(t)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(prompts) < tt.turns {
+				t.Fatalf("RunWorkerAttempt(kind=%q) ran %d turns, want at least %d", tt.kind, len(prompts), tt.turns)
+			}
+			got := prompts[tt.turns-1]
+			if !strings.Contains(got, tt.wantContains) || strings.Contains(got, "WORK") {
+				t.Errorf("RunWorkerAttempt(kind=%q) turn %d prompt = %q, want it to contain %q and not WORK", tt.kind, tt.turns, got, tt.wantContains)
+			}
+			if gotIDs := result.HandedOffComments[ReactionKindReview]; !slices.Equal(gotIDs, tt.wantHandedOff) {
+				t.Errorf("RunWorkerAttempt(kind=%q) HandedOffComments[%q] = %v, want %v", tt.kind, ReactionKindReview, gotIDs, tt.wantHandedOff)
+			}
+		})
+	}
+}
+
+type amountReportingAdapter struct {
+	mockAgentAdapter
+
+	verification domain.TurnResult
+	working      domain.TurnResult
+	viaEvent     bool
+}
+
+func (a *amountReportingAdapter) RunTurn(_ context.Context, session domain.Session, params domain.RunTurnParams) (domain.TurnResult, error) {
+	result := a.working
+	if isMockVerificationSession(session) {
+		result = a.verification
+	} else if a.viaEvent {
+		params.OnEvent(domain.AgentEvent{Type: domain.EventNotification, Timestamp: time.Now().UTC(), ReportedAmounts: result.ReportedAmounts})
+		result.ReportedAmounts = nil
+	}
+	result.SessionID, result.ExitReason = session.ID, domain.EventTurnCompleted
+	return result, nil
+}
+
+func TestRunWorkerAttempt_VerificationAmountsAddToWorkingSessionAmounts(t *testing.T) {
+	t.Parallel()
+
+	verificationSource := domain.UsageProvenance{Source: agentusage.SourceOutput, Strategy: agentusage.StrategyLive}
+	workingSource := domain.UsageProvenance{Source: agentusage.SourceJournal, Strategy: agentusage.StrategyRecords}
+	tests := []struct {
+		name     string
+		viaEvent bool
+	}{
+		{name: "working turn result carries the amounts"},
+		{name: "working turn event carries the amounts", viaEvent: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := defaultWorkerConfig(t.TempDir())
+			cfg.Agent.MaxTurns = 1
+			ec := newExitCapture()
+			deps := WorkerDeps{
+				TrackerAdapter: &mockTrackerAdapter{},
+				AgentAdapter: &amountReportingAdapter{
+					viaEvent: tt.viaEvent,
+					verification: domain.TurnResult{
+						UsageProvenance: []domain.UsageProvenance{verificationSource},
+						ReportedAmounts: []domain.ReportedAmount{{Unit: domain.UnitUSD, Model: "model-x", Amount: 0.25}},
+					},
+					working: domain.TurnResult{
+						UsageProvenance: []domain.UsageProvenance{workingSource},
+						ReportedAmounts: []domain.ReportedAmount{{Unit: domain.UnitUSD, Model: "model-x", Amount: 0.5}},
+					},
+				},
+				ConfigFunc:             func() config.ServiceConfig { return cfg },
+				PromptTemplateByIDFunc: func(_ string) *prompt.Template { return mustParseTemplate(t, "{{ .issue.title }}") },
+				OnEvent:                func(_ string, _ domain.AgentEvent) {},
+				OnExit:                 ec.onExit,
+				Logger:                 discardLogger(),
+				WorkflowPath:           "/fake/WORKFLOW.md",
+			}
+
+			RunWorkerAttempt(context.Background(), workerTestIssue(), nil, deps)
+
+			result := ec.waitResult(t)
+			if result.ExitKind != WorkerExitNormal {
+				t.Fatalf("ExitKind = %q, want %q", result.ExitKind, WorkerExitNormal)
+			}
+			wantAmounts := []domain.ReportedAmount{{Unit: domain.UnitUSD, Model: "model-x", Amount: 0.75}}
+			if !slices.Equal(result.ReportedAmounts, wantAmounts) {
+				t.Errorf("WorkerResult.ReportedAmounts = %+v, want %+v: the verification amount adds to the working session's", result.ReportedAmounts, wantAmounts)
+			}
+			wantProvenance := []domain.UsageProvenance{verificationSource, workingSource}
+			if !slices.Equal(result.UsageProvenance, wantProvenance) {
+				t.Errorf("WorkerResult.UsageProvenance = %+v, want %+v: the union includes the verification result's", result.UsageProvenance, wantProvenance)
 			}
 		})
 	}

@@ -35,7 +35,8 @@ Use the same validation profiles as Section 17:
 
 - HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - Prometheus `/metrics` endpoint exposes defined gauges, counters, and histograms when the HTTP server is enabled (Section 13.7.3). Backed by `github.com/prometheus/client_golang` with a dedicated registry; no external Prometheus server required.
-- Agent tool subsystem: `ToolRegistry` populated with the built-in tools per Section 10.4 (`tracker_api`, `sortie_status`, `workspace_history`, `cost_budget`, `notify_operator`). The runtime execution channel is an MCP stdio sidecar (per ADR-0009).
+- Agent tool subsystem: `ToolRegistry` populated with the built-in tools per Section 10.4 (`tracker_api`, `sortie_status`, `workspace_history`, `cost_budget`, `notify_operator`). The runtime execution channel is an MCP stdio sidecar on a local launch (per ADR-0009); a remote launch reaches the host-side server over loopback Streamable HTTP through the session's reverse forward.
+- Opt-in instance spend ceilings (`agent.max_daily_cost_usd`, `agent.max_weekly_cost_usd`, `agent.max_monthly_cost_usd`): each configured UTC calendar window is evaluated on the poll tick and on every retry timer fire, a window at its ceiling holds every candidate and re-arms every due retry without raising its attempt count, and running sessions finish (Section 8.4).
 - Opt-in age-based workspace retention (`workspace.retention_days`) evaluated by the periodic sweep, with the floor and the recovery-lookback coupling in Section 9.6 preserved.
 - Orchestrator-driven terminal transition on managed pull request merge (`reactions.merge_completion`), latched per merge commit identifier (Section 11G).
 - Make observability settings configurable in workflow front matter without prescribing UI implementation details.

@@ -4,11 +4,8 @@
 // settles the session's cumulative token usage from the one usage
 // figure each pi turn_end carries.
 //
-// pi 0.99 loads MCP servers from mcp.json and from extensions. The
-// adapter re-expresses the worker-generated .sortie/mcp.json in the
-// form pi parses: a static bridge extension loaded through
-// --extension and a JSON environment variable the extension reads with
-// pi.registerMcpServer, so the session can call Sortie's tools.
+// pi receives no Sortie tools: the adapter passes no tool-server
+// configuration to the pi process (MCPDialectNone).
 package pi
 
 import (
@@ -28,6 +25,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/agent/sshutil"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/logging"
 	"github.com/sortie-ai/sortie/internal/redact"
@@ -36,16 +34,25 @@ import (
 
 const defaultCommand = "pi"
 
+var usageSources = usage.Sources{Live: usage.Source{
+	Category: usage.SourceOutput,
+	Strategy: usage.StrategyLive,
+	Spend:    usage.SpendDeclaration{Shape: usage.SpendPerTurn, ServedModel: true},
+}}
+
 func init() {
 	registry.Agents.RegisterWithMeta("pi", NewPiAdapter, registry.AgentMeta{
-		RequiresCommand:     true,
-		DefaultCommand:      defaultCommand,
-		ValidateAgentConfig: validateConfig,
-		MCPInjection:        registry.MCPInjectionTranslated,
-		UsageArrival:        registry.UsageArrivalTurnEnd,
-		UsageAttribution:    registry.UsageAttributionPerModel,
-		CredentialEnv:       registry.DeclareCredentialEnv(),
-		EffortForwarding:    registry.EffortNotForwarded,
+		RequiresCommand:               true,
+		DefaultCommand:                defaultCommand,
+		ValidateAgentConfig:           validateConfig,
+		MCPDialect:                    registry.MCPDialectNone,
+		MCPDialectNoneReason:          "pi has no channel the adapter uses to hand it a tool server",
+		UsageSources:                  usageSources,
+		CredentialEnv:                 registry.DeclareCredentialEnv(),
+		EffortForwarding:              registry.EffortNotForwarded,
+		VerificationContext:           registry.DeclareVerificationContext(),
+		UsageLimitRecognition:         registry.UsageLimitNotRecognized,
+		UsageLimitNotRecognizedReason: "the adapter does not parse a provider usage-limit refusal from pi output",
 	})
 }
 
@@ -76,16 +83,6 @@ type sessionState struct {
 	// StartSession, or by a test before a session's first turn; RunTurn
 	// reads it when it builds each turn's own turnRuntime.
 	drainGrace time.Duration
-
-	// mcpBridgePath is the absolute path to the static bridge extension
-	// pi loads through --extension when the session carries Sortie MCP
-	// servers locally. Empty for a remote launch, an empty
-	// MCPConfigPath, or a configuration declaring no server.
-	mcpBridgePath string
-
-	// mcpEnvValue is the JSON document the bridge extension reads from
-	// SORTIE_PI_MCP_SERVERS. Empty when the session carries no server.
-	mcpEnvValue string
 }
 
 type turnRuntime struct {
@@ -143,9 +140,8 @@ func NewPiAdapter() (domain.AgentAdapter, error) {
 	return &PiAdapter{}, nil
 }
 
-// StartSession resolves the launch target, translates MCPConfigPath into
-// the bridge extension and its environment value, and initializes
-// adapter-owned session state without starting a Pi subprocess.
+// StartSession resolves the launch target and initializes adapter-owned
+// session state without starting a Pi subprocess.
 func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionParams) (domain.Session, error) {
 	pt, faults := parsePassthroughConfig(params.Settings)
 	if len(faults) > 0 {
@@ -165,41 +161,14 @@ func (a *PiAdapter) StartSession(_ context.Context, params domain.StartSessionPa
 		return domain.Session{}, agentErr
 	}
 
-	servers, translateErr := translateMCPServers(params.MCPConfigPath, target.RemoteCommand != "")
-	if translateErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("translate MCP config: %v", translateErr),
-			Err:     translateErr,
-		}
-	}
-	envValue, envErr := buildMCPEnvValue(servers)
-	if envErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("build pi mcp env value: %v", envErr),
-			Err:     envErr,
-		}
-	}
-	bridgePath, bridgeErr := ensureBridgeFile(target.WorkspacePath, servers)
-	if bridgeErr != nil {
-		return domain.Session{}, &domain.AgentError{
-			Kind:    domain.ErrResponseError,
-			Message: fmt.Sprintf("write pi mcp bridge: %v", bridgeErr),
-			Err:     bridgeErr,
-		}
-	}
-
 	state := &sessionState{
-		target:        target,
-		agentConfig:   params.AgentConfig,
-		passthrough:   pt,
-		sessionID:     params.ResumeSessionID,
-		baseLogger:    slog.Default().With(slog.String("component", "pi-adapter")),
-		usage:         agentcore.NewTurnEndUsage(),
-		drainGrace:    procutil.DefaultDrainGrace,
-		mcpBridgePath: bridgePath,
-		mcpEnvValue:   envValue,
+		target:      target,
+		agentConfig: params.AgentConfig,
+		passthrough: pt,
+		sessionID:   params.ResumeSessionID,
+		baseLogger:  slog.Default().With(slog.String("component", "pi-adapter")),
+		usage:       agentcore.NewTurnEndUsage(),
+		drainGrace:  procutil.DefaultDrainGrace,
 	}
 
 	return domain.Session{
@@ -241,7 +210,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 		}
 	}
 
-	env := buildTurnEnv(state)
+	env := os.Environ()
 	cmdArgs := buildRunArgs(state, params.Prompt, state.passthrough)
 	logger := state.loggerLocked()
 
@@ -408,7 +377,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 					TerminalErrorKind: domain.ErrResponseError,
 					TerminalMessage:   problem,
 				}
-				result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
+				result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime), agentcore.TurnSpend{})
 				return result, agentErr, true
 			}
 			if state.applySessionEvent(id) {
@@ -548,7 +517,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 							Cause:             readErr,
 						}
 					}
-					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
+					result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime), agentcore.TurnSpend{})
 					if agentErr != nil {
 						return result, agentErr
 					}
@@ -594,7 +563,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 			drainReaderBounded(runtime.reader, runtime.drainGrace)
 			clearActive(state, runtime)
 			ev := agentcore.TurnEvidence{Terminal: agentcore.TerminalCancelled, TerminalMessage: "turn cancelled"}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime), agentcore.TurnSpend{})
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -623,7 +592,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, session domain.Session, params 
 				TerminalErrorKind: domain.ErrResponseTimeout,
 				TerminalMessage:   "timed out waiting for first pi json event",
 			}
-			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime))
+			result, agentErr := state.usage.Finalize(emit, state.logger(), ev, state.currentSessionID(), 0, state.settleUsage(runtime), agentcore.TurnSpend{})
 			if agentErr != nil {
 				return result, agentErr
 			}
@@ -704,7 +673,7 @@ func (a *PiAdapter) finalizeExitedTurn(ctx context.Context, state *sessionState,
 		procutil.EmitWarnLines(stderrLines, state.logger())
 	}
 
-	result, agentErr := state.usage.Finalize(emit, state.logger(), ev, sessionID, 0, state.settleUsage(runtime))
+	result, agentErr := state.usage.Finalize(emit, state.logger(), ev, sessionID, 0, state.settleUsage(runtime), agentcore.TurnSpend{})
 	if agentErr != nil {
 		return result, agentErr
 	}

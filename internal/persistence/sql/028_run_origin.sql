@@ -1,8 +1,4 @@
--- Migration 28: run origin on run history and retry entries
---
--- The run_history columns stay nullable: NULL means not recorded, which ''
--- would misstate as no retry trigger or a local run.
-
+-- Nullable: '' would misstate an unrecorded origin as no trigger or a local run.
 ALTER TABLE run_history ADD COLUMN trigger TEXT;
 ALTER TABLE run_history ADD COLUMN reaction_kind TEXT;
 ALTER TABLE run_history ADD COLUMN session_id TEXT;

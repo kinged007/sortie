@@ -1,6 +1,7 @@
 package agenttest
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,13 +9,19 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // MCPRelayScenario names the built-in [Scenario] that stands in for an MCP
@@ -33,7 +40,14 @@ type relayRecord struct {
 	Dir string            `json:"dir"`
 	Msg json.RawMessage   `json:"msg,omitempty"`
 	Env map[string]string `json:"env,omitempty"`
+
+	// Req and Accept are set on HTTP records only. Req pairs a response with
+	// its own request when several clients reuse a JSON-RPC id.
+	Req    int     `json:"req,omitempty"`
+	Accept *string `json:"accept,omitempty"`
 }
+
+const httpFlag = "--http"
 
 const (
 	relayToServer = "to_server"
@@ -45,6 +59,11 @@ const (
 // server's output closes, then returns the server's exit status. Each
 // JSON-RPC message is appended to RecordPath before it is forwarded, so a
 // message the agent acted on is always on the record.
+//
+// When args hold --http, the target announces its HTTP listener as a first
+// stdout line {"listening":"127.0.0.1:<port>"}. The relay then announces its
+// own listener the same way and records each forwarded JSON body as a message,
+// so the traffic reads the same as the stdio relay's.
 func (p MCPRelay) Run(args []string) int {
 	record, err := os.OpenFile(p.RecordPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600) //nolint:gosec // G304: path is the test's own t.TempDir fixture.
 	if err != nil {
@@ -78,12 +97,20 @@ func (p MCPRelay) Run(args []string) int {
 
 	var mu sync.Mutex
 	pid := os.Getpid()
-	go func() {
-		_, _ = io.Copy(serverIn, io.TeeReader(os.Stdin, &lineRecorder{mu: &mu, w: record, pid: pid, dir: relayToServer}))
-		_ = serverIn.Close()
-	}()
-
-	_, copyErr := io.Copy(os.Stdout, io.TeeReader(serverOut, &lineRecorder{mu: &mu, w: record, pid: pid, dir: relayToClient}))
+	var copyErr error
+	if slices.Contains(args, httpFlag) {
+		go func() {
+			_, _ = io.Copy(serverIn, os.Stdin)
+			_ = serverIn.Close()
+		}()
+		copyErr = relayHTTP(serverOut, &recorder{mu: &mu, w: record, pid: pid})
+	} else {
+		go func() {
+			_, _ = io.Copy(serverIn, io.TeeReader(os.Stdin, &lineRecorder{mu: &mu, w: record, pid: pid, dir: relayToServer}))
+			_ = serverIn.Close()
+		}()
+		_, copyErr = io.Copy(os.Stdout, io.TeeReader(serverOut, &lineRecorder{mu: &mu, w: record, pid: pid, dir: relayToClient}))
+	}
 	waitErr := cmd.Wait()
 	if copyErr != nil {
 		fmt.Fprintf(os.Stderr, "agenttest: relay MCP server output: %v\n", copyErr)
@@ -130,6 +157,32 @@ type lineRecorder struct {
 	pending []byte
 }
 
+type recorder struct {
+	mu  *sync.Mutex
+	w   io.Writer
+	pid int
+}
+
+func (r *recorder) add(dir string, msg []byte) error {
+	return r.addRecord(relayRecord{Dir: dir}, msg)
+}
+
+func (r *recorder) addRecord(rec relayRecord, msg []byte) error {
+	msg = bytes.TrimSpace(msg)
+	if len(msg) == 0 || !json.Valid(msg) {
+		return nil
+	}
+	rec.PID, rec.Msg = r.pid, msg
+	encoded, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err = r.w.Write(append(encoded, '\n'))
+	return err
+}
+
 func (r *lineRecorder) Write(p []byte) (int, error) {
 	r.pending = append(r.pending, p...)
 	for {
@@ -137,22 +190,99 @@ func (r *lineRecorder) Write(p []byte) (int, error) {
 		if !found {
 			return len(p), nil
 		}
-		line = bytes.TrimSpace(line)
 		r.pending = rest
-		if len(line) == 0 || !json.Valid(line) {
-			continue
-		}
-		encoded, err := json.Marshal(relayRecord{PID: r.pid, Dir: r.dir, Msg: line})
-		if err != nil {
-			return 0, err
-		}
-		r.mu.Lock()
-		_, err = r.w.Write(append(encoded, '\n'))
-		r.mu.Unlock()
-		if err != nil {
+		if err := (&recorder{mu: r.mu, w: r.w, pid: r.pid}).add(r.dir, line); err != nil {
 			return 0, err
 		}
 	}
+}
+
+func relayHTTP(serverOut io.Reader, rec *recorder) error {
+	out := bufio.NewReader(serverOut)
+	first, err := out.ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("read the target's listening event: %w", err)
+	}
+	var event struct {
+		Listening string `json:"listening"`
+	}
+	if err := json.Unmarshal(first, &event); err != nil || event.Listening == "" {
+		return fmt.Errorf("the target's first line %q is not a listening event", bytes.TrimSpace(first))
+	}
+
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	srv := &http.Server{Handler: &httpForwarder{target: event.Listening, rec: rec}, ReadHeaderTimeout: waittest.HangGuard}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close() //nolint:errcheck // the relay process ends right after, so no caller could act on a close error
+
+	announced, err := json.Marshal(struct {
+		Listening string `json:"listening"`
+	}{ln.Addr().String()})
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stdout.Write(append(announced, '\n')); err != nil {
+		return err
+	}
+	_, err = io.Copy(os.Stdout, out)
+	return err
+}
+
+type httpForwarder struct {
+	target string
+	rec    *recorder
+	seq    atomic.Int64
+}
+
+var forwardClient = &http.Client{
+	Transport: &http.Transport{DisableCompression: true},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func (f *httpForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req := int(f.seq.Add(1))
+	accept := r.Header.Get("Accept")
+	if err := f.rec.addRecord(relayRecord{Dir: relayToServer, Req: req, Accept: &accept}, body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	out, err := http.NewRequestWithContext(r.Context(), r.Method, "http://"+f.target+r.URL.RequestURI(), bytes.NewReader(body)) //nolint:gosec // G704: the target is the test's own server on loopback.
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out.Header = r.Header.Clone()
+	out.Host = r.Host
+	resp, err := forwardClient.Do(out) //nolint:gosec // G704: the target is the test's own server on loopback.
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // the body is read in full right after, so a close error adds nothing
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if err := f.rec.addRecord(relayRecord{Dir: relayToClient, Req: req, Accept: &accept}, answer); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	maps.Copy(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(answer)
 }
 
 // RecordingMCPRelay is an MCP server command that forwards to the real
@@ -211,21 +341,60 @@ func (r RecordingMCPRelay) outcome(t testing.TB, tool string) toolCallResult {
 	return requestOutcome(data, "tools/call", tool)
 }
 
+// AssertAcceptNamesBothMedia fails t unless the record holds at least one HTTP
+// request and every one names application/json and text/event-stream in
+// Accept. The server's own check admits wildcards, so only this shows what a
+// runtime really sends.
+func (r RecordingMCPRelay) AssertAcceptNamesBothMedia(t testing.TB, runtime string) {
+	t.Helper()
+
+	data, err := os.ReadFile(r.RecordPath) //nolint:gosec // G304: path is the test's own t.TempDir fixture.
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s Accept: read MCP traffic: %v", runtime, err)
+	}
+	accepts := recordedAccepts(data)
+	if len(accepts) == 0 {
+		t.Errorf("%s Accept = no HTTP request recorded, want at least one", runtime)
+	}
+	for _, accept := range accepts {
+		if !namesMedia(accept, "application/json") || !namesMedia(accept, "text/event-stream") {
+			t.Errorf("%s Accept = %q, want both application/json and text/event-stream", runtime, accept)
+		}
+	}
+}
+
+func recordedAccepts(data []byte) []string {
+	var accepts []string
+	for line := range bytes.SplitSeq(data, []byte("\n")) {
+		var rec relayRecord
+		if json.Unmarshal(line, &rec) == nil && rec.Dir == relayToServer && rec.Accept != nil {
+			accepts = append(accepts, *rec.Accept)
+		}
+	}
+	return accepts
+}
+
+func namesMedia(accept, media string) bool {
+	for part := range strings.SplitSeq(accept, ",") {
+		name, _, _ := strings.Cut(part, ";")
+		if strings.EqualFold(strings.TrimSpace(name), media) {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitToolsListed reports whether the recorded traffic comes to hold a
 // successful tools/list exchange within bound, which shows the runtime has
 // read the server's tools.
 func (r RecordingMCPRelay) WaitToolsListed(bound time.Duration) bool {
-	deadline := time.Now().Add(bound)
-	for {
+	return waittest.UntilWithin(bound, 20*time.Millisecond, func() error {
 		data, _ := os.ReadFile(r.RecordPath) //nolint:gosec // G304: path is the test's own t.TempDir fixture.
-		if listing := requestOutcome(data, "tools/list", ""); listing.answered && !listing.failed {
-			return true
+		if listing := requestOutcome(data, "tools/list", ""); !listing.answered || listing.failed {
+			return errors.New("no successful tools/list exchange recorded")
 		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return nil
+	}) == nil
 }
 
 func reportToolCallOutcome(t testing.TB, tool string, outcome toolCallResult) {
@@ -261,6 +430,7 @@ type rpcMessage struct {
 
 type callKey struct {
 	pid int
+	req int
 	id  string
 }
 
@@ -289,7 +459,7 @@ func requestOutcome(data []byte, method, name string) toolCallResult {
 		}
 		out.messages++
 
-		key := callKey{pid: rec.PID, id: string(msg.ID)}
+		key := callKey{pid: rec.PID, req: rec.Req, id: string(msg.ID)}
 		switch {
 		case rec.Dir == relayToServer && msg.Method == method && msg.Params.Name == name && len(msg.ID) > 0:
 			out.called = true

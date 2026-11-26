@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
 
       - name: Install lychee
-        uses: sortie-ai/shared-workflows/.github/actions/setup-lychee@12099056fde09c3b1ef701128316e9fb883eba90 # v1.1.0
+        uses: sortie-ai/shared-workflows/.github/actions/setup-lychee@6d471deb70b0fee52d42366fb84f76b95d8f957a # v1.2.0
 
       - name: Check links and anchors
         env:

@@ -1,11 +1,16 @@
 package agentcore
 
-import "github.com/sortie-ai/sortie/internal/domain"
+import (
+	"maps"
 
-// RunUsage accumulates normalized token usage across every turn of one
-// agent session. It combines a settled total (closed turns and
-// run-cumulative snapshots) with a provisional contribution from the
-// turn currently in flight, and never returns a snapshot lower than any
+	"github.com/sortie-ai/sortie/internal/agent/usage"
+	"github.com/sortie-ai/sortie/internal/domain"
+)
+
+// RunUsage tracks normalized token usage across every turn of one agent
+// session. It combines a settled total (the latest run-cumulative figure
+// the adapter set) with a provisional contribution from the turn
+// currently in flight, and never returns a snapshot lower than any
 // snapshot it has already returned, so a caller that reports each
 // method's result observes a monotonically non-decreasing sequence per
 // component even when a later provisional estimate would otherwise be
@@ -18,6 +23,7 @@ type RunUsage struct {
 	settled     domain.TokenUsage
 	provisional domain.TokenUsage
 	high        domain.TokenUsage
+	byModel     map[string]domain.TokenUsage
 }
 
 // NewRunUsage returns a zero-value RunUsage ready for use.
@@ -30,26 +36,24 @@ func NewRunUsage() *RunUsage {
 // the new provisional contribution), raised against the highest
 // snapshot returned so far.
 func (u *RunUsage) SetTurnProvisional(turn domain.TokenUsage) domain.TokenUsage {
-	u.provisional = clamp(turn)
-	return u.raise(add(u.settled, u.provisional))
-}
-
-// AddTurn adds turn to the settled total, clears the in-flight turn's
-// provisional contribution, and returns the new settled total, raised
-// against the highest snapshot returned so far.
-func (u *RunUsage) AddTurn(turn domain.TokenUsage) domain.TokenUsage {
-	u.settled = add(u.settled, clamp(turn))
-	u.provisional = domain.TokenUsage{}
-	return u.raise(u.settled)
+	u.provisional = usage.Subtract(turn, domain.TokenUsage{})
+	return u.raise(usage.Add(u.settled, u.provisional))
 }
 
 // SetRunCumulative replaces the settled total with run outright, clears
 // the in-flight turn's provisional contribution, and returns the new
 // settled total, raised against the highest snapshot returned so far.
-func (u *RunUsage) SetRunCumulative(run domain.TokenUsage) domain.TokenUsage {
-	u.settled = clamp(run)
+// It also records runByModel, normalized, as the settled per-model split.
+func (u *RunUsage) SetRunCumulative(run domain.TokenUsage, runByModel map[string]domain.TokenUsage) domain.TokenUsage {
+	u.settled = usage.Subtract(run, domain.TokenUsage{})
 	u.provisional = domain.TokenUsage{}
+	u.byModel = NormalizeUsageByModel(runByModel)
 	return u.raise(u.settled)
+}
+
+// ByModel returns a copy of the settled per-model split, or nil when none.
+func (u *RunUsage) ByModel() map[string]domain.TokenUsage {
+	return maps.Clone(u.byModel)
 }
 
 // Snapshot returns the highest run-cumulative snapshot returned so far
@@ -66,54 +70,34 @@ func (u *RunUsage) raise(snapshot domain.TokenUsage) domain.TokenUsage {
 	return u.high
 }
 
-// clamp floors every negative component of usage at zero and recomputes
-// TotalTokens as InputTokens plus OutputTokens.
-func clamp(usage domain.TokenUsage) domain.TokenUsage {
-	return SubtractUsage(usage, domain.TokenUsage{})
+// NormalizeUsageByModel returns a new map of m with names trimmed and
+// merged, counts floored at zero, and empty names and zero entries
+// dropped; nil when no entry remains.
+func NormalizeUsageByModel(m map[string]domain.TokenUsage) map[string]domain.TokenUsage {
+	return usage.NormalizeByModel(m)
 }
 
-// add returns the componentwise sum of a and b, with TotalTokens
-// recomputed as InputTokens plus OutputTokens.
-func add(a, b domain.TokenUsage) domain.TokenUsage {
-	return AddUsage(a, b)
+// AddUsageByModel returns the per-name sum of a and b as a new map; nil
+// when both are nil.
+func AddUsageByModel(a, b map[string]domain.TokenUsage) map[string]domain.TokenUsage {
+	return usage.AddByModel(a, b)
 }
 
 // SubtractUsage returns the componentwise difference a minus b, floored
 // at zero in every component, with TotalTokens recomputed as
 // InputTokens plus OutputTokens.
 func SubtractUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	diff := domain.TokenUsage{
-		InputTokens:      max(a.InputTokens-b.InputTokens, 0),
-		OutputTokens:     max(a.OutputTokens-b.OutputTokens, 0),
-		CacheReadTokens:  max(a.CacheReadTokens-b.CacheReadTokens, 0),
-		CacheWriteTokens: max(a.CacheWriteTokens-b.CacheWriteTokens, 0),
-	}
-	diff.TotalTokens = diff.InputTokens + diff.OutputTokens
-	return diff
+	return usage.Subtract(a, b)
 }
 
 // MaxUsage returns the componentwise maximum of a and b, with
 // TotalTokens recomputed as InputTokens plus OutputTokens.
 func MaxUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	result := domain.TokenUsage{
-		InputTokens:      max(a.InputTokens, b.InputTokens),
-		OutputTokens:     max(a.OutputTokens, b.OutputTokens),
-		CacheReadTokens:  max(a.CacheReadTokens, b.CacheReadTokens),
-		CacheWriteTokens: max(a.CacheWriteTokens, b.CacheWriteTokens),
-	}
-	result.TotalTokens = result.InputTokens + result.OutputTokens
-	return result
+	return usage.Max(a, b)
 }
 
 // AddUsage returns the componentwise sum of a and b, with TotalTokens
 // recomputed as InputTokens plus OutputTokens.
 func AddUsage(a, b domain.TokenUsage) domain.TokenUsage {
-	sum := domain.TokenUsage{
-		InputTokens:      a.InputTokens + b.InputTokens,
-		OutputTokens:     a.OutputTokens + b.OutputTokens,
-		CacheReadTokens:  a.CacheReadTokens + b.CacheReadTokens,
-		CacheWriteTokens: a.CacheWriteTokens + b.CacheWriteTokens,
-	}
-	sum.TotalTokens = sum.InputTokens + sum.OutputTokens
-	return sum
+	return usage.Add(a, b)
 }

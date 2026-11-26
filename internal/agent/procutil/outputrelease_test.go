@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // syncBuffer is a bytes.Buffer guarded by a mutex, for a logger the
@@ -91,30 +95,28 @@ func newTestOwnedPipes(t *testing.T) *OwnedPipes {
 func TestStartOutputRelease_GraceElapsedAbandonsWithinBound(t *testing.T) {
 	t.Parallel()
 
-	const grace = 80 * time.Millisecond
-	reaped := make(chan struct{})
-	close(reaped)
+	synctest.Test(t, func(t *testing.T) {
+		const grace = 80 * time.Millisecond
+		reaped := make(chan struct{})
+		close(reaped)
 
-	start := time.Now()
-	r := StartOutputRelease(OutputReleaseParams{
-		Pipes:      newTestOwnedPipes(t),
-		Reaped:     reaped,
-		ReaderDone: make(chan struct{}),
-		Grace:      grace,
-		Logger:     slog.New(slog.DiscardHandler),
+		start := time.Now()
+		r := StartOutputRelease(OutputReleaseParams{
+			Pipes:      newTestOwnedPipes(t),
+			Reaped:     reaped,
+			ReaderDone: make(chan struct{}),
+			Grace:      grace,
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+
+		waittest.Receive(t, r.Abandoned(), "the release's abandonment")
+		if elapsed := time.Since(start); elapsed != grace {
+			t.Errorf("the release abandoned after %v, want exactly the injected grace %v", elapsed, grace)
+		}
+		if !r.latch.Load() {
+			t.Error("the release's latch is unset after abandonment, want it set")
+		}
 	})
-
-	select {
-	case <-r.Abandoned():
-	case <-time.After(2 * time.Second):
-		t.Fatal("the release never abandoned within a bound well past the injected grace")
-	}
-	if elapsed := time.Since(start); elapsed < grace {
-		t.Errorf("the release abandoned after %v, want at least the injected grace %v", elapsed, grace)
-	}
-	if !r.latch.Load() {
-		t.Error("the release's latch is unset after abandonment, want it set")
-	}
 }
 
 // TestStartOutputRelease_OnAbandonObservesGiveUpEffectsAlreadyApplied
@@ -161,19 +163,15 @@ func TestStartOutputRelease_OnAbandonObservesGiveUpEffectsAlreadyApplied(t *test
 	// OnAbandon, or that read races the assignment.
 	close(reaped)
 
-	select {
-	case got := <-factsCh:
-		if !got.latchSet {
-			t.Error("OnAbandon observed the latch unset, want it already stored")
-		}
-		if !got.abandonedClosed {
-			t.Error("OnAbandon observed Abandoned() not yet closed, want it already closed")
-		}
-		if !errors.Is(got.readErr, os.ErrClosed) {
-			t.Errorf("OnAbandon observed a read on the standard-output end returning %v, want %v (the read end must already be closed)", got.readErr, os.ErrClosed)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("OnAbandon never ran")
+	got := waittest.Receive(t, factsCh, "the OnAbandon call")
+	if !got.latchSet {
+		t.Error("OnAbandon observed the latch unset, want it already stored")
+	}
+	if !got.abandonedClosed {
+		t.Error("OnAbandon observed Abandoned() not yet closed, want it already closed")
+	}
+	if !errors.Is(got.readErr, os.ErrClosed) {
+		t.Errorf("OnAbandon observed a read on the standard-output end returning %v, want %v (the read end must already be closed)", got.readErr, os.ErrClosed)
 	}
 }
 
@@ -198,11 +196,7 @@ func TestOutputRelease_TurnEndMessage(t *testing.T) {
 	}
 
 	close(reaped)
-	select {
-	case <-r.Abandoned():
-	case <-time.After(2 * time.Second):
-		t.Fatal("the release never abandoned")
-	}
+	waittest.Receive(t, r.Abandoned(), "the release's abandonment")
 
 	if got := r.TurnEndMessage("fallback"); got != OutputAbandonedMessage {
 		t.Errorf("TurnEndMessage() after abandonment = %q, want %q", got, OutputAbandonedMessage)
@@ -248,11 +242,7 @@ func TestStartOutputRelease_ReaderDoneInsideGraceLeavesLatchUnset(t *testing.T) 
 
 	close(readerDone)
 
-	// The grace has definitely elapsed by this point, well past when the
-	// give-up arm would have fired had ReaderDone not stopped it: a
-	// bounded wait past the grace proves absence rather than assuming it
-	// from a race window.
-	<-time.After(grace + 400*time.Millisecond)
+	waittest.Never(t, r.Abandoned(), grace+400*time.Millisecond, "the release's abandonment though the reader ended inside its grace")
 
 	if r.latch.Load() {
 		t.Error("the release's latch is set though the reader ended inside its grace, want it unset")
@@ -267,11 +257,7 @@ func TestStartOutputRelease_ReaderDoneInsideGraceLeavesLatchUnset(t *testing.T) 
 		_, err := outRead.Read(b)
 		readDone <- err
 	}()
-	select {
-	case err := <-readDone:
-		t.Errorf("reading the standard-output read end returned %v, want it still open and blocked (the release must not have closed it)", err)
-	case <-time.After(200 * time.Millisecond):
-	}
+	waittest.Never(t, readDone, 200*time.Millisecond, "a read of the standard-output end, want it still open and blocked (the release must not have closed it)")
 }
 
 // TestStartOutputRelease_GiveUpArmLogsExactlyOneWarnRecord asserts that
@@ -281,43 +267,35 @@ func TestStartOutputRelease_ReaderDoneInsideGraceLeavesLatchUnset(t *testing.T) 
 func TestStartOutputRelease_GiveUpArmLogsExactlyOneWarnRecord(t *testing.T) {
 	t.Parallel()
 
-	var buf syncBuffer
-	handler, warned := newWarnSignalHandler(&buf, OutputAbandonedWarning)
-	logger := slog.New(handler)
+	synctest.Test(t, func(t *testing.T) {
+		var buf syncBuffer
+		handler, warned := newWarnSignalHandler(&buf, OutputAbandonedWarning)
+		logger := slog.New(handler)
 
-	const grace = 60 * time.Millisecond
-	reaped := make(chan struct{})
-	close(reaped)
+		const grace = 60 * time.Millisecond
+		reaped := make(chan struct{})
+		close(reaped)
 
-	StartOutputRelease(OutputReleaseParams{
-		Pipes:      newTestOwnedPipes(t),
-		Reaped:     reaped,
-		ReaderDone: make(chan struct{}),
-		Grace:      grace,
-		Logger:     logger,
+		StartOutputRelease(OutputReleaseParams{
+			Pipes:      newTestOwnedPipes(t),
+			Reaped:     reaped,
+			ReaderDone: make(chan struct{}),
+			Grace:      grace,
+			Logger:     logger,
+		})
+
+		waittest.Receive(t, warned, "the give-up arm's WARN record")
+		synctest.Wait()
+
+		output := buf.String()
+		wantRecord := "level=WARN msg=\"" + OutputAbandonedWarning + "\""
+		if got := strings.Count(output, wantRecord); got != 1 {
+			t.Errorf("give-up arm WARN record count = %d, want exactly 1 record %q: %q", got, wantRecord, output)
+		}
+		if !strings.Contains(output, "drain_bound="+grace.String()) {
+			t.Errorf("WARN record %q does not carry drain_bound=%s", output, grace)
+		}
 	})
-
-	select {
-	case <-warned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the give-up arm never logged its WARN record")
-	}
-
-	// A second record logged right after the give-up arm's own would
-	// land well within this bound: the arm logs synchronously and its
-	// goroutine returns immediately after, so waiting this long before
-	// counting proves the record's absence rather than merely not yet
-	// having observed it.
-	<-time.After(300 * time.Millisecond)
-
-	output := buf.String()
-	wantRecord := "level=WARN msg=\"" + OutputAbandonedWarning + "\""
-	if got := strings.Count(output, wantRecord); got != 1 {
-		t.Errorf("give-up arm WARN record count = %d, want exactly 1 record %q: %q", got, wantRecord, output)
-	}
-	if !strings.Contains(output, "drain_bound="+grace.String()) {
-		t.Errorf("WARN record %q does not carry drain_bound=%s", output, grace)
-	}
 }
 
 // TestStartOutputRelease_StderrArmLogsItsOwnSeparateAbandonmentRecord
@@ -327,58 +305,41 @@ func TestStartOutputRelease_GiveUpArmLogsExactlyOneWarnRecord(t *testing.T) {
 func TestStartOutputRelease_StderrArmLogsItsOwnSeparateAbandonmentRecord(t *testing.T) {
 	t.Parallel()
 
-	var buf syncBuffer
-	handler, warned := newWarnSignalHandler(&buf, OutputAbandonedWarning)
-	logger := slog.New(handler)
+	synctest.Test(t, func(t *testing.T) {
+		var buf syncBuffer
+		handler, warned := newWarnSignalHandler(&buf, OutputAbandonedWarning)
+		logger := slog.New(handler)
 
-	stderrRead, stderrWrite, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = stderrWrite.Close()
-		_ = stderrRead.Close()
+		stderrRead, stderrWrite := io.Pipe()
+		t.Cleanup(func() { _ = stderrWrite.Close() })
+		collector := NewStderrCollector(stderrRead, logger)
+
+		const grace = 60 * time.Millisecond
+		reaped := make(chan struct{})
+		close(reaped)
+
+		StartOutputRelease(OutputReleaseParams{
+			Pipes:      newTestOwnedPipes(t),
+			Reaped:     reaped,
+			ReaderDone: make(chan struct{}),
+			Stderr:     collector,
+			Grace:      grace,
+			Logger:     logger,
+		})
+
+		waittest.Receive(t, warned, "the give-up arm's own WARN record")
+		waittest.Receive(t, collector.abandoned, "the standard-error collector's abandonment")
+		synctest.Wait()
+
+		output := buf.String()
+		wantRecord := "level=WARN msg=\"" + OutputAbandonedWarning + "\""
+		if got := strings.Count(output, wantRecord); got != 1 {
+			t.Errorf("give-up arm WARN record count = %d, want exactly 1 record %q even with a Stderr arm running: %q", got, wantRecord, output)
+		}
+		if !strings.Contains(output, "level=WARN msg=\"agent stderr was not fully collected before the process was reaped\"") {
+			t.Errorf("the standard-error arm's own separate abandonment WARN record is missing: %q", output)
+		}
 	})
-	collector := NewStderrCollector(stderrRead, logger)
-
-	const grace = 60 * time.Millisecond
-	reaped := make(chan struct{})
-	close(reaped)
-
-	StartOutputRelease(OutputReleaseParams{
-		Pipes:      newTestOwnedPipes(t),
-		Reaped:     reaped,
-		ReaderDone: make(chan struct{}),
-		Stderr:     collector,
-		Grace:      grace,
-		Logger:     logger,
-	})
-
-	select {
-	case <-warned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the give-up arm never logged its own WARN record")
-	}
-	select {
-	case <-collector.abandoned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the standard-error collector was never abandoned")
-	}
-
-	// A second give-up-arm record logged right after its own would land
-	// well within this bound, the same margin
-	// TestStartOutputRelease_GiveUpArmLogsExactlyOneWarnRecord waits out,
-	// so waiting this long before counting proves the record's absence.
-	<-time.After(300 * time.Millisecond)
-
-	output := buf.String()
-	wantRecord := "level=WARN msg=\"" + OutputAbandonedWarning + "\""
-	if got := strings.Count(output, wantRecord); got != 1 {
-		t.Errorf("give-up arm WARN record count = %d, want exactly 1 record %q even with a Stderr arm running: %q", got, wantRecord, output)
-	}
-	if !strings.Contains(output, "level=WARN msg=\"agent stderr was not fully collected before the process was reaped\"") {
-		t.Errorf("the standard-error arm's own separate abandonment WARN record is missing: %q", output)
-	}
 }
 
 // TestOutputRelease_NilReceiver asserts that a nil *OutputRelease returns
@@ -445,26 +406,19 @@ func TestStartOutputRelease_PanicsOnNilRequiredFields(t *testing.T) {
 func TestStartOutputRelease_NonPositiveGraceResolvesToDefaultDrainGrace(t *testing.T) {
 	t.Parallel()
 
-	reaped := make(chan struct{})
-	close(reaped)
-	r := StartOutputRelease(OutputReleaseParams{
-		Pipes:      newTestOwnedPipes(t),
-		Reaped:     reaped,
-		ReaderDone: make(chan struct{}),
-		Grace:      0,
-		Logger:     slog.New(slog.DiscardHandler),
+	synctest.Test(t, func(t *testing.T) {
+		reaped := make(chan struct{})
+		close(reaped)
+		r := StartOutputRelease(OutputReleaseParams{
+			Pipes:      newTestOwnedPipes(t),
+			Reaped:     reaped,
+			ReaderDone: make(chan struct{}),
+			Grace:      0,
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+
+		const tooEarly = 500 * time.Millisecond
+		waittest.Never(t, r.Abandoned(), tooEarly, "the release's abandonment of a zero Grace, want it resolved to DefaultDrainGrace rather than firing immediately")
+		waittest.Receive(t, r.Abandoned(), "the release's abandonment, want it bounded by DefaultDrainGrace")
 	})
-
-	const tooEarly = 500 * time.Millisecond
-	select {
-	case <-r.Abandoned():
-		t.Fatalf("the release abandoned within %v of a zero Grace, want it to have resolved to DefaultDrainGrace (%v) rather than firing immediately", tooEarly, DefaultDrainGrace)
-	case <-time.After(tooEarly):
-	}
-
-	select {
-	case <-r.Abandoned():
-	case <-time.After(DefaultDrainGrace):
-		t.Fatal("the release never abandoned, want it bounded by DefaultDrainGrace")
-	}
 }

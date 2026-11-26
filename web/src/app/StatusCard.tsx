@@ -2,7 +2,13 @@ import { Link } from "react-router";
 
 import { useStateQuery } from "@/api/queries";
 import { cn } from "@/lib/cn";
-import { condition, conditionWord, failingChecks } from "@/lib/condition";
+import {
+  ACKNOWLEDGED_WORD,
+  acknowledgedCount,
+  condition,
+  conditionWord,
+  failingChecks,
+} from "@/lib/condition";
 import { fmtCount, pluralVerb } from "@/lib/format";
 
 import type { StateResponse } from "@/api/types.gen";
@@ -11,6 +17,7 @@ import type { Condition } from "@/lib/condition";
 const CONDITION_DOT: Record<Condition, string> = {
   clear: "bg-success-fill",
   needs: "bg-warning-fill",
+  held: "bg-ink-muted",
   degraded: "bg-error-fill",
 };
 
@@ -54,6 +61,14 @@ interface HeadlineProps {
 }
 
 function Headline({ state, current }: HeadlineProps) {
+  if (current === "held") {
+    return (
+      <>
+        <span className="text-ink tabular-nums">{fmtCount(acknowledgedCount(state))}</span>{" "}
+        {ACKNOWLEDGED_WORD}
+      </>
+    );
+  }
   if (current !== "needs") {
     return conditionWord(current);
   }
@@ -108,7 +123,6 @@ function StatusSummary({ state }: StatusSummaryProps) {
   );
 }
 
-/** Renders the rail's link to Overview: a dot and headline for the condition, the failing checks when degraded, and how many agents run. */
 export function StatusCard() {
   const { data } = useStateQuery();
 

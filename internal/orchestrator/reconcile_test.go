@@ -18,6 +18,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // unsupportedReactionObservationStore lets unrelated store doubles satisfy
@@ -48,6 +49,16 @@ func (unsupportedReactionObservationStore) CountWorkerRunsCompletedSince(context
 	return 0, errors.New("worker run count is unsupported by this test double")
 }
 
+type noUsageLimitHolds struct{}
+
+func (noUsageLimitHolds) SaveUsageLimitHold(context.Context, persistence.UsageLimitHold) error {
+	return nil
+}
+
+func (noUsageLimitHolds) DeleteUsageLimitHold(context.Context, string, bool, string) error {
+	return nil
+}
+
 type noEscalationRecords struct{}
 
 func (noEscalationRecords) GetReactionEscalation(context.Context, string, string) (persistence.ReactionEscalation, bool, error) {
@@ -63,8 +74,27 @@ func (noEscalationRecords) EndReactionEscalation(context.Context, string, string
 func (noEscalationRecords) DeleteReactionEscalations(context.Context, string) error { return nil }
 
 type reactionActivityLog struct {
-	mu       sync.Mutex
-	recorded []persistence.ReactionActivity
+	mu             sync.Mutex
+	recorded       []persistence.ReactionActivity
+	triageOutcomes []persistence.ReactionTriageOutcome
+}
+
+func (l *reactionActivityLog) RecordReactionTriageOutcome(_ context.Context, outcome persistence.ReactionTriageOutcome) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.triageOutcomes = append(l.triageOutcomes, outcome)
+	return nil
+}
+
+func (l *reactionActivityLog) LatestReactionTriageDisposition(_ context.Context, issueID, kind, fingerprint string) (string, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, o := range slices.Backward(l.triageOutcomes) {
+		if o.IssueID == issueID && o.Kind == kind && o.Fingerprint == fingerprint {
+			return o.Disposition, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func (l *reactionActivityLog) RecordReactionActivity(_ context.Context, records []persistence.ReactionActivity) error {
@@ -165,9 +195,10 @@ func (m *mockReconcileStore) DeleteReactionFingerprint(_ context.Context, _, _ s
 }
 
 // mockReconcileTracker implements domain.TrackerAdapter for reconcile tests.
-// Only FetchIssueStatesByIDs is exercised; the other methods panic if called.
+// Only the state reads are exercised; the other methods panic if called.
 type mockReconcileTracker struct {
 	states   map[string]string
+	labels   map[string][]string // per-ID labels the reconcile read reports
 	fetchErr error
 
 	calls      int
@@ -175,6 +206,19 @@ type mockReconcileTracker struct {
 }
 
 var _ domain.TrackerAdapter = (*mockReconcileTracker)(nil)
+
+func statesWithLabels(states map[string]string, labels map[string][]string) map[string]domain.IssueStateAndLabels {
+	reads := make(map[string]domain.IssueStateAndLabels, len(states))
+	for id, state := range states {
+		reads[id] = domain.IssueStateAndLabels{State: state, Labels: labels[id]}
+	}
+	return reads
+}
+
+func (m *mockReconcileTracker) FetchIssueStatesAndLabelsByIDs(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+	states, err := m.FetchIssueStatesByIDs(ctx, ids)
+	return statesWithLabels(states, m.labels), err
+}
 
 func (m *mockReconcileTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) (map[string]string, error) {
 	m.calls++
@@ -212,10 +256,6 @@ func (m *mockReconcileTracker) TransitionIssue(context.Context, string, string) 
 
 func (m *mockReconcileTracker) CommentIssue(context.Context, string, string) error {
 	panic("CommentIssue must not be called by ReconcileRunningIssues")
-}
-
-func (m *mockReconcileTracker) CommentIssueWithLiteral(context.Context, string, string, string) error {
-	panic("CommentIssueWithLiteral must not be called by ReconcileRunningIssues")
 }
 
 func (m *mockReconcileTracker) AddLabel(context.Context, string, string) error {
@@ -257,6 +297,10 @@ func (s *sweepTracker) FetchIssuesByStates(context.Context, []string) ([]domain.
 	panic("FetchIssuesByStates must not be called by SweepWorkspaces")
 }
 
+func (s *sweepTracker) FetchIssueStatesAndLabelsByIDs(context.Context, []string) (map[string]domain.IssueStateAndLabels, error) {
+	return nil, nil
+}
+
 func (s *sweepTracker) FetchIssueStatesByIDs(context.Context, []string) (map[string]string, error) {
 	panic("FetchIssueStatesByIDs must not be called by SweepWorkspaces")
 }
@@ -271,10 +315,6 @@ func (s *sweepTracker) TransitionIssue(context.Context, string, string) error {
 
 func (s *sweepTracker) CommentIssue(context.Context, string, string) error {
 	panic("CommentIssue must not be called by SweepWorkspaces")
-}
-
-func (s *sweepTracker) CommentIssueWithLiteral(context.Context, string, string, string) error {
-	panic("CommentIssueWithLiteral must not be called by SweepWorkspaces")
 }
 
 func (s *sweepTracker) AddLabel(context.Context, string, string) error {
@@ -783,31 +823,44 @@ func TestReconcileTrackerState_TerminalSetsPendingCleanup(t *testing.T) {
 	}
 }
 
-func TestReconcileTrackerState_ActiveUpdatesState(t *testing.T) {
+func TestReconcileTrackerState_RecordsReadOnlyWhileRunContinues(t *testing.T) {
 	t.Parallel()
 
-	store := &mockReconcileStore{}
-	tracker := &mockReconcileTracker{
-		states: map[string]string{"ISSUE-1": "In Review"},
+	tests := []struct {
+		name, read string
+		recorded   bool
+	}{
+		{"active reading", "In Review", true},
+		{"terminal reading", "Done", false},
+		{"non-active reading", "Backlog", false},
+		{"first no-state reading", "", false},
 	}
-	params := defaultReconcileParams(t, store, tracker)
-	params.StallTimeoutMS = 0
 
-	state := NewState(5000, 4, 0, nil, AgentTotals{})
-	state.Running["ISSUE-1"] = &RunningEntry{
-		Identifier: "ISSUE-1-ident",
-		StartedAt:  reconcileBaseTime,
-		Issue:      domain.Issue{State: "In Progress"},
-	}
-	state.Claimed["ISSUE-1"] = struct{}{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	ReconcileRunningIssues(state, params)
+			tracker := &mockReconcileTracker{states: map[string]string{"ISSUE-1": tt.read}, labels: map[string][]string{"ISSUE-1": {"ai:in-progress"}}}
+			params := defaultReconcileParams(t, &mockReconcileStore{}, tracker)
+			params.StallTimeoutMS = 0
+			initial := domain.IssueStateAndLabels{State: "In Progress", Labels: []string{"ai:ready"}}
+			entry := &RunningEntry{StartedAt: reconcileBaseTime, CancelFunc: func() {}, Issue: domain.Issue{State: initial.State, Labels: initial.Labels}}
+			state := NewState(5000, 4, 0, nil, AgentTotals{})
+			state.Running["ISSUE-1"] = entry
+			before := time.Now()
 
-	if state.Running["ISSUE-1"].Issue.State != "In Review" {
-		t.Errorf("Issue.State = %q, want %q", state.Running["ISSUE-1"].Issue.State, "In Review")
-	}
-	if state.Running["ISSUE-1"].PendingCleanup {
-		t.Error("PendingCleanup set for active issue")
+			ReconcileRunningIssues(state, params)
+			recordIssueRead(entry, initial, before)
+
+			got := fmt.Sprintf("%s %v", entry.Issue.State, entry.Issue.Labels)
+			want := "In Progress [ai:ready]"
+			if tt.recorded {
+				want = tt.read + " [ai:in-progress]"
+			}
+			if got != want {
+				t.Errorf("ReconcileRunningIssues(%q) then an older worker read: entry = %q, want %q", tt.read, got, want)
+			}
+		})
 	}
 }
 
@@ -3041,13 +3094,9 @@ func TestReconcileOverdueRetries_ReArmsOverdueEntry(t *testing.T) {
 		t.Errorf("Store method calls = %d, want 0", got)
 	}
 
-	select {
-	case id := <-fired:
-		if id != "OVERDUE-1" {
-			t.Errorf("OnRetryFire received %q, want %q", id, "OVERDUE-1")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("OnRetryFire not invoked within 1 second")
+	id := waittest.Receive(t, fired, "OnRetryFire call")
+	if id != "OVERDUE-1" {
+		t.Errorf("OnRetryFire received %q, want %q", id, "OVERDUE-1")
 	}
 
 	if entry.TimerHandle != nil {
@@ -3157,11 +3206,7 @@ func TestReconcileOverdueRetries_StartupReconstructedEntrySkipped(t *testing.T) 
 		t.Errorf(`Warn("overdue retry re-armed") emitted %d times, want 0`, handler.countByMessage("overdue retry re-armed"))
 	}
 
-	select {
-	case id := <-fired:
-		t.Errorf("OnRetryFire invoked with %q, want no invocation for a startup-reconstructed entry", id)
-	case <-time.After(200 * time.Millisecond):
-	}
+	waittest.Never(t, fired, 200*time.Millisecond, "OnRetryFire invocation for a startup-reconstructed entry")
 }
 
 func TestReconcileOverdueRetries_LargeStartupBatchFiresNothing(t *testing.T) {
@@ -3205,11 +3250,7 @@ func TestReconcileOverdueRetries_LargeStartupBatchFiresNothing(t *testing.T) {
 		t.Errorf(`Warn("overdue retry re-armed") emitted %d times, want 0`, handler.countByMessage("overdue retry re-armed"))
 	}
 
-	select {
-	case id := <-fired:
-		t.Errorf("OnRetryFire invoked with %q, want no invocation for a 200-entry startup batch", id)
-	case <-time.After(200 * time.Millisecond):
-	}
+	waittest.Never(t, fired, 200*time.Millisecond, "OnRetryFire invocation for a 200-entry startup batch")
 }
 
 func (m *mockReconcileStore) AddReactionHandedOffComments(_ context.Context, _, _ string, _ []string) error {

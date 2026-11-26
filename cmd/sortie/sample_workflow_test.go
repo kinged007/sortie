@@ -254,6 +254,9 @@ var shippedExampleWorkflows = []string{
 	"WORKFLOW.gitea.md",
 	"WORKFLOW.gitlab.md",
 	"WORKFLOW.agent-client-protocol.md",
+	"WORKFLOW.agent-client-protocol.copilot.md",
+	"WORKFLOW.agent-client-protocol.opencode.md",
+	"WORKFLOW.agent-client-protocol.kiro.md",
 }
 
 // TestSampleWorkflowMergeConflictBranch verifies that each shipped example

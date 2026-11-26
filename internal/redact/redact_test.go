@@ -286,6 +286,20 @@ func TestMask_Idempotent(t *testing.T) {
 	}
 }
 
+func TestRemove_StopsMaskingOnlyTheRemovedValue(t *testing.T) {
+	t.Parallel()
+
+	removed, kept := randomSecret(t), randomSecret(t)
+	Add("test", removed)
+	Add("test", kept)
+	Remove(removed)
+
+	text := removed + " " + kept
+	if got, want := Mask(text), removed+" "+Marker; got != want {
+		t.Errorf("Mask(%q) = %q, want %q", text, got, want)
+	}
+}
+
 func TestMask_UnregisteredValueUnchanged(t *testing.T) {
 	t.Parallel()
 

@@ -3,9 +3,13 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,37 +22,30 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
-// validWorkflow returns a minimal valid WORKFLOW.md content with the
-// given polling interval.
 func validWorkflow(intervalMS int) []byte {
 	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: %d\n---\nDo the task for {{ .issue.title }}.\n", intervalMS)
 }
 
-// retentionWorkflow returns a minimal WORKFLOW.md content with the given
-// workspace.retention_days value.
 func retentionWorkflow(days int) []byte {
 	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: 5000\nworkspace:\n  retention_days: %d\n---\nDo the task for {{ .issue.title }}.\n", days)
 }
 
-// turnTimeoutWorkflow returns a minimal WORKFLOW.md content with the given
-// agent.turn_timeout_ms value.
 func turnTimeoutWorkflow(ms int) []byte {
 	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: 5000\nagent:\n  turn_timeout_ms: %d\n---\nDo the task for {{ .issue.title }}.\n", ms)
 }
 
-// ciWatchWindowWorkflow returns a minimal WORKFLOW.md content with a
-// reactions.ci_failure block carrying the given watch_window_ms value.
 func ciWatchWindowWorkflow(ms int) []byte {
 	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: 5000\nreactions:\n  ci_failure:\n    provider: github-actions\n    watch_window_ms: %d\n---\nDo the task for {{ .issue.title }}.\n", ms)
 }
 
-// trackerEndpointWorkflow returns a minimal WORKFLOW.md content with the
-// given tracker.endpoint value spliced in unquoted, so a numeric literal
-// decodes as a YAML integer rather than a string.
+// The endpoint is spliced in unquoted so a numeric literal decodes as a YAML
+// integer rather than a string.
 func trackerEndpointWorkflow(endpoint string) []byte {
 	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: 5000\ntracker:\n  kind: jira\n  endpoint: %s\n---\nDo the task for {{ .issue.title }}.\n", endpoint)
 }
@@ -57,10 +54,8 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-// writeWorkflow overwrites path atomically via write-to-temp + rename,
-// matching the pattern used by many editors. On Windows the rename can
-// fail with "Access is denied" when fsnotify holds a handle on the
-// target; the helper retries a few times with a brief back-off.
+// On Windows the rename can fail with "Access is denied" while fsnotify
+// holds a handle on the target, so it is retried with a brief back-off.
 func writeWorkflow(t *testing.T, path string, content []byte) {
 	t.Helper()
 	dir := filepath.Dir(path)
@@ -79,17 +74,22 @@ func writeWorkflow(t *testing.T, path string, content []byte) {
 	t.Fatalf("rename temp to target: %v", err)
 }
 
-// pollUntil calls fn repeatedly until it returns true or a 3-second
-// deadline elapses. Returns whether the condition was met.
-func pollUntil(fn func() bool) bool {
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if fn() {
-			return true
+func intervalIs(mgr *Manager, want int) func() error {
+	return func() error {
+		if got := mgr.Config().Polling.IntervalMS; got != want {
+			return fmt.Errorf("Polling.IntervalMS = %d, want %d", got, want)
 		}
-		time.Sleep(20 * time.Millisecond)
+		return nil
 	}
-	return false
+}
+
+func loadErrorSet(mgr *Manager) func() error {
+	return func() error {
+		if mgr.LastLoadError() == nil {
+			return errors.New("LastLoadError is nil, want the reload failure")
+		}
+		return nil
+	}
 }
 
 func mustWriteFile(t *testing.T, path string, content []byte) {
@@ -214,7 +214,6 @@ func TestManager_Reload(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	// Overwrite with new interval.
 	mustWriteFile(t, path, validWorkflow(9999))
 
 	if err := mgr.Reload(); err != nil {
@@ -283,6 +282,8 @@ func TestManager_ReloadFailSafe(t *testing.T) {
 		{name: "partial syntax error", before: []byte(partialsWorkflow), edit: greet("{{ if }}")},
 		{name: "partial calls an undefined name", before: []byte(partialsWorkflow), edit: greet(`{{ template "missing" . }}`)},
 		{name: "deleted partial whose entry expands to nothing", before: []byte(partialsWorkflow), remove: true, wantField: "dispatch.partials[0]"},
+		{name: "operator table file gone", before: priceTableWorkflow("prices.json"), after: priceTableWorkflow("gone.json"), wantField: "price_table.replace_file"},
+		{name: "operator table file invalid", before: priceTableWorkflow("prices.json"), after: priceTableWorkflow("invalid.json"), wantField: "price_table.replace_file"},
 	}
 
 	for _, tt := range tests {
@@ -297,6 +298,8 @@ func TestManager_ReloadFailSafe(t *testing.T) {
 			mustWriteFile(t, path, tt.before)
 			mustWriteFile(t, partial, []byte(greet("hello v1")))
 			mustWriteFile(t, filepath.Join(dir, "rule.tmpl"), []byte(`{{ template "greet" . }}`))
+			mustWriteFile(t, filepath.Join(dir, "prices.json"), []byte(operatorTableA))
+			mustWriteFile(t, filepath.Join(dir, "invalid.json"), []byte("{}"))
 			mgr, err := NewManager(path, testLogger())
 			if err != nil {
 				t.Fatalf("NewManager: %v", err)
@@ -304,7 +307,7 @@ func TestManager_ReloadFailSafe(t *testing.T) {
 			templates := func() []*prompt.Template {
 				return []*prompt.Template{mgr.PromptTemplate(), mgr.PromptTemplateByID(""), mgr.PromptTemplateByID(filepath.Join(dir, "rule.tmpl"))}
 			}
-			wantConfig, wantTemplates := mgr.Config(), templates()
+			wantConfig, wantTemplates, wantRates := mgr.Config(), templates(), mgr.Rates()
 			if tt.after != nil {
 				mustWriteFile(t, path, tt.after)
 			}
@@ -321,8 +324,8 @@ func TestManager_ReloadFailSafe(t *testing.T) {
 			if tt.wantField != "" && (!errors.As(err, &ce) || ce.Field != tt.wantField) {
 				t.Errorf("Reload() error = %v, want a *config.ConfigError with Field %q", err, tt.wantField)
 			}
-			if !reflect.DeepEqual(mgr.Config(), wantConfig) || !slices.Equal(templates(), wantTemplates) {
-				t.Error("Config() or a prompt template changed after the failed reload, want the previous ones")
+			if !reflect.DeepEqual(mgr.Config(), wantConfig) || !slices.Equal(templates(), wantTemplates) || mgr.Rates() != wantRates {
+				t.Error("Config(), a prompt template or Rates() changed after the failed reload, want the previous ones")
 			}
 			if tt.after == nil {
 				mustWriteFile(t, partial, []byte(greet("hello v2")))
@@ -333,6 +336,168 @@ func TestManager_ReloadFailSafe(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func priceTableWorkflow(replaceFile string) []byte {
+	return fmt.Appendf(nil, "---\npolling:\n  interval_ms: 5000\nprice_table:\n  replace_file: %s\n---\nPrompt.\n", replaceFile)
+}
+
+const (
+	operatorTableA  = `{"zz-model-a": {"input_cost_per_token": 0.000001}}`
+	operatorTableAB = `{"zz-model-a": {"input_cost_per_token": 0.000001}, "zz-model-b": {"input_cost_per_token": 0.000001}}`
+)
+
+func TestManager_ReloadAppliesEditedOperatorTable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path, table := filepath.Join(dir, "WORKFLOW.md"), filepath.Join(dir, "prices.json")
+	mustWriteFile(t, path, priceTableWorkflow("prices.json"))
+	mustWriteFile(t, table, []byte(operatorTableA))
+	mgr, err := NewManager(path, testLogger())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	mustWriteFile(t, table, []byte(operatorTableAB))
+
+	if err := mgr.Reload(); err != nil {
+		t.Fatalf("Reload() = %v, want nil for an edited valid operator table", err)
+	}
+
+	usage := domain.TokenUsage{InputTokens: 1_000_000, TotalTokens: 1_000_000}
+	spend := pricing.Spend{Measured: true, Totals: usage, Parts: map[string]domain.TokenUsage{"zz-model-b": usage}}
+	if _, got := pricing.PriceSession(spend, mgr.Rates()); got != pricing.CostEstimated {
+		t.Errorf("PriceSession(a model the edited table lists) status = %q, want %q", got, pricing.CostEstimated)
+	}
+}
+
+const repricedModel = "claude-sonnet-4-5-20250929"
+
+func repricedTable(t *testing.T) []byte {
+	t.Helper()
+
+	embedded, err := pricing.EmbeddedTable()
+	if err != nil {
+		t.Fatalf("EmbeddedTable() = %v, want nil", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(embedded.Encode(), &doc); err != nil {
+		t.Fatalf("decoding the embedded table: %v", err)
+	}
+	doc[repricedModel] = json.RawMessage(`{"litellm_provider": "anthropic", "input_cost_per_token": 0.00001, "output_cost_per_token": 0.00005}`)
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encoding the repriced table: %v", err)
+	}
+	return body
+}
+
+type heldDownload struct {
+	mgr     *Manager
+	release chan struct{}
+	landed  chan struct{}
+}
+
+func startHeldDownload(t *testing.T, body []byte) heldDownload {
+	t.Helper()
+
+	held := heldDownload{release: make(chan struct{}), landed: make(chan struct{}, 1)}
+	entered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-held.release:
+			_, _ = w.Write(body)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	mustWriteFile(t, path, fmt.Appendf(nil, "---\nprice_table:\n  fetch_url: %s\n---\nPrompt.\n", srv.URL))
+	mgr, err := NewManager(path, testLogger())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	downloader := pricing.NewDownloader(filepath.Join(dir, "sortie.db"), testLogger())
+	mgr.SetDownloader(downloader)
+	held.mgr = mgr
+
+	var running sync.WaitGroup
+	running.Go(func() {
+		downloader.Run(t.Context(), func() {
+			mgr.RefreshRates()
+			held.landed <- struct{}{}
+		})
+	})
+	t.Cleanup(running.Wait)
+	<-entered
+	return held
+}
+
+func priceRepricedModel(mgr *Manager) pricing.Price {
+	usage := domain.TokenUsage{InputTokens: 1_000_000, TotalTokens: 1_000_000}
+	return pricing.PriceRun(pricing.Spend{Measured: true, Totals: usage, Parts: map[string]domain.TokenUsage{repricedModel: usage}}, mgr.Rates())
+}
+
+func assertPricedFrom(t *testing.T, price pricing.Price, source pricing.PriceSource, version string) {
+	t.Helper()
+
+	if part := price.Parts[repricedModel]; price.Status != pricing.CostEstimated || part.Source != source || part.TableVersion != version {
+		t.Errorf("PriceRun(%s) status, source, version = %q, %q, %q, want %q, %q, %q",
+			repricedModel, price.Status, part.Source, part.TableVersion, pricing.CostEstimated, source, version)
+	}
+}
+
+func TestManager_StalledDownloadBlocksNothing(t *testing.T) {
+	t.Parallel()
+
+	held := startHeldDownload(t, repricedTable(t))
+	embedded, err := pricing.EmbeddedTable()
+	if err != nil {
+		t.Fatalf("EmbeddedTable() = %v, want nil", err)
+	}
+
+	if err := held.mgr.Reload(); err != nil {
+		t.Fatalf("Reload() with a download in flight = %v, want nil", err)
+	}
+	held.mgr.RefreshRates()
+
+	assertPricedFrom(t, priceRepricedModel(held.mgr), pricing.SourceEmbedded, embedded.Version())
+}
+
+func TestManager_LandedTableLeavesRecordedCostsAlone(t *testing.T) {
+	t.Parallel()
+
+	body := repricedTable(t)
+	landedTable, err := pricing.ParseTable(body, nil)
+	if err != nil {
+		t.Fatalf("ParseTable(repriced table) = %v, want nil", err)
+	}
+	embedded, err := pricing.EmbeddedTable()
+	if err != nil {
+		t.Fatalf("EmbeddedTable() = %v, want nil", err)
+	}
+	held := startHeldDownload(t, body)
+	recorded := priceRepricedModel(held.mgr)
+	recordedCost := *recorded.CostUSD
+
+	close(held.release)
+	<-held.landed
+	later := priceRepricedModel(held.mgr)
+
+	assertPricedFrom(t, recorded, pricing.SourceEmbedded, embedded.Version())
+	if *recorded.CostUSD != recordedCost {
+		t.Errorf("recorded cost after the landing = %v, want %v", *recorded.CostUSD, recordedCost)
+	}
+	assertPricedFrom(t, later, pricing.SourceFetched, landedTable.Version())
+	if math.Abs(*later.CostUSD-10) > 1e-6 {
+		t.Errorf("PriceRun(%s) cost after the landing = %v, want 10", repricedModel, *later.CostUSD)
 	}
 }
 
@@ -374,18 +539,9 @@ func TestManager_WatchPicksUpChange(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	// Give the watcher time to register.
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, validWorkflow(10000))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 10000
-	})
-	if !ok {
-		t.Errorf("config not updated within timeout: Polling.IntervalMS = %d, want 10000",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 10000))
 }
 
 // TestManager_WatchInvalidRetainsGood verifies that an invalid workflow
@@ -408,18 +564,9 @@ func TestManager_WatchInvalidRetainsGood(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[bad yaml\n---\nprompt\n"))
 
-	// Wait until the reload actually fired; confirmed by LastLoadError becoming
-	// set; then assert the last-known-good config was preserved.
-	ok := pollUntil(func() bool {
-		return mgr.LastLoadError() != nil
-	})
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	if mgr.Config().Polling.IntervalMS != 5000 {
 		t.Errorf("after invalid reload: Polling.IntervalMS = %d, want 5000",
@@ -445,8 +592,6 @@ func TestManager_ConcurrentReadSafety(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Readers spin until the reload is confirmed to have completed, ensuring
 	// concurrent access actually overlaps with the write under -race.
 	var reloaded atomic.Bool
@@ -465,18 +610,14 @@ func TestManager_ConcurrentReadSafety(t *testing.T) {
 
 	writeWorkflow(t, path, validWorkflow(7777))
 
-	ok := pollUntil(func() bool {
-		if mgr.Config().Polling.IntervalMS == 7777 {
+	waittest.Until(t, func() error {
+		err := intervalIs(mgr, 7777)()
+		if err == nil {
 			reloaded.Store(true)
-			return true
 		}
-		return false
+		return err
 	})
 	wg.Wait()
-
-	if !ok {
-		t.Error("config not updated within timeout: Polling.IntervalMS did not reach 7777")
-	}
 }
 
 func TestManager_DebounceCoalescence(t *testing.T) {
@@ -497,8 +638,6 @@ func TestManager_DebounceCoalescence(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Write 5 times in rapid succession.
 	for i := range 5 {
 		val := 2000 + i*1000 // 2000, 3000, 4000, 5000, 6000
@@ -506,13 +645,7 @@ func TestManager_DebounceCoalescence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 6000
-	})
-	if !ok {
-		t.Errorf("debounce did not coalesce to last value: Polling.IntervalMS = %d, want 6000",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 6000))
 }
 
 func TestManager_DeleteAndRecreate(t *testing.T) {
@@ -533,31 +666,17 @@ func TestManager_DeleteAndRecreate(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	// Simulate editor delete-and-recreate.
 	mustRemove(t, path)
 	time.Sleep(50 * time.Millisecond)
 	writeWorkflow(t, path, validWorkflow(8888))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 8888
-	})
-	if !ok {
-		t.Errorf("after delete+recreate: Polling.IntervalMS = %d, want 8888",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 8888))
 
 	// Confirm watcher is still alive; write a third value.
 	writeWorkflow(t, path, validWorkflow(9999))
 
-	ok = pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 9999
-	})
-	if !ok {
-		t.Errorf("after second write: Polling.IntervalMS = %d, want 9999",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 9999))
 }
 
 func TestManager_ContextCancellation(t *testing.T) {
@@ -579,19 +698,13 @@ func TestManager_ContextCancellation(t *testing.T) {
 
 	cancel()
 
-	// Stop should not hang. If it does, the test will time out.
 	done := make(chan struct{})
 	go func() {
 		mgr.Stop()
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// ok
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop() did not return within 2s after context cancellation")
-	}
+	waittest.Receive(t, done, "Stop() return after context cancellation")
 }
 
 func TestManager_StopIdempotent(t *testing.T) {
@@ -634,10 +747,8 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[bad\n---\nprompt\n"))
-	time.Sleep(300 * time.Millisecond)
+	waittest.Until(t, loadErrorSet(mgr))
 
 	if mgr.Config().Polling.IntervalMS != 5000 {
 		t.Fatalf("after invalid reload: Polling.IntervalMS = %d, want 5000",
@@ -647,13 +758,7 @@ func TestManager_RecoverAfterInvalidReload(t *testing.T) {
 	// Write valid content again; the watcher should recover.
 	writeWorkflow(t, path, validWorkflow(7777))
 
-	ok := pollUntil(func() bool {
-		return mgr.Config().Polling.IntervalMS == 7777
-	})
-	if !ok {
-		t.Errorf("recovery after invalid reload failed: Polling.IntervalMS = %d, want 7777",
-			mgr.Config().Polling.IntervalMS)
-	}
+	waittest.Until(t, intervalIs(mgr, 7777))
 	if mgr.LastLoadError() != nil {
 		t.Errorf("after recovery: LastLoadError = %v, want nil", mgr.LastLoadError())
 	}
@@ -851,14 +956,9 @@ func TestManager_SetLogger(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[invalid\n---\nprompt\n"))
 
-	ok := pollUntil(func() bool { return mgr.LastLoadError() != nil })
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	// Stop before reading buffers to ensure the watcher goroutine has exited
 	// and no concurrent writes remain.
@@ -898,14 +998,9 @@ func TestManager_SetLoggerNil(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	writeWorkflow(t, path, []byte("---\n[[[invalid\n---\nprompt\n"))
 
-	ok := pollUntil(func() bool { return mgr.LastLoadError() != nil })
-	if !ok {
-		t.Fatal("reload of invalid file was not detected within timeout")
-	}
+	waittest.Until(t, loadErrorSet(mgr))
 
 	mgr.Stop()
 
@@ -934,8 +1029,6 @@ func TestManager_SetLoggerConcurrentWithReload(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -946,7 +1039,7 @@ func TestManager_SetLoggerConcurrentWithReload(t *testing.T) {
 
 	for i := range 5 {
 		writeWorkflow(t, path, validWorkflow(5000+i))
-		time.Sleep(40 * time.Millisecond)
+		waittest.Until(t, intervalIs(mgr, 5000+i))
 	}
 
 	stop.Store(true)
@@ -1192,247 +1285,6 @@ Prompt.
 	}
 }
 
-// labelCommandsWorkflow returns a WORKFLOW.md with an active
-// reactions.label_commands block and the given prompt body.
-func labelCommandsWorkflow(promptBody string) []byte {
-	return fmt.Appendf(nil, "---\n"+
-		"reactions:\n"+
-		"  label_commands:\n"+
-		"    provider: github\n"+
-		"    review_label: \"sortie:review\"\n"+
-		"---\n"+
-		"%s\n", promptBody)
-}
-
-const labelReviewWarnMessage = "label_commands active but prompt template has no label_review branch"
-
-// hasAdvisoryMessage reports whether advisories carries one whose
-// Message equals message.
-func hasAdvisoryMessage(advisories []config.Advisory, message string) bool {
-	for _, a := range advisories {
-		if a.Message == message {
-			return true
-		}
-	}
-	return false
-}
-
-// TestManager_WarnsWhenLabelReviewTokenMissing asserts that with
-// label_commands active and a prompt body that never references
-// label_review, load emits a Warn; the same active block with a
-// {{ if .label_review }} branch in the prompt suppresses it; and an
-// inactive label_commands block suppresses it regardless of prompt
-// content. The warning is advisory only; NewManager never fails because
-// of it.
-func TestManager_WarnsWhenLabelReviewTokenMissing(t *testing.T) {
-	t.Parallel()
-
-	t.Run("missing token warns", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelCommandsWorkflow("Do the task for {{ .issue.title }}."))
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if !hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want the missing-token advisory", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("token present suppresses the warning", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelCommandsWorkflow("{{ if .label_review }}review this{{ end }}\nDo the task for {{ .issue.title }}."))
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want no advisory when the prompt references label_review", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("feature inactive suppresses the warning regardless of prompt content", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, validWorkflow(5000)) // no reactions.label_commands block
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if hasAdvisoryMessage(mgr.Config().Advisories(), labelReviewWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want no advisory when label_commands is inactive", mgr.Config().Advisories())
-		}
-	})
-}
-
-// labelFixCommandsWorkflow returns a WORKFLOW.md with an active
-// reactions.label_commands block whose fix_label is set (review_label
-// left at its default) and the given prompt body.
-func labelFixCommandsWorkflow(promptBody string) []byte {
-	return fmt.Appendf(nil, "---\n"+
-		"reactions:\n"+
-		"  label_commands:\n"+
-		"    provider: github\n"+
-		"    fix_label: \"sortie:fix\"\n"+
-		"---\n"+
-		"%s\n", promptBody)
-}
-
-// labelFixDisabledWorkflow returns a WORKFLOW.md with an active
-// reactions.label_commands block whose fix_label is explicitly disabled
-// (review_label left at its default, keeping the block valid) and the
-// given prompt body.
-func labelFixDisabledWorkflow(promptBody string) []byte {
-	return fmt.Appendf(nil, "---\n"+
-		"reactions:\n"+
-		"  label_commands:\n"+
-		"    provider: github\n"+
-		"    fix_label: \"\"\n"+
-		"---\n"+
-		"%s\n", promptBody)
-}
-
-const labelFixWarnMessage = "label_commands active but prompt template has no label_fix branch"
-
-// TestManager_WarnsWhenLabelFixTokenMissing asserts that with
-// label_commands active and fix_label set, a prompt body that never
-// references label_fix produces a Warn on load; the same active block
-// with a {{ if .label_fix }} branch in the prompt suppresses it; and an
-// explicitly disabled fix_label suppresses it regardless of prompt
-// content. The warning is advisory only; NewManager never fails
-// because of it.
-func TestManager_WarnsWhenLabelFixTokenMissing(t *testing.T) {
-	t.Parallel()
-
-	t.Run("missing token warns", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelFixCommandsWorkflow("Do the task for {{ .issue.title }}."))
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if !hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want the missing-token advisory", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("token present suppresses the warning", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelFixCommandsWorkflow("{{ if .label_fix }}check out {{ .label_fix.branch }}{{ end }}\nDo the task for {{ .issue.title }}."))
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want no advisory when the prompt references label_fix", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("fix_label empty suppresses the warning regardless of prompt content", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelFixDisabledWorkflow("Do the task for {{ .issue.title }}."))
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want no advisory when fix_label is disabled", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("feature inactive suppresses the warning regardless of prompt content", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, validWorkflow(5000)) // no reactions.label_commands block
-
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		mgr, err := NewManager(path, logger)
-		if err != nil {
-			t.Fatalf("NewManager: %v", err)
-		}
-		mgr.Stop()
-
-		if hasAdvisoryMessage(mgr.Config().Advisories(), labelFixWarnMessage) {
-			t.Errorf("Config().Advisories() = %+v, want no advisory when label_commands is inactive", mgr.Config().Advisories())
-		}
-	})
-
-	t.Run("warning never fails the load", func(t *testing.T) {
-		t.Parallel()
-
-		dir := t.TempDir()
-		path := filepath.Join(dir, "WORKFLOW.md")
-		mustWriteFile(t, path, labelFixCommandsWorkflow("Do the task for {{ .issue.title }}."))
-
-		mgr, err := NewManager(path, testLogger())
-		if err != nil {
-			t.Fatalf("NewManager with missing label_fix token: %v, want success (advisory warning only)", err)
-		}
-		mgr.Stop()
-
-		if err := mgr.LastLoadError(); err != nil {
-			t.Errorf("LastLoadError() = %v, want nil", err)
-		}
-	})
-}
-
 func retiredFixtureLookup(kind string) (registry.RetiredAgent, bool) {
 	if kind != "legacy" {
 		return registry.RetiredAgent{}, false
@@ -1591,6 +1443,48 @@ func TestManager_ReloadRetainsOnConversionFaultAndMalformedList(t *testing.T) {
 			}
 			if mgr.PromptTemplate() != previousPrompt {
 				t.Error("PromptTemplate() changed after the failed reload, want the previous template")
+			}
+		})
+	}
+}
+
+func TestManager_LabelCommandsRecordsNoBranchAdvisory(t *testing.T) {
+	t.Parallel()
+
+	const exclusiveChain = "{{ if .label_review }}review{{ else if .label_fix }}fix{{ else }}work{{ end }}"
+
+	tests := []struct {
+		name         string
+		body         string
+		ruleTemplate string
+	}{
+		{name: "exclusive chain in a rule template, empty body", ruleTemplate: exclusiveChain},
+		{name: "no branch anywhere", body: "Do the task for {{ .issue.title }}."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			workflow := "---\nreactions:\n  label_commands:\n    provider: github\n    review_label: \"sortie:review\"\n    fix_label: \"sortie:fix\"\n"
+			if tt.ruleTemplate != "" {
+				mustWriteFile(t, filepath.Join(dir, "chain.md"), []byte(tt.ruleTemplate))
+				workflow += "dispatch:\n  rules:\n    - name: all\n      template: chain.md\n"
+			}
+			path := filepath.Join(dir, "WORKFLOW.md")
+			mustWriteFile(t, path, []byte(workflow+"---\n"+tt.body+"\n"))
+
+			mgr, err := NewManager(path, testLogger())
+			if err != nil {
+				t.Fatalf("NewManager: %v", err)
+			}
+			mgr.Stop()
+
+			for _, a := range mgr.Config().Advisories() {
+				if strings.HasPrefix(a.Check, "reactions.label_commands.") {
+					t.Errorf("Config().Advisories() has %q, want no label_commands advisory", a.Check)
+				}
 			}
 		})
 	}

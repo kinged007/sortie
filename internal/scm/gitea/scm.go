@@ -177,9 +177,7 @@ func (a *GiteaSCMAdapter) MergePR(ctx context.Context, prNumber int, owner, repo
 // to nil, and the caller treats it as a successful no-op. A 403 naming a required
 // scope is enriched to name write:repository. Returns nil on a 204.
 func (a *GiteaSCMAdapter) DeleteBranch(ctx context.Context, owner, repo, branch string) error {
-	path := fmt.Sprintf("/repos/%s/%s/branches/%s",
-		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(branch))
-	if err := a.client.SendNoBody(ctx, http.MethodDelete, path); err != nil {
+	if err := a.client.SendNoBody(ctx, http.MethodDelete, branchPath(owner, repo, branch)); err != nil {
 		scm := scmcore.ToSCMError(err)
 		if scm.Kind == domain.ErrSCMAuth {
 			return enrichScopeError(scm)
@@ -187,6 +185,13 @@ func (a *GiteaSCMAdapter) DeleteBranch(ctx context.Context, owner, repo, branch 
 		return scm
 	}
 	return nil
+}
+
+// branchPath returns the branch route, percent-encoding the branch name so a
+// slash-bearing name reaches Gitea as %2F.
+func branchPath(owner, repo, branch string) string {
+	return fmt.Sprintf("/repos/%s/%s/branches/%s",
+		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(branch))
 }
 
 // RemoveLabel removes the named label from the given pull request via

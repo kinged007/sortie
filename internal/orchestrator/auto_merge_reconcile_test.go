@@ -3,11 +3,15 @@ package orchestrator
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/notify/route"
+	"github.com/sortie-ai/sortie/internal/persistence"
 )
 
 // controlledSCMAdapter is a full SCMAdapter where each method is individually
@@ -195,56 +199,6 @@ func TestReconcileAutoMerge_NotConfigured(t *testing.T) {
 	rkey := ReactionKey("AM-NC", ReactionKindAutoMerge)
 	if _, ok := state.PendingReactions[rkey]; !ok {
 		t.Error("PendingReactions entry removed when not configured; want no-op")
-	}
-}
-
-// TestReconcileAutoMerge_HappyPath verifies that when review is APPROVED, CI
-// is success, and mergeability is clean, MergePR is called and the pending
-// entry is removed.
-func TestReconcileAutoMerge_HappyPath(t *testing.T) {
-	t.Parallel()
-
-	state := stateWithAutoMergePending(t, "AM-HP", 42)
-	store := &reviewReconcileStore{}
-	metrics := newAutoMergeMetricsSpy()
-
-	var mergeCalled bool
-	scm := &controlledSCMAdapter{
-		getMergeabilityFn: func(_ context.Context, _ int, _, _ string) (domain.PRMergeStatus, error) {
-			return domain.PRMergeStatus{
-				Mergeability: domain.MergeabilityClean,
-				HeadSHA:      "sha-happy",
-			}, nil
-		},
-		getReviewDecisionFn: func(_ context.Context, _ int, _, _ string) (domain.ReviewDecision, error) {
-			return domain.ReviewDecisionApproved, nil
-		},
-		getCIStatusFn: func(_ context.Context, _ int, _, _ string) (string, error) {
-			return "success", nil
-		},
-		mergePRFn: func(_ context.Context, prNumber int, _, _ string, strategy domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
-			mergeCalled = true
-			return domain.MergeResult{SHA: "merge-sha-1"}, nil
-		},
-	}
-	tracker := &reviewTrackerStub{}
-	params := autoMergeParams(store, scm, tracker)
-
-	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
-
-	state.TrackerOpsWg.Wait()
-
-	if !mergeCalled {
-		t.Error("MergePR not called on happy path")
-	}
-
-	rkey := ReactionKey("AM-HP", ReactionKindAutoMerge)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-HP:merge] still present after successful merge; want removed")
-	}
-
-	if metrics.autoMerge["merged"] != 1 {
-		t.Errorf("IncAutoMergeReactions(merged) = %d, want 1", metrics.autoMerge["merged"])
 	}
 }
 
@@ -457,46 +411,99 @@ func TestReconcileAutoMerge_MaxRetriesEscalation(t *testing.T) {
 	assertEscalationBegan(t, state, rkey, EscalationTriggerBudget)
 }
 
-// TestReconcileAutoMerge_AlreadyMergedSuccess verifies that ErrSCMConflict with
-// "already merged" message is treated as success.
-func TestReconcileAutoMerge_AlreadyMergedSuccess(t *testing.T) {
+func TestReconcileAutoMerge_MergedActions(t *testing.T) {
 	t.Parallel()
 
-	state := stateWithAutoMergePending(t, "AM-AM", 48)
-	store := &reviewReconcileStore{}
-	metrics := newAutoMergeMetricsSpy()
+	alreadyMerged := &domain.SCMError{Kind: domain.ErrSCMConflict, Message: "already merged"}
 
-	scm := &controlledSCMAdapter{
-		getMergeabilityFn: func(_ context.Context, _ int, _, _ string) (domain.PRMergeStatus, error) {
-			return domain.PRMergeStatus{
-				Mergeability: domain.MergeabilityClean,
-				HeadSHA:      "sha-am",
-			}, nil
-		},
-		getReviewDecisionFn: func(_ context.Context, _ int, _, _ string) (domain.ReviewDecision, error) {
-			return domain.ReviewDecisionApproved, nil
-		},
-		getCIStatusFn: func(_ context.Context, _ int, _, _ string) (string, error) {
-			return "success", nil
-		},
-		mergePRFn: func(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
-			return domain.MergeResult{}, &domain.SCMError{
-				Kind:    domain.ErrSCMConflict,
-				Message: "already merged",
+	tests := []struct {
+		name         string
+		mergeErr     error
+		deleteBranch bool
+	}{
+		{name: "merge succeeded deletes branch", deleteBranch: true},
+		{name: "already merged deletes branch", mergeErr: alreadyMerged, deleteBranch: true},
+		{name: "already merged keeps branch", mergeErr: alreadyMerged},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			const issueID = "AM-MA"
+			state := stateWithAutoMergePending(t, issueID, 48)
+			ciKey := ReactionKey(issueID, ReactionKindCI)
+			reviewKey := ReactionKey(issueID, ReactionKindReview)
+			state.PendingReactions[ciKey] = &PendingReaction{IssueID: issueID, Kind: ReactionKindCI}
+			state.PendingReactions[reviewKey] = &PendingReaction{IssueID: issueID, Kind: ReactionKindReview}
+			state.RetryAttempts[issueID] = &RetryEntry{IssueID: issueID, ReactionKind: ReactionKindReview}
+			state.Claimed[issueID] = struct{}{}
+
+			var deletedBranches []string
+			scm := &controlledSCMAdapter{
+				mergePRFn: func(context.Context, int, string, string, domain.MergeStrategy, string, string, string) (domain.MergeResult, error) {
+					return domain.MergeResult{SHA: "merge-sha"}, tt.mergeErr
+				},
+				deleteBranchFn: func(_ context.Context, owner, repo, branch string) error {
+					deletedBranches = append(deletedBranches, owner+"/"+repo+"/"+branch)
+					return nil
+				},
 			}
-		},
-	}
-	params := autoMergeParams(store, scm, nil)
+			slack := &notifierSpy{}
+			store := &reviewReconcileStore{}
+			metrics := newAutoMergeMetricsSpy()
+			params := autoMergeParams(store, scm, nil)
+			params.AutoMergeConfig.DeleteBranch = tt.deleteBranch
+			params.Router = mustRouter(t, nil, spyLookup(slack), route.Inputs{Entries: []config.NotificationBackend{
+				subscribe("slack", domain.EventAutoMergeMerged),
+			}})
 
-	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
+			reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
+			state.TrackerOpsWg.Wait()
 
-	rkey := ReactionKey("AM-AM", ReactionKindAutoMerge)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-AM:merge] still present after already-merged; want removed (treated as success)")
-	}
+			if _, ok := state.PendingReactions[ReactionKey(issueID, ReactionKindAutoMerge)]; ok {
+				t.Errorf("PendingReactions[%s:merge] present after merge, want removed", issueID)
+			}
+			if metrics.autoMerge["merged"] != 1 {
+				t.Errorf("IncAutoMergeReactions(merged) = %d, want 1", metrics.autoMerge["merged"])
+			}
+			if store.markDispatchedCalls != 1 || store.deleteFingerprintCalls != 1 {
+				t.Errorf("MarkReactionDispatched, DeleteReactionFingerprint calls = %d, %d, want 1, 1",
+					store.markDispatchedCalls, store.deleteFingerprintCalls)
+			}
 
-	if metrics.autoMerge["merged"] != 1 {
-		t.Errorf("IncAutoMergeReactions(merged) = %d, want 1", metrics.autoMerge["merged"])
+			if len(store.outcomes) != 1 || store.outcomes[0].Kind != persistence.IssueOutcomeMerged || store.outcomes[0].IssueID != issueID {
+				t.Errorf("RecordIssueOutcome calls = %+v, want one %q outcome for %q", store.outcomes, persistence.IssueOutcomeMerged, issueID)
+			}
+
+			sent := slack.notifications()
+			if len(sent) != 1 || sent[0].Envelope.EventType != domain.EventAutoMergeMerged || sent[0].Envelope.IssueID != issueID {
+				t.Errorf("notifications = %+v, want one %q for %q", sent, domain.EventAutoMergeMerged, issueID)
+			}
+
+			var wantBranches []string
+			if tt.deleteBranch {
+				wantBranches = []string{"corp/api/feature/" + issueID}
+			}
+			if !slices.Equal(deletedBranches, wantBranches) {
+				t.Errorf("DeleteBranch calls = %q, want %q", deletedBranches, wantBranches)
+			}
+
+			for _, key := range []string{ciKey, reviewKey} {
+				if _, ok := state.PendingReactions[key]; !ok {
+					t.Errorf("PendingReactions[%s] removed by merge, want intact", key)
+				}
+			}
+			if _, ok := state.RetryAttempts[issueID]; !ok {
+				t.Errorf("RetryAttempts[%s] removed by merge, want intact", issueID)
+			}
+			if _, ok := state.Claimed[issueID]; !ok {
+				t.Errorf("Claimed[%s] released by merge, want intact", issueID)
+			}
+			if len(store.deletedIssueIDs) != 0 {
+				t.Errorf("DeleteRetryEntry calls = %q, want none", store.deletedIssueIDs)
+			}
+		})
 	}
 }
 
@@ -717,66 +724,6 @@ func TestReconcileAutoMerge_DoesNotMarkDispatchedOnTransientFailure(t *testing.T
 	}
 	if _, stillPending := state.PendingReactions[rkey]; stillPending {
 		t.Error("PendingReactions[AM-RT:merge] still present after successful retry; want removed")
-	}
-}
-
-// TestReconcileAutoMerge_CrossKindIsolationOnSuccess verifies that a successful
-// merge does not touch review-kind retry entries.
-func TestReconcileAutoMerge_CrossKindIsolationOnSuccess(t *testing.T) {
-	t.Parallel()
-
-	state := stateWithAutoMergePending(t, "AM-XK", 52)
-
-	// Seed a review-kind retry entry for the same issue.
-	reviewRetryKey := "AM-XK"
-	state.RetryAttempts[reviewRetryKey] = &RetryEntry{
-		IssueID:      "AM-XK",
-		Identifier:   "AM-XK-ident",
-		ReactionKind: ReactionKindReview,
-	}
-	state.Claimed["AM-XK"] = struct{}{}
-
-	store := &reviewReconcileStore{}
-	metrics := newAutoMergeMetricsSpy()
-
-	scm := &controlledSCMAdapter{
-		getMergeabilityFn: func(_ context.Context, _ int, _, _ string) (domain.PRMergeStatus, error) {
-			return domain.PRMergeStatus{Mergeability: domain.MergeabilityClean, HeadSHA: "sha-xk"}, nil
-		},
-		getReviewDecisionFn: func(_ context.Context, _ int, _, _ string) (domain.ReviewDecision, error) {
-			return domain.ReviewDecisionApproved, nil
-		},
-		getCIStatusFn: func(_ context.Context, _ int, _, _ string) (string, error) {
-			return "success", nil
-		},
-		mergePRFn: func(_ context.Context, _ int, _, _ string, _ domain.MergeStrategy, _, _, _ string) (domain.MergeResult, error) {
-			return domain.MergeResult{SHA: "sha-merged-xk"}, nil
-		},
-	}
-	tracker := &reviewTrackerStub{}
-	params := autoMergeParams(store, scm, tracker)
-
-	reconcileAutoMerge(state, params, discardLogger(), context.Background(), metrics)
-	state.TrackerOpsWg.Wait()
-
-	// Merge-kind entry must be gone.
-	rkey := ReactionKey("AM-XK", ReactionKindAutoMerge)
-	if _, ok := state.PendingReactions[rkey]; ok {
-		t.Error("PendingReactions[AM-XK:merge] still present after success; want removed")
-	}
-
-	// Review-kind retry entry must be intact.
-	retryEntry, ok := state.RetryAttempts[reviewRetryKey]
-	if !ok {
-		t.Fatal("RetryAttempts[AM-XK] (review kind) removed by reconcileAutoMerge; want intact")
-	}
-	if retryEntry.ReactionKind != ReactionKindReview {
-		t.Errorf("RetryAttempts[AM-XK].ReactionKind = %q, want %q", retryEntry.ReactionKind, ReactionKindReview)
-	}
-
-	// Claim must be intact (reconcileAutoMerge must not touch state.Claimed).
-	if _, ok := state.Claimed["AM-XK"]; !ok {
-		t.Error("state.Claimed[AM-XK] released by reconcileAutoMerge; want intact")
 	}
 }
 
@@ -1252,24 +1199,6 @@ func TestBuildAutoMergeFingerprint(t *testing.T) {
 	fp3 := buildAutoMergeFingerprint("cafebabe", domain.ReviewDecisionApproved)
 	if fp1 == fp3 {
 		t.Error("fingerprint collision between different SHA values; want distinct")
-	}
-}
-
-// TestBuildAutoMergeComment verifies the comment template.
-func TestBuildAutoMergeComment(t *testing.T) {
-	t.Parallel()
-
-	data := &AutoMergeReactionData{
-		PRNumber: 99,
-		Owner:    "myorg",
-		Repo:     "myrepo",
-	}
-	result := domain.MergeResult{SHA: "abc123def"}
-	got := buildAutoMergeComment(data, result, domain.StrategySquash)
-
-	expected := "Sortie auto-merged PR #99 (myorg/myrepo).\nStrategy: squash.\nMerge commit: abc123def."
-	if got != expected {
-		t.Errorf("buildAutoMergeComment() = %q, want %q", got, expected)
 	}
 }
 

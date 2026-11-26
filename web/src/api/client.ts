@@ -3,6 +3,7 @@ import type {
   CheckNowResponse,
   IssueDetailResponse,
   IssueGroupsResponse,
+  PricesResponse,
   RefreshResponse,
   Report,
   RetryNowResponse,
@@ -83,12 +84,10 @@ function withQuery(path: string, query: Record<string, string | number | undefin
   return text === "" ? path : `${path}?${text}`;
 }
 
-/** Fetches the runtime state snapshot. */
 export function getState(signal?: AbortSignal): Promise<StateResponse> {
   return getJson<StateResponse>("state", signal);
 }
 
-/** Fetches one issue by its `issue_identifier`. */
 export function getIssue(identifier: string, signal?: AbortSignal): Promise<IssueDetailResponse> {
   return getJson<IssueDetailResponse>(encodeURIComponent(identifier), signal);
 }
@@ -101,7 +100,6 @@ export interface HistoryFilter {
   stage?: string;
 }
 
-/** Fetches a page of run history, newest first. */
 export function getRuns(
   q: {
     issue_id?: string;
@@ -117,7 +115,6 @@ export function getRuns(
   return getJson<RunsResponse>(withQuery("runs", q), signal);
 }
 
-/** Fetches a page of issues with their newest finished runs, newest first. */
 export function getIssueGroups(
   q: HistoryFilter & { q?: string; cursor?: string; limit?: number },
   signal?: AbortSignal,
@@ -128,6 +125,10 @@ export function getIssueGroups(
 /** Fetches the run statistics report; without `since` it covers every run. */
 export function getStats(q: { since?: string }, signal?: AbortSignal): Promise<Report> {
   return getJson<Report>(withQuery("stats", q), signal);
+}
+
+export function getPrices(signal?: AbortSignal): Promise<PricesResponse> {
+  return getJson<PricesResponse>("prices", signal);
 }
 
 /** Requests a poll and reconcile; `202` queued it, `409` is the server's refusal. */

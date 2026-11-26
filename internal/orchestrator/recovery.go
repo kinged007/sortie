@@ -74,6 +74,8 @@ func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog
 			Trigger:          e.Trigger,
 			OriginTrigger:    e.OriginTrigger,
 			scheduledDelayMS: pending.RemainingMs,
+
+			UsageLimitNotified: e.UsageLimitNotified,
 		}
 		state.Claimed[e.IssueID] = struct{}{}
 
@@ -82,6 +84,19 @@ func PopulateRetries(state *State, entries []persistence.PendingRetry, log *slog
 				slog.String("recovery", "legacy_retry_default_agent"),
 				slog.String("issue_id", e.IssueID),
 			)
+		}
+	}
+}
+
+// PopulateUsageLimitHolds loads persisted usage-limit holds into the state.
+// An expired hold loads and stays inert until a refusal replaces it or a
+// run started after it clears it.
+func PopulateUsageLimitHolds(state *State, holds []persistence.UsageLimitHold) {
+	for _, hold := range holds {
+		key := UsageLimitHoldKey{AgentKind: hold.AgentKind, ModelOnly: hold.ModelOnly, Model: hold.Model}
+		state.UsageLimitHolds[key] = UsageLimitHold{
+			ResetsAt: time.UnixMilli(hold.ResetsAtMs).UTC(),
+			Since:    time.UnixMilli(hold.HeldSinceMs).UTC(),
 		}
 	}
 }

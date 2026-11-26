@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +35,7 @@ const (
 	stageResultAdvanced = "advanced"
 	stageResultPartial  = "partial"
 	stageResultFailed   = "failed"
-	stageResultCeiling  = "ceiling"
+	stageResultCeiling  = domain.StageReasonCeiling
 )
 
 const stageChainSeparator = " -> "
@@ -205,7 +204,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 	}
 
 	if err := params.TrackerAdapter.AddLabel(ctx, issueID, target.Stage); err != nil {
-		missing, readErr := missingStageLabels(ctx, params.TrackerAdapter, params.Dispatch, entry.Issue, issueID)
+		missing, readErr := missingStageLabels(ctx, params.TrackerAdapter, params.Dispatch, entry.DispatchLabels, issueID)
 		extra := []slog.Attr{slog.Any("error", err)}
 		if readErr != nil {
 			extra = append(extra, slog.Any("stage_label_read_error", readErr))
@@ -225,7 +224,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 		previousOutcome = stageOutcomeNoChange
 	}
 	identity := issueIdentityOf(entry.Issue)
-	identity.Labels = labelsAfterHop(entry.Issue.Labels, params.Dispatch.Rules, target.Stage)
+	identity.Labels = labelsAfterHop(entry.DispatchLabels, params.Dispatch.Rules, target.Stage)
 	state.StageHops[issueID] = &StageHopEntry{
 		Identifier:       result.Identifier,
 		Count:            count + 1,
@@ -267,7 +266,7 @@ func advanceStage(ctx context.Context, state *State, entry *RunningEntry, result
 
 	var left []string
 	var firstErr error
-	for _, label := range carriedStageLabels(params.Dispatch.Rules, entry.Issue.Labels) {
+	for _, label := range carriedStageLabels(params.Dispatch.Rules, entry.DispatchLabels) {
 		if config.StageLabelsEqual(label, target.Stage) {
 			continue
 		}
@@ -313,7 +312,7 @@ func reportStageHop(ctx context.Context, state *State, params HandleWorkerExitPa
 		eventType = domain.EventStageAdvanced
 		reason = ""
 	}
-	notification := identity.notification(eventType, "", buildStageHopComment(hop))
+	notification := identity.notification(eventType, "", domain.StageFacts{})
 	notification.Envelope.Stage = domain.StageTransition{
 		SourceRule: hop.SourceRule,
 		TargetRule: hop.TargetRule,
@@ -332,31 +331,11 @@ func reportStageHop(ctx context.Context, state *State, params HandleWorkerExitPa
 	})
 }
 
-// buildStageHopComment returns the public text of a stage event. It names
-// no error, session, or agent, so a tracker comment may post it.
-func buildStageHopComment(d stageHopDecision) string {
-	headline := "Sortie advanced the issue to the next stage."
-	lines := []string{"From: " + d.SourceRule, "To: " + d.TargetRule}
-	if !d.made() {
-		headline = "Sortie did not advance the issue to the next stage."
-		lines = append(lines, "Reason: "+stageNotAdvancedPhrase(d.Result))
-	}
-	lines = append(lines, "Hop count: "+strconv.Itoa(d.HopCount), "Chain: "+d.ChainID)
-	return strings.Join(append([]string{headline}, lines...), "\n")
-}
-
-func stageNotAdvancedPhrase(result string) string {
-	if result == stageResultCeiling {
-		return "the issue reached its limit of consecutive stage moves (dispatch.max_consecutive_hops)"
-	}
-	return "the next stage's label could not be added to the issue"
-}
-
-// missingStageLabels returns the configured stage labels the snapshot
+// missingStageLabels returns the configured stage labels dispatchLabels
 // carried and a fresh read of the issue no longer shows. It reads only when
-// the snapshot carried one, and returns the read's error when it fails.
-func missingStageLabels(ctx context.Context, tracker domain.TrackerAdapter, dispatch config.DispatchConfig, snapshot domain.Issue, issueID string) ([]string, error) {
-	carried := carriedStageLabels(dispatch.Rules, snapshot.Labels)
+// dispatchLabels carried one, and returns the read's error when it fails.
+func missingStageLabels(ctx context.Context, tracker domain.TrackerAdapter, dispatch config.DispatchConfig, dispatchLabels []string, issueID string) ([]string, error) {
+	carried := carriedStageLabels(dispatch.Rules, dispatchLabels)
 	if len(carried) == 0 {
 		return nil, nil
 	}

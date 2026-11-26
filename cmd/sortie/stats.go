@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/config"
-	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
 	"github.com/sortie-ai/sortie/internal/runstats"
 	"github.com/sortie-ai/sortie/internal/server"
@@ -31,28 +30,10 @@ var statsNow = time.Now
 // breakdown, and a report without --since reads every run on record.
 const statsChainTextRows = 20
 
-// statsPricer adapts the workflow's token rates to a [runstats.Pricer]. It
-// returns nil when rates holds no entry, which tells the aggregator that no
-// token_rates are configured.
-func statsPricer(rates server.TokenRates) runstats.Pricer {
-	if len(rates) == 0 {
-		return nil
-	}
-	return func(agentKind string, usage domain.TokenUsage) *float64 {
-		entry, ok := rates[agentKind]
-		if !ok {
-			return nil
-		}
-		return server.EstimateCost(usage, &entry)
-	}
-}
-
-// statsSource is what a stats report is read from and priced with.
+// statsSource is what a stats report is read from.
 type statsSource struct {
 	dbPath       string
 	workflowPath string
-	rates        server.TokenRates
-	rateWarnings []string
 
 	// stages supplies the stage chains chain_funnels reads; nil serves an
 	// empty chain_funnels.
@@ -74,7 +55,7 @@ func (src statsSource) report(ctx context.Context, since, until *time.Time, gene
 		return runstats.Report{}, err
 	}
 
-	agg := runstats.New(caps, statsPricer(src.rates))
+	agg := runstats.New(caps)
 	if src.stages != nil {
 		stages := src.stages()
 		if len(stages.Chains) > 0 && caps.FunnelBreakdown() {
@@ -89,7 +70,7 @@ func (src statsSource) report(ctx context.Context, since, until *time.Time, gene
 	if err := store.ScanRunHistoryRange(ctx, caps, since, until, agg.Add); err != nil {
 		return runstats.Report{}, err
 	}
-	return agg.Report(generatedAt, src.workflowPath, src.dbPath, since, until, src.rateWarnings), nil
+	return agg.Report(generatedAt, src.workflowPath, src.dbPath, since, until), nil
 }
 
 // dispatchStages joins the dispatch section to the stages chain_funnels
@@ -133,13 +114,42 @@ func formatFloatDash(v *float64, format string) string {
 	return fmt.Sprintf(format, *v)
 }
 
-// formatCostDash renders a nullable USD figure with [server.FormatCost],
-// or "-" when v is nil.
-func formatCostDash(v *float64) string {
+// formatCostDash renders a nullable USD figure with [server.FormatCost], or
+// with [server.FormatCostCut] when lowerBound is set so the figure never
+// rounds up past the spend it bounds, or "-" when v is nil.
+func formatCostDash(v *float64, lowerBound bool) string {
 	if v == nil {
 		return "-"
 	}
+	if lowerBound {
+		return server.FormatCostCut(*v)
+	}
 	return server.FormatCost(*v)
+}
+
+// statsLineLabel pads a summary line's label to the report's label width and
+// marks the line as a lower bound when its figure counts only part of its
+// runs.
+func statsLineLabel(name string, lowerBound bool) string {
+	if lowerBound {
+		name += " (lower bound)"
+	}
+	return fmt.Sprintf("%-24s", name)
+}
+
+// statsLowerBoundCell names the figures of g that count only part of its
+// runs, or "-" when none does.
+func statsLowerBoundCell(g runstats.Group) string {
+	switch {
+	case g.TokensLowerBound && g.CostLowerBound:
+		return "tokens, cost"
+	case g.TokensLowerBound:
+		return "tokens"
+	case g.CostLowerBound:
+		return "cost"
+	default:
+		return "-"
+	}
 }
 
 // formatSecondsDash renders a nullable seconds figure with
@@ -182,7 +192,7 @@ func formatTokensTotalDash(t *runstats.Tokens) string {
 // section title, a header row, and one row per group. isOutcomeTable
 // selects the "share" column for the outcome breakdown; every other
 // breakdown carries "succeeded" and "success rate" instead. full selects
-// the turns, total tokens, and cost columns.
+// the turns, total tokens, cost, and lower bound columns.
 //
 // Cells are tab-separated and flushed through a tabwriter so every column
 // lines up at the width of its widest cell. A row is never written
@@ -219,6 +229,7 @@ var noHopReasonWords = map[string]string{
 	"run_failed":       "failed run",
 	"needs_person":     "needs a person",
 	"budget_held":      "budget held",
+	"usage_limited":    "usage limit",
 	"operator_stopped": "stopped by an operator",
 	"verdict_withheld": "verdict withheld",
 }
@@ -272,7 +283,7 @@ func statsGroupHeader(full, isOutcomeTable bool) []string {
 	}
 	header = append(header, "p50", "p95", "mean")
 	if full {
-		header = append(header, "turns", "total tokens", "cost")
+		header = append(header, "turns", "total tokens", "cost", "lower bound")
 	}
 	return header
 }
@@ -292,7 +303,8 @@ func statsGroupCells(g runstats.Group, full, isOutcomeTable bool) []string {
 		cells = append(cells,
 			formatFloatDash(g.MeanTurns, "%.1f"),
 			formatTokensTotalDash(g.Tokens),
-			formatCostDash(g.CostUSD))
+			formatCostDash(g.CostUSD, g.CostLowerBound),
+			statsLowerBoundCell(g))
 	}
 	return cells
 }
@@ -358,8 +370,23 @@ func statsFootnotes(s runstats.Summary, chains int) []string {
 	}
 	if s.CostUnpricedRuns > 0 {
 		lines = append(lines, fmt.Sprintf(
-			"note: the cost figures skip %d of these runs, because token_rates has no price for the coding agent behind them.",
+			"note: the cost figures skip %d of these runs, because Sortie had no price for the models they used when they were recorded.",
 			s.CostUnpricedRuns))
+	}
+	if s.TokensLowerBoundRuns > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"note: the token figures count only part of %d of these runs, because some of their turns were not fully counted.",
+			s.TokensLowerBoundRuns))
+	}
+	if s.CostPartialRuns > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"note: the cost figures count only part of %d of these runs, because part of their spend was not counted or had no price.",
+			s.CostPartialRuns))
+	}
+	if s.AgentPricedUSD != nil {
+		lines = append(lines, fmt.Sprintf(
+			"note: the cost figures include %s that the coding agent reported for models Sortie had no price for when the runs were recorded.",
+			server.FormatCost(*s.AgentPricedUSD)))
 	}
 	if chains > statsChainTextRows {
 		lines = append(lines, fmt.Sprintf(
@@ -417,16 +444,14 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 	if full {
 		fmt.Fprintf(stdout, "turns (succeeded)       %s\n", //nolint:errcheck // stdout write failure is unrecoverable
 			formatFloatDash(report.Summary.MeanTurnsSucceeded, "%.1f"))
-		fmt.Fprintf(stdout, "tokens (measured runs)  %s\n", formatStatsTokens(report.Summary.Tokens)) //nolint:errcheck // stdout write failure is unrecoverable
-		switch {
-		case report.Summary.CostUSD != nil:
-			fmt.Fprintf(stdout, "cost (measured runs)    %s   per succeeded run %s\n", //nolint:errcheck // stdout write failure is unrecoverable
-				server.FormatCost(*report.Summary.CostUSD), formatCostDash(report.Summary.CostPerSucceededRunUSD))
-		case !report.RatesConfigured && report.Summary.Tokens != nil:
-			fmt.Fprintln(stdout, //nolint:errcheck // stdout write failure is unrecoverable
-				"cost                    not estimated; set token_rates in the workflow to price these runs")
-		default:
-			fmt.Fprintln(stdout, "cost (measured runs)    -   per succeeded run -") //nolint:errcheck // stdout write failure is unrecoverable
+		fmt.Fprintf(stdout, "%s%s\n", statsLineLabel("tokens", report.Summary.TokensLowerBound), formatStatsTokens(report.Summary.Tokens)) //nolint:errcheck // stdout write failure is unrecoverable
+		costLabel := statsLineLabel("cost", report.Summary.CostLowerBound)
+		if report.Summary.CostUSD != nil {
+			fmt.Fprintf(stdout, "%s%s   per succeeded run %s\n", costLabel, //nolint:errcheck // stdout write failure is unrecoverable
+				formatCostDash(report.Summary.CostUSD, report.Summary.CostLowerBound),
+				formatCostDash(report.Summary.CostPerSucceededRunUSD, report.Summary.CostLowerBound))
+		} else {
+			fmt.Fprintf(stdout, "%s-   per succeeded run -\n", costLabel) //nolint:errcheck // stdout write failure is unrecoverable
 		}
 	}
 	fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
@@ -442,6 +467,10 @@ func renderStatsText(stdout, stderr io.Writer, report runstats.Report) {
 		if len(report.ByModel) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
 			renderStatsGroupTable(stdout, "by model", "model", report.ByModel, full, false)
+		}
+		if len(report.ByProvenance) > 0 {
+			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
+			renderStatsGroupTable(stdout, "by usage provenance", "provenance", report.ByProvenance, full, false)
 		}
 		if len(report.ByChain) > 0 {
 			fmt.Fprintln(stdout) //nolint:errcheck // stdout write failure is unrecoverable
@@ -561,14 +590,10 @@ func runStats(ctx context.Context, args []string, stdout io.Writer, stderr io.Wr
 	}
 
 	dbPath := resolveDBPath(cfg.DBPath, filepath.Dir(path))
-	rawTokenRates, tokenRatesPresent := cfg.ExtensionValue("token_rates")
-	rates, rateWarnings := server.ParseTokenRates(rawTokenRates, tokenRatesPresent)
 
 	src := statsSource{
 		dbPath:       dbPath,
 		workflowPath: path,
-		rates:        rates,
-		rateWarnings: rateWarnings,
 		stages:       func() runstats.Stages { return dispatchStages(dispatch) },
 	}
 	report, err := src.report(ctx, since, until, now)

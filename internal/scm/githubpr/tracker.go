@@ -379,10 +379,25 @@ func (a *GitHubPRAdapter) FetchIssueStatesByIDs(ctx context.Context, issueIDs []
 		if err != nil {
 			return err
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
+}
+
+// FetchIssueStatesAndLabelsByIDs returns the current state and labels for
+// each requested PR number. The query filter is not applied.
+func (a *GitHubPRAdapter) FetchIssueStatesAndLabelsByIDs(ctx context.Context, issueIDs []string) (map[string]domain.IssueStateAndLabels, error) {
+	var reads map[string]domain.IssueStateAndLabels
+	err := trackermetrics.Track(a.metrics, "fetch_states_by_ids", func() error {
+		fetched, err := a.fetchStatesByNumbers(ctx, issueIDs)
+		if err != nil {
+			return err
+		}
+		reads = fetched
+		return nil
+	})
+	return reads, err
 }
 
 // FetchIssueStatesByIdentifiers returns the current state for each
@@ -395,18 +410,18 @@ func (a *GitHubPRAdapter) FetchIssueStatesByIdentifiers(ctx context.Context, ide
 		if err != nil {
 			return err
 		}
-		states = fetched
+		states = issuekit.StatesOf(fetched)
 		return nil
 	})
 	return states, err
 }
 
-func (a *GitHubPRAdapter) fetchStatesByNumbers(ctx context.Context, numbers []string) (map[string]string, error) {
+func (a *GitHubPRAdapter) fetchStatesByNumbers(ctx context.Context, numbers []string) (map[string]domain.IssueStateAndLabels, error) {
 	if len(numbers) == 0 {
-		return map[string]string{}, nil
+		return map[string]domain.IssueStateAndLabels{}, nil
 	}
 	snapshot := a.model.Snapshot()
-	states := make(map[string]string, len(numbers))
+	states := make(map[string]domain.IssueStateAndLabels, len(numbers))
 	for _, num := range numbers {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -427,7 +442,10 @@ func (a *GitHubPRAdapter) fetchStatesByNumbers(ctx context.Context, numbers []st
 			continue
 		}
 		labels := labelNames(pr.Labels)
-		states[num] = a.model.Derive(snapshot, num, labels, pr.State == "closed")
+		states[num] = domain.IssueStateAndLabels{
+			State:  a.model.Derive(snapshot, num, labels, pr.State == "closed"),
+			Labels: issuekit.NormalizeLabels(labels),
+		}
 	}
 	return states, nil
 }
@@ -517,14 +535,6 @@ func (a *GitHubPRAdapter) setIssueClosed(ctx context.Context, prPath string, clo
 func (a *GitHubPRAdapter) CommentIssue(ctx context.Context, issueID string, text string) error {
 	return trackermetrics.Track(a.metrics, "comment", func() error {
 		return a.postComment(ctx, issueID, text)
-	})
-}
-
-// CommentIssueWithLiteral posts text followed by literal in a fenced Markdown
-// code block, so the tracker shows literal verbatim.
-func (a *GitHubPRAdapter) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	return trackermetrics.Track(a.metrics, "comment", func() error {
-		return a.postComment(ctx, issueID, issuekit.MarkdownLiteralComment(text, literal))
 	})
 }
 

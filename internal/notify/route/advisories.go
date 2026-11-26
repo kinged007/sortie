@@ -143,7 +143,7 @@ func Advisories(cfg config.ServiceConfig) []config.Advisory {
 				"notifications.tracker_comment.implicit_auto_merge",
 				"the auto-merge success comment", domain.EventAutoMergeMerged))
 		}
-		if cfg.Agent.MaxSessions > 0 || cfg.Agent.MaxTokens > 0 {
+		if cfg.Agent.MaxSessions > 0 || cfg.Agent.MaxTokens > 0 || cfg.Agent.MaxCostUSD > 0 {
 			advisories = append(advisories, implicitAdvisory(
 				"notifications.tracker_comment.implicit_budget_hold",
 				"the budget-hold comment", domain.EventBudgetHeld))

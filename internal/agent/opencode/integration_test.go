@@ -3,9 +3,12 @@ package opencode_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,8 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/credentialtest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/fakemodel"
 	"github.com/sortie-ai/sortie/internal/agent/opencode"
+	"github.com/sortie-ai/sortie/internal/agent/opencode/sessionexport"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/registry"
 )
@@ -103,10 +108,19 @@ func collectAllEvents(t *testing.T, a domain.AgentAdapter, session domain.Sessio
 	return events, result
 }
 
-// The key is an {env:} reference because opencode 2.x does not read the
-// provider's key variable on its own.
 func scriptedProviderDocument(url string) string {
+	// The key is an {env:} reference because opencode 2.x does not read the
+	// provider's key variable on its own.
 	return fmt.Sprintf(`{"$schema":"https://opencode.ai/config.json","provider":{"scripted":{"npm":"@ai-sdk/google","name":"scripted","options":{"baseURL":"%s/v1beta","apiKey":"{env:GOOGLE_GENERATIVE_AI_API_KEY}"},"models":{"scripted-model":{"name":"scripted-model"}}}}}`, url)
+}
+
+func tokenUsage(u fakemodel.Usage) domain.TokenUsage {
+	return domain.TokenUsage{
+		InputTokens:     u.Prompt,
+		OutputTokens:    u.Candidates + u.Thoughts,
+		TotalTokens:     u.Prompt + u.Candidates + u.Thoughts,
+		CacheReadTokens: u.CachedContent,
+	}
 }
 
 func TestIntegration_ScriptedModel(t *testing.T) {
@@ -120,11 +134,25 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 		}
 	}
 
-	fakemodel.AssertConformance(t, fakemodel.Binding{
-		Kind:          "opencode",
-		Passthrough:   scriptedSettings(true),
-		CredentialEnv: []string{"GOOGLE_GENERATIVE_AI_API_KEY"},
-		Read:          fakemodel.ReadFile,
+	stepReports := domain.UsageProvenance{Source: usage.SourceOutput, Strategy: usage.StrategyLive}
+
+	binding := fakemodel.Binding{
+		Kind:                "opencode",
+		Passthrough:         scriptedSettings(true),
+		CredentialEnv:       []string{"GOOGLE_GENERATIVE_AI_API_KEY"},
+		Read:                fakemodel.ReadFile,
+		ReportedModelPrefix: "scripted/",
+		Spend: &fakemodel.SpendSources{
+			Live:              stepReports,
+			Records:           domain.UsageProvenance{Source: usage.SourceJournal, Strategy: usage.StrategyRecords},
+			RecordsAtTurnEnd:  sessionexport.Records.WrittenAtTurnEnd,
+			CancelEndsProcess: true,
+		},
+		SSH: &fakemodel.SSHVariant{
+			Package:       "@opencode/cli",
+			HostCommand:   integrationCommand(),
+			RemoteCommand: func(fakemodel.Environment) string { return "opencode" },
+		},
 		PermissionRefusal: &fakemodel.PermissionRefusal{
 			Passthrough: scriptedSettings(false),
 			Guarded:     fakemodel.ReadFile,
@@ -150,7 +178,101 @@ func TestIntegration_ScriptedModel(t *testing.T) {
 				Env: map[string]string{"OPENCODE_CONFIG": document},
 			}
 		},
+	}
+
+	fakemodel.AssertConformance(t, binding)
+
+	t.Run("export failure leaves the turn to the step reports", func(t *testing.T) {
+		runtime := agenttest.WriteScript(t, t.TempDir(), "export-failing-opencode",
+			"if [ \"$1\" = session ] && [ \"$2\" = export ]; then exit 1; fi\nexec "+integrationCommand()+" \"$@\"\n")
+		failing := binding
+		failing.Launch = func(t *testing.T, env fakemodel.Environment) fakemodel.Launch {
+			launch := binding.Launch(t, env)
+			launch.Config.Command = runtime
+			return launch
+		}
+		file := filepath.Join(t.TempDir(), "scripted.txt")
+		if err := os.WriteFile(file, []byte("scripted\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q): %v", file, err)
+		}
+
+		toolCall := fakemodel.Usage{Prompt: 211, Candidates: 13, Thoughts: 5, CachedContent: 53}
+		finalText := fakemodel.Usage{Prompt: 307, Candidates: 17, Thoughts: 7, CachedContent: 61}
+		run := fakemodel.RunCustomTurn(t, failing, fakemodel.CustomTurn{
+			Script: []fakemodel.Response{
+				{Call: binding.Read(file), Usage: toolCall},
+				{Text: "ok", Usage: finalText},
+			},
+			Prompt: "Read the file, then reply with the word ok.",
+		})
+
+		if run.Err != nil {
+			t.Fatalf("RunTurn() error = %v", run.Err)
+		}
+		want := usage.Add(tokenUsage(toolCall), tokenUsage(finalText))
+		if !run.Result.UsageMeasured {
+			t.Error("RunTurn().UsageMeasured = false, want true")
+		}
+		if got := run.Result.Usage; got != want {
+			t.Errorf("RunTurn().Usage = %+v, want %+v, the requests the step reports cover", got, want)
+		}
+		if got, want := run.Result.UsageProvenance, []domain.UsageProvenance{stepReports}; !slices.Equal(got, want) {
+			t.Errorf("RunTurn().UsageProvenance = %+v, want %+v", got, want)
+		}
+		if run.Result.SpendUnaccounted {
+			t.Error("RunTurn().SpendUnaccounted = true, want false: the step reports cover every request")
+		}
 	})
+
+	for _, remote := range []bool{false, true} {
+		name := "free usage limit"
+		if remote {
+			name += " remote"
+		}
+		t.Run(name, func(t *testing.T) {
+			const retryAfter = time.Hour
+			start := time.Now().Truncate(time.Millisecond)
+
+			run := fakemodel.RunCustomTurn(t, binding, fakemodel.CustomTurn{
+				Script: []fakemodel.Response{{
+					Status: http.StatusTooManyRequests,
+					Header: http.Header{"Retry-After": {"3600"}},
+					Body:   []byte(`{"type": "error", "error": {"type": "FreeUsageLimitError", "message": "Rate limit exceeded. Please try again later."}}`),
+				}},
+				Prompt: "Reply with the word ok.",
+				Remote: remote,
+			})
+
+			end := time.Now()
+			var agentErr *domain.AgentError
+			if !errors.As(run.Err, &agentErr) || agentErr.Kind != domain.ErrUsageLimit || agentErr.UsageLimit == nil {
+				t.Fatalf("RunTurn() error = %v, want a usage_limit AgentError carrying a UsageLimit", run.Err)
+			}
+			if !agentErr.UsageLimit.ModelOnly {
+				t.Error("UsageLimit.ModelOnly = false, want true")
+			}
+			assertResetWithin(t, "UsageLimit.ResetsAt", agentErr.UsageLimit.ResetsAt, start.Add(retryAfter), end.Add(retryAfter))
+			var windows []domain.UsageWindow
+			for _, e := range run.Events {
+				windows = append(windows, e.UsageWindows...)
+			}
+			if len(windows) != 1 {
+				t.Fatalf("usage windows of the refused turn = %+v, want exactly one", windows)
+			}
+			w := windows[0]
+			if w.Label != "Free usage limit" || w.Status != domain.UsageWindowExhausted {
+				t.Errorf("window = {Label %q, Status %q}, want {%q, %q}", w.Label, w.Status, "Free usage limit", domain.UsageWindowExhausted)
+			}
+			assertResetWithin(t, "window ResetsAt", w.ResetsAt, start.Add(retryAfter).Truncate(time.Second), end.Add(retryAfter))
+		})
+	}
+}
+
+func assertResetWithin(t *testing.T, what string, got, earliest, latest time.Time) {
+	t.Helper()
+	if got.Before(earliest) || got.After(latest) {
+		t.Errorf("%s = %v, want within [%v, %v]", what, got, earliest, latest)
+	}
 }
 
 func TestIntegration_InvalidModelFailure(t *testing.T) {

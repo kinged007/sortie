@@ -14,6 +14,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/notify/route"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // mgcTransitionCall records one TransitionIssue invocation.
@@ -32,7 +33,6 @@ type mgcLabelCall struct {
 type mgcCommentCall struct {
 	issueID string
 	text    string
-	literal string
 }
 
 // mgcTrackerFake is a fully controllable domain.TrackerAdapter for
@@ -83,6 +83,11 @@ func (f *mgcTrackerFake) FetchIssueComments(context.Context, string) ([]domain.C
 	return nil, nil
 }
 
+func (f *mgcTrackerFake) FetchIssueStatesAndLabelsByIDs(ctx context.Context, ids []string) (map[string]domain.IssueStateAndLabels, error) {
+	states, err := f.FetchIssueStatesByIDs(ctx, ids)
+	return statesWithLabels(states, nil), err
+}
+
 func (f *mgcTrackerFake) FetchIssueStatesByIDs(_ context.Context, _ []string) (map[string]string, error) {
 	f.statesCalls.Add(1)
 	if f.statesErr != nil {
@@ -101,12 +106,6 @@ func (f *mgcTrackerFake) TransitionIssue(_ context.Context, issueID, target stri
 
 func (f *mgcTrackerFake) CommentIssue(ctx context.Context, issueID, text string) error {
 	f.commentCalls = append(f.commentCalls, mgcCommentCall{issueID: issueID, text: text})
-	f.commentCtx = ctx
-	return f.commentErr
-}
-
-func (f *mgcTrackerFake) CommentIssueWithLiteral(ctx context.Context, issueID, text, literal string) error {
-	f.commentCalls = append(f.commentCalls, mgcCommentCall{issueID: issueID, text: text, literal: literal})
 	f.commentCtx = ctx
 	return f.commentErr
 }
@@ -1960,11 +1959,7 @@ func TestReconcileMergeCompletion_MissingSHAMarkerDoesNotWaitForOtherDestination
 	now = now.Add(31 * time.Minute)
 	reconcileMergeCompletion(state, params, discardLogger(), context.Background(), &domain.NoopMetrics{})
 
-	select {
-	case <-store.marked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("observation marker not written while the Slack send is in flight, want it decided by the tracker comment alone")
-	}
+	waittest.Receive(t, store.marked, "observation marker written while the Slack send is in flight")
 	release()
 	state.TrackerOpsWg.Wait()
 

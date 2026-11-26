@@ -11,6 +11,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestSelectRefusingOption(t *testing.T) {
@@ -151,7 +152,7 @@ func TestPermissionRequestNoRefusingOptionEndsAttempt(t *testing.T) {
 
 			respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
 
-			outcome := awaitOutcome(t, outcomeCh)
+			outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 			dispositiontest.AssertDispositionContract(t, agentcore.HumanInputEvidence(""), outcome.result, outcome.err)
 		})
 	}
@@ -183,7 +184,7 @@ func TestPermissionRequestSelectsRefusingOption(t *testing.T) {
 
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
 
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil: the attempt must not end on a selected refusal", outcome.err)
 	}
@@ -247,7 +248,7 @@ func TestPermissionRequestMalformedToolCallNameSelectsRefusingOption(t *testing.
 
 			respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
 
-			outcome := awaitOutcome(t, outcomeCh)
+			outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 			if outcome.err != nil {
 				t.Fatalf("RunTurn() error = %v, want nil: a malformed toolCall.name must not end the attempt", outcome.err)
 			}
@@ -305,7 +306,7 @@ func TestToolDeliveryReportedOnceThenLatched(t *testing.T) {
 	out.next(t)
 
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 	}
@@ -339,7 +340,7 @@ func TestToolDeliveryReportLogsWarnRecord(t *testing.T) {
 	out.next(t)
 
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 	}
@@ -402,7 +403,7 @@ func TestToolDeliveryReportCoversBothPostureArms(t *testing.T) {
 			out.next(t)
 
 			respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-			awaitOutcome(t, outcomeCh)
+			waittest.Receive(t, outcomeCh, "turn outcome")
 
 			if got := countToolDeliveryNotifications(events); got != 1 {
 				t.Errorf("tool delivery uncallable notifications = %d, want 1", got)
@@ -448,7 +449,7 @@ func TestNoToolDeliveryReportWhenNoToolServersDelivered(t *testing.T) {
 			out.next(t)
 
 			respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-			awaitOutcome(t, outcomeCh)
+			waittest.Receive(t, outcomeCh, "turn outcome")
 
 			if got := countToolDeliveryNotifications(events); got != 0 {
 				t.Errorf("tool delivery uncallable notifications with no tool servers delivered = %d, want 0", got)
@@ -508,7 +509,7 @@ func TestToolDeliveryNoticeOrderAndStemExclusion(t *testing.T) {
 		out.next(t)
 
 		respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-		outcome := awaitOutcome(t, outcomeCh)
+		outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 		if outcome.err != nil {
 			t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 		}
@@ -535,7 +536,7 @@ func TestToolDeliveryNoticeOrderAndStemExclusion(t *testing.T) {
 		outcomeCh := runTurnAsync(state, domain.RunTurnParams{Prompt: "go", OnEvent: collectEvents(&events)})
 		promptID := out.awaitMethod(t, methodSessionPrompt)
 		respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-		outcome := awaitOutcome(t, outcomeCh)
+		outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 		if outcome.err != nil {
 			t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 		}

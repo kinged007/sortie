@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/pricing"
 )
 
 // NextOutcome is one thing Sortie does next for an issue: the condition that
@@ -24,11 +25,13 @@ type Situation struct {
 	Spend            *Spend                                 // nil when run history was not read
 }
 
-// Spend is the issue's completed sessions and their summed total tokens, the
-// figures the session and token budget gates compare.
+// Spend is the issue's completed sessions and their summed uncached tokens,
+// the figures the session and token budget gates compare, and the issue's
+// estimated cost in USD, which the money budget gate compares.
 type Spend struct {
 	Sessions int
 	Tokens   int64
+	CostUSD  float64
 }
 
 // debounceWait is the Wait value of a review row that waits for comments to
@@ -127,6 +130,7 @@ func newData() map[string]any {
 		"NoChange":        "",
 		"Watch":           []string{},
 		"Budget":          new(int64),
+		"MoneyHold":       false,
 		"TokenHold":       false,
 		"Sessions":        0,
 		"MaxSessions":     0,
@@ -154,16 +158,18 @@ func newData() map[string]any {
 	}
 }
 
-// budgetHold is the budget gate that would stop a session dispatch: the token
-// budget, or the session budget with the sessions it counts.
+// budgetHold is the budget gate that would stop a session dispatch: the money
+// budget, the token budget, or the session budget with the sessions it counts.
 type budgetHold struct {
+	money    bool
 	tokens   bool
 	sessions int
 }
 
 // holdOf repeats the gates every session dispatch passes. extra counts the
 // sessions that will have landed in run history before the dispatch is gated,
-// beyond the running one. The token budget wins when both hold.
+// beyond the running one. The money budget wins over the token budget, which
+// wins over the session budget.
 func holdOf(s Situation, c Context, extra int) (budgetHold, bool) {
 	if s.Spend == nil {
 		return budgetHold{}, false
@@ -173,11 +179,13 @@ func holdOf(s Situation, c Context, extra int) (budgetHold, bool) {
 	if s.Running != nil {
 		sessions++
 		if s.Running.UsageMeasured {
-			tokens += s.Running.AgentTotalTokens
+			tokens += s.Running.UncachedTokens()
 		}
 	}
 	agent := c.Shape.Agent
 	switch {
+	case agent.MaxCostUSD != nil && pricing.CeilingReached(s.Spend.CostUSD, *agent.MaxCostUSD):
+		return budgetHold{money: true, sessions: sessions}, true
 	case agent.MaxTokens != nil && tokens >= int64(*agent.MaxTokens):
 		return budgetHold{tokens: true, sessions: sessions}, true
 	case agent.MaxSessions != nil && sessions >= *agent.MaxSessions:
@@ -193,6 +201,7 @@ func textOrHold(s Situation, c Context, extra int, data map[string]any, free, he
 	if !stopped {
 		return free
 	}
+	data["MoneyHold"] = hold.money
 	data["TokenHold"] = hold.tokens
 	data["Sessions"] = hold.sessions
 	setBudgets(data, c.Shape)
@@ -280,6 +289,9 @@ func runPairs(s Situation, c Context) []outcomePair {
 		pairs = append(pairs, fails)
 	}
 
+	if shape.Agent.MaxCostUSD != nil && r.UsageArrival.ReportsAnyFigure() {
+		pairs = append(pairs, outcomePair{condition: "next_if_money_reach", text: "next_money_stop", data: newData()})
+	}
 	if shape.Agent.MaxTokens != nil && r.UsageArrival.ReportsAnyFigure() {
 		stops := outcomePair{condition: "next_if_tokens_reach", text: "next_token_stop", data: newData()}
 		setBudgets(stops.data, shape)

@@ -10,6 +10,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // mergeConflictMetricsSpy records merge-conflict-specific metric calls while
@@ -1039,47 +1040,6 @@ func TestBuildMergeConflictTemplateMap(t *testing.T) {
 	}
 }
 
-func TestBuildMergeConflictEscalationComment(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		data     *MergeConflictReactionData
-		attempts int
-		want     string
-	}{
-		{
-			name:     "one dispatched turn at max_retries 1",
-			data:     &MergeConflictReactionData{PRNumber: 42},
-			attempts: 2,
-			want:     "Sortie attempted 1 merge-conflict resolution turn(s) and could not clear the conflicts for PR #42. Manual rebase required.",
-		},
-		{
-			name:     "zero dispatched turns at max_retries 0 (escalates without a rebase)",
-			data:     &MergeConflictReactionData{PRNumber: 7},
-			attempts: 1,
-			want:     "Sortie attempted 0 merge-conflict resolution turn(s) and could not clear the conflicts for PR #7. Manual rebase required.",
-		},
-		{
-			name:     "three dispatched turns at max_retries 3",
-			data:     &MergeConflictReactionData{PRNumber: 99},
-			attempts: 4,
-			want:     "Sortie attempted 3 merge-conflict resolution turn(s) and could not clear the conflicts for PR #99. Manual rebase required.",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := buildMergeConflictEscalationComment(tt.data, tt.attempts)
-			if got != tt.want {
-				t.Errorf("buildMergeConflictEscalationComment(attempts=%d) =\n  %q\nwant:\n  %q", tt.attempts, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestReconcileMergeConflicts_DispatchCarriesRealBase(t *testing.T) {
 	t.Parallel()
 
@@ -1467,7 +1427,7 @@ func runMergeConflictTriageToCompletion(t *testing.T, state *State, params Recon
 	if !ok || entry.Triage == nil {
 		t.Fatalf("PendingReactions[%s] = %+v, want a started triage run", rkey, entry)
 	}
-	waitTriageRunDone(t, entry.Triage)
+	waittest.Receive(t, entry.Triage.Done, "triage run to finish")
 	entry.PendingRetryAt = time.Time{}
 }
 
@@ -1722,7 +1682,7 @@ func TestReconcileMergeConflicts_Triage_DispatchAgent_HeadChangeBlockRunsOnce(t 
 	if !entry.HeadRecordedAt.IsZero() {
 		t.Fatal("HeadRecordedAt set on the starting pass, want zero (the head-change block must not run before the gate resolves)")
 	}
-	waitTriageRunDone(t, entry.Triage)
+	waittest.Receive(t, entry.Triage.Done, "triage run to finish")
 	entry.PendingRetryAt = time.Time{}
 
 	// Resuming pass: dispatch-agent falls through, so the head-change

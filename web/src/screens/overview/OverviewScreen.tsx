@@ -9,7 +9,9 @@ import { useShortcuts } from "@/app/keys";
 import { useAttentionActions } from "@/components/use-attention-actions";
 import { useOpenLatestSession } from "@/components/use-open-session";
 import { usePeek } from "@/components/use-peek";
+import { usageByKind } from "@/lib/agent-kinds";
 import { activeRows, filterRows } from "@/lib/active-rows";
+import { hasRateSource } from "@/lib/budget";
 import { condition } from "@/lib/condition";
 import { buildEnded } from "@/lib/ended";
 import { issueLinkOf } from "@/lib/issue-link";
@@ -23,14 +25,15 @@ import { CalmState } from "./CalmState";
 import { EndedToday } from "./EndedToday";
 import { Headline } from "./Headline";
 import { buildHeadline } from "./headline";
+import { HeldList } from "./HeldList";
 import { activeNavKey, attentionNavKey, endedNavKey } from "./rows";
+import { Usage } from "./Usage";
 
 import type { AttentionItemResponse, Report, RunsResponse, StateResponse } from "@/api/types.gen";
 import type { Binding } from "@/app/keys";
 import type { ActiveRow } from "@/lib/active-rows";
 import type { EndedEmpty } from "./EndedToday";
 
-/** One item the keyboard selection can rest on. */
 interface NavItem {
   key: string;
   /** The `issue_identifier` the peek opens for, or `null` for an item with no issue. */
@@ -86,7 +89,10 @@ function OverviewBody({ state }: OverviewBodyProps) {
   const tally = useTallyQuery(midnight);
   const isFirstRun = useFirstRunQuery();
   const isFetching = useIsFetching() > 0;
-  const [selection, setSelection] = useState({ key: null as string | null, index: 0 });
+  const [selection, setSelection] = useState({
+    key: null as string | null,
+    index: 0,
+  });
   const [showSelection, setShowSelection] = useState(false);
 
   const rows = useMemo(() => activeRows(state), [state]);
@@ -279,14 +285,16 @@ function OverviewBody({ state }: OverviewBodyProps) {
   ];
   useShortcuts(bindings);
 
-  const tokenRatesConfigured = config?.token_rates != null;
-  const tallyText =
+  const hasCost = hasRateSource(view.state);
+  const tallySummary =
     view.tally === undefined ||
     view.pages === undefined ||
     view.isHistoryUnavailable ||
     view.isFirstRun === true
       ? undefined
-      : tallyLine(view.tally.summary, endedAll.length, tokenRatesConfigured);
+      : view.tally.summary;
+  const tallyParts =
+    tallySummary === undefined ? undefined : tallyLine(tallySummary, endedAll.length, hasCost);
 
   return (
     <div className="flex flex-col gap-xl">
@@ -297,7 +305,6 @@ function OverviewBody({ state }: OverviewBodyProps) {
         <AttentionList
           items={unacknowledged}
           now={view.now}
-          readSet={view.readSet}
           selectedKey={selectedKey}
           showSelection={showSelection}
           pending={actions.pending}
@@ -307,13 +314,21 @@ function OverviewBody({ state }: OverviewBodyProps) {
         />
       ) : view.isFirstRun === false && condition(view.state) !== "degraded" ? (
         <CalmState
+          allClear={condition(view.state) === "clear"}
           runningSince={(view.state.running ?? []).map((entry) => entry.started_at)}
           maxAgents={config?.agent.max_concurrent_agents}
           ended={endedAll}
+          terminalStates={config?.tracker.terminal_states ?? []}
           runs={view.tally?.summary}
           now={view.now}
         />
       ) : undefined}
+      <Usage
+        ceiling={view.state.spend_ceiling}
+        rateLimits={view.state.rate_limits}
+        kinds={config ? usageByKind(config).map(([kind]) => kind) : []}
+        now={view.now}
+      />
       <ActiveList
         rows={view.rows}
         visibleRows={visibleRows}
@@ -323,11 +338,12 @@ function OverviewBody({ state }: OverviewBodyProps) {
         showSelection={showSelection}
         onOpen={(row) => selectAndOpen(activeNavKey(row.issueId), row.identifier)}
       />
+      <HeldList rows={view.state.held ?? []} count={view.state.counts.held} now={view.now} />
       <EndedToday
         rows={endedAll}
         unreadIds={endedUnreadIds}
         empty={endedEmpty(view)}
-        tally={tallyText}
+        tally={tallyParts}
         selectedKey={selectedKey}
         showSelection={showSelection}
         onOpen={(issue) => selectAndOpen(endedNavKey(issue.issueId), issue.identifier)}
@@ -336,10 +352,7 @@ function OverviewBody({ state }: OverviewBodyProps) {
   );
 }
 
-/**
- * Renders Overview: Needs attention, Active, and Ended today. While a peek is
- * open it renders the data as it was when the peek opened.
- */
+/** While a peek is open it renders the data as it was when the peek opened. */
 export function OverviewScreen() {
   const { data: state } = useStateQuery();
   return state === undefined ? undefined : <OverviewBody state={state} />;

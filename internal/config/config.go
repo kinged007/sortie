@@ -104,6 +104,17 @@ type ServiceConfig struct {
 	// [ServiceConfig.AgentKindConversions] and
 	// [ServiceConfig.AgentCommand].
 	conversions []AgentKindConversion
+
+	// envSet holds the field paths an environment variable or .env value
+	// set during this load. Read through [ServiceConfig.SetFromEnvironment].
+	envSet map[string]bool
+}
+
+// SetFromEnvironment reports whether an environment variable or .env
+// value set the field at path (for example "price_table.fetch") during
+// this load. A zero ServiceConfig reports false.
+func (c ServiceConfig) SetFromEnvironment(path string) bool {
+	return c.envSet[path]
 }
 
 // SetDispatch attaches a parsed [DispatchConfig] to the service
@@ -283,6 +294,25 @@ type AgentConfig struct {
 	// the dispatch path and, as each usage figure arrives, on the
 	// event loop for the run already in flight. 0 means unlimited.
 	MaxTokens int
+
+	// MaxCostUSD is the per-issue ceiling on the issue's estimated cost
+	// in USD. 0 means unlimited. Non-negative and finite.
+	MaxCostUSD float64
+
+	// MaxDailyCostUSD is the instance ceiling in USD on the estimated cost
+	// of the current UTC calendar day; 0 disables it. Non-negative and
+	// finite.
+	MaxDailyCostUSD float64
+
+	// MaxWeeklyCostUSD is the instance ceiling in USD on the estimated cost of
+	// the current UTC week, Monday 00:00 to the next Monday 00:00; 0 disables
+	// it. Non-negative and finite.
+	MaxWeeklyCostUSD float64
+
+	// MaxMonthlyCostUSD is the instance ceiling in USD on the estimated
+	// cost of the current UTC calendar month; 0 disables it.
+	// Non-negative and finite.
+	MaxMonthlyCostUSD float64
 
 	// TokenWarningPercent is the percentage of MaxTokens, 0 to 99,
 	// at which the event loop warns that the ceiling is near. 0
@@ -753,6 +783,7 @@ func NewServiceConfig(raw map[string]any, opts ...ServiceConfigOption) (ServiceC
 		extensionsPreResolution: preResolution,
 		Notifications:           notifications,
 		conversions:             conversions,
+		envSet:                  envKeys,
 	}
 	cfg.AddAdvisories(advisories...)
 	return cfg, nil
@@ -970,7 +1001,7 @@ func buildPollingConfig(m map[string]any) (PollingConfig, error) {
 
 func buildWorkspaceConfig(m map[string]any, envKeys map[string]bool) (WorkspaceConfig, error) {
 	rootRaw := extractString(m, "root")
-	root, err := expandPath(rootRaw, !envKeys["workspace.root"])
+	root, err := ExpandPath(rootRaw, !envKeys["workspace.root"])
 	if err != nil {
 		return WorkspaceConfig{}, &ConfigError{
 			Field:   "workspace.root",
@@ -1038,7 +1069,7 @@ func buildDBPath(raw map[string]any, envKeys map[string]bool) (string, error) {
 	if s == "" {
 		return "", nil
 	}
-	expanded, err := expandPath(s, !envKeys["db_path"])
+	expanded, err := ExpandPath(s, !envKeys["db_path"])
 	if err != nil {
 		return "", &ConfigError{
 			Field:   "db_path",
@@ -1230,6 +1261,38 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		}
 	}
 
+	maxCostUSD, err := coerceFloatField(m, "max_cost_usd", "agent.max_cost_usd")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+	if math.IsNaN(maxCostUSD) || math.IsInf(maxCostUSD, 0) {
+		return AgentConfig{}, &ConfigError{
+			Field:   "agent.max_cost_usd",
+			Message: "must be a finite number",
+		}
+	}
+	if maxCostUSD < 0 {
+		return AgentConfig{}, &ConfigError{
+			Field:   "agent.max_cost_usd",
+			Message: "must be non-negative",
+		}
+	}
+
+	maxDailyCostUSD, err := coerceNonNegativeFiniteFloat(m, "max_daily_cost_usd", "agent.max_daily_cost_usd")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+
+	maxWeeklyCostUSD, err := coerceNonNegativeFiniteFloat(m, "max_weekly_cost_usd", "agent.max_weekly_cost_usd")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+
+	maxMonthlyCostUSD, err := coerceNonNegativeFiniteFloat(m, "max_monthly_cost_usd", "agent.max_monthly_cost_usd")
+	if err != nil {
+		return AgentConfig{}, err
+	}
+
 	tokenWarningPercent, err := coerceIntField(m, "token_warning_percent", "agent.token_warning_percent")
 	if err != nil {
 		return AgentConfig{}, err
@@ -1277,6 +1340,10 @@ func buildAgentConfig(m map[string]any) (AgentConfig, error) {
 		MaxConcurrentByState:   byState,
 		MaxSessions:            maxSessions,
 		MaxTokens:              maxTokens,
+		MaxCostUSD:             maxCostUSD,
+		MaxDailyCostUSD:        maxDailyCostUSD,
+		MaxWeeklyCostUSD:       maxWeeklyCostUSD,
+		MaxMonthlyCostUSD:      maxMonthlyCostUSD,
 		TokenWarningPercent:    tokenWarningPercent,
 		MaxConsecutiveAbsences: maxConsecutiveAbsences,
 	}, nil
@@ -1671,7 +1738,9 @@ func resolveEnvRef(s string) string {
 	return s
 }
 
-func expandPath(p string, expandEnv bool) (string, error) {
+// ExpandPath expands a leading "~" to the home directory and, when expandEnv
+// is set, environment variable references in p. An empty p yields "".
+func ExpandPath(p string, expandEnv bool) (string, error) {
 	if p == "" {
 		return "", nil
 	}
@@ -1761,6 +1830,66 @@ func coerceIntField(m map[string]any, key, field string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// coerceFloat converts a YAML integer, a float, or a string that
+// [strconv.ParseFloat] accepts after trimming. It passes NaN and the
+// infinities through for the caller to judge; a string that overflows
+// float64 fails.
+func coerceFloat(x any) (float64, error) {
+	switch v := x.(type) {
+	case int:
+		return float64(v), nil
+	case int32:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid number value: %v", x)
+		}
+		return f, nil
+	default:
+		return 0, fmt.Errorf("invalid number value: %v", x)
+	}
+}
+
+// coerceFloatField coerces a map value to float64, returning a ConfigError
+// on failure. Returns 0 when the key is absent or nil.
+func coerceFloatField(m map[string]any, key, field string) (float64, error) {
+	v, exists := m[key]
+	if !exists || v == nil {
+		return 0, nil
+	}
+	f, err := coerceFloat(v)
+	if err != nil {
+		return 0, &ConfigError{
+			Field:   field,
+			Message: err.Error(),
+		}
+	}
+	return f, nil
+}
+
+// coerceNonNegativeFiniteFloat is coerceFloatField plus the finite and
+// non-negative checks of a money ceiling.
+func coerceNonNegativeFiniteFloat(m map[string]any, key, field string) (float64, error) {
+	f, err := coerceFloatField(m, key, field)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, &ConfigError{Field: field, Message: "must be a finite number"}
+	}
+	if f < 0 {
+		return 0, &ConfigError{Field: field, Message: "must be non-negative"}
+	}
+	return f, nil
 }
 
 // coerceIntFieldSafe is like coerceIntField but never returns a

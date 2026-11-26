@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
+name: Community notification
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    if: >-
+      (github.event_name == 'issues'
+        && !contains(github.event.issue.labels.*.name, 'ci-nightly'))
+      || (github.event_name == 'pull_request_target'
+        && github.event.pull_request.user.type != 'Bot'
+        && github.event.pull_request.user.login != 'cicdbot')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_ISSUES }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK}" ]; then
+            echo "::warning::Discord webhook is not configured; skipping"
+            exit 0
+          fi
+
+          jq '(.issue // .pull_request) as $item
+            | [$item.labels[].name] as $labels
+            | {
+                author: {name: $item.user.login, url: $item.user.html_url, icon_url: $item.user.avatar_url},
+                title: "\($item.title) #\($item.number)",
+                url: $item.html_url,
+                color: (if .pull_request then 9000933 else 3447003 end)
+              }
+              + if $labels == [] then {} else {description: ($labels | join(" · "))} end' "${GITHUB_EVENT_PATH}" >embed.json
+
+          scripts/discord-notify.sh --embed <embed.json

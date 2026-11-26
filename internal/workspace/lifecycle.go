@@ -226,6 +226,10 @@ type FinishParams struct {
 	// SelfReviewSummaryPath is the absolute path to .sortie/review_summary.md.
 	// Empty when self-review did not run or the summary was not written.
 	SelfReviewSummaryPath string
+
+	// RunOutcome is how the attempt ended, exported to the hook as
+	// SORTIE_RUN_OUTCOME: "succeeded", "stopped", "failed", or "cancelled".
+	RunOutcome string
 }
 
 // Finish runs the after_run hook if configured. Failure is logged and
@@ -253,6 +257,7 @@ func Finish(ctx context.Context, params FinishParams) {
 		reviewStatus = "disabled"
 	}
 	env["SORTIE_SELF_REVIEW_STATUS"] = reviewStatus
+	env["SORTIE_RUN_OUTCOME"] = params.RunOutcome
 	if params.SelfReviewSummaryPath != "" {
 		env["SORTIE_SELF_REVIEW_SUMMARY_PATH"] = params.SelfReviewSummaryPath
 	}

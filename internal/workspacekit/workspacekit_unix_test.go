@@ -7,9 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func mustMkfifo(t *testing.T, path string) {
@@ -19,20 +20,13 @@ func mustMkfifo(t *testing.T, path string) {
 	}
 }
 
-// runWithDeadline runs fn on its own goroutine and fails the test if fn has
-// not returned within d, proving an open that could block on a FIFO with no
-// writer does not.
-func runWithDeadline(t *testing.T, d time.Duration, fn func() error) error {
+// runOnGoroutine runs fn off the test goroutine, so an open that blocks on a
+// FIFO with no writer fails the test at the hang guard instead of hanging it.
+func runOnGoroutine(t *testing.T, fn func() error) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- fn() }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(d):
-		t.Fatal("call blocked past the deadline, want a non-blocking open")
-		return nil
-	}
+	return waittest.Receive(t, done, "non-blocking open of a FIFO")
 }
 
 func TestOpenSortieDir_FIFOAtWorkspacePathRefusedWithoutHanging(t *testing.T) {
@@ -41,7 +35,7 @@ func TestOpenSortieDir_FIFOAtWorkspacePathRefusedWithoutHanging(t *testing.T) {
 	ws := filepath.Join(t.TempDir(), "workspace-fifo")
 	mustMkfifo(t, ws)
 
-	err := runWithDeadline(t, 5*time.Second, func() error {
+	err := runOnGoroutine(t, func() error {
 		_, err := OpenSortieDir(ws, false)
 		return err
 	})
@@ -56,7 +50,7 @@ func TestOpenSortieFile_FIFOAtSortiePathRefusedWithoutHanging(t *testing.T) {
 	ws := prepareWorkspace(t)
 	mustMkfifo(t, filepath.Join(ws, SortieDir, "f.txt"))
 
-	err := runWithDeadline(t, 5*time.Second, func() error {
+	err := runOnGoroutine(t, func() error {
 		_, err := OpenSortieFile(ws, "f.txt")
 		return err
 	})
@@ -84,8 +78,8 @@ func TestSeamDrivenSymlinkSwapChanged(t *testing.T) {
 		}
 		t.Cleanup(func() { seam = original })
 
-		if _, err := openDir(ws); !errors.Is(err, ErrChanged) {
-			t.Errorf("openDir(seam-swapped for symlink) = %v, want wrapping ErrChanged", err)
+		if _, err := OpenDir(ws); !errors.Is(err, ErrChanged) {
+			t.Errorf("OpenDir(seam-swapped for symlink) = %v, want wrapping ErrChanged", err)
 		}
 	})
 
@@ -102,9 +96,9 @@ func TestSeamDrivenSymlinkSwapChanged(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(ws, "child"), 0o750); err != nil {
 			t.Fatalf("Mkdir(child): %v", err)
 		}
-		parent, err := openDir(ws)
+		parent, err := OpenDir(ws)
 		if err != nil {
-			t.Fatalf("openDir: %v", err)
+			t.Fatalf("OpenDir: %v", err)
 		}
 		t.Cleanup(func() { parent.Close() }) //nolint:errcheck // test cleanup
 
@@ -133,9 +127,9 @@ func TestSeamDrivenSymlinkSwapChanged(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(ws, "f.txt"), []byte("original"), 0o600); err != nil {
 			t.Fatalf("WriteFile(f.txt): %v", err)
 		}
-		dir, err := openDir(ws)
+		dir, err := OpenDir(ws)
 		if err != nil {
-			t.Fatalf("openDir: %v", err)
+			t.Fatalf("OpenDir: %v", err)
 		}
 		t.Cleanup(func() { dir.Close() }) //nolint:errcheck // test cleanup
 

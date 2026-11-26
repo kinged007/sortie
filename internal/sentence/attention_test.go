@@ -2,6 +2,7 @@ package sentence
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -310,12 +311,12 @@ func TestAttentionTexts(t *testing.T) {
 			r.UnmeasuredSessions, r.StoppedInFlight = new(1), new(1)
 		}), nil, texts{
 			"Token budget reached",
-			"The issue has used at least 2.02M tokens and cache reads of its budget of 2M, and the budget stopped 1 session mid-run.",
+			"The issue has used at least 2.02M tokens of its budget of 2M, and the budget stopped 1 session mid-run.",
 			"Clears on the next poll tick after `agent.max_tokens` is raised above what the issue has used or is removed, or after the issue leaves the active tracker states.",
 		}},
 		{"token hold with a complete spend and no stopped session", budgetInput(func(r *orchestrator.SnapshotBudgetEntry) {
 			r.Reason, r.UsedTokens, r.BudgetTokens = "token_budget", new(int64(2_020_000)), 2_000_000
-		}), nil, texts{why: "The issue has used 2.02M tokens and cache reads of its budget of 2M."}},
+		}), nil, texts{why: "The issue has used 2.02M tokens of its budget of 2M."}},
 		{"session hold", budgetInput(nil), nil, texts{
 			"Session budget reached",
 			"The issue has used 3 sessions of its budget of 3.",
@@ -414,6 +415,38 @@ func TestAttentionTexts(t *testing.T) {
 				if part.want != "" && part.got != part.want {
 					t.Errorf("Attention(%s) %s = %q, want %q", tt.name, part.name, part.got, part.want)
 				}
+			}
+		})
+	}
+}
+
+func TestAttentionSpendWordingPerWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, window := range orchestrator.SpendWindows() {
+		t.Run(string(window), func(t *testing.T) {
+			t.Parallel()
+
+			snap := orchestrator.RuntimeSnapshotResult{SpendCeilings: []orchestrator.SpendCeilingStatus{
+				{Window: window, BudgetUSD: 7, UsedUSD: 7, Holding: true, ResetsAt: attentionAt},
+			}}
+
+			got := Attention(snap, nil, Context{})
+
+			if len(got) != 1 {
+				t.Fatalf("Attention(%s hold) = %d items, want 1", window, len(got))
+			}
+			wantPrefix := strings.ToUpper(string(window)[:1]) + string(window)[1:] + " "
+			if !strings.HasPrefix(got[0].ReasonText, wantPrefix) {
+				t.Errorf("Attention(%s hold) ReasonText = %q, want prefix %q", window, got[0].ReasonText, wantPrefix)
+			}
+			for _, text := range []string{got[0].WhyText, got[0].ClearsText} {
+				if text == fallbackText {
+					t.Errorf("Attention(%s hold) text = %q, want the window's wording", window, text)
+				}
+			}
+			if !strings.Contains(got[0].ClearsText, window.Setting()) {
+				t.Errorf("Attention(%s hold) ClearsText = %q, want it to name %q", window, got[0].ClearsText, window.Setting())
 			}
 		})
 	}

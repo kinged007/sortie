@@ -4,7 +4,8 @@ import (
 	"errors"
 	"io"
 	"testing"
-	"time"
+
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // failingWriter fails every write with err.
@@ -43,19 +44,14 @@ func TestConn_WriteFailureClosesOutbox(t *testing.T) {
 	if err := conn.Notify("first", nil); err != nil {
 		t.Fatalf("Notify() before any write failed = %v, want nil", err)
 	}
-	select {
-	case <-conn.WriteFailed():
-	case <-time.After(2 * time.Second):
-		t.Fatal("WriteFailed() did not close within 2s after the writer failed")
-	}
+	waittest.Receive(t, conn.WriteFailed(), "WriteFailed() close after the writer failed")
 
 	// failWrite closes the outbox just after writeFailedCh, so poll for
 	// the refusal rather than asserting on a single sample.
-	deadline := time.Now().Add(2 * time.Second)
-	for conn.outbox.Put(outboxItem{line: []byte("late\n")}) {
-		if time.Now().After(deadline) {
-			t.Fatal("outbox still accepted lines 2s after the write failure, want it refused once the writer goroutine exited")
+	waittest.Until(t, func() error {
+		if conn.outbox.Put(outboxItem{line: []byte("late\n")}) {
+			return errors.New("outbox still accepted a line after the write failure, want it refused once the writer goroutine exited")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return nil
+	})
 }

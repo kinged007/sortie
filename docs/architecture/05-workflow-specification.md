@@ -54,7 +54,7 @@ Note:
 
 - The workflow front matter is extensible. Optional extensions may define additional top-level keys (for example `server`) without changing the core schema above.
 - Extensions should document their field schema, defaults, validation rules, and whether changes apply dynamically or require restart.
-- Common extensions: `server.port` (integer) overrides the default HTTP server port (7678); `server.host` (string, IP address) overrides the default bind address (`127.0.0.1`). The HTTP server starts unconditionally unless `server.port` or `--port` is `0`. See Section 13.7 for full semantics.
+- Common extensions: `server.port` (integer) overrides the default HTTP server port (7678); `server.host` (string, IP address) overrides the default bind address (`127.0.0.1`). The HTTP server starts unconditionally unless `server.port` or `--port` is `0`. See Section 13.7 for full semantics. `token_rates` (map) holds the operator's rates, keyed by agent kind or by model name; `price_table` (object) governs the shared price tables beneath them: `embedded` (boolean, default `true`) keeps the table embedded in the binary in force, `fetch` (boolean, default `true`) governs the runtime download of the shared table from `fetch_url`, and `replace_file` names an operator table that replaces both shared tables, and `replace_url` names one that replaces them once a download of it has passed validation. Both keys reload live and are parsed whether or not the HTTP server is enabled. See Section 13.5 for the layers, their precedence, and how a run is priced.
 
 #### 5.3.1 `tracker` (object)
 
@@ -203,13 +203,14 @@ Fields:
 - `max_retry_backoff_ms` (integer or string integer)
   - Default: `300000` (5 minutes)
   - Changes should be re-applied at runtime and affect future retry scheduling.
+  - Caps the exponential backoff of a retry after an error. A refusal by a provider usage limit that reports a reset time in the future is the exception: the retry waits for the reset, past this cap, up to 7 days.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
   - An entry outside the range an integer setting accepts, positive or negative, is rejected when the configuration is parsed; other invalid entries (non-positive or non-numeric) are ignored.
 - `max_sessions` (integer)
   - Default: `0` (unlimited; no effort budget enforced).
-  - Maximum number of completed worker sessions for a single issue before the orchestrator stops re-dispatching it. Counted from `run_history` entries.
+  - Maximum number of completed worker sessions for a single issue before the orchestrator stops re-dispatching it. Counted from `run_history` entries, except a `usage_limited` entry: a run that a provider usage limit refused with a future reset time, and whose token figure records no output token, does not count. A refusal with no future reset time, after output, or on a run with no token figure, counts.
   - When the count reaches `max_sessions`, a warning is logged. The retry handler releases the claim it holds; the poll tick's own rebuild of the exhausted-issue set writes the candidate into that set instead, because a held candidate never held a claim to release.
   - `0` disables the budget (unlimited retries).
   - Changes are re-applied at runtime and affect future retry timer evaluations.
@@ -217,7 +218,7 @@ Fields:
   - Reaching the ceiling also posts one comment on the issue naming the session budget and `agent.max_sessions` as the setting that raises it.
 - `max_tokens` (integer)
   - Default: `0` (unlimited; no token budget enforced).
-  - Cumulative per-issue token ceiling. The orchestrator sums `total_tokens` across the issue's completed `run_history` entries, adds the running session's own reported spend, and stops re-dispatching once the sum reaches `max_tokens`.
+  - Cumulative per-issue token ceiling, counted in uncached tokens: a run's `total_tokens` less its `cache_read_tokens`, floored at zero, with cache writes counted (Section 13.5). Prompt-cache reads never count toward the ceiling. The orchestrator sums the uncached tokens of the issue's completed `run_history` entries, adds the running session's own uncached tokens, and stops re-dispatching once the sum reaches `max_tokens`.
   - Reaching the ceiling also stops a run already in flight, on the event loop, as soon as a usage figure carries the sum to the ceiling, not only at the next dispatch decision.
   - When the sum reaches `max_tokens`, a warning is logged, on the same two dispatch lanes and for the same reason `max_sessions` states above. A failed token query fails open, but not the same way on both lanes: the retry handler's check is skipped and dispatch proceeds for that issue, while the rebuild folds the prior set's entries for the failing axis forward unchanged and keeps the other axis fresh.
   - A run whose coding agent reported no token usage is recorded unmeasured and contributes nothing to the sum. A sum below `max_tokens` that includes at least one unmeasured run allows the dispatch and logs a warning naming the issue, the sum, the ceiling, and the unmeasured count.
@@ -225,6 +226,44 @@ Fields:
   - Changes are re-applied at runtime: a lowered ceiling reaches a run already in flight from the next poll tick onward, and it affects future retry timer evaluations.
   - Reaching the ceiling also posts one comment on the issue naming the token budget and `agent.max_tokens` as the setting that raises it, stating whether a session was stopped in flight.
   - `token_warning_percent`, below, warns before this ceiling stops a run.
+- `max_cost_usd` (number)
+  - Default: `0` (unlimited; no money ceiling enforced).
+  - Per-issue ceiling in US dollars on the issue's estimated cost: the recorded `estimated_cost_usd` of the issue's completed `run_history` entries plus the running session's live estimate (Section 13.5). A recorded cost never changes after its row is written, so a `token_rates` edit moves only the live estimate and the runs written afterward. The figure is Sortie's estimate under the layered price rates, not the provider's bill, and can differ from a cost the agent's runtime reports.
+  - Accepts a YAML integer, a YAML float, or a string a decimal parse accepts. A value that is not a number, a NaN, an infinity, or a negative number is a configuration error at parse time; a failed reload keeps the previous configuration. `0` or an absent key disables the ceiling.
+  - The ceiling is enforced on the three lanes `max_tokens` uses: the retry handler and the poll tick's rebuild block a re-dispatch, and the event loop stops a run already in flight as soon as a usage figure carries the issue's cost to the ceiling. The dispatch lanes read the issue's usage once and evaluate both the token and the money axis from that read (Section 8.4). Money is compared in whole micro-dollars, so a float sum that equals the ceiling reaches it.
+  - The figure is complete only when every run that spent tokens is priced in full. A run recorded `unpriced` or `unmeasured` contributes nothing, a run recorded `partial` contributes what was priced, and the figure is then a lower bound that every surface marks as incomplete. A figure below the ceiling that is incomplete allows the dispatch and logs a warning naming the issue, the figure, the ceiling, and the counts of unmeasured, partial, and unpriced runs. A failed usage query fails open on both dispatch lanes, as the token axis does.
+  - When one evaluation finds more than one ceiling reached, the reported and recorded reason follows the order `money_budget`, `token_budget`, `session_budget`. The block itself is identical whichever ceiling triggered it.
+  - A stop lands at the next usage figure the agent reports: about one usage event for an agent kind that reports usage incrementally, and a whole turn for a kind that reports at turn end. The run can therefore pass the ceiling by what the agent spends before that report, and operators leave headroom. A run recorded `budget_stopped` carries the error `money ceiling reached: used <amount> of <ceiling>`.
+  - Two preflight warnings apply while the ceiling is above `0`, and neither blocks dispatch: `agent.max_cost_usd.no_usage_reporting` when an agent kind the configuration reaches reports no token usage, so the ceiling cannot be reached for it, and `agent.max_cost_usd.no_rate_source` when no price source is configured, so no run can be priced (Section 6.3). The service keeps dispatching under either configuration, including after a live reload; the ceiling holds no issue whose figure stays unmeasured or unpriced.
+  - Overridable through `SORTIE_AGENT_MAX_COST_USD`. `0` disables the ceiling.
+  - Changes are re-applied at runtime: a lowered ceiling reaches a run already in flight from its next usage figure onward, and it affects future retry timer evaluations and poll tick rebuilds.
+  - Reaching the ceiling also posts one comment on the issue naming the money budget and `agent.max_cost_usd` as the setting that raises it, stating the issue's estimated cost against the ceiling (prefixed `at least` when the figure is a lower bound) and whether a session was stopped in flight.
+  - There is no money counterpart of `token_warning_percent`; that threshold applies to `max_tokens` only.
+- `max_daily_cost_usd` (number)
+  - Default: `0` (unlimited; no daily spend ceiling enforced).
+  - Instance-wide ceiling in US dollars on the estimated cost of the current UTC calendar day, which runs from 00:00 UTC to the next 00:00 UTC. The window's spend is the recorded `estimated_cost_usd` of every `run_history` entry that completed in the window, whichever day the run started, plus the live estimate of the sessions running now (Section 13.5). It is the figure the per-issue money ceiling folds, taken over the window's runs instead of one issue's. A recorded cost never changes after its row is written, so a `token_rates` edit, a reload, a restart, or a price table download leaves the recorded part of a window unchanged and moves only the live estimate of the sessions running. The figure is Sortie's estimate under the layered price rates, not the provider's bill.
+  - Accepts what `max_cost_usd` accepts, and a bad value is a configuration error at parse time under the same rules. `0` or an absent key disables the ceiling. It is independent of `max_cost_usd`, `max_weekly_cost_usd`, and `max_monthly_cost_usd`: each can be set without the others.
+  - While the window's spend has reached the ceiling, Sortie starts no new agent session for any issue: every poll tick holds each candidate that would otherwise dispatch, and every retry timer fire, a pull request reaction continuation included, is re-armed instead of starting a worker. A held retry keeps its attempt count, error, claim, and persisted entry, and fires again one `polling.interval_ms` later (Section 8.4). Sessions already running, their later turns, and their continuations finish, so the window's final spend can pass the ceiling by what they spend. Polling, reconciliation, reaction checks, and the per-issue ceilings keep running.
+  - Money is compared in whole micro-dollars, so a float sum that equals the ceiling reaches it.
+  - The figure is complete only when every run that spent tokens and every session running is priced in full. A run recorded `unpriced` or `unmeasured` contributes nothing, a run recorded `partial` contributes what was priced, a running session whose agent reports no usage figure contributes nothing, and the figure is then a lower bound that every surface marks as incomplete. A lower bound below the ceiling allows dispatch and logs one warning per window start. A running session that has reported nothing yet adds nothing and keeps the figure complete. A failed read of the window keeps the window's last result.
+  - The evaluation runs on the poll tick and on every retry timer fire, so a change applies at the next of them. The hold lifts without operator action when the UTC day ends, and when a reload raises the ceiling above the spend or sets it to `0`.
+  - Reaching the ceiling logs one warning, raises one `critical` attention item for the window (Section 13.7.2), and appears on the state API as `spend_ceiling`. The hold posts no tracker comment and emits no `budget.held` event.
+  - The preflight warns while the ceiling is above `0`, and neither warning blocks dispatch: `agent.max_daily_cost_usd.no_usage_reporting` when an agent kind the configuration reaches reports no token usage, so the ceiling counts none of its spend, and `agent.max_daily_cost_usd.no_rate_source` when no price source is configured, so no run can be priced (Section 6.3).
+  - Overridable through `SORTIE_AGENT_MAX_DAILY_COST_USD`. `0` disables the ceiling.
+  - Changes are re-applied at runtime from the next poll tick or retry timer fire.
+- `max_weekly_cost_usd` (number)
+  - Default: `0` (unlimited; no weekly spend ceiling enforced).
+  - Instance-wide ceiling in US dollars on the estimated cost of the current UTC week, which runs from 00:00 UTC on Monday to 00:00 UTC on the next Monday. The spend, the completeness rules, the hold, and what the hold does not stop are those of `max_daily_cost_usd`, over the week's runs. A run counts in the week that holds its completion time, so a run that crosses Monday 00:00 UTC counts in full in the new week.
+  - The preflight warns while the ceiling is above `0`, and neither warning blocks dispatch: `agent.max_weekly_cost_usd.no_usage_reporting` and `agent.max_weekly_cost_usd.no_rate_source`, on the conditions of the daily ceiling (Section 6.3).
+  - Overridable through `SORTIE_AGENT_MAX_WEEKLY_COST_USD`. `0` disables the ceiling.
+  - Changes are re-applied at runtime from the next poll tick or retry timer fire.
+- `max_monthly_cost_usd` (number)
+  - Default: `0` (unlimited; no monthly spend ceiling enforced).
+  - Instance-wide ceiling in US dollars on the estimated cost of the current UTC calendar month, which runs from 00:00 UTC on the 1st to 00:00 UTC on the 1st of the next month. The spend, the completeness rules, the hold, and what the hold does not stop are those of `max_daily_cost_usd`, over the month's runs.
+  - While more than one window holds, the reason is that of the holding window whose reset is latest, because dispatch resumes only once every holding window clears; on equal resets it is that of the longer window, monthly before weekly before daily.
+  - The preflight warns while the ceiling is above `0`, and neither warning blocks dispatch: `agent.max_monthly_cost_usd.no_usage_reporting` and `agent.max_monthly_cost_usd.no_rate_source`, on the conditions of the daily ceiling (Section 6.3).
+  - Overridable through `SORTIE_AGENT_MAX_MONTHLY_COST_USD`. `0` disables the ceiling.
+  - Changes are re-applied at runtime from the next poll tick or retry timer fire.
 - `token_warning_percent` (integer)
   - Default: `0` (off).
   - Must be between `0` and `99`; rejected as a configuration error at parse time otherwise. It is never validated against `agent.max_tokens`, so lowering the ceiling can never make this field reject a reload.
@@ -584,7 +623,7 @@ dispatch:
 
 #### 5.3.10 `notifications` (list, optional)
 
-The `notifications` list configures every outbound message Sortie sends to a destination other than the issue's own tracker fields: Slack and webhook backends, and the built-in `tracker_comment` destination that posts comments on the tracker issue. Each entry names the event types it receives. Two producers feed the list: the agent, through the `notify_operator` tool (Section 10.4.5), which produces `agent.message`, and the orchestrator, which produces every other event in the catalog below (Section 10.4.7). The tool is registered only when at least one entry receives `agent.message`, so the agent is never offered a tool it cannot use.
+The `notifications` list configures every outbound message Sortie sends to a destination other than the issue's own tracker fields: Slack, Telegram, Discord, and webhook backends, and the built-in `tracker_comment` destination that posts comments on the tracker issue. Each entry names the event types it receives. Two producers feed the list: the agent, through the `notify_operator` tool (Section 10.4.5), which produces `agent.message`, and the orchestrator, which produces every other event in the catalog below (Section 10.4.7). The tool is registered only when at least one entry receives `agent.message`, so the agent is never offered a tool it cannot use.
 
 The value is a sequence, not a single object. Each entry is a map carrying a required `kind` discriminator, an `events` list, and that backend's own fields. A second channel is a second list entry.
 
@@ -596,6 +635,13 @@ notifications:
     webhook_url: $SORTIE_SLACK_WEBHOOK_URL
     events: [agent.message, session.stopped, session.failed]
     max_per_session: 20
+  - kind: telegram
+    bot_token: $SORTIE_TELEGRAM_BOT_TOKEN
+    chat_id: -1001234567890
+    events: [agent.message, session.failed]
+  - kind: discord
+    webhook_url: $SORTIE_DISCORD_WEBHOOK_URL
+    events: [agent.message, session.failed]
   - kind: webhook
     url: $SORTIE_OPS_WEBHOOK_URL
     events: [session.started, session.completed, session.stopped, session.failed]
@@ -604,7 +650,7 @@ notifications:
 Per-entry fields:
 
 - `kind` (string)
-  - Required. The registry discriminator, resolved against the notifier registry (Section 10.4.7). v1 backends are `webhook` and `slack`. The reserved value `tracker_comment` selects the built-in destination and is not a registry entry.
+  - Required. The registry discriminator, resolved against the notifier registry (Section 10.4.7). v1 backends are `webhook`, `slack`, `telegram`, and `discord`. The reserved value `tracker_comment` selects the built-in destination and is not a registry entry.
 - `events` (list of strings)
   - The event types the entry receives, listed explicitly. There is no wildcard and no filter beyond the event type.
   - Optional on a registered kind: an entry that omits it receives `agent.message` only, as every entry did before the key existed, and draws a deprecation advisory that suggests `events: [agent.message]`.
@@ -613,24 +659,24 @@ Per-entry fields:
 - `max_per_session` (integer, optional)
   - The `notify_operator` call cap for the whole agent run, shared by every tool server process of the dispatch (Section 10.4.5). It is not a per-entry default: an omitted, `null`, or `0` value contributes nothing to cap selection, which then falls back to the default of `20` only when every entry that receives `agent.message` is `0` or unset. `0` never means unlimited. A negative value is rejected at config parse time. The value has no effect on an entry that does not receive `agent.message`, and an orchestrator event never counts against it.
 - backend-specific fields
-  - Passed through to the backend constructor untyped, with `$VAR` references resolved. The `webhook` backend requires `url`; the `slack` backend requires `webhook_url`. A `tracker_comment` entry carries no key other than `kind` and `events`.
+  - Passed through to the backend constructor untyped, with `$VAR` references resolved. The `webhook` backend requires `url`; the `slack` backend requires `webhook_url`; the `telegram` backend requires `bot_token` and `chat_id`, which is an integer or a string; the `discord` backend requires `webhook_url`. A `tracker_comment` entry carries no key other than `kind` and `events`.
 
 **Event catalog.** The catalog is closed and lives in the domain model. Validation accepts exactly these names.
 
 | Event type | Meaning |
 |---|---|
-| `session.started` | A session was dispatched on an issue whose dispatch drives issue state |
+| `session.started` | A session was dispatched on an issue whose dispatch drives issue state. A retry that follows a run refused by a provider usage limit publishes none |
 | `session.completed` | A worker exited normally |
 | `session.stopped` | A worker exited on a soft stop: `blocked`, `needs-human-review`, or `no-change-needed`; it carries the agent's reason when the agent wrote one (Section 21.1) |
-| `session.failed` | A worker exited with an error, or its handoff was withheld by the evidence verdict |
+| `session.failed` | A worker exited with an error, or its handoff was withheld by the evidence verdict. When a provider usage limit refuses an issue's runs one after another, only the first refusal publishes it |
 | `escalation.ci_failure`, `escalation.review_comments`, `escalation.bot_review`, `escalation.merge_conflicts`, `escalation.auto_merge`, `escalation.merge_completion` | The matching reaction (Section 5.3.8) handed its subject to a person, under any `escalation` value |
-| `auto_merge.merged` | The auto-merge reaction merged a pull request |
-| `budget.held` | An issue was held out of dispatch by `agent.max_sessions` or `agent.max_tokens` |
+| `auto_merge.merged` | The auto-merge reaction merged a pull request, or its merge call found the pull request already merged |
+| `budget.held` | An issue was held out of dispatch by `agent.max_sessions`, `agent.max_tokens`, or `agent.max_cost_usd` |
 | `stage.advanced` | A stage hop was made: the issue moved to the next stage, whether or not every old stage label was removed |
 | `stage.not_advanced` | A stage hop was due and not made, because the next stage's label could not be added or the hop ceiling was reached; the event carries the reason |
 | `agent.message` | The agent called `notify_operator` |
 
-**The `tracker_comment` destination.** The destination posts an event's body as a comment on the event's issue through the tracker adapter, and renders nothing else of the event except the agent's reason on a `session.stopped` event, which it posts after the body as one literal block (Section 10.4.7, Section 21.1). It is available only when `tracker.kind` is configured. At most one entry has this kind. The destination receives the union of three sets: the `events` of its explicit entry, the subscriptions synthesized from `tracker.comments` and from `escalation: comment` (Section 5.3.1, Section 5.3.8), and, while no explicit entry exists, implicit subscriptions to `auto_merge.merged` and `budget.held`. The union is monotone: writing the new form never withdraws a comment an old key enabled, and one event is delivered at most once to a destination however many subscriptions select it. An operator who keeps `tracker.comments.on_completion: true` and also lists `session.completed` on a `tracker_comment` entry gets one comment per completion.
+**The `tracker_comment` destination.** The destination posts an event's body as a comment on the event's issue through the tracker adapter, and renders nothing else of the event except the agent's reason on a `session.stopped` event, which it posts after the body, separated by a blank line (Section 10.4.7, Section 21.1). It is available only when `tracker.kind` is configured. At most one entry has this kind. The destination receives the union of three sets: the `events` of its explicit entry, the subscriptions synthesized from `tracker.comments` and from `escalation: comment` (Section 5.3.1, Section 5.3.8), and, while no explicit entry exists, implicit subscriptions to `auto_merge.merged` and `budget.held`. The union is monotone: writing the new form never withdraws a comment an old key enabled, and one event is delivered at most once to a destination however many subscriptions select it. An operator who keeps `tracker.comments.on_completion: true` and also lists `session.completed` on a `tracker_comment` entry gets one comment per completion.
 
 **An explicit entry is authoritative for the two formerly ungated comments.** The auto-merge success comment and the budget-hold comment were posted without any configuration gate. They keep posting through implicit subscriptions only while no `tracker_comment` entry exists. An entry is the operator's own statement of what the issue receives, so it receives `auto_merge.merged` and `budget.held` only when it lists them. With no tracker configured no implicit destination exists.
 
@@ -676,7 +722,7 @@ notifications:
     events: [agent.message]
 ```
 
-**Delivery.** The orchestrator delivers its events to Slack and webhook destinations from the main process. A destination for orchestrator events is an entry of a registered kind whose `events` hold at least one orchestrator event; the main process builds it with the backend constructor the sidecar uses. A failed delivery to one destination is logged and does not prevent delivery to the others, and nothing is retried (Section 10.4.7). The orchestrator never claims a notification slot, so its events cannot interact with the `notify_operator` cap.
+**Delivery.** The orchestrator delivers its events to backend destinations from the main process. A destination for orchestrator events is an entry of a registered kind whose `events` hold at least one orchestrator event; the main process builds it with the backend constructor the sidecar uses. A failed delivery to one destination is logged and does not prevent delivery to the others, and nothing is retried (Section 10.4.7). The orchestrator never claims a notification slot, so its events cannot interact with the `notify_operator` cap.
 
 Validation and resolution:
 
@@ -691,7 +737,7 @@ Validation and resolution:
 - `tracker.comments.on_dispatch`, `on_completion`, or `on_failure` resolves to `true`, from the file or from its environment override.
 - A reaction with a non-empty `provider` among `ci_failure`, `review_comments`, `bot_review`, `merge_conflicts`, `auto_merge`, and `merge_completion` sets `escalation: comment`.
 - `tracker.kind` is configured, no `tracker_comment` entry exists, and `reactions.auto_merge.provider` is non-empty: the auto-merge success comment posts only through the implicit subscription.
-- `tracker.kind` is configured, no `tracker_comment` entry exists, and `agent.max_sessions` or `agent.max_tokens` is above `0`: the budget-hold comment posts only through the implicit subscription.
+- `tracker.kind` is configured, no `tracker_comment` entry exists, and `agent.max_sessions`, `agent.max_tokens`, or `agent.max_cost_usd` is above `0`: the budget-hold comment posts only through the implicit subscription.
 - An entry that is not `tracker_comment` omits `events`.
 
 No removal date or removal version is set for any deprecated form.
@@ -725,17 +771,25 @@ Template input variables:
   - `previous` (string): the name of the rule whose hop led to this dispatch; filled when the dispatch selects the target of the issue's latest hop and the hop count has not reset since; otherwise empty.
   - `previous_outcome` (string): `succeeded`, or `no_change` when the previous stage's run declared that the requested outcome already held; empty when `previous` is empty.
   - `previous` and `previous_outcome` are frozen with the dispatch selection, so a retry or reaction continuation renders the pair its first dispatch rendered, also after a restart.
+- `park` (object or null)
+  - Always present as a key, so a template that references it never fails; null except on turn 1 of the first run after a person releases a park, which a label removal or a state change does.
+  - `reason` (string): `agent_blocked` or `handoff_absence`.
+  - `statement` (string): the stop statement of the run the park follows; empty when that run declared none.
+  - `parked_at` and `released_at` (strings): RFC 3339 times in UTC, whole seconds.
+  - `gesture` (string): `label_removed` or `state_changed`.
+  - `comments` (list, never null): the comments created since the park, oldest first, each with `id`, `author`, `body`, and `created_at`.
 
 Define blocks and calls:
 
 - A prompt template calls the define blocks of every partial (§5.3.9) and its own with the built-in `template` action. The FuncMap gains no entry for it.
-- A define block executes with the value its call passes as dot, and `$` inside it is that value; the engine has no dynamic scoping. `{{ template "name" . }}` outside every `range` and `with` body passes the whole input data, `issue`, `attempt`, `run`, `stage`, and every continuation key included. A call without an argument passes nil, and any field reference in the block then fails the render.
+- A define block executes with the value its call passes as dot, and `$` inside it is that value; the engine has no dynamic scoping. `{{ template "name" . }}` outside every `range` and `with` body passes the whole input data, `issue`, `attempt`, `run`, `stage`, `park`, and every continuation key included. A call without an argument passes nil, and any field reference in the block then fails the render.
 - A define block executes under the same strict rules as the template that calls it: an unknown variable or function fails the render.
 - An undefined call, a name defined twice, and text outside a define block of a partial are `template_parse_error` at load, never at render. Each is located at the file and line that hold it.
 
 Fallback prompt behavior:
 
 - If the workflow prompt body is empty, the runtime may use a minimal default prompt.
+- On a reaction run, a blank render, or one that ignores the run's continuation key, yields the built-in prompt of that key on any turn, and the minimal default prompt applies to other runs only.
 - Workflow file read/parse failures are configuration/validation errors and should not silently fall back to a prompt.
 
 ### 5.5 Workflow Validation and Error Surface

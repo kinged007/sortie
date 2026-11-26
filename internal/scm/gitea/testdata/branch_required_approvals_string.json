@@ -1,0 +1,9 @@
+{
+  "name": "main",
+  "commit": { "id": "sha-base-001", "message": "Merge pull request #5\n" },
+  "protected": true,
+  "required_approvals": "1",
+  "enable_status_check": false,
+  "user_can_push": false,
+  "user_can_merge": true
+}

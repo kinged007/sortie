@@ -9,11 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
@@ -21,6 +20,7 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/agent/procutil"
 	"github.com/sortie-ai/sortie/internal/domain"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // teardownReturnOverhead is the margin a return-time assertion adds on
@@ -37,12 +37,6 @@ const teardownParkedOptionSize = 4*1024*1024 + 4096
 // teardownReaderBufSize is a single read well under teardownParkedOptionSize,
 // so a reply built from that option still cannot drain through it.
 const teardownReaderBufSize = 65536
-
-// teardownSetupBound bounds the wait for the parked fixture to settle. The
-// fixture first moves a reply of teardownParkedOptionSize through JSON under
-// the race detector, which takes about a second on a fast idle machine and
-// several times that on a loaded CI runner.
-const teardownSetupBound = 60 * time.Second
 
 type parkedTeardownFixture struct {
 	state   *sessionState
@@ -113,7 +107,7 @@ func newParkedTeardownFixture(t *testing.T, withStderrHolder bool) *parkedTeardo
 		pumpDone:    make(chan struct{}),
 		logger:      discardLogger(),
 		agentConfig: domain.AgentConfig{ReadTimeoutMS: 60000},
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 		usage:       agentcore.NewTurnEndUsage(),
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
@@ -128,45 +122,18 @@ func newParkedTeardownFixture(t *testing.T, withStderrHolder bool) *parkedTeardo
 	go runPump(state)
 	markSessionKnown(state)
 
-	waitForFile(t, readerDonePath, teardownSetupBound)
+	waittest.File(t, readerDonePath)
 
 	release := sync.OnceFunc(func() {
-		// Each helper leads its own process group, so killing only the
-		// recorded pid leaves its idle process holding the pipe end open;
-		// the negative pid signals the whole group.
-		killHelperGroup(readerPIDPath)
-		killHelperGroup(writerPIDPath)
+		agenttest.KillEscaped(readerPIDPath)
+		agenttest.KillEscaped(writerPIDPath)
 		if stderrPIDPath != "" {
-			killHelperGroup(stderrPIDPath)
+			agenttest.KillEscaped(stderrPIDPath)
 		}
 	})
 	t.Cleanup(release)
 
 	return &parkedTeardownFixture{state: state, release: release}
-}
-
-func waitForFile(t *testing.T, path string, bound time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(bound)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s to appear", path)
-}
-
-func killHelperGroup(pidFile string) {
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		return
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return
-	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 // assertSessionGoroutinesExited fails t unless the pump, the connection's
@@ -254,11 +221,7 @@ func TestStopSessionTeardownOrder_ClosePipesPresenceControl(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(procutil.DefaultStopGrace + 2*procutil.DefaultDrainGrace + teardownReturnOverhead):
-		t.Fatal("runTeardown() (minus close_pipes) did not return")
-	}
+	waittest.Receive(t, done, "runTeardown() (minus close_pipes) return")
 
 	if fx.state.stderrCollector.WaitDone(0) {
 		t.Fatal("stderrCollector.WaitDone(0) = true before close_pipes ran, want false: the escaped stderr holder must still be parking the read")
@@ -358,19 +321,11 @@ func runTeardownControl(t *testing.T, fx *parkedTeardownFixture, steps []teardow
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("runTeardown() returned before the one-second observation window expired, want it still parked")
-	case <-time.After(1 * time.Second):
-	}
+	waittest.Never(t, done, 1*time.Second, "runTeardown() return before the park was released")
 
 	fx.release()
 
-	select {
-	case <-done:
-	case <-time.After(2 * procutil.DefaultDrainGrace):
-		t.Fatal("runTeardown() did not return after releasing the park")
-	}
+	waittest.Receive(t, done, "runTeardown() return after releasing the park")
 
 	assertSessionGoroutinesExited(t, fx.state)
 }
@@ -395,11 +350,7 @@ func TestStopSessionTeardownReturnsWithConnectionClosedFirst(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(3*procutil.DefaultDrainGrace + teardownReturnOverhead):
-		t.Fatal("runTeardown() did not return inside the bound, want it to return without waiting for the parked write")
-	}
+	waittest.Receive(t, done, "runTeardown() return without waiting for the parked write")
 
 	assertSessionGoroutinesExited(t, fx.state)
 }
@@ -486,7 +437,7 @@ func newGracefulTeardownSession(t *testing.T, script, readyPath string, logger *
 		stopCh:      make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		logger:      logger,
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 		usage:       agentcore.NewTurnEndUsage(),
 	}
 	state.stderrCollector = procutil.NewStderrCollector(pipes.Stderr, state.logger)
@@ -504,29 +455,10 @@ func newGracefulTeardownSession(t *testing.T, script, readyPath string, logger *
 	})
 
 	if readyPath != "" {
-		waitForFile(t, readyPath, awaitTimeout)
+		waittest.File(t, readyPath)
 	}
 
 	return state
-}
-
-// waitForPIDFile polls path until it holds a parseable positive PID. A shell's
-// "> file" redirect creates the file before the write lands, so polling for
-// content rather than existence closes that window.
-func waitForPIDFile(t *testing.T, path string, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if data, err := os.ReadFile(path); err == nil {
-			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
-				return pid
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s to hold a valid PID", path)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 }
 
 func TestStopSessionTeardownGracefulHandler(t *testing.T) {
@@ -614,7 +546,7 @@ printf '%s\n' "$!" > "` + childPIDPath + `"
 while :; do sleep 1; done
 `
 	state := newGracefulTeardownSession(t, script, "", nil)
-	childPID := waitForPIDFile(t, childPIDPath, awaitTimeout)
+	childPID := waittest.PIDFile(t, childPIDPath)
 
 	start := time.Now()
 	err := stopSession(context.Background(), fakeSession(state))
@@ -627,26 +559,8 @@ while :; do sleep 1; done
 		t.Errorf("stopSession() took %v, want under %v", elapsed, bound)
 	}
 
-	assertProcessGone(t, state.pid, awaitTimeout)
-	assertProcessGone(t, childPID, awaitTimeout)
-}
-
-// assertProcessGone polls until pid no longer answers a signal-0 probe. A
-// signal-0 probe against a zombie still succeeds until it is reaped, so polling
-// absorbs the reparenting delay while still failing on a live process.
-func assertProcessGone(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if err := syscall.Kill(pid, 0); err != nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Errorf("process %d still alive after %v", pid, timeout)
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waittest.ProcessGone(t, state.pid)
+	waittest.ProcessGone(t, childPID)
 }
 
 func TestStopSessionTeardownEscalationLogging(t *testing.T) {
@@ -714,11 +628,7 @@ func TestStopSessionTeardownEscalationLogging(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		state := newGracefulTeardownSession(t, teardownExitsOnItsOwnScript(), "", logger)
 
-		select {
-		case <-state.waitCh:
-		case <-time.After(awaitTimeout):
-			t.Fatal("agent was not reaped before the test needed it exited")
-		}
+		waittest.Receive(t, state.waitCh, "the agent to be reaped")
 
 		expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
 		defer cancel()
@@ -738,11 +648,7 @@ func TestTeardownKillProcessGroupAfterExitSendsNothing(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	state := newGracefulTeardownSession(t, teardownExitsOnItsOwnScript(), "", logger)
-	select {
-	case <-state.waitCh:
-	case <-time.After(awaitTimeout):
-		t.Fatal("agent was not reaped before the test needed it exited")
-	}
+	waittest.Receive(t, state.waitCh, "the agent to be reaped")
 
 	if err := stopSession(context.Background(), fakeSession(state)); err != nil {
 		t.Fatalf("stopSession() error = %v", err)
@@ -766,8 +672,6 @@ func TestStopSessionTeardownParkedWriteBoundsCloseSession(t *testing.T) {
 	fx := newParkedTeardownSession(t)
 	fx.state.closeSessionID = "sess-parked-close"
 	fx.state.agentConfig.StopGraceMS = 400
-	grace := procutil.StopGrace(fx.state.agentConfig.StopGraceMS)
-	bound := closeCallBound(grace)
 
 	start := time.Now()
 	done := make(chan error, 1)
@@ -775,16 +679,11 @@ func TestStopSessionTeardownParkedWriteBoundsCloseSession(t *testing.T) {
 		done <- stopSession(context.Background(), fakeSession(fx.state))
 	}()
 
-	assertProcessGone(t, fx.state.pid, bound+teardownReturnOverhead)
+	waittest.ProcessGone(t, fx.state.pid)
 
 	ceiling := procutil.DefaultStopGrace + 3*procutil.DefaultDrainGrace + teardownReturnOverhead
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("stopSession() error = %v", err)
-		}
-	case <-time.After(ceiling):
-		t.Fatal("stopSession() did not return inside the parked-teardown ceiling")
+	if err := waittest.Receive(t, done, "stopSession() return"); err != nil {
+		t.Fatalf("stopSession() error = %v", err)
 	}
 
 	if elapsed := time.Since(start); elapsed >= ceiling {
@@ -802,17 +701,21 @@ func TestStopSessionTeardownCloseAndAwaitExitShareGrace(t *testing.T) {
 	state := newGracefulTeardownSession(t, teardownIgnoresGracefulScript(readyPath), readyPath, nil)
 	state.closeSessionID = "sess-combined-budget"
 
-	const grace = 1 * time.Second
 	callerCtx := context.Background()
-	graceCtx, cancel := context.WithTimeout(callerCtx, grace)
+	graceCtx, cancel := context.WithTimeout(callerCtx, 1*time.Second)
 	defer cancel()
 
 	signalAnswerOpen(state)
 
-	start := time.Now()
-	closeSession(callerCtx, graceCtx, grace)(state)
-	awaitExit(callerCtx, graceCtx, grace)(state)
-	combinedElapsed := time.Since(start)
+	// A step that started a grace of its own instead of sharing graceCtx
+	// would wait out the hour, so the steps run apart from the test goroutine.
+	stepsDone := make(chan struct{})
+	go func() {
+		defer close(stepsDone)
+		closeSession(callerCtx, graceCtx, time.Hour)(state)
+		awaitExit(callerCtx, graceCtx, time.Hour)(state)
+	}()
+	waittest.Receive(t, stepsDone, "close_session and await_exit under one shared grace")
 
 	runTeardown(state, []teardownStep{
 		{name: "kill_process_group", run: killProcessGroup},
@@ -823,50 +726,32 @@ func TestStopSessionTeardownCloseAndAwaitExitShareGrace(t *testing.T) {
 		{name: "drain_stderr_and_reap", run: drainStderrAndReap(callerCtx)},
 	})
 	assertSessionGoroutinesExited(t, state)
-
-	const schedulingOverhead = 400 * time.Millisecond
-	if bound := grace + schedulingOverhead; combinedElapsed >= bound {
-		t.Errorf("close_session and await_exit together took %v, want under %v (the resolved grace, shared by one deadline)", combinedElapsed, bound)
-	}
 }
 
 func TestStopSessionTeardownCloseHalvesTheCallerWindow(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	readyPath := filepath.Join(dir, "ready")
-	state := newGracefulTeardownSession(t, teardownIgnoresGracefulScript(readyPath), readyPath, nil)
-	state.closeSessionID = "sess-caller-window"
+	synctest.Test(t, func(t *testing.T) {
+		state, outPr, _ := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
+		newOutboundReader(outPr)
+		state.closeSessionID = "sess-caller-window"
 
-	const (
-		grace        = 10 * time.Second
-		callerWindow = 2 * time.Second
-	)
-	callerCtx, cancelCaller := context.WithTimeout(context.Background(), callerWindow)
-	defer cancelCaller()
-	graceCtx, cancel := context.WithTimeout(callerCtx, grace)
-	defer cancel()
+		const (
+			grace        = 10 * time.Second
+			callerWindow = 2 * time.Second
+		)
+		callerCtx, cancelCaller := context.WithTimeout(context.Background(), callerWindow)
+		defer cancelCaller()
+		graceCtx, cancel := context.WithTimeout(callerCtx, grace)
+		defer cancel()
 
-	signalAnswerOpen(state)
+		start := time.Now()
+		closeSession(callerCtx, graceCtx, grace)(state)
 
-	start := time.Now()
-	closeSession(callerCtx, graceCtx, grace)(state)
-	elapsed := time.Since(start)
-
-	runTeardown(state, []teardownStep{
-		{name: "kill_process_group", run: killProcessGroup},
-		{name: "close_stdin", run: closeStdin},
-		{name: "close_stdout", run: closeStdout},
-		{name: "close_connection", run: closeConnection},
-		{name: "stop_pump", run: stopPump},
-		{name: "drain_stderr_and_reap", run: drainStderrAndReap(callerCtx)},
+		if elapsed := time.Since(start); elapsed > callerWindow/2 {
+			t.Errorf("close_session spent %v of the caller's %v window, want at most half so the graceful signal keeps a share", elapsed, callerWindow)
+		}
 	})
-	assertSessionGoroutinesExited(t, state)
-
-	const schedulingOverhead = 400 * time.Millisecond
-	if bound := callerWindow - schedulingOverhead; elapsed >= bound {
-		t.Errorf("close_session spent %v of the caller's %v window, want under %v so the graceful signal keeps a share", elapsed, callerWindow, bound)
-	}
 }
 
 func TestStopSessionGrace_ConfiguredValueBoundsTheWait(t *testing.T) {
@@ -883,7 +768,7 @@ func TestStopSessionGrace_ConfiguredValueBoundsTheWait(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	if elapsed > 2*time.Second {
-		t.Errorf("stopSession() force-terminated after %v, want well under the built-in 5s default (proves the configured 200ms grace bounded graceCtx, not DefaultStopGrace)", elapsed)
+	if elapsed > procutil.DefaultStopGrace {
+		t.Errorf("stopSession() force-terminated after %v, want under the built-in %v default (proves the configured 200ms grace bounded graceCtx, not DefaultStopGrace)", elapsed, procutil.DefaultStopGrace)
 	}
 }

@@ -6,15 +6,18 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agentcore"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
 	"github.com/sortie-ai/sortie/internal/agent/agenttest/dispositiontest"
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
 	"github.com/sortie-ai/sortie/internal/typeutil"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 func TestStartSessionWrongTypedMCPConfigFailsBeforeLaunch(t *testing.T) {
@@ -72,7 +75,7 @@ func TestRunTurnFinalize(t *testing.T) {
 				promptID := out.awaitMethod(t, methodSessionPrompt)
 				respondLine(t, inPw, promptID, promptResponse{StopReason: tt.reason})
 
-				outcome := awaitOutcome(t, outcomeCh)
+				outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 				want := stopReasonEvidence(tt.reason)
 				dispositiontest.AssertDispositionContract(t, want, outcome.result, outcome.err)
 				agenttest.AssertSessionIDContract(t, []string{fakeSession(state).ID}, events, outcome.result)
@@ -97,7 +100,7 @@ func TestRunTurnFinalize(t *testing.T) {
 
 		respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonCancelled})
 
-		outcome := awaitOutcome(t, outcomeCh)
+		outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 		dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
 			Terminal: agentcore.TerminalCancelled,
 			Work:     agentcore.WorkAbsent,
@@ -135,7 +138,7 @@ func TestRunTurnFinalize(t *testing.T) {
 		}
 
 		respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
-		firstOutcome := awaitOutcome(t, firstOutcomeCh)
+		firstOutcome := waittest.Receive(t, firstOutcomeCh, "turn outcome")
 		if firstOutcome.err != nil {
 			t.Fatalf("first RunTurn() error = %v, want nil: the rejected concurrent call must not disturb it", firstOutcome.err)
 		}
@@ -169,7 +172,7 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 			state := &sessionState{
 				agentConfig: domain.AgentConfig{ReadTimeoutMS: 50},
 				inbox:       jsonrpc.NewInbox[pumpItem](),
-				caps:        newCapabilityRecord(false, false),
+				caps:        newCapabilityRecord(),
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
@@ -182,7 +185,7 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 				cancel()
 			}
 
-			outcome := awaitOutcome(t, outcomeCh)
+			outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 
 			if tt.wantErr != nil {
 				if !errors.Is(outcome.err, tt.wantErr) {
@@ -198,14 +201,8 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 				}
 			}
 
-			select {
-			case <-state.inbox.Ready():
-				item, ok := state.inbox.Take()
-				if !ok || item.control == nil || item.control.startTurn == nil {
-					t.Fatalf("runTurn() queued item = %+v, ok=%v, want a startTurn control", item, ok)
-				}
-			case <-time.After(awaitTimeout):
-				t.Fatal("runTurn() queued no startTurn control, want it put before the verdict wait")
+			if item := takeQueuedItem(t, state); item.control == nil || item.control.startTurn == nil {
+				t.Fatalf("runTurn() queued item = %+v, want a startTurn control", item)
 			}
 		})
 	}
@@ -213,11 +210,7 @@ func TestRunTurnPreTurnWaits(t *testing.T) {
 
 func takeQueuedItem(t *testing.T, state *sessionState) pumpItem {
 	t.Helper()
-	select {
-	case <-state.inbox.Ready():
-	case <-time.After(awaitTimeout):
-		t.Fatal("nothing was queued in the session inbox within awaitTimeout, want the startTurn control")
-	}
+	waittest.Receive(t, state.inbox.Ready(), "the startTurn control in the session inbox")
 	item, ok := state.inbox.Take()
 	if !ok {
 		t.Fatal("Take() ok = false, want the queued startTurn control")
@@ -232,13 +225,13 @@ func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 		agentConfig: domain.AgentConfig{ReadTimeoutMS: 20},
 		inbox:       jsonrpc.NewInbox[pumpItem](),
 		logger:      discardLogger(),
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 	}
 
-	outcome := awaitOutcome(t, runTurnAsyncCtx(context.Background(), state, domain.RunTurnParams{
+	outcome := waittest.Receive(t, runTurnAsyncCtx(context.Background(), state, domain.RunTurnParams{
 		Prompt:  "go",
 		OnEvent: func(domain.AgentEvent) {},
-	}))
+	}), "turn outcome")
 	var agentErr *domain.AgentError
 	if !errors.As(outcome.err, &agentErr) || agentErr.Kind != domain.ErrResponseTimeout {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
@@ -256,11 +249,7 @@ func TestDelayedTurnVerdictCannotBlockPump(t *testing.T) {
 		close(delivered)
 	}()
 
-	select {
-	case <-delivered:
-	case <-time.After(awaitTimeout):
-		t.Fatal("handleStartTurn() blocked delivering a delayed verdict, want capacity-one reply delivery")
-	}
+	waittest.Receive(t, delivered, "handleStartTurn() to deliver a delayed verdict on a capacity-one reply")
 }
 
 func TestAbandonedTurnIsNotStarted(t *testing.T) {
@@ -270,13 +259,13 @@ func TestAbandonedTurnIsNotStarted(t *testing.T) {
 		agentConfig: domain.AgentConfig{ReadTimeoutMS: 20},
 		inbox:       jsonrpc.NewInbox[pumpItem](),
 		logger:      discardLogger(),
-		caps:        newCapabilityRecord(false, false),
+		caps:        newCapabilityRecord(),
 	}
 
-	outcome := awaitOutcome(t, runTurnAsyncCtx(context.Background(), state, domain.RunTurnParams{
+	outcome := waittest.Receive(t, runTurnAsyncCtx(context.Background(), state, domain.RunTurnParams{
 		Prompt:  "go",
 		OnEvent: func(domain.AgentEvent) {},
-	}))
+	}), "turn outcome")
 	var agentErr *domain.AgentError
 	if !errors.As(outcome.err, &agentErr) || agentErr.Kind != domain.ErrResponseTimeout {
 		t.Fatalf("runTurn() error = %v, want *domain.AgentError kind %q", outcome.err, domain.ErrResponseTimeout)
@@ -293,8 +282,6 @@ func TestAbandonedTurnIsNotStarted(t *testing.T) {
 	}
 }
 
-// This kind's normalization table never emits domain.EventTokenUsage, so a
-// usage_update observed mid-turn must still leave the measurement contract empty.
 func TestNoCounterSessionReportsUnmeasured(t *testing.T) {
 	t.Parallel()
 
@@ -309,7 +296,7 @@ func TestNoCounterSessionReportsUnmeasured(t *testing.T) {
 	sendLine(t, inPw, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-test","update":{"sessionUpdate":"usage_update","used":12000,"size":200000}}}`)
 	respondLine(t, inPw, promptID, promptResponse{StopReason: stopReasonEndTurn})
 
-	outcome := awaitOutcome(t, outcomeCh)
+	outcome := waittest.Receive(t, outcomeCh, "turn outcome")
 	if outcome.err != nil {
 		t.Fatalf("RunTurn() error = %v, want nil", outcome.err)
 	}
@@ -321,53 +308,30 @@ func TestNoCounterSessionReportsUnmeasured(t *testing.T) {
 func TestAssertUsageReporting(t *testing.T) {
 	t.Parallel()
 
-	measuredEvents, measuredOutcome := measuredSessionTurn(t)
-	unmeasuredEvents, unmeasuredOutcome := unmeasuredSessionTurn(t)
+	remoteEvents, remoteOutcome := remoteLedgerSessionTurn(t)
 
 	agenttest.AssertUsageReporting(t, "agent-client-protocol", []agenttest.UsageReportingCase{
 		{
-			Name:   "a local session whose source proved out settles one figure per turn",
-			Events: measuredEvents,
-			Result: measuredOutcome.result,
-		},
-		{
-			Name:   "a session with no measurement source reports no figure",
-			Remote: true,
-			Events: unmeasuredEvents,
-			Result: unmeasuredOutcome.result,
+			Name:   "a remote session settles one figure per turn from the prompt result",
+			Events: remoteEvents,
+			Result: remoteOutcome.result,
 		},
 	})
 }
 
-func measuredSessionTurn(t *testing.T) ([]domain.AgentEvent, turnOutcome) {
+func remoteLedgerSessionTurn(t *testing.T) ([]domain.AgentEvent, turnOutcome) {
 	t.Helper()
 
-	reader := &fakeUsageReader{
-		recognizes: true,
-		drains: []fakeDrain{{
-			found: true,
-			usage: agentcore.RecoveredUsage{
-				Run:   domain.TokenUsage{InputTokens: 1200, OutputTokens: 80, TotalTokens: 1280, CacheReadTokens: 900},
-				Model: "model-of-record",
-			},
-		}},
+	live := spendReading(1100, 70, 0, "", "")
+	declaration := scriptedSpendDeclaration(&live, nil, nil)
+	ledger, err := usage.NewLedger(declaration.Live, declaration.Records)
+	if err != nil {
+		t.Fatalf("usage.NewLedger() error = %v, want nil", err)
 	}
-	state, outPr, inPw := newTestSessionWithLogger(t, domain.AgentConfig{}, clientProtocolMaxLineBytes, discardLogger())
-	out := newOutboundReader(outPr)
-	publishHandshake(state, reader)
-	markSessionKnown(state)
+	ledger.Boundary(usage.RecordsRead{})
+	state, out, inPw := newDeclaredSession(t, declaration, ledger)
 
-	return measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))
-}
-
-func unmeasuredSessionTurn(t *testing.T) ([]domain.AgentEvent, turnOutcome) {
-	t.Helper()
-
-	state, outPr, inPw := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
-	out := newOutboundReader(outPr)
-	markSessionKnown(state)
-
-	return measuredTurn(t, state, inPw, out, quotaMeta(1100, 70))
+	return measuredTurn(t, state, inPw, out, nil)
 }
 
 func indexOfStepName(t *testing.T, names []string, name string) int {
@@ -408,8 +372,6 @@ func TestDefaultTeardownOrderIncludesCloseSession(t *testing.T) {
 	}
 }
 
-// A zero-value closeSessionID means the handshake never advertised
-// session/close, so the step writes and logs nothing.
 func TestCloseSessionSkipsWhenIdentifierEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -420,11 +382,7 @@ func TestCloseSessionSkipsWhenIdentifierEmpty(t *testing.T) {
 
 	closeSession(context.Background(), context.Background(), time.Second)(state)
 
-	select {
-	case line := <-out.ch:
-		t.Errorf("closeSession() wrote %s, want no bytes written when closeSessionID is empty", line)
-	case <-time.After(100 * time.Millisecond):
-	}
+	waittest.Never(t, out.ch, 100*time.Millisecond, "a line written by closeSession() when closeSessionID is empty")
 
 	if buf.Len() != 0 {
 		t.Errorf("closeSession() logged %q, want no record when closeSessionID is empty", buf.String())
@@ -434,23 +392,24 @@ func TestCloseSessionSkipsWhenIdentifierEmpty(t *testing.T) {
 func TestCloseSessionBoundedWhenAgentNeverAnswers(t *testing.T) {
 	t.Parallel()
 
-	state, outPr, _ := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
-	out := newOutboundReader(outPr)
-	state.closeSessionID = "sess-test"
+	synctest.Test(t, func(t *testing.T) {
+		state, outPr, _ := newTestSession(t, domain.AgentConfig{}, clientProtocolMaxLineBytes)
+		out := newOutboundReader(outPr)
+		state.closeSessionID = "sess-test"
 
-	const grace = 200 * time.Millisecond
-	bound := closeCallBound(grace)
+		const grace = 200 * time.Millisecond
+		bound := closeCallBound(grace)
 
-	start := time.Now()
-	closeSession(context.Background(), context.Background(), grace)(state)
-	elapsed := time.Since(start)
+		start := time.Now()
+		closeSession(context.Background(), context.Background(), grace)(state)
+		elapsed := time.Since(start)
 
-	out.awaitMethod(t, methodSessionClose)
+		out.awaitMethod(t, methodSessionClose)
 
-	const schedulingOverhead = time.Second
-	if wantBound := bound + schedulingOverhead; elapsed > wantBound {
-		t.Errorf("closeSession() step took %v, want at most %v (closeCallBound(%v) plus scheduling overhead)", elapsed, wantBound, grace)
-	}
+		if elapsed > bound {
+			t.Errorf("closeSession() step took %v, want at most %v (closeCallBound(%v))", elapsed, bound, grace)
+		}
+	})
 }
 
 func TestDoInitializeVersionPin(t *testing.T) {
@@ -471,15 +430,11 @@ func TestDoInitializeVersionPin(t *testing.T) {
 	id := out.awaitMethod(t, methodInitialize)
 	respondLine(t, inPw, id, initializeResponse{ProtocolVersion: protocolVersion(2)})
 
-	select {
-	case outcome := <-ch:
-		if outcome.err == nil {
-			t.Fatal("doInitialize() error = nil, want an error for an unpinned protocol version")
-		}
-		if outcome.err.Kind != domain.ErrResponseError {
-			t.Errorf("doInitialize() error kind = %q, want %q", outcome.err.Kind, domain.ErrResponseError)
-		}
-	case <-time.After(awaitTimeout):
-		t.Fatal("timed out waiting for doInitialize to return")
+	outcome := waittest.Receive(t, ch, "doInitialize to return")
+	if outcome.err == nil {
+		t.Fatal("doInitialize() error = nil, want an error for an unpinned protocol version")
+	}
+	if outcome.err.Kind != domain.ErrResponseError {
+		t.Errorf("doInitialize() error kind = %q, want %q", outcome.err.Kind, domain.ErrResponseError)
 	}
 }

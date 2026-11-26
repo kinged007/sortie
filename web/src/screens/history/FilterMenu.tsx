@@ -9,9 +9,7 @@ import {
   ComboboxList,
 } from "@/components/ui/combobox";
 import { Popover, PopoverPopup, PopoverTrigger } from "@/components/ui/popover";
-
-const TRIGGER =
-  "inline-flex h-(--size-chip) items-center gap-xs rounded-full border border-line-medium bg-surface-raised px-sm text-body-sm font-medium whitespace-nowrap text-ink-body select-none cursor-pointer transition-colors duration-(--duration-feedback) focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring hover:bg-[image:linear-gradient(var(--color-state-hover),var(--color-state-hover))] active:bg-[image:linear-gradient(var(--color-state-pressed),var(--color-state-pressed))]";
+import { SELECT_TRIGGER } from "@/components/ui/select-trigger";
 
 /** One choice of a {@link FilterMenu}; the empty value stands for "any". */
 export interface FilterOption {
@@ -19,11 +17,9 @@ export interface FilterOption {
   label: string;
 }
 
-/** Props of {@link FilterMenu}. */
 export interface FilterMenuProps {
-  /** The menu's name, shown on the chip and as the popup's accessible name. */
   label: string;
-  /** What the chip shows as the chosen option; it can word a value no option carries. */
+  /** What the trigger shows as the chosen option; it can word a value no option carries. */
   valueText: string;
   options: readonly FilterOption[];
   /** The applied value, whether or not an option carries it. */
@@ -31,7 +27,6 @@ export interface FilterMenuProps {
   onChange: (value: string) => void;
 }
 
-/** Renders a filter chip that opens a searchable list of options with the chosen one checked. */
 export function FilterMenu({ label, valueText, options, value, onChange }: FilterMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -52,7 +47,7 @@ export function FilterMenu({ label, valueText, options, value, onChange }: Filte
 
   return (
     <Popover open={isOpen} onOpenChange={handleOpenChange}>
-      <PopoverTrigger className={TRIGGER}>
+      <PopoverTrigger className={SELECT_TRIGGER}>
         {label}
         <span className="text-ink wrap-anywhere">{valueText}</span>
         <ChevronDownIcon />

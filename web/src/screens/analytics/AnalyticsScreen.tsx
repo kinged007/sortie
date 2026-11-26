@@ -1,36 +1,25 @@
-import { useSearchParams } from "react-router";
-
 import { ApiError } from "@/api/client";
 import { useStateQuery, useStatsQuery } from "@/api/queries";
 import { ServedText } from "@/components/ServedText";
 import { StatusMark } from "@/components/StatusMark";
-import { Segmented } from "@/components/ui/segmented";
+import { hasRateSource } from "@/lib/budget";
 import { cn } from "@/lib/cn";
-import { fmtClock, fmtDate } from "@/lib/format";
 import { agentLabel, isNamedRuleGroup, modelLabel, ruleLabel, startLabel } from "@/lib/labels";
 import { runStatus } from "@/lib/run-status";
 
 import { ChainFunnel } from "./ChainFunnel";
 import { GroupTable } from "./GroupTable";
 import { OutcomeBar } from "./OutcomeBar";
+import { RangePicker } from "./RangePicker";
+import { SkillTable } from "./SkillTable";
+import { SpendChart } from "./SpendChart";
 import { SummaryTiles } from "./SummaryTiles";
+import { useAnalyticsRange } from "./analytics-range";
 
-import type { AnalyticsRange } from "@/api/queries";
 import type { Group, Report } from "@/api/types.gen";
 import type { NameColumn } from "./GroupTable";
 
-const RANGE_PARAM = "range";
-const DEFAULT_RANGE: AnalyticsRange = "7d";
-const RANGE_ITEMS = [
-  { value: "24h", label: "24 hours" },
-  { value: "7d", label: "7 days" },
-  { value: "all", label: "Since first run" },
-];
 const MESSAGE = "text-body-md text-ink-body";
-
-function rangeOf(value: string | null): AnalyticsRange {
-  return value === "24h" || value === "7d" || value === "all" ? value : DEFAULT_RANGE;
-}
 
 function isUnavailable(error: unknown): boolean {
   return error instanceof ApiError && error.status === 503 && error.code === "history_unavailable";
@@ -103,6 +92,7 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
   const byStatus = report.by_status ?? [];
   const byTrigger = report.by_trigger ?? [];
   const byOrigin = report.by_origin ?? [];
+  const skillCalls = report.skill_calls;
   const showByRule =
     hasRules && byRule.some((group) => byRule.length > 1 || isNamedRuleGroup(group.name));
 
@@ -163,45 +153,25 @@ function Breakdowns({ report, hasRules, hasRates }: BreakdownsProps) {
           {...common}
         />
       ) : undefined}
+      {skillCalls !== null && (skillCalls.by_skill ?? []).length > 0 ? (
+        <SkillTable report={skillCalls} />
+      ) : undefined}
     </>
   );
 }
 
-/** Renders Analytics: the run statistics report of a range with its summary and breakdowns. */
 export function AnalyticsScreen() {
   const { data: state } = useStateQuery();
   const config = state?.config;
-  const [params, setParams] = useSearchParams();
-  const range = rangeOf(params.get(RANGE_PARAM));
+  const [range] = useAnalyticsRange();
   const stats = useStatsQuery(range);
   const report = stats.data;
 
-  function handleRangeChange(value: string) {
-    setParams(
-      (previous) => {
-        const next = new URLSearchParams(previous);
-        next.set(RANGE_PARAM, value);
-        return next;
-      },
-      { replace: true },
-    );
-  }
-
   return (
     <div className="flex flex-col gap-lg">
-      <div className="flex flex-wrap items-center gap-x-md gap-y-sm">
+      <div className="flex items-center justify-between gap-md">
         <h1 className="font-heading text-h4 font-semibold text-ink">Analytics</h1>
-        <Segmented
-          label="Range"
-          items={RANGE_ITEMS}
-          value={range}
-          onValueChange={handleRangeChange}
-        />
-        {report?.since == null ? undefined : (
-          <span className="text-body-md text-ink-muted" title={report.since}>
-            Since {fmtDate(report.since)}, {fmtClock(report.since)}
-          </span>
-        )}
+        <RangePicker className="md:hidden" />
       </div>
       {report === undefined ? (
         stats.isError ? (
@@ -229,15 +199,21 @@ export function AnalyticsScreen() {
             </p>
           ) : (
             <div key={range} className="flex flex-col gap-xl">
-              <SummaryTiles report={report} config={config} />
+              <SummaryTiles report={report} hasCost={hasRateSource(state)} />
               <OutcomeBar summary={report.summary} />
+              {hasRateSource(state) &&
+              range !== "24h" &&
+              report.spend !== null &&
+              (report.spend.buckets ?? []).length > 0 ? (
+                <SpendChart spend={report.spend} since={report.since} />
+              ) : undefined}
               {(report.chain_funnels ?? []).map((funnel) => (
                 <ChainFunnel key={funnel.stages?.[0]?.rule} funnel={funnel} config={config} />
               ))}
               <Breakdowns
                 report={report}
                 hasRules={(config?.dispatch.rules ?? []).length > 0}
-                hasRates={config?.token_rates != null}
+                hasRates={hasRateSource(state)}
               />
             </div>
           )}

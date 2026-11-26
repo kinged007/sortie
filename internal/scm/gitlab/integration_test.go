@@ -1,13 +1,14 @@
 package gitlab
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,37 @@ func skipUnlessIntegration(t *testing.T) {
 	if os.Getenv("SORTIE_GITLAB_TEST") != "1" {
 		t.Skip("skipping GitLab integration test: set SORTIE_GITLAB_TEST=1 to enable")
 	}
+}
+
+// gitlabComRequestInterval keeps a run against GitLab.com under the
+// Free-plan per-user burst limit of 100 requests a minute, which the
+// sequential suite otherwise exceeds and then fails on HTTP 429.
+const gitlabComRequestInterval = 700 * time.Millisecond
+
+func TestMain(m *testing.M) {
+	endpoint, err := url.Parse(os.Getenv("SORTIE_GITLAB_ENDPOINT"))
+	if os.Getenv("SORTIE_GITLAB_TEST") == "1" && err == nil && endpoint.Hostname() == "gitlab.com" {
+		// The limit counts every request of the user, so the merge
+		// fixture's raw client must share the adapter's pace.
+		http.DefaultTransport = &pacedTransport{base: http.DefaultTransport, interval: gitlabComRequestInterval}
+	}
+	os.Exit(m.Run())
+}
+
+type pacedTransport struct {
+	base     http.RoundTripper
+	interval time.Duration
+
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (p *pacedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	p.mu.Lock()
+	time.Sleep(time.Until(p.last.Add(p.interval)))
+	p.last = time.Now()
+	p.mu.Unlock()
+	return p.base.RoundTrip(req)
 }
 
 // requireEnv reads an environment variable and fails the test when empty.
@@ -843,84 +875,6 @@ func TestIntegration_FetchCandidateIssues_QueryFilter(t *testing.T) {
 			t.Errorf("issue %s: Assignee is empty, want non-empty under scope=assigned_to_me", issue.Identifier)
 		}
 	}
-}
-
-const integrationStatement = "/close\n@sortie-literal-probe please look\n[~jdoe] see https://example.com/probe?x=1\n" +
-	"*bold* _it_ h1. Heading\n```` fenced ````\n{NoFormat} then {noformat}\ntoken=[redacted]"
-
-func TestIntegration_CommentIssueWithLiteral_RendersInertAndLeavesTheIssueOpen(t *testing.T) {
-	skipUnlessIntegration(t)
-
-	adapter, ok := newIntegrationAdapter(t).(*GitLabAdapter)
-	if !ok {
-		t.Fatal("NewGitLabAdapter did not return a *GitLabAdapter")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	issue := firstCandidate(t, ctx, adapter)
-	before := nativeIssueState(t, ctx, adapter, issue.ID)
-	marker := "sortie literal round trip " + time.Now().UTC().Format(time.RFC3339Nano)
-	if err := adapter.CommentIssueWithLiteral(ctx, issue.ID, marker, integrationStatement); err != nil {
-		t.Fatalf("CommentIssueWithLiteral(%s): %v", issue.Identifier, err)
-	}
-
-	comments, err := adapter.FetchIssueComments(ctx, issue.ID)
-	if err != nil {
-		t.Fatalf("FetchIssueComments(%s): %v", issue.Identifier, err)
-	}
-	var stored string
-	for _, comment := range comments {
-		if strings.Contains(comment.Body, marker) {
-			stored = comment.Body
-		}
-	}
-	if stored == "" {
-		t.Fatalf("no stored comment contains %q among %d comments", marker, len(comments))
-	}
-
-	payload, err := json.Marshal(map[string]any{"text": stored, "gfm": true, "project": requireEnv(t, "SORTIE_GITLAB_PROJECT")})
-	if err != nil {
-		t.Fatalf("marshal render request: %v", err)
-	}
-	raw, err := adapter.client.Send(ctx, "POST", "/markdown", bytes.NewReader(payload))
-	if err != nil {
-		t.Fatalf("POST /markdown: %v", err)
-	}
-	var rendered struct {
-		HTML string `json:"html"`
-	}
-	if err := json.Unmarshal(raw, &rendered); err != nil {
-		t.Fatalf("decode render response: %v", err)
-	}
-
-	if got := strings.Count(rendered.HTML, "<pre"); got != 1 {
-		t.Errorf("rendered comment holds %d <pre> blocks, want 1:\n%s", got, rendered.HTML)
-	}
-	if strings.Contains(rendered.HTML, "<a ") {
-		t.Errorf("rendered comment holds a link or mention, want the statement inert:\n%s", rendered.HTML)
-	}
-
-	if after := nativeIssueState(t, ctx, adapter, issue.ID); after != before {
-		t.Errorf("native state after the comment = %q, want %q (no quick action may run)", after, before)
-	}
-}
-
-// nativeIssueState reads GitLab's own opened or closed state, which a
-// configured state label would hide from [GitLabAdapter.FetchIssueByID].
-func nativeIssueState(t *testing.T, ctx context.Context, adapter *GitLabAdapter, issueID string) string {
-	t.Helper()
-
-	raw, _, err := adapter.client.Get(ctx, "/projects/"+adapter.projectPath+"/issues/"+issueID, nil)
-	if err != nil {
-		t.Fatalf("GET issue %s: %v", issueID, err)
-	}
-	var issue gitlabIssue
-	if err := json.Unmarshal(raw, &issue); err != nil {
-		t.Fatalf("decode issue %s: %v", issueID, err)
-	}
-	return issue.State
 }
 
 func TestIntegration_LabelRoundTrip(t *testing.T) {

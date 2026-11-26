@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 const (
@@ -28,20 +29,11 @@ func startOwned(t *testing.T, cmd *exec.Cmd) (*OwnedPipes, *Group) {
 	return pipes, g
 }
 
-func awaitDone(t *testing.T, r *Reaper, within time.Duration) {
-	t.Helper()
-	select {
-	case <-r.Done():
-	case <-time.After(within):
-		t.Fatalf("Done() did not close within %v", within)
-	}
-}
-
 func terminateAndAwait(t *testing.T, cmd *exec.Cmd, g *Group, r *Reaper) {
 	t.Helper()
 	_ = g.Kill()
 	_ = cmd.Process.Kill()
-	awaitDone(t, r, 10*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 }
 
 func panicMessage(fn func()) (msg string, panicked bool) {
@@ -64,7 +56,7 @@ func TestReaper_DoneAndErr(t *testing.T) {
 		startOwned(t, cmd)
 
 		r := StartReaper(cmd, nil)
-		awaitDone(t, r, 3*time.Second)
+		waittest.Receive(t, r.Done(), "reaper Done()")
 
 		var exitErr *exec.ExitError
 		if !errors.As(r.Err(), &exitErr) {
@@ -82,7 +74,7 @@ func TestReaper_DoneAndErr(t *testing.T) {
 		startOwned(t, cmd)
 
 		r := StartReaper(cmd, nil)
-		awaitDone(t, r, 3*time.Second)
+		waittest.Receive(t, r.Done(), "reaper Done()")
 
 		if err := r.Err(); err != nil {
 			t.Errorf("Err() = %v, want nil", err)
@@ -96,16 +88,12 @@ func TestReaper_DoneAndErr(t *testing.T) {
 		startOwned(t, cmd)
 
 		r := StartReaper(cmd, nil)
-		select {
-		case <-r.Done():
-			t.Fatal("Done() closed before the subprocess exited")
-		case <-time.After(200 * time.Millisecond):
-		}
+		waittest.Never(t, r.Done(), 200*time.Millisecond, "Done() before the subprocess exited")
 
 		if err := cmd.Process.Kill(); err != nil {
 			t.Fatalf("cmd.Process.Kill() = %v", err)
 		}
-		awaitDone(t, r, 3*time.Second)
+		waittest.Receive(t, r.Done(), "reaper Done()")
 	})
 }
 
@@ -116,7 +104,7 @@ func TestReaper_OutputSurvivesAfterDoneCloses(t *testing.T) {
 	pipes, _ := startOwned(t, cmd)
 
 	r := StartReaper(cmd, nil)
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 
 	line, err := bufio.NewReader(pipes.Stdout).ReadString('\n')
 	if err != nil {
@@ -136,7 +124,7 @@ func TestReaper_ClosingStdoutAtDoneLosesOutput(t *testing.T) {
 	pipes, _ := startOwned(t, cmd)
 
 	r := StartReaper(cmd, nil)
-	awaitDone(t, r, 5*time.Second)
+	waittest.Receive(t, r.Done(), "reaper Done()")
 	if err := pipes.CloseStdout(); err != nil {
 		t.Fatalf("CloseStdout() error = %v", err)
 	}

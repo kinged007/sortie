@@ -114,16 +114,31 @@ type rawRunEvent struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
-// rawMessage is an AgentMessage as the 0.85.1 CLI serializes it. Only
-// the assistant role carries usage, a model name, and a stop reason.
+// rawMessage is an AgentMessage as the pi CLI serializes it (verified
+// against 0.85.1 and 1.6.1). Only the assistant role carries usage, a
+// model name, and a stop reason.
 type rawMessage struct {
-	Role         string       `json:"role"`
-	Content      []rawContent `json:"content"`
-	Usage        *rawUsage    `json:"usage,omitempty"`
-	Model        string       `json:"model,omitempty"`
-	Provider     string       `json:"provider,omitempty"`
-	StopReason   string       `json:"stopReason,omitempty"`
-	ErrorMessage string       `json:"errorMessage,omitempty"`
+	Role         string      `json:"role"`
+	Content      rawContents `json:"content"`
+	Usage        *rawUsage   `json:"usage,omitempty"`
+	Model        string      `json:"model,omitempty"`
+	Provider     string      `json:"provider,omitempty"`
+	StopReason   string      `json:"stopReason,omitempty"`
+	ErrorMessage string      `json:"errorMessage,omitempty"`
+}
+
+// rawContents is a message's content. pi writes a system message's
+// content as a plain string and every other role's as a list of
+// parts; a string is a single text part.
+type rawContents []rawContent
+
+func (c *rawContents) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*c = rawContents{{Type: "text", Text: text}}
+		return nil
+	}
+	return json.Unmarshal(data, (*[]rawContent)(c))
 }
 
 type rawContent struct {

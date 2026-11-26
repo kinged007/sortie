@@ -12,6 +12,10 @@ type ConfigError struct {
 
 	// Message describes the validation failure in operator-friendly terms.
 	Message string
+
+	// Check is the check sortie validate reports the error under; empty
+	// means "config." followed by Field.
+	Check string
 }
 
 // Error returns a human-readable diagnostic including the field path.

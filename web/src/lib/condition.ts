@@ -1,7 +1,8 @@
 import type { StateResponse } from "@/api/types.gen";
 
-/** The one state the status card, narrow bar, title, and favicon follow. */
-export type Condition = "degraded" | "needs" | "clear";
+export type Condition = "degraded" | "needs" | "held" | "clear";
+
+export const ACKNOWLEDGED_WORD = "acknowledged";
 
 const SCM_PROVIDER_NAMES: Record<string, string> = {
   github: "GitHub",
@@ -9,12 +10,10 @@ const SCM_PROVIDER_NAMES: Record<string, string> = {
   gitea: "Gitea",
 };
 
-/** Names an SCM provider the way the Health screen titles its check. */
 export function scmProviderName(provider: string): string {
   return SCM_PROVIDER_NAMES[provider] ?? provider;
 }
 
-/** Names the health checks that fail, in the order the Health screen lists them. */
 export function failingChecks(state: StateResponse): string[] {
   const { health } = state;
   if (health === undefined) {
@@ -32,21 +31,29 @@ export function failingChecks(state: StateResponse): string[] {
     .map(({ name }) => name);
 }
 
-/** Derives the condition: a failing check outranks attention items, which outrank all clear. */
+export function acknowledgedCount(state: StateResponse): number {
+  return (state.attention ?? []).filter((item) => item.acknowledged_at !== null).length;
+}
+
+/** A failing check outranks unacknowledged attention items, which outrank acknowledged ones that still stand, which outrank all clear. */
 export function condition(state: StateResponse): Condition {
   if (failingChecks(state).length > 0) {
     return "degraded";
   }
-  return state.counts.attention > 0 ? "needs" : "clear";
+  if (state.counts.attention > 0) {
+    return "needs";
+  }
+  return acknowledgedCount(state) > 0 ? "held" : "clear";
 }
 
-/** Words the condition for the status card and the title. */
 export function conditionWord(c: Condition): string {
   switch (c) {
     case "degraded":
       return "Degraded";
     case "needs":
       return "Needs attention";
+    case "held":
+      return "Waiting on a person";
     case "clear":
       return "All clear";
   }

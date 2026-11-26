@@ -132,6 +132,7 @@ The primary hourly budget, the search per-minute budget, and the GraphQL budget 
 
 - Candidate polling stays off the search route unless an operator filter requires it, because search draws on the smaller budget.
 - The two GraphQL reads are each gated: the review decision is one call per read, and the merge commit is one call only for a pull request already known to be merged.
+- The review watch reads the decision on each pass that finds no actionable comment. A pull request held past the watch window because it waits on a required approval keeps that watch running, so at the default poll interval each held pull request costs 30 GraphQL points and at least 60 REST reads an hour, and keeps its issue's state read running on every reconcile tick, for as long as the approval takes.
 - The per-issue state reads used by reconciliation go through a bounded, per-path ETag cache. The cache stores the issue's labels and closed flag rather than a derived state, so a not-modified response is derived again under the state lists in force, and does not charge the primary budget. This matters precisely because reconciliation polls the same issues over and over. The cache size is an operator-tunable extension key, and zero disables conditional requests entirely.
 
 Secondary limits are separate again and are not a quota you can count down; they arrive as a rejection carrying a retry hint. The adapter never sleeps or retries on its own: it classifies, appends the retry hint to the message, and leaves backoff to the orchestrator.

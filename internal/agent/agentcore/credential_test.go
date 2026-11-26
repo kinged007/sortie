@@ -53,8 +53,15 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 	cancelledStart := errors.New("adapter-specific start cancellation")
 	cancelledRun := errors.New("adapter-specific cancellation")
 	notFound := &domain.AgentError{Kind: domain.ErrAgentNotFound, Message: "no binary"}
+	usageLimit := &domain.AgentError{
+		Kind:       domain.ErrUsageLimit,
+		Message:    "weekly allowance exhausted",
+		UsageLimit: &domain.UsageLimit{ResetsAt: time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)},
+	}
 	startTimeout := &domain.AgentError{Kind: domain.ErrResponseTimeout, Message: "timed out"}
 	connFailed := ConnectionFailedError()
+	portExit := &domain.AgentError{Kind: domain.ErrPortExit, Message: "exited"}
+	responseErr := &domain.AgentError{Kind: domain.ErrResponseError, Message: "unknown option"}
 	earlyExitReport := &domain.AgentError{
 		Kind:    domain.ErrPortExit,
 		Message: "the agent runtime exited before responding: exit status 1",
@@ -69,6 +76,7 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 		run       func(ctx context.Context, cancel context.CancelFunc) (domain.TurnResult, error)
 		turnBound time.Duration
 
+		wantSessions  int
 		wantUnchanged error
 		wantNil       bool
 		wantMessage   string
@@ -134,7 +142,38 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 			run: func(context.Context, context.CancelFunc) (domain.TurnResult, error) {
 				return domain.TurnResult{}, earlyExitReport
 			},
+			wantSessions:  2,
 			wantUnchanged: earlyExitReport,
+		},
+		{
+			name: "early-exit report recovered by the full-context retry",
+			run: func(context.Context, context.CancelFunc) (domain.TurnResult, error) {
+				return domain.TurnResult{}, earlyExitReport
+			},
+			wantSessions: 2,
+			wantNil:      true,
+		},
+		{
+			name:          "port_exit at start retries once",
+			start:         func(context.Context, context.CancelFunc) error { return portExit },
+			wantSessions:  2,
+			wantUnchanged: portExit,
+		},
+		{
+			name:         "response_error at start recovered by the full-context retry",
+			start:        func(context.Context, context.CancelFunc) error { return responseErr },
+			wantSessions: 2,
+			wantNil:      true,
+		},
+		{
+			name:          "early-exit report with ctx ended starts no retry",
+			start:         func(_ context.Context, cancel context.CancelFunc) error { cancel(); return earlyExitReport },
+			wantUnchanged: earlyExitReport,
+		},
+		{
+			name:          "ssh connection failure at start starts no retry",
+			start:         func(context.Context, context.CancelFunc) error { return connFailed },
+			wantUnchanged: sshutil.ErrConnectionFailed,
 		},
 		{
 			name: "non-retryable kind returned unchanged",
@@ -142,6 +181,13 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 				return domain.TurnResult{}, notFound
 			},
 			wantUnchanged: notFound,
+		},
+		{
+			name: "usage_limit returned unchanged without a retry",
+			run: func(context.Context, context.CancelFunc) (domain.TurnResult, error) {
+				return domain.TurnResult{}, usageLimit
+			},
+			wantUnchanged: usageLimit,
 		},
 		{
 			name: "credential_unverified from RunTurn returned unchanged",
@@ -195,17 +241,30 @@ func TestVerifyCredential_Verdict(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			var fullContext []bool
 			adapter := &scriptedCredentialAdapter{}
-			if tt.start != nil {
-				adapter.startFn = func(ctx context.Context, _ domain.StartSessionParams) (domain.Session, error) {
-					return domain.Session{}, tt.start(ctx, cancel)
+			adapter.startFn = func(ctx context.Context, params domain.StartSessionParams) (domain.Session, error) {
+				fullContext = append(fullContext, params.VerificationFullContext)
+				if tt.start == nil || (tt.wantNil && len(fullContext) == 2) {
+					return domain.Session{}, nil
 				}
+				return domain.Session{}, tt.start(ctx, cancel)
 			}
 			if tt.run != nil {
-				adapter.runFn = func(ctx context.Context) (domain.TurnResult, error) { return tt.run(ctx, cancel) }
+				adapter.runFn = func(ctx context.Context) (domain.TurnResult, error) {
+					if tt.wantNil && len(fullContext) == 2 {
+						return domain.TurnResult{ExitReason: domain.EventTurnCompleted}, nil
+					}
+					return tt.run(ctx, cancel)
+				}
 			}
 
 			_, err := VerifyCredential(ctx, adapter, CredentialVerification{TurnBound: tt.turnBound})
+
+			wantSessions := max(tt.wantSessions, 1)
+			if len(fullContext) != wantSessions || fullContext[0] || fullContext[wantSessions-1] != (wantSessions == 2) {
+				t.Errorf("VerificationFullContext per session = %v, want %d sessions, only the retry set", fullContext, wantSessions)
+			}
 
 			switch {
 			case tt.wantNil:

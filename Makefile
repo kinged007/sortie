@@ -15,6 +15,10 @@ build: ## Compile the sortie binary into the repo root
 clean: ## Remove the binary and all coverage files
 	$(RM) $(BIN) $(COVERAGE_OUT) $(COVERAGE_HTML)
 
+.PHONY: price-table
+price-table: ## Refresh the embedded model price table from upstream LiteLLM
+	$(GO) run ./tools/pricetable
+
 ##@ Testing
 
 .PHONY: test
@@ -81,6 +85,22 @@ test-darwin: ## Run the darwin-only tests on a macOS host; fails on a skipped te
 	cat "$$tmp"/run*.json | sed -n 's/.*"Action":"pass".*"Test":"\([^"]*\)".*/\1/p'; \
 	passed=$$(cat "$$tmp"/run*.json | grep -cE '"Action":"pass".*"Test":"[^"]'); \
 	printf '$(GREEN)test-darwin: %s darwin-only tests executed$(RESET)\n' "$$passed"
+
+.PHONY: ssh-lab
+ssh-lab: ## Start an SSH lab and keep it running until interrupted (INSTALL='npm install -g <package>@<version>')
+	SORTIE_SSHLAB_KEEP=1 SORTIE_SSHLAB_INSTALL='$(subst ','\'',$(INSTALL))' $(GO) test -count=1 -timeout 0 -v -run '^TestSSHLabKeep$$' ./internal/agent/agenttest/
+
+.PHONY: ssh-lab-clean
+ssh-lab-clean: ## Remove every SSH lab container and image from the local Docker cache
+	@set -eu; \
+	containers=$$(docker ps -a --filter name=sortie-sshlab- --format '{{.Names}}'); \
+	for name in $$containers; do \
+		case "$$name" in sortie-sshlab-*) docker rm -f "$$name" >/dev/null ;; esac; \
+	done; \
+	images=$$(docker images --format '{{.Repository}}:{{.Tag}}' sortie-agenttest-sshlab); \
+	for image in $$images; do \
+		docker rmi "$$image" >/dev/null; \
+	done
 
 ##@ Quality
 
@@ -169,6 +189,7 @@ ui-build: ## Build the dashboard into internal/server/ui/dist
 ui-lint: ## Lint and type-check the dashboard sources
 	cd web && $(NPM) run lint
 	cd web && $(NPM) run typecheck
+	node scripts/tailwind-canonical.mjs web
 
 .PHONY: ui-fmt
 ui-fmt: ## Format the dashboard sources
@@ -248,7 +269,7 @@ qualify-live: ## Drive a live capture (spends provider quota; opt-in gated)
 
 .PHONY: qualify-report
 qualify-report: ## Re-derive a report from a saved capture directory and render it (CAPTURE_DIR=path PROFILE=path)
-	cd tools/qualify && SORTIE_CLIENTPROTOCOL_QUALIFICATION_CAPTURE_DIR=$(CAPTURE_DIR) SORTIE_CLIENTPROTOCOL_QUALIFICATION_PROFILE=$(PROFILE) $(GO) test -count=1 -run TestQualifyReport ./eval/...
+	cd tools/qualify && SORTIE_CLIENTPROTOCOL_QUALIFICATION_CAPTURE_DIR=$(CAPTURE_DIR) SORTIE_CLIENTPROTOCOL_QUALIFICATION_PROFILE=$(PROFILE) $(GO) test -count=1 -v -run TestQualifyReport ./eval/...
 
 .PHONY: qualify-reemit
 qualify-reemit: ## Re-emit derived artifacts for a saved capture directory (CAPTURE_DIR=path PROFILE=path)
@@ -288,6 +309,7 @@ endif
 	@printf '  $(CYAN)%-24s$(RESET) %s\n' \
 		'PKG'      ' Package filter for test targets (default: ./...)' \
 		'RUN'      ' Test name filter, passed to -run' \
+		'INSTALL'  ' Runtime install command for ssh-lab (default: none)' \
 		'LINT_GOOS' ' GOOS values the lint targets iterate' \
 		'VERSION'  ' Override version string (default: git describe)' \
 		'NO_COLOR' ' Disable color output (https://no-color.org/)'

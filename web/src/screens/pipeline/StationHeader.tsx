@@ -1,5 +1,6 @@
 import { stationX } from "@/components/Lane";
 import { cn } from "@/lib/cn";
+import { fmtCount } from "@/lib/format";
 
 import type { Station } from "@/lib/lane";
 
@@ -11,7 +12,6 @@ const LOOP_MARGIN = 3;
 // Their full labels do not fit a name box at any width.
 const ALWAYS_SHORT = new Set(["merge_completion", "label_commands"]);
 
-/** Props of {@link StationHeader}. */
 export interface StationHeaderProps {
   stations: readonly Station[];
   /** The lanes per station key; a station without an entry holds none. */
@@ -39,13 +39,7 @@ function StationName({ station }: StationNameProps) {
   );
 }
 
-/**
- * Renders the stations above the Pipeline lanes, each with the count of lanes
- * standing at it. It places each station with {@link stationX}, as the lane
- * tracks do, so the names stand over the dots. A name box never grows past its
- * share of the width; a reaction station shows its short form once the share
- * drops below the room the full name needs.
- */
+/** Stations are placed with {@link stationX}, as the lane tracks do, so the names stand over the dots; the count sits under the name so a count of any length fits. */
 export function StationHeader({ stations, tally }: StationHeaderProps) {
   const count = stations.length;
   const reactions = stations.flatMap((station, index) =>
@@ -65,10 +59,10 @@ export function StationHeader({ stations, tally }: StationHeaderProps) {
     .join(", ")}`;
 
   return (
-    <div className="sticky top-0 z-(--z-sticky) border-b border-line bg-canvas px-md pt-sm pb-xs max-md:hidden">
+    <div className="sticky top-(--size-header) z-(--z-sticky) border-b border-line bg-canvas px-md pt-sm pb-xs max-md:hidden">
       {/* The query threshold depends on the station count, which a static class cannot carry. */}
       <style>{`@container (max-width: ${narrowBelowPx}px) { [data-station-full] { display: none } [data-station-short] { display: inline } }`}</style>
-      <div role="img" aria-label={label} className="@container relative h-16">
+      <div role="img" aria-label={label} className="@container relative h-20">
         {first === undefined || last === undefined ? undefined : (
           <div
             className="absolute top-0 h-3 border-x border-t border-line-strong text-center text-label-caps font-medium text-ink-muted uppercase"
@@ -86,27 +80,27 @@ export function StationHeader({ stations, tally }: StationHeaderProps) {
           return (
             <div
               key={station.key}
-              title={station.label}
+              title={station.short === undefined ? undefined : station.label}
               className="absolute bottom-0 -translate-x-1/2 text-center whitespace-nowrap"
               style={{ left: `${stationX(index, count)}%` }}
             >
               <div
-                className={cn(
-                  "mx-auto mb-xxs grid size-5 place-items-center rounded-full border-[1.5px] text-body-sm font-bold tabular-nums",
-                  total === 0 && "border-track-todo bg-canvas",
-                  total > 0 && entry?.hot !== true && "border-track-done bg-canvas",
-                  total > 0 &&
-                    entry?.hot === true &&
-                    "border-warning-fill bg-warning-fill text-on-warning-fill",
-                )}
-              >
-                {total === 0 ? undefined : total}
-              </div>
+                aria-hidden="true"
+                className="mx-auto mb-xxs size-5 rounded-full border-[1.5px] border-ink-faint bg-canvas"
+              />
               <div
                 className="mx-auto truncate text-body-sm font-medium text-ink-body"
                 style={{ maxWidth: `min(${FULL_NAME_BOX_PX}px, ${shareExpression})` }}
               >
                 <StationName station={station} />
+              </div>
+              <div
+                className={cn(
+                  "h-5 text-body-sm tabular-nums",
+                  entry?.hot === true ? "font-medium text-warning" : "text-ink-muted",
+                )}
+              >
+                {total === 0 ? undefined : fmtCount(total)}
               </div>
             </div>
           );

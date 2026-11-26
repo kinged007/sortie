@@ -12,9 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sortie-ai/sortie/internal/agent/usage"
 	"github.com/sortie-ai/sortie/internal/config"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/persistence"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/prompt"
 	"github.com/sortie-ai/sortie/internal/redact"
 	"github.com/sortie-ai/sortie/internal/registry"
@@ -32,6 +34,7 @@ const (
 	exitTypeSoftStop  = "soft_stop"
 
 	triggerError        = "error"
+	triggerUsageLimit   = "usage_limit"
 	triggerContinuation = "continuation"
 	triggerTimer        = "timer"
 	triggerStall        = "stall"
@@ -50,16 +53,18 @@ const (
 )
 
 // Dispatch-gate reason values recorded in [BudgetExhaustedEntry.Reason].
-// Token budget takes precedence over the session budget.
+// Money budget takes precedence over the token budget, which takes
+// precedence over the session budget.
 const (
-	budgetReasonToken   = "token_budget"
-	budgetReasonSession = "session_budget"
+	budgetReasonMoney   = domain.BudgetHoldReasonMoney
+	budgetReasonToken   = domain.BudgetHoldReasonToken
+	budgetReasonSession = domain.BudgetHoldReasonSession
 )
 
 // knownBudgetReasons lists every dispatch-gate budget reason in the order
 // the gauge reports them. A reason added above must be added here too, so
 // the gauge recompute reports a value for it on every pass.
-var knownBudgetReasons = []string{budgetReasonSession, budgetReasonToken}
+var knownBudgetReasons = []string{budgetReasonSession, budgetReasonToken, budgetReasonMoney}
 
 // AgentTotals holds cumulative token and runtime counters across all ended
 // agent sessions, persisted to SQLite and restored on startup.
@@ -79,22 +84,24 @@ type AgentTotals struct {
 	UnmeasuredSessions int64
 }
 
-// RateLimitSnapshot holds the latest rate-limit payload from an agent
-// event. Opaque because the payload format is agent-adapter-defined.
-type RateLimitSnapshot struct {
-	Data       map[string]any
-	ReceivedAt time.Time
-}
-
 // RunningEntry tracks a single in-flight agent session. Created by dispatch
 // and removed on worker exit or reconciliation termination.
 type RunningEntry struct {
 	// Identifier is the human-readable ticket key (e.g. "MT-649").
 	Identifier string
 
-	// Issue is the last-known normalized issue snapshot, updated by
-	// reconciliation.
+	// Issue is the last-known normalized issue snapshot. After dispatch,
+	// State and Labels change only through [recordIssueRead].
 	Issue domain.Issue
+
+	// DispatchLabels is the dispatch read's labels, set by [DispatchIssue]
+	// and never reassigned. A stage hop takes its stage labels from here
+	// alone, so a label added during the run is never removed by a hop.
+	DispatchLabels []string
+
+	// IssueReadAt is the instant the read held in Issue.State and
+	// Issue.Labels was started; zero while they hold the dispatch read.
+	IssueReadAt time.Time
 
 	// SessionID is the adapter-assigned session identifier, empty until
 	// the worker reports session_started.
@@ -138,6 +145,15 @@ type RunningEntry struct {
 
 	LastReportedCacheWriteTokens int64
 
+	// UsageByModel is the run's per-model token totals, which sum to the
+	// run's token counters in every class. Written only by applyUsageDelta.
+	UsageByModel map[string]domain.TokenUsage
+
+	// ReportedAmounts is the run's amounts the agent reported, each in its
+	// own unit, sorted by unit then model. Written only by [HandleAgentEvent]
+	// and never added to a token or money total outside the pricing fallback.
+	ReportedAmounts []domain.ReportedAmount
+
 	ModelName string
 
 	// APIRequestCount is the number of token_usage events received.
@@ -148,6 +164,10 @@ type RunningEntry struct {
 	// RequestsByModel maps model name to token_usage event count. Nil
 	// until the first token_usage event carrying a model name arrives.
 	RequestsByModel map[string]int
+
+	// Skills holds every skill call of the run in completion order. Only the
+	// event loop appends to it.
+	Skills []domain.SkillCall
 
 	// RetryAttempt is nil for first dispatch, non-nil and >= 1 for retries
 	// and continuations.
@@ -163,9 +183,14 @@ type RunningEntry struct {
 	// nested under it. Nil only in test fixtures that bypass [DispatchIssue].
 	CancelFunc context.CancelFunc
 
-	// TokenCeilingCancelFunc cancels the worker context with cause
-	// [errTokenCeilingStop]. Nil only in test fixtures that bypass [DispatchIssue].
-	TokenCeilingCancelFunc context.CancelFunc
+	// CancelCauseFunc cancels the same run context as CancelFunc and records
+	// the cause the worker reads back. Nil only in test fixtures that bypass
+	// [DispatchIssue].
+	CancelCauseFunc context.CancelCauseFunc
+
+	// CeilingCancelFunc cancels the worker context with cause
+	// [errCeilingStop]. Nil only in test fixtures that bypass [DispatchIssue].
+	CeilingCancelFunc context.CancelFunc
 
 	// PendingCleanup is set by reconciliation on a terminal-state
 	// observation; [HandleWorkerExit] performs the cleanup after the
@@ -178,8 +203,9 @@ type RunningEntry struct {
 	// terminal observation is final for the entry's lifetime.
 	ObservedTerminalState string
 
-	// WorkspacePath is the absolute workspace directory, populated in
-	// [HandleWorkerExit] before cleanup. The PendingCleanup path cleans
+	// WorkspacePath is the absolute workspace directory, populated when the
+	// worker reports it prepared, or in [HandleWorkerExit] before cleanup
+	// when that report never arrived. The PendingCleanup path cleans
 	// this actual directory rather than reconstructing it from config,
 	// which may have changed via reload.
 	WorkspacePath string
@@ -210,6 +236,10 @@ type RunningEntry struct {
 	// Trigger is the OriginTrigger of the retry whose fire dispatched the
 	// entry; empty for a poll-tick dispatch. Runtime-only.
 	Trigger string
+
+	// UsageLimitNotified is the UsageLimitNotified of the retry whose fire
+	// dispatched the entry; false for a poll-tick dispatch. Runtime-only.
+	UsageLimitNotified bool
 
 	// Continuation names the pull request and try of a reaction
 	// continuation; the zero value for every other dispatch. Runtime-only.
@@ -266,13 +296,17 @@ type RunningEntry struct {
 	UsageArrival     registry.UsageArrival
 	UsageAttribution registry.UsageAttribution
 
+	// CarriesTokenFigure is whether this session's kind can carry a token
+	// figure on its launch, frozen at dispatch and on retry.
+	CarriesTokenFigure bool
+
 	// APIRequestCountAtLastTurnEnd is APIRequestCount as of the most recent
 	// turn-terminal event, zero until the first turn ends.
 	APIRequestCountAtLastTurnEnd int
 
-	// IssueTokensCompleted is the issue's summed run_history total_tokens
-	// across completed sessions, read at dispatch and replaced by a
-	// confirming read. 0 when the dispatch read failed.
+	// IssueTokensCompleted is the issue's uncached tokens summed from
+	// run_history across completed sessions, read at dispatch and replaced
+	// by a confirming read. 0 when the dispatch read failed.
 	IssueTokensCompleted int64
 
 	// IssueUsage is the issue's completed-session usage as of the last
@@ -285,13 +319,17 @@ type RunningEntry struct {
 	// Written only on the event loop.
 	UnaccountedTurns int
 
-	// TokenCeilingStopRequest is set once the ceiling decides to stop this
+	// CeilingStopRequest is set once the ceiling decides to stop this
 	// run. Non-nil alone does not mean the ceiling ended it; decided at exit.
-	TokenCeilingStopRequest *TokenCeilingStopRequest
+	CeilingStopRequest *CeilingStopRequest
 
 	// TokenCeilingQueryWarned latches once the ceiling's confirming read
 	// has failed and been reported for this run.
 	TokenCeilingQueryWarned bool
+
+	// MoneyCeilingQueryWarned latches once the money ceiling's confirming
+	// read has failed and been reported for this run.
+	MoneyCeilingQueryWarned bool
 
 	// WorkerDone is the Done() channel of the worker context
 	// [DispatchIssue] creates. Nil only in test fixtures that bypass
@@ -369,6 +407,11 @@ type RetryEntry struct {
 	// put-back by the retry timer; empty when the retry never recorded it.
 	OriginTrigger string
 
+	// UsageLimitNotified reports that the run this retry follows ended in a
+	// provider usage-limit refusal, so the next run publishes no session.started
+	// event and, if refused, no session.failed event.
+	UsageLimitNotified bool
+
 	// RuleName is the dispatch rule of the run this retry follows.
 	RuleName string
 
@@ -400,6 +443,11 @@ type RetryEntry struct {
 	// of HandleRetryTimer's paused-by-issue-state arms. Zero means not
 	// paused. Runtime-only: never persisted, never on ScheduleRetryParams.
 	pausedSinceMS int64
+
+	// holdRearmed is true when HandleRetryTimer re-armed this entry because a
+	// spend ceiling or a usage-limit hold held it, so a later slot or host
+	// shortage keeps Attempt. Runtime-only.
+	holdRearmed bool
 
 	// dueBeforeRequestMS is the DueAtMS the entry had before the first request
 	// that made it due now; zero when no request did. Runtime-only.
@@ -518,6 +566,33 @@ func EscalatingReactionKinds() []string {
 	}
 	slices.Sort(kinds)
 	return kinds
+}
+
+// readKeepsRun reports whether a tracker read of state leaves the run
+// going: an active state, or the handoff state for a known reaction kind.
+// Both reconcile and the post-transition read gate on it, so a read that
+// would stop the run is never recorded.
+func readKeepsRun(entry *RunningEntry, state string, activeStates []string, handoffState string) bool {
+	if state == "" {
+		return false
+	}
+	if isActiveState(state, activeStates) {
+		return true
+	}
+	return handoffState != "" && strings.EqualFold(state, handoffState) && isKnownReactionKind(entry.ReactionKind)
+}
+
+// recordIssueRead stores read as the entry's state and labels unless an
+// equal or newer read is already recorded. Both instants must be unconverted
+// [time.Now] values: .UTC() strips the monotonic reading that makes the
+// comparison immune to wall-clock steps.
+func recordIssueRead(entry *RunningEntry, read domain.IssueStateAndLabels, startedAt time.Time) {
+	if !startedAt.After(entry.IssueReadAt) {
+		return
+	}
+	entry.Issue.State = read.State
+	entry.Issue.Labels = read.Labels
+	entry.IssueReadAt = startedAt
 }
 
 func isKnownReactionKind(kind string) bool {
@@ -702,6 +777,18 @@ type CICheck struct {
 type CommentCheck struct {
 	Actionable int
 	New        int
+	// Handled reports that the newest triage answer recorded for this
+	// comment set is handled, so no run is given it.
+	Handled bool
+	// AwaitingApproval reports that no comment is actionable and the review
+	// decision says an approval rule is unmet. Only the review pass sets it.
+	AwaitingApproval bool
+}
+
+// awaits reports whether check records a pull request waiting on a required
+// approval.
+func awaits(check *ReactionCheck) bool {
+	return check != nil && check.Comments != nil && check.Comments.AwaitingApproval
 }
 
 // MergeabilityCheck reports whether the pull request merges without
@@ -918,14 +1005,17 @@ type BudgetExhaustedEntry struct {
 	Identifier         string // human-readable ticket key; empty when the candidate carried none
 	DisplayID          string // qualified form of Identifier; empty when Identifier is display-ready
 	IssueIdentity      IssueIdentity
-	Reason             string // budgetReasonSession or budgetReasonToken
-	UsedSessions       int    // completed sessions counted from run history
-	BudgetSessions     int    // configured agent.max_sessions; 0 means unlimited
-	UsedTokens         *int64 // nil when the token ceiling was not evaluated for this issue
-	BudgetTokens       int64  // configured agent.max_tokens; 0 means unlimited
-	UnmeasuredSessions *int   // nil exactly when UsedTokens is nil; else runs whose spend is unknown
-	StoppedInFlight    *int   // nil exactly when UsedTokens is nil; else sessions the token ceiling stopped mid-run
-	UnaccountedTurns   int    // taken from the read that set UsedTokens; 0 while UsedTokens is nil
+	Reason             string   // budgetReasonSession, budgetReasonToken, or budgetReasonMoney
+	UsedSessions       int      // completed sessions counted from run history
+	BudgetSessions     int      // configured agent.max_sessions; 0 means unlimited
+	UsedTokens         *int64   // uncached tokens; nil when no ceiling read this issue's usage
+	BudgetTokens       int64    // configured agent.max_tokens; 0 means unlimited
+	UnmeasuredSessions *int     // nil exactly when UsedTokens is nil; else runs whose spend is unknown
+	StoppedInFlight    *int     // nil exactly when UsedTokens is nil; else sessions a budget ceiling stopped mid-run
+	UnaccountedTurns   int      // taken from the read that set UsedTokens; 0 while UsedTokens is nil
+	UsedUSD            *float64 // estimated cost in USD; nil when the money axis did not read this issue
+	UsedUSDComplete    *bool    // nil exactly when UsedUSD is nil
+	BudgetUSD          float64  // configured agent.max_cost_usd; 0 means unlimited
 	ExhaustedAt        time.Time
 
 	// RuleName, StageLineage, AgentKind, and ConfiguredModel describe the
@@ -941,11 +1031,20 @@ type BudgetExhaustedEntry struct {
 // run history. It copies the counts, so the entry never aliases the
 // caller's usage value.
 func (e *BudgetExhaustedEntry) setTokenUsage(usage persistence.IssueTokenUsage) {
-	used, unmeasured, stopped := usage.TotalTokens, usage.UnmeasuredSessions, usage.StoppedInFlight
+	used, unmeasured, stopped := usage.UncachedTokens, usage.UnmeasuredSessions, usage.StoppedInFlight
 	e.UsedTokens = &used
 	e.UnmeasuredSessions = &unmeasured
 	e.StoppedInFlight = &stopped
 	e.UnaccountedTurns = usage.UnaccountedTurns
+}
+
+// clonePointer returns a pointer to a copy of *p, or nil for a nil p.
+func clonePointer[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	value := *p
+	return &value
 }
 
 // SpendIncomplete reports whether a token sum carrying the given counts
@@ -987,6 +1086,19 @@ type ParkedEntry struct {
 	StageLineage    StageLineage
 	AgentKind       string
 	ConfiguredModel string
+
+	// SessionID, TemplateID, and Statement are what the park hands to the
+	// first run after a release, as parkHandOverOf derives them from the
+	// run the park follows. TemplateID is empty for the workflow body
+	// template.
+	SessionID  string
+	TemplateID string
+	Statement  string
+
+	// ReleasedAt and ReleaseGesture record a person's release; both are
+	// zero while the park holds.
+	ReleasedAt     time.Time
+	ReleaseGesture string // "label_removed" or "state_changed"
 }
 
 // IssueIdentity names an issue to a person beside its key: the tracker's
@@ -1198,6 +1310,11 @@ type State struct {
 
 	PollIntervalMS int
 
+	// Rates are the rates in force; a nil value prices nothing. Only the
+	// event loop writes them, and always by replacing the pointer, so a
+	// snapshot can share it without a lock.
+	Rates *pricing.Rates
+
 	MaxConcurrentAgents int
 
 	// MaxConcurrentByState holds per-state concurrency caps, keys
@@ -1208,6 +1325,11 @@ type State struct {
 	// ceiling, refreshed on every poll tick. 0 means unlimited. Written
 	// only on the event-loop goroutine.
 	MaxTokens int
+
+	// MaxCostUSD mirrors config.Agent.MaxCostUSD for the money ceiling,
+	// refreshed on every poll tick. 0 means unlimited. Written only on the
+	// event-loop goroutine.
+	MaxCostUSD float64
 
 	// MaxSessions mirrors config.Agent.MaxSessions, refreshed on every poll
 	// tick. 0 means unlimited. Written only on the event-loop goroutine.
@@ -1302,6 +1424,13 @@ type State struct {
 	// person acts on it. The durable mirror is the parked_issues table.
 	Parked map[string]*ParkedEntry
 
+	// ParkReleases holds, per issue ID, the park a person released until the
+	// issue's next primary dispatch from the poll tick consumes it or a new
+	// park replaces it. An issue ID is never in both ParkReleases and Parked.
+	// The durable mirror is the same parked_issues row, with its release
+	// columns set. Only the event loop mutates this map.
+	ParkReleases map[string]*ParkedEntry
+
 	// AttentionAcknowledgements maps an attention item ID to when a person
 	// acknowledged the item. The durable mirror is the
 	// attention_acknowledgements table. Only the event loop mutates this map.
@@ -1321,9 +1450,9 @@ type State struct {
 	// computed at snapshot time.
 	AgentTotals AgentTotals
 
-	// AgentRateLimits is the most recent rate-limit payload from any agent
-	// event. Nil when none observed.
-	AgentRateLimits *RateLimitSnapshot
+	// UsageWindows maps an agent kind to the newest report of each of its
+	// usage windows. Runtime-only.
+	UsageWindows map[string][]domain.UsageWindow
 
 	// ReactionAttempts maps composite key (issueID:kind) to the count of
 	// reaction-triggered continuations. Reset when the issue leaves Running
@@ -1379,11 +1508,33 @@ type State struct {
 	// by the event loop. Runtime-only.
 	BlockerReadOffset int
 
+	// Held maps the ID of each candidate the latest dispatch pass held back
+	// to its hold. Replaced wholesale by a pass that ran the dispatch loop
+	// and left alone by a tick that returned before it; never persisted.
+	// Mutated only by the event loop.
+	Held map[string]*HeldEntry
+
+	// UsageLimitHolds maps each hold key to the provider usage limit that
+	// stops new sessions under it. Never nil. Restored from the store before
+	// the first tick and mutated only by the event loop.
+	UsageLimitHolds map[UsageLimitHoldKey]UsageLimitHold
+
 	// TokenBudgetIncomplete is the set of issue IDs whose per-issue token
 	// spend is below max_tokens but only a lower bound, so the ceiling could
 	// not be fully evaluated. Rebuilt wholesale each tick when the token
 	// budget is enabled, cleared when not. Owned by the event loop.
 	TokenBudgetIncomplete map[string]struct{}
+
+	// MoneyBudgetIncomplete is the set of issue IDs whose per-issue
+	// estimated cost is below max_cost_usd but only a lower bound. Rebuilt
+	// wholesale each tick when the money ceiling is enabled, cleared when
+	// not. Owned by the event loop.
+	MoneyBudgetIncomplete map[string]struct{}
+
+	// SpendCeilings holds the latest evaluation of each configured instance
+	// spend window, daily first. Nil while no window is configured.
+	// Written only by evaluateSpendCeiling on the event loop.
+	SpendCeilings []SpendCeilingStatus
 }
 
 // continuationCtxKey is the context key for reaction continuation data
@@ -1418,6 +1569,21 @@ func stageRenderFrom(ctx context.Context) prompt.StageContext {
 	return render
 }
 
+type parkRenderCtxKey struct{}
+
+// withParkRender returns a child context carrying the park hand-over the
+// worker renders on turn one of its run.
+func withParkRender(ctx context.Context, pc prompt.ParkContext) context.Context {
+	return context.WithValue(ctx, parkRenderCtxKey{}, pc)
+}
+
+// parkRenderFrom extracts the value injected by [withParkRender] and reports
+// whether one was injected.
+func parkRenderFrom(ctx context.Context) (prompt.ParkContext, bool) {
+	pc, ok := ctx.Value(parkRenderCtxKey{}).(prompt.ParkContext)
+	return pc, ok
+}
+
 // NewState creates an initialized [State] with empty collections and the
 // provided config values. maxConcurrentByState keys must be pre-normalized
 // to lowercase by the caller.
@@ -1438,7 +1604,9 @@ func NewState(pollIntervalMS, maxConcurrentAgents, maxTokens int, maxConcurrentB
 		BudgetAnnounced:           make(map[string]BudgetAnnouncement),
 		BudgetHoldNoticed:         make(map[string]string),
 		Parked:                    make(map[string]*ParkedEntry),
+		ParkReleases:              make(map[string]*ParkedEntry),
 		AttentionAcknowledgements: make(map[string]time.Time),
+		UsageLimitHolds:           make(map[UsageLimitHoldKey]UsageLimitHold),
 		StageHops:                 make(map[string]*StageHopEntry),
 		ActiveOrder:               make(map[string]time.Time),
 		AgentTotals:               totals,
@@ -1449,6 +1617,7 @@ func NewState(pollIntervalMS, maxConcurrentAgents, maxTokens int, maxConcurrentB
 		PendingReactions:          make(map[string]*PendingReaction),
 		AutoMergeAuthLogged:       make(map[string]struct{}),
 		TokenBudgetIncomplete:     make(map[string]struct{}),
+		MoneyBudgetIncomplete:     make(map[string]struct{}),
 	}
 }
 
@@ -1469,15 +1638,19 @@ func RunningCountByState(running map[string]*RunningEntry, state string) int {
 }
 
 // SnapshotIssueUsage is a running issue's completed-session usage,
-// value-copied by [RuntimeSnapshot]. Each ByKind value is shaped for cost
-// estimation: InputTokens spans fresh input and both cache classes, and
-// TotalTokens is left zero because pricing never reads it.
+// value-copied by [RuntimeSnapshot]. UncachedTokens is the figure compared
+// with the token budget. The recorded aggregates carry the cost the completed
+// sessions were priced at when they finished.
 type SnapshotIssueUsage struct {
-	Sessions           int                          `json:"sessions"`
-	TotalTokens        int64                        `json:"total_tokens"`
-	UnmeasuredSessions int                          `json:"unmeasured_sessions"`
-	UnaccountedTurns   int                          `json:"unaccounted_turns"`
-	ByKind             map[string]domain.TokenUsage `json:"by_kind"`
+	Sessions           int     `json:"sessions"`
+	TotalTokens        int64   `json:"total_tokens"`
+	UncachedTokens     int64   `json:"uncached_tokens"`
+	UnmeasuredSessions int     `json:"unmeasured_sessions"`
+	UnaccountedTurns   int     `json:"unaccounted_turns"`
+	RecordedCostUSD    float64 `json:"recorded_cost_usd"`
+	PricedSessions     int     `json:"priced_sessions"`
+	PartialSessions    int     `json:"partial_sessions"`
+	UnpricedSessions   int     `json:"unpriced_sessions"`
 }
 
 // SnapshotStagePosition is where a row's rule stands on its stage chain.
@@ -1496,12 +1669,62 @@ type SnapshotContinuation struct {
 	Attempt    int    `json:"attempt"`    // 0 for a kind that counts no tries
 }
 
+// SnapshotBlocker is a blocker that holds a candidate. State is masked and
+// empty when the tracker returned none.
+type SnapshotBlocker struct {
+	IssueID    string `json:"issue_id"`
+	Identifier string `json:"issue_identifier"`
+	DisplayID  string `json:"display_identifier,omitempty"`
+	State      string `json:"state,omitempty"`
+}
+
+// SnapshotSlotHold is the agent slot limit that held a candidate. State is
+// masked and set exactly for [SlotScopeState].
+type SnapshotSlotHold struct {
+	Scope SlotScope `json:"scope"`
+	State string    `json:"state,omitempty"`
+	Used  int       `json:"used"`
+	Limit int       `json:"limit"`
+}
+
+// SnapshotHold is a read-only view of the hold the latest dispatch pass gave
+// one candidate. Blockers is nil unless Reason is [SkipBlockedBy], Slot is nil
+// unless it is [SkipAgentSlotsFull], ResetsAt is zero unless it is a spend
+// reason or [SkipUsageLimit], and AgentKind, ModelOnly, and Model are set for
+// [SkipUsageLimit] only.
+type SnapshotHold struct {
+	Reason    SkipReason        `json:"reason"`
+	Since     time.Time         `json:"held_since"`
+	Blockers  []SnapshotBlocker `json:"blockers"`
+	Slot      *SnapshotSlotHold `json:"slot"`
+	ResetsAt  time.Time         `json:"resets_at"`
+	AgentKind string            `json:"agent_kind,omitempty"`
+	ModelOnly bool              `json:"model_only,omitempty"`
+	Model     string            `json:"model,omitempty"`
+}
+
+// SnapshotHeldEntry is a read-only view of one held candidate. IssueTitle,
+// IssueURL, IssueType, IssueLabels, and State are masked, and IssueLabels is
+// never nil.
+type SnapshotHeldEntry struct {
+	IssueID     string       `json:"issue_id"`
+	Identifier  string       `json:"issue_identifier"`
+	DisplayID   string       `json:"display_identifier,omitempty"`
+	IssueTitle  string       `json:"issue_title,omitempty"`
+	IssueURL    string       `json:"issue_url,omitempty"`
+	IssueType   string       `json:"issue_type,omitempty"`
+	IssueLabels []string     `json:"issue_labels,omitzero"`
+	State       string       `json:"state,omitempty"`
+	Hold        SnapshotHold `json:"hold"`
+}
+
 // SnapshotStageHop is a read-only view of one issue between stages: a hop was
 // made and no run of the issue was dispatched since. IssueTitle, IssueURL,
 // IssueType, IssueLabels, and State are masked. IssueLabels is nil exactly
 // when the record holds no read of the labels. StagePosition is nil when
 // RuleName is on no stage chain, and AgentKind and ConfiguredModel are empty
-// when the configuration names no rule with a stage label for it.
+// when the configuration names no rule with a stage label for it. Hold is nil
+// while the latest dispatch pass recorded no hold for the issue.
 type SnapshotStageHop struct {
 	IssueID      string    `json:"issue_id"`
 	Identifier   string    `json:"issue_identifier"`
@@ -1522,6 +1745,7 @@ type SnapshotStageHop struct {
 	StagePosition   *SnapshotStagePosition `json:"stage_position"`
 	AgentKind       string                 `json:"agent_kind,omitempty"`
 	ConfiguredModel string                 `json:"configured_model,omitempty"`
+	Hold            *SnapshotHold          `json:"hold"`
 }
 
 // SnapshotRunningEntry is a read-only view of a running session, produced
@@ -1553,6 +1777,7 @@ type SnapshotRunningEntry struct {
 	ModelName           string                    `json:"model_name,omitempty"`
 	APIRequestCount     int                       `json:"api_request_count"`
 	RequestsByModel     map[string]int            `json:"requests_by_model,omitempty"`
+	Skills              []domain.SkillCall        `json:"skills,omitempty"`
 	APIRequestsMeasured bool                      `json:"api_requests_measured"`
 	WorkspacePath       string                    `json:"workspace_path"`
 	SSHHost             string                    `json:"ssh_host,omitempty"`
@@ -1571,6 +1796,8 @@ type SnapshotRunningEntry struct {
 	ConfiguredModel     string                    `json:"configured_model,omitempty"`
 	ConfiguredEffort    string                    `json:"configured_effort,omitempty"`
 	UsageMeasured       bool                      `json:"tokens_measured"`
+	EstimatedCostUSD    *float64                  `json:"estimated_cost_usd"`
+	CostStatus          string                    `json:"cost_status"`
 	UsageArrival        registry.UsageArrival     `json:"usage_arrival"`
 	UsageAttribution    registry.UsageAttribution `json:"usage_attribution"`
 	TokensPending       bool                      `json:"tokens_pending"`
@@ -1587,6 +1814,12 @@ type SnapshotRunningEntry struct {
 	// StallReference is the last agent event instant, else the start of the
 	// run: the instant the stall timeout is measured from.
 	StallReference time.Time `json:"-"`
+}
+
+// UncachedTokens returns the session's total tokens less its cache reads,
+// floored at zero: the figure the token budget compares.
+func (e SnapshotRunningEntry) UncachedTokens() int64 {
+	return domain.TokenUsage{TotalTokens: e.AgentTotalTokens, CacheReadTokens: e.CacheReadTokens}.Uncached()
 }
 
 // SnapshotRetryEntry is a read-only view of a pending retry, produced by
@@ -1666,6 +1899,9 @@ type SnapshotBudgetEntry struct {
 	UnmeasuredSessions *int      `json:"unmeasured_sessions"`
 	StoppedInFlight    *int      `json:"stopped_in_flight"`
 	UnaccountedTurns   int       `json:"unaccounted_turns"`
+	UsedUSD            *float64  `json:"used_usd"`
+	UsedUSDComplete    *bool     `json:"used_usd_complete"`
+	BudgetUSD          float64   `json:"budget_usd"`
 	ExhaustedAt        time.Time `json:"exhausted_at"`
 
 	RuleName        string                 `json:"rule_name,omitempty"`
@@ -1706,7 +1942,7 @@ type SnapshotPendingReaction struct {
 	EscalationTrigger string `json:"escalation_trigger,omitempty"`
 	// WatchEndsAt is when the reaction stops watching unless its watch
 	// restarts first; nil for a kind without a watch window or a window of 0,
-	// and while an escalation stands.
+	// while an escalation stands, and while the latest check awaits approval.
 	WatchEndsAt *time.Time     `json:"watch_ends_at"`
 	LastCheck   *ReactionCheck `json:"last_check"`
 
@@ -1745,18 +1981,27 @@ type SnapshotAgentTotals struct {
 	RunningNonReporting int     `json:"running_non_reporting"`
 }
 
+// SnapshotUsageWindows is one agent kind's usage windows at snapshot time.
+type SnapshotUsageWindows struct {
+	// ReportedAt is the newest report among all held windows, current or not.
+	ReportedAt time.Time `json:"reported_at"`
+
+	// Windows holds the current windows only; never nil.
+	Windows []domain.UsageWindow `json:"windows"`
+}
+
 // RuntimeSnapshotResult is a point-in-time capture of the orchestrator's
 // runtime state, produced by [RuntimeSnapshot].
 type RuntimeSnapshotResult struct {
-	GeneratedAt          time.Time              `json:"generated_at"`
-	Running              []SnapshotRunningEntry `json:"running"`
-	Retrying             []SnapshotRetryEntry   `json:"retrying"`
-	AgentTotals          SnapshotAgentTotals    `json:"agent_totals"`
-	RateLimits           map[string]any         `json:"rate_limits"`
-	BudgetExhaustedCount int                    `json:"budget_exhausted_count"`
-	BudgetExhausted      []SnapshotBudgetEntry  `json:"budget_exhausted"`
-	ParkedCount          int                    `json:"parked_count"`
-	Parked               []SnapshotParkedEntry  `json:"parked"`
+	GeneratedAt          time.Time                       `json:"generated_at"`
+	Running              []SnapshotRunningEntry          `json:"running"`
+	Retrying             []SnapshotRetryEntry            `json:"retrying"`
+	AgentTotals          SnapshotAgentTotals             `json:"agent_totals"`
+	UsageWindows         map[string]SnapshotUsageWindows `json:"usage_windows"`
+	BudgetExhaustedCount int                             `json:"budget_exhausted_count"`
+	BudgetExhausted      []SnapshotBudgetEntry           `json:"budget_exhausted"`
+	ParkedCount          int                             `json:"parked_count"`
+	Parked               []SnapshotParkedEntry           `json:"parked"`
 
 	// PendingReactions is never nil.
 	PendingReactions []SnapshotPendingReaction `json:"pending_reactions"`
@@ -1764,18 +2009,29 @@ type RuntimeSnapshotResult struct {
 	// BetweenStages is never nil.
 	BetweenStages []SnapshotStageHop `json:"between_stages"`
 
+	// Held is never nil.
+	Held []SnapshotHeldEntry `json:"held"`
+
 	// ActiveOrder maps every issue ID the row lists hold to its order time.
 	// It shares nothing with State.
 	ActiveOrder map[string]time.Time `json:"-"`
 
-	// MaxTokens and MaxSessions are the token ceiling and session budget in
-	// force at capture; 0 means no limit.
-	MaxTokens   int `json:"max_tokens"`
-	MaxSessions int `json:"max_sessions"`
+	// MaxTokens, MaxCostUSD, and MaxSessions are the token ceiling, money
+	// ceiling, and session budget in force at capture; 0 means no limit.
+	MaxTokens   int     `json:"max_tokens"`
+	MaxCostUSD  float64 `json:"max_cost_usd"`
+	MaxSessions int     `json:"max_sessions"`
+
+	// Rates is State.Rates at capture; a nil value prices nothing. Safe to
+	// read without a lock because the rates are replaced, never mutated.
+	Rates *pricing.Rates `json:"-"`
 
 	// AttentionAcknowledgements is a copy of State.AttentionAcknowledgements,
 	// keyed by attention item ID.
 	AttentionAcknowledgements map[string]time.Time `json:"-"`
+
+	// SpendCeilings is a copy of State.SpendCeilings.
+	SpendCeilings []SpendCeilingStatus `json:"-"`
 }
 
 // ActiveElapsedSeconds sums wall-clock elapsed seconds across all running
@@ -1833,27 +2089,22 @@ func turnHasEnded(turnCount int, lastEvent domain.AgentEventType) bool {
 }
 
 // SnapshotIssueUsageOf copies a running entry's usage read into the shape the
-// snapshot serves, sharing no map with state. A nil read stays nil so the
-// absence of a successful read is not served as zero usage.
+// snapshot serves. A nil read stays nil so the absence of a successful read is
+// not served as zero usage.
 func SnapshotIssueUsageOf(usage *persistence.IssueTokenUsage) *SnapshotIssueUsage {
 	if usage == nil {
 		return nil
 	}
-	byKind := make(map[string]domain.TokenUsage, len(usage.ByKind))
-	for kind, spent := range usage.ByKind {
-		byKind[kind] = domain.TokenUsage{
-			InputTokens:      spent.FreshInputTokens + spent.CacheReadTokens + spent.CacheWriteTokens,
-			OutputTokens:     spent.OutputTokens,
-			CacheReadTokens:  spent.CacheReadTokens,
-			CacheWriteTokens: spent.CacheWriteTokens,
-		}
-	}
 	return &SnapshotIssueUsage{
 		Sessions:           usage.Sessions,
 		TotalTokens:        usage.TotalTokens,
+		UncachedTokens:     usage.UncachedTokens,
 		UnmeasuredSessions: usage.UnmeasuredSessions,
 		UnaccountedTurns:   usage.UnaccountedTurns,
-		ByKind:             byKind,
+		RecordedCostUSD:    usage.RecordedCostUSD,
+		PricedSessions:     usage.PricedSessions,
+		PartialSessions:    usage.PartialSessions,
+		UnpricedSessions:   usage.UnpricedSessions,
 	}
 }
 
@@ -1877,13 +2128,30 @@ func stallInstants(reference time.Time, timeoutMS int) (quietAt, stallAt time.Ti
 	return reference.Add(timeout / 2), reference.Add(timeout)
 }
 
+func spendOfRunningEntry(entry *RunningEntry) pricing.Spend {
+	return pricing.Spend{
+		Kind:     entry.AgentKind,
+		Model:    cmp.Or(entry.ModelName, entry.ConfiguredModel),
+		Measured: entry.UsageMeasured,
+		Totals: domain.TokenUsage{
+			InputTokens:      entry.AgentInputTokens,
+			OutputTokens:     entry.AgentOutputTokens,
+			TotalTokens:      entry.AgentTotalTokens,
+			CacheReadTokens:  entry.CacheReadTokens,
+			CacheWriteTokens: entry.CacheWriteTokens,
+		},
+		Parts:            entry.UsageByModel,
+		UnaccountedTurns: entry.UnaccountedTurns,
+		Reported:         entry.ReportedAmounts,
+	}
+}
+
 // RuntimeSnapshot captures a point-in-time view of the orchestrator's
 // runtime state. now is normalized to UTC internally.
 //
-// Running, Retrying, Parked, PendingReactions, BetweenStages, and AgentTotals are copied out and
-// may be retained without synchronization. RateLimits is shallow-copied and may alias
-// nested mutable values; callers must treat it and its referents as
-// read-only.
+// Running, Retrying, Parked, PendingReactions, BetweenStages, Held, and AgentTotals are copied out and
+// may be retained without synchronization. UsageWindows is copied out, and the UsedPercent values its
+// windows point to are never written.
 //
 // Must be called from the event loop goroutine; [State] is not safe for
 // concurrent access.
@@ -1899,13 +2167,13 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	var runningUnreported, runningNonReporting int
 	for _, entry := range state.Running {
 		requestsMeasured := apiRequestsMeasured(entry.UsageArrival, entry.TurnCount, entry.APIRequestCount)
-		tokensAwaited := !entry.UsageMeasured &&
+		tokensAwaited := entry.CarriesTokenFigure && !entry.UsageMeasured &&
 			usageStillArriving(entry.UsageArrival, entry.TurnCount, entry.LastAgentEvent)
 
 		switch {
-		case entry.UsageArrival == registry.UsageArrivalNone:
+		case !entry.CarriesTokenFigure:
 			runningNonReporting++
-		case entry.UsageArrival.ReportsAnyFigure() && !entry.UsageMeasured:
+		case !entry.UsageMeasured:
 			// A session whose figure is no longer coming is non-reporting,
 			// not still waiting.
 			if tokensAwaited {
@@ -1924,6 +2192,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 		}
 		identity := maskedIdentity(issueIdentityOf(entry.Issue))
 		quietAt, stallAt := stallInstants(stallReference(entry), state.StallTimeoutMS)
+		liveCost, liveStatus := pricing.PriceSession(spendOfRunningEntry(entry), state.Rates)
 		snap.Running = append(snap.Running, SnapshotRunningEntry{
 			IssueID:             entry.Issue.ID,
 			Identifier:          entry.Identifier,
@@ -1947,6 +2216,7 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			ModelName:           entry.ModelName,
 			APIRequestCount:     entry.APIRequestCount,
 			RequestsByModel:     modelRequests,
+			Skills:              slices.Clone(entry.Skills),
 			APIRequestsMeasured: requestsMeasured,
 			WorkspacePath:       entry.WorkspacePath,
 			SSHHost:             entry.SSHHost,
@@ -1965,6 +2235,8 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			ConfiguredModel:     entry.ConfiguredModel,
 			ConfiguredEffort:    entry.ConfiguredEffort,
 			UsageMeasured:       entry.UsageMeasured,
+			EstimatedCostUSD:    liveCost,
+			CostStatus:          string(liveStatus),
 			UsageArrival:        entry.UsageArrival,
 			UsageAttribution:    entry.UsageAttribution,
 			TokensPending: entry.UsageArrival == registry.UsageArrivalTurnEnd &&
@@ -2027,8 +2299,11 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 	}
 
 	snap.MaxTokens = state.MaxTokens
+	snap.MaxCostUSD = state.MaxCostUSD
 	snap.MaxSessions = state.MaxSessions
+	snap.Rates = state.Rates
 	snap.AttentionAcknowledgements = maps.Clone(state.AttentionAcknowledgements)
+	snap.SpendCeilings = slices.Clone(state.SpendCeilings)
 
 	snap.BudgetExhaustedCount = len(state.BudgetExhausted)
 	budgetExhausted := make([]SnapshotBudgetEntry, 0, len(state.BudgetExhausted))
@@ -2051,6 +2326,9 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 			UnmeasuredSessions: entry.UnmeasuredSessions,
 			StoppedInFlight:    entry.StoppedInFlight,
 			UnaccountedTurns:   entry.UnaccountedTurns,
+			UsedUSD:            clonePointer(entry.UsedUSD),
+			UsedUSDComplete:    clonePointer(entry.UsedUSDComplete),
+			BudgetUSD:          entry.BudgetUSD,
 			ExhaustedAt:        entry.ExhaustedAt,
 			RuleName:           entry.RuleName,
 			StageLineage:       entry.StageLineage,
@@ -2097,13 +2375,30 @@ func RuntimeSnapshot(state *State, now time.Time) RuntimeSnapshotResult {
 
 	snap.PendingReactions = snapshotPendingReactions(state)
 	snap.BetweenStages = snapshotBetweenStages(state)
+	snap.Held = snapshotHeld(state)
 	snap.ActiveOrder = activeOrderOf(state)
 
-	if state.AgentRateLimits != nil {
-		snap.RateLimits = maps.Clone(state.AgentRateLimits.Data)
-	}
+	snap.UsageWindows = snapshotUsageWindows(state, now)
 
 	return snap
+}
+
+// snapshotUsageWindows returns the per-kind windows current at now; never nil.
+func snapshotUsageWindows(state *State, now time.Time) map[string]SnapshotUsageWindows {
+	windows := make(map[string]SnapshotUsageWindows, len(state.UsageWindows))
+	for kind, held := range state.UsageWindows {
+		var reportedAt time.Time
+		for _, w := range held {
+			if w.ReportedAt.After(reportedAt) {
+				reportedAt = w.ReportedAt
+			}
+		}
+		windows[kind] = SnapshotUsageWindows{
+			ReportedAt: reportedAt,
+			Windows:    usage.CurrentWindows(held, now),
+		}
+	}
+	return windows
 }
 
 // snapshotPendingReactions builds the pending-reaction rows sorted by issue
@@ -2156,7 +2451,7 @@ func snapshotPendingReactions(state *State) []SnapshotPendingReaction {
 			row.EscalatedAt = &escalatedAt
 			row.EscalationTrigger = string(entry.EscalationTrigger)
 		}
-		if window, ok := state.ReactionWatchWindows[entry.Kind]; ok && entry.EscalatedAt.IsZero() {
+		if window, ok := state.ReactionWatchWindows[entry.Kind]; ok && entry.EscalatedAt.IsZero() && !awaits(entry.LastCheck) {
 			watchEndsAt := watchBasis(entry).Add(window)
 			row.WatchEndsAt = &watchEndsAt
 		}
@@ -2197,7 +2492,7 @@ func snapshotBetweenStages(state *State) []SnapshotStageHop {
 		}
 		identity := maskedIdentity(hop.IssueIdentity)
 		agent := state.RuleAgents[hop.TargetRule]
-		rows = append(rows, SnapshotStageHop{
+		row := SnapshotStageHop{
 			IssueID:      id,
 			Identifier:   hop.Identifier,
 			DisplayID:    hop.DisplayID,
@@ -2217,7 +2512,12 @@ func snapshotBetweenStages(state *State) []SnapshotStageHop {
 			StagePosition:   stagePosition(state, id, hop.TargetRule, hop.SourceRule),
 			AgentKind:       agent.AgentKind,
 			ConfiguredModel: agent.ConfiguredModel,
-		})
+		}
+		if held := state.Held[id]; held != nil {
+			hold := snapshotHold(held)
+			row.Hold = &hold
+		}
+		rows = append(rows, row)
 	}
 	slices.SortFunc(rows, func(a, b SnapshotStageHop) int {
 		return cmp.Or(cmp.Compare(a.Identifier, b.Identifier), cmp.Compare(a.IssueID, b.IssueID))

@@ -443,7 +443,7 @@ func TestFinalizeTurn_TerminalIncompleteLogsWarn(t *testing.T) {
 	// other test in this package that installs the log spy.
 	spy := agenttest.InstallLogSpy(t)
 
-	_, _ = FinalizeTurn(func(domain.AgentEvent) {}, nil, TurnEvidence{Terminal: TerminalIncomplete}, TurnMeta{})
+	_, _ = FinalizeTurn(func(domain.AgentEvent) {}, nil, TurnEvidence{Terminal: TerminalIncomplete}, TurnMeta{}, TurnSpend{})
 
 	const want = "agent stopped without reporting the task complete, treating as failure"
 
@@ -473,7 +473,7 @@ func TestFinalizeTurn_WorkUnobservableLogsWarn(t *testing.T) {
 	spy := agenttest.InstallLogSpy(t)
 
 	ev := TurnEvidence{Terminal: TerminalAbsent, ExitObserved: true, ExitCode: 0, Work: WorkUnobservable}
-	_, _ = FinalizeTurn(func(domain.AgentEvent) {}, nil, ev, TurnMeta{})
+	_, _ = FinalizeTurn(func(domain.AgentEvent) {}, nil, ev, TurnMeta{}, TurnSpend{})
 
 	const want = "agent exited with no result and this kind offers no output signal, treating as failure"
 
@@ -615,7 +615,7 @@ func TestFinalizeTurn_RowExitedBeforeOutputLogsNoWarnOfItsOwn(t *testing.T) {
 	ev := TurnEvidence{Terminal: TerminalAbsent, ExitObserved: true, ExitCode: 1, EarlyExit: earlyExitReport}
 
 	var events []domain.AgentEvent
-	result, err := FinalizeTurn(func(e domain.AgentEvent) { events = append(events, e) }, nil, ev, TurnMeta{})
+	result, err := FinalizeTurn(func(e domain.AgentEvent) { events = append(events, e) }, nil, ev, TurnMeta{}, TurnSpend{})
 
 	if result.ExitReason != domain.EventTurnFailed {
 		t.Errorf("FinalizeTurn().result.ExitReason = %q, want %q", result.ExitReason, domain.EventTurnFailed)

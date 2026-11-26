@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sortie-ai/sortie/internal/agent/agenttest"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
 // scenarios is filled by this package's test files before TestMain runs, so a
@@ -167,16 +168,12 @@ func TestFakeRuntime_Hang(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	select {
-	case err := <-done:
-		t.Fatalf("hanging runtime exited: %v", err)
-	case <-time.After(500 * time.Millisecond):
-	}
+	waittest.Never(t, done, 500*time.Millisecond, "exit of a hanging runtime")
 
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("Kill() error = %v", err)
 	}
-	if err := <-done; err == nil {
+	if err := waittest.Receive(t, done, "Wait after Kill"); err == nil {
 		t.Error("Wait() after Kill() = nil, want the kill reported")
 	}
 }

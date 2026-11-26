@@ -632,6 +632,23 @@ func TestFinish(t *testing.T) {
 	})
 }
 
+func TestFinish_RunOutcomeBeatsParentEnvironment(t *testing.T) {
+	t.Setenv("SORTIE_RUN_OUTCOME", "succeeded")
+	dir := t.TempDir()
+
+	Finish(context.Background(), FinishParams{
+		Path:          dir,
+		Identifier:    "F-RO-1",
+		IssueID:       "id-ro-1",
+		Attempt:       1,
+		AfterRun:      `[ "$SORTIE_RUN_OUTCOME" = failed ] && touch "$SORTIE_WORKSPACE/.failed"`,
+		HookTimeoutMS: 5000,
+		RunOutcome:    "failed",
+	})
+
+	assertFileExists(t, filepath.Join(dir, ".failed"))
+}
+
 func TestCleanup(t *testing.T) {
 	t.Parallel()
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 
 	_ "github.com/sortie-ai/sortie/internal/scm/github"
 )
@@ -318,21 +320,19 @@ func TestReconcileLabelReview_LiveAPI_E2E(t *testing.T) {
 	ghClient.addLabel(t, owner, repo, prNumber, reviewLabel)
 
 	const maxTicks = 8
-	dispatched := false
-	for range maxTicks {
+	dispatchTick := func() error {
 		reconcileLabelReviewCommands(state, params, discardLogger(), ctx, &domain.NoopMetrics{})
 
 		if _, retryQueued := state.RetryAttempts[issueID]; retryQueued {
-			dispatched = true
-			break
+			return nil
 		}
 		if pending, present := state.PendingReactions[rkey]; present {
 			pending.PendingRetryAt = time.Time{}
 			state.PendingReactions[rkey] = pending
 		}
-		time.Sleep(2 * time.Second)
+		return errors.New("no label-review dispatch queued")
 	}
-	if !dispatched {
+	if err := waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, dispatchTick); err != nil {
 		t.Fatal("label-review dispatch did not fire within the tick budget")
 	}
 
@@ -382,21 +382,7 @@ func TestReconcileLabelReview_LiveAPI_E2E(t *testing.T) {
 
 	ghClient.addLabel(t, owner, repo, prNumber, reviewLabel)
 
-	dispatchedAgain := false
-	for range maxTicks {
-		reconcileLabelReviewCommands(state, params, discardLogger(), ctx, &domain.NoopMetrics{})
-
-		if _, retryQueued := state.RetryAttempts[issueID]; retryQueued {
-			dispatchedAgain = true
-			break
-		}
-		if pending, present := state.PendingReactions[rkey]; present {
-			pending.PendingRetryAt = time.Time{}
-			state.PendingReactions[rkey] = pending
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if !dispatchedAgain {
+	if err := waittest.UntilWithin(maxTicks*2*time.Second, 2*time.Second, dispatchTick); err != nil {
 		t.Fatal("second label-review dispatch did not fire within the tick budget after re-applying the label")
 	}
 }

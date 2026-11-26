@@ -16,6 +16,7 @@ import (
 
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/orchestrator"
+	"github.com/sortie-ai/sortie/internal/pricing"
 	"github.com/sortie-ai/sortie/internal/server/ui"
 )
 
@@ -59,7 +60,7 @@ type RunHistoryEntry struct {
 	// Attempt is the one-based retry attempt number.
 	Attempt int
 	// Status is the terminal run outcome: "succeeded", "failed",
-	// "cancelled", "ci_failed", "needs_person", or "budget_stopped".
+	// "cancelled", "ci_failed", "needs_person", "budget_stopped", or "usage_limited".
 	Status string
 	// WorkflowFile is the path to the workflow definition used.
 	WorkflowFile string
@@ -110,13 +111,32 @@ type RunHistoryEntry struct {
 	Tokens domain.TokenUsage
 	// TokensMeasured is false when the agent reported no usage.
 	TokensMeasured bool
-	// UnaccountedTurns counts turns whose usage the agent never reported.
-	UnaccountedTurns int
+	// UsageCompleteness is "complete", "lower_bound", or "unmeasured".
+	UsageCompleteness string
+	// UsageProvenance lists the run's usage sources, live strategy first; nil
+	// when the run was recorded before provenance was kept.
+	UsageProvenance []UsagePair
+	// VendorAmounts lists the amounts the run reported in a unit other than US
+	// dollars; nil when the run was recorded before provenance was kept.
+	VendorAmounts []VendorAmount
+	// UnmeasuredCause is why the run has no token figure; empty unless
+	// UsageCompleteness is "unmeasured".
+	UnmeasuredCause string
+	// UnmeasuredUnits lists the units the run reported, ascending; empty
+	// unless UnmeasuredCause is "amounts_only".
+	UnmeasuredUnits []string
+	// EstimatedCostUSD and CostStatus are the cost recorded when the run
+	// finished. CostStatus is empty when the run was recorded without one.
+	EstimatedCostUSD *float64
+	CostStatus       string
 	// StagePreviousOutcome is the outcome of the run that led to this one.
 	StagePreviousOutcome string
 	// ReviewMetadata is the self-review JSON as recorded; nil when
 	// self-review did not run.
 	ReviewMetadata *string
+	// Skills is the JSON array of the run's skill calls as recorded; nil when
+	// the run recorded none.
+	Skills *string
 	// OriginRecorded is false for a run recorded before the origin fields
 	// existed; Trigger, ReactionKind, SessionID, and SSHHost are then unknown.
 	OriginRecorded bool
@@ -132,6 +152,67 @@ type RunHistoryEntry struct {
 	// DispatchID keys the run's retained events: empty on the recorded CI
 	// result, nil for a run recorded before the dispatch ID existed.
 	DispatchID *string
+	// DeclaredOutcome and AgentText are as stored, empty when none.
+	// AgentText is masked when recorded and again by the server at serve time.
+	DeclaredOutcome string
+	AgentText       string
+	// ModelUsage is the run's per-model spend ordered by model; empty when
+	// the run recorded none.
+	ModelUsage []RunModelUsage
+}
+
+// RunModelUsage is one model's part of a finished run's spend.
+type RunModelUsage struct {
+	// Model is the model name as recorded; empty when the agent reported none.
+	Model string
+	// Tokens.TotalTokens is InputTokens plus OutputTokens, as for a run.
+	Tokens domain.TokenUsage
+	// EstimatedCostUSD and CostStatus are the cost recorded for the part.
+	// CostStatus is empty when the part was recorded without a price.
+	EstimatedCostUSD *float64
+	CostStatus       string
+	// UnratedClasses names the token classes that had no rate; empty when
+	// none did or when UnratedRecorded is false.
+	UnratedClasses []string
+	// UnratedRecorded is false for a part recorded without a price or priced
+	// before the classes were recorded.
+	UnratedRecorded bool
+	// PriceSource names where the part's price came from; empty when none is
+	// recorded.
+	PriceSource string
+}
+
+// UsagePair is one source a run's usage was read from and the strategy that
+// read it.
+type UsagePair struct {
+	Source, Strategy string
+}
+
+// VendorAmount is an amount a run reported in a unit other than US dollars.
+// Model is empty when the source attributed it to no model.
+type VendorAmount struct {
+	Unit, Model string
+	Amount      float64
+	LowerBound  bool
+}
+
+// UnitAmount is the sum of one unit's amounts over an issue's runs.
+type UnitAmount struct {
+	Unit       string
+	Amount     float64
+	LowerBound bool
+}
+
+// IssueProvenance is what an issue's recorded runs say about the origin of
+// their figures. UnmeasuredCause is empty when no run is unmeasured, and
+// AgentPricedUSD is nil when no share was priced from an agent-reported
+// amount. AgentPricedModels holds an empty name for an unknown model.
+type IssueProvenance struct {
+	UnmeasuredCause   string
+	UnmeasuredUnits   []string
+	VendorAmounts     []UnitAmount
+	AgentPricedUSD    *float64
+	AgentPricedModels []string
 }
 
 // RunHistoryQuery selects completed runs; a zero field matches every run.
@@ -236,6 +317,8 @@ type IssueRunTotals struct {
 	Usage orchestrator.SnapshotIssueUsage
 	// Tokens sums each token class over the measured runs.
 	Tokens domain.TokenUsage
+	// Provenance is what the runs say about the origin of the figures above.
+	Provenance IssueProvenance
 }
 
 // RunHistoryReader reads persisted run history. Runs come newest first, and
@@ -344,14 +427,36 @@ type Params struct {
 	// the stream reads every run from the store only.
 	RunEventsAfterFn RunEventsAfterFunc
 
-	// TokenRates maps agent adapter kind strings to per-token USD
-	// rates for cost estimation in the JSON API. When nil or empty,
-	// the API reports raw token counts without cost estimates.
-	TokenRates TokenRates
-
 	// Stats computes the run statistics report. Called on each
 	// GET /api/v1/stats; nil answers 503.
 	Stats StatsFunc
+
+	// ModelUse lists the agent kind and model pairs with a recorded run.
+	// Called on each GET /api/v1/prices; nil answers 503.
+	ModelUse ModelUseFunc
+
+	// ConfiguredModelsFn lists the agent kind and model pairs the workflow
+	// configures. When nil, GET /api/v1/prices lists only models with a
+	// recorded run.
+	ConfiguredModelsFn func() []orchestrator.ConfiguredModel
+
+	// RatesFn returns the rates the next recorded run gets. When nil,
+	// GET /api/v1/prices serves every model unpriced and the fetched and
+	// embedded tables off.
+	RatesFn func() *pricing.Rates
+
+	// PriceDownloads reports the state of the price table downloads. When
+	// nil, GET /api/v1/prices reads an enabled download as not loaded.
+	PriceDownloads *pricing.Downloader
+
+	// WorkflowLoadFn returns when the latest workflow load ended and its
+	// error, nil when it succeeded. When nil, GET /api/v1/prices reports no
+	// load failure.
+	WorkflowLoadFn func() (endedAt time.Time, err error)
+
+	// MaskErrorFn masks an error text before GET /api/v1/prices serves it.
+	// When nil, the route serves no error text.
+	MaskErrorFn func(string) string
 }
 
 // Server is the embedded HTTP server for the JSON API, the dashboard
@@ -378,8 +483,14 @@ type Server struct {
 	runHistory       RunHistoryReader
 	runEventsFn      RunEventsFunc
 	runEventsAfterFn RunEventsAfterFunc
-	tokenRates       TokenRates
 	stats            StatsFunc
+
+	modelUse           ModelUseFunc
+	configuredModelsFn func() []orchestrator.ConfiguredModel
+	ratesFn            func() *pricing.Rates
+	priceDownloads     *pricing.Downloader
+	workflowLoadFn     func() (time.Time, error)
+	maskErrorFn        func(string) string
 
 	changes *changeFeed
 	timing  streamTiming
@@ -425,9 +536,15 @@ func New(params Params) *Server {
 		runHistory:       params.RunHistory,
 		runEventsFn:      params.RunEventsFn,
 		runEventsAfterFn: params.RunEventsAfterFn,
-		tokenRates:       params.TokenRates,
 		stats:            params.Stats,
-		changes:          newChangeFeed(),
+
+		modelUse:           params.ModelUse,
+		configuredModelsFn: params.ConfiguredModelsFn,
+		ratesFn:            params.RatesFn,
+		priceDownloads:     params.PriceDownloads,
+		workflowLoadFn:     params.WorkflowLoadFn,
+		maskErrorFn:        params.MaskErrorFn,
+		changes:            newChangeFeed(),
 		timing: streamTiming{
 			heartbeat:      15 * time.Second,
 			signalInterval: time.Second,
@@ -454,6 +571,7 @@ func New(params Params) *Server {
 	mux.HandleFunc("/api/v1/runs/issues", s.routeIssueGroups)
 	mux.HandleFunc("/api/v1/runs/{dispatch_id}/events", s.routeRunEvents)
 	mux.HandleFunc("/api/v1/stats", s.routeStats)
+	mux.HandleFunc("/api/v1/prices", s.routePrices)
 	mux.HandleFunc("/api/v1/refresh", s.routeRefresh)
 	mux.HandleFunc("/api/v1/retries/{identifier}/run", s.routeRetryNow)
 	mux.HandleFunc("/api/v1/attention/{id}/acknowledge", s.routeAcknowledge)

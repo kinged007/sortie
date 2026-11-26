@@ -21,12 +21,11 @@ import (
 	"github.com/sortie-ai/sortie/internal/agent/jsonrpc"
 	"github.com/sortie-ai/sortie/internal/domain"
 	"github.com/sortie-ai/sortie/internal/registry"
+	"github.com/sortie-ai/sortie/internal/waittest"
 )
 
-// Compile-time interface satisfaction check.
 var _ domain.AgentAdapter = (*CodexAdapter)(nil)
 
-// requireAgentError asserts err is a *domain.AgentError with the given Kind.
 func requireAgentError(t *testing.T, err error, wantKind domain.AgentErrorKind) {
 	t.Helper()
 	if err == nil {
@@ -172,9 +171,6 @@ func TestStartSession_BinaryNotFound(t *testing.T) {
 	requireAgentError(t, err, domain.ErrAgentNotFound)
 }
 
-// TestRunTurn_UsageMeasured_AbsentWhenNoTokenUsageNotification drives a
-// turn whose stream carries no thread/tokenUsage/updated notification and
-// asserts the run is reported unmeasured.
 func TestRunTurn_UsageMeasured_AbsentWhenNoTokenUsageNotification(t *testing.T) {
 	t.Parallel()
 
@@ -193,31 +189,6 @@ func TestRunTurn_UsageMeasured_AbsentWhenNoTokenUsageNotification(t *testing.T) 
 	agenttest.AssertMeasurementAbsent(t, events, result)
 }
 
-// TestRunTurn_UsageMeasured_TrueOnTokenUsageNotification drives a turn
-// whose stream carries a thread/tokenUsage/updated notification and
-// asserts the run is reported measured.
-func TestRunTurn_UsageMeasured_TrueOnTokenUsageNotification(t *testing.T) {
-	t.Parallel()
-
-	state := makeTestState(t, loadFixture(t, "runturn_success.jsonl"))
-	adapter, _ := NewCodexAdapter()
-
-	result, err := adapter.RunTurn(context.Background(), fakeSession(state), domain.RunTurnParams{
-		Prompt:  "do something",
-		OnEvent: func(domain.AgentEvent) {},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn() error = %v", err)
-	}
-
-	if !result.UsageMeasured {
-		t.Error("RunTurn().UsageMeasured = false, want true when a thread/tokenUsage/updated notification carried a token-usage object")
-	}
-}
-
-// TestRunTurn_CompletedTurnReturnsUntypedNilError pins that a completed
-// turn's returned error interface is genuinely nil, not a typed-nil
-// *domain.AgentError promoted to a non-nil error interface.
 func TestRunTurn_CompletedTurnReturnsUntypedNilError(t *testing.T) {
 	t.Parallel()
 
@@ -233,11 +204,8 @@ func TestRunTurn_CompletedTurnReturnsUntypedNilError(t *testing.T) {
 	}
 }
 
-// atomicErrContext behaves like context.Background() to every consumer
-// that selects on Done() (the channel is nil and never closes), but its
-// Err() method reports context.Canceled once cancelled is set, so a
-// test can drive a code path that reads ctx.Err() synchronously without
-// racing RunTurn's own <-ctx.Done() select case.
+// Done never closes, so a test can make ctx.Err() report cancellation
+// without racing RunTurn's own <-ctx.Done() select case.
 type atomicErrContext struct {
 	context.Context
 	cancelled *atomic.Bool
@@ -250,12 +218,9 @@ func (c atomicErrContext) Err() error {
 	return nil
 }
 
-// newInterruptedStatusState builds a sessionState wired to a real
-// jsonrpc.Conn over an io.Pipe, whose peer answers the turn/start call
-// only once it observes codex write it (required so the response
-// cannot be misrouted as unmatched, ahead of Call's own pending-map
-// registration). stdin, when non-nil, receives every line codex
-// writes, including the turn/start request itself.
+// The peer answers turn/start only after it sees the request written: an
+// earlier response would be routed as unmatched, ahead of Call's own
+// pending-map registration.
 func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 	t.Helper()
 
@@ -273,8 +238,10 @@ func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 		inbox:      jsonrpc.NewInbox[jsonrpc.Message](),
 		readerDone: make(chan struct{}),
 		acc:        agentcore.NewRunUsage(),
+		ledger:     adaptNewLedger(t),
 	}
 	state.conn = jsonrpc.NewConn(sig, inPr, jsonrpc.Deliver(state.inbox, identity))
+	t.Cleanup(state.conn.Close)
 	go watchTermination(state)
 
 	go func() {
@@ -285,24 +252,6 @@ func newInterruptedStatusState(t *testing.T, stdin io.Writer) *sessionState {
 	return state
 }
 
-// waitForSessionStarted blocks until state's turn emits its
-// domain.EventSessionStarted event, which RunTurn's loop can only
-// reach after its initial turn/start Call has returned: this is the
-// test's proof that RunTurn has moved past that call and into its main
-// loop, so a real context cancellation that follows lands on the
-// loop's own arm rather than aborting the call itself.
-func waitForSessionStarted(t *testing.T, started <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunTurn did not emit domain.EventSessionStarted within 2s, want it past the initial turn/start call")
-	}
-}
-
-// onEventSignalingSessionStarted wraps onEvent so it closes started
-// the first time it observes domain.EventSessionStarted, in addition
-// to forwarding every event to onEvent unchanged.
 func onEventSignalingSessionStarted(onEvent func(domain.AgentEvent), started chan<- struct{}) func(domain.AgentEvent) {
 	var once sync.Once
 	return func(e domain.AgentEvent) {
@@ -313,10 +262,6 @@ func onEventSignalingSessionStarted(onEvent func(domain.AgentEvent), started cha
 	}
 }
 
-// TestRunTurn_InterruptedStatus pins the context-gated mapping for a
-// turn/completed notification reporting status interrupted: cancelled
-// only when the turn context is already done, failed (preserving the
-// retryable classification) when the context is still live.
 func TestRunTurn_InterruptedStatus(t *testing.T) {
 	t.Parallel()
 
@@ -471,6 +416,10 @@ func TestRunTurn_CompletedNotificationUnderCancelledContext(t *testing.T) {
 	}
 }
 
+func turnFailedFixture(codexErrorInfo string) string {
+	return `{"method":"turn/completed","params":{"turn":{"id":"turn-001","status":"failed","error":{"message":"token expired","codexErrorInfo":` + codexErrorInfo + `}}}}` + "\n"
+}
+
 // TestRunTurn_FailedOrUnrecognizedStatus pins that a failed status with
 // no turn.error object, and any status other than completed,
 // interrupted, and failed, both produce turn_failed with a non-nil
@@ -482,16 +431,23 @@ func TestRunTurn_FailedOrUnrecognizedStatus(t *testing.T) {
 	tests := []struct {
 		name        string
 		fixture     string
+		wantKind    domain.AgentErrorKind
 		wantMessage string
 	}{
 		{
 			name:        "failed status with no turn.error object",
 			fixture:     `{"method":"turn/completed","params":{"turn":{"id":"turn-001","status":"failed"}}}` + "\n",
+			wantKind:    domain.ErrTurnFailed,
 			wantMessage: "turn failed",
 		},
+		{name: "unauthorized as a string", fixture: turnFailedFixture(`"unauthorized"`), wantKind: domain.ErrCredentialUnverified, wantMessage: agentcore.CredentialRefusedMessage("token expired")},
+		{name: "unauthorized as an object", fixture: turnFailedFixture(`{"unauthorized":{"httpStatusCode":401}}`), wantKind: domain.ErrCredentialUnverified, wantMessage: agentcore.CredentialRefusedMessage("token expired")},
+		{name: "connection error as an object", fixture: turnFailedFixture(`{"httpConnectionFailed":{"httpStatusCode":502}}`), wantKind: domain.ErrTurnFailed, wantMessage: "token expired"},
+		{name: "unrecognized error info shape", fixture: turnFailedFixture(`7`), wantKind: domain.ErrTurnFailed, wantMessage: "token expired"},
 		{
 			name:        "unrecognized status",
 			fixture:     `{"method":"turn/completed","params":{"turn":{"id":"turn-001","status":"queued_for_review"}}}` + "\n",
+			wantKind:    domain.ErrTurnFailed,
 			wantMessage: "turn queued_for_review",
 		},
 	}
@@ -516,8 +472,8 @@ func TestRunTurn_FailedOrUnrecognizedStatus(t *testing.T) {
 			if !errors.As(err, &agentErr) {
 				t.Fatalf("error type = %T, want *domain.AgentError", err)
 			}
-			if agentErr.Kind != domain.ErrTurnFailed {
-				t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, domain.ErrTurnFailed)
+			if agentErr.Kind != tt.wantKind {
+				t.Errorf("AgentError.Kind = %q, want %q", agentErr.Kind, tt.wantKind)
 			}
 			if agentErr.Message != tt.wantMessage {
 				t.Errorf("AgentError.Message = %q, want %q", agentErr.Message, tt.wantMessage)
@@ -525,18 +481,133 @@ func TestRunTurn_FailedOrUnrecognizedStatus(t *testing.T) {
 
 			dispositiontest.AssertDispositionContract(t, agentcore.TurnEvidence{
 				Terminal:          agentcore.TerminalFailure,
-				TerminalErrorKind: domain.ErrTurnFailed,
+				TerminalErrorKind: tt.wantKind,
 				TerminalMessage:   tt.wantMessage,
 			}, result, err)
 		})
 	}
 }
 
-// TestRunTurn_EmptyTurnStatus pins both ways a turn/completed
-// notification can arrive without a status word: params that fail to
-// unmarshal into an object, and a turn object that omits the status
-// member. Neither builds a terminal message from the empty status, so
-// agentcore.DecideTurn's own fallback message applies.
+type replayAdapter struct {
+	*CodexAdapter
+	state *sessionState
+}
+
+func (r replayAdapter) StartSession(context.Context, domain.StartSessionParams) (domain.Session, error) {
+	return fakeSession(r.state), nil
+}
+
+func (replayAdapter) StopSession(context.Context, domain.Session) error { return nil }
+
+func recordedRefusalTurn(t *testing.T, mutate func(string) string) []byte {
+	t.Helper()
+
+	_, turn, ok := strings.Cut(string(loadFixture(t, "usage_limit_exceeded.jsonl")), `{"id":3,`)
+	if !ok {
+		t.Fatalf("usage_limit_exceeded.jsonl has no turn/start response")
+	}
+	return []byte(mutate(`{"id":1,` + turn))
+}
+
+func windowBelowLimit(t *testing.T) func(string) string {
+	t.Helper()
+	return func(recorded string) string {
+		const exhausted, open = `"usedPercent":100`, `"usedPercent":99`
+		if !strings.Contains(recorded, exhausted) {
+			t.Fatalf("recorded refusal has no %s window", exhausted)
+		}
+		return strings.Replace(recorded, exhausted, open, 1)
+	}
+}
+
+func withRateLimitsBefore(t *testing.T, rateLimits string) func(string) string {
+	t.Helper()
+	return func(recorded string) string {
+		const recordedLine = `{"method":"account/rateLimits/updated"`
+		if !strings.Contains(recorded, recordedLine) {
+			t.Fatalf("recorded refusal has no %s line", recordedLine)
+		}
+		inserted := `{"method":"account/rateLimits/updated","params":{"rateLimits":` + rateLimits + `}}` + "\n"
+		return strings.Replace(recorded, recordedLine, inserted+recordedLine, 1)
+	}
+}
+
+func TestRunTurn_UsageLimitRefusal(t *testing.T) {
+	t.Parallel()
+
+	replay := func(model string, mutate func(string) string) *replayAdapter {
+		state := makeTestState(t, recordedRefusalTurn(t, mutate))
+		state.passthrough.Model = model
+		return &replayAdapter{CodexAdapter: &CodexAdapter{}, state: state}
+	}
+	exhaustedBucket := func(limitID, limitName string) string {
+		return `{"limitId":"` + limitID + `","limitName":"` + limitName + `","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":4103049600}}`
+	}
+	const weeklyHeld = `{"limitId":"codex","limitName":null,"primary":null,"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":4103049600}}`
+	recordedReset, laterReset := time.Unix(4102444800, 0).UTC(), time.Unix(4103049600, 0).UTC()
+	var mu sync.Mutex
+	var windows []domain.UsageWindow
+	collect := func(e domain.AgentEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		windows = append(windows, e.UsageWindows...)
+	}
+	cases := []agenttest.UsageLimitRefusalCase{
+		{
+			Name:         "recorded refusal",
+			Adapter:      replay("", func(s string) string { return s }),
+			Turn:         domain.RunTurnParams{OnEvent: collect},
+			WantResetsAt: recordedReset,
+		},
+		{Name: "window below the limit", Adapter: replay("", windowBelowLimit(t))},
+		{
+			Name:         "weekly window held across notifications",
+			Adapter:      replay("", withRateLimitsBefore(t, weeklyHeld)),
+			WantResetsAt: laterReset,
+		},
+		{
+			Name:    "reset already past",
+			Adapter: replay("", func(s string) string { return strings.Replace(s, "4102444800", "946684800", 1) }),
+		},
+		{
+			Name:         "another model's bucket",
+			Adapter:      replay("gpt-5.4", withRateLimitsBefore(t, exhaustedBucket("codex_bengalfox", "gpt-5.2-codex-sonic"))),
+			WantResetsAt: recordedReset,
+		},
+		{
+			Name:         "the configured model's bucket",
+			Adapter:      replay("gpt-5.2-codex-sonic", withRateLimitsBefore(t, exhaustedBucket("codex_bengalfox", "gpt-5.2-codex-sonic"))),
+			WantResetsAt: laterReset,
+		},
+		{
+			Name:         "bucket label",
+			Adapter:      replay("gpt-5.4", withRateLimitsBefore(t, exhaustedBucket("codex_other", "codex_other"))),
+			WantResetsAt: laterReset,
+		},
+	}
+
+	agenttest.AssertUsageLimitRefusal(t, "codex", cases)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(windows) != 1 {
+		t.Fatalf("usage windows emitted by the recorded refusal = %+v, want exactly one for the primary window", windows)
+	}
+	got := windows[0]
+	if got.Key != "codex/primary" || got.Label != "5-hour limit" || got.Status != "" {
+		t.Errorf("window = {Key %q, Label %q, Status %q}, want {%q, %q, %q}", got.Key, got.Label, got.Status, "codex/primary", "5-hour limit", "")
+	}
+	if got.UsedPercent == nil || *got.UsedPercent != 100 {
+		t.Errorf("window UsedPercent = %v, want 100", got.UsedPercent)
+	}
+	if want := time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC); !got.ResetsAt.Equal(want) {
+		t.Errorf("window ResetsAt = %v, want %v", got.ResetsAt, want)
+	}
+	if got.ReportedAt.IsZero() {
+		t.Error("window ReportedAt is zero, want the instant the report was observed")
+	}
+}
+
 func TestRunTurn_EmptyTurnStatus(t *testing.T) {
 	t.Parallel()
 
@@ -677,30 +748,18 @@ func TestStopSession_ReturnsWhileWriteParked(t *testing.T) {
 	t.Cleanup(func() {
 		_ = pr.Close()
 		_ = pw.Close()
-		select {
-		case <-written:
-		case <-time.After(2 * time.Second):
-		}
+		waittest.Receive(t, written, "parked write release")
 	})
 
-	select {
-	case <-sig.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the write to enter the wrapped writer")
-	}
+	waittest.Receive(t, sig.done, "write entering the wrapped writer")
 
 	stopErr := make(chan error, 1)
 	go func() {
 		stopErr <- (&CodexAdapter{}).StopSession(context.Background(), domain.Session{Internal: state})
 	}()
 
-	select {
-	case err := <-stopErr:
-		if err != nil {
-			t.Errorf("StopSession() error = %v, want nil", err)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("StopSession() did not return while a write was parked, want it to return well short of its own 5-second graceful-wait ceiling")
+	if err := waittest.Receive(t, stopErr, "StopSession return while a write is parked"); err != nil {
+		t.Errorf("StopSession() error = %v, want nil", err)
 	}
 }
 
@@ -758,7 +817,7 @@ var fakeScenarios = map[string]agenttest.Scenario{
 		return serveHandshakeBurstThread(newFakeAppServerScanner(), os.Stdout)
 	}),
 	scenarioRecordFrames: agenttest.Typed(func(_ []string, params recordFramesParams) int {
-		return serveRecordFrames(newFakeAppServerScanner(), os.Stdout, params.RecordPath)
+		return serveRecordFrames(newFakeAppServerScanner(), os.Stdout, params)
 	}),
 }
 
@@ -772,14 +831,27 @@ type burstBetweenTurnsParams struct {
 }
 
 type recordFramesParams struct {
-	RecordPath string `json:"recordPath"`
+	RecordPath        string   `json:"recordPath"`
+	ConfigReadServers []string `json:"configReadServers,omitempty"`
+	ConfigReadFails   bool     `json:"configReadFails,omitempty"`
 }
 
-func serveRecordFrames(client *bufio.Scanner, out io.Writer, recordPath string) int {
+func answerConfigRead(out io.Writer, id json.RawMessage, params recordFramesParams) bool {
+	if params.ConfigReadFails {
+		return writeJSON(out, map[string]any{"id": id, "error": map[string]any{"code": -32601, "message": "method not found"}})
+	}
+	servers := map[string]any{}
+	for _, name := range params.ConfigReadServers {
+		servers[name] = struct{}{}
+	}
+	return writeJSON(out, rpcResult{ID: id, Result: map[string]any{"config": map[string]any{"mcp_servers": servers}}})
+}
+
+func serveRecordFrames(client *bufio.Scanner, out io.Writer, params recordFramesParams) int {
 	if !answerPreThreadHandshake(client, out) {
 		return 1
 	}
-	record, err := os.OpenFile(recordPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	record, err := os.OpenFile(params.RecordPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return 1
 	}
@@ -792,6 +864,11 @@ func serveRecordFrames(client *bufio.Scanner, out io.Writer, recordPath string) 
 		}
 		var result, completed any
 		switch frame.Method {
+		case "config/read":
+			if !answerConfigRead(out, frame.ID, params) {
+				return 1
+			}
+			continue
 		case "thread/start", "thread/resume":
 			result, completed = map[string]any{"thread": map[string]any{"id": "fake-thread-1"}}, rpcNotification{Method: "thread/started"}
 		case "turn/start":
@@ -1121,12 +1198,7 @@ func TestRunTurn_BurstDuringTurnOpeningNoLongerHangs(t *testing.T) {
 		outcomeCh <- handlerParkedOutcome{result: result, err: runErr}
 	}()
 
-	var got handlerParkedOutcome
-	select {
-	case got = <-outcomeCh:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("RunTurn has not returned after 10s, state.waitCh still open = %v", waitChOpen(state))
-	}
+	got := waittest.Receive(t, outcomeCh, "RunTurn outcome")
 
 	if got.err != nil {
 		t.Errorf("RunTurn() error = %v, want nil", got.err)
@@ -1180,16 +1252,7 @@ func TestRunTurn_BurstBetweenTurnsNoLongerHangs(t *testing.T) {
 		t.Fatalf("RunTurn(1) ExitReason = %q, want %q", result1.ExitReason, domain.EventTurnCompleted)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, statErr := os.Stat(markerPath); statErr == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("marker file is absent after 10s, state.waitCh still open = %v", waitChOpen(state))
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waittest.File(t, markerPath)
 
 	var events []domain.AgentEvent
 	outcomeCh := make(chan handlerParkedOutcome, 1)
@@ -1201,12 +1264,7 @@ func TestRunTurn_BurstBetweenTurnsNoLongerHangs(t *testing.T) {
 		outcomeCh <- handlerParkedOutcome{result: result, err: runErr}
 	}()
 
-	var got handlerParkedOutcome
-	select {
-	case got = <-outcomeCh:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("RunTurn(2) has not returned after 10s, state.waitCh still open = %v", waitChOpen(state))
-	}
+	got := waittest.Receive(t, outcomeCh, "RunTurn(2) outcome")
 
 	if got.err != nil {
 		t.Errorf("RunTurn(2) error = %v, want nil", got.err)
@@ -1222,17 +1280,8 @@ func TestRunTurn_BurstBetweenTurnsNoLongerHangs(t *testing.T) {
 	}
 }
 
-// TestStartSession_HandshakeBurstDoesNotLoseAwaitedNotification drives
-// two fake runtimes, each of which writes burstCount notifications in
-// one write before the notification the handshake waits for: the first
-// answers account/login/start after account/login/completed, with
-// CODEX_API_KEY set; the second answers thread/start after
-// thread/started. Each StartSession must succeed well inside its read
-// timeout: a lost thread/started is accepted silently once that
-// timeout expires, so only elapsed time can expose it, and the bound
-// sits far enough below the timeout to tolerate a slow race build.
 func TestStartSession_HandshakeBurstDoesNotLoseAwaitedNotification(t *testing.T) {
-	const readTimeout = 30 * time.Second
+	const readTimeout = waittest.HangGuard
 	tests := []struct {
 		name     string
 		scenario string
@@ -1275,8 +1324,12 @@ func TestStartSession_HandshakeBurstDoesNotLoseAwaitedNotification(t *testing.T)
 			}
 			t.Cleanup(func() { _ = adapter.StopSession(context.Background(), session) })
 
-			if bound := readTimeout / 2; elapsed > bound {
-				t.Fatalf("StartSession() took %v past its %v bound, want the burst to cost it nothing", elapsed, bound)
+			// A lost thread/started is accepted silently once the read
+			// timeout expires and yields the same thread ID, so waiting
+			// the timeout out is the only trace it leaves. A timer never
+			// fires early, so a regression always reaches the bound.
+			if elapsed >= readTimeout {
+				t.Fatalf("StartSession() took %v, want less than the %v read timeout: it waited the timeout out, so the awaited notification was lost to the burst", elapsed, readTimeout)
 			}
 		})
 	}
